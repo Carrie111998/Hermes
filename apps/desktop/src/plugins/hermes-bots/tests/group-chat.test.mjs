@@ -208,7 +208,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, mergeGroupChatSyncSnapshots, groupChatSyncSnapshot, attachDesktopRoomAuthorityCommitments, groupChatGatewayJsonSize, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, desktopCommandEligibleRooms, currentDesktopRoomCoordinatorId, ensureDesktopRoomCommandConsumerId, executeDesktopRoomCommand, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, stageHostedAttachments, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, mergeGroupChatSyncSnapshots, groupChatSyncSnapshot, attachDesktopRoomAuthorityCommitments, groupChatGatewayJsonSize, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, desktopCommandEligibleRooms, currentDesktopRoomCoordinatorId, ensureDesktopRoomCommandConsumerId, executeDesktopRoomCommand, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -332,6 +332,37 @@ test('classic room projection carries only a one-way authority commitment', asyn
   assert.equal(JSON.stringify(snapshot).includes('private-token'), false)
 })
 
+test('shared room projection keeps attachment ids and metadata but never bytes', () => {
+  const gc = load(() => '(pass)')
+  const snapshot = gc.groupChatSyncSnapshot({
+    Classic: {
+      roomId: 'room-1',
+      log: [{
+        id: 'message-1',
+        at: 1,
+        from: { kind: 'user', name: 'You' },
+        text: 'Review this',
+        images: [{
+          attachment_id: 'att_11111111111111111111111111111111',
+          kind: 'image',
+          name: 'diagram.png',
+          size: 12,
+          mime: 'image/png',
+          connectionId: 'gateway-a',
+          data: 'data:image/png;base64,iVBORw0KGgoAAAAA'
+        }]
+      }],
+      members: [{ name: 'research' }]
+    }
+  })
+  const projected = snapshot.rooms['id:room-1'].log[0].images[0]
+
+  assert.equal(projected.attachment_id, 'att_11111111111111111111111111111111')
+  assert.equal(projected.connectionId, 'gateway-a')
+  assert.equal(Object.hasOwn(projected, 'data'), false)
+  assert.doesNotMatch(JSON.stringify(snapshot), /iVBOR|data:image/)
+})
+
 test('classic messaging send waits for a complete live roster', async () => {
   const gc = load(() => '(pass)')
   gc.$lastRoster.set([{ name: 'research' }])
@@ -422,6 +453,235 @@ test('lease loss during the reachability probe prevents every room effect', asyn
   assert.equal(gc.$groupChats.get().Classic.log.length, 0)
 })
 
+test('classic attachment read carries authority and live command lease proof', async () => {
+  const gc = load(() => '(pass)')
+  const members = [{ name: 'research' }]
+  const coordinator = gc.currentDesktopRoomCoordinatorId()
+  gc.$lastRoster.set(members)
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members,
+      desktopCoordinatorId: coordinator,
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+  const request = gc.host.request
+  let attachmentRead
+  gc.host.request = async (method, params) => {
+    if (method === 'groups.attachment.read') {
+      attachmentRead = params
+      return {
+        attachment: {
+          attachment_id: 'att_11111111111111111111111111111111',
+          kind: 'image',
+          name: 'diagram.png',
+          size: 12,
+          mime: 'image/png'
+        },
+        content_base64: 'iVBORw0KGgoAAAAA'
+      }
+    }
+    return request(method, params)
+  }
+
+  const result = await gc.executeDesktopRoomCommand({
+    command_id: 'messaging:attachment-proof',
+    room_id: 'room-1',
+    action: 'send',
+    lease_token: 'lease:one',
+    payload: {
+      message: '',
+      attachments: [{
+        attachment_id: 'att_11111111111111111111111111111111',
+        kind: 'image',
+        name: 'diagram.png',
+        size: 12,
+        mime: 'image/png'
+      }]
+    }
+  }, [{ name: 'Classic', roomId: 'room-1' }])
+
+  assert.equal(result.room_name, 'Classic')
+  assert.equal(attachmentRead.consumer_id, coordinator)
+  assert.equal(attachmentRead.lease_token, 'lease:one')
+  assert.equal(attachmentRead.authority_token, 'authority:test')
+  assert.equal(attachmentRead.event_id, 'messaging:attachment-proof')
+  assert.equal(attachmentRead.purpose, 'desktop-command')
+  assert.doesNotMatch(JSON.stringify(gc.$groupChats.get().Classic.log), /iVBOR|data:image/)
+  assert.ok(gc.requests.some(call => call.method === 'image.attach_bytes'))
+})
+
+test('classic messaging executes against the send-time Bot roster only', async () => {
+  const gc = load(() => '(pass)')
+  const roster = [{ name: 'research' }, { name: 'late-bot' }]
+  gc.$lastRoster.set(roster)
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members: roster,
+      desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+
+  await gc.executeDesktopRoomCommand({
+    command_id: 'messaging:frozen-roster',
+    room_id: 'room-1',
+    action: 'send',
+    payload: {
+      message: 'Review this',
+      recipients: [{ name: 'research' }]
+    }
+  }, [{ name: 'Classic', roomId: 'room-1' }])
+
+  assert.deepEqual(gc.calls.map(call => call.profile), ['research'])
+})
+
+test('classic messaging waits for an unavailable send-time recipient instead of using a later Bot', async () => {
+  const gc = load(() => '(pass)')
+  gc.$lastRoster.set([{ name: 'late-bot' }])
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members: [{ name: 'research' }, { name: 'late-bot' }],
+      desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+
+  await assert.rejects(
+    gc.executeDesktopRoomCommand({
+      command_id: 'messaging:frozen-offline',
+      room_id: 'room-1',
+      action: 'send',
+      payload: {
+        message: 'Review this',
+        recipients: [{ name: 'research' }]
+      }
+    }, [{ name: 'Classic', roomId: 'room-1' }]),
+    error => error.retryable === true
+  )
+  assert.equal(gc.calls.length, 0)
+})
+
+test('lease loss during attachment read prevents the room turn from starting', async () => {
+  let releaseRead
+  const pendingRead = new Promise(resolve => { releaseRead = resolve })
+  const gc = load(() => '(pass)')
+  const members = [{ name: 'research' }]
+  gc.$lastRoster.set(members)
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members,
+      desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+  const request = gc.host.request
+  gc.host.request = async (method, params) =>
+    method === 'groups.attachment.read' ? pendingRead : request(method, params)
+  const lease = new AbortController()
+  const execution = gc.executeDesktopRoomCommand({
+    command_id: 'messaging:attachment-lease-loss',
+    room_id: 'room-1',
+    action: 'send',
+    lease_token: 'lease:one',
+    payload: {
+      message: '',
+      attachments: [{
+        attachment_id: 'att_11111111111111111111111111111111',
+        kind: 'image',
+        name: 'diagram.png',
+        size: 12,
+        mime: 'image/png'
+      }]
+    }
+  }, [{ name: 'Classic', roomId: 'room-1' }], { signal: lease.signal })
+
+  await new Promise(resolve => setImmediate(resolve))
+  lease.abort('lease-lost')
+  releaseRead({
+    attachment: {
+      attachment_id: 'att_11111111111111111111111111111111',
+      kind: 'image',
+      name: 'diagram.png',
+      size: 12,
+      mime: 'image/png'
+    },
+    content_base64: 'iVBORw0KGgoAAAAA'
+  })
+
+  await assert.rejects(execution, error => error.retryable === true && /lease/.test(error.message))
+  assert.equal(gc.calls.length, 0)
+  assert.equal(gc.$groupChats.get().Classic.log.length, 0)
+})
+
+test('priority Stop overtakes an attachment read before the room turn starts', async () => {
+  let releaseRead
+  const pendingRead = new Promise(resolve => { releaseRead = resolve })
+  const gc = load(() => '(pass)')
+  const members = [{ name: 'research' }]
+  gc.$lastRoster.set(members)
+  gc.$groupChats.set({
+    Classic: {
+      roomId: 'room-1',
+      log: [],
+      members,
+      desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
+      desktopAuthorityToken: 'authority:test'
+    }
+  })
+  const request = gc.host.request
+  gc.host.request = async (method, params) =>
+    method === 'groups.attachment.read' ? pendingRead : request(method, params)
+  const send = gc.executeDesktopRoomCommand({
+    command_id: 'messaging:attachment-send',
+    room_id: 'room-1',
+    action: 'send',
+    lease_token: 'lease:send',
+    payload: {
+      message: '',
+      attachments: [{
+        attachment_id: 'att_11111111111111111111111111111111',
+        kind: 'image',
+        name: 'diagram.png',
+        size: 12,
+        mime: 'image/png'
+      }]
+    }
+  }, [{ name: 'Classic', roomId: 'room-1' }])
+
+  await new Promise(resolve => setImmediate(resolve))
+  const stopped = await gc.executeDesktopRoomCommand({
+    command_id: 'stop:attachment-send',
+    room_id: 'room-1',
+    action: 'stop',
+    payload: {}
+  }, [{ name: 'Classic', roomId: 'room-1' }])
+  releaseRead({
+    attachment: {
+      attachment_id: 'att_11111111111111111111111111111111',
+      kind: 'image',
+      name: 'diagram.png',
+      size: 12,
+      mime: 'image/png'
+    },
+    content_base64: 'iVBORw0KGgoAAAAA'
+  })
+  const sendResult = await send
+
+  assert.equal(stopped.stopped, true)
+  assert.equal(sendResult.stopped, true)
+  assert.equal(gc.calls.length, 0)
+  assert.equal(gc.$groupChats.get().Classic.log.length, 0)
+})
+
 test('lease loss cancels without holds or settlement and the command can replay', async () => {
   let releaseFirst
   let turn = 0
@@ -490,7 +750,14 @@ test('a visible unacknowledged messaging entry re-drives once then stays settled
         at: 1,
         from: { kind: 'user', name: 'Signal' },
         text: 'Resume this',
-        thread: 'thread-recover'
+        thread: 'thread-recover',
+        images: [{
+          attachment_id: 'att_11111111111111111111111111111111',
+          kind: 'image',
+          name: 'diagram.png',
+          size: 12,
+          mime: 'image/png'
+        }]
       }],
       members,
       desktopCoordinatorId: gc.currentDesktopRoomCoordinatorId(),
@@ -499,24 +766,36 @@ test('a visible unacknowledged messaging entry re-drives once then stays settled
     }
   })
 
-  gc.sendToGroupChat('Classic', members, 'Resume this', null, [], {
+  const attachments = [{
+    attachment_id: 'att_11111111111111111111111111111111',
+    kind: 'image',
+    name: 'diagram.png',
+    size: 12,
+    mime: 'image/png',
+    data: 'data:image/png;base64,iVBORw0KGgoAAAAA'
+  }]
+  gc.sendToGroupChat('Classic', members, 'Resume this', null, attachments, {
     entryId: 'messaging:recover',
-    userName: 'Signal'
+    userName: 'Signal',
+    omitAttachmentDataFromLog: true
   })
   for (let index = 0; index < 100 && gc.$groupChats.get().Classic.running; index++) {
     await new Promise(resolve => setImmediate(resolve))
   }
 
   assert.equal(gc.calls.length, 1)
+  assert.equal(gc.requests.filter(call => call.method === 'image.attach_bytes').length, 1)
   assert.equal(roomLog(gc, 'Classic').filter(entry => entry.id === 'messaging:recover').length, 1)
   assert.ok(gc.$groupChats.get().Classic.desktopCommandSettled['messaging:recover'])
 
-  gc.sendToGroupChat('Classic', members, 'Resume this', null, [], {
+  gc.sendToGroupChat('Classic', members, 'Resume this', null, attachments, {
     entryId: 'messaging:recover',
-    userName: 'Signal'
+    userName: 'Signal',
+    omitAttachmentDataFromLog: true
   })
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(gc.calls.length, 1)
+  assert.equal(gc.requests.filter(call => call.method === 'image.attach_bytes').length, 1)
 })
 
 test('classic command execution resolves only after the room drive settles', async () => {
@@ -1091,7 +1370,7 @@ test('hosted-room marker survives projection, cold hydrate, and plugin persisten
   assert.equal(reloaded.Hosted.running, false)
 })
 
-test('persisted hosted fence blocks the local driver after relaunch', () => {
+test('persisted hosted fence routes the send to its home without a local driver', async () => {
   const gc = load(() => 'must not run')
   const reloaded = gc.hydratePersistedGroupChatRooms({
     Hosted: {
@@ -1104,11 +1383,11 @@ test('persisted hosted fence blocks the local driver after relaunch', () => {
   })
 
   gc.$groupChats.set(reloaded)
-  const thread = gc.sendToGroupChat('Hosted', [{ name: 'research' }], 'after restart')
-
-  assert.equal(thread, null)
+  await assert.rejects(
+    gc.sendToGroupChat('Hosted', [{ name: 'research' }], 'after restart'),
+    /offline/i
+  )
   assert.equal(gc.calls.length, 0)
-  assert.match(gc.notifications.at(-1).message, /gateway-a/)
 })
 
 test('remote-merge persistence preserves session ownership and sticky holds', () => {
@@ -1374,7 +1653,7 @@ test('a receipted legacy adoption converges on the install authority once', () =
   assert.deepEqual(repeated, adopted)
 })
 
-test('a hosted-room marker prevents a second local round driver', () => {
+test('a hosted-room marker prevents a second local round driver', async () => {
   const gc = load(() => 'must not run')
   gc.$groupChats.set({
     Hosted: {
@@ -1387,15 +1666,105 @@ test('a hosted-room marker prevents a second local round driver', () => {
     }
   })
 
-  const sent = gc.sendToGroupChat('Hosted', [{ name: 'research', title: '' }], 'do the work')
-
-  assert.equal(sent, null)
+  await assert.rejects(
+    gc.sendToGroupChat('Hosted', [{ name: 'research', title: '' }], 'do the work'),
+    /offline/i
+  )
   assert.equal(gc.calls.length, 0, 'no member turn starts locally')
   assert.equal(gc.$groupChats.get().Hosted.log.length, 0, 'the local mirror stays read-only')
-  assert.equal(gc.notifications.length, 1)
-  assert.equal(gc.notifications[0].kind, 'info')
-  assert.match(gc.notifications[0].message, /gateway-a/)
-  assert.match(gc.notifications[0].message, /isn't available in this build yet/)
+})
+
+test('hosted attachments upload once to the room home and return metadata-only manifests', async () => {
+  const gc = load(() => 'must not run')
+  const calls = []
+  gc.host.requestProfile = async (route, method, params) => {
+    calls.push({ route, method, params })
+    return {
+      attachment: {
+        attachment_id: 'att_11111111111111111111111111111111',
+        kind: params.kind,
+        name: params.name,
+        size: 12,
+        mime: params.mime
+      }
+    }
+  }
+  const manifest = await gc.stageHostedAttachments(
+    { connectionId: 'gateway-a' },
+    'room-hosted',
+    'event-1',
+    [
+      {
+        kind: 'image',
+        name: 'diagram.png',
+        size: 12,
+        mime: 'image/png',
+        data: 'data:image/png;base64,iVBORw0KGgoAAAAA'
+      }
+    ]
+  )
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].method, 'groups.attachment.put')
+  assert.equal(calls[0].params.room_id, 'room-hosted')
+  assert.equal(calls[0].params.upload_id, 'event-1:upload:0')
+  assert.equal(calls[0].params.content_base64, 'iVBORw0KGgoAAAAA')
+  assert.deepEqual(JSON.parse(JSON.stringify(manifest)), [
+    {
+      attachment_id: 'att_11111111111111111111111111111111',
+      kind: 'image',
+      name: 'diagram.png',
+      size: 12,
+      mime: 'image/png'
+    }
+  ])
+  assert.doesNotMatch(JSON.stringify(manifest), /base64|data:|iVBOR/)
+})
+
+test('classic messaging image, PDF, and file bytes reuse the existing attach RPCs', async () => {
+  const gc = load(() => '(pass)')
+  const members = [{ name: 'research', title: '' }]
+  gc.$groupChats.set({ Classic: { log: [], members } })
+
+  gc.sendToGroupChat(
+    'Classic',
+    members,
+    '',
+    null,
+    [
+      {
+        attachment_id: 'att_11111111111111111111111111111111',
+        kind: 'image',
+        name: 'diagram.png',
+        size: 12,
+        mime: 'image/png',
+        data: 'data:image/png;base64,iVBORw0KGgoAAAAA'
+      },
+      {
+        attachment_id: 'att_22222222222222222222222222222222',
+        kind: 'pdf',
+        name: 'brief.pdf',
+        size: 8,
+        mime: 'application/pdf',
+        data: 'data:application/pdf;base64,JVBERi0xLjc='
+      },
+      {
+        attachment_id: 'att_33333333333333333333333333333333',
+        kind: 'file',
+        name: 'notes.txt',
+        size: 5,
+        mime: 'text/plain',
+        data: 'data:text/plain;base64,aGVsbG8='
+      }
+    ],
+    { entryId: 'messaging:attachment-1', omitAttachmentDataFromLog: true }
+  )
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.doesNotMatch(JSON.stringify(roomLog(gc, 'Classic')), /base64,|iVBOR|JVBER|aGVsbG8/)
+  assert.ok(gc.requests.some(call => call.method === 'image.attach_bytes'))
+  assert.ok(gc.requests.some(call => call.method === 'pdf.attach'))
+  assert.ok(gc.requests.some(call => call.method === 'file.attach'))
 })
 
 test('late renderer callbacks cannot mutate a hosted room mirror', () => {
@@ -2629,7 +2998,7 @@ test('source contract: thread UI — folded rows, per-thread reply box, new-thre
   assert.match(pluginSource, /Open this thread/)
   assert.match(pluginSource, /Collapse thread/)
   assert.match(pluginSource, /Reply in thread…/)
-  assert.match(pluginSource, /children: 'New Thread'/)
+  assert.match(pluginSource, /sendingComposer === 'main' \? 'Sending…' : 'New Thread'/)
   assert.match(pluginSource, /const markKey = `\$\{thread\}::\$\{memberKey\}`/)
 })
 
@@ -2654,6 +3023,17 @@ test('source contract: group chat log lines expose CopyButton on the entry body'
   assert.doesNotMatch(src, /RefreshCw/)
   assert.doesNotMatch(src, /readAloud/)
   assert.doesNotMatch(src, /ActionBarPrimitive\.Reload/)
+})
+
+test('source contract: metadata-only attachments load on demand without a broken image source', () => {
+  const src = groupChatWorkspaceSource()
+  const render = src.slice(src.indexOf('const renderEntry'), src.indexOf('// Threads:'))
+
+  assert.match(pluginSource, /function GroupAttachmentDisplay\(/)
+  assert.match(pluginSource, /'groups\.attachment\.read'/)
+  assert.match(pluginSource, /purpose: 'viewer'/)
+  assert.match(render, /jsx\(GroupAttachmentDisplay/)
+  assert.doesNotMatch(render, /src: img\.data/)
 })
 
 test('source contract: group chat message bodies opt back into selectable text', () => {

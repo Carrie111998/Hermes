@@ -115,7 +115,7 @@ def authorize_attachment_read(
     authority_token: Any,
     clock: Any = time.time,
 ) -> None:
-    """Require the live command lease and room authority before byte access."""
+    """Require the live command lease and bound room authority before byte access."""
 
     room_id = _room_identifier(room_id)
     command_id = _identifier(command_id, label="command_id")

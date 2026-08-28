@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 
 from gateway import hosted_room_driver, hosted_rooms
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.hosted_room_attachments import HostedRoomAttachmentStore
 from gateway.hosted_room_messaging import (
     MessagingRoomBackend,
     RoomControlError,
@@ -39,14 +41,29 @@ class _FakeService:
         self.db_path = db_path
         self.sent = []
         self.stopped = []
+        self.attachments = HostedRoomAttachmentStore(db_path)
         self.room_status = {"running": True, "working": False, "blocked": False}
 
     def status(self, _room_id):
         return dict(self.room_status)
 
     def send(self, **kwargs):
+        manifest = kwargs.get("payload", {}).get("attachments") or []
+        if manifest:
+            room = hosted_rooms.room_state(self.db_path, room_id=kwargs["room_id"])
+            self.attachments.commit_message(
+                room_id=kwargs["room_id"],
+                event_id=kwargs["event_id"],
+                manifest=manifest,
+                recipient_member_ids=tuple(
+                    member["member_id"] for member in room["members"]
+                ),
+            )
         self.sent.append(kwargs)
         return {"seq": 1}
+
+    def put_attachment(self, **kwargs):
+        return self.attachments.put(**kwargs)
 
     def stop_room(self, room_id, *, cancel_id):
         self.stopped.append((room_id, cancel_id))
@@ -185,6 +202,8 @@ def _event(
     user_id: str = "user-1",
     message_id: str = "message-1",
     media: bool = False,
+    media_urls: list[str] | None = None,
+    media_types: list[str] | None = None,
     is_bot: bool = False,
 ) -> MessageEvent:
     return MessageEvent(
@@ -193,8 +212,8 @@ def _event(
         user_id=user_id,
         user_name="Display Name",
         message_id=message_id,
-        media_urls=["/tmp/image.png"] if media else [],
-        media_types=["image/png"] if media else [],
+        media_urls=media_urls if media_urls is not None else ["/tmp/image.png"] if media else [],
+        media_types=media_types if media_types is not None else ["image/png"] if media else [],
         source=SessionSource(
             platform=platform,
             chat_id=f"chat-{platform.value}",
@@ -429,7 +448,14 @@ def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
     assert [(item["action"], item["payload"]) for item in commands] == [
         (
             "send",
-            {"actor_display_name": "Display Name via Signal", "message": "hello"},
+            {
+                "actor_display_name": "Display Name via Signal",
+                "message": "hello",
+                "recipients": [
+                    {"name": "default", "handle": "hermes"},
+                    {"name": "reviewer", "handle": "reviewer"},
+                ],
+            },
         ),
         ("stop", {}),
     ]
@@ -456,6 +482,57 @@ def test_legacy_desktop_room_control_requests_one_current_desktop_open(tmp_path,
             _event("/group 1 send hello", message_id="legacy-send"),
             "hello",
         )
+
+
+def test_classic_mailbox_carries_attachment_ids_and_desktop_can_read_bytes(
+    tmp_path, monkeypatch
+):
+    from gateway import desktop_room_mailbox
+
+    home = tmp_path / "hermes"
+    _seed_classic_projection(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        hosted_rooms,
+        "local_authority_gateway_id",
+        lambda: "install:test-gateway",
+    )
+    db = desktop_room_mailbox.default_db_path()
+    service = _FakeService(db)
+    room = list_messaging_rooms(service)[0]
+    cache = db.parent / "cache"
+    cache.mkdir(exist_ok=True)
+    notes = cache / "notes.txt"
+    notes.write_text("release notes", encoding="utf-8")
+    event = _event(
+        "/group 1 send",
+        message_id="send-attachment-1",
+        media_urls=[str(notes)],
+        media_types=["text/plain"],
+    )
+
+    send_to_room(service, room, event, "")
+    command = desktop_room_mailbox.claim_commands(
+        db,
+        consumer_id="desktop:test",
+        room_authorities=[{
+            "room_id": "classic-room",
+            "authority_token": "authority:test",
+        }],
+    )[0]
+
+    attachment = command["payload"]["attachments"][0]
+    assert attachment["attachment_id"].startswith("att_")
+    serialized = json.dumps(command["payload"])
+    assert "release notes" not in serialized
+    assert str(notes) not in serialized
+    stored = HostedRoomAttachmentStore(hosted_rooms.default_db_path()).read(
+        room_id="classic-room",
+        attachment_id=attachment["attachment_id"],
+        recipient_member_id="desktop",
+        event_id=command["command_id"],
+    )
+    assert stored.data == b"release notes"
 
 
 def test_classic_room_detail_surfaces_failed_command_recovery(tmp_path, monkeypatch):
@@ -496,6 +573,26 @@ def test_classic_room_detail_surfaces_failed_command_recovery(tmp_path, monkeypa
 
     assert "Desktop planning — needs attention" in detail
     assert "The latest command could not be applied." in detail
+
+
+def test_room_detail_names_attachment_only_activity(tmp_path):
+    room = {
+        "room_id": "classic-room",
+        "name": "Design review",
+        "members": [{"name": "default"}],
+        "messaging_ref": 1,
+        "_room_mode": "desktop",
+        "desktop_available": True,
+        "log": [{
+            "from": {"kind": "user", "name": "You"},
+            "text": "",
+            "images": [{"name": "brief.pdf", "kind": "pdf"}],
+        }],
+    }
+
+    detail = format_room_detail(_FakeService(tmp_path / "state.db"), room)
+
+    assert "• You: Shared brief.pdf" in detail
 
 
 @pytest.mark.parametrize(
@@ -810,7 +907,7 @@ async def test_entity_first_group_send_is_dispatched(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_send_rejects_attachments_instead_of_silently_dropping_them(
+async def test_send_ingests_localized_attachment_and_accepts_attachment_only_command(
     tmp_path, monkeypatch
 ):
     db, _, _ = _seed_rooms(tmp_path)
@@ -818,10 +915,116 @@ async def test_send_rejects_attachments_instead_of_silently_dropping_them(
     monkeypatch.setattr(
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
     )
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    image = cache / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+
     result = await _runner()._handle_room_command(
-        _event("/group 1 send inspect this", media=True)
+        _event(
+            "/group 1 send",
+            media_urls=[str(image)],
+            media_types=["image/png"],
+        )
     )
-    assert "Attachments from messaging chats aren’t supported yet" in result
+
+    assert result == "Queued in Release room. Check: `/group 1`."
+    assert service.sent[-1]["payload"]["text"] == ""
+    manifest = service.sent[-1]["payload"]["attachments"]
+    assert manifest[0]["attachment_id"].startswith("att_")
+    assert manifest[0]["name"] == "image.png"
+    serialized = json.dumps(service.sent[-1])
+    assert str(image) not in serialized
+    assert "base64" not in serialized
+    assert "PNG" not in serialized
+
+
+def test_attachment_redelivery_reuses_upload_after_local_temp_file_is_removed(tmp_path):
+    db, room, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    image = cache / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+    event = _event(
+        "/group 1 send inspect",
+        media_urls=[str(image)],
+        media_types=["image/png"],
+    )
+
+    send_to_room(service, {**room, "_room_mode": "hosted"}, event, "inspect")
+    first_id = service.sent[-1]["payload"]["attachments"][0]["attachment_id"]
+    image.unlink()
+    send_to_room(service, {**room, "_room_mode": "hosted"}, event, "inspect")
+
+    assert service.sent[-1]["payload"]["attachments"][0]["attachment_id"] == first_id
+    assert service.attachments.stats()["attachments"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("media_url", "message"),
+    [
+        ("https://example.com/private.png", "Remote or encoded"),
+        ("../image.png", "safe localized path"),
+    ],
+)
+async def test_send_rejects_remote_and_traversal_media(
+    tmp_path, monkeypatch, media_url, message
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+
+    result = await _runner()._handle_room_command(
+        _event(
+            "/group 1 send inspect",
+            media_urls=[media_url],
+            media_types=["image/png"],
+        )
+    )
+
+    assert message in result
+    assert service.sent == []
+
+
+@pytest.mark.asyncio
+async def test_send_rejects_symlink_and_mime_mismatch(tmp_path, monkeypatch):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    real = cache / "real.png"
+    real.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+    link = cache / "link.png"
+    try:
+        link.symlink_to(real)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    symlink_result = await _runner()._handle_room_command(
+        _event(
+            "/group 1 send inspect",
+            media_urls=[str(link)],
+            media_types=["image/png"],
+        )
+    )
+    mismatch_result = await _runner()._handle_room_command(
+        _event(
+            "/group 1 send inspect",
+            message_id="message-2",
+            media_urls=[str(real)],
+            media_types=["application/pdf"],
+        )
+    )
+
+    assert "Symlinked attachments" in symlink_result
+    assert "PDF bytes" in mismatch_result
     assert service.sent == []
 
 

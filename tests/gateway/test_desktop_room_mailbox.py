@@ -374,6 +374,60 @@ def test_authority_token_fences_a_cold_desktop_after_owner_expiry(tmp_path):
     assert reclaimed[0]["command_id"] == "messaging:fenced-room"
 
 
+def test_attachment_read_requires_bound_authority_and_live_command_lease(tmp_path):
+    db = tmp_path / "state.db"
+    clock = Clock()
+    mailbox.enqueue_command(
+        db,
+        command_id="messaging:attachment",
+        room_id="room-1",
+        authority_hash=authority_commitment(),
+        action="send",
+        payload={"message": "inspect"},
+        clock=clock,
+    )
+    command = mailbox.claim_commands(
+        db,
+        consumer_id="desktop:owner",
+        room_authorities=authorities("room-1"),
+        claim_ttl=5,
+        presence_ttl=5,
+        clock=clock,
+    )[0]
+
+    mailbox.authorize_attachment_read(
+        db,
+        room_id="room-1",
+        command_id="messaging:attachment",
+        consumer_id="desktop:owner",
+        lease_token=command["lease_token"],
+        authority_token="authority:one",
+        clock=clock,
+    )
+    with pytest.raises(mailbox.DesktopRoomMailboxError, match="not authorized"):
+        mailbox.authorize_attachment_read(
+            db,
+            room_id="room-1",
+            command_id="messaging:attachment",
+            consumer_id="desktop:owner",
+            lease_token=command["lease_token"],
+            authority_token="authority:wrong",
+            clock=clock,
+        )
+
+    clock.value += 6
+    with pytest.raises(mailbox.DesktopRoomMailboxError, match="not authorized"):
+        mailbox.authorize_attachment_read(
+            db,
+            room_id="room-1",
+            command_id="messaging:attachment",
+            consumer_id="desktop:owner",
+            lease_token=command["lease_token"],
+            authority_token="authority:one",
+            clock=clock,
+        )
+
+
 def test_claim_cannot_establish_room_authority(tmp_path):
     db = tmp_path / "state.db"
     mailbox.enqueue_command(

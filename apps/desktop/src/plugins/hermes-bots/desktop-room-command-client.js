@@ -115,7 +115,10 @@ export async function runDesktopRoomCommandCycle({
           }
           try {
             result = await execute(command, descriptors, {
-              signal: abortController?.signal || null
+              signal: abortController?.signal || null,
+              route,
+              consumerId,
+              request: (method, params) => request(route, method, params)
             })
             if (leaseLost) {
               outcomes.push({

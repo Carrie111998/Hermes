@@ -8,9 +8,13 @@ one behavior contract.
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import os
 import re
 import sqlite3
+import stat
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -20,11 +24,20 @@ from typing import Any
 from gateway import hosted_room_discussion as discussion
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
+from gateway.hosted_room_attachments import (
+    AttachmentError,
+    CLASSIC_ATTACHMENT_TTL_SECONDS,
+    HostedRoomAttachmentStore,
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS_PER_MESSAGE,
+    MAX_MESSAGE_ATTACHMENT_BYTES,
+)
 
 
 MAX_ROOM_CHOICES = 8
 MAX_RECENT_MESSAGES = 5
 MAX_PREVIEW_CHARS = 180
+MAX_GROUP_MEMBERS = 6
 GROUP_CHAT_SYNC_META_KEY = "hermes-bots-groups"
 
 
@@ -229,6 +242,10 @@ class RoomControlError(ValueError):
     """A user-actionable hosted-room command error."""
 
 
+class _LocalizedMediaUnavailable(RoomControlError):
+    """A trusted localized media reference disappeared before durable ingest."""
+
+
 @dataclass(frozen=True)
 class RoomCommand:
     """Parsed mutating ``/group`` subcommand."""
@@ -244,6 +261,11 @@ class MessagingRoomBackend:
     def __init__(self, *, db_path: Any, service: Any = None) -> None:
         self.db_path = db_path
         self.service = service
+        self.attachments = (
+            service.attachments
+            if service is not None and hasattr(service, "attachments")
+            else HostedRoomAttachmentStore(db_path)
+        )
 
     def status(self, room_id: str) -> dict[str, Any]:
         if self.service is not None:
@@ -274,14 +296,61 @@ class MessagingRoomBackend:
                 payload=payload,
                 actor=actor,
             )
-        normalized = discussion.validate_user_payload(payload)
-        return hosted_rooms.append_event(
+        room = hosted_rooms.room_state(self.db_path, room_id=room_id)
+        member_ids = tuple(
+            str(member.get("member_id") or "") for member in room["members"]
+        )
+        normalized = discussion.validate_user_payload(
+            payload,
+            member_ids=member_ids,
+        )
+        if normalized.get("attachments"):
+            normalized["attachments"] = self.attachments.commit_message(
+                room_id=room_id,
+                event_id=event_id,
+                manifest=normalized["attachments"],
+                recipient_member_ids=(*member_ids, "viewer"),
+                hold_until_event=True,
+            )
+        event = hosted_rooms.append_event(
             self.db_path,
             room_id=room_id,
             event_id=event_id,
             kind="message.user",
             actor=dict(actor),
             payload=normalized,
+        )
+        if normalized.get("attachments"):
+            self.attachments.retain_event(room_id=room_id, event_id=event_id)
+        return event
+
+    def put_attachment(
+        self,
+        *,
+        room_id: str,
+        upload_id: str,
+        kind: str,
+        name: str,
+        mime: str,
+        data: bytes,
+    ) -> dict[str, Any]:
+        if self.service is not None:
+            return self.service.put_attachment(
+                room_id=room_id,
+                upload_id=upload_id,
+                kind=kind,
+                name=name,
+                mime=mime,
+                data=data,
+            )
+        hosted_rooms.room_state(self.db_path, room_id=room_id)
+        return self.attachments.put(
+            room_id=room_id,
+            upload_id=upload_id,
+            kind=kind,
+            name=name,
+            mime=mime,
+            data=data,
         )
 
     def stop_room(self, room_id: str, *, cancel_id: str) -> int:
@@ -385,10 +454,6 @@ def parse_room_command(args: str, *, command_root: str = "/group") -> RoomComman
         message = remainder.removeprefix("--").strip()
         if len(message) >= 2 and message[0] == message[-1] and message[0] in {'"', "'"}:
             message = message[1:-1].strip()
-        if not message:
-            raise RoomControlError(
-                f"Use `{command_root} <number> send <message>`."
-            )
         return RoomCommand("send", room_query, message)
     if action == "stop":
         if remainder:
@@ -553,6 +618,22 @@ def _event_label(event: Mapping[str, Any], member_names: Mapping[str, str]) -> s
     return "You"
 
 
+def _activity_text(text: Any, attachments: Any) -> str:
+    message = _clean_line(text)
+    names = [
+        _clean_line(item.get("name"), limit=48)
+        for item in attachments
+        if isinstance(item, Mapping) and _clean_line(item.get("name"), limit=48)
+    ] if isinstance(attachments, list) else []
+    if not names:
+        return message
+    visible = names[:3]
+    files = ", ".join(visible)
+    if len(names) > len(visible):
+        files += f", and {len(names) - len(visible)} more"
+    return f"{message} [Files: {files}]" if message else f"Shared {files}"
+
+
 def format_room_detail(
     service: Any,
     room: Mapping[str, Any],
@@ -613,14 +694,12 @@ def format_room_detail(
             if desktop_mode:
                 source = event.get("from") if isinstance(event.get("from"), Mapping) else {}
                 label = _clean_line(source.get("name") or "You", limit=48)
-                text = event.get("text")
+                text = _activity_text(event.get("text"), event.get("images"))
             else:
                 payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
                 label = _event_label(event, member_names)
-                text = payload.get("text")
-            lines.append(
-                f"• {label}: {_clean_line(text)}"
-            )
+                text = _activity_text(payload.get("text"), payload.get("attachments"))
+            lines.append(f"• {label}: {text}")
     else:
         lines.append("No messages yet.")
     command = room.get("desktop_command")
@@ -757,13 +836,185 @@ def messaging_event_id(event: Any) -> str:
     return f"messaging:{hashlib.sha256(material.encode()).hexdigest()}"
 
 
-def ensure_text_only(event: Any) -> None:
-    """Reject media explicitly until hosted-room attachment transport exists."""
+def _localized_media_roots(service: Any) -> tuple[Path, ...]:
+    """Return the bounded cache roots authorized inbound adapters localize into."""
 
-    if getattr(event, "media_urls", None) or getattr(event, "media_types", None):
+    db_root = Path(service.db_path).parent
+    roots = [Path(tempfile.gettempdir()), db_root / "cache"]
+    profiles = db_root / "profiles"
+    if profiles.is_dir():
+        roots.extend(path / "cache" for path in profiles.iterdir() if path.is_dir())
+    for key in (
+        "IMAGE_CACHE_DIR",
+        "VIDEO_CACHE_DIR",
+        "AUDIO_CACHE_DIR",
+        "DOCUMENT_CACHE_DIR",
+    ):
+        value = os.getenv(key, "").strip()
+        if value:
+            roots.append(Path(value).expanduser())
+    return tuple(roots)
+
+
+def _read_localized_media(service: Any, raw_path: Any) -> tuple[str, bytes]:
+    """Read one regular, non-symlinked adapter-localized file under a cache root."""
+
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise RoomControlError("Attachment media path is missing.")
+    raw_path = raw_path.strip()
+    if "://" in raw_path or raw_path.lower().startswith(("data:", "file:")):
+        raise RoomControlError("Remote or encoded attachment URLs are not trusted.")
+    path = Path(raw_path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise RoomControlError("Attachment media path is not a safe localized path.")
+
+    selected: tuple[Path, tuple[str, ...]] | None = None
+    for root in _localized_media_roots(service):
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        selected = (root, relative.parts)
+        break
+    if selected is None:
+        raise RoomControlError("Attachment is outside the authenticated media cache.")
+
+    current = selected[0]
+    try:
+        for part in selected[1]:
+            current = current / part
+            if stat.S_ISLNK(current.lstat().st_mode):
+                raise RoomControlError("Symlinked attachments are not trusted.")
+    except FileNotFoundError as exc:
+        raise _LocalizedMediaUnavailable(
+            "Localized attachment is no longer available."
+        ) from exc
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RoomControlError("Symlinked attachments are not trusted.") from exc
+        raise _LocalizedMediaUnavailable(
+            "Localized attachment could not be opened safely."
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise RoomControlError("Localized attachment is not a regular file.")
+        if info.st_size <= 0 or info.st_size > MAX_ATTACHMENT_BYTES:
+            raise RoomControlError("Attachment exceeds the 15MB per-file limit.")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(MAX_ATTACHMENT_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) != info.st_size or len(data) > MAX_ATTACHMENT_BYTES:
+        raise RoomControlError("Attachment changed while it was being ingested.")
+    return path.name, data
+
+
+def _ingest_event_attachments(
+    service: Any,
+    room: Mapping[str, Any],
+    event: Any,
+    *,
+    event_id: str,
+) -> list[dict[str, Any]]:
+    """Persist authenticated local media once and return a metadata-only manifest."""
+
+    urls = list(getattr(event, "media_urls", None) or [])
+    media_types = list(getattr(event, "media_types", None) or [])
+    if not urls and not media_types:
+        return []
+    if len(urls) != len(media_types):
+        raise RoomControlError("Attachment MIME metadata is incomplete or misaligned.")
+    if len(urls) > MAX_ATTACHMENTS_PER_MESSAGE:
         raise RoomControlError(
-            "Attachments from messaging chats aren’t supported yet. Send text only."
+            f"A Group Chat message supports at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments."
         )
+
+    room_id = str(room["room_id"])
+    classic = room.get("_room_mode") == "desktop"
+    store = HostedRoomAttachmentStore(hosted_rooms.default_db_path()) if classic else None
+    canonical_store = store or getattr(service, "attachments", None)
+    manifest = []
+    total = 0
+    for index, (raw_path, raw_mime) in enumerate(zip(urls, media_types)):
+        upload_id = f"{event_id}:media:{index}"
+        mime = str(raw_mime or "").strip().lower()
+        kind = "image" if mime.startswith("image/") else "pdf" if mime == "application/pdf" else "file"
+        try:
+            existing = (
+                canonical_store.find_upload(room_id=room_id, upload_id=upload_id)
+                if canonical_store is not None
+                else None
+            )
+        except AttachmentError as exc:
+            raise RoomControlError(str(exc)) from exc
+        try:
+            name, data = _read_localized_media(service, raw_path)
+        except _LocalizedMediaUnavailable:
+            if existing is None:
+                raise
+            attachment = existing
+        else:
+            if existing is not None:
+                if (
+                    existing["kind"] != kind
+                    or existing["mime"] != mime
+                    or existing["size"] != len(data)
+                    or existing["sha256"] != hashlib.sha256(data).hexdigest()
+                ):
+                    raise RoomControlError(
+                        "Message redelivery changed previously ingested attachment content."
+                    )
+                attachment = existing
+            else:
+                try:
+                    attachment = (
+                        store.put(
+                            room_id=room_id,
+                            upload_id=upload_id,
+                            kind=kind,
+                            name=name,
+                            mime=mime,
+                            data=data,
+                        )
+                        if store is not None
+                        else service.put_attachment(
+                            room_id=room_id,
+                            upload_id=upload_id,
+                            kind=kind,
+                            name=name,
+                            mime=mime,
+                            data=data,
+                        )
+                    )
+                except AttachmentError as exc:
+                    raise RoomControlError(str(exc)) from exc
+        if attachment["kind"] != kind or attachment["mime"] != mime:
+            raise RoomControlError(
+                "Message redelivery changed previously ingested attachment metadata."
+            )
+        total += int(attachment["size"])
+        if total > MAX_MESSAGE_ATTACHMENT_BYTES:
+            raise RoomControlError("Attachments exceed the 25MB per-message total limit.")
+        manifest.append({
+            "attachment_id": attachment["attachment_id"],
+            "kind": attachment["kind"],
+            "name": attachment["name"],
+            "size": attachment["size"],
+            "mime": attachment["mime"],
+        })
+    if store is not None:
+        manifest = store.commit_message(
+            room_id=room_id,
+            event_id=event_id,
+            manifest=manifest,
+            recipient_member_ids=("desktop", "viewer"),
+            retention_seconds=CLASSIC_ATTACHMENT_TTL_SECONDS,
+        )
+    return manifest
 
 
 def is_machine_authored(event: Any) -> bool:
@@ -813,11 +1064,54 @@ def _desktop_authority_hash(room: Mapping[str, Any]) -> str:
     return authority_hash
 
 
+def _desktop_recipients(room: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Freeze the projected Bot owners when a messaging command is admitted."""
+
+    recipients: list[dict[str, Any]] = []
+    for raw in list(room.get("members") or [])[:MAX_GROUP_MEMBERS]:
+        if not isinstance(raw, Mapping):
+            continue
+        name = _clean_line(raw.get("name"), limit=128)
+        if not name:
+            continue
+        recipient: dict[str, Any] = {"name": name}
+        for key, limit in (
+            ("handle", 128),
+            ("connectionId", 128),
+            ("connectionKind", 64),
+            ("connectionLabel", 128),
+        ):
+            value = _clean_line(raw.get(key), limit=limit)
+            if value:
+                recipient[key] = value
+        if raw.get("sourceScoped") is True:
+            recipient["sourceScoped"] = True
+        recipients.append(recipient)
+    if not recipients:
+        raise RoomControlError(
+            "This Group Chat has no reachable Bot roster yet. Open it in Hermes Desktop and retry."
+        )
+    return recipients
+
+
 def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -> str:
     """Append or hand off one idempotent room turn."""
 
-    ensure_text_only(event)
     event_id = messaging_event_id(event)
+    desktop_authority_hash = (
+        _desktop_authority_hash(room)
+        if room.get("_room_mode") == "desktop"
+        else None
+    )
+    attachments = _ingest_event_attachments(
+        service,
+        room,
+        event,
+        event_id=event_id,
+    )
+    text = str(text or "").strip()
+    if not text and not attachments:
+        raise RoomControlError("Send a message, an attachment, or both.")
     name = _clean_line(room.get("name") or room.get("room_id"), limit=72)
     if room.get("_room_mode") == "desktop":
         from gateway.desktop_room_mailbox import enqueue_command, default_db_path
@@ -830,11 +1124,13 @@ def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -
             default_db_path(),
             command_id=event_id,
             room_id=str(room["room_id"]),
-            authority_hash=_desktop_authority_hash(room),
+            authority_hash=desktop_authority_hash,
             action="send",
             payload={
                 "message": text,
                 "actor_display_name": actor.get("display_name") or "Messaging",
+                "recipients": _desktop_recipients(room),
+                **({"attachments": attachments} if attachments else {}),
             },
         )
         if room.get("desktop_available"):
@@ -843,7 +1139,11 @@ def send_to_room(service: Any, room: Mapping[str, Any], event: Any, text: str) -
     service.send(
         room_id=str(room["room_id"]),
         event_id=event_id,
-        payload={"text": text, "thread_id": event_id},
+        payload={
+            "text": text,
+            "thread_id": event_id,
+            **({"attachments": attachments} if attachments else {}),
+        },
         actor=messaging_actor(
             event,
             gateway_id=str(room["authority_gateway_id"]),

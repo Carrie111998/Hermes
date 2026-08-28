@@ -8,26 +8,23 @@ const MAX_ATTACHMENT_NAME_BYTES = 512
 const MAX_ATTACHMENT_FILE_BYTES = 15_000_000
 const MAX_ATTACHMENT_MANIFEST_BYTES = 32 * 1024
 const MAX_ATTACHMENT_MIME_CHARS = 127
-const MAX_ATTACHMENT_REFS = 6
 const MAX_MEMBER_ID_CHARS = 128
-const MAX_STAGED_REF_CHARS = 256
+const ATTACHMENT_ID_RE = /^att_[0-9a-f]{32}$/
 
 export const HOSTED_ROOM_CLIENT_LIMITATIONS = Object.freeze({
-  attachments: false,
+  attachments: true,
   automaticFailover: false,
   crossGatewayMembers: false,
   stagedAttachmentManifest: true
 })
 
-const ATTACHMENT_FIELDS = new Set(['kind', 'name', 'size', 'mime', 'refs'])
+const ATTACHMENT_FIELDS = new Set(['attachment_id', 'kind', 'name', 'size', 'mime'])
 const ATTACHMENT_KINDS = new Set(['image', 'pdf', 'file'])
 const ATTACHMENT_PAYLOAD_ALIASES = new Set(['attachment', 'attachment_manifest', 'files', 'images'])
 const COMMAND_KINDS = new Set(['create', 'send', 'stop', 'disband'])
-const DISALLOWED_STAGED_REF_SCHEMES = new Set(['blob', 'data', 'file', 'http', 'https', 'path'])
 const FORBIDDEN_TRANSPORT_FIELD_TOKENS = new Set(['base64', 'byte', 'bytes', 'data', 'path', 'paths'])
 const MEMBER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
 const MIME_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i
-const STAGED_REF_RE = /^[a-z][a-z0-9+.-]*:[A-Za-z0-9][A-Za-z0-9._:-]*$/i
 const STATUS_EVENT_KINDS = new Set([
   'authority.lost',
   'member.unavailable',
@@ -349,7 +346,7 @@ function messageFromEvent(roomEvent) {
     text: typeof payload.text === 'string' ? payload.text : '',
     thread: text(payload.thread_id) || text(payload.thread) || 'legacy',
     at: roomEvent.createdAt,
-    ...(attachments.length ? { attachments } : {})
+    ...(attachments.length ? { images: attachments } : {})
   }
 }
 
@@ -654,9 +651,7 @@ function assertNoRawTransportFields(value, location = 'payload') {
     if (forbidden) {
       throw new TypeError(`${location}.${key} contains a forbidden ${forbidden} field`)
     }
-    if (key !== 'refs') {
-      assertNoRawTransportFields(nested, `${location}.${key}`)
-    }
+    assertNoRawTransportFields(nested, `${location}.${key}`)
   }
 }
 
@@ -693,46 +688,7 @@ function normalizeAttachmentMime(value, kind) {
   return mime
 }
 
-function normalizeAttachmentRefs(value, { required }) {
-  if (value === undefined && !required) {
-    return null
-  }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError('attachment member refs must be an object')
-  }
-
-  const entries = Object.entries(value)
-
-  if (!entries.length || entries.length > MAX_ATTACHMENT_REFS) {
-    throw new TypeError(`attachment member refs must contain 1-${MAX_ATTACHMENT_REFS} entries`)
-  }
-
-  const refs = {}
-
-  for (const [rawMemberId, rawRef] of entries) {
-    const memberId = text(rawMemberId)
-    const ref = text(rawRef)
-    const refScheme = ref?.split(':', 1)[0]?.toLowerCase()
-
-    if (!memberId || memberId.length > MAX_MEMBER_ID_CHARS || !MEMBER_ID_RE.test(memberId)) {
-      throw new TypeError('attachment member refs require valid member_id keys')
-    }
-    if (
-      !ref ||
-      ref.length > MAX_STAGED_REF_CHARS ||
-      !STAGED_REF_RE.test(ref) ||
-      DISALLOWED_STAGED_REF_SCHEMES.has(refScheme)
-    ) {
-      throw new TypeError('attachment member refs require opaque staged reference ids')
-    }
-
-    refs[memberId] = ref
-  }
-
-  return refs
-}
-
-function normalizeAttachmentEntry(raw, { requireRefs }) {
+function normalizeAttachmentEntry(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new TypeError('each attachment must be an object')
   }
@@ -750,7 +706,11 @@ function normalizeAttachmentEntry(raw, { requireRefs }) {
   }
 
   const kind = text(raw.kind)?.toLowerCase()
+  const attachmentId = text(raw.attachment_id)
 
+  if (!attachmentId || !ATTACHMENT_ID_RE.test(attachmentId)) {
+    throw new TypeError('attachment_id must be an opaque server-minted id')
+  }
   if (!kind || !ATTACHMENT_KINDS.has(kind)) {
     throw new TypeError('attachment kind must be image, pdf, or file')
   }
@@ -764,17 +724,16 @@ function normalizeAttachmentEntry(raw, { requireRefs }) {
   }
 
   const normalized = {
+    attachment_id: attachmentId,
     kind,
     name: normalizeAttachmentName(raw.name),
     size: raw.size,
     mime: normalizeAttachmentMime(raw.mime, kind)
   }
-  const refs = normalizeAttachmentRefs(raw.refs, { required: requireRefs })
-
-  return refs ? { ...normalized, refs } : normalized
+  return normalized
 }
 
-function normalizeAttachmentManifest(value, { requireRefs }) {
+function normalizeAttachmentManifest(value) {
   if (!Array.isArray(value)) {
     throw new TypeError('attachments must be a manifest array')
   }
@@ -782,7 +741,13 @@ function normalizeAttachmentManifest(value, { requireRefs }) {
     throw new TypeError(`attachment manifest supports at most ${MAX_ATTACHMENT_COUNT} entries`)
   }
 
-  const manifest = value.map(entry => normalizeAttachmentEntry(entry, { requireRefs }))
+  const manifest = value.map(entry => normalizeAttachmentEntry(entry))
+  if (new Set(manifest.map(entry => entry.attachment_id)).size !== manifest.length) {
+    throw new TypeError('attachment ids must be unique within one message')
+  }
+  if (manifest.reduce((sum, entry) => sum + entry.size, 0) > 25_000_000) {
+    throw new TypeError('attachment manifest exceeds the 25MB message limit')
+  }
 
   if (utf8Size(JSON.stringify(manifest)) > MAX_ATTACHMENT_MANIFEST_BYTES) {
     throw new TypeError('attachment manifest metadata is too large')
@@ -800,9 +765,15 @@ function safeAttachmentMetadata(value) {
 
   for (const entry of value) {
     try {
-      const normalized = normalizeAttachmentEntry(entry, { requireRefs: false })
+      const normalized = normalizeAttachmentEntry(entry)
 
-      metadata.push({ kind: normalized.kind, name: normalized.name, size: normalized.size, mime: normalized.mime })
+      metadata.push({
+        attachment_id: normalized.attachment_id,
+        kind: normalized.kind,
+        name: normalized.name,
+        size: normalized.size,
+        mime: normalized.mime
+      })
     } catch {
       // A malformed internal manifest must not expose refs or block replay.
     }
@@ -843,7 +814,7 @@ function normalizeCommand(raw) {
   const payload = cloneJson(rawPayload, 'command payload')
 
   if (kind === 'send' && Object.prototype.hasOwnProperty.call(payload, 'attachments')) {
-    payload.attachments = normalizeAttachmentManifest(payload.attachments, { requireRefs: true })
+    payload.attachments = normalizeAttachmentManifest(payload.attachments)
   }
 
   return {

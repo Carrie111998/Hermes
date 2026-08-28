@@ -67,6 +67,48 @@ test('one cycle claims, executes and completes commands per gateway', async () =
 })
 
 
+test('execution context reads command data from the gateway that issued the claim', async () => {
+  const calls = []
+  let executionContext
+  await runDesktopRoomCommandCycle({
+    routes: [{ connectionId: 'gateway-b' }],
+    consumerId: 'desktop:test',
+    rooms: {
+      Classic: {
+        roomId: 'room-1',
+        desktopAuthorityToken: 'authority:test',
+        log: []
+      }
+    },
+    request: async (route, method, params) => {
+      calls.push({ connectionId: route.connectionId, method, params })
+      if (method === 'groups.desktop.claim') {
+        return {
+          commands: [{
+            command_id: 'messaging:attachment',
+            room_id: 'room-1',
+            action: 'send',
+            lease_token: 'lease:one',
+            payload: { message: 'inspect' }
+          }]
+        }
+      }
+      return {}
+    },
+    execute: async (_command, _rooms, context) => {
+      executionContext = context
+      await context.request('groups.attachment.read', { attachment_id: 'att_1' })
+      return { settled: true }
+    }
+  })
+
+  assert.equal(executionContext.consumerId, 'desktop:test')
+  assert.equal(executionContext.route.connectionId, 'gateway-b')
+  const read = calls.find(call => call.method === 'groups.attachment.read')
+  assert.equal(read.connectionId, 'gateway-b')
+})
+
+
 test('execution failures are acknowledged without breaking later cycles', async () => {
   const completions = []
   const outcomes = await runDesktopRoomCommandCycle({
