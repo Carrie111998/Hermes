@@ -3225,6 +3225,22 @@ def _normalize_required_parent_result(value: Optional[str]) -> Optional[str]:
     return value.strip()
 
 
+def _task_dependency_contract(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Optional[str]]:
+    """Return the exact parent/result predicate contract for one task."""
+    rows = conn.execute(
+        "SELECT parent_id, required_parent_result FROM task_links "
+        "WHERE child_id = ?",
+        (task_id,),
+    ).fetchall()
+    return {
+        row["parent_id"]: row["required_parent_result"]
+        for row in rows
+    }
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3268,8 +3284,9 @@ def create_task(
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    creating a duplicate when its dependency contract is identical. A retry
+    with different parent ids or result predicates raises ``ValueError``.
+    Useful for retried webhooks / automation that should not double-write.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3484,6 +3501,16 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            requested_contract = {
+                parent_id: required_parent_results.get(parent_id)
+                for parent_id in set(parents)
+            }
+            existing_contract = _task_dependency_contract(conn, row["id"])
+            if existing_contract != requested_contract:
+                raise ValueError(
+                    f"idempotency_key {idempotency_key!r} belongs to task "
+                    f"{row['id']!r} with a different dependency contract"
+                )
             return row["id"]
 
     now = int(time.time())

@@ -73,6 +73,103 @@ def test_result_gated_creation_accepts_exact_done_result(conn) -> None:
     assert kb._parents_satisfied(conn, child_id)
 
 
+def test_idempotent_create_reuses_exact_dependency_contract(conn) -> None:
+    parent_id = _completed_parent(conn, result="qa_failed")
+    expected_id = kb.create_task(
+        conn,
+        title="deploy",
+        parents=[parent_id],
+        required_parent_results={parent_id: "ready_to_deploy"},
+        idempotency_key="deploy-once",
+    )
+
+    actual_id = kb.create_task(
+        conn,
+        title="ignored on exact retry",
+        parents=[parent_id],
+        required_parent_results={parent_id: "ready_to_deploy"},
+        idempotency_key="deploy-once",
+    )
+
+    assert actual_id == expected_id
+
+
+@pytest.mark.parametrize(
+    ("original_required_result", "retry_required_result"),
+    [
+        pytest.param(None, "ready_to_deploy", id="legacy-to-strict"),
+        pytest.param(
+            "ready_to_deploy",
+            "qa_failed",
+            id="different-required-result",
+        ),
+    ],
+)
+def test_idempotent_create_rejects_different_dependency_contract(
+    conn,
+    original_required_result: str | None,
+    retry_required_result: str,
+) -> None:
+    parent_id = _completed_parent(conn, result="qa_failed")
+    original_requirements = (
+        {parent_id: original_required_result}
+        if original_required_result is not None
+        else None
+    )
+    existing_id = kb.create_task(
+        conn,
+        title="original deploy",
+        parents=[parent_id],
+        required_parent_results=original_requirements,
+        idempotency_key="deploy-once",
+    )
+
+    with pytest.raises(ValueError, match="different dependency contract"):
+        kb.create_task(
+            conn,
+            title="conflicting deploy retry",
+            parents=[parent_id],
+            required_parent_results={parent_id: retry_required_result},
+            idempotency_key="deploy-once",
+        )
+
+    tasks = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ?",
+        ("deploy-once",),
+    ).fetchall()
+    assert [row["id"] for row in tasks] == [existing_id]
+
+
+def test_idempotent_create_rejects_different_parent_set(conn) -> None:
+    first_parent_id = _completed_parent(conn, result="ready_to_deploy")
+    second_parent_id = _completed_parent(conn, result="ready_to_deploy")
+    existing_id = kb.create_task(
+        conn,
+        title="original deploy",
+        parents=[first_parent_id],
+        required_parent_results={first_parent_id: "ready_to_deploy"},
+        idempotency_key="deploy-once",
+    )
+
+    with pytest.raises(ValueError, match="different dependency contract"):
+        kb.create_task(
+            conn,
+            title="conflicting deploy retry",
+            parents=[first_parent_id, second_parent_id],
+            required_parent_results={
+                first_parent_id: "ready_to_deploy",
+                second_parent_id: "ready_to_deploy",
+            },
+            idempotency_key="deploy-once",
+        )
+
+    tasks = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ?",
+        ("deploy-once",),
+    ).fetchall()
+    assert [row["id"] for row in tasks] == [existing_id]
+
+
 def test_summary_or_metadata_claim_does_not_satisfy_result_gate(conn) -> None:
     parent_id = kb.create_task(conn, title="qa", assignee="reviewer")
     assert kb.complete_task(
@@ -149,6 +246,54 @@ def test_claim_and_repeated_recompute_fail_closed(conn) -> None:
     conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child_id,))
     assert kb.claim_task(conn, child_id, claimer="dispatcher") is None
     assert kb.get_task(conn, child_id).status == "todo"
+
+
+def test_claim_holds_child_after_completed_parent_result_stops_matching(
+    conn,
+) -> None:
+    parent_id = _completed_parent(conn, result="ready_to_deploy")
+    child_id = kb.create_task(
+        conn,
+        title="deploy",
+        assignee="deployer",
+        parents=[parent_id],
+        required_parent_results={parent_id: "ready_to_deploy"},
+    )
+    assert kb.get_task(conn, child_id).status == "ready"
+
+    assert kb.edit_completed_task_result(
+        conn,
+        parent_id,
+        result="qa_failed",
+    )
+
+    assert kb.claim_task(conn, child_id, claimer="dispatcher") is None
+    assert kb.get_task(conn, child_id).status == "todo"
+
+
+def test_recompute_releases_child_after_completed_parent_result_starts_matching(
+    conn,
+) -> None:
+    parent_id = _completed_parent(conn, result="qa_failed")
+    child_id = kb.create_task(
+        conn,
+        title="deploy",
+        assignee="deployer",
+        parents=[parent_id],
+        required_parent_results={parent_id: "ready_to_deploy"},
+    )
+    assert kb.get_task(conn, child_id).status == "todo"
+
+    assert kb.edit_completed_task_result(
+        conn,
+        parent_id,
+        result="ready_to_deploy",
+    )
+
+    assert kb.recompute_ready(conn) == 1
+    claimed = kb.claim_task(conn, child_id, claimer="dispatcher")
+    assert claimed is not None
+    assert claimed.id == child_id
 
 
 def test_manual_force_cannot_bypass_result_predicate(conn) -> None:
