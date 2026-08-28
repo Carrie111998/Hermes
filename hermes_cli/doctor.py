@@ -2271,7 +2271,7 @@ def run_doctor(args):
     # Check WAL health (#96976): unbounded growth indicates missed
     # checkpoints, but a large WAL whose frames are all checkpointed is
     # healthy — its on-disk size is just the high-water mark.
-    _check_wal_health(hermes_home, state_db_path, should_fix, issues)
+    fixed_count += _check_wal_health(hermes_home, state_db_path, should_fix, issues)
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)

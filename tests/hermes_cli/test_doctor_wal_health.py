@@ -5,6 +5,7 @@ just the high-water mark SQLite keeps for reuse, and "repairing" it is a
 no-op. Doctor must classify WAL health by checkpoint state, not raw size.
 """
 
+import re
 import sqlite3
 
 import hermes_cli.doctor as doctor_mod
@@ -142,5 +143,39 @@ def test_probe_fails_closed_for_unreadable_db(tmp_path):
             assert doctor_mod._wal_uncheckpointed_frames(db_path) is None
         finally:
             sqlite3.connect = real_connect
+    finally:
+        keeper.close()
+
+
+def test_wal_fix_counts_toward_doctor_fix_summary(monkeypatch, tmp_path):
+    """Regression: a WAL truncation performed by --fix must be tallied in the
+    "Fixed N issue(s)" summary (fixed_count), not silently dropped."""
+    from tests.hermes_cli.test_doctor_command_install import _run_doctor, _setup_doctor_env
+
+    home, project, _ = _setup_doctor_env(monkeypatch, tmp_path)
+
+    # Grow a fully checkpointed WAL in the doctor env's state.db.
+    db_path = home / "state.db"
+    keeper = sqlite3.connect(str(db_path))
+    keeper.execute("PRAGMA journal_mode=WAL")
+    keeper.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, blob BLOB)")
+    keeper.commit()
+    wal_path = home / "state.db-wal"
+    chunk = b"x" * (64 * 1024)
+    conn = sqlite3.connect(str(db_path))
+    while wal_path.stat().st_size < 55 * 1024 * 1024:
+        conn.executemany("INSERT INTO t (blob) VALUES (?)", [(chunk,)] * 100)
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    conn.close()
+    try:
+        out = _run_doctor(fix=True)
+        # The fixture env itself triggers 7 fixes; the WAL truncation must
+        # contribute exactly 1 more (regression: the return value of
+        # _check_wal_health() was dropped from fixed_count).
+        m = re.search(r"Fixed (\d+) issue\(s\)", out)
+        assert m is not None, out
+        assert int(m.group(1)) == 8
+        assert wal_path.stat().st_size < 50 * 1024 * 1024
     finally:
         keeper.close()
