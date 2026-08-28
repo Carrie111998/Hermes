@@ -15,6 +15,11 @@ test('source contract: header + is a dropdown offering agent and group chat', ()
   assert.match(pluginSource, /'New Group Chat'/)
 })
 
+test('source contract: remote selectable bots count toward enabling New Group Chat', () => {
+  assert.match(pluginSource, /disabled:\s*roster\.filter\(bot => !bot\?\.ghost\)\.length < 2/)
+  assert.doesNotMatch(pluginSource, /disabled:\s*activeSourceRoster\.length < 2/)
+})
+
 test('source contract: create-group modal has search, checkboxes, name, create', () => {
   assert.match(pluginSource, /function CreateGroupChatDialog\(/)
   // An outage placeholder preserves identity, but cannot receive a message.
