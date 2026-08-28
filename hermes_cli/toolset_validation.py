@@ -1,4 +1,4 @@
-"""Validation for the ``platform_toolsets`` config section.
+"""Validation for toolset-related config declarations.
 
 Pure, side-effect-free helpers so the logic is unit-testable without importing
 the tool registry or launching Hermes (mirrors the decoupled-helper pattern used
@@ -12,7 +12,23 @@ significant debugging to find. Surfacing invalid toolset names (and the
 zero-tools end state) loudly turns that silent failure into an actionable one.
 """
 
-from typing import Callable, List
+from collections.abc import Mapping
+from typing import Callable, Collection, List, Optional
+
+from agent.skill_utils import parse_config_string_list
+
+
+LEGACY_TOOLSET_NAMES = frozenset({
+    "web_tools",
+    "terminal_tools",
+    "vision_tools",
+    "image_tools",
+    "skills_tools",
+    "browser_tools",
+    "cronjob_tools",
+    "file_tools",
+    "tts_tools",
+})
 
 
 def validate_platform_toolsets(
@@ -70,5 +86,49 @@ def validate_platform_toolsets(
         warnings.append(
             "platform_toolsets resolves to zero valid toolsets — the agent will "
             "have no tools. Run `hermes tools` to reconfigure."
+        )
+    return warnings
+
+
+def validate_disabled_toolset_declarations(
+    config: object,
+    is_valid_toolset: Callable[[str], bool],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    legacy_names: Collection[str] = LEGACY_TOOLSET_NAMES,
+) -> List[str]:
+    """Report deny declarations that cannot affect the active tool surface.
+
+    Values are only named when they are toolset identifiers; arbitrary config
+    and environment values are never included in diagnostics.
+    """
+    warnings: List[str] = []
+    if environ is not None and "HERMES_DISABLED_TOOLSETS" in environ:
+        warnings.append(
+            "HERMES_DISABLED_TOOLSETS is not supported and has no effect; "
+            "configure agent.disabled_toolsets in config.yaml instead"
+        )
+
+    if not isinstance(config, dict):
+        return warnings
+
+    if "disabled_toolsets" in config:
+        warnings.append(
+            "root-level 'disabled_toolsets' has no effect; move it under "
+            "agent.disabled_toolsets"
+        )
+
+    agent_config = config.get("agent")
+    if not isinstance(agent_config, dict):
+        return warnings
+
+    for raw_name in parse_config_string_list(agent_config.get("disabled_toolsets")):
+        name = raw_name.strip()
+        if not name or is_valid_toolset(name) or name in legacy_names:
+            continue
+        warnings.append(
+            f"agent.disabled_toolsets references unknown toolset '{name}'; "
+            "this entry has no effect. Run `hermes tools list` to see valid "
+            "toolset names"
         )
     return warnings

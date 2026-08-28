@@ -450,6 +450,19 @@ class TestDisabledToolsetsPlatformBundle:
         names = {t["function"]["name"] for t in tools}
         assert "discord" not in names
 
+    def test_unknown_disabled_toolset_warns_in_quiet_mode(self, caplog):
+        from model_tools import _compute_tool_definitions
+
+        _compute_tool_definitions(
+            enabled_toolsets=["terminal"],
+            disabled_toolsets=["execute_code"],
+            quiet_mode=True,
+        )
+
+        assert "agent.disabled_toolsets" in caplog.text
+        assert "execute_code" in caplog.text
+        assert "has no effect" in caplog.text
+
 
 
 

@@ -6,7 +6,10 @@ tool registry nor a running Hermes.
 
 import pytest
 
-from hermes_cli.toolset_validation import validate_platform_toolsets
+from hermes_cli.toolset_validation import (
+    validate_disabled_toolset_declarations,
+    validate_platform_toolsets,
+)
 
 # A representative set of real toolset names. `hermes` is deliberately absent —
 # that is the corruption #38798 reported (`hermes-cli` rewritten to `hermes`).
@@ -44,6 +47,43 @@ def test_mixed_valid_and_invalid_flags_only_the_invalid():
     assert len(warnings) == 1
     assert "platform 'discord'" in warnings[0]
     assert "unknown toolset 'bogus'" in warnings[0]
+
+
+def test_disabled_toolset_validation_reports_every_inert_declaration():
+    warnings = validate_disabled_toolset_declarations(
+        {
+            "disabled_toolsets": ["terminal"],
+            "agent": {"disabled_toolsets": ["terminal", "execute_code"]},
+        },
+        _is_valid,
+        environ={"HERMES_DISABLED_TOOLSETS": "code_execution"},
+    )
+
+    assert len(warnings) == 3
+    assert any("HERMES_DISABLED_TOOLSETS" in warning for warning in warnings)
+    assert any("root-level 'disabled_toolsets'" in warning for warning in warnings)
+    assert any("unknown toolset 'execute_code'" in warning for warning in warnings)
+    assert all("agent.disabled_toolsets" in warning for warning in warnings)
+
+
+def test_disabled_toolset_validation_accepts_effective_legacy_names():
+    warnings = validate_disabled_toolset_declarations(
+        {"agent": {"disabled_toolsets": ["terminal_tools"]}},
+        _is_valid,
+        legacy_names={"terminal_tools"},
+    )
+
+    assert warnings == []
+
+
+def test_disabled_toolset_validation_parses_list_shaped_strings():
+    warnings = validate_disabled_toolset_declarations(
+        {"agent": {"disabled_toolsets": "['terminal', 'execute_code']"}},
+        _is_valid,
+    )
+
+    assert len(warnings) == 1
+    assert "unknown toolset 'execute_code'" in warnings[0]
 
 
 

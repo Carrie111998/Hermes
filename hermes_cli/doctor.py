@@ -1779,6 +1779,27 @@ def run_doctor(args):
         except Exception:
             pass
 
+        # Deny declarations are policy, so inert spellings must never look
+        # healthy. Inspect raw config plus environment key names only; values
+        # are deliberately excluded from diagnostics.
+        try:
+            from hermes_cli.config import load_env, read_user_config_raw
+            from hermes_cli.toolset_validation import validate_disabled_toolset_declarations
+            from toolsets import validate_toolset
+
+            raw_config = read_user_config_raw(config_path)
+            env_names = set(os.environ) | set(load_env())
+            deny_warnings = validate_disabled_toolset_declarations(
+                raw_config,
+                validate_toolset,
+                environ={name: "" for name in env_names},
+            )
+            for warning in deny_warnings:
+                check_warn(warning)
+                issues.append(warning)
+        except Exception:
+            pass
+
         # Detect stale HERMES_MAX_ITERATIONS ghost in .env shadowing
         # agent.max_turns in config.yaml (issue #17534). The setup wizard
         # used to dual-write the iteration budget to both stores; users who
