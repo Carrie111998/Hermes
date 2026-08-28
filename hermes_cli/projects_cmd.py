@@ -305,31 +305,82 @@ def _cmd_restore(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_bind_board(args, conn, proj) -> int:
+    previous = (proj.board_slug or "").strip()
     pdb.update_project(conn, proj.id, board_slug=args.board)
     if args.board.strip():
         print(f"Bound {proj.slug} -> board {args.board}")
-        _sync_board_default_workdir(proj, args.board)
+        _sync_board_binding(proj, args.board)
     else:
         print(f"Unbound board from {proj.slug}")
+        # The board keeps a `project_id` of its own; leaving it set after an
+        # unbind is how a board goes on inheriting a project it is no longer
+        # bound to.
+        _clear_board_binding(previous)
     return 0
 
 
-def _sync_board_default_workdir(proj, board_slug: str) -> None:
-    """Best-effort: point the bound board's default_workdir at the primary repo.
+def _board_slug_or_none(board_slug: str):
+    """The normalized slug of an EXISTING board, or None. Shared by both writers."""
+    from hermes_cli import kanban_db as kb
 
-    Keeps kanban task worktrees anchored to the project's repo. Failures here
-    are non-fatal — the binding itself already succeeded.
+    slug = kb._normalize_board_slug(board_slug)
+    if not slug:
+        return None, kb
+    if slug != kb.DEFAULT_BOARD and not kb.board_exists(slug):
+        return None, kb
+    return slug, kb
+
+
+def _sync_board_binding(proj, board_slug: str) -> None:
+    """Best-effort: write the project LINK onto the board, and mirror its repo.
+
+    TWO jobs, and the previous version silently did only the second one.
+    ``project_id`` is the field the board's own inheritance path reads —
+    ``kanban_db.write_board_metadata`` documents it as "Optional first-class
+    Project this board is scoped to. When set, new tasks inherit it
+    (deterministic worktree + branch under the project's primary repo)" — so a
+    board bound without it keeps minting tasks on a shared ``dir`` workspace,
+    which is what ``--project`` exists to avoid. The bind reported success and
+    the effect never arrived.
+
+    Measured on one install before this fix: 11 of 11 boards had
+    ``project_id: null`` while their projects named them, and 249 tasks had piled
+    onto shared working trees — including two that blocked each other with
+    "concurrent edits in shared dir".
+
+    The order also matters: the primary-path check may not gate the link. A
+    project with no folder yet still has an identity to bind, and the old early
+    return threw both jobs away for want of the second one's input.
+
+    Failures stay non-fatal, as before: the binding in the projects DB has
+    already succeeded, and this mirror is a convenience on top of it.
     """
-    if not proj.primary_path:
-        return
     try:
-        from hermes_cli import kanban_db as kb
-
-        slug = kb._normalize_board_slug(board_slug)
+        slug, kb = _board_slug_or_none(board_slug)
         if not slug:
             return
-        if slug != kb.DEFAULT_BOARD and not kb.board_exists(slug):
+        fields = {"project_id": proj.id}
+        if proj.primary_path:
+            fields["default_workdir"] = proj.primary_path
+        kb.write_board_metadata(slug, **fields)
+    except Exception:
+        pass
+
+
+def _clear_board_binding(board_slug: str) -> None:
+    """Best-effort: drop the project scope from a board that was just unbound.
+
+    ``write_board_metadata`` takes the empty string as "clear" and ``None`` as
+    "leave unchanged", so the clear has to be explicit. ``default_workdir`` is
+    deliberately left alone: an operator may have set it by hand, and it is not
+    the project link.
+    """
+    if not board_slug:
+        return
+    try:
+        slug, kb = _board_slug_or_none(board_slug)
+        if not slug:
             return
-        kb.write_board_metadata(slug, default_workdir=proj.primary_path)
+        kb.write_board_metadata(slug, project_id="")
     except Exception:
         pass
