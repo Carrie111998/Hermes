@@ -39,6 +39,7 @@ from tools.registry import (
     tool_error,
 )
 from toolsets import resolve_toolset, validate_toolset
+from tools.tool_result_sanitization import sanitize_tool_result_for_sink
 
 logger = logging.getLogger(__name__)
 
@@ -1217,11 +1218,17 @@ def _emit_post_tool_call_hook(
                 function_name,
                 result,
             )
+        safe_result = sanitize_tool_result_for_sink(result)
+        safe_error_message = (
+            sanitize_tool_result_for_sink(error_message)
+            if error_message is not None
+            else None
+        )
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
             args=function_args,
-            result=result,
+            result=safe_result,
             task_id=task_id or "",
             session_id=session_id or "",
             tool_call_id=tool_call_id or "",
@@ -1230,7 +1237,7 @@ def _emit_post_tool_call_hook(
             duration_ms=duration_ms,
             status=status,
             error_type=error_type,
-            error_message=error_message,
+            error_message=safe_error_message,
             middleware_trace=list(middleware_trace or []),
         )
     except Exception as _hook_err:
@@ -1635,8 +1642,9 @@ def handle_function_call(
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.exception(error_msg)
-        result = tool_error(_sanitize_tool_error(error_msg))
+        safe_error_msg = sanitize_tool_result_for_sink(error_msg)
+        logger.exception(safe_error_msg)
+        result = tool_error(safe_error_msg)
         duration_ms = (
             int((time.monotonic() - _dispatch_start) * 1000)
             if _dispatch_start is not None
