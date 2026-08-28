@@ -6772,20 +6772,25 @@ class TurnRunner:
                 "Session split detected: %s → %s (compression)",
                 ctx.session_id, agent_session_id,
             )
-            entry = self._runner.session_store._entries.get(ctx.session_key)
             _session_split_entry_persisted = False
-            if entry:
-                entry_session_id = getattr(entry, "session_id", None)
-                if not ctx._run_still_current():
-                    logger.info(
-                        "Skipping session split sync for stale run %s — "
-                        "generation %s is no longer current",
-                        ctx.session_key or "?",
-                        ctx.run_generation,
+            entry = None
+            if not ctx._run_still_current():
+                logger.info(
+                    "Skipping session split sync for stale run %s — "
+                    "generation %s is no longer current",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+            else:
+                entry = self._runner.session_store.advance_compression_session(
+                    ctx.session_key,
+                    ctx.session_id,
+                    agent_session_id,
+                )
+                if entry is None:
+                    entry_session_id = self._runner.session_store.peek_session_id(
+                        ctx.session_key,
                     )
-                elif entry_session_id == agent_session_id:
-                    _session_split_entry_persisted = True
-                elif entry_session_id != ctx.session_id:
                     logger.info(
                         "Skipping session split sync for %s because the "
                         "session binding moved from %s to %s before "
@@ -6795,8 +6800,6 @@ class TurnRunner:
                         entry_session_id,
                     )
                 else:
-                    entry.session_id = agent_session_id
-                    self._runner.session_store._save()
                     self._runner.session_store._record_gateway_session_peer(
                         agent_session_id,
                         ctx.session_key,

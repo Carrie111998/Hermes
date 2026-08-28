@@ -1,5 +1,6 @@
 """Behavioral coverage for agent-result compression route publication."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,7 +8,8 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, SessionStore
+from gateway.turn_context import TurnContext
 
 
 def _source() -> SessionSource:
@@ -135,3 +137,141 @@ async def test_agent_result_rotation_invalidates_clarify_before_lease_rebind(
     assert runner.session_store.peek_session_id(entry.session_key) == target_session_id
     assert pending.event.is_set()
     assert pending.response == ""
+
+
+def test_run_sync_stale_compression_child_cannot_overwrite_cas_winner(tmp_path):
+    """The real TurnRunner path must publish compression through store CAS.
+
+    The generation predicate is the deterministic interleaving point: the
+    old implementation had already snapshotted the parent route when this
+    callback published a different child, then directly overwrote that winner
+    from the stale snapshot after the callback returned.
+    """
+    from tools import clarify_gateway as cm
+
+    cm.clear_all()
+    try:
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            user_id="12345",
+        )
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            session_boundary_cleanup_fn=cm.clear_session,
+        )
+        store._db = None
+        route = store.get_or_create_session(source)
+        session_key = route.session_key
+        parent_session_id = route.session_id
+        winner_session_id = "compression-winner"
+        stale_child_session_id = "stale-agent-child"
+
+        pending = cm.register(
+            "run-sync-stale-pending",
+            session_key,
+            "Pick",
+            ["A"],
+            origin=cm.ClarifyOrigin("12345", "-1001"),
+            session_id=parent_session_id,
+            active_session_transaction=lambda action: store.run_if_session_current(
+                session_key,
+                parent_session_id,
+                action,
+            ),
+        )
+
+        interleaving_calls = 0
+
+        def _publish_winner_during_current_run_check():
+            nonlocal interleaving_calls
+            interleaving_calls += 1
+            assert interleaving_calls == 1
+            advanced = store.advance_compression_session(
+                session_key,
+                parent_session_id,
+                winner_session_id,
+            )
+            assert advanced is route
+            assert pending.event.is_set()
+            return True
+
+        class _StaleRotatingAgent:
+            def __init__(self, **kwargs):
+                self.model = kwargs["model"]
+                self.session_id = kwargs["session_id"]
+                self.tools = []
+                self.context_compressor = SimpleNamespace(
+                    last_prompt_tokens=0,
+                    context_length=200_000,
+                )
+                self.session_prompt_tokens = 0
+                self.session_completion_tokens = 0
+                self._last_compaction_in_place = False
+
+            def run_conversation(self, _message, **_kwargs):
+                self.session_id = stale_child_session_id
+                return {
+                    "final_response": "stale result",
+                    "failed": False,
+                    "messages": [],
+                }
+
+        runner = MagicMock()
+        runner.config = SimpleNamespace(streaming=None)
+        runner._provider_routing = {}
+        runner._agent_cache_lock = None
+        runner._agent_cache = {}
+        runner._session_db = None
+        runner._prefill_messages = None
+        runner._pending_model_notes = {}
+        runner._pending_skills_reload_notes = {}
+        runner.session_store = store
+        runner._running = True
+        runner._draining = False
+        runner._get_system_prompt_for_channel.return_value = None
+        runner._resolve_session_agent_runtime.return_value = ("test-model", {})
+        runner._resolve_session_reasoning_config.return_value = None
+        runner._resolve_session_service_tier.return_value = None
+        runner._resolve_turn_agent_config.return_value = {
+            "model": "test-model",
+            "runtime": {},
+        }
+        runner._agent_config_signature.return_value = ("test-signature",)
+        runner._extract_cache_busting_config.return_value = {}
+        runner._refresh_fallback_model.return_value = None
+        runner._consume_pending_native_image_paths.return_value = []
+        runner._consume_pending_turn_sidecar_notes.return_value = []
+        runner._is_telegram_topic_lane.return_value = False
+        runner._is_discord_auto_thread_lane.return_value = False
+        runner._is_relay_discord_channel_lane.return_value = False
+
+        ctx = TurnContext(
+            source=source,
+            message="compress during this turn",
+            history=[],
+            session_id=parent_session_id,
+            session_key=session_key,
+            user_config={},
+            AIAgent=_StaleRotatingAgent,
+            resolve_display_setting=lambda *_args: False,
+            _run_still_current=_publish_winner_during_current_run_check,
+            _hooks_ref=SimpleNamespace(loaded_hooks=False),
+        )
+
+        result = gateway_run.TurnRunner(runner, ctx).run_sync()
+
+        assert result["session_id"] == stale_child_session_id
+        assert interleaving_calls == 1
+        assert store.peek_session_id(session_key) == winner_session_id
+        assert cm.resolve_bound_choice(
+            pending.clarify_id,
+            0,
+            binding=pending.binding,
+            observed_origin=pending.binding.origin,
+        ) is False
+        runner._sync_telegram_topic_binding.assert_not_called()
+    finally:
+        cm.clear_all()
