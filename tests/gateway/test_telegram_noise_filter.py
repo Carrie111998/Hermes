@@ -300,6 +300,179 @@ def test_telegram_final_response_redacts_auth_secrets():
     assert "sk-live" not in sanitized
 
 
+def test_provider_error_reply_uses_platform_display_override(monkeypatch):
+    """Customer-facing gateways can replace the safe technical fallback."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "provider_error_reply": "Please try again in a minute."
+                    }
+                }
+            }
+        },
+    )
+    raw = "API call failed after 3 retries: HTTP 401 Authorization: Bearer secret"
+
+    assert (
+        _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
+        == "Please try again in a minute."
+    )
+
+
+def test_provider_error_reply_reads_active_profile_config(tmp_path):
+    """The real config path follows the active multiplex profile scope."""
+    from gateway.run import _profile_runtime_scope
+
+    (tmp_path / "config.yaml").write_text(
+        "display:\n"
+        "  platforms:\n"
+        "    telegram:\n"
+        "      provider_error_reply: Routed failure.\n",
+        encoding="utf-8",
+    )
+
+    with _profile_runtime_scope(tmp_path):
+        final_reply = _sanitize_gateway_final_response(
+            Platform.TELEGRAM,
+            "API call failed after 3 retries: HTTP 500",
+        )
+        status_reply = _prepare_gateway_status_message(
+            Platform.TELEGRAM,
+            "warn",
+            "API call failed after 3 retries: HTTP 500",
+        )
+
+    assert final_reply == "Routed failure."
+    assert status_reply == "Routed failure."
+
+
+def test_whitespace_provider_error_reply_uses_safe_builtin(monkeypatch):
+    """Whitespace-only overrides cannot erase the safe provider fallback."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"provider_error_reply": "   "}},
+    )
+
+    reply = _sanitize_gateway_final_response(
+        Platform.TELEGRAM,
+        "API call failed after 3 retries: HTTP 500",
+    )
+
+    assert "provider failed after retries" in reply.lower()
+
+
+def test_custom_provider_error_reply_is_safely_sanitized(monkeypatch):
+    """Configured copy cannot leak URL credentials or invalid surrogates."""
+    import gateway.run as gateway_run
+
+    credential = "abcdefghijklmnopqrstuvwxyz1234567890"
+    custom_reply = (
+        f"Try https://user:{credential}@example.test/"
+        f"?token={credential} later \ud800"
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"provider_error_reply": custom_reply}},
+    )
+
+    reply = _sanitize_gateway_final_response(
+        Platform.TELEGRAM,
+        "API call failed after 3 retries: HTTP 500",
+    )
+
+    assert "Try " in reply
+    assert credential not in reply
+    assert "\ud800" not in reply
+    reply.encode("utf-8")
+
+
+def test_provider_error_reply_override_applies_to_status_messages(monkeypatch):
+    """Status callbacks use the same customer-facing provider failure reply."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"provider_error_reply": "Temporary failure."}},
+    )
+
+    assert (
+        _prepare_gateway_status_message(
+            Platform.TELEGRAM,
+            "warn",
+            "API call failed after 3 retries: HTTP 500",
+        )
+        == "Temporary failure."
+    )
+
+
+def test_provider_error_reply_override_handles_failed_agent_wrapper(monkeypatch):
+    """The empty-response failure wrapper must not bypass the configured reply."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"provider_error_reply": "Temporary failure."}},
+    )
+    wrapped = (
+        "The request failed: API call failed after 3 retries: HTTP 401 secret\n"
+        "Try again or use /reset to start a fresh session."
+    )
+
+    assert (
+        _sanitize_gateway_final_response(Platform.TELEGRAM, wrapped)
+        == "Temporary failure."
+    )
+
+
+@pytest.mark.parametrize("platform", ["slack", "matrix", "whatsapp"])
+def test_provider_error_reply_override_supports_string_platform_keys(monkeypatch, platform):
+    """Plugin and shared delivery paths may identify a platform by string."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "display": {
+                "platforms": {platform: {"provider_error_reply": "Temporary failure."}}
+            }
+        },
+    )
+
+    assert (
+        _sanitize_gateway_final_response(platform, "API call failed: HTTP 500")
+        == "Temporary failure."
+    )
+
+
+def test_provider_error_reply_override_does_not_replace_normal_answers(monkeypatch):
+    """The override applies only to classified provider failures."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"provider_error_reply": "Temporary failure."}},
+    )
+
+    assert (
+        _sanitize_gateway_final_response(Platform.TELEGRAM, "Normal answer")
+        == "Normal answer"
+    )
+
+
 def test_telegram_final_response_keeps_normal_answers():
     """Normal assistant content should not be rewritten."""
     answer = "Here is the clean summary you asked for."
