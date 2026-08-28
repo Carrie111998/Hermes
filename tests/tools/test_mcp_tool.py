@@ -471,6 +471,52 @@ class TestCheckFunction:
 
 
 # ---------------------------------------------------------------------------
+# Stdio child liveness fast-fail
+# ---------------------------------------------------------------------------
+
+class TestStdioChildrenDead:
+    """Regression coverage for the inverted liveness check (#786f37071a).
+
+    _stdio_children_dead() must return False while any tracked stdio child
+    is alive; it must only return True when every tracked child has exited.
+    The Aug 2026 regression flipped the alive-branch to return True, which
+    made every tool call to a healthy stdio MCP server fail fast with
+    "MCP stdio subprocess has exited".
+    """
+
+    def test_alive_child_returns_false(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("test_server")
+        server._stdio_child_pids = {1234}
+        with patch("psutil.pid_exists", return_value=True):
+            assert server._stdio_children_dead() is False
+
+    def test_dead_child_returns_true(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("test_server")
+        server._stdio_child_pids = {1234}
+        with patch("psutil.pid_exists", return_value=False):
+            assert server._stdio_children_dead() is True
+
+    def test_mixed_alive_and_dead_returns_false(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("test_server")
+        server._stdio_child_pids = {1234, 5678}
+        with patch("psutil.pid_exists", side_effect=lambda pid: pid == 1234):
+            assert server._stdio_children_dead() is False
+
+    def test_no_tracked_pids_returns_false(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("test_server")
+        server._stdio_child_pids = set()
+        assert server._stdio_children_dead() is False
+
+
+# ---------------------------------------------------------------------------
 # MCP loop runner
 # ---------------------------------------------------------------------------
 
