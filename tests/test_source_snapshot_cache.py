@@ -106,6 +106,39 @@ class TestFirstReadWins:
 
         assert inspect.getsource(mod) == first
 
+    def test_cross_module_wrapped_function_pins_unwrapped_source(
+        self, module_factory
+    ):
+        decorator, _ = module_factory(
+            "import functools\n"
+            "def preserve_metadata(fn):\n"
+            "    @functools.wraps(fn)\n"
+            "    def wrapper(*args, **kwargs):\n"
+            "        return fn(*args, **kwargs)\n"
+            "    return wrapper\n"
+        )
+        mod, path = module_factory(
+            f"from {decorator.__name__} import preserve_metadata\n"
+            "@preserve_metadata\n"
+            "def decorated():\n"
+            "    return 'ORIGINAL-WRAPPED-SOURCE'\n"
+        )
+        first = inspect.getsource(mod.decorated)
+        assert "ORIGINAL-WRAPPED-SOURCE" in first
+
+        path.write_text(
+            f"from {decorator.__name__} import preserve_metadata\n"
+            "@preserve_metadata\n"
+            "def decorated():\n"
+            "    return 'REWRITTEN-WRAPPED-SOURCE'\n",
+            encoding="utf-8",
+        )
+        _force_revalidation(path)
+
+        second = inspect.getsource(mod.decorated)
+        assert second == first
+        assert "REWRITTEN" not in second
+
 
 class TestMechanism:
     def test_wrappers_are_installed(self):

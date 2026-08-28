@@ -404,8 +404,11 @@ def _install_inspect_source_snapshot() -> None:
 
     def _pin_for(obj) -> None:
         try:
-            _pin_source_snapshot(inspect.getsourcefile(obj) or inspect.getfile(obj))
-        except (TypeError, OSError):
+            source_obj = inspect.unwrap(obj)
+            _pin_source_snapshot(
+                inspect.getsourcefile(source_obj) or inspect.getfile(source_obj)
+            )
+        except (TypeError, OSError, ValueError):
             pass
 
     def _snapshot_getsourcelines(object):

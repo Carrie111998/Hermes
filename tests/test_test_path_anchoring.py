@@ -269,6 +269,25 @@ class _TreeSnapshot:
         self.blobs = blobs  # posix rel path -> bytes (None: unreadable blob)
 
 
+def _parse_tree_entries(listing: bytes) -> list[tuple[str, bytes]] | None:
+    """Return Python paths paired with blob OIDs from NUL-delimited ls-tree.
+
+    Paths are display/scan keys only. ``cat-file`` receives the ASCII object ID,
+    so line breaks and undecodable bytes in legal POSIX names never enter its
+    line-based request protocol.
+    """
+    fields = listing.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 2:
+        return None
+    return [
+        (path.decode("utf-8", "surrogateescape"), oid)
+        for oid, path in zip(fields[::2], fields[1::2])
+        if path.endswith(b".py")
+    ]
+
+
 def _read_committed_tree(repo_root: pathlib.Path) -> _TreeSnapshot | None:
     """All ``*.py`` blobs at ``repo_root``'s HEAD, or None if git can't say.
 
@@ -287,16 +306,19 @@ def _read_committed_tree(repo_root: pathlib.Path) -> _TreeSnapshot | None:
 
     try:
         commit = _git("rev-parse", "HEAD").decode("ascii").strip()
-        listing = _git("ls-tree", "-r", "-z", "--name-only", commit)
+        listing = _git(
+            "ls-tree",
+            "-r",
+            "-z",
+            "--format=%(objectname)%x00%(path)",
+            commit,
+        )
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
 
-    paths = [
-        p.decode("utf-8", "surrogateescape")
-        for p in listing.split(b"\0")
-        if p.endswith(b".py")
-    ]
-    paths = [p for p in paths if "\n" not in p]  # batch protocol is line-based
+    entries = _parse_tree_entries(listing)
+    if entries is None:
+        return None
 
     blobs: dict[str, bytes | None] = {}
     try:
@@ -310,23 +332,27 @@ def _read_committed_tree(repo_root: pathlib.Path) -> _TreeSnapshot | None:
     try:
         def _feed() -> None:
             try:
-                for p in paths:
-                    proc.stdin.write(f"{commit}:{p}\n".encode())
-                proc.stdin.close()
+                for _, oid in entries:
+                    proc.stdin.write(oid + b"\n")
             except OSError:
                 pass  # reader sees EOF and stops
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
 
         threading.Thread(target=_feed, daemon=True).start()
         out = proc.stdout
-        for p in paths:
+        for path, _ in entries:
             header = out.readline().split()
             if len(header) == 3 and header[1] == b"blob":
                 size = int(header[2])
                 data = out.read(size)
                 out.read(1)  # trailing LF
-                blobs[p] = data if len(data) == size else None
+                blobs[path] = data if len(data) == size else None
             else:
-                blobs[p] = None  # "missing" or truncated stream
+                blobs[path] = None  # "missing" or truncated stream
                 if not header:
                     break
     finally:
@@ -891,6 +917,60 @@ class TestScanJudgesTheCommittedTree:
         scan = _scan("tests", repo_root=repo)
         assert scan.files_read == 1
         assert scan.unreadable == []
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows filenames forbid newlines")
+    def test_committed_filename_with_newline_is_judged(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        repo = tmp_path / "scratch"
+        target = repo / "tests" / "cron" / "test_line\nbreak.py"
+        target.parent.mkdir(parents=True)
+        target.write_text(self._VIOLATION, encoding="utf-8")
+        self._git(repo, "init", "-q")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "scratch")
+
+        scan = _scan("tests", repo_root=repo)
+        assert scan.files_read == 1
+        assert scan.violations == [("tests/cron/test_line\nbreak.py", 3, 2)]
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows paths must be Unicode")
+    def test_committed_non_utf8_filename_is_judged(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        repo = tmp_path / "scratch"
+        directory = os.fsencode(repo / "tests" / "cron")
+        os.makedirs(directory)
+        filename = directory + b"/test_non_utf8_\xff.py"
+        fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(self._VIOLATION.encode())
+        self._git(repo, "init", "-q")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "scratch")
+
+        scan = _scan("tests", repo_root=repo)
+        expected = os.fsdecode(b"tests/cron/test_non_utf8_\xff.py")
+        assert scan.files_read == 1
+        assert scan.violations == [(expected, 3, 2)]
+
+    def test_tree_listing_parser_preserves_posix_edge_case_names(self) -> None:
+        oid_a = b"a" * 40
+        oid_b = b"b" * 40
+        listing = (
+            oid_a
+            + b"\0tests/cron/test_line\nbreak.py\0"
+            + oid_b
+            + b"\0tests/cron/test_non_utf8_\xff.py\0"
+        )
+
+        entries = _parse_tree_entries(listing)
+
+        assert entries == [
+            ("tests/cron/test_line\nbreak.py", oid_a),
+            ("tests/cron/test_non_utf8_\udcff.py", oid_b),
+        ]
+        assert all(oid.isascii() and b"\n" not in oid for _, oid in entries)
 
     def test_non_git_root_falls_back_to_the_working_tree(
         self, tmp_path: pathlib.Path
