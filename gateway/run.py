@@ -2284,7 +2284,12 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
         return cfg
 
 
-def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
+def _platform_has_bot_credential(
+    platform: "Platform",
+    platform_config: "PlatformConfig",
+    *,
+    allow_env_fallback: bool = False,
+) -> bool:
     """Return True when a token-authenticated platform has a usable bot credential.
 
     Platforms that do not use ``PlatformConfig.token`` always return True so we
@@ -2300,6 +2305,16 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     # Some adapters also accept api_key as the primary credential.
     api_key = getattr(platform_config, "api_key", None) or ""
     if isinstance(api_key, str) and api_key.strip():
+        return True
+    if not allow_env_fallback:
+        return False
+    # Long-running non-multiplex gateways reload .env on later turns, so an
+    # operator can supply/rotate a token after this PlatformConfig snapshot
+    # was queued during startup. Multiplex callers must not use this fallback:
+    # process-global env may contain another profile's credential.
+    env_token = os.environ.get(PLATFORM_TOKEN_ENV_NAMES[platform], "").strip()
+    if env_token:
+        platform_config.token = env_token
         return True
     return False
 
@@ -14685,7 +14700,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Empty-token primary configs can never reconnect; drop them so
                 # multiplex setups where a secondary profile owns the bot do
                 # not spin forever (#64674).
-                if not _platform_has_bot_credential(platform, platform_config):
+                if not _platform_has_bot_credential(
+                    platform,
+                    platform_config,
+                    allow_env_fallback=not bool(
+                        getattr(self.config, "multiplex_profiles", False)
+                    ),
+                ):
                     logger.warning(
                         "Reconnect %s: no bot credential on queued config, "
                         "removing from retry queue",

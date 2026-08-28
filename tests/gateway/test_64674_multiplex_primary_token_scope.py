@@ -14,6 +14,7 @@ this suite locks the complementary primary-path fixes:
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -215,6 +216,63 @@ class TestPrimaryMessageRuntimeScope:
 
 
 class TestReconnectDropsEmptyToken:
+    def test_backfills_late_resolved_token_from_env(self, monkeypatch):
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES, Platform, PlatformConfig
+        from gateway.run import _platform_has_bot_credential
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.setenv(env_name, "late-resolved-token")
+        config = PlatformConfig(enabled=True, token="")
+
+        assert _platform_has_bot_credential(
+            Platform.DISCORD, config, allow_env_fallback=True
+        ) is True
+        assert config.token == "late-resolved-token"
+
+    def test_multiplex_path_does_not_borrow_process_global_token(self, monkeypatch):
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES, Platform, PlatformConfig
+        from gateway.run import _platform_has_bot_credential
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.setenv(env_name, "secondary-profile-token")
+        config = PlatformConfig(enabled=True, token="")
+
+        assert _platform_has_bot_credential(Platform.DISCORD, config) is False
+        assert config.token == ""
+
+    def test_runtime_env_reload_backfills_queued_reconnect_config(self, monkeypatch):
+        import agent.secret_scope
+        import gateway.run as gateway_run
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES, Platform, PlatformConfig
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.delenv(env_name, raising=False)
+        config = PlatformConfig(enabled=True, token="")
+
+        def reload_dotenv(**_kwargs):
+            os.environ[env_name] = "rotated-runtime-token"
+
+        monkeypatch.setattr(agent.secret_scope, "is_multiplex_active", lambda: False)
+        monkeypatch.setattr(gateway_run, "load_hermes_dotenv", reload_dotenv)
+        monkeypatch.setattr(gateway_run, "_bridge_max_turns_from_config", lambda _home: None)
+
+        gateway_run._reload_runtime_env_preserving_config_authority()
+
+        assert gateway_run._platform_has_bot_credential(
+            Platform.DISCORD, config, allow_env_fallback=True
+        ) is True
+        assert config.token == "rotated-runtime-token"
+
+    def test_empty_config_and_environment_remains_uncredentialed(self, monkeypatch):
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES, Platform, PlatformConfig
+        from gateway.run import _platform_has_bot_credential
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.delenv(env_name, raising=False)
+        config = PlatformConfig(enabled=True, token="")
+
+        assert _platform_has_bot_credential(Platform.DISCORD, config) is False
+
     @pytest.mark.asyncio
     async def test_empty_token_removed_from_queue(self):
         from gateway.run import GatewayRunner, _platform_has_bot_credential
