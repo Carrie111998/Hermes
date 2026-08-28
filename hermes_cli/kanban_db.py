@@ -129,10 +129,20 @@ def _task_requires_pr_write_authority(
     return _PR_WRITE_ACTION_RE.search(f"{title}\n{body or ''}") is not None
 
 
-def _profile_is_explicitly_read_only(profile: Optional[str]) -> bool:
-    """Read operator-authored profile authority metadata, failing open."""
+def _profile_read_only_status(profile: Optional[str]) -> Optional[bool]:
+    """Read operator-authored profile authority metadata.
+
+    Returns True when the profile explicitly declares itself read-only,
+    False when its metadata is readable and does not, or None when
+    authority cannot be determined at all (no profile named, missing
+    profile.yaml, unreadable file, malformed YAML, or a non-mapping
+    document). None is deliberately distinct from False: a caller gating
+    PR write-class work must treat "unknown" as "not proven writable",
+    not as silent permission -- proof consumed once at admission time is
+    exactly the failure mode this guards against.
+    """
     if not profile:
-        return False
+        return None
     try:
         import yaml
 
@@ -142,9 +152,9 @@ def _profile_is_explicitly_read_only(profile: Optional[str]) -> bool:
         with profile_path.open("r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
     except Exception:
-        return False
+        return None
     if not isinstance(data, dict):
-        return False
+        return None
     authority = str(
         data.get("execution_authority") or data.get("authority") or ""
     ).strip().casefold()
@@ -161,12 +171,21 @@ def _validate_pr_task_assignee_authority(
     idempotency_key: Optional[str],
     assignee: Optional[str],
 ) -> None:
-    if _task_requires_pr_write_authority(
+    if not _task_requires_pr_write_authority(
         title=title, body=body, idempotency_key=idempotency_key
-    ) and _profile_is_explicitly_read_only(assignee):
+    ):
+        return
+    status = _profile_read_only_status(assignee)
+    if status is True:
         raise ValueError(
             f"read-only profile {assignee!r} cannot own PR repair, push, "
             "reply, or base-refresh work"
+        )
+    if status is None:
+        raise ValueError(
+            f"cannot verify write authority for profile {assignee!r} "
+            "(missing, unreadable, or malformed profile.yaml); refusing "
+            "to admit PR repair, push, reply, or base-refresh work"
         )
 
 
@@ -4744,6 +4763,38 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # PR write-class authority (_validate_pr_task_assignee_authority) was
+        # previously proven only once, at create_task()/assign_task() time.
+        # The assignee, or that assignee's profile.yaml, can still change
+        # between admission and claim -- reassignment, a profile authority
+        # edit, or profile.yaml becoming momentarily unreadable -- so a task
+        # that was write-capable when created is not necessarily still
+        # write-capable now. Re-verify immediately before spawning the
+        # effect-capable worker rather than trusting proof consumed once at
+        # admission.
+        auth_row = conn.execute(
+            "SELECT title, body, idempotency_key, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if auth_row is not None:
+            try:
+                _validate_pr_task_assignee_authority(
+                    title=auth_row["title"] or "",
+                    body=auth_row["body"],
+                    idempotency_key=auth_row["idempotency_key"],
+                    assignee=auth_row["assignee"],
+                )
+            except ValueError as exc:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'capability' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "authority_revoked", "detail": str(exc)},
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant

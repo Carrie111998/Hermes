@@ -76,6 +76,64 @@ def test_reassign_rejects_read_only_owner_and_preserves_current_owner(kanban_hom
         assert kb.get_task(conn, tid).assignee == "pr-repair-steward"
 
 
+def test_claim_rejects_authority_revoked_between_admission_and_claim(kanban_home):
+    """review NousResearch/hermes-agent#97368: proof consumed once at
+    create_task() time must not silently authorize a claim after the
+    assignee's profile has since become read-only."""
+    _write_profile(
+        kanban_home,
+        "pr-repair-steward",
+        "Repairs pull requests, pushes exact-head fixes, and posts factual replies.",
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Repair and push LunaBot PR #132",
+            body=_repair_body(),
+            assignee="pr-repair-steward",
+            idempotency_key="github-pr-feedback:repair:132:abc",
+        )
+        # Authority is revoked in place after admission -- no reassignment,
+        # just an edit to the already-admitted assignee's own profile.
+        (kanban_home / "profiles" / "pr-repair-steward" / "profile.yaml").write_text(
+            "name: pr-repair-steward\n"
+            "description: 'Read-only verifier now; never edits, pushes, replies, "
+            "refreshes, or merges.'\n",
+            encoding="utf-8",
+        )
+        assert kb.claim_task(conn, tid) is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+
+
+def test_claim_rejects_unreadable_authority_metadata(kanban_home):
+    """review NousResearch/hermes-agent#97368: unknown authority (missing
+    or unreadable profile.yaml at claim time) must fail closed for a
+    write-class task, not be treated as proof of write capability."""
+    _write_profile(
+        kanban_home,
+        "pr-repair-steward",
+        "Repairs pull requests, pushes exact-head fixes, and posts factual replies.",
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Repair and push LunaBot PR #132",
+            body=_repair_body(),
+            assignee="pr-repair-steward",
+            idempotency_key="github-pr-feedback:repair:132:abc",
+        )
+        profile_yaml = kanban_home / "profiles" / "pr-repair-steward" / "profile.yaml"
+        profile_yaml.write_text("not: [valid, yaml", encoding="utf-8")
+        assert kb.claim_task(conn, tid) is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+
+
 def test_read_only_profile_may_own_exact_head_verification(kanban_home):
     _write_profile(
         kanban_home,
