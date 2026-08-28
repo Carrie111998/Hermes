@@ -78,12 +78,29 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            argv = [_launcher_python(), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [_launcher_python(), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _launcher_python() -> str:
+    """The interpreter to write into ``Exec=`` — absolute, but NOT resolved.
+
+    ``sys.executable`` is already absolute, so ``.resolve()`` buys nothing,
+    and in a venv whose python is a symlink into a versioned runtime tree
+    (uv-managed CPython, Hermes' own generation-stamped runtime python) it
+    is actively wrong: the resolved target is the BASE interpreter, which
+    has no access to the venv's site-packages (the launch dies on the first
+    third-party import, invisibly under ``Terminal=false``) and is pinned
+    to a version/generation directory that the next update deletes, leaving
+    a dead ``Exec=`` behind (#92095). Writing the venv path keeps the entry
+    stable across updates and preserves PEP 405 venv detection, which keys
+    off the path the interpreter is invoked with.
+    """
+    return os.path.abspath(sys.executable)
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
@@ -103,11 +120,17 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
-    # A python shebang pointing INSIDE the running interpreter's environment
-    # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    # A venv console script's shebang typically names the venv bin dir
+    # (``#!/…/venv/bin/python3``), while ``sys.executable`` may RESOLVE to a
+    # different base-interpreter tree (uv / generation-stamped runtimes).
+    # Match against BOTH the unresolved and the resolved interpreter dirs:
+    # either match means the script is self-sufficient; anything else would
+    # escape the venv when spawned by the DE.
+    candidates = (
+        str(Path(sys.executable).parent).lower(),
+        str(Path(sys.executable).resolve().parent).lower(),
+    )
+    return not any(c in shebang for c in candidates)
 
 
 def _quote_exec_arg(arg: str) -> str:
