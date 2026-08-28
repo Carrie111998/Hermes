@@ -108,3 +108,43 @@ test('P1 (RED): dispatch → real handleAct reaches CDP input — no ensureCdp h
   const out = await dispatchTool('ui_click', { selector: '.btn' }, deps)
   assert.ok(sends.length > 0, 'real handleAct must produce CDP input from the dispatch ctx; got: ' + JSON.stringify(out).slice(0, 120))
 })
+
+// --- Task 3: ctx-contract pin (the bug class, not just the bugs) ---
+// Real handler modules + the exact ctx shape dispatch builds. If a handler
+// ever starts reading a ctx member dispatch doesn't provide (the Bugbot P1
+// shape), these tests fail with that handler's own TypeError.
+
+test('ctx contract: act path with REAL handleAct satisfies every ctx member it reads', async () => {
+  const sends = []
+  const live = {
+    send: async (m, p) => { sends.push({ m, p }); return { ok: true } },
+    eval: async () => true,
+    on: () => {}
+  }
+  const realHandleAct = (await import('./tools/act.mjs')).handleAct
+  const deps = baseDeps({ handleAct: realHandleAct, CFG: { allowAct: true } })
+  deps.connect = async () => live
+
+  // ui_press has no selector and reads only ctx.cdp; ui_click adds resolveSelector.
+  for (const [tool, args] of [['ui_press', { key: 'Enter' }], ['ui_click', { selector: '.btn' }]]) {
+    sends.length = 0
+    await dispatchTool(tool, args, deps)
+    assert.ok(sends.length > 0, `${tool} must reach CDP through the dispatch ctx`)
+  }
+})
+
+test('ctx contract: flow path with REAL handleFlow satisfies every ctx member it reads', async () => {
+  const evals = []
+  const live = {
+    send: async () => ({ ok: true }),
+    eval: async (e) => { evals.push(e); return null },
+    on: () => {}
+  }
+  const realHandleFlow = (await import('./tools/flows.mjs')).handleFlow
+  const deps = baseDeps({ handleFlow: realHandleFlow, CFG: { allowAct: true } })
+  deps.connect = async () => live
+
+  const out = await dispatchTool('ui_flow_model_switch', {}, deps)
+  assert.ok(!String(JSON.stringify(out)).includes('no live CDP connection'), 'flow must receive the live handle')
+  assert.ok(evals.length > 0, 'modelSwitchFlow must run its observer evals')
+})
