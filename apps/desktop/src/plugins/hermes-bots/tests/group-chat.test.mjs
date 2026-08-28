@@ -572,6 +572,51 @@ test('a restored queue waits for durable member sessions to become idle before d
   assert.equal(roomLog(gc, 'Restored').some(entry => entry.text === 'wait for the old backend turn'), true)
 })
 
+test('a new composer send stays behind an older restored queue item', async () => {
+  const gc = load(() => '(pass)')
+  await new Promise(resolve => setImmediate(resolve))
+  const roster = [{ name: 'research', title: '' }]
+  gc.host.request = async (method, params) => {
+    if (method === 'session.resume' && params.session_id === 'still-busy-session') {
+      return { messages: [], inflight: true, running: true }
+    }
+    return {}
+  }
+  gc.host.requestProfile = (_route, method, params) => gc.host.request(method, params)
+  gc.updateGroupChat('Backlog', room => {
+    room.running = true
+    room.members = roster
+    room.sessions = { research: 'still-busy-session' }
+    return room
+  })
+  gc.sendToGroupChat('Backlog', roster, 'older durable item')
+  gc.updateGroupChat('Backlog', room => {
+    room.running = false
+    return room
+  })
+
+  gc.sendToGroupChat('Backlog', roster, 'new composer item')
+  assert.equal(
+    JSON.stringify(gc.$groupChats.get().Backlog.pending.map(item => item.text)),
+    JSON.stringify(['older durable item', 'new composer item'])
+  )
+  assert.equal(roomLog(gc, 'Backlog').some(entry => entry.from.kind === 'user'), false)
+})
+
+test('rename waits until an active or queued room has released name-keyed ownership', async () => {
+  const gc = load(() => '(pass)')
+  gc.updateGroupChat('Owned', room => {
+    room.running = true
+    room.members = MEMBERS
+    return room
+  })
+  gc.sendToGroupChat('Owned', MEMBERS, 'queued before rename')
+
+  assert.equal(await gc.renameGroupChat('Owned', 'Moved', MEMBERS), null)
+  assert.ok(gc.$groupChats.get().Owned)
+  assert.equal(gc.$groupChats.get().Moved, undefined)
+})
+
 test('restored queue replay fails closed on an unknown session status payload', async () => {
   const gc = load(() => '(pass)')
   await new Promise(resolve => setImmediate(resolve))

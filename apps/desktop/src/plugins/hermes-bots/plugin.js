@@ -1493,7 +1493,14 @@ function handleSessionsGatewayTransition() {
   // client's stale cache hide a room written by another Desktop/mobile client.
   void pullGroupChatServerState()
     .catch(() => false)
-    .then(() => scheduleGroupChatServerSync($groupChats.get()))
+    .then(() => {
+      scheduleGroupChatServerSync($groupChats.get())
+      for (const [name, room] of Object.entries($groupChats.get())) {
+        if (!room.running && room.pending?.length) {
+          scheduleQueuedGroupRecovery(name, room.members)
+        }
+      }
+    })
 }
 
 // ── cross-connection bot relay ────────────────────────────────────────────
@@ -7188,6 +7195,14 @@ async function renameGroupChat(oldName, newName, members) {
   const all = { ...$groupChats.get() }
   const room = all[oldName]
 
+  // Active drives and recovery timers are keyed by the room name. Do not move
+  // that ownership out from under them; once the room and its durable queue
+  // are idle the same rename is safe and preserves the immutable roomId.
+  if (room?.running || room?.interruptingQueue || room?.pending?.length) {
+    host.notify({ kind: 'error', message: 'Wait for the room and its queued messages to finish before renaming it.' })
+    return null
+  }
+
   if (room) {
     migrateGroupComposerDraft(groupComposerDraftKey(oldName, room), groupComposerDraftKey(next, room))
   }
@@ -8647,6 +8662,7 @@ function drainQueuedGroupMessage(group, members = null) {
  * reload cannot submit into backend work that survived the renderer. Unknown
  * session state fails closed and leaves the durable queue untouched. */
 async function drainQueuedGroupMessageWhenIdle(group, members = null, messageId = null) {
+  const recoveryGeneration = groupQueueRecoveryGeneration
   const before = $groupChats.get()[group] || {}
   const roster = Array.isArray(members) && members.length ? members : before.members || []
   const queued = messageId
@@ -8674,6 +8690,13 @@ async function drainQueuedGroupMessageWhenIdle(group, members = null, messageId 
       return false
     }
 
+    if (
+      groupQueueRecoveryDisposed ||
+      recoveryGeneration !== groupQueueRecoveryGeneration
+    ) {
+      return false
+    }
+
     const hasBusyState =
       state &&
       typeof state === 'object' &&
@@ -8693,6 +8716,8 @@ async function drainQueuedGroupMessageWhenIdle(group, members = null, messageId 
 
   const current = $groupChats.get()[group] || {}
   if (
+    groupQueueRecoveryDisposed ||
+    recoveryGeneration !== groupQueueRecoveryGeneration ||
     current.running ||
     current.interruptingQueue ||
     !(current.pending || []).some(item => item.id === queued.id)
@@ -8707,6 +8732,7 @@ const groupQueueRecoveryTimers = new Map()
 const GROUP_QUEUE_RECOVERY_INTERVAL_MS = 5000
 const GROUP_QUEUE_RECOVERY_MAX_TRIES = 120
 let groupQueueRecoveryDisposed = false
+let groupQueueRecoveryGeneration = 0
 
 /** Retry a durable queue after ambiguous submit failures or renderer reloads.
  * Every attempt rechecks backend session state; the bound prevents a dead
@@ -8719,8 +8745,15 @@ function scheduleQueuedGroupRecovery(group, members = null, attempt = 0) {
   ) {
     return
   }
+  const recoveryGeneration = groupQueueRecoveryGeneration
 
   const run = async () => {
+    if (
+      groupQueueRecoveryDisposed ||
+      recoveryGeneration !== groupQueueRecoveryGeneration
+    ) {
+      return
+    }
     const room = $groupChats.get()[group] || {}
 
     if (room.running || room.interruptingQueue || !room.pending?.length) {
@@ -8728,7 +8761,11 @@ function scheduleQueuedGroupRecovery(group, members = null, attempt = 0) {
       return
     }
 
-    if (await drainQueuedGroupMessageWhenIdle(group, members)) {
+    const drained = await drainQueuedGroupMessageWhenIdle(group, members)
+    if (recoveryGeneration !== groupQueueRecoveryGeneration) {
+      return
+    }
+    if (drained) {
       groupQueueRecoveryTimers.delete(group)
       return
     }
@@ -8762,6 +8799,7 @@ function scheduleQueuedGroupRecovery(group, members = null, attempt = 0) {
 
 function stopQueuedGroupRecovery() {
   groupQueueRecoveryDisposed = true
+  groupQueueRecoveryGeneration += 1
   for (const timer of groupQueueRecoveryTimers.values()) {
     if (timer !== null) {
       clearTimeout(timer)
@@ -8889,13 +8927,16 @@ function sendToGroupChat(group, members, text, thread, images) {
     queuedBehindRun: Math.max(1, Number(room.runSequence || 1))
   }
 
-  if (room.running || room.interruptingQueue) {
+  if (room.running || room.interruptingQueue || room.pending?.length) {
     updateGroupChat(group, current => {
       current.members = durableGroupChatMembers(members)
       current.pending = [...(current.pending || []), queued]
       return current
     })
     recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
+    if (!room.running && !room.interruptingQueue) {
+      scheduleQueuedGroupRecovery(group, members)
+    }
   } else {
     runQueuedGroupMessage(group, members, queued)
   }
@@ -15993,6 +16034,8 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
+    groupQueueRecoveryDisposed = false
+    groupQueueRecoveryGeneration += 1
     startFaceClock()
     // The cross-connection relay rides every gateway socket this Desktop
     // holds: roster sync + envelope drain/deliver/reply loops.
