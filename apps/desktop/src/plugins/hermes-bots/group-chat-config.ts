@@ -44,16 +44,24 @@ export async function getGroupChatConfig(): Promise<GroupChatConfig> {
 
 export function isFreeModel(modelName: unknown, config: GroupChatConfig): boolean {
   const name = String(modelName || '').trim()
-  if (!name) return false
-  if (/:free$/i.test(name)) return true
-  if (config.free_models.some(pattern => name.toLowerCase().includes(pattern.toLowerCase()))) return true
+  if (!name) {
+    return false
+  }
+  if (/:free$/i.test(name)) {
+    return true
+  }
+  if (config.free_models.some(pattern => name.toLowerCase().includes(pattern.toLowerCase()))) {
+    return true
+  }
   return false
 }
 
 export function getEffectiveRoundCap(modelName: unknown, config: GroupChatConfig): number {
   if (isFreeModel(modelName, config)) {
     const cap = config.max_rounds_free
-    if (cap === null || cap === undefined || cap === Infinity) return config.hard_cap
+    if (cap === null || cap === undefined || cap === Infinity) {
+      return config.hard_cap
+    }
     return Math.min(Number(cap), config.hard_cap)
   }
   return Math.min(Number(config.max_rounds), config.hard_cap)
@@ -63,7 +71,9 @@ export async function getCurrentModelName(): Promise<string> {
   try {
     if (host && typeof host.request === 'function') {
       const res = await host.request<{ model?: string }>('model.options', {})
-      if (res?.model) return String(res.model).trim()
+      if (res?.model) {
+        return String(res.model).trim()
+      }
     }
   } catch {
     // Ignore
