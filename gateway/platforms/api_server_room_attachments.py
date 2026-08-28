@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import threading
@@ -47,9 +48,9 @@ class RoomAttachmentSpoolIncomplete(RoomAttachmentSpoolError):
 
 
 def roomlink_attachments_available() -> bool:
-    """Return the single advertised capability for this installed runtime."""
+    """Advertise only when every supported attachment kind can materialize."""
 
-    return web is not None
+    return web is not None and shutil.which("pdftoppm") is not None
 
 
 def _batch_key(dispatch: HostedMemberDispatch) -> str:

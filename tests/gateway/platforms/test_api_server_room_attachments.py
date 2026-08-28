@@ -23,6 +23,15 @@ from gateway.platforms.api_server import APIServerAdapter
 TARGET_INSTALL = "install:target"
 
 
+def test_capability_requires_the_pdf_renderer(monkeypatch):
+    monkeypatch.setattr(room_attachments, "web", object())
+    monkeypatch.setattr(room_attachments.shutil, "which", lambda _name: None)
+    assert room_attachments.roomlink_attachments_available() is False
+
+    monkeypatch.setattr(room_attachments.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert room_attachments.roomlink_attachments_available() is True
+
+
 def _manifest(data: bytes = b"hello") -> list[dict[str, object]]:
     return [
         {
