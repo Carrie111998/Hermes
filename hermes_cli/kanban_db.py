@@ -4602,18 +4602,49 @@ def _stage_terminal_routing_record(
         pass
 
 
+# SQLite's INTEGER is 64-bit. A value outside that range did not come from a
+# real identifier, and printing it would only widen the log line.
+_MIN_DIAG_ID = -(2 ** 63)
+_MAX_DIAG_ID = 2 ** 63 - 1
+
+
 def _diag_id(value: Any) -> "int | str":
     """An outbox identifier safe to interpolate into a log line.
 
-    The columns are declared INTEGER, but SQLite is dynamically typed and the
-    outbox is same-user writable, so a row can hold text with newlines or ANSI
-    escapes in its id. Anything not an integer becomes a marker rather than
-    formatting itself into the log.
+    A total function: a genuine in-range integer is returned as itself, and
+    everything else is the fixed marker ``"?"``.
+
+    It does not coerce, because coercion is what broke. The columns are
+    declared INTEGER, but SQLite is dynamically typed and the outbox is
+    same-user writable, so a row can hold a REAL, TEXT or BLOB id.
+    ``int(float("inf"))`` raises ``OverflowError`` — which the previous
+    ``except (TypeError, ValueError)`` did not catch, so it escaped this
+    helper, rolled the projector's transaction back, and left the entire batch
+    pending behind the poisoned row on every future drain.
+
+    ``type(value) is int`` rather than ``isinstance``: it excludes ``bool``,
+    which is an ``int`` in Python but never a record identity, and it excludes
+    ``int`` subclasses, whose ``__str__`` we would otherwise call during
+    formatting. Nothing here invokes a conversion or formatting hook on the
+    value, so a hostile scalar has no way to run code or raise.
+    """
+    if type(value) is int and _MIN_DIAG_ID <= value <= _MAX_DIAG_ID:
+        return value
+    return "?"
+
+
+def _diag_warn(message: str, *args: Any) -> None:
+    """Emit a quarantine diagnostic that can never undo the quarantine.
+
+    The ``UPDATE`` recording the quarantine has already run inside the open
+    transaction. A failure in the logging stack — a broken handler, a full
+    disk — must not roll that back and re-poison the queue head, which is the
+    failure mode this correction exists to repair.
     """
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return "?"
+        _log.warning(message, *args)
+    except Exception:
+        pass
 
 
 def project_routing_outbox(
@@ -4679,7 +4710,7 @@ def project_routing_outbox(
                         (now, f"unreadable payload: {type(exc).__name__}",
                          row["id"]),
                     )
-                    _log.warning(
+                    _diag_warn(
                         "routing outbox: quarantined record %s (run %s): "
                         "payload is unreadable",
                         _diag_id(row["id"]), _diag_id(row["run_id"]),
@@ -4703,7 +4734,7 @@ def project_routing_outbox(
                         " WHERE id = ?",
                         (now, code, row["id"]),
                     )
-                    _log.warning(
+                    _diag_warn(
                         "routing outbox: quarantined record %s (run %s): %s",
                         _diag_id(row["id"]), _diag_id(row["run_id"]), code,
                     )

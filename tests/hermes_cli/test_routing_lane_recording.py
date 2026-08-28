@@ -1854,3 +1854,164 @@ def test_resolution_of_valid_owners_is_unchanged(profiles_root):
         profiles_root.root / "logs" / "routing.jsonl", None)
     assert ra.resolve_profile_log_owner(None)[1] is None, "a legacy row still resolves"
     assert ra.resolve_profile_log_owner("  ")[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Sixth round: a malformed identifier cannot wedge the queue
+# ---------------------------------------------------------------------------
+
+DIAG_ACCEPTED = [
+    ("positive", 1), ("large", 2 ** 63 - 1), ("zero", 0),
+    ("negative", -7), ("most-negative", -(2 ** 63)),
+]
+
+DIAG_REJECTED = [
+    ("true", True), ("false", False),
+    ("float-integral", 1.0), ("float", 3.5), ("float-negative", -0.0),
+    ("nan", float("nan")),
+    ("inf", float("inf")), ("-inf", float("-inf")),
+    ("text-numeric", "12"), ("text", "coder"),
+    ("text-newline", "1\nCRITICAL zzforgedzz"),
+    ("text-ansi", "1\x1b[31m"),
+    ("text-percent", "%s %d %(x)s"),
+    ("text-credential", "glpat-NOTAREALKEY-ABCDEFGHIJKLMNOP"),
+    ("text-huge-number", "9" * 400),
+    ("blob", b"\x00\x01binary"),
+    ("null", None),
+    ("int-too-large", 2 ** 63), ("int-too-small", -(2 ** 63) - 1),
+    ("huge-int", 10 ** 400),
+]
+
+
+@pytest.mark.parametrize("kind,value", DIAG_ACCEPTED)
+def test_a_real_identifier_is_shown_as_itself(kind, value):
+    assert kb._diag_id(value) == value
+
+
+@pytest.mark.parametrize("kind,value", DIAG_REJECTED)
+def test_any_other_scalar_becomes_the_fixed_marker(kind, value):
+    assert kb._diag_id(value) == "?", kind
+
+
+def test_no_scalar_makes_the_identifier_helper_raise():
+    """It is total: SQLite can return exactly these five Python types."""
+    for value in (None, 1, 1.5, float("inf"), float("nan"), "x", b"y",
+                  True, 10 ** 400, -(10 ** 400)):
+        assert kb._diag_id(value) in ("?", value)
+
+
+def test_an_int_subclass_is_not_trusted_to_render_itself():
+    class Sneaky(int):
+        def __str__(self):
+            raise RuntimeError("formatting hook")
+
+        __repr__ = __str__
+
+    assert kb._diag_id(Sneaky(5)) == "?"
+
+
+def _poisoned_board(caplog):
+    """Row 1 carries run_id +inf; row 2 is an ordinary quarantinable row."""
+    import logging
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (id, run_id, profile, payload, created_at)"
+            " VALUES (1, ?, 'missing-owner', '{\"a\": 1}', 1)", (float("inf"),))
+        conn.execute(
+            "INSERT INTO routing_outbox (id, run_id, profile, payload, created_at)"
+            " VALUES (2, 2, 'also-missing', '{\"a\": 1}', 1)")
+        conn.commit()
+        stored = conn.execute(
+            "SELECT typeof(run_id) t FROM routing_outbox WHERE id = 1").fetchone()["t"]
+        assert stored == "real", "the fixture must really store a non-integer"
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            written = kb.project_routing_outbox(conn)
+        rows = conn.execute(
+            "SELECT id, error, quarantined_at, projected_at FROM routing_outbox "
+            " ORDER BY id").fetchall()
+        pending = conn.execute(
+            "SELECT COUNT(*) c FROM routing_outbox "
+            " WHERE projected_at IS NULL AND quarantined_at IS NULL").fetchone()["c"]
+    finally:
+        conn.close()
+    return written, rows, pending, "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_a_poisoned_identifier_does_not_wedge_the_queue(board, caplog, tmp_path):
+    written, rows, pending, log = _poisoned_board(caplog)
+
+    assert written == 0
+    assert pending == 0, "one pass disposes of both rows"
+    for row in rows:
+        assert row["projected_at"] is None
+        assert row["quarantined_at"] is not None
+        assert row["error"] == "missing_profile_owner"
+    assert "quarantined record 1 (run ?)" in log, log
+    assert "quarantined record 2 (run 2)" in log, log
+    assert _terminal(tmp_path) == [], "a rejected owner still writes no JSONL"
+
+
+def test_a_poisoned_identifier_leaves_nothing_hostile_in_any_sink(board, caplog):
+    _, rows, _, log = _poisoned_board(caplog)
+
+    everything = log + "".join(str(r["error"]) for r in rows)
+    for hostile in ("inf", "Infinity", "1e", "OverflowError"):
+        assert hostile not in everything, hostile
+    for line in log.splitlines():
+        assert len(line) < 200 and all(ch == " " or ch.isprintable() for ch in line)
+
+
+def test_a_broken_log_handler_cannot_undo_a_quarantine(board, caplog, monkeypatch):
+    """The UPDATE has already run; a logging failure must not roll it back."""
+    import logging
+
+    class Exploding(logging.Handler):
+        def emit(self, record):
+            raise RuntimeError("handler is broken")
+
+    lg = logging.getLogger("hermes_cli.kanban_db")
+    handler = Exploding()
+    lg.addHandler(handler)
+    try:
+        conn = kb.connect()
+        try:
+            conn.execute(
+                "INSERT INTO routing_outbox (run_id, profile, payload, created_at)"
+                " VALUES (9, 'missing-owner', '{}', 1)")
+            conn.commit()
+            assert kb.project_routing_outbox(conn) == 0
+            row = conn.execute(
+                "SELECT quarantined_at, error FROM routing_outbox "
+                " WHERE run_id = 9").fetchone()
+        finally:
+            conn.close()
+    finally:
+        lg.removeHandler(handler)
+    assert row["quarantined_at"] is not None, "the quarantine survived"
+    assert row["error"] == "missing_profile_owner"
+
+
+def test_a_malformed_payload_row_with_a_poisoned_id_also_disposes(board, caplog):
+    """The other quarantine branch shares the same identifier boundary."""
+    import logging
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (id, run_id, profile, payload, created_at)"
+            " VALUES (1, ?, 'coder', 'not json', 1)", (float("-inf"),))
+        conn.commit()
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            kb.project_routing_outbox(conn)
+        row = conn.execute(
+            "SELECT quarantined_at, error FROM routing_outbox WHERE id = 1").fetchone()
+    finally:
+        conn.close()
+    log = "\n".join(r.getMessage() for r in caplog.records)
+    assert row["quarantined_at"] is not None
+    assert "unreadable payload" in row["error"]
+    assert "(run ?)" in log, log
