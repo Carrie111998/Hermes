@@ -730,6 +730,12 @@ class IdleChipArchiveWorker:
                 current_activity = self._activity_ms(current)
                 if current_activity is None or current_activity >= idle_floor_ms:
                     return False
+                latest_group_activity = self._fresh_group_activity(group_paths[key])
+                if (
+                    latest_group_activity is None
+                    or latest_group_activity >= idle_floor_ms
+                ):
+                    return False
                 return current.__setitem__("isArchived", True) is None
 
             try:

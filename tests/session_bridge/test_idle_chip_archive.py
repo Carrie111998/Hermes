@@ -301,6 +301,35 @@ def test_skips_already_archived_without_rewrite(tmp_path) -> None:
     assert path.stat().st_mtime == before
 
 
+def test_archiver_spares_group_when_sibling_becomes_recent_during_transform(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _write_record(
+        tmp_path / "a", "chip1", cli_session_id="cli-shared"
+    )
+    sibling = _write_record(
+        tmp_path / "b", "chip1", cli_session_id="cli-shared"
+    )
+    actual_read = Path.read_bytes
+    calls = {"target": 0}
+
+    def racing_read(candidate: Path) -> bytes:
+        if candidate == target:
+            calls["target"] += 1
+            if calls["target"] == 1:
+                current = json.loads(actual_read(sibling).decode("utf-8"))
+                current["lastActivityAt"] = int((NOW - 60) * 1000)
+                sibling.write_text(json.dumps(current), encoding="utf-8")
+        return actual_read(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read)
+
+    result = _worker(tmp_path / "a", tmp_path / "b").run_once()
+
+    assert result["archived"] == 0
+    assert _load(target)["isArchived"] is False
+
+
 def test_archiver_spares_target_that_becomes_recent_before_transform(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
