@@ -378,6 +378,47 @@ class TestTurnUsageFields:
             "context_window": 1050000,
         }
 
+    def test_anchored_figure_preferred_over_last_prompt_tokens(self):
+        """A valid usage anchor is the figure /context now prefers — the last
+        response's exact prompt+completion plus a delta estimate of anything
+        appended since — so the API reports it too, not the raw
+        last_prompt_tokens (which lacks the completion and any later
+        appends)."""
+        from agent.model_metadata import capture_usage_anchor
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        agent = types.SimpleNamespace(
+            session_prompt_tokens=1200,
+            session_completion_tokens=300,
+            session_total_tokens=1500,
+            context_compressor=types.SimpleNamespace(
+                last_prompt_tokens=35019, context_length=1050000
+            ),
+            _usage_anchor=capture_usage_anchor(35019, 42, messages),
+        )
+        fields = _turn_usage_fields(agent, messages=messages)
+        assert fields["context_tokens"] == 35019 + 42
+        assert fields["context_window"] == 1050000
+
+    def test_stale_anchor_falls_back_to_last_prompt_tokens(self):
+        """Message identity is part of the anchor's contract — a reloaded
+        transcript (equal content, different objects) invalidates it, and
+        the figure falls back to the compressor's last_prompt_tokens."""
+        from agent.model_metadata import capture_usage_anchor
+
+        messages = [{"role": "user", "content": "hi"}]
+        agent = types.SimpleNamespace(
+            context_compressor=types.SimpleNamespace(
+                last_prompt_tokens=35019, context_length=1050000
+            ),
+            _usage_anchor=capture_usage_anchor(9000, 10, messages),
+        )
+        reloaded = [dict(m) for m in messages]
+        assert _turn_usage_fields(agent, messages=reloaded)["context_tokens"] == 35019
+
     def test_compression_sentinel_clamps_to_zero(self):
         """The Codex runtime parks last_prompt_tokens at -1 right after a
         compression; the status bar shows 0, so the API must too."""
