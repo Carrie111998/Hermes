@@ -2818,6 +2818,11 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Optional allowlist of workflow_template_id values eligible for
+        # automatic ready/review dispatch. None preserves the historical
+        # all-workflows behavior. A non-empty list lets governed deployments
+        # keep legacy/untyped backlog visible without executing it.
+        "dispatch_workflow_template_allowlist": None,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.

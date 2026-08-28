@@ -66,6 +66,44 @@ def test_create_persists_governance_fields_and_json_exposes_them(kanban_home):
     }
 
 
+def test_dispatch_allowlist_excludes_legacy_ready_tasks(kanban_home, monkeypatch):
+    import hermes_cli.config as config
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(
+        config,
+        "load_config_readonly",
+        lambda: {
+            "kanban": {
+                "dispatch_workflow_template_allowlist": ["valor.mission/v2"]
+            }
+        },
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+
+    with kb.connect_closing() as conn:
+        legacy_id = kb.create_task(conn, title="legacy", assignee="valorcore")
+        governed_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="valorcore",
+            workflow_template_id="valor.mission/v2",
+        )
+
+        result = kb.dispatch_once(conn, dry_run=True, reconcile_orphans=False)
+        spawned_ids = [entry[0] for entry in result.spawned]
+
+        assert spawned_ids == [governed_id]
+        assert kb.get_task(conn, legacy_id).status == "ready"
+        assert kb.has_spawnable_ready(conn) is True
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done' WHERE id = ?", (governed_id,)
+            )
+        assert kb.has_spawnable_ready(conn) is False
+
+
 def test_configured_graph_depth_is_enforced_atomically(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_configured_graph_limits", lambda: (3, 6, 20))
     with kb.connect_closing() as conn:

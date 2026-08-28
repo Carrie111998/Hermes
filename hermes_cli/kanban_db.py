@@ -160,6 +160,46 @@ def _configured_graph_limits() -> Optional[tuple[int, int, int]]:
     return values
 
 
+def _configured_dispatch_workflow_template_allowlist() -> Optional[tuple[str, ...]]:
+    """Return workflow templates eligible for automatic dispatch.
+
+    ``None`` preserves Hermes' historical behavior and dispatches every ready
+    or review task. Once configured, the allowlist must be a non-empty list of
+    non-empty strings. Invalid explicit policy fails closed by raising before
+    a task can be claimed.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    raw = (load_config_readonly().get("kanban") or {}).get(
+        "dispatch_workflow_template_allowlist"
+    )
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            "kanban.dispatch_workflow_template_allowlist must be a non-empty list"
+        )
+    normalized: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                "kanban.dispatch_workflow_template_allowlist entries must be "
+                "non-empty strings"
+            )
+        candidate = value.strip()
+        if candidate not in normalized:
+            normalized.append(candidate)
+    return tuple(normalized)
+
+
+def _dispatch_workflow_sql() -> tuple[str, tuple[str, ...]]:
+    allowlist = _configured_dispatch_workflow_template_allowlist()
+    if allowlist is None:
+        return "", ()
+    placeholders = ", ".join("?" for _ in allowlist)
+    return f" AND workflow_template_id IN ({placeholders})", allowlist
+
+
 def _assert_graph_limits(
     conn: sqlite3.Connection,
     *,
@@ -9720,10 +9760,13 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
+    workflow_sql, workflow_params = _dispatch_workflow_sql()
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
+        + workflow_sql,
+        workflow_params,
     ).fetchall()
     if not rows:
         return False
@@ -9746,10 +9789,13 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     used by the health telemetry to decide whether the dispatcher
     should have spawned a review agent.
     """
+    workflow_sql, workflow_params = _dispatch_workflow_sql()
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
+        + workflow_sql,
+        workflow_params,
     ).fetchall()
     if not rows:
         return False
@@ -10202,10 +10248,13 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
+    workflow_sql, workflow_params = _dispatch_workflow_sql()
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        + workflow_sql
+        + " ORDER BY priority DESC, created_at ASC",
+        workflow_params,
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
@@ -10214,7 +10263,9 @@ def _dispatch_once_locked(
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
+            + workflow_sql
+            + " ORDER BY priority DESC, created_at ASC",
+            workflow_params,
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
