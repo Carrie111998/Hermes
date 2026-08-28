@@ -1168,6 +1168,12 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     from agent.redact import redact_sensitive_text
 
     stdout_text = kernel_result.get("stdout", "") or ""
+    runner_stdout_bytes = len(stdout_text.encode("utf-8", errors="replace"))
+    runner_stdout_clipped = bool(kernel_result.get("stdout_clipped"))
+    try:
+        runner_stdout_total = int(kernel_result.get("stdout_bytes_total") or 0)
+    except (TypeError, ValueError):
+        runner_stdout_total = 0
     stderr_text = kernel_result.get("stderr", "") or ""
     traceback_text = kernel_result.get("traceback", "") or ""
     if stderr_text or traceback_text:
@@ -1186,11 +1192,42 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     result: Dict[str, Any] = {
         "status": kernel_result.get("status", "error"),
         "output": stdout_text,
+        "exit_code": kernel_result.get("exit_code", -1),
         "tool_calls_made": kernel_result.get("tool_calls_made", 0),
         "duration_seconds": duration,
         "kernel": kernel_result.get("kernel", {"remote": True}),
     }
     result.update(stdout_metadata)
+
+    if runner_stdout_clipped:
+        captured = min(
+            int(result.get("stdout_bytes_captured") or 0),
+            runner_stdout_bytes,
+        )
+        total = max(runner_stdout_total, runner_stdout_bytes)
+        result.update({
+            "stdout_truncated": True,
+            "stdout_bytes_captured": captured,
+            "stdout_bytes_total": total,
+            "stdout_bytes_omitted": max(0, total - captured),
+        })
+        spill_path = str(kernel_result.get("stdout_spill_path") or "")
+        if spill_path:
+            result["stdout_spill_path"] = spill_path
+            result["warning"] = (
+                "Cell stdout exceeded the inline cap; head shown. FULL "
+                f"output saved to {spill_path} — page it with "
+                f'read_file(path="{spill_path}", offset=...) instead of '
+                "re-running."
+            )
+        else:
+            # A host-side spill, if any, contains only the runner's already
+            # clipped payload and must not be advertised as the full output.
+            result.pop("stdout_spill_path", None)
+            result["warning"] = (
+                "Cell stdout exceeded the remote kernel's inline cap; the "
+                "returned output is truncated."
+            )
 
     if result["status"] == "timeout":
         timeout_msg = (

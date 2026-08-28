@@ -69,15 +69,29 @@ import traceback
 KDIR = os.environ["HERMES_KERNEL_DIR"]
 CELLS = os.path.join(KDIR, "cells")
 CAPTURE_LIMIT = {capture_limit}
+SPILL_CAP = {spill_cap}
 IDLE_EXIT_SECONDS = {idle_exit}
 
 GLOBALS = {{"__name__": "__main__", "__builtins__": __builtins__}}
 
 
-def _bounded(text):
-    if len(text) <= CAPTURE_LIMIT:
-        return text, False
-    return text[:CAPTURE_LIMIT], True
+def _bounded(text, spill_name=""):
+    encoded = text.encode("utf-8", errors="replace")
+    total_bytes = len(encoded)
+    if total_bytes <= CAPTURE_LIMIT:
+        return text, False, "", total_bytes
+    spill_path = ""
+    if spill_name:
+        try:
+            spill_path = os.path.join(KDIR, spill_name)
+            with open(spill_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(encoded[:SPILL_CAP].decode("utf-8", errors="replace"))
+                if total_bytes > SPILL_CAP:
+                    f.write("\\n\\n[... spill capped ...]")
+        except Exception:
+            spill_path = ""
+    clipped = encoded[:CAPTURE_LIMIT].decode("utf-8", errors="replace")
+    return clipped, True, spill_path, total_bytes
 
 
 def main():
@@ -116,8 +130,10 @@ def main():
             except BaseException:
                 status = "error"
                 trace = traceback.format_exc()
-            stdout_text, stdout_clipped = _bounded(out.getvalue())
-            stderr_text, stderr_clipped = _bounded(err.getvalue())
+            stdout_text, stdout_clipped, stdout_spill, stdout_total = _bounded(
+                out.getvalue(), "cell_%06d_stdout.txt" % execution_count
+            )
+            stderr_text, stderr_clipped, _, _ = _bounded(err.getvalue())
             payload = {{
                 "id": request.get("id", ""),
                 "status": status,
@@ -125,6 +141,8 @@ def main():
                 "stderr": stderr_text,
                 "stdout_clipped": stdout_clipped,
                 "stderr_clipped": stderr_clipped,
+                "stdout_spill_path": stdout_spill,
+                "stdout_bytes_total": stdout_total,
                 "traceback": trace,
                 "execution_count": execution_count,
             }}
@@ -227,6 +245,7 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                          idle_exit: int) -> Optional[RemoteKernel]:
     """Start a detached kernel runner on the remote. None on failure."""
     from tools.code_execution_tool import (
+        MAX_SPILLED_STDOUT_BYTES,
         MAX_STDOUT_BYTES,
         _ship_file_to_remote,
         _env_temp_dir,
@@ -242,6 +261,7 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         rpc_token = _secrets.token_urlsafe(32)
         runner_src = REMOTE_KERNEL_RUNNER_SOURCE.format(
             capture_limit=MAX_STDOUT_BYTES,
+            spill_cap=MAX_SPILLED_STDOUT_BYTES,
             idle_exit=idle_exit,
         )
         _ship_file_to_remote(env, f"{kernel_dir}/kernel_runner.py", runner_src)
@@ -443,6 +463,7 @@ def execute_in_remote_kernel(
         _kill(kernel)
         return {
             "status": "timeout" if cell_status == "timeout" else "error",
+            "exit_code": -1,
             "stdout": "",
             "stderr": "",
             "traceback": "",
@@ -470,11 +491,14 @@ def execute_in_remote_kernel(
 
     result: Dict[str, Any] = {
         "status": "success" if cell_status in ("ok", "exit") else "error",
+        "exit_code": 0 if cell_status in ("ok", "exit") else 1,
         "stdout": cell_payload.get("stdout", ""),
         "stderr": cell_payload.get("stderr", ""),
         "traceback": cell_payload.get("traceback", ""),
         "stdout_clipped": bool(cell_payload.get("stdout_clipped")),
         "stderr_clipped": bool(cell_payload.get("stderr_clipped")),
+        "stdout_spill_path": cell_payload.get("stdout_spill_path", ""),
+        "stdout_bytes_total": cell_payload.get("stdout_bytes_total", 0),
         "tool_calls_made": tool_call_counter[0],
         "kernel": {
             "reused": reused,
