@@ -6,6 +6,7 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -70,6 +71,28 @@ def _gateway_owner_status() -> dict:
     return import_module("gateway.status").get_gateway_owner_status()
 
 
+def _builtin_gateway_liveness() -> Optional[bool]:
+    """Tri-state liveness of the builtin cron scheduler's trigger.
+
+    Single source of truth shared by the CLI (``_warn_if_gateway_not_running``)
+    and the ``cronjob`` model tool (#87033). External providers do not depend on
+    the in-process gateway ticker and therefore report active. For the builtin
+    provider, preserve the runtime-lock probe's explicit unknown state instead
+    of collapsing an unreadable/shared owner into ``False``.
+    """
+    try:
+        if _active_cron_provider_name() != "builtin":
+            return True
+        owner_state = _gateway_owner_status().get("state")
+    except Exception:
+        return None
+    if owner_state in {"local_pid_running", "shared_lock_active"}:
+        return True
+    if owner_state == "not_running":
+        return False
+    return None
+
+
 def _warn_if_gateway_not_running() -> None:
     """Warn that scheduled jobs won't fire unless the gateway is running.
 
@@ -85,14 +108,9 @@ def _warn_if_gateway_not_running() -> None:
     any non-builtin provider; the gateway-process heuristic only speaks to the
     built-in ticker's trigger.
     """
-    try:
-        if _active_cron_provider_name() != "builtin":
-            return
-
-        if _gateway_owner_status().get("state") != "not_running":
-            return
-    except Exception:
-        # If we can't determine gateway state, stay quiet rather than nag.
+    # ``False`` is the only warn-worthy state; active and unverifiable owners
+    # both fail closed to silence.
+    if _builtin_gateway_liveness() is not False:
         return
 
     print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
@@ -247,6 +265,104 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
         )
         if record.get("error"):
             print(f"    {record['error']}")
+
+
+_INCIDENT_STATE_COLORS = {
+    "detected": Colors.RED,
+    "alerted": Colors.YELLOW,
+    "closed": Colors.GREEN,
+}
+
+
+def cron_incidents(args) -> int:
+    """List or acknowledge durable cron failure incidents.
+
+    ``hermes cron incidents [--state <s>]`` lists incidents (the stored error
+    is redacted and truncated at write time, safe for terminal display);
+    ``hermes cron incidents ack <id>`` closes one so its failure ping stays
+    silent until the error signature changes.
+    """
+    from cron.incidents import ack_incident, list_incidents
+
+    action = getattr(args, "incident_action", "list")
+    if action == "ack":
+        incident_id = getattr(args, "incident_id", None)
+        if not incident_id:
+            print(
+                color(
+                    "✗ Incident ID required: hermes cron incidents ack <incident_id>",
+                    Colors.RED,
+                )
+            )
+            return 1
+        if ack_incident(incident_id):
+            print(
+                color(
+                    f"✓ Incident {incident_id} acknowledged (closed).",
+                    Colors.GREEN,
+                )
+            )
+        else:
+            print(
+                color(
+                    f"Incident {incident_id} not found or already closed.",
+                    Colors.YELLOW,
+                )
+            )
+        return 0
+
+    state = getattr(args, "state", None)
+    incidents = list_incidents(state=state)
+    if not incidents:
+        print(color("No cron failure incidents recorded.", Colors.DIM))
+        if state:
+            print(color(f"  (filtered by state '{state}')", Colors.DIM))
+        return 0
+
+    print()
+    print(
+        color(
+            "┌─────────────────────────────────────────────────────────────────────────┐",
+            Colors.CYAN,
+        )
+    )
+    print(
+        color(
+            "│                         Cron Failure Incidents                          │",
+            Colors.CYAN,
+        )
+    )
+    print(
+        color(
+            "└─────────────────────────────────────────────────────────────────────────┘",
+            Colors.CYAN,
+        )
+    )
+    print()
+    for inc in incidents:
+        state_display = color(
+            inc["state"], _INCIDENT_STATE_COLORS.get(inc["state"], Colors.DIM)
+        )
+        print(f"  {color(inc['id'], Colors.YELLOW)}  {state_display}")
+        print(f"    Job:        {inc['job_id']}")
+        print(f"    Type:       {inc.get('failure_type', 'unknown')}")
+        print(f"    First seen: {inc.get('first_seen_at', '?')}")
+        print(f"    Last seen:  {inc.get('last_seen_at', '?')}")
+        error_text = re.sub(r"\s+", " ", inc.get("error") or "").strip()
+        if len(error_text) > 160:
+            error_text = error_text[:157].rstrip() + "..."
+        print(f"    Error:      {error_text}")
+        if inc.get("output_file"):
+            print(f"    Output:     {inc['output_file']}")
+        print()
+    print(
+        color(
+            f"  {len(incidents)} incident(s)  |  ack one with: "
+            "hermes cron incidents ack <id>",
+            Colors.DIM,
+        )
+    )
+    return 0
 
 
 def cron_status():
@@ -607,6 +723,29 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     return 0
 
 
+def cron_resume(args) -> int:
+    """Resume a paused job or explicitly re-arm a completed one-shot."""
+    if bool(getattr(args, "run_at", None)) == bool(getattr(args, "run_now", False)):
+        if getattr(args, "run_at", None) or getattr(args, "run_now", False):
+            print(color("Use exactly one of --at or --run-now.", Colors.RED))
+            return 1
+        return _job_action("resume", args.job_id, "Resumed")
+    from cron.jobs import AmbiguousJobReference, _hermes_now, rearm_oneshot
+
+    run_at = _hermes_now().isoformat() if args.run_now else args.run_at
+    try:
+        job = rearm_oneshot(args.job_id, run_at)
+    except (AmbiguousJobReference, ValueError) as exc:
+        print(color(f"Failed to re-arm job: {exc}", Colors.RED))
+        return 1
+    if not job:
+        print(color(f"Job not found: {args.job_id}", Colors.RED))
+        return 1
+    print(color(f"Re-armed job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN))
+    print(f"  Next run: {job.get('next_run_at')}")
+    return 0
+
+
 def cron_notepad(args) -> int:
     """Handle ``hermes cron notepad <job_id> [get|set|delete|list]``.
 
@@ -690,6 +829,9 @@ def cron_command(args):
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
 
+    if subcmd == "incidents":
+        return cron_incidents(args)
+
     if subcmd == "notepad":
         return cron_notepad(args)
 
@@ -703,7 +845,7 @@ def cron_command(args):
         return _job_action("pause", args.job_id, "Paused")
 
     if subcmd == "resume":
-        return _job_action("resume", args.job_id, "Resumed")
+        return cron_resume(args)
 
     if subcmd == "run":
         return _job_action("run", args.job_id, "Triggered")
