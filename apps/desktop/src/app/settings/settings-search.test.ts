@@ -44,6 +44,7 @@ describe('settings search index', () => {
 
     expect(entries.map(entry => entry.id)).toEqual([
       'config-field:display.personality',
+      'config-field:delegate_wave.route_repo_changes',
       'config-field:tts.provider',
       'config-field:tts.edge.voice'
     ])

@@ -467,6 +467,7 @@ export const zhHant = defineLocale({
       }
     },
     fieldLabels: defineFieldCopy({
+      'delegate_wave.route_repo_changes': '委派儲存庫變更',
       model: '預設模型',
       modelContextLength: '上下文視窗',
       fallbackProviders: '備用模型',
@@ -629,6 +630,7 @@ export const zhHant = defineLocale({
       }
     }),
     fieldDescriptions: defineFieldCopy({
+      'delegate_wave.route_repo_changes': '將儲存庫變更請求傳送給 delegate-wave，而不是讓 Hermes 直接編輯檔案。',
       model: '除非你在輸入框選擇其他模型，否則新聊天會使用此模型。',
       modelContextLength: '保留 0 會使用所選模型偵測到的上下文視窗。',
       fallbackProviders: '預設模型失敗時要嘗試的備用 provider:model 項目。',

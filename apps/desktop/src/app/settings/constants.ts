@@ -373,6 +373,7 @@ export const FREE_INPUT_KEYS = new Set([
 ])
 
 export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
+  'delegate_wave.route_repo_changes': 'Route repository changes',
   model: 'Default Model',
   modelContextLength: 'Context Window',
   fallbackProviders: 'Fallback Models',
@@ -541,6 +542,8 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
 })
 
 export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
+  'delegate_wave.route_repo_changes':
+    'Send repository-changing requests to delegate-wave instead of letting Hermes edit files directly.',
   model: 'Used for new chats unless you pick a different model in the composer.',
   modelContextLength: "Leave at 0 to use the selected model's detected context window.",
   fallbackProviders: 'Backup provider:model entries to try if the default model fails.',
@@ -664,6 +667,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'approvals.mode',
       'approvals.timeout',
       'approvals.mcp_reload_confirm',
+      'delegate_wave.route_repo_changes',
       'command_allowlist',
       'security.redact_secrets',
       'security.allow_private_urls',

@@ -331,6 +331,16 @@ describe('settings helpers', () => {
   })
 
   describe('sectionFieldEntries', () => {
+    it('shows the repository-routing switch as off before it exists in config', () => {
+      const fields = new Map(sectionFieldEntries({}, {}).get('safety') ?? [])
+
+      expect(fields.get('delegate_wave.route_repo_changes')).toEqual({ type: 'boolean' })
+      expect(getNested({}, 'delegate_wave.route_repo_changes')).toBeUndefined()
+      expect(setNested({}, 'delegate_wave.route_repo_changes', true)).toEqual({
+        delegate_wave: { route_repo_changes: true }
+      })
+    })
+
     it('renders memory.provider from config even when the backend schema omits it', () => {
       const schema = { 'memory.memory_enabled': { type: 'boolean' as const } }
       const config: HermesConfigRecord = { memory: { memory_enabled: true, provider: '' } }

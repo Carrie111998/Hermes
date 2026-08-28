@@ -482,6 +482,7 @@ export const ja = defineLocale({
       }
     },
     fieldLabels: defineFieldCopy({
+      'delegate_wave.route_repo_changes': 'リポジトリ変更を委任',
       model: 'デフォルトモデル',
       modelContextLength: 'コンテキストウィンドウ',
       fallbackProviders: 'フォールバックモデル',
@@ -644,6 +645,8 @@ export const ja = defineLocale({
       }
     }),
     fieldDescriptions: defineFieldCopy({
+      'delegate_wave.route_repo_changes':
+        'Hermes がファイルを直接編集せず、リポジトリ変更の依頼を delegate-wave に送ります。',
       model: 'コンポーザーで別のモデルを選ばない限り、新しいチャットで使用されます。',
       modelContextLength: '0 のままにすると、選択したモデルから検出されたコンテキストウィンドウを使用します。',
       fallbackProviders: 'デフォルトモデルが失敗したときに試す provider:model 形式のバックアップです。',
