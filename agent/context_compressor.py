@@ -3037,7 +3037,11 @@ class ContextCompressor(ContextEngine):
         ``run_compress_context_with_progress_timeout``. Avoids re-implementing
         the ladder at each call site (#62452).
         """
-        _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+        # Top rung 1800: a session whose summary phase structurally cannot
+        # finish inside the host ceiling (very large compaction regions)
+        # otherwise re-burns a doomed multi-minute attempt every ~15 minutes
+        # forever. Any successful summary still resets the streak.
+        _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900, 1800)
         self._consecutive_timeout_failures = (
             getattr(self, "_consecutive_timeout_failures", 0) + 1
         )
@@ -4754,11 +4758,44 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
             chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
+
+        # Host-cancellation probe (installed by compress_context for fenced
+        # attempts). On a large region this loop is the dominant cost of a
+        # compression attempt — up to _LEAN_DIGEST_MAX_CHUNKS sequential LLM
+        # calls AFTER the main summary call — and it used to run to completion
+        # even when the host's progress-aware timeout had already
+        # fence-cancelled the attempt, burning tens of minutes of doomed
+        # provider calls whose commit was guaranteed to be refused. Check the
+        # probe before every chunk call and stop as soon as cancellation won.
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+
+        def _host_cancelled() -> bool:
+            if not callable(cancelled_check):
+                return False
+            try:
+                return bool(cancelled_check())
+            except Exception:
+                return False
+
         digests: list[str] = []
         for ci in range(n_chunks):
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]
             if not segment.strip():
                 continue
+            if _host_cancelled():
+                logger.warning(
+                    "lean chunk digests stopped before segment %d/%d: the "
+                    "host cancelled this compression attempt — skipping the "
+                    "remaining digest calls",
+                    ci + 1, n_chunks,
+                )
+                digests.append(
+                    f"### Segment {ci + 1}/{n_chunks}\n"
+                    f"[digests unavailable for segments {ci + 1}-{n_chunks}: "
+                    "compression attempt cancelled — recover via "
+                    "session_search]"
+                )
+                break
             try:
                 from agent.auxiliary_client import call_llm
 
@@ -5472,8 +5509,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             # summary route can produce within its deadline will fail the
             # same way every time, and re-burning the full timeout every
             # 60s turns each subsequent turn into a multi-minute stall
-            # (#62452). 60s → 300s → 900s (capped); any successful summary
-            # resets the streak via _clear_compression_failure_cooldown().
+            # (#62452). 60s → 300s → 900s → 1800s (capped); any successful
+            # summary resets the streak via
+            # _clear_compression_failure_cooldown().
             # Timeout takes precedence over the streaming-closed short rung:
             # a "timed out" error also matches _is_connection_error, but a
             # deadline exhaustion is the structural repeat-offender class,
@@ -5482,7 +5520,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._consecutive_timeout_failures = (
                     getattr(self, "_consecutive_timeout_failures", 0) + 1
                 )
-                _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+                _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900, 1800)
                 _transient_cooldown = _TIMEOUT_COOLDOWN_LADDER[
                     min(self._consecutive_timeout_failures,
                         len(_TIMEOUT_COOLDOWN_LADDER)) - 1
