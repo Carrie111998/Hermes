@@ -125,6 +125,164 @@ def test_turn_completion_release_invalidates_waiter():
     assert not cm.has_pending(session_key)
 
 
+def test_stale_turn_release_clears_only_its_owned_clarify():
+    """An old unwind cannot cancel a replacement turn's prompt."""
+    from tools import clarify_gateway as cm
+
+    runner, _adapter = make_restart_runner()
+    session_key = build_session_key(_source())
+    old_generation = runner._begin_session_run_generation(session_key)
+    old_entry = cm.register(
+        "old-generation-pending",
+        session_key,
+        "Old prompt",
+        ["old"],
+        run_generation=old_generation,
+    )
+
+    runner._invalidate_session_run_generation(session_key, reason="test_stop")
+    new_generation = runner._begin_session_run_generation(session_key)
+    fresh_agent = MagicMock()
+    runner._running_agents = {session_key: fresh_agent}
+    new_entry = cm.register(
+        "new-generation-pending",
+        session_key,
+        "New prompt",
+        ["new"],
+        run_generation=new_generation,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        old_waiter = pool.submit(cm.wait_for_response, old_entry.clarify_id, 5.0)
+        new_waiter = pool.submit(cm.wait_for_response, new_entry.clarify_id, 5.0)
+        _wait_until_waiter_started(old_entry)
+        _wait_until_waiter_started(new_entry)
+
+        released = runner._release_running_agent_state(
+            session_key,
+            run_generation=old_generation,
+        )
+
+        assert released is False
+        assert old_waiter.result(timeout=2.0) == ""
+        assert runner._running_agents[session_key] is fresh_agent
+        assert cm.get_entry(new_entry.clarify_id) is new_entry
+        assert not new_entry.event.is_set()
+
+        assert cm.resolve_gateway_clarify(new_entry.clarify_id, "new") is True
+        assert new_waiter.result(timeout=2.0) == "new"
+
+
+def test_turn_runner_old_unwind_preserves_new_generation_clarify():
+    """TurnRunner's real finally clears only the turn that is unwinding."""
+    from gateway.run import TurnRunner
+    from gateway.turn_context import TurnContext
+    from tools import clarify_gateway as cm
+
+    old_run_started = threading.Event()
+    allow_old_unwind = threading.Event()
+
+    class _OldTurnAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.session_id = kwargs["session_id"]
+            self.tools = []
+            self.context_compressor = SimpleNamespace(
+                last_prompt_tokens=0,
+                context_length=200_000,
+            )
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+
+        def run_conversation(self, _message, **_kwargs):
+            old_run_started.set()
+            assert allow_old_unwind.wait(2.0)
+            return {
+                "final_response": "old turn finished",
+                "failed": False,
+                "messages": [],
+            }
+
+    runner = MagicMock()
+    runner.config = SimpleNamespace(streaming=None)
+    runner._provider_routing = {}
+    runner._agent_cache_lock = None
+    runner._agent_cache = {}
+    runner._session_db = None
+    runner._prefill_messages = None
+    runner._pending_model_notes = {}
+    runner._pending_skills_reload_notes = {}
+    runner.session_store._entries = {}
+    runner._running = True
+    runner._draining = False
+    runner._get_system_prompt_for_channel.return_value = None
+    runner._resolve_session_agent_runtime.return_value = ("test-model", {})
+    runner._resolve_session_reasoning_config.return_value = None
+    runner._resolve_session_service_tier.return_value = None
+    runner._resolve_turn_agent_config.return_value = {
+        "model": "test-model",
+        "runtime": {},
+    }
+    runner._agent_config_signature.return_value = ("test-signature",)
+    runner._extract_cache_busting_config.return_value = {}
+    runner._refresh_fallback_model.return_value = None
+    runner._consume_pending_native_image_paths.return_value = []
+    runner._consume_pending_turn_sidecar_notes.return_value = []
+    runner._is_telegram_topic_lane.return_value = False
+    runner._is_discord_auto_thread_lane.return_value = False
+    runner._is_relay_discord_channel_lane.return_value = False
+
+    session_key = build_session_key(_source())
+    ctx = TurnContext(
+        source=_source(),
+        message="old turn",
+        history=[],
+        session_id="old-session",
+        session_key=session_key,
+        run_generation=1,
+        user_config={},
+        AIAgent=_OldTurnAgent,
+        resolve_display_setting=lambda *_args: False,
+        _run_still_current=lambda: False,
+        _hooks_ref=SimpleNamespace(loaded_hooks=False),
+    )
+    old_entry = cm.register(
+        "turn-runner-old-pending",
+        session_key,
+        "Old prompt",
+        ["old"],
+        run_generation=1,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        old_run = pool.submit(TurnRunner(runner, ctx).run_sync)
+        try:
+            assert old_run_started.wait(2.0)
+            new_entry = cm.register(
+                "turn-runner-new-pending",
+                session_key,
+                "New prompt",
+                ["new"],
+                run_generation=2,
+            )
+            new_waiter = pool.submit(
+                cm.wait_for_response,
+                new_entry.clarify_id,
+                5.0,
+            )
+            _wait_until_waiter_started(new_entry)
+        finally:
+            allow_old_unwind.set()
+
+        assert old_run.result(timeout=2.0)["final_response"] == "old turn finished"
+        assert old_entry.event.is_set()
+        assert cm.get_entry(old_entry.clarify_id) is None
+        assert cm.get_entry(new_entry.clarify_id) is new_entry
+        assert not new_entry.event.is_set()
+        assert cm.resolve_gateway_clarify(new_entry.clarify_id, "new") is True
+        assert new_waiter.result(timeout=2.0) == "new"
+
+
 def test_idle_reset_exact_boundary_then_invalidates_before_rotation(tmp_path):
     """Idle policy remains strict-greater-than and clears on the first due tick."""
     from tools import clarify_gateway as cm

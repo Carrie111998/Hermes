@@ -990,14 +990,18 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     return response
 
 
-def _clear_pending_clarify_session(session_key: str) -> int:
-    """Invalidate one session's clarify callbacks and wake unresolved waiters."""
+def _clear_pending_clarify_session(
+    session_key: str,
+    *,
+    run_generation: Optional[int] = None,
+) -> int:
+    """Invalidate matching clarify callbacks and wake unresolved waiters."""
     if not session_key:
         return 0
     try:
         from tools.clarify_gateway import clear_session
 
-        return int(clear_session(session_key))
+        return int(clear_session(session_key, run_generation=run_generation))
     except Exception:
         logger.debug(
             "Failed to clear clarify state for %s", session_key, exc_info=True
@@ -6152,6 +6156,7 @@ class TurnRunner:
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                run_generation=ctx.run_generation,
                 **_clarify_binding_kwargs,
             )
             # Bracket registration with the liveness check. If shutdown raced
@@ -6674,7 +6679,10 @@ class TurnRunner:
             # completion, gateway shutdown).  Idempotent.
             try:
                 from tools.clarify_gateway import clear_session as _clear_clarify_session
-                _clear_clarify_session(_approval_session_key)
+                _clear_clarify_session(
+                    _approval_session_key,
+                    run_generation=ctx.run_generation,
+                )
             except Exception:
                 pass
             reset_current_session_key(_approval_session_token)
@@ -19084,7 +19092,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            self._release_running_agent_state(
+                _quick_key,
+                clarify_run_generation=_run_generation,
+            )
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
@@ -27469,6 +27480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         *,
         run_generation: Optional[int] = None,
+        clarify_run_generation: Any = _UNSET,
     ) -> bool:
         """Pop ALL per-running-agent state entries for ``session_key``.
 
@@ -27495,11 +27507,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return False
-        # Wake any clarify waiter before releasing or replacing the running
-        # turn.  This is deliberately before the generation guard: a stale
-        # unwind must not clobber a newer turn's slot, but its old session-
-        # scoped prompt still cannot survive completion/close/rotation.
-        _clear_pending_clarify_session(session_key)
+        # Wake this turn's clarify waiter before releasing its slot.  A stale
+        # unwind still owns cleanup of its own prompt, but must not cancel a
+        # newer generation's prompt on the same routing key.  Callers that
+        # omit both generation arguments are true session boundaries and keep
+        # the legacy clear-all behavior.
+        if clarify_run_generation is _UNSET:
+            clarify_run_generation = run_generation
+        _clear_pending_clarify_session(
+            session_key,
+            run_generation=clarify_run_generation,
+        )
         if run_generation is not None and not self._is_session_run_current(
             session_key, run_generation
         ):

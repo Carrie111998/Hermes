@@ -93,6 +93,7 @@ class _ClarifyEntry:
     question: str
     choices: Optional[List[str]]
     multi_select: bool = False
+    run_generation: Optional[int] = None
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
@@ -135,6 +136,7 @@ def register(
     choices: Optional[List[str]],
     multi_select: bool = False,
     *,
+    run_generation: Optional[int] = None,
     origin: Optional[ClarifyOrigin] = None,
     session_id: Optional[str] = None,
     active_session_transaction: Optional[
@@ -169,6 +171,7 @@ def register(
         question=question,
         choices=list(choices) if choices else None,
         multi_select=bool(multi_select) and bool(choices),
+        run_generation=run_generation,
         awaiting_text=not bool(choices),
         binding=binding,
         active_session_transaction=active_session_transaction,
@@ -780,14 +783,23 @@ def has_pending(session_key: str) -> bool:
         return any(_entries.get(cid) is not None for cid in ids)
 
 
-def clear_session(session_key: str) -> int:
-    """Resolve and drop every pending clarify for a session.
+def clear_session(
+    session_key: str,
+    *,
+    run_generation: Optional[int] = None,
+) -> int:
+    """Resolve and drop matching pending clarifies for a session.
 
     Used by session-boundary cleanup (e.g. ``/new``, gateway shutdown,
     cached-agent eviction) so blocked agent threads don't hang past the
     end of their session.  Returns the number of entries actually
     cancelled (i.e. whose event had not yet been set).  Already-resolved
     entries are dropped from the registry but their response is preserved.
+
+    When ``run_generation`` is provided, only entries owned by that turn are
+    cleared.  This lets an old turn unwind after a replacement turn has begun
+    without cancelling the replacement's prompt.  Omitting it remains the
+    conversation-boundary operation and clears every generation.
 
     First-writer-wins: an entry whose event is already set has been resolved
     by a real response (button callback or text intercept).  Session cleanup
@@ -796,8 +808,24 @@ def clear_session(session_key: str) -> int:
     user answered.  Only unresolved entries are cancelled here.
     """
     with _lock:
-        ids = list(_session_index.pop(session_key, []) or [])
-        entries = [_entries.pop(cid, None) for cid in ids]
+        ids = list(_session_index.get(session_key, []) or [])
+        entries = []
+        retained_ids = []
+        for cid in ids:
+            entry = _entries.get(cid)
+            if entry is None:
+                continue
+            if (
+                run_generation is not None
+                and entry.run_generation != run_generation
+            ):
+                retained_ids.append(cid)
+                continue
+            entries.append(_entries.pop(cid))
+        if retained_ids:
+            _session_index[session_key] = retained_ids
+        else:
+            _session_index.pop(session_key, None)
         # The mutation loop must stay inside the lock: the pop above and the
         # event.is_set() check below have to be atomic with respect to
         # resolve_gateway_clarify, or a button callback could win between the
