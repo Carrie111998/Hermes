@@ -38,6 +38,7 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
+from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -512,15 +513,9 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
 
 
 def _is_openai_codex_backend(agent) -> bool:
-    base_url_lower = str(getattr(agent, "_base_url_lower", "") or "")
-    base_url_hostname = str(getattr(agent, "_base_url_hostname", "") or "")
-    return (
-        getattr(agent, "provider", None) == "openai-codex"
-        or (
-            base_url_hostname == "chatgpt.com"
-            and "/backend-api/codex" in base_url_lower
-        )
-    )
+    from agent.codex_responses_adapter import classify_responses_route
+
+    return classify_responses_route(agent).is_codex_backend
 
 
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
@@ -576,6 +571,24 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     if agent.provider_data_collection:
         preferences["data_collection"] = agent.provider_data_collection
     return preferences
+
+
+def _prompt_cache_scope_for_agent(agent) -> "str | None":
+    """Rotation-stable logical cache scope for *agent*, or None.
+
+    Guarded-import wrapper over the never-raising
+    ``agent.prompt_cache_scope.resolve_prompt_cache_scope_safe`` — the
+    transports treat a None/empty value as "fall back to the physical
+    session_id", so any resolution failure degrades to pre-#79017 behavior
+    instead of blocking the request build.
+    """
+    try:
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
+
+        return resolve_prompt_cache_scope_safe(agent)
+    except Exception:
+        logger.debug("prompt-cache scope resolution failed", exc_info=True)
+        return None
 
 
 def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dict:
@@ -712,6 +725,34 @@ def _reset_stale_streak(agent) -> None:
         agent._consecutive_stale_streams = 0
     except Exception:
         pass
+
+
+_INTERRUPTED_WAIT_STALE_SECONDS = 30.0
+
+
+def _record_interrupted_provider_wait(
+    agent,
+    elapsed: float,
+    *,
+    response_started: bool,
+) -> bool:
+    """Count a user-aborted pre-response stall toward the stale breaker.
+
+    Interactive users commonly send a follow-up while a provider is wedged.
+    Once the same no-output interval that earns a wait notice has elapsed, that
+    interrupt is evidence of an unresponsive attempt rather than a quick user
+    cancellation. Mid-response and early interrupts remain neutral.
+    """
+    if response_started or elapsed < _INTERRUPTED_WAIT_STALE_SECONDS:
+        return False
+    _bump_stale_streak(agent)
+    logger.warning(
+        "Interrupted provider wait counted as stale after %.0fs with no output; "
+        "consecutive stale attempts=%d.",
+        elapsed,
+        _stale_streak(agent),
+    )
+    return True
 
 
 def _report_stale_nonstream_kill(
@@ -1732,6 +1773,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
             break
 
         if agent._interrupt_requested:
+            _record_interrupted_provider_wait(
+                agent,
+                _elapsed,
+                response_started=(
+                    _codex_watchdog_enabled
+                    and getattr(agent, "_codex_stream_last_event_ts", None) is not None
+                ),
+            )
             # Mark THIS request cancelled before force-closing so the worker's
             # exception handler recognizes the forced transport error as a
             # cancel and exits cleanly instead of surfacing a network error or
@@ -1815,20 +1864,19 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             guardrail_config=guardrail,
         )
 
+    # Rotation-stable logical cache scope, shared by every OpenAI-wire branch
+    # below (codex + both chat_completions paths). Memoized on the agent —
+    # cheap after the first call. Resolved after the anthropic/bedrock early
+    # returns above, which don't use prompt_cache_key.
+    _cache_scope_id = _prompt_cache_scope_for_agent(agent)
+
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
-        is_github_responses = (
-            base_url_host_matches(agent.base_url, "models.github.ai")
-            or base_url_host_matches(agent.base_url, "githubcopilot.com")
+        from agent.codex_responses_adapter import classify_responses_route
+
+        is_codex_backend, is_xai_responses, is_github_responses = (
+            classify_responses_route(agent)
         )
-        is_codex_backend = (
-            agent.provider == "openai-codex"
-            or (
-                agent._base_url_hostname == "chatgpt.com"
-                and "/backend-api/codex" in agent._base_url_lower
-            )
-        )
-        is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
 
         # Native server-side compaction (gpt-5.6 on direct OpenAI API /
@@ -1880,6 +1928,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
+            cache_scope_id=_cache_scope_id,
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
@@ -1989,6 +2038,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             reasoning_config=agent.reasoning_config,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
+            cache_scope_id=_cache_scope_id,
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
@@ -2021,6 +2071,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         reasoning_config=agent.reasoning_config,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
+        cache_scope_id=_cache_scope_id,
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=_is_nous,
@@ -2129,12 +2180,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # a DB-side pad can't survive ``_rows_to_conversation``'s whitespace strip
     # anyway.  Repair belongs at the send boundary, once.
 
-    msg = {
+    msg = stamp_message_timestamp({
         "role": "assistant",
         "content": _san_content,
         "reasoning": reasoning_text,
         "finish_reason": finish_reason,
-    }
+    })
 
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
     if raw_reasoning_content is None and hasattr(assistant_message, "model_extra"):
@@ -2358,6 +2409,41 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
         return "nous_token_missing"
     return None
 
+
+def _fallback_reason_text(reason: "FailoverReason | None") -> str:
+    """Return a concise operator-facing explanation for a fallback switch."""
+    if reason is None:
+        return "provider failure"
+    labels = {
+        FailoverReason.auth: "authentication failed",
+        FailoverReason.auth_permanent: "authentication permanently failed",
+        FailoverReason.billing: "billing or quota exhausted",
+        FailoverReason.rate_limit: "rate limit",
+        FailoverReason.upstream_rate_limit: "upstream model rate limit",
+        FailoverReason.overloaded: "provider overloaded",
+        FailoverReason.server_error: "provider server error",
+        FailoverReason.timeout: "request timeout",
+        FailoverReason.ssl_cert_verification: "TLS certificate verification failed",
+        FailoverReason.context_overflow: "context window exceeded",
+        FailoverReason.payload_too_large: "request payload too large",
+        FailoverReason.image_too_large: "image payload too large",
+        FailoverReason.model_not_found: "model not found",
+        FailoverReason.provider_policy_blocked: "provider policy blocked the request",
+        FailoverReason.content_policy_blocked: "content policy blocked the request",
+        FailoverReason.format_error: "request format rejected",
+        FailoverReason.invalid_encrypted_content: "encrypted reasoning state rejected",
+        FailoverReason.multimodal_tool_content_unsupported: "multimodal tool content unsupported",
+        FailoverReason.thinking_signature: "thinking signature rejected",
+        FailoverReason.long_context_tier: "long-context tier unavailable",
+        FailoverReason.oauth_long_context_beta_forbidden: "OAuth long-context beta unavailable",
+        FailoverReason.llama_cpp_grammar_pattern: "grammar pattern rejected",
+        FailoverReason.unknown: "provider failure",
+    }
+    label = labels.get(reason)
+    if label:
+        return label
+    value = getattr(reason, "value", None)
+    return str(value or reason or "provider failure").replace("_", " ")
 
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
@@ -2588,6 +2674,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
+        # Read from the fallback entry so the flag travels with the active
+        # provider; restore_primary_runtime will revert it from the snapshot.
+        agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -2746,20 +2836,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
+        notice = (
+            f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
+            f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
         )
-        # The buffered line above is dropped on successful recovery, but a
-        # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
+        # The buffered switch is surfaced on terminal failure. A successful
+        # fallback clears retry chatter, so retain every switch as a durable
+        # one-shot notice for _emit_pending_fallback_notice (run_agent.py).
+        agent._buffer_status(notice)
+        pending = getattr(agent, "_pending_fallback_notice", None)
+        if isinstance(pending, list):
+            pending.append(notice)
+        elif pending:
+            agent._pending_fallback_notice = [str(pending), notice]
+        else:
+            agent._pending_fallback_notice = [notice]
+        # ``_fallback_activated`` is also reused by temporary `/model --once`
+        # restoration. Keep separate provenance so the restore path only emits
+        # a fallback-recovery notice after an actual provider fallback.
+        agent._provider_fallback_active = True
+        agent._provider_fallback_route = (str(fb_model), str(fb_provider))
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
@@ -2780,8 +2876,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    agent._safe_print(
-        f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    if getattr(agent, "suppress_status_output", False):
+        # Strict machine-readable mode (hermes chat -Q, oneshot, background
+        # review): keep diagnostics out of stdout so wrappers receive only
+        # the final assistant content (#93220 class). Note: plain quiet_mode
+        # is NOT the right gate — the interactive CLI runs quiet_mode=True by
+        # default and should still see this warning.
+        logger.warning(warning)
+    else:
+        agent._safe_print(warning)
+
+    summary_request = (
+        "You've reached the maximum number of tool-calling iterations allowed. "
+        "Please provide a final response summarizing what you've found and accomplished so far, "
+        "without calling any more tools."
     )
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
@@ -2812,7 +2921,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
 
     summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
-    messages.append({"role": "user", "content": summary_request})
+    append_message(messages, {"role": "user", "content": summary_request})
 
     try:
         # Build API messages, stripping internal-only fields
@@ -3035,7 +3144,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
             if final_response:
                 summary_call_outcome = "success"
-                messages.append({"role": "assistant", "content": final_response})
+                append_message(
+                    messages,
+                    {"role": "assistant", "content": final_response},
+                )
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
         else:
@@ -3097,7 +3209,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
                 if final_response:
                     summary_call_outcome = "success"
-                    messages.append({"role": "assistant", "content": final_response})
+                    append_message(
+                        messages,
+                        {"role": "assistant", "content": final_response},
+                    )
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
             else:
@@ -3290,7 +3405,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # events wedges the thread forever. on_event stamps this on EVERY
         # yielded Bedrock event (text/tool/metadata) — the poll loop below
         # trips a watchdog when the gap exceeds the stale timeout.
-        _bedrock_last_event = {"t": time.time()}
+        _bedrock_started_at = time.time()
+        _bedrock_last_event = {"t": _bedrock_started_at}
+        _bedrock_response_started = {"yes": False}
         # Region captured for the poll-loop client eviction below.  Read
         # (not popped) here so the worker's own pop inside _bedrock_call still
         # resolves the same value.
@@ -3359,15 +3476,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     return raw_response.get("stream", [])
 
                 def _on_text(text):
+                    _bedrock_response_started["yes"] = True
                     _fire_first()
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
+                    _bedrock_response_started["yes"] = True
                     _fire_first()
                     agent._fire_tool_gen_started(name)
 
                 def _on_reasoning(text):
+                    _bedrock_response_started["yes"] = True
                     _fire_first()
                     agent._fire_reasoning_delta(text)
 
@@ -3446,6 +3566,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             while t.is_alive():
                 t.join(timeout=0.3)
                 if agent._interrupt_requested:
+                    _record_interrupted_provider_wait(
+                        agent,
+                        time.time() - _bedrock_started_at,
+                        response_started=_bedrock_response_started["yes"],
+                    )
                     # #81521 (sibling of the main streaming-path fix): give
                     # the Bedrock worker a bounded window to unwind its
                     # Relay-managed stream scopes before surfacing
@@ -3512,6 +3637,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Bedrock path — mirrors the post-worker guard on the main streaming
             # loop. (#59999 area)
             if agent._interrupt_requested:
+                _record_interrupted_provider_wait(
+                    agent,
+                    time.time() - _bedrock_started_at,
+                    response_started=_bedrock_response_started["yes"],
+                )
                 raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
             if result["error"] is not None:
                 raise result["error"]
@@ -4055,8 +4185,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
-            if delta and delta.content:
-                content_parts.append(delta.content)
+            delta_content = getattr(delta, "content", None)
+            if delta_content:
+                content_parts.append(delta_content)
                 if not tool_calls_acc:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
                         pending_text_parts.append(delta.content)
@@ -4066,7 +4197,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta.content)
+                    agent._fire_stream_delta(delta_content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
@@ -4081,17 +4212,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
+                        agent.stream_delta_callback(delta_content)
+                        agent._record_streamed_assistant_text(delta_content)
                     except Exception:
                         pass
 
             # Accumulate tool call deltas — notify display on first name
-            if delta and delta.tool_calls:
+            delta_tool_calls = getattr(delta, "tool_calls", None)
+            if delta_tool_calls:
                 _flush_pending_stream_text()
-                for tc_delta in delta.tool_calls:
-                    raw_idx = tc_delta.index if tc_delta.index is not None else 0
-                    delta_id = tc_delta.id or ""
+                for tc_delta in delta_tool_calls:
+                    raw_index = getattr(tc_delta, "index", None)
+                    raw_idx = raw_index if raw_index is not None else 0
+                    delta_id = getattr(tc_delta, "id", None) or ""
 
                     # Ollama fix: detect a new tool call reusing the same
                     # raw index (different id) and redirect to a fresh slot.
@@ -4110,7 +4243,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
                     if idx not in tool_calls_acc:
                         # Poolside may send integer id instead of string
-                        _tc_id = tc_delta.id
+                        _tc_id = getattr(tc_delta, "id", None)
                         if isinstance(_tc_id, int):
                             _tc_id = str(_tc_id)
                         tool_calls_acc[idx] = {
@@ -4120,14 +4253,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "extra_content": None,
                         }
                     entry = tool_calls_acc[idx]
-                    if tc_delta.id is not None:
-                        _new_id = tc_delta.id
+                    tc_id = getattr(tc_delta, "id", None)
+                    if tc_id is not None:
+                        _new_id = tc_id
                         if isinstance(_new_id, int):
                             _new_id = str(_new_id)
                         if _new_id:
                             entry["id"] = _new_id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
+                    tc_function = getattr(tc_delta, "function", None)
+                    if tc_function:
+                        function_name = getattr(tc_function, "name", None)
+                        if function_name:
                             # Use assignment, not +=.  Function names are
                             # atomic identifiers delivered complete in the
                             # first chunk (OpenAI spec).  Some providers
@@ -4136,9 +4272,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # produce "read_fileread_file".  Assignment
                             # (matching the OpenAI Node SDK / LiteLLM /
                             # Vercel AI patterns) is immune to this.
-                            entry["function"]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            entry["function"]["arguments"] += tc_delta.function.arguments
+                            entry["function"]["name"] = function_name
+                        function_arguments = getattr(tc_function, "arguments", None)
+                        if function_arguments:
+                            entry["function"]["arguments"] += function_arguments
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
@@ -4164,8 +4301,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # discarding the attempted action.
                         result["partial_tool_names"].append(name)
 
-            if chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
+            chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+            if chunk_finish_reason:
+                finish_reason = chunk_finish_reason
 
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
@@ -5091,6 +5229,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
         if agent._interrupt_requested:
+            # The stale branch above already counted this iteration when its
+            # deadline won the race; do not double-count a simultaneous stop.
+            if _stale_elapsed <= _stream_stale_timeout:
+                _record_interrupted_provider_wait(
+                    agent,
+                    _stale_elapsed,
+                    response_started=deltas_were_sent["yes"],
+                )
             # Mark THIS request cancelled before force-closing so the worker's
             # exception handler recognizes the forced transport error as a
             # cancel and exits without retrying or surfacing a network error.
