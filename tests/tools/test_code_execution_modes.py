@@ -246,10 +246,18 @@ class TestExecuteCodeModeIntegration(unittest.TestCase):
         return json.loads(raw)
 
     def test_strict_mode_runs_in_tmpdir(self):
-        """Strict mode: script's os.getcwd() is the staging tmpdir."""
+        """Strict mode: script's os.getcwd() is a staging tmpdir, never the
+        session cwd. Behavior contract, not a prefix snapshot: the per-call
+        path stages in hermes_sandbox_*, the session kernel in
+        hermes_kernel_* — either satisfies strict mode's isolation promise."""
         result = self._run("import os; print(os.getcwd())", mode="strict")
         self.assertEqual(result["status"], "success")
-        self.assertIn("hermes_sandbox_", result["output"])
+        cwd = result["output"].strip()
+        self.assertTrue(
+            "hermes_sandbox_" in cwd or "hermes_kernel_" in cwd,
+            f"strict-mode cwd is not a staging tmpdir: {cwd!r}",
+        )
+        self.assertNotEqual(os.path.realpath(cwd), os.path.realpath(os.getcwd()))
 
 
     def test_project_mode_interpreter_is_venv_python(self):
