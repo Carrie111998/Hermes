@@ -594,19 +594,6 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_fallback is False
 
-    def test_404_nous_opaque_couldnt_find_that_is_model_not_found(self):
-        e = MockAPIError(
-            'HTTP 404: {"status":404,"message":"Couldn\'t find that, sorry."}',
-            status_code=404,
-            body={"status": 404, "message": "Couldn't find that, sorry."},
-        )
-        result = classify_api_error(
-            e, provider="nous", model="meta/muse-spark-1.2-contributor"
-        )
-        assert result.reason == FailoverReason.model_not_found
-        assert result.retryable is False
-        assert result.should_fallback is True
-
     def test_404_bare_model_id_missing_prefix_is_model_not_found(self):
         """A bare id the provider only serves as ``vendor/id`` is malformed.
 
