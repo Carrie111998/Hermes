@@ -7165,6 +7165,10 @@ def _rebuild_desktop_after_update(
         skip_desktop_build = False
     if skip_desktop_build:
         print("  ✓ Desktop app up to date")
+        # Keep the launcher self-healing even when the Electron artifact did
+        # not need rebuilding. A stale Linux desktop entry can otherwise keep
+        # invoking a retired Python wrapper after an update.
+        _m()._register_linux_desktop_entry()
         return True
 
     desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
