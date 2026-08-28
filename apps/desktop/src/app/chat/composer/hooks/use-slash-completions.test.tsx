@@ -159,6 +159,34 @@ describe('useSlashCompletions', () => {
     expect(items[0]?.description).toBe('Run a prompt in the background')
   })
 
+  it('waits for an in-flight catalog before canonicalizing alias results', async () => {
+    let resolveCatalog!: (catalog: CommandsCatalogLike) => void
+    const catalogPromise = new Promise<CommandsCatalogLike>(resolve => {
+      resolveCatalog = resolve
+    })
+    const request = vi.fn().mockImplementation((method: string) =>
+      method === 'commands.catalog'
+        ? catalogPromise
+        : Promise.resolve({ items: [{ text: '/btw ', display: '/btw', meta: 'Run a prompt in the background' }] })
+    )
+    const api = harness({ request } as unknown as HermesGateway)
+
+    await act(async () => {
+      api.search('bt')
+      await new Promise(resolve => setTimeout(resolve, 120))
+    })
+    expect(request).toHaveBeenCalledWith('complete.slash', { text: '/bt' })
+
+    await act(async () => {
+      resolveCatalog(ALIAS_CATALOG)
+      await Promise.resolve()
+    })
+    const items = api.search('bt')
+
+    expect(commandsOf(items)).toEqual(['/background'])
+    expect(items[0]?.label).toBe('background (btw)')
+  })
+
   it('matches aliases case-insensitively', () => {
     rememberDesktopCommandsCatalog(ALIAS_CATALOG)
 

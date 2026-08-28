@@ -230,6 +230,18 @@ export function useSlashCompletions(options: {
           return { items, query }
         }
 
+        // Start the catalog and completion requests together. Dynamic aliases
+        // live in the catalog, so command-row canonicalization must wait for
+        // that shared warm-up; otherwise a fast complete.slash response can
+        // briefly render `/btw` instead of `/background (btw)`. A catalog
+        // failure still leaves ordinary completions usable and retryable.
+        const catalogReady = cachedSlashCompletion('catalog', () =>
+          gateway.request<CommandsCatalogLike>('commands.catalog')
+        )
+          .then(catalog => {
+            filterDesktopCommandsCatalog(catalog)
+          })
+          .catch(() => undefined)
         const result = await cachedSlashCompletion(`slash:${text.toLowerCase()}`, () =>
           gateway.request<{ items?: CompletionEntry[]; replace_from?: number }>('complete.slash', { text })
         )
@@ -241,6 +253,10 @@ export function useSlashCompletions(options: {
         const replaceFrom = typeof result.replace_from === 'number' ? result.replace_from : 1
         const isArgCompletion = replaceFrom > 1
         const prefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
+
+        if (!isArgCompletion) {
+          await catalogReady
+        }
 
         const completionItems = isArgCompletion
           ? (result.items ?? [])
