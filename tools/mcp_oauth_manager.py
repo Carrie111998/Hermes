@@ -524,6 +524,19 @@ def _make_hermes_provider_class() -> Optional[type]:
             )
             return True
 
+        def _normalize_auth_server_url(self) -> None:
+            """Google's PRM lists ``https://accounts.google.com/`` while its AS
+            metadata issuer is ``https://accounts.google.com``; the SDK compares
+            them as plain strings (RFC 8414 §3.3), so drop the slash of a bare
+            origin before the SDK validates."""
+            url = self.context.auth_server_url
+            if not url or not url.endswith("/"):
+                return
+            from urllib.parse import urlparse
+
+            if urlparse(url).path == "/":
+                self.context.auth_server_url = url.rstrip("/")
+
         @staticmethod
         def _synthetic_unauthorized(incoming):
             from tools.mcp_tool import sdk_httpx
@@ -570,6 +583,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                     await self._maybe_flag_poisoned_client(incoming)
                     if self._needs_forced_authorization(request, outgoing, incoming):
                         incoming = self._synthetic_unauthorized(incoming)
+                    self._normalize_auth_server_url()
                     outgoing = await inner.asend(incoming)
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the

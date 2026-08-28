@@ -86,3 +86,42 @@ async def test_non_interactive_no_token_200_passes_through(tmp_path, monkeypatch
     outbound = await flow.__anext__()
     with pytest.raises(StopAsyncIteration):
         await flow.asend(httpx.Response(200, request=outbound))
+
+
+class _AuthorizeReached(Exception):
+    pass
+
+
+async def _stop_callback() -> tuple[str, str | None]:
+    raise _AuthorizeReached()
+
+
+@pytest.mark.asyncio
+async def test_trailing_slash_authorization_server_matches_issuer(tmp_path, monkeypatch):
+    from tools.mcp_tool import sdk_httpx
+    from tools.mcp_oauth import force_interactive_oauth
+
+    httpx = sdk_httpx()
+    provider = await _make_provider(tmp_path, monkeypatch)
+    provider.context.callback_handler = _stop_callback
+
+    prm = {
+        "resource": "https://example.com/mcp",
+        "authorization_servers": ["https://accounts.google.com/"],
+    }
+    asm = {
+        "issuer": "https://accounts.google.com",
+        "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_endpoint": "https://oauth2.googleapis.com/token",
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+    }
+    with force_interactive_oauth():
+        flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
+        outbound = await flow.__anext__()
+        prm_req = await flow.asend(httpx.Response(200, request=outbound))
+        asm_req = await flow.asend(httpx.Response(200, request=prm_req, json=prm))
+        assert "oauth-authorization-server" in str(asm_req.url)
+        with pytest.raises(_AuthorizeReached):
+            await flow.asend(httpx.Response(200, request=asm_req, json=asm))
+    assert provider.context.auth_server_url == "https://accounts.google.com"
