@@ -392,7 +392,12 @@ class HostedRoomRuntime:
         if binding is None:
             raise state.RoomUnavailableError("hosted room is unavailable")
         lease = self._ensure_lease(binding)
-        inspection = self._inspect_recovery_session(binding, task)
+        transport = self._transport_for(binding, task)
+        inspection = (
+            self._inspect_local_recovery_session(task)
+            if transport is self.rpc
+            else self._inspect_recovery_session(binding, task)
+        )
         if inspection.terminal is not None:
             resolved = state.resolve_indeterminate_task(
                 self.db_path,
@@ -1155,7 +1160,12 @@ class HostedRoomRuntime:
         for task in running:
             if task["run_process_generation"] == self.process_generation:
                 continue
-            inspection = self._inspect_recovery_session(binding, task)
+            transport = self._transport_for(binding, task)
+            inspection = (
+                self._inspect_local_recovery_session(task)
+                if transport is self.rpc
+                else self._inspect_recovery_session(binding, task)
+            )
             if inspection.terminal is not None:
                 self._harvest_previous_attempt(binding, task, inspection.terminal)
             elif inspection.active:
@@ -1206,6 +1216,41 @@ class HostedRoomRuntime:
                 status=str(info.get("status") or "") or None,
             )
 
+    def _inspect_local_recovery_session(
+        self,
+        task: Mapping[str, Any],
+    ) -> _RecoveryInspection:
+        """Check only live process state before an explicit local retry.
+
+        A dashboard restart loses the hosted terminal callback identity. Fully
+        resuming the hidden session here can hydrate a huge transcript and
+        auto-continue work before the user confirms Retry. The durable task is
+        already indeterminate, so only an exact still-live in-memory attempt
+        blocks a new fenced generation.
+        """
+
+        profile = task["payload"]["target_profile"]
+        with self.turn_lock(profile):
+            session = self.rpc.resolve_exact(
+                profile=profile,
+                title=room_session_title(task["identity"].room_id),
+                source=ROOM_SESSION_SOURCE,
+            )
+            if session is None:
+                return _RecoveryInspection(terminal=None, active=False, status=None)
+            session_id = _session_id(session)
+            info = self.rpc.info(
+                profile=profile,
+                session_id=session_id,
+                source=ROOM_SESSION_SOURCE,
+            )
+            self._report_pending_action(task, session_id=session_id, info=info)
+            return _RecoveryInspection(
+                terminal=None,
+                active=_info_is_active_for(info, task["identity"]),
+                status=str(info.get("status") or "") or None,
+            )
+
     def _reconcile_indeterminate(
         self,
         binding: HostedRoomBinding,
@@ -1228,6 +1273,10 @@ class HostedRoomRuntime:
                 # reconciles the exact task.
                 return True
         for task in unresolved:
+            if self._transport_for(binding, task) is self.rpc:
+                with self._status_lock:
+                    self._blocked_rooms.add(binding.room_id)
+                return True
             inspection = self._inspect_recovery_session(binding, task)
             if inspection.status == "cancelled":
                 state.resolve_indeterminate_cancellation(

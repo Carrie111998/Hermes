@@ -722,7 +722,7 @@ def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
     }
 
 
-def test_crash_recovery_harvests_existing_terminal_receipt(db: Path):
+def test_peer_crash_recovery_harvests_existing_terminal_receipt(db: Path):
     identity = _identity()
     old_lease = state.acquire_lease(
         db,
@@ -742,32 +742,22 @@ def test_crash_recovery_harvests_existing_terminal_receipt(db: Path):
         clock=time.time,
     )
     rpc = FakeSessionRPC(auto_complete=False)
-    rpc.add_session(
+    peer = TerminalPeerClient(
         task_id=identity.task_id,
-        history=[
-            {
-                "role": "assistant",
-                "task_id": identity.task_id,
-                "execution_generation": 1,
-                "status": "settled",
-                "message_id": "reply:recovered",
-                "content": "Recovered durable answer.",
-            }
-        ],
+        execution_generation=1,
     )
     runtime = _runtime(db, rpc)
+    runtime.transport_resolver = _peer_resolver(peer)
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
     assert runtime.stop(timeout=1.0)
 
-    assert state.get_task(db, identity)["result"]["text"] == (
-        "Recovered durable answer."
-    )
+    assert state.get_task(db, identity)["result"]["text"] == "interrupted"
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
-def test_expired_attempt_receipt_is_reconciled_under_current_lease(db: Path):
+def test_expired_local_attempt_requires_explicit_retry_without_hydration(db: Path):
     identity = _identity()
     now = [100.0]
 
@@ -808,12 +798,11 @@ def test_expired_attempt_receipt_is_reconciled_under_current_lease(db: Path):
     runtime = _runtime(db, rpc, clock=clock)
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    _wait_for(lambda: ROOM_ID in runtime.status()["blocked_rooms"])
     assert runtime.stop(timeout=1.0)
 
-    assert state.get_task(db, identity)["result"]["text"] == (
-        "Recovered after lease expiry."
-    )
+    assert state.get_task(db, identity)["status"] == "indeterminate"
+    assert not [call for call in rpc.calls if call[0] in {"resume", "history"}]
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
@@ -964,7 +953,7 @@ def test_retry_cannot_advance_generation_while_original_attempt_is_active(
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
-def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
+def test_local_retry_does_not_resume_or_hydrate_hidden_history(db: Path):
     identity = _identity()
     old_lease = state.acquire_lease(
         db,
@@ -998,34 +987,15 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
 
     rpc = FakeSessionRPC(auto_complete=False)
     stored_id = rpc.add_session(active=False, task_id=identity.task_id)
-    runtime_id = "runtime-session"
-    rpc.states[runtime_id] = rpc.states.pop(stored_id)
-
-    def resume(**kwargs):
-        rpc.calls.append(("resume", dict(kwargs)))
-        return {"session_id": runtime_id}
-
-    observed: dict[str, str] = {}
-    original_history = rpc.history
-    original_info = rpc.info
-
-    def history(**kwargs):
-        observed["history"] = kwargs["session_id"]
-        return original_history(**kwargs)
-
-    def info(**kwargs):
-        observed["info"] = kwargs["session_id"]
-        return original_info(**kwargs)
-
-    rpc.resume = resume
-    rpc.history = history
-    rpc.info = info
     runtime = _runtime(db, rpc)
 
     retried = runtime.retry_indeterminate(identity)
 
     assert retried["status"] == "queued"
-    assert observed == {"history": runtime_id, "info": runtime_id}
+    assert not [call for call in rpc.calls if call[0] in {"resume", "history"}]
+    assert [
+        params["session_id"] for method, params in rpc.calls if method == "info"
+    ] == [stored_id]
 
 
 def test_retry_terminal_reconciliation_clears_blocked_room(db: Path):
@@ -1060,26 +1030,17 @@ def test_retry_terminal_reconciliation_clears_blocked_room(db: Path):
     state.recover_room(db, recovery_lease, clock=time.time)
     state.release_lease(db, recovery_lease, clock=time.time)
     rpc = FakeSessionRPC(auto_complete=False)
-    rpc.add_session(
-        active=False,
+    peer = TerminalPeerClient(
         task_id=identity.task_id,
-        history=[
-            {
-                "role": "assistant",
-                "task_id": identity.task_id,
-                "execution_generation": attempt.execution_generation,
-                "status": "settled",
-                "message_id": "reply:retry-recovered",
-                "content": "Recovered response.",
-            }
-        ],
+        execution_generation=attempt.execution_generation,
     )
     runtime = _runtime(db, rpc)
+    runtime.transport_resolver = _peer_resolver(peer)
     runtime._blocked_rooms.add(ROOM_ID)
 
     settled = runtime.retry_indeterminate(identity)
 
-    assert settled["status"] == "settled"
+    assert settled["status"] == "failed"
     assert ROOM_ID not in runtime.status()["blocked_rooms"]
 
 
