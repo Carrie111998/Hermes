@@ -265,7 +265,7 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
     # a live gateway PID would trip the test-suite kill guard and turn the
     # run into exit 1 (gateway_fleet_restart_incomplete).
     monkeypatch.setattr(
-        "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
+        "hermes_cli.gateway.find_gateway_pids", lambda *a, **kw: [], raising=False
     )
     monkeypatch.setattr(
         "hermes_cli.gateway.find_profile_gateway_processes",
@@ -274,6 +274,15 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         "hermes_cli.gateway.supports_systemd_services", lambda: False, raising=False
+    )
+    # The launchd restart branch is a bare module-global call in
+    # hermes_cli.update_cmd (not routed through _m()), so it must be stubbed
+    # on that namespace — a hermes_cli.main patch would never reach it. On a
+    # launchd-managed install the real function bypasses the HOME/HERMES_HOME
+    # sandbox via pwd.getpwuid and polls launchctl for the full drain budget.
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._restart_macos_launchd_gateways",
+        lambda *a, **k: None,
     )
     return restore_calls, discard_calls, park_calls
 

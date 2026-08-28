@@ -25,12 +25,21 @@ def _isolate_cmd_update(monkeypatch):
     # These tests cover prompt behavior, not module purging or fleet restart.
     # Retain the no-live-gateway stubs so cmd_update cannot rediscover and
     # signal a developer's running gateway after the simulated pull.
+    # _purge_stale_hermes_modules is invoked through _m(), so the
+    # hermes_cli.main patch reaches it; _finish_dashboard_update_cleanup and
+    # _restart_macos_launchd_gateways are bare module globals in
+    # hermes_cli.update_cmd and must be patched on that namespace.
     monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(
-        hermes_main, "_finish_dashboard_update_cleanup", lambda *a, **k: None
+        "hermes_cli.update_cmd._finish_dashboard_update_cleanup",
+        lambda *a, **k: None,
     )
     monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+        "hermes_cli.update_cmd._restart_macos_launchd_gateways",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "find_gateway_pids", lambda *a, **kw: []
     )
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
