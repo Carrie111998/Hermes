@@ -87,6 +87,33 @@ Hermes had no direct mutator to reach for, found the matching project, and
 delegated. The Desktop showed "Work is underway in the matching delegate-wave
 project."
 
+## Desktop toggle live proof
+
+2026-08-28. Desktop v0.20.5 at `2fa6424e42`, using the same isolated C5b
+profile and delegate-wave server:
+
+1. The Safety switch was turned OFF in the UI and Desktop was restarted.
+2. In a fresh conversation, Hermes reported these directly visible mutators:
+   `browser_exec`, `execute_code`, `patch`, `process`, `skill_manage`,
+   `terminal`, and `write_file`.
+3. The Safety switch was turned ON in the UI. No config file was edited by
+   hand. A fresh conversation received an ordinary repository-change request.
+4. The agent log recorded the declared-write filter and natural delegation:
+
+```
+14:12:12 delegate-wave routing on: withholding browser_exec, computer_use,
+         cronjob, execute_code, patch, terminal, write_file (declared write)
+14:12:31 tool mcp__delegate_wave__list_projects completed
+14:12:38 tool mcp__delegate_wave__session_start completed
+```
+
+5. Desktop was restarted again. Settings → Safety visibly reopened with
+   **Route repository changes** ON, proving persistence through the UI's normal
+   profile-scoped config save path.
+
+The proof job `job_8a77ee28-17c1-4b8a-a795-b6bec4b8f11e` was cancelled after
+`session_start`; no implementation was integrated.
+
 ## Traps
 
 - The Desktop resolves its backend Python by search and will happily boot a
