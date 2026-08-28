@@ -355,6 +355,87 @@ class TestFamilyRouting:
         assert result["error_type"] == "modality_unsupported"
 
 
+def test_flux3_keyframe_draft_and_enhance_use_managed_gateway(monkeypatch):
+    """The Hermes-credit workflow must stay on managed fal-queue end to end."""
+    from plugins.video_gen import fal as fal_plugin
+
+    calls = []
+
+    class FakeHandle:
+        request_id = "managed-request-1"
+
+        def __init__(self, result):
+            self._result = result
+
+        def get(self):
+            return self._result
+
+    class ManagedClient:
+        def submit(self, endpoint, arguments=None, headers=None):
+            calls.append({
+                "endpoint": endpoint,
+                "arguments": arguments,
+                "headers": headers,
+            })
+            result = {"video": {"url": "https://managed.example/out.mp4"}}
+            if endpoint.endswith("/draft"):
+                result["draft_cache"] = {
+                    "url": "https://managed.example/draft-cache.bin",
+                }
+            return FakeHandle(result)
+
+    direct_client = Mock()
+    direct_client.submit.side_effect = AssertionError(
+        "Nous selection must not fall back to direct FAL billing"
+    )
+    managed_gateway = object()
+    managed_client = ManagedClient()
+
+    monkeypatch.setattr(fal_plugin, "_check_fal_video_available", lambda: True)
+    monkeypatch.setattr(fal_plugin, "_load_fal_client", lambda: None)
+    monkeypatch.setattr(
+        fal_plugin,
+        "_resolve_managed_fal_video_gateway",
+        lambda: managed_gateway,
+    )
+    monkeypatch.setattr(
+        fal_plugin,
+        "_get_managed_fal_video_client",
+        lambda gateway: managed_client if gateway is managed_gateway else None,
+    )
+    monkeypatch.setattr(fal_plugin, "_fal_client", direct_client)
+
+    provider = fal_plugin.FALVideoGenProvider()
+    draft = provider.generate(
+        "move between frames",
+        model="flux-3",
+        duration=10,
+        draft=True,
+        keyframes=[
+            {"frame_index": 0, "image_url": "https://example.com/a.png"},
+            {"frame_index": 240, "image_url": "https://example.com/b.png"},
+        ],
+    )
+    enhanced = provider.generate(
+        "",
+        model="flux-3",
+        draft_cache_url=draft["draft_cache_url"],
+    )
+
+    assert draft["success"] is True
+    assert enhanced["success"] is True
+    assert [call["endpoint"] for call in calls] == [
+        "blackforestlabs/flux-3/keyframes-to-video/draft",
+        "blackforestlabs/flux-3/draft-enhance",
+    ]
+    assert calls[0]["arguments"]["keyframes"][1]["frame_index"] == 240
+    assert "resolution" not in calls[0]["arguments"]
+    assert calls[1]["arguments"] == {
+        "draft_cache_url": "https://managed.example/draft-cache.bin",
+    }
+    direct_client.submit.assert_not_called()
+
+
 class TestFamilyKeyNormalization:
     def test_full_endpoint_paths_resolve_to_their_own_family(self):
         """A configured endpoint path must resolve to the family that declares
