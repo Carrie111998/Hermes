@@ -59,12 +59,13 @@ def test_read_failure_raises_and_leaves_the_store_alone(store_file, monkeypatch,
     )
 
 
-def test_unparseable_json_still_degrades_and_preserves_a_copy(store_file):
+def test_unparseable_json_enters_read_only_state_and_preserves_a_copy(store_file):
     store_file.write_text("{ not json", encoding="utf-8")
 
-    result = auth._load_auth_store(store_file)
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(store_file)
 
-    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+    assert caught.value.preserved is True
     corrupt = store_file.with_suffix(".json.corrupt")
     assert corrupt.exists(), "genuine corruption must still be preserved"
     assert corrupt.read_text(encoding="utf-8") == "{ not json"
@@ -89,9 +90,10 @@ def test_log_does_not_claim_a_backup_that_was_not_written(
     monkeypatch.setattr(shutil, "copy2", _no_copy)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
-        result = auth._load_auth_store(store_file)
+        with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+            auth._load_auth_store(store_file)
 
-    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+    assert caught.value.preserved is False
     assert not store_file.with_suffix(".json.corrupt").exists()
     text = caplog.text
     assert "could NOT be preserved" in text

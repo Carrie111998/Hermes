@@ -20,6 +20,35 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 
+class AuthStoreCorruptionError(RuntimeError):
+    """The auth store is corrupt and must remain read-only until recovery."""
+
+    def __init__(
+        self,
+        auth_file: Path,
+        corrupt_path: Optional[Path],
+        *,
+        preserved: bool,
+    ) -> None:
+        self.auth_file = auth_file
+        self.path = auth_file
+        self.corrupt_path = corrupt_path
+        self.preserved = preserved
+        super().__init__(
+            f"Corrupt auth store requires explicit recovery: {auth_file}"
+        )
+
+
+class AuthStoreRecoveryRequired(RuntimeError):
+    """An ordinary save cannot replace an unreadable auth store."""
+
+    def __init__(self, auth_file: Path) -> None:
+        self.auth_file = auth_file
+        super().__init__(
+            f"Explicit auth-store recovery is required before replacing {auth_file}"
+        )
+
+
 class _LateBinding:
     """Resolve a facade binding at call time, avoiding an auth import cycle."""
 
@@ -74,6 +103,7 @@ for _late_name in (
 AUTH_STORE_VERSION = 1
 AUTH_LOCK_TIMEOUT_SECONDS = 15.0
 _global_auth_store_cache: Optional[Tuple[str, int, Dict[str, Any]]] = None
+_recovery_state = threading.local()
 # =============================================================================
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
@@ -346,18 +376,22 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             )
         if preserved:
             logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
+                "auth: failed to parse %s (%s); store is read-only. "
                 "Corrupt file preserved at %s",
                 auth_file, exc, corrupt_path,
             )
-        else:
-            # Do not advertise a backup that was never written.
-            logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
-                "A copy could NOT be preserved at %s",
-                auth_file, exc, corrupt_path,
-            )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+            raise AuthStoreCorruptionError(
+                auth_file, corrupt_path, preserved=True
+            ) from exc
+        # Do not advertise a backup that was never written.
+        logger.warning(
+            "auth: failed to parse %s (%s); store is read-only. "
+            "A copy could NOT be preserved at %s",
+            auth_file, exc, corrupt_path,
+        )
+        raise AuthStoreCorruptionError(
+            auth_file, None, preserved=False
+        ) from exc
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
@@ -387,6 +421,13 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    if auth_file.exists() and not getattr(_recovery_state, "enabled", False):
+        try:
+            json.loads(auth_file.read_text(encoding="utf-8-sig"))
+        except OSError:
+            raise
+        except Exception as exc:
+            raise AuthStoreRecoveryRequired(auth_file) from exc
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -433,6 +474,19 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     except OSError:
         pass
     return auth_file
+
+
+def recover_auth_store(
+    auth_store: Dict[str, Any], target_path: Optional[Path] = None
+) -> Path:
+    """Explicitly import a replacement after a corrupt store is reviewed."""
+    auth_file = target_path if target_path is not None else _auth_file_path()
+    previous = getattr(_recovery_state, "enabled", False)
+    _recovery_state.enabled = True
+    try:
+        return _save_auth_store(auth_store, target_path=auth_file)
+    finally:
+        _recovery_state.enabled = previous
 
 
 def _load_provider_state_with_source(

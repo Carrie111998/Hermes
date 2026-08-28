@@ -1128,6 +1128,9 @@ _save_provider_state = _auth_store._public("_save_provider_state")
 _save_provider_state_to_source = _auth_store._public("_save_provider_state_to_source")
 _store_provider_state = _auth_store._public("_store_provider_state")
 _persist_provider_state_to_store = _auth_store._public("_persist_provider_state_to_store")
+AuthStoreCorruptionError = _auth_store.AuthStoreCorruptionError
+AuthStoreRecoveryRequired = _auth_store.AuthStoreRecoveryRequired
+recover_auth_store = _auth_store.recover_auth_store
 _auth_target_lock_holders = {}
 _auth_target_lock_holders_guard = threading.Lock()
 
