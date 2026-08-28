@@ -4,7 +4,15 @@ import type { HermesConnection } from '@/global'
 import { readKey } from '@/lib/storage'
 
 import { $pinnedSessionIds, $sidebarSessionOrderIds, $sidebarSessionOrderManual, pinSession } from './layout'
-import { getRememberedSessionId, setConnection, setRememberedSessionId } from './session'
+import {
+  getRememberedConversation,
+  getRememberedRoute,
+  getRememberedSessionId,
+  setConnection,
+  setRememberedConversation,
+  setRememberedRoute,
+  setRememberedSessionId
+} from './session'
 
 // Two Desktop windows share one renderer origin (and therefore one
 // localStorage area) while each can be connected to a DIFFERENT gateway.
@@ -162,5 +170,37 @@ describe('connection-scoped sidebar lists (#77318)', () => {
 
     setConnection(localConn)
     expect(getRememberedSessionId('default')).toBe('local-session')
+  })
+
+  it('scopes remembered routes and conversation records to the exact connection', () => {
+    setRememberedRoute('/skills', 'default')
+    setRememberedConversation({ kind: 'session', sessionId: 'local-root', version: 1 }, 'default')
+
+    setConnection(remoteA)
+    expect(getRememberedRoute('default')).toBeNull()
+    expect(getRememberedConversation('default')).toBeNull()
+    setRememberedConversation({ kind: 'session', sessionId: 'remote-a-root', version: 1 }, 'default')
+
+    setConnection(remoteB)
+    expect(getRememberedConversation('default')).toBeNull()
+    setRememberedConversation({ kind: 'blank', version: 1 }, 'default')
+
+    setConnection(remoteA)
+    expect(getRememberedConversation('default')).toEqual({ kind: 'session', sessionId: 'remote-a-root', version: 1 })
+
+    setConnection(remoteB)
+    expect(getRememberedConversation('default')).toEqual({ kind: 'blank', version: 1 })
+
+    setConnection(localConn)
+    expect(getRememberedConversation('default')).toEqual({ kind: 'session', sessionId: 'local-root', version: 1 })
+  })
+
+  it('keeps the active remembered-conversation scope during a null reconnect blip', () => {
+    setConnection(remoteA)
+    setRememberedConversation({ kind: 'session', sessionId: 'remote-root', version: 1 }, 'default')
+
+    setConnection(null)
+
+    expect(getRememberedConversation('default')).toEqual({ kind: 'session', sessionId: 'remote-root', version: 1 })
   })
 })

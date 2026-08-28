@@ -45,7 +45,7 @@ export function closeWorkspaceTab(loadSessionIntoWorkspace?: (storedSessionId: s
     return false
   }
 
-  requestFreshSession()
+  requestFreshSession({ cause: 'close-chat', persistence: 'explicit' })
 
   return true
 }

@@ -1,6 +1,7 @@
 import { skillInvocationText } from '@hermes/shared'
 import { type MutableRefObject, useCallback, useRef } from 'react'
 
+import type { FreshSessionDraftOptions } from '@/app/session/hooks/use-session-actions'
 import { getProfiles } from '@/hermes'
 import type { Translations } from '@/i18n'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
@@ -21,6 +22,7 @@ import { setComposerDraft } from '@/store/composer'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
 import { applyGoalStatusText } from '@/store/goals'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
+import { createFreshSessionIntent, promoteAutomaticFreshDraftToExplicit } from '@/store/profile-conversation-restore'
 import { setPetScale } from '@/store/pet-gallery'
 import { $petGenInput, openPetGenerate } from '@/store/pet-generate'
 import {
@@ -148,7 +150,7 @@ interface SlashCommandDeps {
   requestGateway: GatewayRequest
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
-  startFreshSessionDraft: () => void
+  startFreshSessionDraft: (options: FreshSessionDraftOptions) => void
   submitPromptText: (rawText: string, options?: SubmitTextOptions) => Promise<boolean>
   updateSessionState: (
     sessionId: string,
@@ -184,6 +186,13 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
   return useCallback(
     async (rawCommand: string, options?: { sessionId?: string; recordInput?: boolean }) => {
+      // Slash/skill/quick-command dispatch may create a backend session before
+      // it reaches the prompt pipeline. Claim an automatic blank synchronously
+      // at this user-action boundary, including backend-create failure paths.
+      if (!options?.sessionId && !activeSessionIdRef.current && !selectedStoredSessionIdRef.current) {
+        promoteAutomaticFreshDraftToExplicit()
+      }
+
       // Resolve the session this command targets through the SHARED ladder that
       // submit.ts uses. A slash command runs backend commands against a runtime
       // session, and per-session state (`/goal`, `/usage`, `/status`) is keyed by
@@ -492,7 +501,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       // new branch in a dispatch ladder.
       const actionHandlers: Record<DesktopActionId, (ctx: SlashActionCtx) => Promise<void>> = {
         new: async () => {
-          startFreshSessionDraft()
+          startFreshSessionDraft({
+            intent: createFreshSessionIntent({ cause: 'new-chat', persistence: 'explicit' })
+          })
         },
         branch: async () => {
           await branchCurrentSession()

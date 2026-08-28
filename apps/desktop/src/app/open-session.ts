@@ -16,6 +16,7 @@
  */
 import type { WorkspaceMode } from '@/contrib/types'
 import { $activeSessionId, $selectedStoredSessionId, markSessionRead } from '@/store/session'
+import { cancelProfileConversationRestore } from '@/store/profile-conversation-restore'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import {
   focusedSessionNeedsRoute,
@@ -88,6 +89,8 @@ export function openSession(
   if (!storedSessionId) {
     return
   }
+
+  cancelProfileConversationRestore(undefined, 'session-open')
 
   // Any explicit open/focus means the user has seen the finished-turn marker.
   // Must run BEFORE the focus short-circuits below: clicking a session that is

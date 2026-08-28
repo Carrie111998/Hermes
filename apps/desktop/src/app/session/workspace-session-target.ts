@@ -1,9 +1,10 @@
 import type { MutableRefObject } from 'react'
 
+import type { FreshSessionDraftOptions } from '@/app/session/hooks/use-session-actions'
+import { createFreshSessionIntent } from '@/store/profile-conversation-restore'
 import { followActiveSessionCwd, resolveNewSessionCwd } from '@/store/projects'
 import {
   $newChatWorkspaceTargetGeneration,
-  type NewChatWorkspaceTarget,
   setCurrentBranch,
   setCurrentCwd,
   setNewChatWorkspaceTarget
@@ -15,7 +16,7 @@ interface WorkspaceSessionOptions {
   onExplicitWorkspace?: (cwd: string) => void
   path: null | string
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
-  startFreshSessionDraft: (options?: { workspaceTarget: NewChatWorkspaceTarget }) => void
+  startFreshSessionDraft: (options: FreshSessionDraftOptions) => void
 }
 
 export function startWorkspaceSession({
@@ -31,7 +32,10 @@ export function startWorkspaceSession({
   // return a default/remembered project folder and re-attach the last repo
   // (digitwo: New session in Home still shows `main`).
   if (path === null) {
-    startFreshSessionDraft({ workspaceTarget: null })
+    startFreshSessionDraft({
+      intent: createFreshSessionIntent({ cause: 'new-project-chat', persistence: 'explicit' }),
+      workspaceTarget: null
+    })
 
     return
   }
@@ -41,7 +45,10 @@ export function startWorkspaceSession({
   const explicitTarget = path.trim()
   const target = explicitTarget || resolveNewSessionCwd()
 
-  startFreshSessionDraft(target ? { workspaceTarget: target } : undefined)
+  startFreshSessionDraft({
+    intent: createFreshSessionIntent({ cause: 'new-project-chat', persistence: 'explicit' }),
+    ...(target ? { workspaceTarget: target } : {})
+  })
 
   if (!target) {
     return

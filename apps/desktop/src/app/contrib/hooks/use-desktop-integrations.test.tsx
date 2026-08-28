@@ -1,19 +1,38 @@
-import { renderHook } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
-import { _resetLegacyDiscardForTests } from '@/store/session'
+import { gatewayActivationEpoch } from '@/store/gateway'
+import {
+  $appliedFreshDraftProvenance,
+  $profileConversationRestore,
+  _resetProfileConversationRestoreForTests,
+  applyFreshDraftProvenance,
+  beginProfileConversationRestore,
+  commitProfileConversationRestore
+} from '@/store/profile-conversation-restore'
+import { _resetLegacyDiscardForTests, getRememberedConversation, setRememberedConversation } from '@/store/session'
 import type * as WindowsStore from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
+import type { HermesConnection } from '@/global'
 
 import { makeSessionInfo } from '../../../test/session-info'
 
-import { useDesktopIntegrations } from './use-desktop-integrations'
+import { type ConversationRestoreScope, useDesktopIntegrations } from './use-desktop-integrations'
 
 // Mutable HUD-window flag so the restore tests can flip the window kind the
 // hook believes it runs in. Default false keeps the pre-existing restore
 // coverage exercising the real main-window path.
-const { hudWindowMock } = vi.hoisted(() => ({ hudWindowMock: vi.fn(() => false) }))
+const { hudWindowMock, publishRestoreMock, restoreLookupMock } = vi.hoisted(() => ({
+  hudWindowMock: vi.fn(() => false),
+  publishRestoreMock: vi.fn(),
+  restoreLookupMock: vi.fn()
+}))
+
+vi.mock('../../session/hooks/use-session-actions/utils', () => ({
+  publishResolvedSessionForRestore: publishRestoreMock,
+  resolveStoredSessionForRestore: restoreLookupMock
+}))
 
 vi.mock('@/store/mcp-deeplink-install', () => ({
   requestMcpInstallFromDeepLink: vi.fn()
@@ -46,6 +65,10 @@ describe('useDesktopIntegrations', () => {
   beforeEach(() => {
     window.localStorage.clear()
     _resetLegacyDiscardForTests()
+    _resetProfileConversationRestoreForTests()
+    publishRestoreMock.mockReset()
+    restoreLookupMock.mockReset()
+    restoreLookupMock.mockResolvedValue({ status: 'found', session: session() })
     vi.mocked(requestMcpInstallFromDeepLink).mockClear()
     navigate = vi.fn()
     // Every test starts as a main window; only the HUD describe flips this.
@@ -68,6 +91,7 @@ describe('useDesktopIntegrations', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     if (initialHermesDesktop) {
       desktopWindow.hermesDesktop = initialHermesDesktop
     }
@@ -79,7 +103,7 @@ describe('useDesktopIntegrations', () => {
     activeProfile = 'default',
     locationPathname = '/',
     profileReady = false,
-    resumeExhaustedSessionId = null as string | null,
+    restoreScopeOverride = undefined as ConversationRestoreScope | undefined,
     routedSessionId = null as string | null,
     sessions = [] as readonly SessionInfo[]
   } = {}) {
@@ -88,36 +112,47 @@ describe('useDesktopIntegrations', () => {
         activeProfile,
         locationPathname,
         profileReady,
-        resumeExhaustedSessionId,
+        restoreScopeOverride,
         routedSessionId,
         sessions
       }: {
         activeProfile: string
         locationPathname: string
         profileReady: boolean
-        resumeExhaustedSessionId: string | null
+        restoreScopeOverride?: ConversationRestoreScope
         routedSessionId: string | null
         sessions: readonly SessionInfo[]
       }) =>
         useDesktopIntegrations({
+          activeSessionId: null,
           activeProfile,
           chatOpen: false,
+          creatingSessionRef: { current: false },
+          gatewayState: 'open',
           hasPreview: false,
           locationPathname,
           navigate,
           profileReady,
           refreshSessions: vi.fn(),
-          resumeExhaustedSessionId,
           routedSessionId,
+          restoreScope: restoreScopeOverride ?? {
+            activationEpoch: gatewayActivationEpoch(),
+            connection: { mode: 'local', profile: activeProfile } as HermesConnection,
+            connectionId: null,
+            gatewayScope: `\0${activeProfile}`,
+            profile: activeProfile,
+            storageSuffix: ''
+          },
           runtimeIdByStoredSessionId: { current: new Map() },
-          sessions
+          sessions,
+          selectedStoredSessionId: null
         }),
       {
         initialProps: {
           activeProfile,
           locationPathname,
           profileReady,
-          resumeExhaustedSessionId,
+          restoreScopeOverride,
           routedSessionId,
           sessions
         }
@@ -137,17 +172,17 @@ describe('useDesktopIntegrations', () => {
       expect(navigate).not.toHaveBeenCalled()
     })
 
-    it('restores on profileReady when remembered route exists and owns the session', () => {
+    it('restores on profileReady when the authoritative lookup finds the remembered route', async () => {
       window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
 
       const sessions = [session({ id: 'remembered-session', profile: 'default' })]
 
       render({ profileReady: true, sessions })
 
-      expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true })
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true }))
     })
 
-    it('restores remembered session id when no remembered route exists', () => {
+    it('restores remembered session id when no remembered route exists', async () => {
       window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'remembered-session')
 
       const sessions = [session({ id: 'remembered-session', profile: 'default' })]
@@ -155,40 +190,40 @@ describe('useDesktopIntegrations', () => {
       render({ profileReady: true, sessions })
 
       // sessionRoute('remembered-session') = '/remembered-session'
-      expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true })
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true }))
     })
 
-    it('waits for sessions before validating a remembered session route', () => {
+    it('preserves the remembered route when authoritative lookup is inconclusive', async () => {
       window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
 
-      const result = render({ profileReady: true, sessions: [] })
+      restoreLookupMock.mockResolvedValue({ status: 'inconclusive', reason: 'network' })
+      vi.useFakeTimers()
+      render({ profileReady: true, sessions: [] })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_500)
+      })
 
       expect(navigate).not.toHaveBeenCalled()
       expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.default')).toBe('/remembered-session')
-
-      result.rerender({
-        activeProfile: 'default',
-        locationPathname: '/',
-        profileReady: true,
-        resumeExhaustedSessionId: null,
-        routedSessionId: null,
-        sessions: [session({ id: 'remembered-session', profile: 'default' })]
-      })
-
-      expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true })
     })
   })
 
   describe('ownership validation', () => {
-    it('refuses to restore a session route owned by another profile', () => {
+    it('refuses to restore when exact lookup reports a conflicting owner', async () => {
       window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/ai-session')
 
       const sessions = [session({ id: 'ai-session', profile: 'ai-engineer' })]
 
-      // The route belongs to ai-engineer; active profile is default.
-      // No navigation should happen — wrong owner.
+      restoreLookupMock.mockResolvedValue({
+        status: 'inconclusive',
+        reason: 'session response belongs to another connection'
+      })
+      vi.useFakeTimers()
       render({ activeProfile: 'default', profileReady: true, sessions })
-
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_500)
+      })
       expect(navigate).not.toHaveBeenCalled()
     })
 
@@ -204,7 +239,7 @@ describe('useDesktopIntegrations', () => {
       expect(navigate).not.toHaveBeenCalled()
     })
 
-    it('clears stale remembered route owned by wrong profile', () => {
+    it('restores a remembered route owned by the active profile', async () => {
       window.localStorage.setItem('hermes.desktop.lastRoute.profile.ai-engineer', '/ai-session')
 
       const sessions = [session({ id: 'ai-session', profile: 'ai-engineer' })]
@@ -212,12 +247,12 @@ describe('useDesktopIntegrations', () => {
       render({ activeProfile: 'ai-engineer', profileReady: true, sessions })
 
       // The route and session match the active profile — should restore.
-      expect(navigate).toHaveBeenCalledWith('/ai-session', { replace: true })
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/ai-session', { replace: true }))
     })
   })
 
   describe('two profiles with distinct sessions', () => {
-    it('restores profile A session when profile A is active', () => {
+    it('restores profile A session when profile A is active', async () => {
       window.localStorage.setItem('hermes.desktop.lastRoute.profile.coder', '/coder-session')
 
       const sessions = [
@@ -227,7 +262,7 @@ describe('useDesktopIntegrations', () => {
 
       render({ activeProfile: 'coder', profileReady: true, sessions })
 
-      expect(navigate).toHaveBeenCalledWith('/coder-session', { replace: true })
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/coder-session', { replace: true }))
     })
 
     it('does NOT bleed profile A session into profile B', () => {
@@ -328,7 +363,7 @@ describe('useDesktopIntegrations', () => {
         activeProfile: 'ops',
         locationPathname: '/ops-session',
         profileReady: true,
-        resumeExhaustedSessionId: null,
+        restoreScopeOverride: undefined,
         routedSessionId: 'ops-session',
         sessions
       })
@@ -394,7 +429,7 @@ describe('useDesktopIntegrations', () => {
         activeProfile: 'default',
         locationPathname: '/settings',
         profileReady: true,
-        resumeExhaustedSessionId: null,
+        restoreScopeOverride: undefined,
         routedSessionId: null,
         sessions: []
       })
@@ -404,58 +439,15 @@ describe('useDesktopIntegrations', () => {
     })
   })
 
-  describe('exhausted session cleanup', () => {
-    it('clears remembered session id when the exhausted session matches', () => {
+  describe('resume exhaustion persistence', () => {
+    it('preserves rollback navigation because generic exhaustion is not authoritative deletion proof', () => {
       window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'exhausted')
-
-      const sessions = [session({ id: 'exhausted', profile: 'default' })]
-
-      render({
-        profileReady: true,
-        resumeExhaustedSessionId: 'exhausted',
-        sessions
-      })
-
-      expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.default')).toBeNull()
-    })
-
-    it('clears remembered route when it carries the exhausted session', () => {
       window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/exhausted')
 
-      const sessions = [session({ id: 'exhausted', profile: 'default' })]
+      render({ profileReady: true, sessions: [session({ id: 'exhausted', profile: 'default' })] })
 
-      render({
-        profileReady: true,
-        resumeExhaustedSessionId: 'exhausted',
-        sessions
-      })
-
-      expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.default')).toBeNull()
-    })
-
-    it('does NOT clear exhausted when profileReady is false', () => {
-      window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'exhausted')
-
-      render({
-        profileReady: false,
-        resumeExhaustedSessionId: 'exhausted',
-        sessions: []
-      })
-
-      // profileReady=false gates the cleanup effect.
       expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.default')).toBe('exhausted')
-    })
-
-    it('does NOT clear remembered state when exhausted id does not match', () => {
-      window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'other-session')
-
-      render({
-        profileReady: true,
-        resumeExhaustedSessionId: 'exhausted',
-        sessions: [session({ id: 'other-session', profile: 'default' })]
-      })
-
-      expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.default')).toBe('other-session')
+      expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.default')).toBe('/exhausted')
     })
   })
 
@@ -509,6 +501,259 @@ describe('useDesktopIntegrations', () => {
       deepLink?.({ kind: 'mcp', name: 'install', params: { name: 'context7' } })
       expect(requestMcpInstallFromDeepLink).toHaveBeenCalledWith({ name: 'context7' })
       expect(navigate).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('profile conversation restore transaction', () => {
+    it('restores a committed automatic draft through the authoritative lookup without overwriting memory', async () => {
+      setRememberedConversation({ kind: 'session', sessionId: 'work-last', version: 1 }, 'work')
+      const sequence = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
+      commitProfileConversationRestore(sequence)
+      applyFreshDraftProvenance({
+        cause: 'profile-switch',
+        freshSequence: 1,
+        kind: 'automatic',
+        restoreSequence: sequence
+      })
+      restoreLookupMock.mockResolvedValueOnce({
+        status: 'found',
+        session: session({ id: 'work-last', profile: 'work' })
+      })
+
+      render({ activeProfile: 'work', profileReady: true })
+
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/work-last', { replace: true }))
+      expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'work-last', version: 1 })
+      expect($profileConversationRestore.get()).toMatchObject({ phase: 'navigating', sequence })
+    })
+
+    it('treats the explicit local descriptor as the same owner as a profile-door target', async () => {
+      setRememberedConversation({ kind: 'session', sessionId: 'local-last', version: 1 }, 'work')
+      const sequence = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
+      commitProfileConversationRestore(sequence)
+      applyFreshDraftProvenance({
+        cause: 'profile-switch',
+        freshSequence: 1,
+        kind: 'automatic',
+        restoreSequence: sequence
+      })
+      restoreLookupMock.mockResolvedValueOnce({
+        status: 'found',
+        session: session({ connection_id: 'local', id: 'local-last', profile: 'work' })
+      })
+
+      render({
+        activeProfile: 'work',
+        profileReady: true,
+        restoreScopeOverride: {
+          activationEpoch: gatewayActivationEpoch(),
+          connection: {
+            connectionId: 'local',
+            mode: 'local'
+          } as HermesConnection,
+          connectionId: 'local',
+          gatewayScope: `local\0work`,
+          profile: 'work',
+          storageSuffix: ''
+        }
+      })
+
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/local-last', { replace: true }))
+      expect(restoreLookupMock).toHaveBeenCalledWith('local-last', {
+        connectionId: null,
+        profile: 'work',
+        storageSuffix: ''
+      })
+      expect(publishRestoreMock).toHaveBeenCalledWith(expect.objectContaining({ id: 'local-last' }), 'local-last', {
+        connectionId: null,
+        profile: 'work',
+        storageSuffix: ''
+      })
+    })
+
+    it('rejects an explicit conflicting profile on the local descriptor', async () => {
+      vi.useFakeTimers()
+      const sequence = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
+      commitProfileConversationRestore(sequence)
+      applyFreshDraftProvenance({
+        cause: 'profile-switch',
+        freshSequence: 1,
+        kind: 'automatic',
+        restoreSequence: sequence
+      })
+
+      render({
+        activeProfile: 'work',
+        profileReady: true,
+        restoreScopeOverride: {
+          activationEpoch: gatewayActivationEpoch(),
+          connection: {
+            connectionId: 'local',
+            mode: 'local',
+            profile: 'previous'
+          } as HermesConnection,
+          connectionId: 'local',
+          gatewayScope: `local\0work`,
+          profile: 'work',
+          storageSuffix: ''
+        }
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_500)
+      })
+
+      expect(restoreLookupMock).not.toHaveBeenCalled()
+      expect(navigate).not.toHaveBeenCalled()
+    })
+
+    it('rejects a retained registry descriptor for a true null/profile-door target', async () => {
+      vi.useFakeTimers()
+      const sequence = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
+      commitProfileConversationRestore(sequence)
+      applyFreshDraftProvenance({
+        cause: 'profile-switch',
+        freshSequence: 1,
+        kind: 'automatic',
+        restoreSequence: sequence
+      })
+
+      render({
+        activeProfile: 'work',
+        profileReady: true,
+        restoreScopeOverride: {
+          activationEpoch: gatewayActivationEpoch(),
+          connection: {
+            connectionId: 'previous-source',
+            mode: 'remote',
+            profile: 'work',
+            registryScoped: true
+          } as HermesConnection,
+          connectionId: 'previous-source',
+          gatewayScope: `previous-source\0work`,
+          profile: 'work',
+          storageSuffix: ''
+        }
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_500)
+      })
+
+      expect(restoreLookupMock).not.toHaveBeenCalled()
+      expect(navigate).not.toHaveBeenCalled()
+    })
+
+    it('durably records an explicit blank while an automatic isolation blank remains non-durable', async () => {
+      applyFreshDraftProvenance({ cause: 'profile-switch', freshSequence: 1, kind: 'automatic' })
+      const automatic = render({ activeProfile: 'work', profileReady: true })
+
+      expect(getRememberedConversation('work')).toBeNull()
+      automatic.unmount()
+
+      applyFreshDraftProvenance({ cause: 'new-chat', freshSequence: 2, kind: 'explicit' })
+      render({ activeProfile: 'work', profileReady: true })
+
+      await waitFor(() => expect(getRememberedConversation('work')).toEqual({ kind: 'blank', version: 1 }))
+      expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.work')).toBeNull()
+      expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.work')).toBe('/')
+    })
+
+    it('bounds inconclusive retries to 500/1000ms and preserves the remembered session', async () => {
+      vi.useFakeTimers()
+      setRememberedConversation({ kind: 'session', sessionId: 'retry-me', version: 1 }, 'work')
+      const sequence = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
+      commitProfileConversationRestore(sequence)
+      applyFreshDraftProvenance({
+        cause: 'profile-switch',
+        freshSequence: 1,
+        kind: 'automatic',
+        restoreSequence: sequence
+      })
+      restoreLookupMock.mockResolvedValue({ status: 'inconclusive', reason: 'network' })
+
+      render({ activeProfile: 'work', profileReady: true })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_500)
+      })
+
+      expect(restoreLookupMock).toHaveBeenCalledTimes(3)
+      expect(getRememberedConversation('work')).toEqual({ kind: 'session', sessionId: 'retry-me', version: 1 })
+      expect($profileConversationRestore.get()).toBeNull()
+      expect(vi.getTimerCount()).toBe(0)
+      vi.useRealTimers()
+    })
+
+    it('lets a rapid B to C switch strand B lookup completion so only C navigates', async () => {
+      setRememberedConversation({ kind: 'session', sessionId: 'b-last', version: 1 }, 'b')
+      setRememberedConversation({ kind: 'session', sessionId: 'c-last', version: 1 }, 'c')
+      let resolveB!: (value: unknown) => void
+      const pendingB = new Promise(resolve => {
+        resolveB = resolve
+      })
+      restoreLookupMock
+        .mockImplementationOnce(() => pendingB)
+        .mockResolvedValueOnce({ status: 'found', session: session({ id: 'c-last', profile: 'c' }) })
+
+      const b = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'b' })
+      commitProfileConversationRestore(b)
+      applyFreshDraftProvenance({
+        cause: 'profile-switch',
+        freshSequence: 1,
+        kind: 'automatic',
+        restoreSequence: b
+      })
+      const result = render({ activeProfile: 'b', profileReady: true })
+      await waitFor(() => expect(restoreLookupMock).toHaveBeenCalledTimes(1))
+
+      const c = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'c' })
+      commitProfileConversationRestore(c)
+      applyFreshDraftProvenance({
+        cause: 'profile-switch',
+        freshSequence: 2,
+        kind: 'automatic',
+        restoreSequence: c
+      })
+      result.rerender({
+        activeProfile: 'c',
+        locationPathname: '/',
+        profileReady: true,
+        restoreScopeOverride: undefined,
+        routedSessionId: null,
+        sessions: []
+      })
+
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith('/c-last', { replace: true }))
+      await act(async () => {
+        resolveB({ status: 'found', session: session({ id: 'b-last', profile: 'b' }) })
+        await pendingB
+      })
+      expect(navigate).not.toHaveBeenCalledWith('/b-last', expect.anything())
+      expect(publishRestoreMock).not.toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'b-last' }),
+        'b-last',
+        expect.anything()
+      )
+    })
+
+    it('cancels a pending restore before explicit notification navigation', () => {
+      const sequence = beginProfileConversationRestore('profile-switch', { connectionId: null, profile: 'work' })
+      commitProfileConversationRestore(sequence)
+      let activate: ((payload: { activate?: string; notifyId: string }) => void) | undefined
+      desktopWindow.hermesDesktop = {
+        ...desktopWindow.hermesDesktop,
+        onNotificationActivate: (
+          cb: (payload: { actionId?: string; activate?: string; notifyId?: string; tag?: string }) => void
+        ) => {
+          activate = cb
+          return () => undefined
+        }
+      } as unknown as Window['hermesDesktop']
+
+      render({ activeProfile: 'work', profileReady: true })
+      activate?.({ activate: '/skills', notifyId: 'n1' })
+      expect($profileConversationRestore.get()).toBeNull()
+      expect(navigate).toHaveBeenCalledWith('/skills')
     })
   })
 })

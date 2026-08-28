@@ -17,6 +17,11 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import {
+  $profileConversationRestore,
+  _resetProfileConversationRestoreForTests,
+  beginProfileConversationRestore
+} from '@/store/profile-conversation-restore'
 import { $stalledSessionIds } from '@/store/session-states'
 
 import {
@@ -92,6 +97,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
 describe('beginGatewaySwitch / endGatewaySwitch — the shared switch commit point (#93937)', () => {
   beforeEach(() => {
     $gatewaySwitching.set(false)
+    _resetProfileConversationRestoreForTests()
     setSessions([{ id: 's1', title: 'old', profile: 'default' } as never])
     setActiveSessionId('a93bb39d')
     setSessionsLoading(false)
@@ -102,6 +108,19 @@ describe('beginGatewaySwitch / endGatewaySwitch — the shared switch commit poi
     setActiveSessionId(null)
     setSessionsLoading(true)
     $gatewaySwitching.set(false)
+  })
+
+  it('preserves renderer restore coordination across the gateway-bound wipe', () => {
+    const sequence = beginProfileConversationRestore('connection-switch', {
+      connectionId: 'homelab',
+      profile: 'default'
+    })
+
+    beginGatewaySwitch()
+
+    expect($profileConversationRestore.get()?.sequence).toBe(sequence)
+    expect($profileConversationRestore.get()?.phase).toBe('activating')
+    endGatewaySwitch()
   })
 
   it('raises the barrier, runs the registered machine-context reset, then wipes — synchronously, in that order', () => {

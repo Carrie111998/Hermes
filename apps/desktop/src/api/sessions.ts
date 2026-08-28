@@ -21,8 +21,19 @@ function sessionScoped(scope?: ProfileScope): { connectionId?: string; profile?:
 
   const scoped = capabilityScoped(scope)
 
-  if (typeof scope === 'object' && scope.connectionId?.trim() === 'local') {
-    return { ...scoped, connectionId: 'local' }
+  if (typeof scope === 'object') {
+    const connectionId = scope.connectionId?.trim() || null
+
+    if (connectionId === 'local') {
+      return { ...scoped, connectionId: 'local' }
+    }
+
+    if (connectionId === null) {
+      // An explicit null is the legacy/profile-door route, not "inherit the
+      // active registry source". Preserve the key so hermesApi's request spread
+      // clears its ambient connection tag before IPC.
+      return { ...scoped, connectionId: undefined }
+    }
   }
 
   return scoped
@@ -339,7 +350,9 @@ export function searchSessions(query: string): Promise<SessionSearchResponse> {
 }
 
 // Resolves a single session row by id on one backend (the active profile, or
-// the given `profile`). The backend resolves exact ids and unique prefixes and
+// the given `profile`). Pass an explicit `{ connectionId: null, profile }` to
+// select the profile-door route without inheriting the ambient registry source.
+// The backend resolves exact ids and unique prefixes and
 // 404s when the id isn't on that profile — so a cheap by-id lookup replaces the
 // cross-profile list scan when locating an unknown id's owner.
 export function getSession(id: string, profile?: ProfileScope): Promise<SessionInfo> {

@@ -6,7 +6,13 @@ import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
-import { resolveSessionProfile, resolveStoredSession } from './utils'
+import {
+  classifySessionLookupError,
+  publishResolvedSessionForRestore,
+  resolveSessionProfile,
+  resolveStoredSession,
+  resolveStoredSessionForRestore
+} from './utils'
 
 vi.mock('@/hermes', async importActual => ({
   ...(await importActual<typeof HermesModule>()),
@@ -142,5 +148,167 @@ describe('resolveStoredSession profile ownership', () => {
     mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
 
     await expect(resolveSessionProfile('s1')).resolves.toBe('default')
+  })
+})
+
+describe('resolveStoredSessionForRestore exact target lookup', () => {
+  const registryTarget = { connectionId: 'source-a', profile: 'meta', storageSuffix: '.source-a' }
+
+  beforeEach(() => {
+    $cronSessions.set([])
+    $messagingSessions.set([])
+    $sessions.set([])
+    mockGetSession.mockReset()
+  })
+
+  afterEach(() => {
+    $cronSessions.set([])
+    $messagingSessions.set([])
+    $sessions.set([])
+  })
+
+  it('always probes the exact registry target instead of trusting a colliding bare-id cache row', async () => {
+    $sessions.set([session({ connection_id: 'source-b', id: 's1', profile: 'meta' })])
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
+
+    const result = await resolveStoredSessionForRestore('s1', registryTarget)
+
+    expect(mockGetSession).toHaveBeenCalledWith('s1', { connectionId: 'source-a', profile: 'meta' })
+    expect(result).toMatchObject({
+      ownerRoute: { connectionId: 'source-a', profile: 'meta' },
+      session: { connection_id: 'source-a', id: 's1', profile: 'meta' },
+      status: 'found'
+    })
+    // Lookup is read-only until the caller validates its activation generation.
+    expect($sessions.get()).toEqual([expect.objectContaining({ connection_id: 'source-b', profile: 'meta' })])
+
+    if (result.status !== 'found') {
+      throw new Error('expected found restore candidate')
+    }
+
+    publishResolvedSessionForRestore(result.session, 's1', registryTarget)
+    expect($sessions.get().filter(row => row.id === 's1')).toEqual([
+      expect.objectContaining({ connection_id: 'source-a', profile: 'meta' }),
+      expect.objectContaining({ connection_id: 'source-b', profile: 'meta' })
+    ])
+  })
+
+  it('replaces same-owner lineage aliases while preserving foreign twins', () => {
+    $sessions.set([
+      session({ connection_id: 'source-a', id: 'root-1', profile: 'meta' }),
+      session({ connection_id: 'source-b', id: 'root-1', profile: 'meta' })
+    ])
+    const resolved = session({
+      _lineage_root_id: 'root-1',
+      connection_id: 'source-a',
+      id: 'tip-2',
+      profile: 'meta'
+    })
+
+    publishResolvedSessionForRestore(resolved, 'tip-2', registryTarget)
+
+    expect($sessions.get()).toEqual([
+      expect.objectContaining({ connection_id: 'source-a', id: 'tip-2' }),
+      expect.objectContaining({ connection_id: 'source-b', id: 'root-1' })
+    ])
+  })
+
+  it('does not publish a late candidate before caller generation validation', async () => {
+    $sessions.set([session({ connection_id: 'source-b', id: 's1', profile: 'meta' })])
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1' }))
+
+    await expect(resolveStoredSessionForRestore('s1', registryTarget)).resolves.toMatchObject({ status: 'found' })
+
+    expect($sessions.get()).toEqual([expect.objectContaining({ connection_id: 'source-b' })])
+  })
+
+  it('accepts a compressed tip whose lineage root is the requested durable id', async () => {
+    mockGetSession.mockResolvedValueOnce(session({ _lineage_root_id: 'root-1', id: 'tip-9' }))
+
+    const result = await resolveStoredSessionForRestore('root-1', registryTarget)
+
+    expect(result).toMatchObject({ status: 'found', session: { _lineage_root_id: 'root-1', id: 'tip-9' } })
+  })
+
+  it('routes a legacy/profile-only target without treating null connection as a wildcard', async () => {
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1' }))
+
+    const result = await resolveStoredSessionForRestore('s1', {
+      connectionId: null,
+      profile: 'meta',
+      storageSuffix: ''
+    })
+
+    expect(mockGetSession).toHaveBeenCalledWith('s1', { connectionId: null, profile: 'meta' })
+    expect(result).toEqual({ status: 'found', session: expect.objectContaining({ id: 's1', profile: 'meta' }) })
+  })
+
+  it('keeps a profile-door lookup ownerless and preserves same-id registry twins when publishing', async () => {
+    const profileTarget = { connectionId: null, profile: 'meta', storageSuffix: '' }
+    $sessions.set([
+      session({ connection_id: 'local', id: 's1', profile: 'meta' }),
+      session({ connection_id: 'source-b', id: 's1', profile: 'meta' })
+    ])
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1' }))
+
+    const result = await resolveStoredSessionForRestore('s1', profileTarget)
+
+    expect(mockGetSession).toHaveBeenCalledWith('s1', { connectionId: null, profile: 'meta' })
+    expect(result).toEqual({
+      status: 'found',
+      session: expect.objectContaining({ connection_id: undefined, id: 's1', profile: 'meta' })
+    })
+
+    if (result.status !== 'found') {
+      throw new Error('expected found restore candidate')
+    }
+
+    publishResolvedSessionForRestore(result.session, 's1', profileTarget)
+    expect($sessions.get().filter(row => row.id === 's1')).toEqual([
+      expect.objectContaining({ connection_id: undefined, profile: 'meta' }),
+      expect.objectContaining({ connection_id: 'local', profile: 'meta' }),
+      expect.objectContaining({ connection_id: 'source-b', profile: 'meta' })
+    ])
+  })
+
+  it('returns not-found only for a target-scoped session-gone response', async () => {
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    await expect(resolveStoredSessionForRestore('s1', registryTarget)).resolves.toEqual({ status: 'not-found' })
+    expect(classifySessionLookupError(new Error('session not found'))).toBe('not-found')
+  })
+
+  it.each([
+    ['generic endpoint miss', new Error('404 Not Found')],
+    ['auth', new Error('401 Unauthorized')],
+    ['server', new Error('503 Service Unavailable')],
+    ['network', new Error('ECONNREFUSED')],
+    ['timeout', new Error('request timed out')],
+    ['abort', new DOMException('aborted', 'AbortError')]
+  ])('preserves %s failures as inconclusive', async (_name, error) => {
+    mockGetSession.mockRejectedValueOnce(error)
+
+    const result = await resolveStoredSessionForRestore('s1', registryTarget)
+
+    expect(result.status).toBe('inconclusive')
+    expect(classifySessionLookupError(error)).toBe('inconclusive')
+  })
+
+  it('fails closed for malformed, mismatched-lineage, and conflicting-owner responses', async () => {
+    mockGetSession
+      .mockResolvedValueOnce(null as never)
+      .mockResolvedValueOnce(session({ id: 'other' }))
+      .mockResolvedValueOnce(session({ connection_id: 'source-b', id: 's1' }))
+
+    await expect(resolveStoredSessionForRestore('s1', registryTarget)).resolves.toMatchObject({
+      status: 'inconclusive'
+    })
+    await expect(resolveStoredSessionForRestore('s1', registryTarget)).resolves.toMatchObject({
+      status: 'inconclusive'
+    })
+    await expect(resolveStoredSessionForRestore('s1', registryTarget)).resolves.toMatchObject({
+      status: 'inconclusive'
+    })
+    expect($sessions.get()).toEqual([])
   })
 })

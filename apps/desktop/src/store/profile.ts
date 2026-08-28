@@ -24,6 +24,15 @@ import {
   openGatewayForProfile
 } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
+import {
+  beginProfileConversationRestore,
+  cancelProfileConversationRestore,
+  commitProfileConversationRestore,
+  createFreshSessionIntent,
+  type FreshSessionIntent,
+  isCurrentProfileConversationRestore,
+  type FreshSessionIntentInput
+} from '@/store/profile-conversation-restore'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
 import { setConnection } from '@/store/session'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
@@ -332,9 +341,23 @@ export function resolveNewChatOwnerRoute(): AgentProfileRoute | null {
 // currently-open session (store/projects). The chat controller subscribes and
 // resets to the intro draft, so we never strand the user in an orphaned view.
 export const $freshSessionRequest = atom(0)
+export const $freshSessionIntent = atom<FreshSessionIntent | null>(null)
 
-export function requestFreshSession(): void {
-  $freshSessionRequest.set($freshSessionRequest.get() + 1)
+export function requestFreshSession(input: FreshSessionIntentInput): void {
+  if (
+    input.persistence === 'explicit' ||
+    (input.persistence === 'automatic' &&
+      input.restoreSequence === undefined &&
+      input.cause !== 'boot-transition' &&
+      input.cause !== 'gateway-transition')
+  ) {
+    cancelProfileConversationRestore(undefined, `fresh-session:${input.cause}`)
+  }
+
+  const intent = createFreshSessionIntent(input)
+
+  $freshSessionIntent.set(intent)
+  $freshSessionRequest.set(intent.sequence)
 }
 
 // Route profile-scoped REST settings (config/env/skills/tools/model/…) to the
@@ -756,6 +779,9 @@ export function selectProfile(name: string): void {
   // Switching profiles (or coming back from the all-profiles browse view) starts
   // fresh; re-tapping the profile you're already in leaves your session be.
   const switching = $showAllProfiles.get() || target !== normalizeProfileKey($activeGatewayProfile.get())
+  const sourceConnectionId = profilePickConnectionId()
+  const onPrimary = activeGatewayConnectionId() == null
+
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
   $newChatRoute.set(null)
@@ -763,38 +789,55 @@ export function selectProfile(name: string): void {
   // is made on the source the user is looking at (activateOnCurrentSource
   // dials exactly that pair), so the draft's exact owner is that pair — or the
   // legacy profile-only path when that is the door the pick takes.
-  captureNewChatSource(profilePickConnectionId())
+  captureNewChatSource(sourceConnectionId)
 
-  if (switching) {
-    requestFreshSession()
+  const restoreSequence = switching
+    ? beginProfileConversationRestore('profile-switch', { connectionId: sourceConnectionId, profile: target })
+    : null
+
+  if (restoreSequence !== null) {
+    requestFreshSession({
+      cause: 'profile-switch',
+      persistence: 'automatic',
+      restoreSequence
+    })
   }
 
-  // A profile with a remote override can fail to activate because the remote
-  // host rejected its saved token (rotated/revoked). That must surface as a
-  // "re-enter token" affordance, never a silently dead profile (#91349).
-  // #81094: any other failed switch must be visible too — the profile pill
-  // stays on the previous profile and the user learns why the backend is
-  // unreachable.
-  //
-  // The profile rail is a live workspace switch, so it must not call
-  // profile.set() and reload the window. Once activation succeeds, remember
-  // the selection for the next Desktop launch through the persistence-only
-  // IPC instead (#79886). Registry-source picks name ANOTHER source's
-  // profiles, so only a primary-backend activation updates the startup
-  // preference.
-  const onPrimary = activeGatewayConnectionId() == null
+  // Restore authority follows activation itself. Startup-profile persistence is
+  // separate best-effort bookkeeping and must never cancel a landed restore.
+  const activation = activateOnCurrentSource(target)
 
-  const shouldRememberStartupProfile = onPrimary ? isLocalDesktopProfile(target) : Promise.resolve(false)
-
-  void Promise.all([activateOnCurrentSource(target), shouldRememberStartupProfile])
-    .then(([, shouldRemember]) => {
-      if (shouldRemember) {
-        return window.hermesDesktop?.profile?.remember(target)
+  void activation
+    .then(() => {
+      if (restoreSequence !== null && !commitProfileConversationRestore(restoreSequence)) {
+        return
       }
 
-      return undefined
+      if (!onPrimary) {
+        return
+      }
+
+      void isLocalDesktopProfile(target)
+        .then(shouldRemember => {
+          if (shouldRemember) {
+            return window.hermesDesktop?.profile?.remember(target)
+          }
+
+          return undefined
+        })
+        .catch((error: unknown) => {
+          notifyError(error, `Failed to switch to profile "${target}"`)
+        })
     })
     .catch((error: unknown) => {
+      if (restoreSequence !== null && !isCurrentProfileConversationRestore(restoreSequence)) {
+        return
+      }
+
+      if (restoreSequence !== null) {
+        cancelProfileConversationRestore(restoreSequence, 'profile-activation-failed')
+      }
+
       if (!notifyRemoteOverrideAuthFailure(target, error)) {
         notifyError(error, `Failed to switch to profile "${target}"`)
       }
@@ -846,7 +889,7 @@ export function newSessionInProfile(name: string): void {
   $newChatProfile.set(target)
   $newChatRoute.set(null)
   captureNewChatSource(profilePickConnectionId())
-  requestFreshSession()
+  requestFreshSession({ cause: 'new-chat-in-profile', persistence: 'explicit' })
   // #81094: surface the failed dial instead of failing silently.
   void activateOnCurrentSource(target).catch((error: unknown) => {
     if (!notifyRemoteOverrideAuthFailure(target, error)) {
@@ -873,7 +916,7 @@ export function newSessionInAgent(route: AgentProfileRoute): void {
   $newChatProfile.set(captured.profile)
   $newChatRoute.set(captured)
   $newChatConnectionId.set(captured.connectionId)
-  requestFreshSession()
+  requestFreshSession({ cause: 'new-chat-in-agent', persistence: 'explicit' })
   // #81094: surface the failed dial instead of failing silently.
   void ensureGatewayAgent(captured.connectionId, captured.profile).catch((error: unknown) => {
     notifyError(error, `Failed to open profile "${captured.profile}"`)
@@ -881,11 +924,15 @@ export function newSessionInAgent(route: AgentProfileRoute): void {
 }
 
 export function setShowAllProfiles(value: boolean): void {
+  if (value) {
+    cancelProfileConversationRestore(undefined, 'all-profiles')
+  }
+
   $showAllProfiles.set(value)
 }
 
 export function toggleShowAllProfiles(): void {
-  $showAllProfiles.set(!$showAllProfiles.get())
+  setShowAllProfiles(!$showAllProfiles.get())
 }
 
 // ── Hotkey-driven profile switching ────────────────────────────────────────

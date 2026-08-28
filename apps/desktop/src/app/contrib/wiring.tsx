@@ -36,6 +36,7 @@ import { TipHost } from '@/components/tips'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { activeConnectionScopeSuffix } from '@/lib/connection-scoped'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
 import { activateWakeIndicator } from '@/lib/wake-indicator'
@@ -45,11 +46,13 @@ import { $desktopBoot } from '@/store/boot'
 import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
+import { $gatewayActivationEpoch } from '@/store/gateway'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
+  $freshSessionIntent,
   $freshSessionRequest,
   $profileScope,
   ALL_PROFILES,
@@ -58,6 +61,7 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
+import { createFreshSessionIntent } from '@/store/profile-conversation-restore'
 import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
 import {
   $activeSessionId,
@@ -188,6 +192,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const actionsRef = useRef<WiringActions | null>(null)
 
   const gatewayState = useStore($gatewayState)
+  const gatewayActivationEpoch = useStore($gatewayActivationEpoch)
   const activeSessionId = useStore($activeSessionId)
   const billingSettingsRequest = useStore($billingSettingsRequest)
   const cronReviewRequest = useStore($cronReviewRequest)
@@ -226,6 +231,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const messagingSessions = useStore($messagingSessions)
   const sessions = useStore($sessions)
   const activeConnectionId = useStore($activeConnectionId)
+  const connection = useStore($connection)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
   const boot = useStore($desktopBoot)
@@ -508,6 +514,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   // A profile switch/create drops to a fresh new-session draft so the
   // previously open session doesn't bleed across contexts. Skip initial value.
+  const freshSessionIntent = useStore($freshSessionIntent)
   const freshSessionRequest = useStore($freshSessionRequest)
   const lastFreshRef = useRef(freshSessionRequest)
 
@@ -518,8 +525,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastFreshRef.current = freshSessionRequest
-    startFreshSessionDraft()
-  }, [freshSessionRequest, startFreshSessionDraft])
+
+    if (freshSessionIntent?.sequence === freshSessionRequest) {
+      startFreshSessionDraft({ intent: freshSessionIntent })
+    }
+  }, [freshSessionIntent, freshSessionRequest, startFreshSessionDraft])
 
   // Swapping the live gateway to another source or profile must re-pull that
   // source's model/config/profile state. Two sources commonly both expose a
@@ -669,7 +679,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // The global-hotkey Quick Entry window's bridge: its captured text rides the
   // SAME submit machinery the normal composer uses (current chat / picked
   // session / new session), and it hears gateway truth from this window.
-  useQuickEntryBridge({ startFreshSessionDraft, submitText })
+  const startQuickEntryDraft = useCallback(
+    () =>
+      startFreshSessionDraft({
+        intent: createFreshSessionIntent({ cause: 'new-chat', persistence: 'explicit' })
+      }),
+    [startFreshSessionDraft]
+  )
+
+  useQuickEntryBridge({ startFreshSessionDraft: startQuickEntryDraft, submitText })
 
   // Leaving HUD mode hands this window the session back (see hud/handoff).
   useHudHandoff({ navigate, resumeSession })
@@ -766,7 +784,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             })
           }
         } else if (payload?.start_new_session !== false) {
-          startFreshSessionDraft()
+          startFreshSessionDraft({
+            intent: createFreshSessionIntent({ cause: 'new-chat', persistence: 'explicit' })
+          })
         }
 
         requestVoiceConversationStart()
@@ -781,7 +801,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   useGatewayBoot({
     beforeConnectionSwitch: () => {
-      startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null })
+      startFreshSessionDraft({
+        intent: createFreshSessionIntent({ cause: 'gateway-transition', persistence: 'automatic' }),
+        preserveRoute: true,
+        workspaceTarget: null
+      })
       resetOverlayReturnRoute()
       resetProjectTreeState()
       closeAllTerminals()
@@ -835,19 +859,34 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // deep links, native-notification nav, preview-shortcut enablement,
   // remembered-session restore, and cross-window session-list sync.
   const previewTarget = useStore($previewTarget)
+  const conversationRestoreScope = useMemo(
+    () => ({
+      activationEpoch: gatewayActivationEpoch,
+      connection,
+      connectionId: activeConnectionId,
+      gatewayScope,
+      profile: normalizeProfileKey(activeGatewayProfile),
+      storageSuffix: activeConnectionScopeSuffix()
+    }),
+    [activeConnectionId, activeGatewayProfile, connection, gatewayActivationEpoch, gatewayScope]
+  )
 
   useDesktopIntegrations({
+    activeSessionId,
     activeProfile: normalizeProfileKey(activeGatewayProfile),
     chatOpen,
+    creatingSessionRef,
+    gatewayState,
     hasPreview: Boolean(previewTarget),
     locationPathname: location.pathname,
     navigate,
     profileReady: boot.phase === 'renderer.ready',
     refreshSessions,
-    resumeExhaustedSessionId,
     routedSessionId,
+    restoreScope: conversationRestoreScope,
     runtimeIdByStoredSessionId: runtimeIdByStoredSessionIdRef,
-    sessions
+    sessions,
+    selectedStoredSessionId
   })
 
   // Pin/unpin the selected session (statusbar keybind + chat header) — pinned
@@ -922,10 +961,18 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   // Single global listener for every rebindable hotkey plus the on-screen
   // keybind editor's capture mode (same as DesktopController).
+  const startFreshSessionFromKeybind = useCallback(
+    () =>
+      startFreshSessionDraft({
+        intent: createFreshSessionIntent({ cause: 'new-chat', persistence: 'explicit' })
+      }),
+    [startFreshSessionDraft]
+  )
+
   useKeybinds({
     archiveSelectedSession,
     openNewSessionTab,
-    startFreshSession: startFreshSessionDraft,
+    startFreshSession: startFreshSessionFromKeybind,
     toggleCommandCenter,
     toggleSelectedPin
   })
@@ -1085,7 +1132,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // (preview's monitor/devtools cluster, …) arrive as registry contributions.
   const leftTitlebarTools = useTitlebarToolContributions('left')
   const rightTitlebarTools = useTitlebarToolContributions('right')
-  const connection = useStore($connection)
   const controlsPos = titlebarControlsPosition(connection?.windowButtonPosition, Boolean(connection?.isFullscreen))
   // Windows/WSLg reserve native min/max/close on the right (AppShell parity:
   // prefer the live WCO measurement, fall back to the static reservation).

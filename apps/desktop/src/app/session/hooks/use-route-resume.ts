@@ -1,6 +1,8 @@
 import { type MutableRefObject, useEffect, useRef } from 'react'
 
 import { isNewChatRoute } from '@/app/routes'
+import type { FreshSessionDraftOptions } from '@/app/session/hooks/use-session-actions'
+import { createFreshSessionIntent } from '@/store/profile-conversation-restore'
 import { type SessionResumeRequest, setResumeExhaustedSessionId } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import { markSelectionRestore } from '@/store/session-states'
@@ -13,7 +15,12 @@ interface RouteResumeOptions {
   freshDraftReady: boolean
   gatewayState: string | undefined
   locationPathname: string
-  resumeSession: (sessionId: string, focus: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
+  resumeSession: (
+    sessionId: string,
+    focus: boolean,
+    ownerRoute?: SessionProfileRoute,
+    options?: { forceCold?: boolean }
+  ) => Promise<unknown>
   // Stored-session id whose most recent resume failed terminally (set by
   // useSessionActions, mirrored from $resumeFailedSessionId). While this equals
   // routedSessionId the window would otherwise latch on the loader forever, so
@@ -30,7 +37,7 @@ interface RouteResumeOptions {
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
-  startFreshSessionDraft: (focus: boolean) => unknown
+  startFreshSessionDraft: (options: FreshSessionDraftOptions) => unknown
 }
 
 // Bounded auto-retry for a stranded session window. A resume can fail terminally
@@ -106,6 +113,11 @@ export function useRouteResume({
   // never touches this latch, so it can't spuriously trigger the reset).
   const prevResumeExhaustedRef = useRef<string | null>(null)
   const handledResumeRequestRef = useRef(0)
+  const retryResumeRequestRef = useRef<{
+    forceCold?: boolean
+    ownerRoute?: SessionProfileRoute
+    sessionId: string
+  } | null>(null)
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -165,8 +177,17 @@ export function useRouteResume({
       // a dead id ("session not found"). An explicit plugin reselect similarly
       // bypasses the warm-id skip when the focused transcript disappeared.
       if ((gatewayBecameOpen || explicitlyRequested || !alreadyActive) && shouldResume && !creatingSessionRef.current) {
-        if (explicitlyRequested) {
-          handledResumeRequestRef.current = sessionResumeRequest.sequence
+        const explicitRequest = explicitlyRequested ? sessionResumeRequest : null
+
+        if (explicitRequest) {
+          handledResumeRequestRef.current = explicitRequest.sequence
+          retryResumeRequestRef.current = {
+            sessionId: routedSessionId,
+            ...(explicitRequest.ownerRoute ? { ownerRoute: explicitRequest.ownerRoute } : {}),
+            ...(explicitRequest.forceCold ? { forceCold: true } : {})
+          }
+        } else if (retryResumeRequestRef.current?.sessionId !== routedSessionId) {
+          retryResumeRequestRef.current = null
         }
 
         // The window's FIRST resume re-attaches the pre-reload route rather
@@ -180,10 +201,13 @@ export function useRouteResume({
 
         bootResumeRef.current = false
 
-        const ownerRoute =
-          sessionResumeRequest?.sessionId === routedSessionId ? sessionResumeRequest.ownerRoute : undefined
+        const retryRequest = retryResumeRequestRef.current
+        const effectiveRequest = explicitRequest ?? (retryRequest?.sessionId === routedSessionId ? retryRequest : null)
+        const ownerRoute = effectiveRequest?.ownerRoute
 
-        if (ownerRoute) {
+        if (effectiveRequest?.forceCold) {
+          void resumeSession(routedSessionId, true, ownerRoute, { forceCold: true })
+        } else if (ownerRoute) {
           void resumeSession(routedSessionId, true, ownerRoute)
         } else {
           void resumeSession(routedSessionId, true)
@@ -201,7 +225,10 @@ export function useRouteResume({
     ) {
       // A fresh draft is a real navigation — any later resume homes normally.
       bootResumeRef.current = false
-      startFreshSessionDraft(true)
+      startFreshSessionDraft({
+        intent: createFreshSessionIntent({ cause: 'context-recovery', persistence: 'automatic' }),
+        replaceRoute: true
+      })
     }
   }, [
     activeSessionId,
@@ -267,6 +294,9 @@ export function useRouteResume({
       if (retrySessionIdRef.current !== routedSessionId) {
         retrySessionIdRef.current = null
         retryAttemptRef.current = 0
+        if (retryResumeRequestRef.current?.sessionId !== routedSessionId) {
+          retryResumeRequestRef.current = null
+        }
         setResumeExhaustedSessionId(current => (current && current !== routedSessionId ? null : current))
       }
 
@@ -311,7 +341,18 @@ export function useRouteResume({
       // having fired. A flapping backend could then hit MAX in a couple of
       // re-renders with far fewer than MAX real attempts. (Point 3)
       retryAttemptRef.current += 1
-      void resumeSession(sessionId, true)
+      const retryRequest = retryResumeRequestRef.current
+
+      if (retryRequest?.sessionId === sessionId) {
+        void resumeSession(
+          sessionId,
+          true,
+          retryRequest.ownerRoute,
+          retryRequest.forceCold ? { forceCold: true } : undefined
+        )
+      } else {
+        void resumeSession(sessionId, true)
+      }
     }, resumeRetryDelayMs(attempt))
 
     return () => clearTimeout(timer)

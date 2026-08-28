@@ -29,7 +29,16 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, newSessionInProfile, selectProfile } = await import('./profile')
+const {
+  $activeGatewayProfile,
+  $freshSessionIntent,
+  $showAllProfiles,
+  newSessionInProfile,
+  selectProfile,
+  setShowAllProfiles
+} = await import('./profile')
+const { $profileConversationRestore, _resetProfileConversationRestoreForTests } =
+  await import('./profile-conversation-restore')
 
 beforeEach(() => {
   ensureGatewayForProfile.mockClear()
@@ -38,9 +47,12 @@ beforeEach(() => {
   activeGatewayConnectionId.mockReturnValue(null)
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
+  $showAllProfiles.set(false)
+  _resetProfileConversationRestoreForTests()
   // resolveConnectionForAgent is best-effort; without a bridge it resolves
-  // null and the previous descriptor stays, which is fine here.
-  ;(globalThis as { window?: unknown }).window = {}
+  // null and the previous descriptor stays, which is fine here. Preserve the
+  // jsdom Window itself because notifications rely on its timer APIs.
+  ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = undefined
 })
 
 describe('selectProfile', () => {
@@ -70,6 +82,73 @@ describe('selectProfile', () => {
     await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('override-profile'))
     expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
+
+  it('begins before isolation and commits only after activation succeeds', async () => {
+    let resolveActivation!: () => void
+
+    ensureGatewayForProfile.mockImplementationOnce(
+      () =>
+        new Promise<undefined>(resolve => {
+          resolveActivation = () => resolve(undefined)
+        })
+    )
+
+    selectProfile('research')
+
+    const activating = $profileConversationRestore.get()
+    expect(activating).toMatchObject({ phase: 'activating', target: { connectionId: null, profile: 'research' } })
+    expect($freshSessionIntent.get()).toMatchObject({
+      cause: 'profile-switch',
+      persistence: 'automatic',
+      restoreSequence: activating?.sequence
+    })
+
+    resolveActivation()
+    await vi.waitFor(() => expect($profileConversationRestore.get()?.phase).toBe('committed'))
+  })
+
+  it('cancels the matching restore when activation fails', async () => {
+    ensureGatewayForProfile.mockRejectedValueOnce(new Error('offline'))
+
+    selectProfile('research')
+
+    await vi.waitFor(() => expect($profileConversationRestore.get()).toBeNull())
+  })
+
+  it('keeps only the latest restore across rapid selections', async () => {
+    let resolveFirst!: () => void
+
+    ensureGatewayForProfile.mockImplementationOnce(
+      () =>
+        new Promise<undefined>(resolve => {
+          resolveFirst = () => resolve(undefined)
+        })
+    )
+
+    selectProfile('research')
+    const first = $profileConversationRestore.get()?.sequence
+    selectProfile('ops')
+    resolveFirst()
+
+    await vi.waitFor(() =>
+      expect($profileConversationRestore.get()).toMatchObject({ phase: 'committed', target: { profile: 'ops' } })
+    )
+
+    expect($profileConversationRestore.get()?.sequence).not.toBe(first)
+    expect($profileConversationRestore.get()?.target.profile).toBe('ops')
+  })
+
+  it('restores on concrete re-entry from All Profiles but not a same-profile retap', async () => {
+    $activeGatewayProfile.set('default')
+
+    selectProfile('default')
+    await Promise.resolve()
+    expect($profileConversationRestore.get()).toBeNull()
+
+    setShowAllProfiles(true)
+    selectProfile('default')
+    await vi.waitFor(() => expect($profileConversationRestore.get()?.phase).toBe('committed'))
+  })
 })
 
 describe('newSessionInProfile', () => {
@@ -80,6 +159,11 @@ describe('newSessionInProfile', () => {
 
     await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('mini', 'designer'))
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+    expect($profileConversationRestore.get()).toBeNull()
+    expect($freshSessionIntent.get()).toMatchObject({
+      cause: 'new-chat-in-profile',
+      persistence: 'explicit'
+    })
   })
 
   it('keeps the legacy profile-only path for a new chat on the explicit local source', async () => {
@@ -102,12 +186,10 @@ describe('selectProfile startup preference (#79886)', () => {
 
     const getConnectionConfig = vi.fn(async () => ({ mode: 'local' }))
 
-    ;(globalThis as { window?: unknown }).window = {
-      hermesDesktop: {
-        getConnection,
-        getConnectionConfig,
-        profile: { remember: rememberProfile }
-      }
+    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+      getConnection,
+      getConnectionConfig,
+      profile: { remember: rememberProfile }
     }
   })
 
@@ -140,6 +222,16 @@ describe('selectProfile startup preference (#79886)', () => {
     await vi.waitFor(() => expect(rememberProfile).toHaveBeenCalledWith('tilly'))
   })
 
+  it('keeps a landed restore committed when startup-profile persistence fails', async () => {
+    activeGatewayConnectionId.mockReturnValue(null)
+    rememberProfile.mockRejectedValueOnce(new Error('read-only userData'))
+
+    selectProfile('tilly')
+
+    await vi.waitFor(() => expect(rememberProfile).toHaveBeenCalledWith('tilly'))
+    await vi.waitFor(() => expect($profileConversationRestore.get()?.phase).toBe('committed'))
+  })
+
   it('does not replace the startup preference for a registry-source pick', async () => {
     activeGatewayConnectionId.mockReturnValue('mini')
 
@@ -167,12 +259,10 @@ describe('selectProfile startup preference (#79886)', () => {
 
     const getConnectionConfig = vi.fn(async () => ({ mode: 'local' }))
 
-    ;(globalThis as { window?: unknown }).window = {
-      hermesDesktop: {
-        getConnection,
-        getConnectionConfig,
-        profile: { remember: rememberProfile }
-      }
+    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+      getConnection,
+      getConnectionConfig,
+      profile: { remember: rememberProfile }
     }
 
     selectProfile('tilly')
@@ -188,12 +278,10 @@ describe('selectProfile startup preference (#79886)', () => {
 
     const getConnectionConfig = vi.fn(async () => ({ mode: 'ssh' }))
 
-    ;(globalThis as { window?: unknown }).window = {
-      hermesDesktop: {
-        getConnection,
-        getConnectionConfig,
-        profile: { remember: rememberProfile }
-      }
+    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+      getConnection,
+      getConnectionConfig,
+      profile: { remember: rememberProfile }
     }
 
     selectProfile('macmini-hermes')

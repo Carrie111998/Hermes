@@ -2,6 +2,7 @@ import type { ConnectionState } from '@hermes/shared'
 import { atom, computed } from 'nanostores'
 
 import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
+import { routeSessionId, sessionRoute } from '@/app/routes'
 import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -40,6 +41,7 @@ const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
 // cross-profile corruption this storage boundary prevents (#67709).
 const LAST_SESSION_KEY = 'hermes.desktop.lastSessionId'
 const LAST_ROUTE_KEY = 'hermes.desktop.lastRoute'
+const LAST_CONVERSATION_KEY = 'hermes.desktop.lastConversation'
 
 function profileNavigationKey(base: string, profile: string): string {
   const key = profile.trim() || 'default'
@@ -100,6 +102,123 @@ export function getRememberedSessionId(profile: string): null | string {
 export function setRememberedSessionId(id: null | string, profile: string): void {
   discardLegacyRememberedNavigation()
   persistString(profileNavigationKey(LAST_SESSION_KEY, profile), id)
+}
+
+export type RememberedConversation = { kind: 'blank'; version: 1 } | { kind: 'session'; sessionId: string; version: 1 }
+
+function validRememberedConversation(value: unknown): RememberedConversation | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+
+  const candidate = value as Partial<RememberedConversation>
+
+  if (candidate.version !== 1) {
+    return null
+  }
+
+  if (candidate.kind === 'blank') {
+    return { kind: 'blank', version: 1 }
+  }
+
+  if (candidate.kind === 'session' && typeof candidate.sessionId === 'string' && candidate.sessionId.trim()) {
+    return { kind: 'session', sessionId: candidate.sessionId.trim(), version: 1 }
+  }
+
+  return null
+}
+
+/**
+ * The durable conversation preference for one exact profile + connection.
+ *
+ * Invalid or not-yet-written records fall through to the rollback-compatible
+ * navigation keys. Legacy candidates are deliberately not migrated here: the
+ * restore path must first prove their exact backend ownership. In particular,
+ * `/` is never inferred to be a blank tombstone because older renderers also
+ * wrote it for automatic profile/connection isolation transitions.
+ */
+export function getRememberedConversation(profile: string): RememberedConversation | null {
+  discardLegacyRememberedNavigation()
+
+  const stored = validRememberedConversation(readJson<unknown>(profileNavigationKey(LAST_CONVERSATION_KEY, profile)))
+
+  if (stored) {
+    return stored
+  }
+
+  const rememberedRoute = getRememberedRoute(profile)
+  const routedSessionId = rememberedRoute ? routeSessionId(rememberedRoute) : null
+
+  if (routedSessionId) {
+    return { kind: 'session', sessionId: routedSessionId, version: 1 }
+  }
+
+  const rememberedSessionId = getRememberedSessionId(profile)
+
+  return rememberedSessionId ? { kind: 'session', sessionId: rememberedSessionId, version: 1 } : null
+}
+
+/**
+ * Persist a validated durable preference and maintain the old navigation keys
+ * so rolling back Desktop preserves the same outcome.
+ */
+export function setRememberedConversation(value: RememberedConversation, profile: string): void {
+  discardLegacyRememberedNavigation()
+
+  if (value.kind === 'blank') {
+    // Compatibility writes happen first: an older renderer must not resurrect
+    // the previous session if it observes storage before the new record lands.
+    setRememberedSessionId(null, profile)
+    setRememberedRoute('/', profile)
+    writeJson(profileNavigationKey(LAST_CONVERSATION_KEY, profile), { kind: 'blank', version: 1 })
+    return
+  }
+
+  const sessionId = value.sessionId.trim()
+
+  if (!sessionId) {
+    return
+  }
+
+  writeJson(profileNavigationKey(LAST_CONVERSATION_KEY, profile), {
+    kind: 'session',
+    sessionId,
+    version: 1
+  })
+  setRememberedSessionId(sessionId, profile)
+  setRememberedRoute(sessionRoute(sessionId), profile)
+}
+
+/**
+ * Remove a stale remembered session only when every persisted session-shaped
+ * value still names that exact durable id. Unrelated sessions, non-session
+ * routes, and explicit blank tombstones are preserved.
+ */
+export function clearRememberedConversationIfSession(profile: string, sessionId: string): void {
+  discardLegacyRememberedNavigation()
+
+  const target = sessionId.trim()
+
+  if (!target) {
+    return
+  }
+
+  const conversationKey = profileNavigationKey(LAST_CONVERSATION_KEY, profile)
+  const remembered = validRememberedConversation(readJson<unknown>(conversationKey))
+
+  if (remembered?.kind === 'session' && remembered.sessionId === target) {
+    writeJson(conversationKey, null)
+  }
+
+  if (getRememberedSessionId(profile) === target) {
+    setRememberedSessionId(null, profile)
+  }
+
+  const rememberedRoute = getRememberedRoute(profile)
+
+  if (rememberedRoute && routeSessionId(rememberedRoute) === target) {
+    setRememberedRoute(null, profile)
+  }
 }
 
 export function sessionBelongsToProfile(
@@ -732,6 +851,7 @@ export const $awaitingResponse = atom(false)
 // Null whenever the active route has a healthy (or in-flight) resume.
 export const $resumeFailedSessionId = atom<string | null>(null)
 export interface SessionResumeRequest {
+  forceCold?: boolean
   ownerRoute?: SessionOwnerRoute
   sequence: number
   sessionId: string
@@ -1073,7 +1193,11 @@ export const setMessages = (next: Updater<ChatMessage[]>) => updateAtom($message
 export const setFreshDraftReady = (next: Updater<boolean>) => updateAtom($freshDraftReady, next)
 export const setResumeFailedSessionId = (next: Updater<string | null>) => updateAtom($resumeFailedSessionId, next)
 
-export const requestSessionResume = (sessionId: string, ownerRoute?: SessionOwnerRoute) => {
+export const requestSessionResume = (
+  sessionId: string,
+  ownerRoute?: SessionOwnerRoute,
+  options?: { forceCold?: boolean }
+) => {
   const id = sessionId.trim()
 
   if (!id) {
@@ -1085,6 +1209,7 @@ export const requestSessionResume = (sessionId: string, ownerRoute?: SessionOwne
   }
 
   $sessionResumeRequest.set({
+    ...(options?.forceCold ? { forceCold: true } : {}),
     ...(ownerRoute ? { ownerRoute: { ...ownerRoute } } : {}),
     sequence: ++sessionResumeRequestSequence,
     sessionId: id

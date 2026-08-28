@@ -8,6 +8,7 @@ import {
   beginGatewaySwitch,
   endGatewaySwitch,
   type GatewaySwitchToken,
+  isCurrentGatewaySwitch,
   recoverActiveSourceAfterFailedGatewaySwitch
 } from '@/store/gateway-switch'
 import {
@@ -21,6 +22,13 @@ import {
   refreshActiveProfile,
   requestFreshSession
 } from '@/store/profile'
+import {
+  $profileConversationRestore,
+  beginProfileConversationRestore,
+  cancelProfileConversationRestore,
+  commitProfileConversationRestore,
+  isCurrentProfileConversationRestore
+} from '@/store/profile-conversation-restore'
 import { $connection } from '@/store/session'
 
 const LAST_PROFILE_STORAGE_KEY = 'hermes.desktop.lastProfileByConnection'
@@ -230,7 +238,7 @@ export async function initializeConnectionsRegistry(): Promise<DesktopConnection
   if ($activeConnectionId.get() === preferredId) {
     await rememberConnection(preferredId)
   } else {
-    await selectConnection(preferredId)
+    await selectConnection(preferredId, { initiator: 'boot' })
   }
 
   return $connectionsRegistry.get() ?? registry
@@ -261,6 +269,8 @@ export async function initializeConnectionsRegistry(): Promise<DesktopConnection
  * the barrier and repaints the source that is still active.
  */
 export interface SelectConnectionOptions {
+  /** Boot adoption remains owned by cold restoration; user is the default. */
+  initiator?: 'boot' | 'user'
   /** Land on this profile of the target source instead of the one last used
    *  there. The fleet profile rail passes the exact square the user clicked. */
   profile?: null | string
@@ -274,12 +284,10 @@ export async function selectConnection(connectionId: string, options: SelectConn
     return
   }
 
-  // A user-initiated source switch collapses "All profiles" browse mode: the
-  // picker is a concrete-source action. The silent boot-time restore (below,
-  // from initializeConnectionsRegistry) is not — it must leave the persisted
-  // browse-mode preference alone so it survives restart (#93197).
-  const restoreOnBoot = pendingTarget === null && $activeConnectionId.get() === null
-
+  // Boot adoption remains under the cold-start restoration controller. This
+  // explicit initiator is the sole authority; ambient connection state cannot
+  // safely distinguish boot from a user's first click after failed adoption.
+  const initiator = options.initiator ?? 'user'
   const currentConnectionId = $activeConnectionId.get()
   const currentProfile = normalizeProfileKey($activeGatewayProfile.get())
   const explicitProfile = String(options.profile ?? '').trim()
@@ -312,6 +320,11 @@ export async function selectConnection(connectionId: string, options: SelectConn
     return
   }
 
+  const restoreSequence =
+    initiator === 'user'
+      ? beginProfileConversationRestore('connection-switch', { connectionId, profile: targetProfile })
+      : null
+
   if (pendingTarget === null && currentConnectionId === connectionId && currentProfile === targetProfile) {
     $showAllProfiles.set(false)
     $newChatProfile.set(targetProfile)
@@ -319,7 +332,17 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // registry identity with the profile so the next create names local::x /
     // <source>::x exactly, never a bare profile string.
     captureNewChatSource()
-    requestFreshSession()
+
+    if (restoreSequence !== null && commitProfileConversationRestore(restoreSequence)) {
+      requestFreshSession({
+        cause: 'connection-switch',
+        persistence: 'automatic',
+        restoreSequence
+      })
+    } else if (initiator === 'boot') {
+      requestFreshSession({ cause: 'boot-transition', persistence: 'automatic' })
+    }
+
     await rememberConnection(connectionId)
 
     return
@@ -332,6 +355,10 @@ export async function selectConnection(connectionId: string, options: SelectConn
   // barrier and, if the commit then fails, owes the still-active source a
   // repaint. Null while queued, or if it stepped aside before its turn.
   let token = null as GatewaySwitchToken | null
+  let targetLanded = false
+
+  const ownsSwitchIntent = () =>
+    revision === switchRevision && (restoreSequence === null || isCurrentProfileConversationRestore(restoreSequence))
 
   try {
     // Phase 1 — open the target's socket; the active route is untouched.
@@ -346,7 +373,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // A newer click owns the switch from here on. The superseded dial never
     // activates, so the user doesn't flip through it on the way to the source
     // they picked last; its socket stays warm for that click or idles out.
-    if (revision !== switchRevision) {
+    if (!ownsSwitchIntent()) {
       return
     }
 
@@ -356,6 +383,14 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // superseded this switch while it was queued makes the hook decline —
     // neither wipe nor activation — so the user never flips through it.
     const activationController = new AbortController()
+    const stopWatchingRestore =
+      restoreSequence === null
+        ? () => undefined
+        : $profileConversationRestore.listen(current => {
+            if (current?.sequence !== restoreSequence && !activationController.signal.aborted) {
+              activationController.abort(new Error('Connection switch superseded by newer context intent'))
+            }
+          })
     let markActivationStarted: () => void = () => undefined
 
     const activationStarted = new Promise<void>(resolve => {
@@ -367,7 +402,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
         const activation = ensureGatewayAgent(connectionId, targetProfile, {
           signal: activationController.signal,
           beforeActivate: () => {
-            if (revision !== switchRevision) {
+            if (!ownsSwitchIntent()) {
               return false
             }
 
@@ -414,7 +449,10 @@ export async function selectConnection(connectionId: string, options: SelectConn
       if (!targetIsActive()) {
         throw new Error(`Connection "${targetConnection.label}" did not become active.`)
       }
+
+      targetLanded = true
     } finally {
+      stopWatchingRestore()
       // Lower the barrier the moment the commit settles — before the
       // bookkeeping awaits below — but only if this switch still owns it.
       if (token !== null) {
@@ -425,29 +463,58 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // A newer click owns the final refresh. Serialized gateway activation
     // already makes the latest source win; this guard also prevents an older
     // request from repainting its profile list after that newer activation.
-    if (revision === switchRevision) {
-      await rememberConnection(connectionId)
-
-      if (!restoreOnBoot) {
+    if (ownsSwitchIntent()) {
+      if (initiator === 'user') {
         $showAllProfiles.set(false)
       }
 
       $newChatProfile.set(targetProfile)
       captureNewChatSource()
-      requestFreshSession()
+
+      if (restoreSequence !== null && commitProfileConversationRestore(restoreSequence)) {
+        requestFreshSession({
+          cause: 'connection-switch',
+          persistence: 'automatic',
+          restoreSequence
+        })
+      } else if (initiator === 'boot') {
+        requestFreshSession({ cause: 'boot-transition', persistence: 'automatic' })
+      }
+
+      await rememberConnection(connectionId)
       await refreshActiveProfile()
     }
   } catch (error) {
-    if (revision === switchRevision) {
-      if (token !== null) {
-        // This switch wiped for a commit that never landed. The previous
-        // source is still the active one, and nothing reactive re-pulls its
-        // lists (no scope moved): repaint it and land on a fresh draft there,
-        // matching what a failed Settings apply leaves behind.
-        recoverActiveSourceAfterFailedGatewaySwitch(token)
-        requestFreshSession()
-      }
+    const ownsIntent = ownsSwitchIntent()
+    const recoveryToken = token
+    // Capture ownership before scheduling recovery. A newer intent can begin
+    // between this catch and the helper's microtask; the helper re-checks the
+    // token before every publication, while this snapshot decides whether the
+    // failed owner may also paint a recovery draft.
+    const tokenWasCurrent = recoveryToken !== null && !targetLanded && isCurrentGatewaySwitch(recoveryToken)
 
+    if (ownsIntent && restoreSequence !== null && !targetLanded) {
+      cancelProfileConversationRestore(
+        restoreSequence,
+        token === null ? 'connection-dial-failed' : 'connection-commit-failed'
+      )
+    }
+
+    if (recoveryToken !== null && !targetLanded) {
+      // Acquiring a token means this switch synchronously wiped the outgoing
+      // source. Recovery is therefore an obligation of the token, not of the
+      // still-current click. A superseding intent may fail before acquiring a
+      // token of its own; in that case this older request remains responsible
+      // for repainting the source it wiped. The token-aware helper safely
+      // declines once a newer commit has actually taken ownership.
+      recoverActiveSourceAfterFailedGatewaySwitch(recoveryToken)
+
+      if (ownsIntent && tokenWasCurrent) {
+        requestFreshSession({ cause: 'switch-recovery', persistence: 'automatic' })
+      }
+    }
+
+    if (ownsIntent) {
       throw error
     }
   } finally {

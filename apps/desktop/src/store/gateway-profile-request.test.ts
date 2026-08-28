@@ -47,6 +47,7 @@ vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() })
 
 const {
   $gateway,
+  $gatewayActivationEpoch,
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForAgent,
@@ -204,7 +205,6 @@ describe('requestGatewayForAgent', () => {
 
     setPrimaryGateway(primary as never, 'default')
     setPrimaryGatewayConnection({ connectionId: 'remote-primary' })
-
     ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
       getConnection: vi.fn(),
       getConnectionFor,
@@ -242,7 +242,6 @@ describe('requestGatewayForAgent', () => {
 
     setPrimaryGateway(primary as never, 'default')
     setPrimaryGatewayConnection({ connectionId: 'remote-primary' })
-
     ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
       getConnection: vi.fn(),
       getConnectionFor,
@@ -402,6 +401,7 @@ describe('requestGatewayForAgent', () => {
     const sourceBActivation = ensureGatewayForAgent('source-b', 'pinned')
     await vi.waitFor(() => expect(secondaryGateways[1]?.connect).toHaveBeenCalledOnce())
     expect(gatewayActivationEpoch()).toBeGreaterThan(invalidationEpoch)
+    expect($gatewayActivationEpoch.get()).toBe(gatewayActivationEpoch())
     releaseConnect()
     await sourceBActivation
     expect(onActiveConnectionChanged).toHaveBeenLastCalledWith(expect.objectContaining({ connectionId: 'source-b' }))

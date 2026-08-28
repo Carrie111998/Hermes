@@ -10,13 +10,41 @@ vi.mock('./client', () => ({
 }))
 
 const client = await import('./client')
-const { listSidebarSessions } = await import('./sessions')
+const { getSession, listSidebarSessions } = await import('./sessions')
 
 const hermesApi = vi.mocked(client.hermesApi)
 
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(client.getApiRequestConnection).mockReturnValue('prometheus')
+})
+
+describe('getSession routing', () => {
+  it('clears the ambient connection tag for an explicit profile-door target', async () => {
+    vi.mocked(client.capabilityScoped).mockReturnValue({ profile: 'arthur' })
+    hermesApi.mockResolvedValue({ id: 's1' } as never)
+
+    await getSession('s1', { connectionId: null, profile: 'arthur' })
+
+    expect(hermesApi).toHaveBeenCalledWith({
+      connectionId: undefined,
+      path: '/api/sessions/s1?profile=arthur',
+      profile: 'arthur'
+    })
+  })
+
+  it('preserves an explicit local registry target', async () => {
+    vi.mocked(client.capabilityScoped).mockReturnValue({ profile: 'arthur' })
+    hermesApi.mockResolvedValue({ id: 's1' } as never)
+
+    await getSession('s1', { connectionId: 'local', profile: 'arthur' })
+
+    expect(hermesApi).toHaveBeenCalledWith({
+      connectionId: 'local',
+      path: '/api/sessions/s1?profile=arthur',
+      profile: 'arthur'
+    })
+  })
 })
 
 describe('listSidebarSessions remote ownership', () => {

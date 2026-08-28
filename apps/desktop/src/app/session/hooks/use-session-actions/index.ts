@@ -50,6 +50,14 @@ import {
   resolveNewChatOwnerRoute
 } from '@/store/profile'
 import {
+  $appliedFreshDraftProvenance,
+  applyFreshDraftProvenance,
+  cancelProfileConversationRestore,
+  createFreshSessionIntent,
+  type FreshSessionIntent,
+  provenanceForFreshSessionIntent
+} from '@/store/profile-conversation-restore'
+import {
   $projectScope,
   beginSessionMutation,
   endSessionMutation,
@@ -272,7 +280,8 @@ async function desktopSessionCreateParams(
   }
 }
 
-interface FreshSessionDraftOptions {
+export interface FreshSessionDraftOptions {
+  intent: FreshSessionIntent
   preserveRoute?: boolean
   replaceRoute?: boolean
   workspaceTarget?: NewChatWorkspaceTarget
@@ -386,8 +395,26 @@ export function useSessionActions({
   }, [activeSessionIdRef, getRoutedStoredSessionId, navigate, selectedStoredSessionIdRef, storedIdRotation])
 
   const startFreshSessionDraft = useCallback(
-    (options: boolean | FreshSessionDraftOptions = false) => {
-      const draftOptions = typeof options === 'boolean' ? { replaceRoute: options } : options
+    (draftOptions: FreshSessionDraftOptions) => {
+      const { intent } = draftOptions
+      const applied = $appliedFreshDraftProvenance.get()
+
+      if (applied && applied.freshSequence > intent.sequence) {
+        return
+      }
+
+      if (
+        intent.persistence === 'explicit' ||
+        (intent.persistence === 'automatic' &&
+          intent.restoreSequence === undefined &&
+          intent.cause !== 'boot-transition' &&
+          intent.cause !== 'gateway-transition')
+      ) {
+        cancelProfileConversationRestore(undefined, `fresh-draft:${intent.cause}`)
+      }
+
+      applyFreshDraftProvenance(provenanceForFreshSessionIntent(intent))
+
       const preserveRoute = draftOptions.preserveRoute ?? false
       const replaceRoute = draftOptions.replaceRoute ?? false
 
@@ -473,6 +500,7 @@ export function useSessionActions({
 
   const createBackendSessionForSend = useCallback(
     async (preview: string | null = null): Promise<string | null> => {
+      cancelProfileConversationRestore(undefined, 'session-create')
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
 
@@ -648,12 +676,15 @@ export function useSessionActions({
     (item: SidebarNavItem) => {
       if (item.action === 'new-session') {
         setWorkspaceScope('sessions')
-        startFreshSessionDraft()
+        startFreshSessionDraft({
+          intent: createFreshSessionIntent({ cause: 'new-chat', persistence: 'explicit' })
+        })
 
         return
       }
 
       if (item.route) {
+        cancelProfileConversationRestore(undefined, 'sidebar-page')
         navigateToWorkspacePage(navigate, item.route)
       }
     },
@@ -800,10 +831,20 @@ export function useSessionActions({
   }, [navigate, selectedStoredSessionId])
 
   const resumeSession = useCallback(
-    async (storedSessionId: string, replaceRoute = false, capturedOwner?: SessionProfileRoute) => {
+    async (
+      storedSessionId: string,
+      replaceRoute = false,
+      capturedOwner?: SessionProfileRoute,
+      options?: { forceCold?: boolean }
+    ) => {
+      const forceCold = options?.forceCold === true
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
-      const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
+      // forceCold is an ownership boundary, not only a runtime-cache policy.
+      // A colliding durable id may currently paint another connection's
+      // transcript, so never carry foreground messages into the exact-target
+      // resume even when the bare selected id happens to match.
+      const resumedSameSelectedSession = !forceCold && selectedStoredSessionIdRef.current === storedSessionId
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
 
       const isCurrentResume = () =>
@@ -832,7 +873,7 @@ export function useSessionActions({
       // now-redundant tile so main owns it. Runs before the async awaits below (and
       // before the selection listener homes focus) so the tile is gone the same tick
       // the route takes over; the warm cache/runtime binding survives for main to reuse.
-      if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
+      if (!forceCold && $sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
         closeSessionTile(storedSessionId)
       }
 
@@ -874,7 +915,7 @@ export function useSessionActions({
         return { runtimeId, state }
       }
 
-      if (!takeWarmCache()) {
+      if (forceCold || !takeWarmCache()) {
         setActiveSessionId(null)
         activeSessionIdRef.current = null
         // History load is not turn-busy. Drop the previous session's leftover
@@ -908,6 +949,14 @@ export function useSessionActions({
 
       if (resumeRequestRef.current !== requestId) {
         return
+      }
+
+      if (forceCold && storedForProfile) {
+        closeSessionTile(storedSessionId, {
+          connectionId: capturedOwner?.connectionId || storedForProfile.connection_id?.trim() || null,
+          profile: normalizeProfileKey(capturedOwner?.profile || sessionProfile),
+          ...(capturedOwner?.targetProfile ? { targetProfile: capturedOwner.targetProfile } : {})
+        })
       }
 
       const resolvedConnectionId = ownerRoute?.connectionId || storedForProfile?.connection_id || ambientConnectionId
@@ -970,7 +1019,7 @@ export function useSessionActions({
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
       // purges a cross-wired mapping before we trust the fast-path.
-      const warmHit = takeWarmCache()
+      const warmHit = forceCold ? null : takeWarmCache()
 
       if (warmHit) {
         const cachedRuntimeId = warmHit.runtimeId
@@ -1114,8 +1163,8 @@ export function useSessionActions({
 
               const busyChangedWhileActivating = Boolean(
                 latestCachedState?.busy &&
-                (latestCachedState.turnStartedAt !== activateBaselineState.turnStartedAt ||
-                  (latestCachedState.turnLive && !activateBaselineState.turnLive))
+                  (latestCachedState.turnStartedAt !== activateBaselineState.turnStartedAt ||
+                    (latestCachedState.turnLive && !activateBaselineState.turnLive))
               )
 
               const running =
@@ -1811,7 +1860,7 @@ export function useSessionActions({
               // draft fallback for genuinely dead ids on secondary profiles.
               Boolean(
                 sessionProfile?.trim() &&
-                normalizeProfileKey(sessionProfile) !== normalizeProfileKey($activeGatewayProfile.get())
+                  normalizeProfileKey(sessionProfile) !== normalizeProfileKey($activeGatewayProfile.get())
               )
           })
 
@@ -1821,7 +1870,10 @@ export function useSessionActions({
             return
           }
 
-          startFreshSessionDraft(true)
+          startFreshSessionDraft({
+            intent: createFreshSessionIntent({ cause: 'context-recovery', persistence: 'automatic' }),
+            replaceRoute: true
+          })
 
           return
         }
@@ -2172,7 +2224,10 @@ export function useSessionActions({
       // Tear down before awaiting so the route effect can't resume the
       // doomed session via the stale /<sid> URL.
       if (wasSelected) {
-        startFreshSessionDraft(true)
+        startFreshSessionDraft({
+          intent: createFreshSessionIntent({ cause: 'context-recovery', persistence: 'automatic' }),
+          replaceRoute: true
+        })
       }
 
       try {
@@ -2291,7 +2346,10 @@ export function useSessionActions({
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
 
       if (wasSelected) {
-        startFreshSessionDraft(true)
+        startFreshSessionDraft({
+          intent: createFreshSessionIntent({ cause: 'context-recovery', persistence: 'automatic' }),
+          replaceRoute: true
+        })
       }
 
       try {
