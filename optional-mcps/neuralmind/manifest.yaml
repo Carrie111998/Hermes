@@ -8,8 +8,10 @@ name: neuralmind
 description: >-
   Persistent code-intelligence memory for AI agents: progressive-disclosure
   semantic search (12-50x cheaper than raw file reads) plus a local Hebbian
-  synapse graph that learns which code moves together from real usage. Runs
-  entirely local; makes no network calls of its own.
+  synapse graph that learns which code moves together from real usage. Indexes
+  and queries locally, with no telemetry and no calls home; the one outbound
+  request is the embedding model the vector store fetches on the first build,
+  which air-gapped installs can pre-seed.
 source: https://github.com/dfrostar/neuralmind
 
 # neuralmind-mcp is a PyPI console-script entry point, not a git-cloned
@@ -26,9 +28,17 @@ transport:
 auth:
   type: none
 
-# All tools enabled by default: unlike n8n's mutating workflow actions,
-# nothing here reaches outside the local project directory or makes a
-# network call — `neuralmind_build` only rebuilds the local index.
+# All tools enabled by default: unlike n8n's mutating workflow actions, none
+# of these mutate state outside the local project directory — `neuralmind_build`
+# only rebuilds that project's own index.
+#
+# On the network claim, stated precisely rather than absolutely: no tool here
+# opens a network connection at query time, and none sends telemetry. The one
+# exception is the *first* `neuralmind_build` on a machine with no cached
+# embedding model, where the vector store downloads that model. Later builds
+# are offline, and the cache can be pre-seeded for air-gapped installs (see
+# docs/use-cases/air-gapped.md in the source repo). Note this is a property of
+# the server, not something this catalog's CI verifies.
 tools:
   default_enabled:
     - neuralmind_wakeup
