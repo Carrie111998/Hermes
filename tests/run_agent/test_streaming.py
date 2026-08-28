@@ -98,6 +98,37 @@ class TestStreamingAccumulator:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_ignores_non_string_content_delta(self, mock_close, mock_create):
+        """Malformed provider content cannot abort a later text delta."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content=42),
+            _make_stream_chunk(content="still delivered", finish_reason="stop"),
+        ]
+        deltas = []
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=deltas.append,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "still delivered"
+        assert deltas == ["still delivered"]
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_sparse_delta_allows_missing_optional_fields(self, mock_close, mock_create):
         """Managed stream deltas may omit both content and tool_calls."""
         from run_agent import AIAgent
