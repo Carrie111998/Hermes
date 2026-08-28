@@ -162,10 +162,28 @@ def extract_document_bytes(data: bytes, path: str) -> str:
                 pass
 
 
+def _anydoc_missing_error(path: str) -> str:
+    """Teaching error for anydoc-gated formats when the converter is absent.
+
+    Response-time hint (#95681 pattern): the schema no longer lists the
+    anydoc-gated formats or the availability caveat — a session that never
+    touches a .doc/.odt/.epub never pays for the explanation, and one that
+    does gets the full story here, with the fix.
+    """
+    return (
+        f"Cannot convert {path!r}: this format needs the optional anydoc "
+        "converter, which is not installed (install blocked or first "
+        "attempt failed; retried every 5 minutes). Fix: `pip install "
+        "firecrawl-anydoc` in Hermes's environment, or convert the file "
+        "yourself via terminal (e.g. libreoffice --headless --convert-to "
+        "txt)."
+    )
+
+
 def _extract_anydoc(path: str) -> str:
     mod = _anydoc()
     if mod is None:
-        raise ExtractionError(f"Unsupported document type: {path!r}")
+        raise ExtractionError(_anydoc_missing_error(path))
     try:
         size = os.path.getsize(path)
     except OSError as exc:
@@ -335,7 +353,7 @@ def _pdf_coverage_note(path: str, display_path: Optional[str] = None) -> str:
 def _extract_anydoc_bytes(data: bytes, path: str) -> str:
     mod = _anydoc()
     if mod is None:
-        raise ExtractionError(f"Unsupported document type: {path!r}")
+        raise ExtractionError(_anydoc_missing_error(path))
     if len(data) > MAX_ANYDOC_BYTES:
         raise ExtractionError(
             f"Document too large to convert ({len(data):,} bytes, limit is {MAX_ANYDOC_BYTES:,})"
