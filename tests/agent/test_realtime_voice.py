@@ -5,7 +5,6 @@ from typing import Any
 
 import pytest
 
-from agent import realtime_voice_coordinator
 from agent import realtime_voice_registry
 from agent.realtime_voice import (
     HeardAudioBoundary,
@@ -178,12 +177,14 @@ async def test_coordinator_rejects_foreign_stale_and_regressing_heard_boundaries
 
 
 @pytest.mark.asyncio
-async def test_coordinator_rejects_foreign_event_when_identity_token_is_reused(
-    monkeypatch: pytest.MonkeyPatch,
-):
+async def test_coordinator_rejects_foreign_event_with_the_same_emission_identity():
     emitted = RealtimeEvent.audio(b"emitted", item_id="item-1")
-    foreign = RealtimeEvent.audio(b"foreign", item_id="item-1")
-    monkeypatch.setattr(realtime_voice_coordinator, "id", lambda _event: 7, raising=False)
+    foreign = RealtimeEvent(
+        type=RealtimeEventType.AUDIO,
+        audio_bytes=b"foreign",
+        item_id="item-1",
+        emission_id=emitted.emission_id,
+    )
     coordinator = RealtimeVoiceCoordinator(
         FakeProvider("fake", FakeSession([emitted])),
         dispatch_tool=lambda _name, _args: "ok",
@@ -233,7 +234,9 @@ async def test_zero_heard_boundary_truncates_to_start_before_cancel():
 
 
 @pytest.mark.asyncio
-async def test_coordinator_returns_dispatch_failures_to_provider_without_losing_session():
+async def test_coordinator_logs_dispatch_failures_with_tool_context(
+    caplog: pytest.LogCaptureFixture,
+):
     session = FakeSession([RealtimeEvent.tool_call("call-2", "browser", {})])
 
     async def dispatch(_name: str, _arguments: dict[str, Any]) -> str:
@@ -245,6 +248,14 @@ async def test_coordinator_returns_dispatch_failures_to_provider_without_losing_
 
     assert len(events) == 1
     assert session.tool_results == [("call-2", "Error: approval denied")]
+    [record] = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Realtime voice tool dispatch failed"
+    ]
+    assert record.__dict__["tool_name"] == "browser"
+    assert record.__dict__["call_id"] == "call-2"
+    assert record.exc_info is not None
 
 
 @pytest.mark.asyncio

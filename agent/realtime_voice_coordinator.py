@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
+from uuid import UUID
 
 from agent.realtime_voice import (
     HeardAudioBoundary,
@@ -15,6 +17,7 @@ from agent.realtime_voice import (
 )
 
 ToolDispatcher = Callable[[str, dict[str, Any]], str | Awaitable[str]]
+logger = logging.getLogger(__name__)
 
 
 class RealtimeVoiceCoordinator:
@@ -27,7 +30,7 @@ class RealtimeVoiceCoordinator:
         self._dispatch_tool = dispatch_tool
         self._session: RealtimeSession | None = None
         self._current_item_id: str | None = None
-        self._current_audio_events: dict[int, RealtimeEvent] = {}
+        self._current_audio_events: dict[UUID, RealtimeEvent] = {}
         self._heard_boundary: HeardAudioBoundary | None = None
 
     async def open(
@@ -59,7 +62,7 @@ class RealtimeVoiceCoordinator:
             or event.type is not RealtimeEventType.AUDIO
             or not event.item_id
             or event.item_id != self._current_item_id
-            or self._current_audio_events.get(id(event)) is not event
+            or self._current_audio_events.get(event.emission_id) is not event
             or audio_end_ms < 0
         ):
             return False
@@ -84,7 +87,7 @@ class RealtimeVoiceCoordinator:
                     self._current_item_id = event.item_id
                     self._current_audio_events.clear()
                     self._heard_boundary = None
-                self._current_audio_events[id(event)] = event
+                self._current_audio_events[event.emission_id] = event
             if event.type is RealtimeEventType.TOOL_CALL:
                 await self._dispatch(event, session)
             yield event
@@ -100,6 +103,11 @@ class RealtimeVoiceCoordinator:
                 result = await result
             output = str(result)
         except Exception as exc:
+            logger.warning(
+                "Realtime voice tool dispatch failed",
+                extra={"tool_name": event.tool_name, "call_id": event.call_id},
+                exc_info=True,
+            )
             output = f"Error: {exc}"
         await session.submit_tool_result(event.call_id, output)
 
