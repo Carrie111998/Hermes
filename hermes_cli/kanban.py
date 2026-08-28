@@ -3370,7 +3370,22 @@ def run_slash(rest: str) -> str:
     ``rest`` is everything after ``/kanban`` (may be empty).  Used from
     both the interactive CLI (``self._handle_kanban_command``) and the
     gateway (``_handle_kanban_command``) so formatting is identical.
+
+    The capture below swaps PROCESS-GLOBAL ``sys.stdout``/``sys.stderr``, and
+    does so twice with logic in between that reads the first buffer. Two
+    concurrent gateway requests would therefore interleave into each other's
+    replies, so the whole region runs under the shared boundary in
+    ``hermes_cli.cli_capture`` — the same lock ``/project`` takes, because a
+    per-command lock would leave the cross-command leak open.
     """
+    from hermes_cli.cli_capture import cli_output_lock
+
+    with cli_output_lock():
+        return _run_slash_captured(rest)
+
+
+def _run_slash_captured(rest: str) -> str:
+    """``run_slash`` body. Call it only with the capture boundary held."""
     import io
     import contextlib
 
@@ -3399,6 +3414,11 @@ def run_slash(rest: str) -> str:
                 _choice.prog = f"/kanban {_name}"
                 _choice.exit_on_error = False  # type: ignore[attr-defined]
 
+    # Everything below captures process-global stdout/stderr, twice, with
+    # logic in between that reads the first buffer. Hold the shared boundary
+    # across the WHOLE region: a per-block lock would let another gateway
+    # request redirect in the gap. Same lock /project takes, so the two
+    # commands cannot interleave with each other either.
     def _usage_for_error() -> str:
         if tokens:
             for _action in kanban_parser._actions:

@@ -508,8 +508,6 @@ class GatewaySlashCommandsMixin:
         never reaches a verb or flag outside the two allowlists above.
         """
         import asyncio
-        import contextlib
-        import io
         import shlex
 
         text = (event.text or "").strip()
@@ -567,21 +565,25 @@ class GatewaySlashCommandsMixin:
             import argparse
 
             from hermes_cli import projects_cmd
+            from hermes_cli.cli_capture import captured_streams
 
             root = argparse.ArgumentParser(prog="hermes", add_help=False)
             sub = root.add_subparsers(dest="command")
             projects_cmd.build_parser(sub)
+            # Parse OUTSIDE the capture boundary: argparse writes its own
+            # message to stderr and exits, and holding the process-global
+            # boundary is not needed to answer with text.
             try:
                 args = root.parse_args(["project", *argv])
             except SystemExit:
-                # argparse writes its own message to stderr and exits; the
-                # gateway must answer with text, never die.
                 return (
                     f"project: could not parse those arguments.\n\n"
                     f"{self._PROJECT_GATEWAY_USAGE}"
                 )
-            out, err = io.StringIO(), io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            # `redirect_stdout` swaps PROCESS-GLOBAL sys.stdout, so two
+            # concurrent gateway requests would interleave into each other's
+            # replies. One shared boundary, also taken by /kanban.
+            with captured_streams() as (out, err):
                 projects_cmd.projects_command(args)
             return (out.getvalue() + err.getvalue()).strip()
 
