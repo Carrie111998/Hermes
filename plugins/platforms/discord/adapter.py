@@ -7382,13 +7382,18 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
 
-        # First try: create a thread directly on the channel.
+        # First try: create a PUBLIC thread directly on the channel.  Do not
+        # rely on discord.py's ``type=None`` default here: after a reconnect it
+        # may resolve to Discord's private-thread path, which is rejected for
+        # this channel although a public thread is permitted.  That failure was
+        # previously swallowed below and cron silently fell back to a flat post.
         try:
             create = getattr(parent, "create_thread", None)
             if create is not None:
                 thread = await create(
                     name=thread_name,
                     auto_archive_duration=1440,
+                    type=discord.ChannelType.public_thread,
                     reason=reason,
                 )
                 return str(thread.id)

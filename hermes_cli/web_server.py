@@ -262,6 +262,27 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+def _desktop_should_own_cron() -> bool:
+    """Whether the desktop/dashboard backend should drive the cron ticker.
+
+    A running gateway owns the live adapters (e.g. Discord) and is the single
+    correct owner of cron delivery: it can open per-run handoff threads and
+    seed them. Multiple long-lived desktop backends (``hermes dashboard`` /
+    ``hermes serve`` SSH sessions) otherwise each start their own ticker and
+    steal the ``cron/.tick.lock`` from the gateway — jobs then deliver on the
+    flat standalone path with NO live adapter, silently losing the per-run
+    Discord threads. Only tick here when no gateway daemon is active, i.e. a
+    true standalone desktop/CLI deployment with no gateway to own cron.
+    """
+    try:
+        from gateway.status import is_gateway_running
+        return not is_gateway_running()
+    except Exception:
+        # Fail SAFE toward ticking (historical behavior): if we cannot tell
+        # whether a gateway runs, do not silently stop desktop cron.
+        return True
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -271,11 +292,18 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     scheduler provider here (no live adapters; delivery falls back to the
     per-platform send path).
 
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
-    real gateway on the same HERMES_HOME — whichever process grabs the lock
-    first wins the tick.
+    Guard: when a real gateway daemon is running (``_desktop_should_own_cron``
+    is False), do NOT start the ticker at all. The gateway owns the live
+    adapters and per-run thread delivery; letting a desktop backend tick too
+    would steal the ``cron/.tick.lock`` and deliver jobs flat without a live
+    adapter, breaking Discord handoff threads (regression 2026-08, multi-day).
     """
+    if not _desktop_should_own_cron():
+        _log.info(
+            "Desktop cron scheduler skipped: a gateway daemon is running and "
+            "owns cron delivery (with live adapters / per-run threads)."
+        )
+        return
     from cron.scheduler_provider import resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()

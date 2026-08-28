@@ -84,7 +84,9 @@ def test_desktop_ticker_calls_tick_then_stops():
         calls.append(kwargs)
         return 0
 
-    with patch("cron.scheduler.tick", side_effect=fake_tick):
+    # Desktop ticker must believe NO gateway is running so it actually ticks.
+    with patch("cron.scheduler.tick", side_effect=fake_tick), \
+         patch("hermes_cli.web_server._desktop_should_own_cron", return_value=True):
         t = threading.Thread(
             target=_start_desktop_cron_ticker,
             args=(stop,),
@@ -99,6 +101,27 @@ def test_desktop_ticker_calls_tick_then_stops():
     assert not t.is_alive(), "desktop ticker did not exit after stop_event was set"
     assert len(calls) >= 1, "desktop ticker never called tick()"
     assert calls[0].get("sync") is False
+
+
+def test_desktop_ticker_skips_when_gateway_owns_cron():
+    """When a live gateway (which owns the Discord adapter + thread delivery) is
+    running, the desktop ticker must NOT start — otherwise it steals the cron
+    tick lock from the gateway and delivers jobs without a live adapter,
+    losing per-run handoff threads (regression: multi-day flat-delivery bug)."""
+    from hermes_cli.web_server import _start_desktop_cron_ticker
+
+    calls = []
+    stop = threading.Event()
+
+    def fake_tick(*args, **kwargs):
+        calls.append(kwargs)
+        return 0
+
+    with patch("cron.scheduler.tick", side_effect=fake_tick), \
+         patch("hermes_cli.web_server._desktop_should_own_cron", return_value=False):
+        _start_desktop_cron_ticker(stop, interval=0)  # synchronous; must return immediately
+
+    assert calls == [], "desktop ticker ticked despite gateway owning cron"
 
 
 # ── Phase 1: CronScheduler ABC + InProcessCronScheduler ──────────────────────
