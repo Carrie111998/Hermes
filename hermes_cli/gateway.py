@@ -1039,6 +1039,12 @@ def find_profile_gateway_processes(
     return processes
 
 
+def _is_hermes_windows_gateway_service(name: str) -> bool:
+    """Return whether an SCM service name declares Hermes ownership."""
+    normalized = "".join(char for char in name.casefold() if char.isalnum())
+    return normalized == "hermes" or normalized.startswith("hermesgateway")
+
+
 def find_windows_gateway_services(
     *,
     psutil_module=None,
@@ -1093,6 +1099,8 @@ def find_windows_gateway_services(
                 raise RuntimeError(
                     f"Running SCM service {service_name} has no valid process ID"
                 )
+            if not _is_hermes_windows_gateway_service(service_name):
+                continue
             service_names_by_pid.setdefault(service_pid, set()).add(service_name)
     except Exception as exc:
         raise RuntimeError("SCM service enumeration failed") from exc
