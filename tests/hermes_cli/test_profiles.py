@@ -670,6 +670,68 @@ class TestFindAliasForProfile:
         assert info.alias_path.name == "qiaobusi"
 
 
+class TestListProfilesSkipsRuntimeFolders:
+    """#95953: internal runtime/data folders must not surface as profiles.
+
+    Hermes itself drops folders like audio_cache / cache / cron / hooks next
+    to real profiles under ``profiles/``; both listing surfaces (the selector
+    via ``list_profiles`` and the cron delivery-target scan via
+    ``list_profile_names``) must only surface directories carrying at least
+    one created-profile marker (.env / config.yaml / SOUL.md /
+    .no-bundled-skills).
+    """
+
+    def _seed_runtime_folders(self, tmp_path):
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        for folder in ("audio_cache", "cache", "cron", "hooks", "logs", "skills"):
+            (profiles_root / folder).mkdir(parents=True, exist_ok=True)
+            (profiles_root / folder / "data.bin").write_bytes(b"\x00")
+
+    def test_list_profiles_skips_unmarked_runtime_folders(self, profile_env):
+        from hermes_cli.profiles import create_profile, list_profiles
+
+        create_profile("real", no_alias=True)
+        self._seed_runtime_folders(profile_env)
+
+        names = [p.name for p in list_profiles()]
+
+        assert "real" in names  # real profile survives
+        assert "default" in names
+        for folder in ("audio_cache", "cache", "cron", "hooks", "logs", "skills"):
+            assert folder not in names
+
+    def test_list_profile_names_skips_unmarked_runtime_folders(self, profile_env):
+        from hermes_cli.profiles import create_profile, list_profile_names
+
+        create_profile("real", no_alias=True)
+        self._seed_runtime_folders(profile_env)
+
+        names = list_profile_names()
+
+        assert "real" in names
+        assert "default" in names
+        for folder in ("audio_cache", "cache", "cron", "hooks", "logs", "skills"):
+            assert folder not in names
+
+    def test_marker_files_each_count_as_profile(self, profile_env):
+        """Every marker in _PROFILE_MARKER_FILES keeps a directory listed."""
+        from hermes_cli.profiles import (
+            _PROFILE_MARKER_FILES,
+            list_profile_names,
+        )
+
+        profiles_root = profile_env / ".hermes" / "profiles"
+        for index, marker in enumerate(_PROFILE_MARKER_FILES):
+            folder = profiles_root / f"marked{index}"
+            folder.mkdir(parents=True)
+            (folder / marker).write_text("", encoding="utf-8")
+
+        names = list_profile_names()
+
+        for index in range(len(_PROFILE_MARKER_FILES)):
+            assert f"marked{index}" in names
+
+
 # ===================================================================
 # TestRenameProfile
 # ===================================================================
