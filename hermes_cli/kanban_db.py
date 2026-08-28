@@ -10936,15 +10936,27 @@ def _dispatch_once_locked(
         # per-model cap ineffective for those workers and let them starve
         # one another with connection timeouts until the board timeout
         # (live incident, 2026-08-28: qwen3.5:4b/devstral-small-2:24b via
-        # ollama-launch across ~14 profiles). This fallback resolution is
-        # deliberately unconditional on kanban.local_first: that flag
-        # controls whether local-first SUBSTITUTION happens at spawn time
-        # (a real behavior change, and one with its own history of
-        # surprises -- see the explicit-task-model-pin incident this cap's
-        # own accounting exists to protect against), which is an
-        # unrelated concern from whether we accurately COUNT what a task
-        # will actually run for capacity purposes. _resolve_local_first_route
-        # is pure/read-only, so using it here has no spawn-time effect.
+        # ollama-launch across ~14 profiles).
+        #
+        # What route a task with no override actually runs depends on
+        # kanban.local_first: when it's on, the spawn path substitutes the
+        # profile's first local route ahead of its configured primary, so
+        # _resolve_local_first_route is what must be counted. When it's
+        # off (the common case), no substitution happens and the task
+        # runs its profile's own model.provider/model.default exactly as
+        # configured -- which can itself be a *remote* provider with a
+        # local fallback entry. Live incident (2026-08-28, same day):
+        # unconditionally using _resolve_local_first_route here -- it
+        # finds the first local entry anywhere in the chain regardless of
+        # tier -- mis-attributed profiles whose primary had just been
+        # moved to openai-codex to their local fallback instead, so their
+        # (correct, remote) capacity was double-counted against Ollama's
+        # cap and starved unrelated ready work that was never going to
+        # touch Ollama at all. Both resolvers are pure/read-only, so
+        # using either here has no spawn-time effect either way -- only
+        # which one matches what local_first will actually do at spawn
+        # time.
+        local_first_enabled = _kanban_local_first_enabled()
         effective_route_cache: dict[str, Optional[tuple[str, str]]] = {}
 
         def _route_value(row: Any, field: str) -> Any:
@@ -10970,7 +10982,15 @@ def _dispatch_once_locked(
 
                     profile_path = Path(resolve_profile_env(normalize_profile_name(assignee))) / "config.yaml"
                     loaded = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
-                    route = _resolve_local_first_route(loaded)
+                    if local_first_enabled:
+                        route = _resolve_local_first_route(loaded)
+                    elif isinstance(loaded, Mapping):
+                        primary = loaded.get("model")
+                        if isinstance(primary, Mapping):
+                            p = str(primary.get("provider") or "").strip()
+                            d = str(primary.get("default") or "").strip()
+                            if p and d:
+                                route = (p, d)
                 except Exception:
                     # A profile parse problem is handled by the existing spawn
                     # failure path.  Do not invent a route or block unrelated
