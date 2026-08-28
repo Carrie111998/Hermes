@@ -2387,6 +2387,7 @@ export interface Translations {
       noModels: string
       editModels: string
       refreshModels: string
+      portalCta: string
       fast: string
     }
     modelOptions: {

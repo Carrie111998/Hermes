@@ -2211,6 +2211,7 @@ export const ar = defineLocale({
       noModels: 'لا توجد نماذج',
       editModels: 'تحرير النماذج',
       refreshModels: 'تحديث النماذج',
+      portalCta: 'ربط Nous Portal',
       fast: 'سريع'
     },
     modelOptions: {

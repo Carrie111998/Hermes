@@ -34,6 +34,7 @@ import {
   modelVisibilityKey,
   setModelVisibilityOpen
 } from '@/store/model-visibility'
+import { startManualProviderOAuth } from '@/store/onboarding'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { $defaultReasoningEffort } from '@/store/session'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
@@ -112,6 +113,30 @@ interface ProviderGroup {
   provider: ModelOptionProvider
 }
 
+/** The Nous Portal provider slug. Portal is Hermes' own inference product and
+ *  the path the app already steers new users down: onboarding gives it
+ *  `order: 0` in `PROVIDER_DISPLAY` and renders it through
+ *  `FeaturedProviderRow`. This menu was the one model surface that ignored
+ *  that and sorted it under whatever fell earlier in the alphabet. */
+const PORTAL_SLUG = 'nous'
+
+/** Provider order: Portal first, then alphabetical by name.
+ *
+ *  Deliberate product placement, not a neutral ranking — worth naming plainly
+ *  rather than burying. Everything below Portal keeps the stable alphabetical
+ *  order the previous sort established, so no other provider's position moves
+ *  relative to its peers and the list still cannot reshuffle on a switch. */
+function compareProviderGroups(a: ProviderGroup, b: ProviderGroup): number {
+  const aPortal = a.provider.slug.toLowerCase() === PORTAL_SLUG
+  const bPortal = b.provider.slug.toLowerCase() === PORTAL_SLUG
+
+  if (aPortal !== bPortal) {
+    return aPortal ? -1 : 1
+  }
+
+  return a.provider.name.localeCompare(b.provider.name)
+}
+
 /**
  * THE model catalog menu: searchable, provider-grouped, `-fast` families
  * collapsed to one row, per-row hover submenu for thinking/effort/fast, full
@@ -186,6 +211,16 @@ export function ModelCatalogMenu({
   )
 
   const q = normalize(search)
+
+  // Portal missing from the catalog means the user has not connected it: the
+  // payload is `explicit_only`, so an unconfigured provider produces no row at
+  // all rather than an empty one. Offer the sign-in instead of silently
+  // leaving Hermes' own inference off a list of everywhere else they can go.
+  // Hidden while searching — a query means "find me a model", not "sell me
+  // one" — and hidden on load/error, where a half-known catalog would make the
+  // row a lie.
+  const showPortalCta =
+    !q && !loading && !error && pickerProviders.every(provider => provider.slug.toLowerCase() !== PORTAL_SLUG)
 
   // Presets are searchable rows like everything else — an unfiltered preset
   // sitting under zero model matches would otherwise become the "first match"
@@ -369,6 +404,15 @@ export function ModelCatalogMenu({
         </DropdownMenuItem>
       ) : (
         <div className={cn('max-h-[max(150px,30dvh)] overflow-y-auto py-0.5', quietRows)} ref={listRef}>
+          {showPortalCta ? (
+            <DropdownMenuItem
+              className={cn(dropdownMenuRow, 'gap-2')}
+              onSelect={() => startManualProviderOAuth(PORTAL_SLUG, null)}
+            >
+              <Codicon className="text-(--ui-accent)" name="sparkle" size="0.75rem" />
+              <span className="min-w-0 flex-1 truncate">{copy.portalCta}</span>
+            </DropdownMenuItem>
+          ) : null}
           {groups.map(group => {
             const slug = group.provider.slug
 
@@ -589,9 +633,9 @@ function groupModels(
     }
   }
 
-  // Stable, logical group order: alphabetical by provider name. (The backend
-  // floats the current provider first, which would reshuffle on every switch.)
-  groups.sort((a, b) => a.provider.name.localeCompare(b.provider.name))
+  // Portal first, then alphabetical by provider name. (The backend floats the
+  // current provider first, which would reshuffle on every switch.)
+  groups.sort(compareProviderGroups)
 
   return groups
 }

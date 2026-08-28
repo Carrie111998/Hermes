@@ -2465,6 +2465,7 @@ export const ja = defineLocale({
       noModels: 'モデルが見つかりません',
       editModels: 'モデルを編集…',
       refreshModels: 'モデルを更新',
+      portalCta: 'Nous Portal に接続',
       fast: '高速'
     },
     modelOptions: {
