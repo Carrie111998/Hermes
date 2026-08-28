@@ -150,7 +150,14 @@ def relay(source, destination):
         destination.sendall(chunk)
 
 
+# Which upstream host a failure belongs to. Set around every upstream
+# connection; read by handle() so a dropped proxy request names its target.
+_ACTIVE_HOST = ''
+
+
 def forward_https(conn, host, port, request):
+    global _ACTIVE_HOST
+    _ACTIVE_HOST = host
     context = ssl.create_default_context(cafile=str(REAL_CA))
     with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as raw:
         with context.wrap_socket(raw, server_hostname=host) as upstream:
@@ -159,6 +166,8 @@ def forward_https(conn, host, port, request):
 
 
 def forward_http(conn, host, port, request, target):
+    global _ACTIVE_HOST
+    _ACTIVE_HOST = host
     parsed = urlsplit(target)
     path = parsed.path or '/'
     if parsed.query:
@@ -220,7 +229,12 @@ def handle(conn):
     try:
         handle_request(conn)
     except Exception as error:
-        print(f'proxy request failed: {error!r}', file=sys.stderr, flush=True)
+        host = _ACTIVE_HOST or 'unknown'
+        print(
+            f'proxy request failed: {host} -> {error!r}',
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def main():
