@@ -1142,6 +1142,18 @@ class Task:
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
 
+    @property
+    def assignment_state(self) -> str:
+        """How the stored assignee relates to executable work right now."""
+        if not self.assignee:
+            return "unassigned"
+        return "active" if self.status in {"ready", "running", "review"} else "reserved"
+
+    @property
+    def pending_assignee(self) -> Optional[str]:
+        """Future route selected for a task that is not dispatchable yet."""
+        return self.assignee if self.assignment_state == "reserved" else None
+
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())

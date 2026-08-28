@@ -111,6 +111,26 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def test_list_exposes_todo_assignee_as_pending(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="builder")
+        child = kb.create_task(
+            conn, title="child", assignee="verifier", parents=[parent]
+        )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_list({"status": "todo", "limit": 10}))
+    task = next(t for t in d["tasks"] if t["id"] == child)
+    assert task["assignee"] == "verifier"
+    assert task["assignment_state"] == "reserved"
+    assert task["pending_assignee"] == "verifier"
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({

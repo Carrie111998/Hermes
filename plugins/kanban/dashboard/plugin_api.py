@@ -162,6 +162,8 @@ def _task_dict(
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    d["assignment_state"] = task.assignment_state
+    d["pending_assignee"] = task.pending_assignee
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:

@@ -103,7 +103,7 @@
   };
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
-    todo: "Waiting on dependencies or unassigned",
+    todo: "Not dispatchable yet. A selected profile is reserved until Ready.",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
@@ -3126,7 +3126,11 @@
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
-            t.assignee
+            t.assignment_state === "reserved" && t.pending_assignee
+              ? h("span", { className: "hermes-kanban-unassigned",
+                            title: `Reserved for @${t.pending_assignee}. The worker becomes active only when this task reaches Ready.` },
+                  "reserved → @", t.pending_assignee)
+              : t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
                             title: `Assigned to Hermes profile @${t.assignee}` }, "@", t.assignee)
               : h("span", { className: "hermes-kanban-unassigned",
