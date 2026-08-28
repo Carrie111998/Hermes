@@ -1609,8 +1609,8 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
         },
     )
 
-    # Exercise the public resolver: pooled credentials must not collapse the
-    # configured provider identity into the shared "custom" billing class.
+    # Exercise the public resolver: the wire transport stays canonical while
+    # requested_provider carries the configured endpoint identity.
     resolved = rp.resolve_runtime_provider(requested="custom:lmstudio")
 
     assert resolved is not None
@@ -1620,12 +1620,11 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     }
     assert resolved["api_key"] == "pooled-key"
     assert resolved["source"] == "pool:lmstudio-pool"
-    assert resolved["provider"] == "custom:lmstudio"
+    assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:lmstudio"
 
 
-def test_pooled_providers_entry_preserves_config_key_identity(monkeypatch):
-    """A display name must not replace the durable ``providers`` mapping key."""
+def test_pooled_providers_entry_keeps_transport_and_policy_identity_separate(monkeypatch):
     monkeypatch.setattr(
         rp,
         "load_config",
@@ -1653,9 +1652,26 @@ def test_pooled_providers_entry_preserves_config_key_identity(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="custom:zhipuai")
 
-    assert resolved["provider"] == "custom:zhipuai"
+    assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:zhipuai"
     assert resolved["api_key"] == "pooled-key"
+
+
+def test_named_custom_runtime_avoids_generic_custom_request_policy():
+    from agent.chat_completion_helpers import _request_policy_provider
+    from providers import get_provider_profile
+
+    policy_provider = _request_policy_provider("custom", "custom:zhipuai")
+
+    assert policy_provider == "custom:zhipuai"
+    assert get_provider_profile(policy_provider) is None
+    assert get_provider_profile("custom") is not None
+
+
+def test_bare_custom_runtime_keeps_generic_custom_request_policy():
+    from agent.chat_completion_helpers import _request_policy_provider
+
+    assert _request_policy_provider("custom", "custom") == "custom"
 
 
 def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):

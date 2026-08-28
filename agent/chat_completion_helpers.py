@@ -1822,6 +1822,22 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _request_policy_provider(provider: str, requested_provider: str) -> str:
+    """Return the identity used to select request-shaping policy.
+
+    Named custom providers share the canonical ``custom`` wire transport, but
+    must not inherit the generic custom profile's endpoint-specific request
+    fields.  Keep transport and policy identities separate just as capability
+    routing does; an unregistered ``custom:<name>`` then uses the conservative
+    legacy path instead of Ollama-style custom policy.
+    """
+    provider = str(provider or "").strip().lower()
+    requested_provider = str(requested_provider or "").strip().lower()
+    if provider == "custom" and requested_provider.startswith("custom:"):
+        return requested_provider
+    return provider
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
@@ -2025,7 +2041,12 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # found, delegate fully; otherwise fall through to the legacy flag path.
     try:
         from providers import get_provider_profile
-        _profile = get_provider_profile(agent.provider)
+        _profile = get_provider_profile(
+            _request_policy_provider(
+                agent.provider,
+                getattr(agent, "requested_provider", ""),
+            )
+        )
     except Exception:
         _profile = None
 
