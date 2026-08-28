@@ -95,6 +95,46 @@ def _read_user_token_override() -> Optional[str]:
     return None
 
 
+def _read_nous_fallback_token() -> Optional[str]:
+    """Resolve a cached Nous token through the same chain as the status panel.
+
+    ``read_nous_access_token()`` and ``get_nous_auth_status()`` both resolve
+    credentials beyond the active store: provider state falls back to the
+    global-root auth.json in profile mode (#18594 shadowing), and when no
+    provider state exists the status snapshot falls back to the credential
+    pool. Mirroring that chain here keeps availability scans truthful in a
+    profile whose Nous login lives in the global store or in
+    ``credential_pool.nous`` — otherwise every managed tool reports
+    unavailable while working when invoked (#97490). Read-only: file reads
+    only, no locks, no network, so the cheap-probe contract of
+    :func:`peek_nous_access_token` is preserved.
+    """
+    try:
+        from hermes_cli.auth import (
+            _load_auth_store,
+            _load_provider_state_with_source,
+            read_credential_pool,
+        )
+
+        state, _source_path = _load_provider_state_with_source(
+            _load_auth_store(), "nous",
+        )
+        if isinstance(state, dict):
+            token = state.get("access_token")
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+
+        for entry in read_credential_pool("nous"):
+            if not isinstance(entry, dict):
+                continue
+            token = entry.get("access_token")
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+    except Exception:
+        logger.debug("Nous peek fallback resolution failed", exc_info=True)
+    return None
+
+
 def peek_nous_access_token() -> Optional[str]:
     """Cheap probe for a Nous gateway token without triggering refresh.
 
@@ -102,8 +142,11 @@ def peek_nous_access_token() -> Optional[str]:
     `is_available()` checks) must stay off the synchronous OAuth refresh path.
     This helper therefore only inspects the explicit env override and the
     cached auth-store token, without checking expiry and without making any
-    network calls. Truthful refresh handling stays in request/session paths
-    that call :func:`read_nous_access_token`.
+    network calls. Resolution mirrors the status panel: the active store's
+    ``providers.nous`` first, then the global-root fallback and the
+    credential pool (see :func:`_read_nous_fallback_token`). Truthful refresh
+    handling stays in request/session paths that call
+    :func:`read_nous_access_token`.
     """
     explicit = _read_user_token_override()
     if explicit:
@@ -113,7 +156,7 @@ def peek_nous_access_token() -> Optional[str]:
     access_token = nous_provider.get("access_token")
     if isinstance(access_token, str) and access_token.strip():
         return access_token.strip()
-    return None
+    return _read_nous_fallback_token()
 
 
 def read_nous_access_token() -> Optional[str]:
