@@ -368,6 +368,34 @@ class TestNlo365ApprovalButtons:
         assert adapter._bot.send_message.call_args.kwargs["reply_markup"] == captured_rows
 
     @pytest.mark.asyncio
+    async def test_markdown_bold_approval_id_gets_inline_buttons(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._should_attempt_rich = MagicMock(return_value=False)
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=79)
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: {"text": text, "callback_data": callback_data},
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+            lambda rows: rows,
+        )
+
+        await adapter.send(
+            "12345",
+            f"The contact has been queued for your approval.\n\n**Approval ID:** {self.APPROVAL_ID}",
+            metadata={"notify": True},
+        )
+
+        rows = adapter._bot.send_message.call_args.kwargs["reply_markup"]
+        assert rows[0][0] == {
+            "text": "✅ Approve & Execute",
+            "callback_data": f"na:a:{self.APPROVAL_ID}",
+        }
+
+    @pytest.mark.asyncio
     async def test_nonapproval_message_has_no_nlo365_keyboard(self):
         adapter = _make_adapter()
         adapter._should_attempt_rich = MagicMock(return_value=False)

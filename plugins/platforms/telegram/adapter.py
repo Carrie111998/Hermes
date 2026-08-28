@@ -26,14 +26,15 @@ logger = logging.getLogger(__name__)
 
 _NLO365_APPROVAL_CLI = "/home/ilan/nlo365-broker/.venv/bin/nlo365-approvals"
 _NLO365_APPROVAL_ID_RE = re.compile(
-    r"\bApproval ID:\s*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\b",
+    r"\bApproval ID:\s*[*_`~]*\s*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\b",
     re.IGNORECASE,
 )
+_NLO365_QUEUED_NOTICE_RE = re.compile(r"\bqueued for (?:your )?approval\b", re.IGNORECASE)
 
 
 def _nlo365_approval_id(content: str) -> Optional[str]:
     """Extract a canonical approval UUID only from an explicit queued notice."""
-    if "queued for approval" not in content.lower():
+    if not _NLO365_QUEUED_NOTICE_RE.search(content):
         return None
     match = _NLO365_APPROVAL_ID_RE.search(content)
     if not match:
