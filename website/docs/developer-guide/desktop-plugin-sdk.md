@@ -173,7 +173,7 @@ interface PluginContext {
   rest: <T>(path: string, opts?: PluginRestOptions) => Promise<T>
   /** Live WebSocket to this plugin's own namespace. Returns a disposer. */
   socket: (path: string, onMessage: (data: unknown) => void) => () => void
-  /** The curated OS door: native notification, open-external, reveal-in-file-manager, clipboard. */
+  /** The curated OS door: native notification, open-external, reveal-in-file-manager, clipboard, and native path selection. */
   os: PluginOs
   /** Plugin-scoped JSON persistence (keys live under `hermes.plugin.<id>.`). */
   storage: PluginStorage
@@ -498,6 +498,9 @@ ctx.os.notify({ title, body?, silent?, icon?, activate?, onActivate?, actions? }
 ctx.os.openExternal(url)                   // OS default handler (browser, mail, spotify:) → Promise<boolean>
 ctx.os.revealPath(path)                    // reveal in Finder / Explorer → Promise<boolean>
 ctx.os.writeClipboard(text)                // system clipboard → Promise<boolean>
+ctx.os.selectPaths({                        // native open dialog → Promise<string[]>
+  title?, defaultPath?, directories?, multiple?, filters?
+})
 host.navigate('/route')                    // hash-route navigation
 host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
