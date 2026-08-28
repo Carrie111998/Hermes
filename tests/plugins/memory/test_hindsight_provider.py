@@ -11,6 +11,7 @@ import re
 import stat
 import sys
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +60,38 @@ def _clean_env(tmp_path, monkeypatch):
     # Patch the actual API and keep all legacy profile writes in tmp_path.
     isolated_home = tmp_path / "user-home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: isolated_home))
+
+
+def test_provider_atexit_registration_is_process_wide(monkeypatch):
+    """Many providers must share one exit hook rather than stack callbacks."""
+    registered = []
+    instances = weakref.WeakSet()
+    monkeypatch.setattr(hindsight_module.atexit, "register", registered.append)
+    monkeypatch.setattr(hindsight_module, "_PROVIDER_INSTANCES", instances)
+    monkeypatch.setattr(hindsight_module, "_PROVIDER_ATEXIT_REGISTERED", False)
+
+    first = HindsightMemoryProvider()
+    second = HindsightMemoryProvider()
+    first._register_atexit()
+    second._register_atexit()
+
+    assert registered == [hindsight_module._shutdown_all_hindsight_providers]
+    assert first in instances
+    assert second in instances
+
+
+def test_provider_atexit_shutdown_is_non_blocking(monkeypatch):
+    """Interpreter exit must not wait for server-side retain visibility."""
+    provider = HindsightMemoryProvider()
+    shutdown = MagicMock()
+    monkeypatch.setattr(provider, "shutdown", shutdown)
+
+    provider._atexit_shutdown()
+
+    shutdown.assert_called_once_with(
+        retain_shutdown_timeout=0.0,
+        thread_join_timeout=0.0,
+    )
 
 
 def _make_mock_client():

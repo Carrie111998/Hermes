@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -112,6 +113,11 @@ _PROFILE_ENV_LOCK = threading.RLock()
 _EMBEDDED_RUNTIME_LOCK = threading.RLock()
 _EMBEDDED_RUNTIME_REGISTRY: dict[tuple[Any, ...], _SharedEmbeddedRuntime] = {}
 _EMBEDDED_RUNTIME_ATEXIT_REGISTERED = False
+_PROVIDER_ATEXIT_LOCK = threading.RLock()
+_PROVIDER_INSTANCES: weakref.WeakSet[Any] = weakref.WeakSet()
+_PROVIDER_ATEXIT_REGISTERED = False
+_ATEXIT_RETAIN_SHUTDOWN_TIMEOUT = 0.0
+_ATEXIT_THREAD_JOIN_TIMEOUT = 0.0
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -966,6 +972,14 @@ def _register_shared_runtime_atexit() -> None:
         if not _EMBEDDED_RUNTIME_ATEXIT_REGISTERED:
             atexit.register(_shutdown_all_shared_embedded_runtimes)
             _EMBEDDED_RUNTIME_ATEXIT_REGISTERED = True
+
+
+def _shutdown_all_hindsight_providers() -> None:
+    """Run bounded cleanup for every live provider at interpreter exit."""
+    with _PROVIDER_ATEXIT_LOCK:
+        providers = list(_PROVIDER_INSTANCES)
+    for provider in providers:
+        provider._atexit_shutdown()
 
 
 def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str) -> str:
@@ -2038,13 +2052,21 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._atexit_registered:
             return
         self._atexit_registered = True
-        atexit.register(self._atexit_shutdown)
+        global _PROVIDER_ATEXIT_REGISTERED
+        with _PROVIDER_ATEXIT_LOCK:
+            _PROVIDER_INSTANCES.add(self)
+            if not _PROVIDER_ATEXIT_REGISTERED:
+                atexit.register(_shutdown_all_hindsight_providers)
+                _PROVIDER_ATEXIT_REGISTERED = True
 
     def _atexit_shutdown(self) -> None:
         if self._shutting_down.is_set():
             return
         try:
-            self.shutdown()
+            self.shutdown(
+                retain_shutdown_timeout=_ATEXIT_RETAIN_SHUTDOWN_TIMEOUT,
+                thread_join_timeout=_ATEXIT_THREAD_JOIN_TIMEOUT,
+            )
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
@@ -3076,8 +3098,23 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight embedded manager stop fallback failed: %s", type(exc).__name__)
 
-    def shutdown(self) -> None:
+    def shutdown(
+        self,
+        *,
+        retain_shutdown_timeout: float | None = None,
+        thread_join_timeout: float | None = None,
+    ) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
+        retain_timeout = (
+            self._retain_shutdown_timeout
+            if retain_shutdown_timeout is None
+            else max(0.0, float(retain_shutdown_timeout))
+        )
+        join_timeout = (
+            5.0
+            if thread_join_timeout is None
+            else max(0.0, float(thread_join_timeout))
+        )
         # Stop accepting new retain jobs first so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
         self._shutting_down.set()
@@ -3090,36 +3127,36 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._retain_queue.put(_WRITER_SENTINEL)
             except Exception:
                 pass
-            writer.join(timeout=self._retain_shutdown_timeout)
+            writer.join(timeout=retain_timeout)
             if writer.is_alive():
                 logger.warning(
                     "Hindsight writer did not stop within %.1fs; "
                     "abandoning %d pending retain(s)",
-                    self._retain_shutdown_timeout,
+                    retain_timeout,
                     self._retain_queue.qsize(),
                 )
         with self._pending_retain_ops_lock:
             pending_server_ops = bool(self._pending_retain_ops)
         if pending_server_ops:
-            retain_deadline = time.monotonic() + self._retain_shutdown_timeout
+            retain_deadline = time.monotonic() + retain_timeout
             if not self._wait_for_server_retain_ops(
                 retain_deadline,
-                self._retain_shutdown_timeout,
+                retain_timeout,
                 allow_shutdown=True,
             ):
                 logger.warning(
                     "Hindsight shutdown retain visibility wait expired after %.1fs",
-                    self._retain_shutdown_timeout,
+                    retain_timeout,
                 )
         if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=5.0)
+            self._prefetch_thread.join(timeout=join_timeout)
         daemon_thread = self._daemon_thread
         if (
             daemon_thread is not None
             and daemon_thread is not threading.current_thread()
             and daemon_thread.is_alive()
         ):
-            daemon_thread.join(timeout=5.0)
+            daemon_thread.join(timeout=join_timeout)
         self._daemon_thread = None
         if self._embedded_runtime_lease:
             self._release_shared_embedded_runtime()
