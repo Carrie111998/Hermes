@@ -2314,8 +2314,11 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         )
     else:
         cwd_note = (
-            "Scripts run in the session's working directory with the active venv's python, "
-            "so project deps (pandas, etc.) and relative paths work like in terminal()."
+            "Scripts run in the session's working directory. Interpreter: "
+            "the project's activated venv/conda python when one is active "
+            "(VIRTUAL_ENV/CONDA_PREFIX — matches terminal()); otherwise "
+            "Hermes's own python (the common case — stdlib plus Hermes's "
+            "deps; check `import x` before relying on project packages)."
         )
 
     # Session kernels are always on (kernel_mode retired in #96787):
