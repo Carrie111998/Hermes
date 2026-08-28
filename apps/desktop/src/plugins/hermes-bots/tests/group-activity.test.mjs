@@ -91,6 +91,7 @@ function load(turnScript = () => '(pass)') {
         }
         return {}
       },
+      requestProfile: async (_route, method, params) => context.host.request(method, params),
       state: { profile: { get: () => 'default', listen: () => undefined }, gateway: { listen: () => undefined } },
       notify: () => undefined,
       notifyError: () => undefined
@@ -116,6 +117,26 @@ function load(turnScript = () => '(pass)') {
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
+
+function sameNamedMembers(localLabel = 'This device', remoteLabel = 'Work') {
+  return [
+    {
+      name: 'default',
+      title: '',
+      connectionId: 'local',
+      connectionLabel: localLabel,
+      sourceScoped: true
+    },
+    {
+      name: 'default',
+      title: '',
+      connectionId: 'work',
+      connectionLabel: remoteLabel,
+      sourceScoped: true,
+      remoteSource: true
+    }
+  ]
+}
 
 async function drain(gc, group) {
   for (let i = 0; i < 200 && (gc.$groupChats.get()[group] || {}).running; i++) {
@@ -196,6 +217,79 @@ test('an untyped failed member turn keeps the message-classification fallback', 
   const failed = feed(gc, 'Untyped failure').find(e => e.kind === 'failed' && e.member === 'builder')
   assert.equal(failed.reason, undefined)
   assert.equal(Object.values(gc.$botAttention.get())[0]?.reason, 'missing_config')
+})
+
+test('same-named members on different connections stay distinct in Activity', async () => {
+  const gc = load(() => '(pass)')
+  const members = sameNamedMembers()
+
+  gc.sendToGroupChat('Collision', members, 'status?')
+  await drain(gc, 'Collision')
+
+  const memberEvents = feed(gc, 'Collision').filter(event => event.member === 'default')
+  const labels = memberEvents.map(event => gc.groupActivityLabel(event))
+  assert.equal(memberEvents.length, 4)
+  assert.deepEqual(
+    new Set(labels),
+    new Set([
+      'Hermes · This device/default is working…',
+      'Hermes · This device/default passed',
+      'Hermes · Work/default is working…',
+      'Hermes · Work/default passed'
+    ])
+  )
+  assert.equal(memberEvents.every(event => typeof event.member === 'string' && event.memberKey), true)
+})
+
+test('colliding connection labels fall back to stable connection ids', async () => {
+  const gc = load(() => '(pass)')
+  const members = sameNamedMembers('Office', 'Office')
+
+  gc.sendToGroupChat('Same source label', members, 'status?')
+  await drain(gc, 'Same source label')
+
+  const events = feed(gc, 'Same source label').filter(event => event.member === 'default')
+  const labels = events.map(event => gc.groupActivityLabel(event))
+  assert.deepEqual(
+    new Set(labels),
+    new Set([
+      'Hermes · Office (local)/default is working…',
+      'Hermes · Office (local)/default passed',
+      'Hermes · Office (work)/default is working…',
+      'Hermes · Office (work)/default passed'
+    ])
+  )
+})
+
+test('every member-scoped Activity kind keeps collision identity while room-level cancellation stays concise', async () => {
+  const gc = load(() => '(pass)')
+  const [local, remote] = sameNamedMembers()
+
+  gc.sendToGroupChat('Kinds', [local, remote], 'status?')
+  await drain(gc, 'Kinds')
+  gc.$groupActivity.set({})
+
+  const kinds = ['working', 'replied', 'passed', 'timed-out', 'failed', 'delivered', 'held', 'cancelled']
+  const events = kinds.map(kind => gc.recordGroupActivity('Kinds', { kind, member: remote, thread: 'thread-1' }))
+  const labels = events.map(event => gc.groupActivityLabel(event))
+
+  assert.equal(labels.every(label => label.startsWith('Hermes · Work/default ')), true)
+  assert.deepEqual(events.map(event => event.member), Array(kinds.length).fill('default'))
+  assert.deepEqual(events.map(event => event.memberKey), Array(kinds.length).fill('work::default'))
+  assert.equal(
+    gc.groupActivityLabel(gc.recordGroupActivity('Kinds', { kind: 'cancelled', member: null, thread: 'thread-1' })),
+    'turn interrupted by a newer message'
+  )
+})
+
+test('unique Activity member names keep their concise labels', async () => {
+  const gc = load(() => '(pass)')
+
+  gc.sendToGroupChat('Unique', MEMBERS, 'status?')
+  await drain(gc, 'Unique')
+
+  const working = feed(gc, 'Unique').find(event => event.kind === 'working' && event.member === 'research')
+  assert.equal(gc.groupActivityLabel(working), 'research is working…')
 })
 
 test('a newer send interrupts the previous run and records cancelled in the CURRENT epoch', async () => {
