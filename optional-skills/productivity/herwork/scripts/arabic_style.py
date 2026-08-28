@@ -221,3 +221,53 @@ def register_pdf_font() -> str:
 
     pdfmetrics.registerFont(TTFont(FONT, find_font_ttf()))
     return FONT
+
+
+def shape_arabic(text: str, font: str = FONT) -> str:
+    """Reshape + reorder Arabic for a PDF canvas, with a glyph-coverage net.
+
+    reportlab has no text shaper: it draws codepoint by codepoint, so Arabic
+    must be pre-shaped into Presentation Forms-B (U+FE70-U+FEFF) and reordered
+    to visual order before it is drawn. That is what ``arabic_reshaper`` and
+    the bidi algorithm do.
+
+    The trap is that a font is NOT required to carry that block. Cairo's
+    variable build covers 89 of the 144 forms — everything a shaping engine
+    would ever ask it for through GSUB, but not the standalone codepoints.
+    Isolated alef (U+FE8D) and isolated teh (U+FE95) are among the missing,
+    which is why "المبيعات" came out of a plain reshape+bidi pipeline as
+    "▯لمبيعا▯": reportlab asked for a codepoint the font never claimed and
+    drew .notdef, silently, in a finished deliverable.
+
+    So every shaped character is checked against the registered font's own
+    cmap and, when absent, folded back to its canonical letter (NFKC:
+    U+FE8D -> U+0627). The base letters are all present, and for the forms
+    that go missing the two glyphs are visually identical anyway — an
+    isolated alef IS an alef.
+
+    Call this instead of using ``arabic_reshaper``/``get_display`` directly,
+    and only AFTER ``register_pdf_font()`` — the coverage check reads the
+    registered face.
+    """
+    import unicodedata
+
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    from reportlab.pdfbase import pdfmetrics
+
+    visual = get_display(arabic_reshaper.reshape(text))
+
+    try:
+        supported = pdfmetrics.getFont(font).face.charToGlyph
+    except Exception:
+        # Font not registered, or a face that exposes no cmap (Type 1). The
+        # shaped text is still the best answer available; don't fail the
+        # document over a coverage check we can't run.
+        return visual
+
+    return "".join(
+        character
+        if ord(character) in supported
+        else unicodedata.normalize("NFKC", character)
+        for character in visual
+    )

@@ -134,3 +134,44 @@ def test_style_pptx_descends_into_groups_and_notes(arabic_style):
     assert _pptx_cs(grouped) == font, "text inside a group must be reached"
     assert _pptx_cs(deep) == font, "recursion must be depth-unbounded"
     assert _pptx_cs(note) == font, "notes ship with the deliverable"
+
+
+def test_shape_arabic_replaces_forms_the_font_has_no_glyph_for(arabic_style):
+    """The bug this exists for: reportlab draws .notdef and says nothing.
+
+    Cairo carries 89 of the 144 Presentation Forms-B codepoints. A plain
+    reshape+bidi emits isolated alef (U+FE8D) and isolated teh (U+FE95),
+    which it does NOT carry, so «المبيعات» rendered as «▯لمبيعا▯» in a PDF
+    that otherwise looked finished.
+    """
+    pytest.importorskip("arabic_reshaper")
+    pytest.importorskip("bidi")
+    pytest.importorskip("reportlab")
+
+    from reportlab.pdfbase import pdfmetrics
+
+    try:
+        arabic_style.register_pdf_font()
+    except FileNotFoundError:
+        pytest.skip("Cairo font not installed on this machine")
+
+    supported = pdfmetrics.getFont(arabic_style.FONT).face.charToGlyph
+    shaped = arabic_style.shape_arabic("تقرير المبيعات للربع الثالث")
+
+    uncovered = [character for character in shaped if ord(character) not in supported]
+
+    assert not uncovered, f"would render as .notdef boxes: {uncovered}"
+    # The fold is to the canonical letter, not a drop: nothing may vanish.
+    assert len(shaped) == len(arabic_style.shape_arabic("تقرير المبيعات للربع الثالث"))
+    assert "ﺍ" not in shaped and "ﺕ" not in shaped
+
+
+def test_shape_arabic_survives_an_unregistered_font(arabic_style):
+    """A coverage check we cannot run must not fail the document."""
+    pytest.importorskip("arabic_reshaper")
+    pytest.importorskip("bidi")
+    pytest.importorskip("reportlab")
+
+    shaped = arabic_style.shape_arabic("مرحبا", font="NoSuchFontRegistered")
+
+    assert shaped and "مرحبا" != shaped  # still reshaped + reordered

@@ -104,8 +104,8 @@ office-suite default (Calibri) renders Arabic badly. Use the helper at
 - pptx: `style_pptx(prs)` after building the Presentation — covers tables,
   grouped shapes at any nesting depth, and speaker notes
 - pdf (reportlab): `register_pdf_font()`, then draw with
-  `canvas.setFont("Cairo", size)`; shape Arabic first with
-  `arabic_reshaper.reshape(...)` + `bidi.algorithm.get_display(...)`
+  `canvas.setFont("Cairo", size)` and pass every Arabic string through
+  `shape_arabic(text)` — never `arabic_reshaper` + `get_display` directly
 
 Setting `font.name` alone is NOT enough — Arabic is shaped from the
 complex-script font slot (`w:cs` in docx, `a:cs` in pptx), which these
@@ -116,6 +116,15 @@ alone. `register_pdf_font` locates the Cairo TTF across
 Linux/macOS/Windows font directories and raises an install hint if Cairo
 is missing (free at fonts.google.com/specimen/Cairo). Pure-English
 deliverables may use the suite defaults.
+
+`shape_arabic` is not optional for PDFs. reportlab draws codepoint by
+codepoint with no shaper, and Cairo carries only 89 of the 144
+Presentation Forms-B codepoints a reshaper emits — isolated alef and teh
+are among the missing, so a plain reshape+bidi renders «المبيعات» as
+«▯لمبيعا▯» in a file that otherwise looks finished. `shape_arabic` checks
+each shaped character against the registered font's own cmap and folds the
+uncovered ones back to their base letter. docx and pptx are unaffected:
+Word and PowerPoint shape the text themselves at open time.
 
 ## Safety rules (non-negotiable)
 
