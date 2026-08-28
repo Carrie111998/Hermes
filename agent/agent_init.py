@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -148,6 +149,10 @@ def _normalize_route_base_url(base_url: Any) -> str:
 
 def _provider_default_routes(provider: str) -> set[str]:
     """Return known exact default routes for a canonical provider id."""
+    return _provider_default_routes_cached(provider)
+
+@functools.lru_cache(maxsize=256)
+def _provider_default_routes_cached(provider: str) -> frozenset[str]:
     routes: set[str] = set()
     try:
         from hermes_cli.providers import HERMES_OVERLAYS, get_provider

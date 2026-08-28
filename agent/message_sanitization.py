@@ -47,19 +47,22 @@ def _sanitize_structure_surrogates(payload: Any) -> bool:
     Used to scrub nested structured fields (e.g. ``reasoning_details`` — an
     array of dicts with ``summary``/``text`` strings) that flat per-field
     checks don't reach.  Returns True if any surrogates were replaced.
+
+    Perf: iterative stack avoids recursion depth + function-call overhead for
+    deeply nested payloads; early skip when string contains no surrogate char.
     """
     found = False
-
-    def _walk(node):
-        nonlocal found
+    stack = [payload]
+    while stack:
+        node = stack.pop()
         if isinstance(node, dict):
-            for key, value in node.items():
+            for key, value in list(node.items()):
                 if isinstance(value, str):
                     if _SURROGATE_RE.search(value):
                         node[key] = _SURROGATE_RE.sub('\ufffd', value)
                         found = True
                 elif isinstance(value, (dict, list)):
-                    _walk(value)
+                    stack.append(value)
         elif isinstance(node, list):
             for idx, value in enumerate(node):
                 if isinstance(value, str):
@@ -67,9 +70,7 @@ def _sanitize_structure_surrogates(payload: Any) -> bool:
                         node[idx] = _SURROGATE_RE.sub('\ufffd', value)
                         found = True
                 elif isinstance(value, (dict, list)):
-                    _walk(value)
-
-    _walk(payload)
+                    stack.append(value)
     return found
 
 
@@ -84,15 +85,21 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
     (xiaomi/mimo, kimi, glm) can emit lone surrogates in reasoning output
     that flow through to ``api_messages["reasoning_content"]`` on the next
     turn and crash json.dumps inside the OpenAI SDK.
+
+    Perf: iterative stack + direct regex (surrogate rare). Keeps per-msg
+    overhead O(1) when clean via fast regex miss.
     """
+    if not messages:
+        return False
     found = False
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         content = msg.get("content")
-        if isinstance(content, str) and _SURROGATE_RE.search(content):
-            msg["content"] = _SURROGATE_RE.sub('\ufffd', content)
-            found = True
+        if isinstance(content, str):
+            if _SURROGATE_RE.search(content):
+                msg["content"] = _SURROGATE_RE.sub('\ufffd', content)
+                found = True
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict):
@@ -123,11 +130,6 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                     if isinstance(fn_args, str) and _SURROGATE_RE.search(fn_args):
                         fn["arguments"] = _SURROGATE_RE.sub('\ufffd', fn_args)
                         found = True
-        # Walk any additional string / nested fields (reasoning,
-        # reasoning_content, reasoning_details, etc.) — surrogates from
-        # byte-level reasoning models (xiaomi/mimo, kimi, glm) can lurk
-        # in these fields and aren't covered by the per-field checks above.
-        # Matches _sanitize_messages_non_ascii's coverage (PR #10537).
         for key, value in msg.items():
             if key in {"content", "name", "tool_calls", "role"}:
                 continue
