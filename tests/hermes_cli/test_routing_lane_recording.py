@@ -885,19 +885,19 @@ def test_a_committed_record_survives_a_log_outage_and_projects_once(
         kb.record_run_session_id(conn, run_id, "sess-1")
 
         # The log is unavailable while the run ends.
-        real_path = routing_audit.resolve_profile_log_path
+        real_path = routing_audit.resolve_profile_log_owner
 
         def boom(*a, **k):
             raise OSError("log is gone")
 
-        monkeypatch.setattr(routing_audit, "resolve_profile_log_path", boom)
+        monkeypatch.setattr(routing_audit, "resolve_profile_log_owner", boom)
         kb.complete_task(conn, tid, summary="done")
         assert kb.project_routing_outbox(conn) == 0, "nothing could be written"
         assert _staged(run_id)["projected_at"] is None, "and nothing was claimed"
 
         # The log comes back. Restore only this attribute — monkeypatch.undo()
         # would also revert the board fixture's HERMES_KANBAN_DB.
-        monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real_path)
+        monkeypatch.setattr(routing_audit, "resolve_profile_log_owner", real_path)
         assert kb.project_routing_outbox(conn) == 1
         assert _staged(run_id)["projected_at"] is not None
         # Draining again is a no-op: exactly once.
@@ -1162,9 +1162,9 @@ def test_a_dispatcher_tick_drains_what_a_previous_process_left(
     from hermes_cli import routing_audit
 
     tid, _run_id = _routed_task()
-    real = routing_audit.resolve_profile_log_path
-    monkeypatch.setattr(routing_audit, "resolve_profile_log_path",
-                        lambda p: None)
+    real = routing_audit.resolve_profile_log_owner
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_owner",
+                        lambda p: (None, routing_audit.OWNER_MISSING))
     conn = kb.connect()
     try:
         kb.complete_task(conn, tid, summary="done")
@@ -1172,7 +1172,7 @@ def test_a_dispatcher_tick_drains_what_a_previous_process_left(
         conn.close()
     # Unresolvable → quarantined, not projected. Restore and prove the tick
     # recovers a genuinely pending one instead.
-    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real)
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_owner", real)
 
     tid2, run2 = _routed_task()
     boom = {"n": 0}
@@ -1183,7 +1183,7 @@ def test_a_dispatcher_tick_drains_what_a_previous_process_left(
             raise OSError("log gone")
         return real(profile)
 
-    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", flaky)
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_owner", flaky)
     conn = kb.connect()
     try:
         kb.complete_task(conn, tid2, summary="done")
@@ -1192,7 +1192,7 @@ def test_a_dispatcher_tick_drains_what_a_previous_process_left(
         conn.close()
     assert _pending() == 1, "the record survived the outage"
 
-    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real)
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_owner", real)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _n: True)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
@@ -1211,8 +1211,8 @@ def test_ordinary_activity_after_recovery_drains_exactly_once(
     from hermes_cli import routing_audit
 
     tid, run_id = _routed_task()
-    real = routing_audit.resolve_profile_log_path
-    monkeypatch.setattr(routing_audit, "resolve_profile_log_path",
+    real = routing_audit.resolve_profile_log_owner
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_owner",
                         lambda p: (_ for _ in ()).throw(OSError("gone")))
     conn = kb.connect()
     try:
@@ -1222,7 +1222,7 @@ def test_ordinary_activity_after_recovery_drains_exactly_once(
     assert _pending() == 1
     assert _terminal(tmp_path) == []
 
-    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real)
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_owner", real)
     for _ in range(3):                      # ordinary CLI activity, repeatedly
         _run_cli(["kanban", "stats"])
     records = [t for t in _terminal(tmp_path)
@@ -1263,6 +1263,8 @@ def test_a_record_is_written_to_its_owning_profiles_log(board, tmp_path, monkeyp
 
 
 def test_an_unresolvable_owner_is_quarantined_not_misrouted(board, tmp_path):
+    from hermes_cli import routing_audit
+
     tid, run_id = _routed_task(assignee="ghost-profile")
     conn = kb.connect()
     try:
@@ -1273,7 +1275,7 @@ def test_an_unresolvable_owner_is_quarantined_not_misrouted(board, tmp_path):
     assert _terminal(tmp_path) == [], "never guess a destination"
     q = _quarantined()
     assert len(q) == 1 and q[0]["run_id"] == run_id
-    assert "unresolvable profile" in q[0]["error"]
+    assert q[0]["error"] == routing_audit.OWNER_MISSING
     assert q[0]["projected_at"] is None, "quarantine is not success"
 
 
@@ -1359,7 +1361,7 @@ def test_a_payload_that_is_not_an_object_is_quarantined(board, tmp_path):
 def test_a_log_outage_never_fails_the_completed_task(board, tmp_path, monkeypatch):
     from hermes_cli import routing_audit
 
-    monkeypatch.setattr(routing_audit, "resolve_profile_log_path",
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_owner",
                         lambda p: (_ for _ in ()).throw(OSError("gone")))
     tid, _run_id = _routed_task()
     conn = kb.connect()
@@ -1497,6 +1499,8 @@ def test_a_traversing_owner_is_quarantined_and_writes_nothing(
     profiles_root, monkeypatch, tmp_path
 ):
     """The end-to-end reproduction: nothing outside the root, nothing marked."""
+    from hermes_cli import routing_audit
+
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "esc.db"))
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
@@ -1519,7 +1523,7 @@ def test_a_traversing_owner_is_quarantined_and_writes_nothing(
     assert not (outside / "logs" / "routing.jsonl").exists()
     assert row["projected_at"] is None
     assert row["quarantined_at"] is not None
-    assert "unresolvable profile" in row["error"]
+    assert row["error"] == routing_audit.OWNER_INVALID
 
 
 def test_the_quarantine_reason_is_bounded_and_printable(profiles_root, tmp_path,
@@ -1653,3 +1657,200 @@ def test_history_is_preserved_and_the_tick_stays_bounded(board):
         conn.close()
     assert [r["run_id"] for r in pending] == [90002], "only the pending row"
     assert total == 5002, "projected and quarantined history is preserved"
+
+
+# ---------------------------------------------------------------------------
+# Fifth round: a rejected owner never reaches a diagnostic sink
+# ---------------------------------------------------------------------------
+
+# Synthetic markers only — shaped like the real families, valid in none of them.
+CREDENTIAL_SHAPED = [
+    ("gitlab",      "glpat-NOTAREALKEY-ABCDEFGHIJKLMNOP"),
+    ("stripe",      "sk_live_NOTAREAL0000ABCDEFGHIJKLMNOPQRSTUV"),
+    ("openrouter",  "sk-or-v1-notarealnotarealnotarealnotarealnotareal00"),
+    ("github",      "ghp_NOTAREAL0000ABCDEFGHIJKLMNOPQRSTUV"),
+    ("github-pat",  "github_pat_NOTAREAL0000ABCDEFGHIJKLMNOPQRSTUV"),
+    ("huggingface", "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"),
+    ("anthropic",   "sk-ant-api03-notarealnotarealnotarealnotarealnotareal"),
+    ("aws",         "AKIANOTAREAL00000000"),
+    ("google",      "AIzaNotARealKeyNotARealKeyNotARealKey00"),
+    ("slack",       "xoxb-000000000000-000000000000-notarealnotarealnotar"),
+    ("generic",     "api_key_NOTAREAL0000ABCDEFGHIJKLMNOPQRSTUVWX"),
+]
+
+PATH_SHAPED = [
+    ("traversal",     "../../Users/Rick/Secret Project"),
+    ("absolute-unix", "/Users/Rick/Secret Project/.env"),
+    ("absolute-etc",  "/etc/hermes/credentials.json"),
+    ("windows",       "C:\\Users\\Rick\\Secret Project\\.env"),
+    ("unc",           "\\\\fileserver\\Finance$\\payroll"),
+    ("home",          "~/Documents/Client Names/acme-corp"),
+]
+
+CONTROL_SHAPED = [
+    ("newline",     "coder\nCRITICAL zzforgedzz NOTAREAL"),
+    ("crlf",        "coder\r\nFAKE"),
+    ("ansi",        "coder\x1b[31mRED\x1b[0m"),
+    ("bidi",        "coder\u202egnidaolyap\u202c"),
+    ("zero-width",  "co\u200bder\u200d"),
+    ("tab-null",    "coder\t\x00trailing"),
+    ("oversized",   "z" * 20000),
+    ("oversized-credential", "glpat-" + "N" * 9000),
+]
+
+_CODES = {
+    "invalid_profile_owner", "missing_profile_owner",
+    "escaped_profile_owner", "unresolvable_profile_owner",
+}
+
+
+def _quarantine_diagnostics(owner, caplog, run_id=4242):
+    """Insert *owner*, project it, and return (db_error, log_text)."""
+    import logging
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (run_id, profile, payload, created_at) "
+            "VALUES (?, ?, '{}', 1)", (run_id, owner))
+        conn.commit()
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            written = kb.project_routing_outbox(conn)
+        row = conn.execute(
+            "SELECT error, projected_at, quarantined_at FROM routing_outbox "
+            " WHERE run_id = ?", (run_id,)).fetchone()
+    finally:
+        conn.close()
+    assert written == 0, "a rejected owner is never projected"
+    assert row["projected_at"] is None
+    assert row["quarantined_at"] is not None
+    return row["error"], "\n".join(r.getMessage() for r in caplog.records)
+
+
+def _assert_sink_is_safe(owner, error, log):
+    """Neither sink may carry the value, and both stay bounded and printable."""
+    assert error in _CODES, f"reason code only, got {error!r}"
+    haystack = f"{error}\n{log}"
+    # No run of the rejected value survives anywhere in either sink.
+    for n in range(0, max(1, len(owner) - 7)):
+        chunk = owner[n:n + 8]
+        if chunk.strip():
+            assert chunk not in haystack, f"leaked {chunk!r}"
+    for line in log.splitlines():
+        assert len(line) < 200, "log lines stay bounded"
+        assert all(ch == " " or ch.isprintable() for ch in line), repr(line)
+
+
+@pytest.mark.parametrize("family,owner", CREDENTIAL_SHAPED)
+def test_a_credential_shaped_owner_never_reaches_a_sink(board, caplog, family, owner):
+    error, log = _quarantine_diagnostics(owner, caplog)
+    _assert_sink_is_safe(owner, error, log)
+
+
+@pytest.mark.parametrize("kind,owner", PATH_SHAPED)
+def test_a_local_path_owner_never_reaches_a_sink(board, caplog, kind, owner):
+    error, log = _quarantine_diagnostics(owner, caplog)
+    _assert_sink_is_safe(owner, error, log)
+    assert "Rick" not in f"{error}{log}" and "Secret" not in f"{error}{log}"
+
+
+@pytest.mark.parametrize("kind,owner", CONTROL_SHAPED)
+def test_a_control_character_owner_cannot_forge_a_log_line(board, caplog, kind, owner):
+    error, log = _quarantine_diagnostics(owner, caplog)
+    _assert_sink_is_safe(owner, error, log)
+    assert "zzforgedzz" not in log, "a newline cannot inject a second line"
+    assert len(error) < 64, "the stored reason stays small"
+
+
+def test_a_lone_surrogate_owner_is_rejected_without_stringifying(board):
+    """SQLite cannot store one, so the boundary is the resolver itself."""
+    from hermes_cli import routing_audit
+
+    path, reason = routing_audit.resolve_profile_log_owner("\ud800coder")
+    assert path is None and reason in _CODES
+
+
+def test_an_owner_whose_string_conversion_raises_is_rejected(board):
+    from hermes_cli import routing_audit
+
+    class Boom:
+        def __str__(self):
+            raise RuntimeError("never stringify untrusted input")
+
+        __repr__ = __str__
+
+    path, reason = routing_audit.resolve_profile_log_owner(Boom())
+    assert path is None
+    assert reason == routing_audit.OWNER_INVALID
+
+
+def test_diagnostics_stay_safe_when_the_redactor_raises(board, caplog, monkeypatch):
+    """Safety must not depend on the redactor: the value is simply never used."""
+    import agent.redact
+
+    monkeypatch.setattr(
+        agent.redact, "redact_sensitive_text",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("redactor down")))
+    owner = "glpat-NOTAREALKEY-ABCDEFGHIJKLMNOP"
+    error, log = _quarantine_diagnostics(owner, caplog)
+    _assert_sink_is_safe(owner, error, log)
+
+
+def test_diagnostics_stay_safe_when_the_redactor_is_unavailable(
+    board, caplog, monkeypatch
+):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "agent.redact", None)
+    owner = "sk-ant-api03-notarealnotarealnotarealnotarealnotareal"
+    error, log = _quarantine_diagnostics(owner, caplog)
+    _assert_sink_is_safe(owner, error, log)
+
+
+def test_the_rejected_value_is_still_recoverable_from_its_own_row(board, caplog):
+    """Diagnostics drop the value; the record keeps it, which is where it belongs."""
+    owner = "glpat-NOTAREALKEY-ABCDEFGHIJKLMNOP"
+    _quarantine_diagnostics(owner, caplog, run_id=555)
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT profile, error FROM routing_outbox WHERE run_id = 555").fetchone()
+    finally:
+        conn.close()
+    assert row["profile"] == owner, "the row still identifies its own owner"
+    assert row["error"] == "missing_profile_owner"
+
+
+# --- the reason code is specific, not a single catch-all --------------------
+
+def test_each_rejection_gets_its_own_reason_code(profiles_root):
+    from hermes_cli import routing_audit as ra
+
+    outside = profiles_root.outside
+    outside.mkdir(parents=True, exist_ok=True)
+    (profiles_root.profiles / "escaped").symlink_to(outside, target_is_directory=True)
+
+    cases = {
+        "../../escape": ra.OWNER_INVALID,       # rejected by validation
+        "hermes": ra.OWNER_INVALID,             # reserved
+        "never-created": ra.OWNER_MISSING,      # valid name, no directory
+        "escaped": ra.OWNER_ESCAPED,            # symlink out of the root
+    }
+    for owner, expected in cases.items():
+        path, reason = ra.resolve_profile_log_owner(owner)
+        assert path is None, owner
+        assert reason == expected, f"{owner}: {reason}"
+
+
+def test_resolution_of_valid_owners_is_unchanged(profiles_root):
+    from hermes_cli import routing_audit as ra
+
+    assert ra.resolve_profile_log_owner("reviewer") == (
+        profiles_root.profiles / "reviewer" / "logs" / "routing.jsonl", None)
+    assert ra.resolve_profile_log_owner("REVIEWER ")[0] == (
+        profiles_root.profiles / "reviewer" / "logs" / "routing.jsonl")
+    assert ra.resolve_profile_log_owner("default") == (
+        profiles_root.root / "logs" / "routing.jsonl", None)
+    assert ra.resolve_profile_log_owner(None)[1] is None, "a legacy row still resolves"
+    assert ra.resolve_profile_log_owner("  ")[1] is None

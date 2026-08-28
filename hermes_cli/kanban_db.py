@@ -4602,6 +4602,20 @@ def _stage_terminal_routing_record(
         pass
 
 
+def _diag_id(value: Any) -> "int | str":
+    """An outbox identifier safe to interpolate into a log line.
+
+    The columns are declared INTEGER, but SQLite is dynamically typed and the
+    outbox is same-user writable, so a row can hold text with newlines or ANSI
+    escapes in its id. Anything not an integer becomes a marker rather than
+    formatting itself into the log.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return "?"
+
+
 def project_routing_outbox(
     conn: sqlite3.Connection, *, limit: int = 50,
 ) -> int:
@@ -4667,28 +4681,31 @@ def project_routing_outbox(
                     )
                     _log.warning(
                         "routing outbox: quarantined record %s (run %s): "
-                        "payload is unreadable", row["id"], row["run_id"],
+                        "payload is unreadable",
+                        _diag_id(row["id"]), _diag_id(row["run_id"]),
                     )
                     continue
-                destination = routing_audit.resolve_profile_log_path(row["profile"])
+                destination, reason = routing_audit.resolve_profile_log_owner(
+                    row["profile"]
+                )
                 if destination is None:
-                    # The reason names the owner but is bounded and stripped of
-                    # control characters, and never carries a resolved local
-                    # path — the value that failed validation is attacker-
-                    # influenced.
-                    owner = "".join(
-                        ch for ch in str(row["profile"] or "")[:64]
-                        if ch.isprintable()
-                    )
+                    # Neither sink repeats the rejected owner. It is untrusted
+                    # input — a credential shape and a local path both fit
+                    # inside any length bound — and both the quarantine column
+                    # and the application log are persistent. A stable reason
+                    # code plus the record and run ids says what happened; the
+                    # value stays only in the row's own ``profile`` column,
+                    # where recovery needs it and no diagnostic reader lands
+                    # by accident.
+                    code = reason or routing_audit.OWNER_UNRESOLVABLE
                     conn.execute(
                         "UPDATE routing_outbox SET quarantined_at = ?, error = ? "
                         " WHERE id = ?",
-                        (now, f"unresolvable profile: {owner!r}", row["id"]),
+                        (now, code, row["id"]),
                     )
                     _log.warning(
-                        "routing outbox: quarantined record %s (run %s): "
-                        "profile %r cannot be resolved to a log",
-                        row["id"], row["run_id"], row["profile"],
+                        "routing outbox: quarantined record %s (run %s): %s",
+                        _diag_id(row["id"]), _diag_id(row["run_id"]), code,
                     )
                     continue
                 if not routing_audit.record_routing_decision(

@@ -57,8 +57,22 @@ def _resolve_log_path() -> Path:
     return get_hermes_home() / "logs" / "routing.jsonl"
 
 
-def resolve_profile_log_path(profile: "str | None") -> "Path | None":
-    """The routing log belonging to *profile*, or ``None`` if unresolvable.
+# Stable, bounded reason codes for a record whose owner cannot be resolved.
+# They deliberately carry no part of the rejected value: it is untrusted input,
+# and both sinks it would otherwise reach — the quarantine column and the
+# application log — are persistent. The outbox id and run id are already
+# sufficient non-sensitive correlation identifiers, and the value itself
+# remains in the row's own ``profile`` column for recovery.
+OWNER_INVALID = "invalid_profile_owner"
+OWNER_MISSING = "missing_profile_owner"
+OWNER_ESCAPED = "escaped_profile_owner"
+OWNER_UNRESOLVABLE = "unresolvable_profile_owner"
+
+
+def resolve_profile_log_owner(
+    profile: "str | None",
+) -> "tuple[Path | None, str | None]":
+    """``(path, None)`` when *profile* owns a log, else ``(None, reason_code)``.
 
     The kanban board is shared across profiles, so whichever process drains the
     outbox must still write each record to the log of the profile that produced
@@ -71,7 +85,7 @@ def resolve_profile_log_path(profile: "str | None") -> "Path | None":
     1. normalise to the canonical on-disk id;
     2. **validate** with Hermes' own ``validate_profile_name`` — normalisation
        alone lowercases and strips, and does *not* reject ``/``, ``\`` or
-       ``..``. A name like ``../../escape`` previously resolved to a directory
+       ``..``. A name like ``../../escape`` once resolved to a directory
        outside the profiles root and was written to;
     3. ``default`` is handled explicitly as the root home, not as a child
        directory of the profiles root;
@@ -82,15 +96,19 @@ def resolve_profile_log_path(profile: "str | None") -> "Path | None":
        accepted only when it still lands inside the permitted root, and
        anything pointing outside fails closed.
 
-    Returns ``None`` for every rejection, so the caller quarantines the record
-    rather than guessing a destination.
+    A reason code accompanies every rejection so the caller can quarantine the
+    record and say *why* without repeating what it was given.
     """
     from hermes_constants import get_hermes_home
 
-    if not isinstance(profile, str) or not profile.strip():
+    if profile is None or (isinstance(profile, str) and not profile.strip()):
         # No owner recorded (a legacy row): this process's own log is the only
         # defensible destination.
-        return get_hermes_home() / "logs" / "routing.jsonl"
+        return get_hermes_home() / "logs" / "routing.jsonl", None
+    if not isinstance(profile, str):
+        # Never stringified: a non-string owner may have a __str__ that raises,
+        # and it is not something any supported writer stages.
+        return None, OWNER_INVALID
     try:
         from hermes_cli.profiles import (
             _get_default_hermes_home,
@@ -100,33 +118,50 @@ def resolve_profile_log_path(profile: "str | None") -> "Path | None":
             validate_profile_name,
         )
 
-        canon = normalize_profile_name(profile)
-        validate_profile_name(canon)          # rejects separators + traversal
+        try:
+            canon = normalize_profile_name(profile)
+            validate_profile_name(canon)      # rejects separators + traversal
+        except Exception:
+            return None, OWNER_INVALID
 
         if canon == "default":
-            return Path(_get_default_hermes_home()) / "logs" / "routing.jsonl"
+            return (
+                Path(_get_default_hermes_home()) / "logs" / "routing.jsonl",
+                None,
+            )
 
         try:
             active = normalize_profile_name(get_active_profile_name() or "")
         except Exception:
             active = ""
         if canon and canon == active:
-            return get_hermes_home() / "logs" / "routing.jsonl"
+            return get_hermes_home() / "logs" / "routing.jsonl", None
 
         root = Path(_get_profiles_root())
         candidate = root / canon
         if not candidate.is_dir():
-            return None
+            return None, OWNER_MISSING
         real_root = root.resolve()
         real_candidate = candidate.resolve()
         if real_candidate != real_root and real_root not in real_candidate.parents:
             # Escaped the permitted root — by traversal, or by a symlink
             # pointing outside it. Fail closed.
-            return None
-        return real_candidate / "logs" / "routing.jsonl"
+            return None, OWNER_ESCAPED
+        return real_candidate / "logs" / "routing.jsonl", None
     except Exception as exc:
+        # Only the exception CLASS, never its message: an exception raised
+        # while handling an untrusted name tends to quote that name.
         _log.debug("routing log path unresolvable: %s", type(exc).__name__)
-    return None
+    return None, OWNER_UNRESOLVABLE
+
+
+def resolve_profile_log_path(profile: "str | None") -> "Path | None":
+    """The routing log belonging to *profile*, or ``None`` if unresolvable.
+
+    Thin wrapper over :func:`resolve_profile_log_owner` for callers that do not
+    need the rejection reason.
+    """
+    return resolve_profile_log_owner(profile)[0]
 
 
 _MAX_REDACT_DEPTH = 6
