@@ -1505,6 +1505,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
+        # Monotonic generation for the tool-client binding published by this
+        # adapter. Each successful connect increments it, so a reconnect
+        # supersedes the previous binding, and compare-and-remove teardown
+        # (``unpublish``) can never erase a newer adapter's binding.
+        self._tool_binding_generation = 0
         # Adapter-owned thread pool for blocking Feishu SDK calls. Routing SDK
         # work through this pool (instead of asyncio's shared default executor)
         # means a torn-down default executor can no longer wedge sends with
@@ -1904,6 +1909,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
+        self._client = None
+        # Compare-and-remove: only this adapter's generation is removed, so a
+        # stale adapter tearing down cannot clear a newer adapter's binding.
+        self._unpublish_tool_clients()
         self._shutdown_sdk_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
@@ -4960,6 +4969,10 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_client,
             self,
         )
+        # Publish only after every step above succeeded — a failed connect
+        # attempt must never expose a tool client with no live adapter behind
+        # it (see tools/feishu_client_binding.py).
+        self._publish_tool_clients()
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:
@@ -4979,6 +4992,10 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._webhook_runner.setup()
         self._webhook_site = web.TCPSite(self._webhook_runner, self._webhook_host, self._webhook_port)
         await self._webhook_site.start()
+        # Publish only after every step above succeeded — a failed connect
+        # attempt must never expose a tool client with no live adapter behind
+        # it (see tools/feishu_client_binding.py).
+        self._publish_tool_clients()
 
     def _build_lark_client(self, domain: Any) -> Any:
         return (
@@ -4989,6 +5006,26 @@ class FeishuAdapter(BasePlatformAdapter):
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
+
+    def _publish_tool_clients(self) -> None:
+        """Publish this adapter's client into the profile-qualified binding
+        registry so Feishu doc/drive tools work in DM/gateway sessions where no
+        comment-thread client is injected.
+
+        Called only after a connection fully succeeds. The generation stamp
+        lets a reconnect supersede the old binding and prevents a stale
+        adapter's teardown from clearing a newer one.
+        """
+        from tools.feishu_client_binding import publish
+
+        self._tool_binding_generation += 1
+        publish(self._client, self._tool_binding_generation)
+
+    def _unpublish_tool_clients(self) -> None:
+        """Remove this adapter's binding (compare-and-remove by generation)."""
+        from tools.feishu_client_binding import unpublish
+
+        unpublish(self._tool_binding_generation)
 
     async def _feishu_send_with_retry(
         self,
