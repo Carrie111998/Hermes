@@ -2096,6 +2096,9 @@ export interface Translations {
     dismiss: string
     exit: (code: number) => string
     context: {
+      compact: string
+      compactHint: string
+      compacting: string
       label: string
     }
     coding: {

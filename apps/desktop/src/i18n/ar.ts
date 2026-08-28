@@ -1933,6 +1933,9 @@ export const ar = defineLocale({
     dismiss: 'تجاهل',
     exit: code => `خروج ${code}`,
     context: {
+      compact: 'ضغط',
+      compactHint: 'اضغط هذه المحادثة لتفريغ مساحة من السياق',
+      compacting: 'جارٍ الضغط…',
       label: 'السياق'
     },
     coding: {

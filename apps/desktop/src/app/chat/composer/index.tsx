@@ -73,6 +73,7 @@ import {
 import { useComposerScope } from './scope'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
+import { ContextStatusRow } from './status-stack/context-row'
 import { SuggestionPills } from './suggestion-pills'
 import { extractClipboardImageBlobs, openDirectiveScope } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
@@ -165,7 +166,12 @@ export function ChatBar({
   // prompt owns its own dismissal (Skip, Reject, dialog close).
   const awaitingInput = useStore(scope.$awaitingInput)
   // Parked on an approval/sudo/secret prompt: typing can't answer those, so the
-  // busy submit routes text to the queue instead of a steer (which would sit
+  // The slash command behind the underside gauge's Compact pill. Submitted
+// through the composer's own onSubmit so it queues, clears the draft, and
+// reports exactly like typing it — no second dispatch path to keep in sync.
+const COMPACT_COMMAND = '/compress'
+
+// busy submit routes text to the queue instead of a steer (which would sit
   // undelivered behind the blocked tool batch). Drives the button affordance.
   const blockingPrompt = useStore(useMemo(() => sessionBlockingPrompt(sessionId ?? null), [sessionId]))
   const activeQueueSessionKey = queueSessionKey || sessionId || null
@@ -1161,8 +1167,6 @@ export function ChatBar({
               grows upward over the thread and the dock's own measurement covers
               it. Collapses to nothing when every status is empty. */}
           <ComposerStatusStack
-            busy={busy}
-            gateway={gateway}
             queue={
               activeQueueSessionKey && queuedPrompts.length > 0 ? (
                 <QueuePanel
@@ -1363,6 +1367,12 @@ export function ChatBar({
               the pop-out drag region. Same px as the strip above, so the two
               bracket the composer on one vertical line. */}
           <div className={cn(composerFloatingStrip, 'px-[5px] pt-1.5 empty:hidden')}>
+            <ContextStatusRow
+              busy={busy}
+              gateway={gateway}
+              onCompact={() => void onSubmit(COMPACT_COMMAND)}
+              sessionId={statusSessionId}
+            />
             <ContribSlot area={COMPOSER_AREAS.underside} />
           </div>
         </div>

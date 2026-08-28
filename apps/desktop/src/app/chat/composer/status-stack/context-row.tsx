@@ -1,11 +1,18 @@
-import { memo, useState } from 'react'
+import { useStore } from '@nanostores/react'
+import { memo, useCallback, useMemo, useState } from 'react'
 
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
-import { StatusRow } from '@/components/chat/status-row'
+import { useContextBreakdown } from '@/app/shell/hooks/use-context-breakdown'
+import { composerFloatingPill } from '@/components/chat/composer-dock'
 import { Codicon } from '@/components/ui/codicon'
+import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Tip } from '@/components/ui/tooltip'
+import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { contextBarLabel, usageContextLabel } from '@/lib/statusbar'
+import { usageContextLabel } from '@/lib/statusbar'
+import { cn } from '@/lib/utils'
+import { sessionCompacting } from '@/store/compaction'
 import type { ContextBreakdown, UsageStats } from '@/types/hermes'
 
 /** Flatten a breakdown into the {@link UsageStats} shape the shared gauge
@@ -26,61 +33,116 @@ export function contextUsageFromBreakdown(breakdown: ContextBreakdown | null): U
 }
 
 interface ContextStatusRowProps {
-  breakdown: ContextBreakdown | null
-  loading: boolean
-  usage: UsageStats
+  /** Live turn: the transcript changes on every delta, so an estimate would be
+   *  both stale and wasteful mid-turn (see `useContextBreakdown`). */
+  busy: boolean
+  gateway?: HermesGateway | null
+  /** Runs `/compress` through the composer's own submit path, so it queues,
+   *  clears, and reports exactly like typing it. */
+  onCompact?: () => void
+  sessionId: null | string
 }
 
 /**
- * Context readout for THIS conversation, in the composer status stack directly
- * under the transcript. Reads `<used>/<max>` and a percent at a glance; the row
- * IS the button — clicking it opens the shared {@link ContextUsagePanel} with
- * the per-category breakdown.
+ * Context gauge for THIS conversation, in the chrome-free strip BELOW the
+ * composer. Reads `<used>/<max>` and a percent at a glance; the pill opens the
+ * shared {@link ContextUsagePanel} with the per-category breakdown, and its
+ * neighbour compacts without going to find a slash command.
  *
- * The statusbar carries the same gauge, but it is hideable and lives at the far
- * edge of the window. This row is the one that answers "what is in my context
- * right now" without leaving the conversation.
+ * Below and not above: the strip above the composer already carries the todo
+ * list, subagents, background tasks, the queue, and the branch rail, and a
+ * gauge that has to be hunted for among them is worse than no gauge. Down here
+ * it holds one position that nothing else competes for.
  *
- * Presentational, like {@link ContextUsagePanel}: the stack fetches, because it
- * has to know whether this row has anything to say before it decides to render
- * the card at all.
+ * Renders nothing until the session reports a context window, so a fresh app
+ * shows an empty strip rather than an empty gauge.
  */
 export const ContextStatusRow = memo(function ContextStatusRow({
-  breakdown,
-  loading,
-  usage
+  busy,
+  gateway,
+  onCompact,
+  sessionId
 }: ContextStatusRowProps) {
   const { t } = useI18n()
   const copy = t.statusStack.context
   const [open, setOpen] = useState(false)
+  const compacting = useStore(useMemo(() => sessionCompacting(sessionId), [sessionId]))
 
+  const requestGateway = useCallback(
+    <T,>(method: string, params?: Record<string, unknown>): Promise<T> =>
+      gateway ? gateway.request<T>(method, params) : Promise.reject(new Error('gateway unavailable')),
+    [gateway]
+  )
+
+  const { breakdown, loading } = useContextBreakdown({
+    busy,
+    enabled: Boolean(gateway),
+    requestGateway,
+    sessionId
+  })
+
+  const usage = useMemo(() => contextUsageFromBreakdown(breakdown), [breakdown])
   const summary = usageContextLabel(usage)
-  const bar = contextBarLabel(usage)
+  const percent = Math.max(0, Math.min(100, Math.round(usage.context_percent ?? 0)))
+
+  if (!summary) {
+    return null
+  }
 
   return (
-    <Popover onOpenChange={setOpen} open={open}>
-      <PopoverTrigger asChild>
-        <StatusRow
-          leading={<Codicon aria-hidden className="text-muted-foreground/70" name="pulse" size="0.8rem" />}
-          onActivate={() => setOpen(value => !value)}
-        >
-          <span className="min-w-0 truncate text-[0.73rem] leading-4 text-foreground/92">{copy.label}</span>
-
-          <span
-            className="ml-auto flex shrink-0 items-center gap-2 text-[0.68rem] leading-4 text-muted-foreground/75 tabular-nums"
-            data-slot="context-status-summary"
+    <>
+      <Popover onOpenChange={setOpen} open={open}>
+        <PopoverTrigger asChild>
+          <button
+            className={cn(composerFloatingPill, 'gap-2 tabular-nums')}
+            data-slot="context-status-pill"
+            type="button"
           >
-            <span>{summary}</span>
-            {bar && <span className="font-mono text-muted-foreground/60">{bar}</span>}
-          </span>
-        </StatusRow>
-      </PopoverTrigger>
+            <Codicon aria-hidden className="text-(--ui-text-tertiary)" name="pulse" size="0.8rem" />
 
-      {/* Same chrome the statusbar gauge gives this panel: the panel paints its
-          own padding, so the popover contributes none. */}
-      <PopoverContent align="start" className="w-auto border-(--ui-stroke-secondary) p-0" side="top">
-        <ContextUsagePanel breakdown={breakdown} loading={loading} usage={usage} />
-      </PopoverContent>
-    </Popover>
+            <span className="text-(--ui-text-tertiary)">{copy.label}</span>
+
+            <span data-slot="context-status-summary">{summary}</span>
+
+            {/* The number that actually drives the decision to compact, so it
+                gets the emphasis and warms as the window fills. */}
+            <span
+              className={cn(
+                percent >= 90 ? 'text-(--ui-red)' : percent >= 70 ? 'text-(--ui-orange)' : 'text-(--ui-text-tertiary)'
+              )}
+            >
+              {percent}%
+            </span>
+          </button>
+        </PopoverTrigger>
+
+        {/* Same chrome the statusbar gauge gives this panel: the panel paints
+            its own padding, so the popover contributes none. */}
+        <PopoverContent align="start" className="w-auto border-(--ui-stroke-secondary) p-0" side="top">
+          <ContextUsagePanel breakdown={breakdown} loading={loading} usage={usage} />
+        </PopoverContent>
+      </Popover>
+
+      {onCompact && (
+        <Tip label={copy.compactHint}>
+          <button
+            aria-label={copy.compact}
+            className={cn(composerFloatingPill, 'disabled:cursor-default disabled:opacity-45')}
+            data-slot="context-compact-pill"
+            disabled={busy || compacting}
+            onClick={onCompact}
+            type="button"
+          >
+            {compacting ? (
+              <GlyphSpinner ariaLabel={copy.compacting} className="text-[0.8rem] leading-none" spinner="braille" />
+            ) : (
+              <Codicon aria-hidden name="fold" size="0.8rem" />
+            )}
+
+            <span>{compacting ? copy.compacting : copy.compact}</span>
+          </button>
+        </Tip>
+      )}
+    </>
   )
 })

@@ -2662,6 +2662,9 @@ export const zh: Translations = {
     dismiss: '关闭',
     exit: code => `退出码 ${code}`,
     context: {
+      compact: '压缩',
+      compactHint: '压缩此对话以释放上下文',
+      compacting: '正在压缩…',
       label: '上下文'
     },
     coding: {

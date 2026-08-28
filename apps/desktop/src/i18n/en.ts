@@ -2482,6 +2482,9 @@ export const en: Translations = {
     dismiss: 'Dismiss',
     exit: code => `exit ${code}`,
     context: {
+      compact: 'Compact',
+      compactHint: 'Compress this conversation to free context',
+      compacting: 'Compacting…',
       label: 'Context'
     },
     coding: {
