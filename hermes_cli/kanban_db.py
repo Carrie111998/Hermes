@@ -8901,6 +8901,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    review_candidates: list[tuple] = []  # (task_id, comment_excerpt, run_id)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
@@ -8927,7 +8928,41 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            unconfirmed_completion = None
             if kind == "clean_exit":
+                # Valicen/Talaria: a clean exit is not a failure when the
+                # worker left its RESULT on the card — a comment by the
+                # assignee during this run. Re-running such a task burns a
+                # whole budget to redo finished work and then auto-blocks a
+                # done card ("Iteration budget exhausted", t_a5199403,
+                # 2026-08-25). Route it to review instead: the human/reviewer
+                # sees the comment and confirms with one click.
+                try:
+                    _c = conn.execute(
+                        "SELECT body FROM task_comments WHERE task_id = ? "
+                        "AND author = ? AND created_at >= ? ORDER BY id DESC LIMIT 1",
+                        (row["id"], row["assignee"], int(started_at or 0) - 1),
+                    ).fetchone()
+                    if _c is not None and str(_c["body"] or "").strip():
+                        unconfirmed_completion = str(_c["body"]).strip()
+                except Exception:
+                    unconfirmed_completion = None
+            if kind == "clean_exit" and unconfirmed_completion:
+                protocol_violation = False
+                error_text = (
+                    "worker exited cleanly (rc=0) after posting a completion "
+                    "comment but without calling kanban_complete — routed to "
+                    "review instead of retry (unconfirmed completion)."
+                )
+                event_kind = "unconfirmed_completion"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "unconfirmed_completion": True,
+                    "comment_excerpt": unconfirmed_completion[:280],
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -9001,7 +9036,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                _run_outcome = (
+                    "rate_limited" if rate_limited_exit
+                    else "unconfirmed_completion" if unconfirmed_completion
+                    else "crashed"
+                )
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9023,7 +9062,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "outcome": _run_outcome,
                     "retry_status": retry_status,
                 })
-                if rate_limited_exit:
+                if unconfirmed_completion:
+                    # Not a failure: the result is on the card. Hand off to
+                    # review after the txn (request_review needs its own
+                    # write_txn). Leaves consecutive_failures untouched.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = NULL WHERE id = ?",
+                        (row["id"],),
+                    )
+                    review_candidates.append((row["id"], unconfirmed_completion, run_id))
+                elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
                     # respawn until the window clears — WITHOUT touching
@@ -9068,6 +9116,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # A per-task ``max_retries`` overrides the violation bound with the same
     # top precedence it has for every other failure kind. Systemic same-error
     # crashes still trip immediately.
+    # Unconfirmed completions: the worker's own comment is the summary.
+    # request_review emits ``review_requested`` (a terminal notifier kind), so
+    # the subscriber is woken to confirm with kanban_complete or send it back.
+    for _tid, _excerpt, _run_id in review_candidates:
+        try:
+            ok = request_review(
+                conn, _tid,
+                summary="[unconfirmed completion — worker exited without kanban_complete] "
+                        + _excerpt[:1500],
+                metadata={"source": "unconfirmed_completion", "run_id": _run_id},
+                force=True,
+            )
+            if not ok:
+                _log.warning(
+                    "kanban: unconfirmed completion for %s could not enter review; left at its source phase",
+                    _tid,
+                )
+        except Exception as _exc:
+            _log.warning("kanban: unconfirmed-completion review handoff failed for %s: %s", _tid, _exc)
     auto_blocked: list[str] = []
     if crash_details:
         # Fingerprint errors to detect systemic failures.
