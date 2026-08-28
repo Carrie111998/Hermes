@@ -73,6 +73,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import ntpath
 import os
 import re
 import random
@@ -133,6 +134,66 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def _is_windows_absolute_path(raw: str) -> bool:
+    return ntpath.isabs(raw) and (
+        bool(ntpath.splitdrive(raw)[0]) or raw.startswith(("\\\\", "//"))
+    )
+
+
+def _is_windows_unc_path(raw: str) -> bool:
+    lowered = raw.replace("\\", "/").lower()
+    if lowered.startswith("//?/unc/"):
+        return True
+    return lowered.startswith("//") and not lowered.startswith("//?/")
+
+
+def _strip_windows_extended_prefix(normalized: str) -> str:
+    if normalized.startswith("//?/unc/"):
+        return "//" + normalized[8:]
+    if normalized.startswith("//?/"):
+        return normalized[4:]
+    return normalized
+
+
+def _normalize_windows_root_key(raw: str) -> str:
+    normalized = ntpath.normcase(ntpath.normpath(raw)).replace("\\", "/")
+    normalized = _strip_windows_extended_prefix(normalized)
+    if normalized.startswith("//"):
+        normalized = normalized.rstrip("/") or "//"
+    return normalized
+
+
+def _resolve_existing_local_windows_root(raw: str) -> str:
+    """Resolve junction/symlink aliases for existing local Windows roots only."""
+    if os.name != "nt" or _is_windows_unc_path(raw):
+        return raw
+    try:
+        candidate = Path(raw)
+        if not candidate.exists():
+            return raw
+        return str(candidate.resolve(strict=False))
+    except OSError:
+        return raw
+
+
+def normalize_workspace_root(path: Path | str) -> str:
+    """Return a stable physical comparison key for a workspace root.
+
+    Existing local roots are resolved before lexical normalization so a
+    symlink or Windows junction cannot give one directory multiple policy
+    identities. Windows paths still use Windows case/slash semantics, including
+    when a board DB is inspected from another platform where that path cannot
+    be resolved physically. UNC / unavailable-network paths stay lexical.
+    """
+    raw = os.path.expanduser(str(path).strip())
+    if not raw:
+        raise ValueError("workspace root is required")
+    if _is_windows_absolute_path(raw):
+        return _normalize_windows_root_key(_resolve_existing_local_windows_root(raw))
+    resolved = Path(raw).expanduser().resolve(strict=False)
+    return os.path.normcase(str(resolved)).replace("\\", "/")
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1492,6 +1553,30 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
+);
+
+-- Board-scoped leases for workspace roots whose primary checkout must have
+-- one exact owner. The DB itself is the board boundary, so claim checks can
+-- read this policy in the same transaction as the status CAS.
+CREATE TABLE IF NOT EXISTS protected_workspaces (
+    normalized_root          TEXT PRIMARY KEY,
+    root_path                TEXT NOT NULL,
+    authorized_task_id       TEXT NOT NULL,
+    authorized_title         TEXT NOT NULL,
+    authorized_workspace_kind TEXT NOT NULL,
+    is_git_root              INTEGER NOT NULL DEFAULT 0,
+    created_at               INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS protected_workspace_allowlist (
+    normalized_root TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    workspace_kind  TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (normalized_root, task_id),
+    FOREIGN KEY (normalized_root) REFERENCES protected_workspaces(normalized_root)
+        ON DELETE CASCADE
 );
 
 -- Subscription from a gateway source (platform + chat + thread) to a
@@ -3565,6 +3650,20 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if workspace_path:
+                    normalized_workspace = normalize_workspace_root(workspace_path)
+                    protected = conn.execute(
+                        "SELECT authorized_task_id FROM protected_workspaces "
+                        "WHERE normalized_root = ?",
+                        (normalized_workspace,),
+                    ).fetchone()
+                    if protected is not None:
+                        _append_protected_workspace_conflict_if_needed(
+                            conn,
+                            task_id=task_id,
+                            normalized_root=normalized_workspace,
+                            authorized_task_id=protected["authorized_task_id"],
+                        )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4614,6 +4713,262 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _live_task_ids_at_workspace_root(
+    conn: sqlite3.Connection,
+    normalized_root: str,
+) -> list[str]:
+    rows = conn.execute(
+        "SELECT rowid, id, workspace_path FROM tasks "
+        "WHERE status NOT IN ('done', 'archived') AND workspace_path IS NOT NULL "
+        "ORDER BY created_at ASC, rowid ASC"
+    ).fetchall()
+    return [
+        row["id"]
+        for row in rows
+        if row["workspace_path"]
+        and normalize_workspace_root(row["workspace_path"]) == normalized_root
+    ]
+
+
+def _append_protected_workspace_conflict_if_needed(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    normalized_root: str,
+    authorized_task_id: str,
+) -> list[str]:
+    conflicts = _live_task_ids_at_workspace_root(conn, normalized_root)
+    if len(conflicts) > 1:
+        _append_event(
+            conn,
+            task_id,
+            "protected_workspace_conflict",
+            {
+                "severity": "critical",
+                "normalized_root": normalized_root,
+                "authorized_task_id": authorized_task_id,
+                "conflicting_task_ids": conflicts,
+            },
+        )
+    return conflicts
+
+
+def _close_leaked_run_before_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+    now: int,
+) -> None:
+    """Close an impossible prior run before a new claim or policy refusal."""
+    stale = conn.execute(
+        "SELECT current_run_id FROM tasks "
+        "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+        (task_id, expected_status),
+    ).fetchone()
+    if stale is None or not stale["current_run_id"]:
+        return
+    run_id = int(stale["current_run_id"])
+    conn.execute(
+        """
+        UPDATE task_runs
+           SET status = 'reclaimed', outcome = 'reclaimed',
+               summary = COALESCE(summary, 'invariant recovery on re-claim'),
+               ended_at = ?,
+               claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+         WHERE id = ? AND ended_at IS NULL
+        """,
+        (now, run_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET current_run_id = NULL "
+        "WHERE id = ? AND status = ? AND claim_lock IS NULL "
+        "AND current_run_id = ?",
+        (task_id, expected_status, run_id),
+    )
+
+
+def _protected_workspace_claim_allowed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+) -> bool:
+    """Enforce protected-root ownership inside an open claim transaction."""
+    task = conn.execute(
+        "SELECT id, title, status, workspace_kind, workspace_path, branch_name, "
+        "claim_lock, block_kind, block_recurrences "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None or task["status"] != expected_status:
+        return False
+    if task["claim_lock"] is not None:
+        return False
+    if not task["workspace_path"]:
+        return True
+    workspace_normalized = normalize_workspace_root(task["workspace_path"])
+    policy = conn.execute(
+        "SELECT normalized_root, root_path, authorized_task_id, "
+        "authorized_title, authorized_workspace_kind, is_git_root "
+        "FROM protected_workspaces WHERE normalized_root = ?",
+        (workspace_normalized,),
+    ).fetchone()
+    persisted_isolated_path: Optional[Path] = None
+    if policy is None and task["workspace_kind"] == "worktree":
+        policies = conn.execute(
+            "SELECT normalized_root, root_path, authorized_task_id, "
+            "authorized_title, authorized_workspace_kind, is_git_root "
+            "FROM protected_workspaces WHERE is_git_root = 1"
+        ).fetchall()
+        for candidate in policies:
+            expected = Path(candidate["root_path"]) / ".worktrees" / task_id
+            if normalize_workspace_root(expected) == workspace_normalized:
+                policy = candidate
+                persisted_isolated_path = expected
+                break
+    if policy is None:
+        return True
+    normalized = policy["normalized_root"]
+
+    _append_protected_workspace_conflict_if_needed(
+        conn,
+        task_id=task_id,
+        normalized_root=normalized,
+        authorized_task_id=policy["authorized_task_id"],
+    )
+
+    rejection_code = "exact_owner_required"
+    reason = (
+        f"protected workspace {policy['root_path']} is reserved for exact task "
+        f"{policy['authorized_task_id']!r}"
+    )
+    if persisted_isolated_path is not None:
+        branch_name = (task["branch_name"] or "").strip() or f"wt/{task_id}"
+        try:
+            _ensure_git_worktree(
+                Path(policy["root_path"]),
+                persisted_isolated_path,
+                branch_name,
+            )
+        except Exception as exc:
+            rejection_code = "worktree_isolation_failed"
+            reason = (
+                f"protected worktree isolation failed for {persisted_isolated_path} "
+                f"on branch {branch_name!r}: {exc}"
+            )
+        else:
+            return True
+    else:
+        exact_owner = (
+            task["id"] == policy["authorized_task_id"]
+            and task["title"] == policy["authorized_title"]
+            and task["workspace_kind"] == policy["authorized_workspace_kind"]
+        )
+        if exact_owner:
+            return True
+
+        allow = conn.execute(
+            "SELECT title, workspace_kind FROM protected_workspace_allowlist "
+            "WHERE normalized_root = ? AND task_id = ?",
+            (normalized, task_id),
+        ).fetchone()
+        if (
+            allow is not None
+            and task["title"] == allow["title"]
+            and task["workspace_kind"] == allow["workspace_kind"]
+        ):
+            return True
+
+        if task["workspace_kind"] == "worktree" and bool(policy["is_git_root"]):
+            branch_name = (task["branch_name"] or "").strip() or f"wt/{task_id}"
+            repo_root = Path(policy["root_path"])
+            isolated_path = repo_root / ".worktrees" / task_id
+            try:
+                _ensure_git_worktree(repo_root, isolated_path, branch_name)
+            except Exception as exc:
+                rejection_code = "worktree_isolation_failed"
+                reason = (
+                    f"protected worktree isolation failed for {isolated_path} on "
+                    f"branch {branch_name!r}: {exc}"
+                )
+            else:
+                redirected = conn.execute(
+                    "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+                    "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+                    (str(isolated_path), branch_name, task_id, expected_status),
+                )
+                if redirected.rowcount != 1:
+                    return False
+                _append_event(
+                    conn,
+                    task_id,
+                    "protected_workspace_redirected",
+                    {
+                        "normalized_root": normalized,
+                        "workspace_path": str(isolated_path),
+                        "branch_name": branch_name,
+                        "source_status": expected_status,
+                    },
+                )
+                return True
+
+    kind = "capability"
+    previous_kind = task["block_kind"]
+    previous_recurrences = int(task["block_recurrences"] or 0)
+    recurrences = previous_recurrences + 1 if previous_kind == kind else 1
+    target_status = (
+        "triage" if recurrences >= BLOCK_RECURRENCE_LIMIT else "blocked"
+    )
+    blocked = conn.execute(
+        "UPDATE tasks SET status = ?, block_kind = ?, block_recurrences = ?, "
+        "last_failure_error = ? "
+        "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+        (target_status, kind, recurrences, reason, task_id, expected_status),
+    )
+    if blocked.rowcount != 1:
+        return False
+    _append_event(
+        conn,
+        task_id,
+        "protected_workspace_claim_rejected",
+        {
+            "severity": "critical",
+            "normalized_root": normalized,
+            "authorized_task_id": policy["authorized_task_id"],
+            "reason": rejection_code,
+            "detail": reason,
+            "source_status": expected_status,
+        },
+    )
+    if target_status == "triage":
+        _append_event(
+            conn,
+            task_id,
+            "block_loop_detected",
+            {
+                "reason": reason,
+                "kind": kind,
+                "recurrences": recurrences,
+                "limit": BLOCK_RECURRENCE_LIMIT,
+                "source_status": expected_status,
+            },
+        )
+    else:
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": reason,
+                "kind": kind,
+                "recurrences": recurrences,
+                "source_status": expected_status,
+            },
+        )
+    return False
+
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -4667,25 +5022,18 @@ def claim_task(
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
-        # an unknown code path), close it as 'reclaimed' so we don't strand
-        # it when the CAS resets the pointer below. No-op when the invariant
-        # holds (the common case).
-        stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
-            (task_id,),
-        ).fetchone()
-        if stale and stale["current_run_id"]:
-            conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
-                """,
-                (now, int(stale["current_run_id"])),
-            )
+        # an unknown code path), close it before either a protected-workspace
+        # refusal or a new claim. No-op when the invariant holds.
+        _close_leaked_run_before_claim(
+            conn,
+            task_id,
+            expected_status="ready",
+            now=now,
+        )
+        if not _protected_workspace_claim_allowed(
+            conn, task_id, expected_status="ready"
+        ):
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4785,6 +5133,16 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        _close_leaked_run_before_claim(
+            conn,
+            task_id,
+            expected_status="review",
+            now=now,
+        )
+        if not _protected_workspace_claim_allowed(
+            conn, task_id, expected_status="review"
+        ):
             return None
         cur = conn.execute(
             """
@@ -7626,6 +7984,158 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         return Path(out).expanduser()
 
 
+def _protected_workspace_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "normalized_root": row["normalized_root"],
+        "root_path": row["root_path"],
+        "authorized_task_id": row["authorized_task_id"],
+        "authorized_title": row["authorized_title"],
+        "authorized_workspace_kind": row["authorized_workspace_kind"],
+        "is_git_root": bool(row["is_git_root"]),
+    }
+
+
+def list_protected_workspaces(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """List the protected-root leases stored in this board's DB."""
+    rows = conn.execute(
+        "SELECT normalized_root, root_path, authorized_task_id, "
+        "authorized_title, authorized_workspace_kind, is_git_root "
+        "FROM protected_workspaces ORDER BY normalized_root"
+    ).fetchall()
+    return [_protected_workspace_row(row) for row in rows]
+
+
+def protect_workspace(
+    conn: sqlite3.Connection,
+    root: Path | str,
+    *,
+    authorized_task_id: str,
+) -> dict[str, Any]:
+    """Protect ``root`` for one task's exact id/title/workspace-kind tuple."""
+    raw_root = str(root).strip()
+    root_path = Path(raw_root).expanduser()
+    if not root_path.is_absolute() and not ntpath.isabs(raw_root):
+        raise ValueError("protected workspace root must be absolute")
+    if root_path.is_absolute():
+        root_path = root_path.resolve(strict=False)
+        stored_root = str(root_path)
+    else:
+        stored_root = ntpath.normpath(raw_root)
+    normalized_root = normalize_workspace_root(stored_root)
+
+    repo_root = _git_toplevel(root_path) if root_path.is_absolute() else None
+    is_git_root = bool(
+        repo_root is not None
+        and normalize_workspace_root(repo_root) == normalized_root
+    )
+    with write_txn(conn):
+        owner = get_task(conn, authorized_task_id)
+        if owner is None:
+            raise ValueError(f"authorized task {authorized_task_id!r} does not exist")
+        if (
+            not owner.workspace_path
+            or normalize_workspace_root(owner.workspace_path) != normalized_root
+        ):
+            raise ValueError(
+                f"authorized task {authorized_task_id!r} does not point at "
+                f"protected root {stored_root!r}"
+            )
+        conn.execute(
+            "INSERT INTO protected_workspaces ("
+            "normalized_root, root_path, authorized_task_id, authorized_title, "
+            "authorized_workspace_kind, is_git_root, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(normalized_root) DO UPDATE SET "
+            "root_path=excluded.root_path, "
+            "authorized_task_id=excluded.authorized_task_id, "
+            "authorized_title=excluded.authorized_title, "
+            "authorized_workspace_kind=excluded.authorized_workspace_kind, "
+            "is_git_root=excluded.is_git_root",
+            (
+                normalized_root,
+                stored_root,
+                owner.id,
+                owner.title,
+                owner.workspace_kind,
+                int(is_git_root),
+                int(time.time()),
+            ),
+        )
+        _append_protected_workspace_conflict_if_needed(
+            conn,
+            task_id=owner.id,
+            normalized_root=normalized_root,
+            authorized_task_id=owner.id,
+        )
+    return {
+        "normalized_root": normalized_root,
+        "root_path": stored_root,
+        "authorized_task_id": owner.id,
+        "authorized_title": owner.title,
+        "authorized_workspace_kind": owner.workspace_kind,
+        "is_git_root": is_git_root,
+    }
+
+
+def allow_task_at_protected_workspace(
+    conn: sqlite3.Connection,
+    root: Path | str,
+    *,
+    task_id: str,
+) -> dict[str, str]:
+    """Allow one additional task's current exact identity at ``root``."""
+    normalized_root = normalize_workspace_root(root)
+    with write_txn(conn):
+        policy = conn.execute(
+            "SELECT 1 FROM protected_workspaces WHERE normalized_root = ?",
+            (normalized_root,),
+        ).fetchone()
+        if policy is None:
+            raise ValueError(f"workspace root {str(root)!r} is not protected")
+        task = get_task(conn, task_id)
+        if task is None:
+            raise ValueError(f"allowlisted task {task_id!r} does not exist")
+        if (
+            not task.workspace_path
+            or normalize_workspace_root(task.workspace_path) != normalized_root
+        ):
+            raise ValueError(
+                f"allowlisted task {task_id!r} does not point at protected root "
+                f"{str(root)!r}"
+            )
+        conn.execute(
+            "INSERT INTO protected_workspace_allowlist ("
+            "normalized_root, task_id, title, workspace_kind, created_at"
+            ") VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(normalized_root, task_id) DO UPDATE SET "
+            "title=excluded.title, workspace_kind=excluded.workspace_kind",
+            (
+                normalized_root,
+                task.id,
+                task.title,
+                task.workspace_kind,
+                int(time.time()),
+            ),
+        )
+    return {
+        "normalized_root": normalized_root,
+        "task_id": task.id,
+        "title": task.title,
+        "workspace_kind": task.workspace_kind,
+    }
+
+
+def unprotect_workspace(conn: sqlite3.Connection, root: Path | str) -> bool:
+    """Remove a protected-root lease and its exact-tuple allowlist."""
+    normalized_root = normalize_workspace_root(root)
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM protected_workspaces WHERE normalized_root = ?",
+            (normalized_root,),
+        )
+    return cur.rowcount == 1
+
+
 def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     try:
         result = subprocess.run(
@@ -7721,14 +8231,39 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
-    target = target.expanduser()
+def _worktree_checkout_matches(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+) -> bool:
+    """Return whether ``target`` is the intended linked worktree checkout."""
+    if not target.exists() or not _is_linked_worktree_checkout(target):
+        return False
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
-        target_common = _git_common_dir(target)
-        if target_common == repo_common:
+    target_common = _git_common_dir(target)
+    target_root = _git_toplevel(target)
+    if repo_common is None or target_common is None or target_root is None:
+        return False
+    return (
+        normalize_workspace_root(repo_common) == normalize_workspace_root(target_common)
+        and normalize_workspace_root(target_root) == normalize_workspace_root(target)
+        and _git_current_branch(target) == branch_name
+    )
+
+
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+    """Materialize and verify ``target`` as the intended linked worktree."""
+    repo_root = repo_root.expanduser().resolve(strict=False)
+    target = target.expanduser()
+    if target.exists():
+        if _worktree_checkout_matches(repo_root, target, branch_name):
             return
+        actual_branch = _git_current_branch(target)
+        raise RuntimeError(
+            f"worktree target {target} is occupied; expected a linked worktree "
+            f"of {repo_root} on branch {branch_name!r}, found branch "
+            f"{actual_branch!r}"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -7748,6 +8283,11 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+        )
+    if not _worktree_checkout_matches(repo_root, target, branch_name):
+        raise RuntimeError(
+            f"git created {target}, but it is not a linked worktree of "
+            f"{repo_root} on branch {branch_name!r}"
         )
 
 
@@ -7819,10 +8359,11 @@ def _resolve_worktree_workspace(
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise RuntimeError(
+            f"worktree target {requested_resolved} is occupied by branch "
+            f"{actual_branch!r}; expected branch {branch_name!r} and no safe "
+            "alternate linked-worktree target is available"
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
@@ -7905,11 +8446,26 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    stored_path = str(path)
     with write_txn(conn):
-        conn.execute(
+        cur = conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (str(path), task_id),
+            (stored_path, task_id),
         )
+        if cur.rowcount == 1:
+            normalized_workspace = normalize_workspace_root(stored_path)
+            protected = conn.execute(
+                "SELECT authorized_task_id FROM protected_workspaces "
+                "WHERE normalized_root = ?",
+                (normalized_workspace,),
+            ).fetchone()
+            if protected is not None:
+                _append_protected_workspace_conflict_if_needed(
+                    conn,
+                    task_id=task_id,
+                    normalized_root=normalized_workspace,
+                    authorized_task_id=protected["authorized_task_id"],
+                )
 
 
 def set_branch_name(

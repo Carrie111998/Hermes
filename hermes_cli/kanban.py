@@ -326,6 +326,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    # --- protect-workspace ---
+    p_protect = sub.add_parser(
+        "protect-workspace",
+        help="Manage exact-owner leases for sensitive workspace roots",
+    )
+    protect_sub = p_protect.add_subparsers(dest="protect_workspace_action")
+    protect_list = protect_sub.add_parser("list", help="List protected workspace roots")
+    protect_list.add_argument("--json", action="store_true")
+    protect_set = protect_sub.add_parser("set", help="Protect a root for one exact task")
+    protect_set.add_argument("root", help="Absolute workspace root")
+    protect_set.add_argument("--owner", required=True, dest="owner_task_id",
+                             help="Authorized owner task id")
+    protect_allow = protect_sub.add_parser(
+        "allow", help="Allow one additional exact task tuple at a protected root"
+    )
+    protect_allow.add_argument("root", help="Absolute protected workspace root")
+    protect_allow.add_argument("--task", required=True, dest="task_id",
+                               help="Additional task id to allow")
+    protect_remove = protect_sub.add_parser(
+        "remove", aliases=["rm"], help="Remove a protected workspace policy"
+    )
+    protect_remove.add_argument("root", help="Absolute protected workspace root")
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -1107,6 +1130,7 @@ def kanban_command(args: argparse.Namespace) -> int:
 
         handlers = {
             "init":     _cmd_init,
+            "protect-workspace": _cmd_protect_workspace,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
@@ -1182,6 +1206,7 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
+    "protect-workspace",
     "create",
     "swarm",
     "assign",
@@ -1503,6 +1528,56 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "running gateway, tasks stay in 'ready' forever."
     )
     return 0
+
+
+def _cmd_protect_workspace(args: argparse.Namespace) -> int:
+    action = getattr(args, "protect_workspace_action", None) or "list"
+    with kb.connect_closing() as conn:
+        if action == "list":
+            policies = kb.list_protected_workspaces(conn)
+            if getattr(args, "json", False):
+                print(json.dumps(policies, indent=2, ensure_ascii=False))
+                return 0
+            if not policies:
+                print("(no protected workspace roots)")
+                return 0
+            for policy in policies:
+                print(
+                    f"{policy['root_path']} -> {policy['authorized_task_id']} "
+                    f"({policy['authorized_workspace_kind']}: "
+                    f"{policy['authorized_title']})"
+                )
+            return 0
+        if action == "set":
+            policy = kb.protect_workspace(
+                conn,
+                args.root,
+                authorized_task_id=args.owner_task_id,
+            )
+            print(
+                f"Protected {policy['root_path']} for exact task "
+                f"{policy['authorized_task_id']} "
+                f"({policy['authorized_workspace_kind']}: "
+                f"{policy['authorized_title']})"
+            )
+            return 0
+        if action == "allow":
+            allowed = kb.allow_task_at_protected_workspace(
+                conn,
+                args.root,
+                task_id=args.task_id,
+            )
+            print(
+                f"Allowlisted {allowed['task_id']} at {args.root} "
+                f"({allowed['workspace_kind']}: {allowed['title']})"
+            )
+            return 0
+        if action in {"remove", "rm"}:
+            if not kb.unprotect_workspace(conn, args.root):
+                raise ValueError(f"workspace root {args.root!r} is not protected")
+            print(f"Removed protected workspace policy for {args.root}")
+            return 0
+    raise ValueError(f"unknown protect-workspace action {action!r}")
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
