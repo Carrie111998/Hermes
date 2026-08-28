@@ -33,6 +33,7 @@ authority therefore has to live somewhere the agent holds no credential.
 import os
 import subprocess
 import sys
+import textwrap
 import time
 
 import pytest
@@ -80,6 +81,7 @@ def _assert_gate_intact(board, tid):
     conn = kb.connect(db_path=board / "kanban.db")
     try:
         task = kb.get_task(conn, tid)
+        gate_state = kb.gate_state_of(conn, tid)
         approvals = conn.execute("SELECT COUNT(*) FROM pm_approvals").fetchone()[0]
         plan = conn.execute(
             "SELECT approved_by, approved_at, rejected_at FROM pm_plans"
@@ -87,7 +89,12 @@ def _assert_gate_intact(board, tid):
     finally:
         conn.close()
     assert task.status == "scheduled", f"task moved: {task.status}"
-    assert kb.gate_state_of.__name__          # sanity: helper imported
+    # Read the gate itself, not a proxy for it. Asserting only on status would
+    # pass a partial clear that dropped ``gate_state`` while leaving the
+    # scheduled row otherwise untouched — today's release path happens to move
+    # status too, but that is a property of the current implementation, not the
+    # invariant this test claims to hold.
+    assert gate_state == "plan", f"gate_state is {gate_state!r}, not 'plan'"
     assert approvals == 0, "an approval row was written"
     assert all(v in (None, "") for v in tuple(plan)), "a plan decision was recorded"
 
@@ -126,6 +133,69 @@ def _assert_process_gone(pid, timeout=15.0):
         f"the orphaned grandchild (pid {pid}) was still running {timeout}s "
         f"after publishing its result"
     )
+
+
+# The grandchild's own ceiling on the CLI. Must stay BELOW the parent's
+# marker deadline so a hung CLI is killed and reaped by the process that
+# spawned it, before the parent gives up and starts cleaning up itself.
+_ORPHAN_CLI_TIMEOUT = 60
+_ORPHAN_MARKER_DEADLINE = 90
+
+
+def _reap_orphan(pidfile, scratch):
+    """Teardown that must run even when the test fails.
+
+    The orphan is reparented to init, so pytest can neither wait on it nor
+    reach it through process-group membership. If the CLI hangs, the
+    double-forked process and its children would otherwise outlive the whole
+    test session: the mutation probe that proved this test fails on an
+    unfinished CLI had to be cleaned up by hand, which is the hole this closes.
+
+    Best-effort by construction — it runs in a ``finally`` and must never
+    replace the real failure with one of its own.
+    """
+    import psutil
+
+    pid = created = None
+    try:
+        pid_text, created_text = pidfile.read_text().split()
+        pid, created = int(pid_text), float(created_text)
+    except Exception:
+        pid = None
+
+    if pid is not None:
+        try:
+            proc = psutil.Process(pid)
+            # PID-reuse guard — the same identity check production uses in
+            # OwnedProcess. A recycled pid must never be signalled.
+            if abs(proc.create_time() - created) <= 0.05:
+                # Descendants first: killing the leader can reparent them and
+                # lose the relationship.
+                victims = proc.children(recursive=True) + [proc]
+                for victim in victims:
+                    try:
+                        victim.terminate()
+                    except Exception:
+                        pass
+                _, alive = psutil.wait_procs(victims, timeout=5)
+                for victim in alive:
+                    try:
+                        victim.kill()
+                    except Exception:
+                        pass
+                psutil.wait_procs(alive, timeout=5)
+        except Exception:
+            # Broad on purpose. This runs in a ``finally`` after a test that
+            # may already be failing, and the repository's own live-system
+            # guard raises a bare RuntimeError (not a psutil error) for any
+            # signal aimed outside the test subtree. Cleanup must never
+            # replace the real failure with an error of its own.
+            pass
+
+    try:
+        scratch.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _run_in_tool_pty(board, command, timeout=60):
@@ -199,7 +269,16 @@ def test_environment_stripping_no_longer_matters(board):
     _assert_gate_intact(board, tid)
 
 
+# The orphan is deliberately OUTSIDE the test process subtree — that is the
+# whole point of the double fork — so the conftest live-system guard refuses
+# any signal aimed at it. Terminating it in cleanup therefore needs the
+# conftest's own `live_system_guard_bypass` marker, the supported narrow
+# escape already carried by the confinement suite's termination tests
+# (tests/hermes_cli/test_dispatch_preflight.py). The guard is not weakened:
+# the bypass is scoped to this one test, and the kanban write guard — the one
+# that matters for a gate test — stays armed.
 @requires_cli
+@pytest.mark.live_system_guard_bypass
 def test_an_orphaned_process_cannot_approve(board):
     """Orphaning shed the ancestry the previous design relied on.
 
@@ -225,48 +304,70 @@ def test_an_orphaned_process_cannot_approve(board):
     scratch = board / "orphan.out.partial"
     pidfile = board / "orphan.pid"
     script = board / "orphan.py"
-    script.write_text(
-        "import os, sys, subprocess\n"
-        "if os.fork():\n"
-        "    sys.exit(0)\n"
-        "os.setsid()\n"
-        "if os.fork():\n"
-        "    os._exit(0)\n"
-        # The orphan cannot be waited on, so it names itself for the cleanup
-        # assertion at the end of the test.
-        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
-        f"env = dict(os.environ, HERMES_HOME={str(board)!r},\n"
-        f"           HERMES_KANBAN_DB={str(board / 'kanban.db')!r})\n"
-        f"fh = open({str(scratch)!r}, 'w')\n"
-        f"subprocess.run([{HERMES_BIN!r}, 'project', 'approve-plan', {tid!r}],\n"
-        "               stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,\n"
-        "               env=env)\n"
-        # Publish only a COMPLETE result: flush, fsync, close, then rename.
-        # Every line above must have finished for the rename to happen at all.
-        "fh.flush()\n"
-        "os.fsync(fh.fileno())\n"
-        "fh.close()\n"
-        f"os.rename({str(scratch)!r}, {str(marker)!r})\n"
-        "os._exit(0)\n"
-    )
+    script.write_text(textwrap.dedent(f"""
+        import os, sys, subprocess
+        if os.fork():
+            sys.exit(0)
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        import psutil
+        me = psutil.Process()
+        # The orphan cannot be waited on, so it names itself — pid plus start
+        # time, so the parent's cleanup can tell it from a recycled pid.
+        with open({str(pidfile)!r}, "w") as pf:
+            pf.write("%d %.6f" % (os.getpid(), me.create_time()))
+        env = dict(os.environ,
+                   HERMES_HOME={str(board)!r},
+                   HERMES_KANBAN_DB={str(board / 'kanban.db')!r})
+        fh = open({str(scratch)!r}, "w")
+        try:
+            subprocess.run([{HERMES_BIN!r}, "project", "approve-plan", {tid!r}],
+                           stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,
+                           env=env, timeout={_ORPHAN_CLI_TIMEOUT})
+        except Exception:
+            # A hung or failed CLI must NEVER publish a marker. Reap whatever
+            # it left running before leaving, so nothing outlives this process.
+            kids = me.children(recursive=True)
+            for kid in kids:
+                try:
+                    kid.kill()
+                except Exception:
+                    pass
+            psutil.wait_procs(kids, timeout=5)
+            fh.close()
+            os._exit(1)
+        fh.flush()
+        os.fsync(fh.fileno())
+        fh.close()
+        os.rename({str(scratch)!r}, {str(marker)!r})
+        os._exit(0)
+    """))
     _run_in_tool_pty(board, f"{sys.executable} {script}", timeout=45)
 
-    deadline = time.time() + 90
-    while time.time() < deadline and not marker.exists():
-        time.sleep(0.1)
-    assert marker.exists(), (
-        "the orphaned grandchild never published a complete result within 90s "
-        "— the CLI did not return, so this test proved nothing about the gate"
-    )
-    output = marker.read_text(errors="replace")
-    assert output, "orphaned child produced no output; test is not meaningful"
-    _assert_refused_for_the_right_reason(output)
-    _assert_gate_intact(board, tid)
+    try:
+        deadline = time.time() + _ORPHAN_MARKER_DEADLINE
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.1)
+        assert marker.exists(), (
+            f"the orphaned grandchild never published a complete result within "
+            f"{_ORPHAN_MARKER_DEADLINE}s — the CLI did not return, so this test "
+            f"proved nothing about the gate"
+        )
+        output = marker.read_text(errors="replace")
+        assert output, "orphaned child produced no output; test is not meaningful"
+        _assert_refused_for_the_right_reason(output)
+        _assert_gate_intact(board, tid)
 
-    # Nothing the attack created outlives the test: the scratch file was
-    # renamed away, and the orphan itself has actually exited.
-    assert not scratch.exists(), "a partial result file was left behind"
-    _assert_process_gone(int(pidfile.read_text()))
+        # On the success path the orphan tears itself down; assert that rather
+        # than leaning on the cleanup below to hide a process that lingered.
+        assert not scratch.exists(), "a partial result file was left behind"
+        _assert_process_gone(int(pidfile.read_text().split()[0]))
+    finally:
+        # Runs on every path, including the ones that never reach the
+        # assertions above. A failing security test must not contaminate the
+        # rest of the session with a live orphan or its CLI child.
+        _reap_orphan(pidfile, scratch)
 
 
 @requires_cli
