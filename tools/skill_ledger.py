@@ -31,6 +31,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import tarfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +41,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+# Same snapshot-id shape as agent.curator_backup — duplicated so this module
+# can read the newest skills.tar.gz without importing the backup stack.
+_BACKUP_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z(-\d{2})?$")
+_ARCHIVE_TS_SUFFIX_RE = re.compile(r"^(.+)-\d{14}$")
+_PACKAGE_RESTORE_ACTIONS = frozenset({"delete", "archive", "purge"})
 
 ACTOR_CURATOR = "curator"
 ACTOR_AGENT = "agent"
@@ -135,11 +143,22 @@ def read_blob(sha256: str) -> Optional[bytes]:
         return None
 
 
-def snapshot_paths(root: Optional[Path]) -> List[Dict[str, str]]:
+def snapshot_paths(
+    root: Optional[Path],
+    *,
+    complete_package: bool = False,
+) -> List[Dict[str, str]]:
     """Capture {path, sha256} for every file under *root* (recursively),
     storing each file's content as a blob. Empty list when root is None or
     doesn't exist. Raises on I/O failure — callers decide whether that is
-    fatal (rollback safety capture) or swallowed (telemetry hooks)."""
+    fatal (rollback safety capture) or swallowed (telemetry hooks).
+
+    ``complete_package=True`` unions in files from the newest curator
+    ``skills.tar.gz`` for this skill (#96962). Consolidation re-homes
+    ``references/`` / ``scripts/`` before ``delete``, so a disk-only
+    capture would ledger ``files: 1`` and rollback would restore a
+    hollow skill.
+    """
     if root is None:
         return []
     root = Path(root)
@@ -148,11 +167,174 @@ def snapshot_paths(root: Optional[Path]) -> List[Dict[str, str]]:
     elif root.is_dir():
         files = sorted(p for p in root.rglob("*") if p.is_file())
     else:
-        return []
+        files = []
+        if not complete_package:
+            return []
     out: List[Dict[str, str]] = []
     for f in files:
         data = f.read_bytes()
         out.append({"path": str(f), "sha256": _store_blob(data)})
+    if complete_package:
+        out = fill_snapshot_from_curator_backup(root, out)
+    return out
+
+
+def _skills_dir() -> Path:
+    return get_hermes_home() / "skills"
+
+
+def _package_rel(root: Path) -> Optional[str]:
+    """Relative POSIX path of a skill directory under ``skills/``."""
+    try:
+        rel = Path(os.path.normpath(str(root))).relative_to(
+            Path(os.path.normpath(str(_skills_dir())))
+        )
+    except ValueError:
+        return None
+    posix = rel.as_posix().strip("/")
+    if not posix:
+        return None
+    top = posix.split("/", 1)[0]
+    if top in {".curator_backups", ".hub"}:
+        return None
+    return posix
+
+
+def _strip_archive_timestamp(name: str) -> str:
+    match = _ARCHIVE_TS_SUFFIX_RE.match(name)
+    return match.group(1) if match else name
+
+
+def package_prefixes(
+    root: Optional[Path] = None,
+    skill: Optional[str] = None,
+    before: Optional[List[Dict[str, str]]] = None,
+) -> List[str]:
+    """Tar member prefixes that belong to this skill's package."""
+    found: List[str] = []
+
+    def add(prefix: Optional[str]) -> None:
+        if not prefix:
+            return
+        prefix = prefix.strip("/")
+        if prefix and prefix not in found:
+            found.append(prefix)
+
+    if root is not None:
+        rel = _package_rel(Path(root))
+        add(rel)
+        if rel:
+            parts = rel.split("/")
+            if parts[0] == ".archive" and len(parts) >= 2:
+                add(parts[-1])
+                add(_strip_archive_timestamp(parts[-1]))
+    for item in before or []:
+        path = Path(str(item.get("path", "")))
+        if path.name == "SKILL.md":
+            add(_package_rel(path.parent))
+    if skill:
+        add(skill)
+        add(_strip_archive_timestamp(skill))
+    return found
+
+
+def _latest_skills_tarball() -> Optional[Path]:
+    backups = _skills_dir() / ".curator_backups"
+    if not backups.is_dir():
+        return None
+    candidates: List[Path] = []
+    try:
+        children = list(backups.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if not child.is_dir() or not _BACKUP_ID_RE.match(child.name):
+            continue
+        archive = child / "skills.tar.gz"
+        if archive.is_file():
+            candidates.append(archive)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.parent.name, reverse=True)
+    return candidates[0]
+
+
+def _read_package_files_from_latest_backup(prefixes: List[str]) -> Dict[str, bytes]:
+    """``{posix-relpath: bytes}`` for files under *prefixes* in the newest snapshot."""
+    if not prefixes:
+        return {}
+    archive = _latest_skills_tarball()
+    if archive is None:
+        return {}
+    prefixed = tuple(p if p.endswith("/") else p + "/" for p in prefixes)
+    exact = set(prefixes)
+    out: Dict[str, bytes] = {}
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                name = member.name.replace("\\", "/").lstrip("./")
+                if not name or name.startswith("/") or ".." in Path(name).parts:
+                    continue
+                if name not in exact and not name.startswith(prefixed):
+                    continue
+                extracted = tf.extractfile(member)
+                if extracted is None:
+                    continue
+                out[name] = extracted.read()
+    except (OSError, tarfile.TarError) as exc:
+        logger.debug("skill_ledger: could not read curator backup package: %s", exc)
+        return {}
+    return out
+
+
+def fill_snapshot_from_curator_backup(
+    root: Optional[Path],
+    existing: Optional[List[Dict[str, str]]] = None,
+    *,
+    skill: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Union missing skill-package files from the newest curator snapshot.
+
+    Disk (or already-ledgered) hashes win. Failures are swallowed — this is
+    a completeness fill, not a gate.
+    """
+    out = list(existing or [])
+    prefixes = package_prefixes(root, skill, out)
+    if not prefixes:
+        return out
+    try:
+        extra = _read_package_files_from_latest_backup(prefixes)
+    except Exception as exc:
+        logger.debug("skill_ledger: backup package fill failed: %s", exc)
+        return out
+    if not extra:
+        return out
+    skills = _skills_dir()
+    have = set()
+    for item in out:
+        path = Path(str(item.get("path", "")))
+        try:
+            have.add(
+                Path(os.path.normpath(str(path)))
+                .relative_to(Path(os.path.normpath(str(skills))))
+                .as_posix()
+            )
+        except ValueError:
+            continue
+    for rel, data in extra.items():
+        if rel in have:
+            continue
+        dest = skills.joinpath(*rel.split("/"))
+        if not _is_within(skills, dest) or not _is_within(get_hermes_home(), dest):
+            continue
+        try:
+            out.append({"path": str(dest), "sha256": _store_blob(data)})
+        except Exception as exc:
+            logger.debug("skill_ledger: backup blob store failed for %s: %s", rel, exc)
+            continue
+        have.add(rel)
     return out
 
 
@@ -201,6 +383,7 @@ def record_mutation(
     after_root: Optional[Path] = None,
     actor: Optional[str] = None,
     evidence: Optional[Dict[str, Any]] = None,
+    complete_package: bool = False,
 ) -> Optional[str]:
     """One-stop hook for mutation call sites: capture after-state from
     *after_root* (pre-captured *before* list, or capture from *before_root*)
@@ -209,7 +392,14 @@ def record_mutation(
         return None
     try:
         if before is None:
-            before = snapshot_paths(before_root)
+            before = snapshot_paths(
+                before_root,
+                complete_package=complete_package or action in _PACKAGE_RESTORE_ACTIONS,
+            )
+        elif complete_package or action in _PACKAGE_RESTORE_ACTIONS:
+            before = fill_snapshot_from_curator_backup(
+                before_root, before, skill=skill
+            )
         after = snapshot_paths(after_root)
         return append_entry(
             action, skill, before=before, after=after, actor=actor, evidence=evidence
@@ -219,13 +409,17 @@ def record_mutation(
         return None
 
 
-def capture_before(root: Optional[Path]) -> Optional[List[Dict[str, str]]]:
+def capture_before(
+    root: Optional[Path],
+    *,
+    complete_package: bool = False,
+) -> Optional[List[Dict[str, str]]]:
     """Best-effort pre-mutation capture. Returns None on failure or when the
     ledger is disabled (callers pass the result straight to record_mutation)."""
     if not ledger_enabled():
         return None
     try:
-        return snapshot_paths(root)
+        return snapshot_paths(root, complete_package=complete_package)
     except Exception as e:
         logger.warning("skill_ledger: before-capture failed (%s) — mutation unaffected", e)
         return None
@@ -314,8 +508,24 @@ def rollback_entry(entry_id: str) -> Tuple[bool, str]:
     if path_err:
         return False, f"refusing rollback: {path_err}"
 
-    before = entry.get("before") or []
-    after = entry.get("after") or []
+    before = list(entry.get("before") or [])
+    after = list(entry.get("after") or [])
+    if entry.get("action") in _PACKAGE_RESTORE_ACTIONS:
+        skill_root = None
+        for item in before:
+            path = Path(str(item.get("path", "")))
+            if path.name == "SKILL.md":
+                skill_root = path.parent
+                break
+        if skill_root is None:
+            skill_root = _skills_dir() / str(entry.get("skill") or "")
+        before = fill_snapshot_from_curator_backup(
+            skill_root, before, skill=str(entry.get("skill") or "") or None
+        )
+
+    path_err = _validate_entry_paths({**entry, "before": before, "after": after})
+    if path_err:
+        return False, f"refusing rollback: {path_err}"
 
     # Pre-check every blob we need so we never fail mid-restore.
     for item in before:

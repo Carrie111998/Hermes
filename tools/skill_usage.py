@@ -1119,7 +1119,7 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     _ledger_before = None
     try:
         from tools import skill_ledger as _ledger
-        _ledger_before = _ledger.capture_before(skill_dir)
+        _ledger_before = _ledger.capture_before(skill_dir, complete_package=True)
     except Exception:
         _ledger = None  # type: ignore[assignment]
 

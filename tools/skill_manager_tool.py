@@ -1621,7 +1621,10 @@ def skill_manage(
         from tools import skill_ledger as _ledger
         _pre = _find_skill(name)
         _ledger_before_dir = _pre["path"] if _pre else None
-        _ledger_before = _ledger.capture_before(_ledger_before_dir)
+        _ledger_before = _ledger.capture_before(
+            _ledger_before_dir,
+            complete_package=(action == "delete"),
+        )
     except Exception:
         pass
 
