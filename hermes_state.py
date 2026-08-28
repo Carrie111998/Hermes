@@ -12013,6 +12013,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             active_clause = " AND (active = 1 OR compacted = 1)"
         else:
             active_clause = " AND active = 1"
+        needs_display_dedupe = include_compacted
+        if include_compacted:
+            # Desktop always opts into compacted display history, including
+            # for sessions that have never compacted. Avoid turning those
+            # ordinary bounded reads into a full transcript materialization:
+            # without archived rows there cannot be cross-generation copies
+            # to dedupe, so SQL pagination is already exact.
+            with self._read_ctx() as conn:
+                needs_display_dedupe = (
+                    conn.execute(
+                        "SELECT 1 FROM messages "
+                        "WHERE session_id = ? AND active = 0 AND compacted = 1 "
+                        "LIMIT 1",
+                        [session_id],
+                    ).fetchone()
+                    is not None
+                )
+            if not needs_display_dedupe and not include_inactive:
+                # Keep the fast query active-only even if a concurrent
+                # compaction commits after the probe. That request may see the
+                # new compacted tail on its next refresh, but it cannot mix
+                # duplicate generations in one non-deduped page.
+                active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
@@ -12021,7 +12044,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         params: list = [session_id]
         if after_id is not None:
             params.append(after_id)
-        if include_compacted:
+        if needs_display_dedupe:
             # Compaction epochs copy the protected tail into each new
             # generation, so the same logical message can exist as several
             # rows (identical role/content/timestamp) with different active

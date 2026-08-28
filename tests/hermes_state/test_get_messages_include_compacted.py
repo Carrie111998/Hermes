@@ -111,6 +111,37 @@ class TestIncludeCompacted:
         all_ids = _row_ids(db, sid, include_compacted=True)
         assert [m["id"] for m in page] == all_ids[2:5]
 
+    def test_uncompacted_latest_page_decodes_only_requested_rows(self, db, monkeypatch):
+        """The Desktop tail read stays bounded before any compaction exists."""
+        sid = "uncompacted-long-session"
+        db.create_session(sid, source="desktop")
+        db.append_messages_batch(
+            sid,
+            [{"role": "user", "content": f"message {index}"} for index in range(3_000)],
+        )
+
+        original_decode = db._decode_content
+        decoded = 0
+
+        def _counted_decode(content):
+            nonlocal decoded
+            decoded += 1
+            return original_decode(content)
+
+        monkeypatch.setattr(db, "_decode_content", _counted_decode)
+
+        page = db.get_messages(
+            sid,
+            include_compacted=True,
+            latest=True,
+            limit=120,
+        )
+
+        assert [message["content"] for message in page] == [
+            f"message {index}" for index in range(2_880, 3_000)
+        ]
+        assert decoded == 120
+
 
 class TestDisplayDedupe:
     """Compaction epochs copy the protected tail into each new generation, so
