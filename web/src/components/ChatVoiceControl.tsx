@@ -118,7 +118,7 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
     const recognition = new Constructor();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = "en-US";
+    recognition.lang = navigator.language;
     recognition.onresult = (event) => {
       if (generation !== generationRef.current || !listeningRef.current) return;
       let appendedFinal = "";
@@ -194,7 +194,7 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
       try {
         event = JSON.parse(message.data) as NativeVoiceEvent;
       } catch {
-        fallbackToBrowser(generation);
+        console.warn("[voice] Ignoring malformed native bridge payload");
         return;
       }
       if (event.version !== 1) return;

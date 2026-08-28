@@ -75,6 +75,15 @@ describe("ChatVoiceControl browser speech input", () => {
     expect(submit).not.toHaveBeenCalled();
   });
 
+  it("uses the browser locale for speech recognition", async () => {
+    vi.stubGlobal("navigator", { language: "fr-CA" });
+    const { surface } = await render();
+
+    await act(async () => surface.click());
+
+    expect(FakeRecognition.instances[0].lang).toBe("fr-CA");
+  });
+
   it("restarts Android premature onend with bounded exponential backoff and no submit", async () => {
     const { submit, surface } = await render();
     await act(async () => surface.click());
@@ -196,6 +205,21 @@ describe("ChatVoiceControl browser speech input", () => {
 
     expect(submit).not.toHaveBeenCalled();
     expect(FakeRecognition.instances).toHaveLength(1);
+  });
+
+  it("logs and ignores a malformed native bridge payload", async () => {
+    const bridge = new FakeNativeBridge();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    Object.defineProperty(window, "zer0Voice", { configurable: true, value: bridge });
+    const { surface } = await render();
+
+    await act(async () => surface.click());
+    await act(async () => bridge.onmessage?.(new MessageEvent("message", { data: "not-json" })));
+
+    expect(warn).toHaveBeenCalledWith("[voice] Ignoring malformed native bridge payload");
+    expect(FakeRecognition.instances).toHaveLength(0);
+    await act(async () => bridge.emit("availability", "on-device"));
+    expect(bridge.messages.at(-1)).toBe(JSON.stringify({ version: 1, command: "start" }));
   });
 
   it("uses confirmed native partials for display and submits a final exactly once", async () => {
