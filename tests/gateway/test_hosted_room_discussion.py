@@ -828,6 +828,40 @@ def test_attachment_task_reconstructs_after_driver_reopen(
     assert "att_11111111111111111111111111111111" not in reconstructed.payload["prompt"]
 
 
+def test_attachment_task_reconstructs_after_its_terminal_publication(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(
+        db,
+        event_id="user-attachments-terminal",
+        text="Review the upload.",
+        attachments=_attachment_manifest(),
+    )
+    first = _next_task(room, db)
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="settled",
+        result={"text": "First review complete."},
+        local_profiles=LOCAL_PROFILES,
+    )
+    _append_publication(db, publication)
+
+    reconstructed = discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        {"identity": first.identity, "payload": first.payload},
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert reconstructed == first
+
+    second = _next_task(room, db)
+    assert second.member.member_id != first.member.member_id
+    assert second.payload["attachments"] == _attachment_manifest()
+
+
 def test_attachment_manifest_requires_frozen_member_ids():
     with pytest.raises(discussion.DiscussionValidationError, match="frozen room member"):
         discussion.validate_user_payload(

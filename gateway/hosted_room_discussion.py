@@ -1439,7 +1439,25 @@ def reconstruct_task_plan(
         raise DiscussionReconstructionError("task prompt is missing")
     if len(prompt.encode("utf-8")) > driver.MAX_PROMPT_BYTES:
         raise DiscussionReconstructionError("task prompt exceeds the driver limit")
-    watermarks = _derive_member_watermarks(validated)
+    # Reconstruct the watermark that existed when THIS task was planned. Once
+    # its terminal publication lands, the current watermark includes this
+    # task's own seen-through sequence and would incorrectly erase the
+    # attachments that were part of its persisted payload.
+    terminal = next(
+        (
+            event
+            for event in validated
+            if event.kind in _TERMINAL_EVENT_KINDS
+            and event.payload.get("task_id") == identity.task_id
+        ),
+        None,
+    )
+    watermark_events = (
+        validated
+        if terminal is None
+        else tuple(event for event in validated if event.seq < terminal.seq)
+    )
+    watermarks = _derive_member_watermarks(watermark_events)
     watermark = watermarks.get((identity.thread_id, member.member_id), 0)
     task_messages = _message_events(
         validated,
