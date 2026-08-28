@@ -3228,10 +3228,25 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        """The adapter must abort a stream that stays alive past the deadline.
+
+        Asserted by counting events consumed, not by wall clock. The stream
+        yields 5 events; prompt enforcement stops after the first one or two.
+        A wall-clock budget cannot express this: ``time.sleep`` is only a
+        *lower* bound, and on a loaded machine (or macOS timer coalescing) a
+        nominal 0.03s sleep is regularly measured at ~0.18s, which made the
+        old ``< 0.14`` assertion unsatisfiable no matter how promptly the
+        adapter reacted. Event count measures the enforcement itself and is
+        immune to scheduler latency.
+        """
+        events_yielded = 0
+
         class _SlowAliveCreateStream:
             def __iter__(self):
+                nonlocal events_yielded
                 for _ in range(5):
                     time.sleep(0.03)
+                    events_yielded += 1
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -3243,14 +3258,19 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # The whole point: it must NOT drain all 5 events. Each event is >= the
+        # 0.05s deadline in aggregate, so a correct adapter bails almost
+        # immediately; anything that consumes the full stream is not enforcing.
+        assert events_yielded < 5, (
+            f"adapter drained the entire stream ({events_yielded} events) "
+            "instead of enforcing the total timeout"
+        )
 
 
 class TestCodexAuxiliaryAdapterCacheScope:

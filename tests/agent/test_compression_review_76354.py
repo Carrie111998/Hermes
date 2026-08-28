@@ -460,13 +460,20 @@ class TestS3IdleChargedFromLastProgress:
     def test_silence_cannot_approach_double_idle_timeout(self):
         """Progress early in an interval must not extend silence to ~2x idle."""
         _drain_admission_slots()
-        idle = 0.4
+        # Deliberately not 0.4s. Detection carries a fixed poll-granularity
+        # overshoot, so the *ratio* to idle shrinks as idle grows (measured on
+        # this codebase: 1.50x @0.4s, 1.37x @1.0s, 1.24x @2.0s, 1.15x @4.0s --
+        # the signature of poll granularity, not of the ~2x regression this
+        # test guards). At 0.4s the 1.8x budget left only ~0.12s of absolute
+        # headroom, which normal scheduler jitter on a loaded machine exceeds.
+        # A larger idle keeps the identical invariant with ~1.1s of headroom.
+        idle = 2.0
         release = threading.Event()
 
         def worker(fence: CompressionCommitFence):
             time.sleep(0.05)
             fence.touch_progress()  # early progress, then total silence
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=30)
             return ([], "late")
 
         t0 = time.monotonic()
@@ -476,15 +483,15 @@ class TestS3IdleChargedFromLastProgress:
                 messages=[{"role": "user", "content": "a"}],
                 system_prompt_fallback="fb",
                 idle_timeout_seconds=idle,
-                total_ceiling_seconds=5.0,
+                total_ceiling_seconds=idle * 12,
             )
         finally:
             elapsed = time.monotonic() - t0
             release.set()
         assert prompt == "fb"
-        # Old behavior waited a full interval from the CHECK (~2x idle ≈
-        # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
+        # Old behavior waited a full interval from the CHECK (~2x idle ≈ 4.0s+
+        # here). New behavior times out ~idle after the last progress (~2.5s).
+        # Allow generous slack while still excluding ~2x.
         assert elapsed < idle * 1.8, (
             f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
         )
