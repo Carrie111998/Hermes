@@ -403,6 +403,37 @@ class DelegationConfigGateTests(unittest.TestCase):
         ):
             self.assertTrue(delegate_tool._get_worktree_isolation())
 
+    def test_worktree_repo_root_default_none(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(delegate_tool, "_load_config", return_value={}):
+            self.assertIsNone(delegate_tool._get_worktree_repo_root())
+
+    def test_worktree_repo_root_configured(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(
+            delegate_tool,
+            "_load_config",
+            return_value={"worktree_repo_root": "/opt/custom/repo"},
+        ):
+            self.assertEqual(
+                delegate_tool._get_worktree_repo_root(), "/opt/custom/repo"
+            )
+
+    def test_worktree_repo_root_whitespace_stripped(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(
+            delegate_tool,
+            "_load_config",
+            return_value={"worktree_repo_root": "   /opt/custom/repo   "},
+        ):
+            self.assertEqual(
+                delegate_tool._get_worktree_repo_root(), "/opt/custom/repo"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
+
