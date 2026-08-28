@@ -627,8 +627,19 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             # Header parsing happens before any JWKS fetch. Catch only structural
             # decode failures; other token errors keep their existing semantics.
             raise MalformedTokenError(f"malformed id token: {exc}") from exc
-        except jwt.PyJWKClientError as exc:
+        except jwt.exceptions.PyJWKClientConnectionError as exc:
+            # The JWKS endpoint could not be fetched: the token can be neither
+            # confirmed nor denied, so this stays a ProviderError and the
+            # middleware answers 503 rather than logging a valid user out on a
+            # transient outage.
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
+        except jwt.PyJWKClientError as exc:
+            # No JWK matches the token's kid. PyJWT refetches the JWK set once
+            # and retries before raising this, so the endpoint has answered:
+            # the token is well-formed but belongs to another issuer. Same
+            # "not my token" case as a malformed one, reached with a real JWT
+            # instead of an opaque blob.
+            raise InvalidCodeError(f"no matching signing key: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 

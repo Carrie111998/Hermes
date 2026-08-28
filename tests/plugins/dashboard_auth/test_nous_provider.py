@@ -590,14 +590,28 @@ class TestVerifySession:
 
     def test_jwks_unreachable_raises_provider_error(self, provider, rsa_keypair):
         token = _mint_token(rsa_keypair)
-        # Replace the patched client so it raises.
+        # Replace the patched client so it raises. PyJWT signals an
+        # unreachable endpoint with this subclass (``fetch_data`` maps
+        # URLError / TimeoutError onto it), not with a bare PyJWKClientError.
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
-            "fetch failed"
+        bad_client.get_signing_key_from_jwt.side_effect = (
+            jwt.exceptions.PyJWKClientConnectionError("fetch failed")
         )
         provider._jwks_client = bad_client
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
+
+    def test_unknown_signing_key_returns_none(self, provider, rsa_keypair):
+        """A well-formed JWT whose kid matches no JWK is another issuer's
+        token, not an outage: PyJWT already refreshed the JWK set once before
+        raising, so the endpoint answered."""
+        token = _mint_token(rsa_keypair)
+        other_issuer_client = MagicMock()
+        other_issuer_client.get_signing_key_from_jwt.side_effect = (
+            jwt.PyJWKClientError('Unable to find a signing key that matches: "kid42"')
+        )
+        provider._jwks_client = other_issuer_client
+        assert provider.verify_session(access_token=token) is None
 
     def test_foreign_opaque_token_returns_none(self, provider):
         # A non-JWT token (e.g. a session minted by a different provider, or a
