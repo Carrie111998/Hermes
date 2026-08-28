@@ -56,13 +56,25 @@ def test_the_lazy_fence_table_is_not_empty():
 
 
 def test_every_inline_fence_renderer_is_named_in_the_desktop_hint():
-    unadvertised = sorted(lang for lang in _rich_fence_languages() if lang not in _HINT)
+    # The FENCED form, not a bare substring. "ts" and "py" both occur inside
+    # ordinary words in the hint ("artifacts", "copyable"), so a substring
+    # check would pass a TypeScript or Python renderer that was never
+    # advertised — a guard that reports success is worse than no guard.
+    unadvertised = sorted(
+        lang for lang in _rich_fence_languages() if f"```{lang}" not in _HINT
+    )
 
     assert not unadvertised, (
         f"the desktop renders ```{{{','.join(unadvertised)}}} fences but the model is "
-        "never told, so it will not emit them. Add them to "
+        "never told, so it will not emit them. Name the fence as ```<lang> in "
         "PLATFORM_HINTS['desktop'] in agent/prompt_builder.py."
     )
+
+
+def test_the_fence_check_is_not_satisfied_by_an_accidental_substring():
+    """Guard the guard, the other way: prove the strict form actually bites."""
+    assert "ts" in _HINT and "```ts" not in _HINT  # "artifacts" contains "ts"
+    assert "py" in _HINT and "```py" not in _HINT  # "copyable" contains "py"
 
 
 def test_artifact_promotion_is_named_in_the_desktop_hint():
