@@ -9,8 +9,13 @@ subcommand dispatch.
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import shutil
+import time
+from pathlib import Path
 
 import pytest
 
@@ -152,6 +157,764 @@ _SKILL = (
 )
 
 
+def test_skill_approval_preserves_newer_edit_when_pending_rewrite_is_stale(
+    hermes_home,
+):
+    """Approving an old proposal must not overwrite a newer live edit."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _edit_skill, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+
+    _set_approval("skills", True)
+    stale_rewrite = _SKILL.replace("body", "stale pending rewrite")
+    staged = json.loads(
+        skill_manage(action="patch", name="test-skill", content=stale_rewrite)
+    )
+    assert staged["staged"] is True, staged
+    pending_id = staged["pending_id"]
+
+    # The Desktop editor writes through the same direct edit path while the
+    # older agent proposal remains queued for later review.
+    newer_edit = _SKILL.replace("body", "newer Desktop edit")
+    edited = _edit_skill("test-skill", newer_edit)
+    assert edited["success"] is True, edited
+
+    result = handle_pending_subcommand(wa.SKILLS, ["approve", pending_id])
+
+    skill_md = Path(created["skill_md"])
+    assert skill_md.read_text(encoding="utf-8") == newer_edit, result
+    assert wa.get_pending(wa.SKILLS, pending_id) is not None
+
+
+def test_stale_existing_skill_refuses_entire_pending_batch(hermes_home):
+    """One changed whole-tree generation prevents every operation."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _write_file, skill_manage
+
+    alpha = _SKILL.replace("test-skill", "alpha")
+    beta = _SKILL.replace("test-skill", "beta")
+    alpha_created = _create_skill("alpha", alpha)
+    beta_created = _create_skill("beta", beta)
+    assert alpha_created["success"] is True, alpha_created
+    assert beta_created["success"] is True, beta_created
+
+    _set_approval("skills", True)
+    staged = json.loads(skill_manage(
+        action="",
+        name="",
+        operations=[
+            {
+                "name": "alpha",
+                "action": "patch",
+                "old_string": "body",
+                "new_string": "stale alpha batch bytes",
+            },
+            {
+                "name": "beta",
+                "action": "patch",
+                "old_string": "body",
+                "new_string": "beta batch bytes must not publish",
+            },
+        ],
+    ))
+    assert staged["staged"] is True, staged
+
+    edited = _write_file(
+        "alpha",
+        "references/newer.md",
+        "newer Desktop supporting bytes",
+    )
+    assert edited["success"] is True, edited
+    result = handle_pending_subcommand(
+        wa.SKILLS, ["approve", staged["pending_id"]]
+    )
+
+    assert "Approved 0" in result
+    assert Path(alpha_created["skill_md"]).read_text(encoding="utf-8") == alpha
+    assert (
+        Path(alpha_created["skill_md"]).parent / "references" / "newer.md"
+    ).read_text(encoding="utf-8") == "newer Desktop supporting bytes"
+    assert Path(beta_created["skill_md"]).read_text(encoding="utf-8") == beta
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_pending_create_batch_refuses_same_name_in_other_category(hermes_home):
+    """Create authority binds both logical name and destination absence."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, skill_manage
+
+    fresh = _SKILL.replace("test-skill", "fresh")
+    _set_approval("skills", True)
+    staged = json.loads(skill_manage(
+        action="",
+        name="",
+        operations=[
+            {
+                "name": "fresh",
+                "action": "create",
+                "category": "category-a",
+                "content": fresh,
+            },
+            {
+                "name": "fresh",
+                "action": "write_file",
+                "file_path": "references/a.md",
+                "file_content": "queued",
+            },
+        ],
+    ))
+    assert staged["staged"] is True, staged
+
+    competing = _create_skill("fresh", fresh, "category-b")
+    assert competing["success"] is True, competing
+    result = handle_pending_subcommand(
+        wa.SKILLS, ["approve", staged["pending_id"]]
+    )
+
+    home = Path(hermes_home)
+    assert "Approved 0" in result
+    assert (home / "skills" / "category-b" / "fresh" / "SKILL.md").exists()
+    assert not (home / "skills" / "category-a" / "fresh").exists()
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_legacy_pending_skill_write_without_precondition_fails_closed(hermes_home):
+    """Old queue records are reviewable but never safe to replay blindly."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    legacy_rewrite = _SKILL.replace("body", "unverifiable legacy rewrite")
+    record = wa.stage_write(
+        wa.SKILLS,
+        {"action": "patch", "name": "test-skill", "content": legacy_rewrite},
+        summary="legacy rewrite",
+        origin="background_review",
+    )
+
+    result = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert result is not None
+    assert "Approved 0" in result
+    assert "cannot be safely applied" in result
+    assert Path(created["skill_md"]).read_text(encoding="utf-8") == _SKILL
+    assert wa.get_pending(wa.SKILLS, record["id"]) is not None
+
+
+def test_approve_all_applies_safe_skill_write_and_preserves_conflict(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _edit_skill, skill_manage
+
+    safe_initial = _SKILL.replace("test-skill", "safe-skill")
+    conflict_initial = _SKILL.replace("test-skill", "conflict-skill")
+    safe_created = _create_skill("safe-skill", safe_initial)
+    conflict_created = _create_skill("conflict-skill", conflict_initial)
+    assert safe_created["success"] is True, safe_created
+    assert conflict_created["success"] is True, conflict_created
+
+    _set_approval("skills", True)
+    safe_rewrite = safe_initial.replace("body", "safe queued rewrite")
+    conflict_rewrite = conflict_initial.replace("body", "stale queued rewrite")
+    safe_staged = json.loads(
+        skill_manage(action="patch", name="safe-skill", content=safe_rewrite)
+    )
+    conflict_staged = json.loads(
+        skill_manage(action="patch", name="conflict-skill", content=conflict_rewrite)
+    )
+
+    newer_edit = conflict_initial.replace("body", "newer Desktop edit")
+    edited = _edit_skill("conflict-skill", newer_edit)
+    assert edited["success"] is True, edited
+
+    result = handle_pending_subcommand(wa.SKILLS, ["approve", "all"])
+
+    assert result is not None
+    assert "Approved 1" in result
+    assert conflict_staged["pending_id"] in result
+    assert Path(safe_created["skill_md"]).read_text(encoding="utf-8") == safe_rewrite
+    assert Path(conflict_created["skill_md"]).read_text(encoding="utf-8") == newer_edit
+    assert wa.get_pending(wa.SKILLS, safe_staged["pending_id"]) is None
+    assert wa.get_pending(wa.SKILLS, conflict_staged["pending_id"]) is not None
+
+
+@pytest.mark.parametrize(
+    ("action", "staged_kwargs"),
+    [
+        ("write_file", {"file_content": "stale replacement"}),
+        ("remove_file", {}),
+        ("patch", {"old_string": "original file", "new_string": "stale patch"}),
+    ],
+)
+def test_pending_supporting_file_mutation_preserves_newer_file(
+    hermes_home,
+    action,
+    staged_kwargs,
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _write_file, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    initial_file = _write_file("test-skill", "references/note.md", "original file")
+    assert initial_file["success"] is True, initial_file
+
+    _set_approval("skills", True)
+    staged = json.loads(
+        skill_manage(
+            action=action,
+            name="test-skill",
+            file_path="references/note.md",
+            **staged_kwargs,
+        )
+    )
+    newer_file = _write_file("test-skill", "references/note.md", "newer file")
+    assert newer_file["success"] is True, newer_file
+
+    result = handle_pending_subcommand(wa.SKILLS, ["approve", staged["pending_id"]])
+
+    target = Path(created["skill_md"]).parent / "references" / "note.md"
+    assert result is not None
+    assert "Approved 0" in result
+    assert target.read_text(encoding="utf-8") == "newer file"
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_pending_delete_conflicts_when_skill_tree_changes(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _write_file, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    _set_approval("skills", True)
+    staged = json.loads(
+        skill_manage(action="delete", name="test-skill", absorbed_into="")
+    )
+    newer_file = _write_file("test-skill", "references/note.md", "newer file")
+    assert newer_file["success"] is True, newer_file
+
+    result = handle_pending_subcommand(wa.SKILLS, ["approve", staged["pending_id"]])
+
+    assert result is not None
+    assert "Approved 0" in result
+    assert Path(created["skill_md"]).exists()
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_pending_create_conflicts_when_skill_is_created_before_approval(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, skill_manage
+
+    _set_approval("skills", True)
+    stale_create = _SKILL.replace("body", "stale proposed skill")
+    staged = json.loads(
+        skill_manage(action="create", name="test-skill", content=stale_create)
+    )
+    newer_skill = _SKILL.replace("body", "newer created skill")
+    created = _create_skill("test-skill", newer_skill)
+    assert created["success"] is True, created
+
+    result = handle_pending_subcommand(wa.SKILLS, ["approve", staged["pending_id"]])
+
+    assert result is not None
+    assert "Approved 0" in result
+    assert Path(created["skill_md"]).read_text(encoding="utf-8") == newer_skill
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_pending_full_rewrite_diff_compares_proposal_with_current_skill(hermes_home):
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    rewrite = _SKILL.replace("body", "proposed rewrite")
+    diff = wa.skill_pending_diff(
+        {
+            "payload": {
+                "action": "patch",
+                "name": "test-skill",
+                "content": rewrite,
+            }
+        }
+    )
+
+    assert "-body" in diff
+    assert "+proposed rewrite" in diff
+
+
+class _Gate:
+    """Deterministic two-thread barrier for check→publish / publish→rollback."""
+
+    def __init__(self):
+        self.arrived = threading.Event()
+        self.release = threading.Event()
+
+    def hold(self):
+        self.arrived.set()
+        assert self.release.wait(timeout=10), "timed out waiting to resume mutation"
+
+
+def test_pending_approval_fails_closed_when_mutation_lock_cannot_open(
+    hermes_home, monkeypatch
+):
+    """Missing mutation authority must preserve both live bytes and proposal."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_mutation_authority as authority
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    _set_approval("skills", True)
+    proposed = _SKILL.replace("body", "proposed rewrite C")
+    staged = json.loads(
+        skill_manage(action="patch", name="test-skill", content=proposed)
+    )
+    assert staged["staged"] is True, staged
+
+    def _deny_lock_open(*_args, **_kwargs):
+        raise PermissionError("deterministic lock-open refusal")
+
+    monkeypatch.setattr(authority, "open", _deny_lock_open, raising=False)
+    result = handle_pending_subcommand(
+        wa.SKILLS, ["approve", staged["pending_id"]]
+    )
+
+    assert result is not None
+    assert "Approved 0" in result
+    assert "exclusive mutation authority" in result
+    assert Path(created["skill_md"]).read_text(encoding="utf-8") == _SKILL
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_pending_nested_supporting_file_lock_refusal_preserves_entire_tree(
+    hermes_home, monkeypatch
+):
+    """Lock refusal cannot create parents before supporting-file authority."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_mutation_authority as authority
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    skill_dir = Path(created["skill_md"]).parent
+    original_tree = authority.snapshot_path_state(skill_dir)
+
+    _set_approval("skills", True)
+    staged = json.loads(
+        skill_manage(
+            action="write_file",
+            name="test-skill",
+            file_path="references/nested/proposed.md",
+            file_content="proposed supporting bytes",
+        )
+    )
+    assert staged["staged"] is True, staged
+
+    def _deny_lock_open(*_args, **_kwargs):
+        raise PermissionError("deterministic supporting-file lock refusal")
+
+    monkeypatch.setattr(authority, "open", _deny_lock_open, raising=False)
+    result = handle_pending_subcommand(
+        wa.SKILLS, ["approve", staged["pending_id"]]
+    )
+
+    assert result is not None
+    assert "Approved 0" in result
+    assert "exclusive mutation authority" in result
+    assert authority.snapshot_path_state(skill_dir) == original_tree
+    assert not (skill_dir / "references").exists()
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_check_publish_race_preserves_desktop_edit(hermes_home, monkeypatch):
+    """A Desktop write that lands after the approval check, before publish,
+    must survive. Proof of A cannot authorize replacing B."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _edit_skill, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    _set_approval("skills", True)
+    stale_rewrite = _SKILL.replace("body", "stale pending rewrite")
+    staged = json.loads(
+        skill_manage(action="patch", name="test-skill", content=stale_rewrite)
+    )
+    assert staged["staged"] is True, staged
+
+    gate = _Gate()
+    monkeypatch.setattr(
+        "tools.skill_mutation_authority._after_pending_precondition_check",
+        gate.hold,
+    )
+
+    newer_edit = _SKILL.replace("body", "newer Desktop edit")
+    results = []
+
+    def _approve():
+        results.append(
+            handle_pending_subcommand(wa.SKILLS, ["approve", staged["pending_id"]])
+        )
+
+    worker = threading.Thread(target=_approve)
+    worker.start()
+    assert gate.arrived.wait(timeout=10)
+    edited = _edit_skill("test-skill", newer_edit)
+    assert edited["success"] is True, edited
+    gate.release.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    result = results[0]
+    skill_md = Path(created["skill_md"])
+    assert skill_md.read_text(encoding="utf-8") == newer_edit, result
+    assert result is not None
+    assert "Approved 0" in result
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_publish_rollback_race_preserves_desktop_edit(hermes_home, monkeypatch):
+    """A newer Desktop write waits for rejected C to settle, then survives."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, _edit_skill, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    _set_approval("skills", True)
+    proposed = _SKILL.replace("body", "proposed rewrite C")
+    staged = json.loads(
+        skill_manage(action="patch", name="test-skill", content=proposed)
+    )
+    assert staged["staged"] is True, staged
+
+    gate = _Gate()
+    approve_thread = []
+
+    def _scan(_skill_dir):
+        if threading.current_thread() is approve_thread[0]:
+            gate.hold()
+            return "blocked"
+        return None
+
+    monkeypatch.setattr("tools.skill_manager_tool._security_scan_skill", _scan)
+
+    newer_edit = _SKILL.replace("body", "newer Desktop edit")
+    results = []
+
+    def _approve():
+        approve_thread.append(threading.current_thread())
+        results.append(
+            handle_pending_subcommand(wa.SKILLS, ["approve", staged["pending_id"]])
+        )
+
+    worker = threading.Thread(target=_approve)
+    worker.start()
+    assert gate.arrived.wait(timeout=10)
+    writer_started = threading.Event()
+    writer_results = []
+
+    def _write_newer_edit():
+        writer_started.set()
+        writer_results.append(_edit_skill("test-skill", newer_edit))
+
+    writer = threading.Thread(target=_write_newer_edit)
+    writer.start()
+    assert writer_started.wait(timeout=10)
+    gate.release.set()
+    worker.join(timeout=10)
+    writer.join(timeout=10)
+    assert not worker.is_alive()
+    assert not writer.is_alive()
+    assert writer_results[0]["success"] is True, writer_results[0]
+
+    result = results[0]
+    skill_md = Path(created["skill_md"])
+    assert skill_md.read_text(encoding="utf-8") == newer_edit, result
+    assert result is not None
+    assert "Approved 0" in result
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX independent-process harness")
+def test_check_publish_race_independent_process_preserves_newer_edit(
+    hermes_home, monkeypatch
+):
+    """Same check→publish invariant across a real second process.
+
+    /skills approve and the Desktop backend do not share one Python lock.
+    """
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    _set_approval("skills", True)
+    stale_rewrite = _SKILL.replace("body", "stale pending rewrite")
+    staged = json.loads(
+        skill_manage(action="patch", name="test-skill", content=stale_rewrite)
+    )
+    assert staged["staged"] is True, staged
+
+    gate = _Gate()
+    monkeypatch.setattr(
+        "tools.skill_mutation_authority._after_pending_precondition_check",
+        gate.hold,
+    )
+
+    newer_edit = _SKILL.replace("body", "newer Desktop edit")
+    results = []
+
+    def _approve():
+        results.append(
+            handle_pending_subcommand(wa.SKILLS, ["approve", staged["pending_id"]])
+        )
+
+    worker = threading.Thread(target=_approve)
+    worker.start()
+    assert gate.arrived.wait(timeout=10)
+
+    repo = str(Path(__file__).resolve().parents[2])
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys\n"
+                f"os.environ['HERMES_HOME'] = {hermes_home!r}\n"
+                f"sys.path.insert(0, {repo!r})\n"
+                "from tools.skill_manager_tool import _edit_skill\n"
+                f"result = _edit_skill('test-skill', {newer_edit!r})\n"
+                "assert result.get('success') is True, result\n"
+            ),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    gate.release.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert child.returncode == 0, child.stdout + child.stderr
+
+    result = results[0]
+    skill_md = Path(created["skill_md"])
+    assert skill_md.read_text(encoding="utf-8") == newer_edit, result
+    assert result is not None
+    assert "Approved 0" in result
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX independent-process harness")
+def test_publish_rollback_race_independent_process_preserves_newer_edit(
+    hermes_home, monkeypatch
+):
+    """A child-process write waits for rejected C to settle, then survives."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _create_skill, skill_manage
+
+    created = _create_skill("test-skill", _SKILL)
+    assert created["success"] is True, created
+    _set_approval("skills", True)
+    proposed = _SKILL.replace("body", "proposed rewrite C")
+    staged = json.loads(
+        skill_manage(action="patch", name="test-skill", content=proposed)
+    )
+    assert staged["staged"] is True, staged
+
+    gate = _Gate()
+    approve_thread = []
+
+    def _scan(_skill_dir):
+        if threading.current_thread() is approve_thread[0]:
+            gate.hold()
+            return "blocked"
+        return None
+
+    monkeypatch.setattr("tools.skill_manager_tool._security_scan_skill", _scan)
+
+    newer_edit = _SKILL.replace("body", "newer Desktop edit")
+    results = []
+
+    def _approve():
+        approve_thread.append(threading.current_thread())
+        results.append(
+            handle_pending_subcommand(wa.SKILLS, ["approve", staged["pending_id"]])
+        )
+
+    worker = threading.Thread(target=_approve)
+    worker.start()
+    assert gate.arrived.wait(timeout=10)
+
+    repo = str(Path(__file__).resolve().parents[2])
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys\n"
+                f"os.environ['HERMES_HOME'] = {hermes_home!r}\n"
+                f"sys.path.insert(0, {repo!r})\n"
+                "print('STARTED', flush=True)\n"
+                "from tools.skill_manager_tool import _edit_skill\n"
+                f"result = _edit_skill('test-skill', {newer_edit!r})\n"
+                "assert result.get('success') is True, result\n"
+            ),
+        ],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None
+    assert child.stdout.readline().strip() == "STARTED"
+    gate.release.set()
+    worker.join(timeout=10)
+    stdout, stderr = child.communicate(timeout=20)
+    assert not worker.is_alive()
+    assert child.returncode == 0, stdout + stderr
+
+    result = results[0]
+    skill_md = Path(created["skill_md"])
+    assert skill_md.read_text(encoding="utf-8") == newer_edit, result
+    assert result is not None
+    assert "Approved 0" in result
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is not None
+
+
+def test_direct_targeted_patches_serialize_the_full_read_modify_write(
+    hermes_home, tmp_path
+):
+    """Independent direct patches must derive from the latest locked image."""
+    from tools.skill_manager_tool import _create_skill
+
+    initial = _SKILL.replace("body", "alpha: one\nbeta: two")
+    created = _create_skill("test-skill", initial)
+    assert created["success"] is True, created
+    _set_approval("skills", False)
+
+    repo = str(Path(__file__).resolve().parents[2])
+    first_acquired = tmp_path / "first-acquired"
+    second_entered = tmp_path / "second-entered"
+    child_code = """
+import contextlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+role, hermes_home, repo, first_marker, second_marker, old, new = sys.argv[1:]
+os.environ["HERMES_HOME"] = hermes_home
+sys.path.insert(0, repo)
+
+from tools import skill_manager_tool as manager
+
+real_lease = manager._skill_mutation_lease
+first_marker = Path(first_marker)
+second_marker = Path(second_marker)
+
+@contextlib.contextmanager
+def coordinated_lease(identity):
+    if role == "second":
+        second_marker.write_text("entered", encoding="utf-8")
+    with real_lease(identity) as admitted:
+        if role == "first" and admitted:
+            first_marker.write_text("acquired", encoding="utf-8")
+            deadline = time.monotonic() + 10
+            while not second_marker.exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("second writer never reached mutation authority")
+                time.sleep(0.01)
+        yield admitted
+
+manager._skill_mutation_lease = coordinated_lease
+result = json.loads(
+    manager.skill_manage(
+        action="patch",
+        name="test-skill",
+        old_string=old,
+        new_string=new,
+    )
+)
+assert result.get("success") is True, result
+print(json.dumps(result), flush=True)
+"""
+
+    common = [
+        hermes_home,
+        repo,
+        str(first_acquired),
+        str(second_entered),
+    ]
+    first = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            "first",
+            *common,
+            "alpha: one",
+            "alpha: ONE",
+        ],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    deadline = time.monotonic() + 10
+    while not first_acquired.exists():
+        if first.poll() is not None:
+            stdout, stderr = first.communicate()
+            pytest.fail(f"first writer exited early: {stdout}{stderr}")
+        if time.monotonic() >= deadline:
+            first.kill()
+            stdout, stderr = first.communicate()
+            pytest.fail(f"first writer never acquired authority: {stdout}{stderr}")
+        time.sleep(0.01)
+
+    second = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            "second",
+            *common,
+            "beta: two",
+            "beta: TWO",
+        ],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=20)
+    second_stdout, second_stderr = second.communicate(timeout=20)
+
+    assert first.returncode == 0, first_stdout + first_stderr
+    assert second.returncode == 0, second_stdout + second_stderr
+    final_content = Path(created["skill_md"]).read_text(encoding="utf-8")
+    assert "alpha: ONE" in final_content
+    assert "beta: TWO" in final_content
+
+
 # ---------------------------------------------------------------------------
 # Pending store CRUD
 # ---------------------------------------------------------------------------
@@ -284,6 +1047,14 @@ class TestSkillGist:
         assert (
             wa.skill_gist("edit", "demo", content=content)
             == f"rewrite 'demo' ({len(content)} chars)"
+        )
+
+    def test_patch_with_full_content_is_described_as_rewrite(self):
+        from tools import write_approval as wa
+        content = "---\ndescription: Updated skill.\n---\n# Updated\n"
+        assert (
+            wa.skill_gist("patch", "demo", content=content)
+            == f"rewrite 'demo' — Updated skill. ({len(content)} chars)"
         )
 
 

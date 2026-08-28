@@ -62,7 +62,10 @@ class TestSkillManageBatch(unittest.TestCase):
         ])
         self.assertFalse(r["success"])
         self.assertEqual(r["failed_index"], 1)
-        content = open(os.path.join(self.home, "skills", "probe", "SKILL.md")).read()
+        content = open(
+            os.path.join(self.home, "skills", "probe", "SKILL.md"),
+            encoding="utf-8",
+        ).read()
         self.assertIn("Step 1.", content)       # patch undone
         self.assertNotIn("Step ONE.", content)
 
@@ -130,7 +133,7 @@ class TestSkillManageBatch(unittest.TestCase):
             self.assertIn("discard", r["error"])
         # ...and rejected pre-effect: c.md still holds its seed text.
         c_md = os.path.join(self.home, "skills", "probe", "references", "c.md")
-        self.assertEqual(open(c_md).read(), "seed")
+        self.assertEqual(open(c_md, encoding="utf-8").read(), "seed")
         # write-then-patch on one supporting file stays legal (additive).
         r = self._call("probe", [
             {"action": "write_file", "file_path": "references/e.md", "file_content": "base"},
@@ -171,7 +174,10 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertFalse(r["success"])
         self.assertEqual(r["failed_index"], 2)
         # alpha's patch undone; beta (batch-created) removed entirely.
-        content = open(os.path.join(self.home, "skills", "alpha", "SKILL.md")).read()
+        content = open(
+            os.path.join(self.home, "skills", "alpha", "SKILL.md"),
+            encoding="utf-8",
+        ).read()
         self.assertIn("Step 1.", content)
         self.assertNotIn("Step A.", content)
         self.assertFalse(os.path.exists(os.path.join(self.home, "skills", "beta")))
@@ -196,8 +202,14 @@ class TestSkillManageBatch(unittest.TestCase):
 
         staged = {}
 
-        def fake_stage_write(area, payload, summary=None, origin=None):
-            staged.update(payload=payload, summary=summary)
+        def fake_stage_write(
+            area, payload, summary=None, origin=None, precondition=None
+        ):
+            staged.update(
+                payload=payload,
+                summary=summary,
+                precondition=precondition,
+            )
             return {"id": "pend_1"}
 
         import tools.write_approval as wa
@@ -212,11 +224,76 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertTrue(r.get("staged"), r)
         self.assertEqual(staged["payload"]["action"], "batch")
         self.assertEqual(len(staged["payload"]["operations"]), 2)
+        self.assertEqual(staged["precondition"]["kind"], "skill_batch")
         self.assertIn("2 ops", staged["summary"])
         # Replay applies the batch (gate bypassed inside).
-        out = json.loads(self.smt.apply_skill_pending(staged["payload"]))
+        out = json.loads(self.smt.apply_skill_pending(
+            staged["payload"], precondition=staged["precondition"]
+        ))
         self.assertTrue(out["success"], out)
         self.assertEqual(out["operations_applied"], 2)
+
+    def test_legacy_batch_without_precondition_fails_closed(self):
+        payload = {
+            "action": "batch",
+            "operations": [
+                {
+                    "name": "probe",
+                    "action": "create",
+                    "content": SK.format(n="probe"),
+                }
+            ],
+        }
+        out = json.loads(self.smt.apply_skill_pending(payload))
+        self.assertFalse(out["success"], out)
+        self.assertEqual(out["error_code"], "missing_precondition")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.home, "skills", "probe")
+        ))
+
+    def test_generation_bound_rollback_preserves_external_publication(self):
+        self._call("alpha", [
+            {"action": "create", "content": SK.format(n="alpha")}
+        ])
+        self._call("beta", [
+            {"action": "create", "content": SK.format(n="beta")}
+        ])
+        alpha_md = os.path.join(self.home, "skills", "alpha", "SKILL.md")
+        external = SK.format(n="alpha").replace("Step 1.", "external bytes")
+
+        from unittest.mock import patch as _patch
+
+        def publish_external(index, name, _skill_dir):
+            if index == 0 and name == "alpha":
+                with open(alpha_md, "w", encoding="utf-8") as handle:
+                    handle.write(external)
+
+        with _patch(
+            "tools.skill_batch_authority._after_batch_operation_publication",
+            side_effect=publish_external,
+        ):
+            out = json.loads(self.smt.skill_manage(
+                action="",
+                name="",
+                operations=[
+                    {
+                        "name": "alpha",
+                        "action": "patch",
+                        "old_string": "Step 1.",
+                        "new_string": "batch bytes",
+                    },
+                    {
+                        "name": "beta",
+                        "action": "write_file",
+                        "file_path": "bad/nope.md",
+                        "file_content": "force failure",
+                    },
+                ],
+            ))
+
+        self.assertFalse(out["success"], out)
+        self.assertEqual(out["settlement"], "superseded")
+        self.assertEqual(open(alpha_md, encoding="utf-8").read(), external)
 
 
 if __name__ == "__main__":
