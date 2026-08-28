@@ -13,7 +13,6 @@ import {
   GROUP_CHAT_HISTORY_LIMIT,
   GROUP_CHAT_MAX_CONTINUATIONS,
   GROUP_CHAT_MAX_MESSAGES,
-  GROUP_CHAT_MAX_ROUNDS,
   groupSpeakerLabel,
   groupThreadOf,
   mintGroupThreadId,
@@ -24,8 +23,8 @@ import type { GroupChatRoom, GroupHoldStamp } from './group-chat'
 import {
   estimateTokens,
   getEffectiveRoundCap,
-  getGroupChatConfig,
-  getCurrentModelName
+  getCurrentModelName,
+  getGroupChatConfig
 } from './group-chat-config'
 import { durableGroupChatMembers, groupMemberKey } from './group-membership'
 import { harvestStrandedGroupReply, isGroupPassText, runGroupChatMemberTurn } from './group-turns'
