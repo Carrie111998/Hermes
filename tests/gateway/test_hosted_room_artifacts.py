@@ -127,3 +127,38 @@ def test_cancel_and_disband_purge_only_the_matching_scope(tmp_path: Path):
     assert outbox.discard_room("room-1") == 1
     assert outbox.list(second) == []
     assert len(outbox.list(other_room)) == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "kind", "mime"),
+    [
+        ("diagram.png", b"\x89PNG\r\n\x1a\nimage", "image", "image/png"),
+        ("brief.pdf", b"%PDF-1.7\nbody", "pdf", "application/pdf"),
+        ("archive.bin", b"\x00\x01\x02", "file", "application/octet-stream"),
+    ],
+)
+def test_output_artifact_kinds_keep_verified_bytes(
+    tmp_path: Path,
+    name: str,
+    data: bytes,
+    kind: str,
+    mime: str,
+):
+    path = tmp_path / name
+    path.write_bytes(data)
+    outbox = RoomArtifactOutbox(tmp_path / "state.db")
+    stored = outbox.put_path(scope=_scope(), path=path)
+    metadata, copied = outbox.read(_scope(), stored["artifact_id"])
+    assert metadata["kind"] == kind
+    assert metadata["mime"] == mime
+    assert copied == data
+
+
+def test_output_artifact_rejects_mislabeled_image(tmp_path: Path):
+    path = tmp_path / "not-an-image.png"
+    path.write_text("plain text", encoding="utf-8")
+    with pytest.raises(RoomArtifactError, match="image bytes"):
+        RoomArtifactOutbox(tmp_path / "state.db").put_path(
+            scope=_scope(),
+            path=path,
+        )
