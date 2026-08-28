@@ -704,10 +704,19 @@ const cacheSet = (b: Map<string, ReactNode[]>, key: string, v: ReactNode[]) => {
   }
 }
 
+// Fast string hash for cache key - avoids large string keys
+function hashString(str: string): string {
+  let h = 0
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h + str.charCodeAt(i)) | 0
+  }
+  return h.toString(36)
+}
+
 function MdImpl({ cols, compact, t, text }: MdProps) {
   const nodes = useMemo(() => {
     const bucket = cacheBucket(t)
-    const cacheKey = `${compact ? '1' : '0'}|${cols ?? ''}|${text}`
+    const cacheKey = `${compact ? '1' : '0'}|${cols ?? ''}|${hashString(text)}`
     const cached = cacheGet(bucket, cacheKey)
 
     if (cached) {
