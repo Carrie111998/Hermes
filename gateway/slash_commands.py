@@ -570,21 +570,36 @@ class GatewaySlashCommandsMixin:
             root = argparse.ArgumentParser(prog="hermes", add_help=False)
             sub = root.add_subparsers(dest="command")
             projects_cmd.build_parser(sub)
-            # Parse OUTSIDE the capture boundary: argparse writes its own
-            # message to stderr and exits, and holding the process-global
-            # boundary is not needed to answer with text.
-            try:
-                args = root.parse_args(["project", *argv])
-            except SystemExit:
+
+            # `redirect_stdout` swaps PROCESS-GLOBAL sys.stdout, so two
+            # concurrent gateway requests would interleave into each other's
+            # replies. One shared boundary, also taken by /kanban.
+            #
+            # The PARSE runs inside it too. argparse prints its usage and error
+            # to stderr *before* raising SystemExit, so parsing outside the
+            # boundary meant a malformed request wrote into whichever other
+            # reply happened to own the global stream at that moment — the
+            # valid request's answer came back with a stranger's usage error
+            # appended. Tokenisation and the allowlist above produce no output
+            # and stay outside; the parser and the handler are the
+            # output-producing region.
+            parsed = None
+            with captured_streams() as (out, err):
+                try:
+                    parsed = root.parse_args(["project", *argv])
+                except SystemExit:
+                    parsed = None
+                if parsed is not None:
+                    projects_cmd.projects_command(parsed)
+
+            if parsed is None:
+                # argparse's own text is discarded on purpose: it is unbounded,
+                # names internal prog paths, and reads as noise in a chat
+                # bubble. The gateway answers with its own bounded usage.
                 return (
                     f"project: could not parse those arguments.\n\n"
                     f"{self._PROJECT_GATEWAY_USAGE}"
                 )
-            # `redirect_stdout` swaps PROCESS-GLOBAL sys.stdout, so two
-            # concurrent gateway requests would interleave into each other's
-            # replies. One shared boundary, also taken by /kanban.
-            with captured_streams() as (out, err):
-                projects_cmd.projects_command(args)
             return (out.getvalue() + err.getvalue()).strip()
 
         try:

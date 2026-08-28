@@ -299,3 +299,134 @@ async def test_the_boundary_never_blocks_the_event_loop(board):
     assert ticks == 20, (
         f"the event loop stalled while commands serialized (ticks={ticks})"
     )
+
+
+# ---------------------------------------------------------------------------
+# argparse is output-producing, so it belongs inside the boundary too
+# ---------------------------------------------------------------------------
+
+MALFORMED = "/project show"          # `show` requires a positional
+
+
+@pytest.mark.asyncio
+async def test_malformed_input_emits_nothing_to_the_process_streams(board):
+    """argparse prints usage + error to stderr before raising SystemExit."""
+    from gateway.run import GatewayRunner
+
+    real_out, real_err = sys.stdout, sys.stderr
+    escaped_out, escaped_err = io.StringIO(), io.StringIO()
+    try:
+        sys.stdout, sys.stderr = escaped_out, escaped_err
+        runner = object.__new__(GatewayRunner)
+        reply = await GatewayRunner._handle_project_command(
+            runner, _event(MALFORMED))
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+
+    assert escaped_out.getvalue() == "", escaped_out.getvalue()
+    assert escaped_err.getvalue() == "", escaped_err.getvalue()
+    assert sys.stdout is real_out and sys.stderr is real_err
+    # The caller still gets a friendly, bounded answer — not an argparse dump.
+    assert "could not parse those arguments" in reply
+    assert "usage: hermes project" not in reply
+    assert len(reply) < 400
+
+
+def test_malformed_input_cannot_reach_another_requests_reply(board):
+    """One request holds the boundary; a malformed one runs against it.
+
+    Before the fix the malformed request's argparse error was written to the
+    process-global stream that the FIRST request owned, and came back appended
+    to that user's reply.
+    """
+    import asyncio as _asyncio
+
+    from gateway.run import GatewayRunner
+    from hermes_cli import projects_cmd
+
+    inside = threading.Event()
+    may_finish = threading.Event()
+    replies: dict[str, str] = {}
+
+    def slow_valid(args):
+        print("ALPHA-ONLY")
+        inside.set()
+        may_finish.wait(timeout=1.5)   # stay inside the capture region
+        return 0
+
+    real_command = projects_cmd.projects_command
+    projects_cmd.projects_command = slow_valid
+    real_out, real_err = sys.stdout, sys.stderr
+    escaped = io.StringIO()
+
+    def run_valid():
+        runner = object.__new__(GatewayRunner)
+        replies["valid"] = _asyncio.run(
+            GatewayRunner._handle_project_command(
+                runner, _event("/project plan-show alpha")))
+
+    def run_malformed():
+        inside.wait(timeout=10)
+        runner = object.__new__(GatewayRunner)
+        replies["malformed"] = _asyncio.run(
+            GatewayRunner._handle_project_command(runner, _event(MALFORMED)))
+        may_finish.set()
+
+    try:
+        sys.stdout = escaped
+        threads = [threading.Thread(target=run_valid),
+                   threading.Thread(target=run_malformed)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        may_finish.set()
+        assert not any(t.is_alive() for t in threads), "a request deadlocked"
+    finally:
+        projects_cmd.projects_command = real_command
+        sys.stdout, sys.stderr = real_out, real_err
+
+    assert replies["valid"].split() == ["ALPHA-ONLY"], replies["valid"]
+    assert "usage:" not in replies["valid"]
+    assert "error:" not in replies["valid"]
+    assert "could not parse those arguments" in replies["malformed"]
+    assert "ALPHA-ONLY" not in replies["malformed"]
+    assert escaped.getvalue() == "", "argparse text escaped to the process stream"
+
+
+@pytest.mark.asyncio
+async def test_streams_survive_a_handler_exception_inside_the_boundary(board):
+    from gateway.run import GatewayRunner
+    from hermes_cli import projects_cmd
+
+    def explode(args):
+        print("partial output")
+        raise RuntimeError("handler blew up")
+
+    real_command = projects_cmd.projects_command
+    projects_cmd.projects_command = explode
+    real_out, real_err = sys.stdout, sys.stderr
+    try:
+        runner = object.__new__(GatewayRunner)
+        reply = await GatewayRunner._handle_project_command(
+            runner, _event("/project plan-show alpha"))
+    finally:
+        projects_cmd.projects_command = real_command
+
+    assert sys.stdout is real_out and sys.stderr is real_err
+    assert "handler blew up" in reply
+    # and the boundary is free for the next request
+    with captured_streams() as (out, _err):
+        print("next")
+    assert out.getvalue().strip() == "next"
+
+
+@pytest.mark.asyncio
+async def test_a_valid_request_still_answers_after_a_malformed_one(board):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    await GatewayRunner._handle_project_command(runner, _event(MALFORMED))
+    reply = await GatewayRunner._handle_project_command(
+        runner, _event("/project plan-show proj-1"))
+    assert "the plan body" in reply
