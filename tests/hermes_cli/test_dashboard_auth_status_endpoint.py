@@ -249,3 +249,22 @@ def test_status_survives_an_unreadable_config(gated_client, monkeypatch):
     r = gated_client.get("/api/status")
     assert r.status_code == 200
     assert "version" in r.json()
+
+
+def test_unreadable_config_warns_once_not_per_probe(gated_client, monkeypatch, caplog):
+    """The warning must not scale with probe traffic. /api/status is polled on a
+    timer by portals, uptime monitors and the desktop, so a per-call warning
+    turns one broken config into a log flood that buries the line the operator
+    needs."""
+    import logging
+
+    def _boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(web_server, "load_config", _boom)
+    monkeypatch.setattr(web_server, "_warned_public_status_detail_unreadable", False)
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.web_server"):
+        for _ in range(3):
+            assert gated_client.get("/api/status").status_code == 200
+    hits = [r for r in caplog.records if "public_status_detail" in r.message]
+    assert len(hits) == 1, f"expected one warning, got {len(hits)}"

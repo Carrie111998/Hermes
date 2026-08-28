@@ -3740,6 +3740,14 @@ def _merge_profile_gateway_platforms(
     return merged
 
 
+# One-shot guard for the unreadable-config warning below. ``/api/status`` is a
+# liveness probe: portals, uptime monitors and the desktop poll it on a timer,
+# so a per-call warning would turn one broken config into a log flood that
+# buries the very line the operator needs to see. Same discipline as the
+# malformed-public_url warnings in dashboard_auth/prefix.py.
+_warned_public_status_detail_unreadable = False
+
+
 def _public_status_detail() -> str:
     """Return ``"minimal"`` or ``"full"`` for the public ``/api/status`` payload.
 
@@ -3759,12 +3767,15 @@ def _public_status_detail() -> str:
         )
     except Exception:
         # Fail open: an unreadable config must not turn a liveness probe into
-        # an error. Logged because it silently drops an operator's hardening
-        # choice back to the public default.
-        _log.warning(
-            "Could not read dashboard.public_status_detail; "
-            "serving the full public /api/status payload"
-        )
+        # an error. Warned once because it silently drops an operator's
+        # hardening choice back to the public default.
+        global _warned_public_status_detail_unreadable
+        if not _warned_public_status_detail_unreadable:
+            _warned_public_status_detail_unreadable = True
+            _log.warning(
+                "Could not read dashboard.public_status_detail; "
+                "serving the full public /api/status payload"
+            )
         return "full"
     if isinstance(configured, str) and configured.strip().lower() == "minimal":
         return "minimal"
