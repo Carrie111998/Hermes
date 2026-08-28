@@ -53,6 +53,19 @@ _PARENT_HANDOFF_METADATA_STRING_MAX_BYTES = 2048
 _PARENT_HANDOFF_METADATA_MAX_ITEMS = 32
 _PARENT_HANDOFF_METADATA_MAX_DEPTH = 4
 
+# A decomposer creates leaf cards only after it has committed the scope and
+# ownership decision into the child body.  Letting such a leaf re-open that
+# decision as ``needs_input`` is a common local-model failure mode: the worker
+# asks a human which analysis to perform instead of performing the bounded
+# analysis it was assigned.  Real external access failures remain
+# ``capability`` blocks.  Keep this list aligned with dispatcher handling of
+# generated tasks in ``kanban_db.dispatch_once``.
+_GENERATED_LEAF_CREATORS = frozenset({
+    "auto-decomposer",
+    "decomposer",
+    "specialist-routing",
+})
+
 _PRIVATE_PATH_IN_TEXT = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     r"/(?:Users|home|private|var/folders|root|Volumes)/[^\s\"'`)]+"
@@ -1088,6 +1101,20 @@ def _handle_block(args: dict, **kw) -> str:
         # and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
+        generated_leaf = bool(
+            task
+            and (task.created_by or "").strip().lower()
+            in _GENERATED_LEAF_CREATORS
+        )
+        if kind == "needs_input" and generated_leaf:
+            conn.close()
+            return tool_error(
+                "auto-decomposed leaf tasks cannot block with needs_input: "
+                "their bounded scope and decision owner were fixed by the "
+                "decomposer. Make the role-owned decision and complete with "
+                "factual evidence; use kind='capability' only for a newly "
+                "reproduced external access or credential failure."
+            )
         if (
             task
             and task.goal_mode
