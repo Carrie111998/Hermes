@@ -31,6 +31,7 @@ def fake_ws(query: str = "") -> SimpleNamespace:
     params = {key: items[0] for key, items in values.items()}
     return SimpleNamespace(
         query_params=SimpleNamespace(get=lambda key, default="": params.get(key, default)),
+        headers={},
         client=SimpleNamespace(host="127.0.0.1"),
         url=SimpleNamespace(path="/api/ws"),
     )
