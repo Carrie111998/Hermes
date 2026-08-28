@@ -82,6 +82,7 @@ export function sshFailureMessage(
   error: string | null | undefined,
   copy: {
     sshErrAuth?: string
+    sshErrDesktopUpdateRequired?: string
     sshErrHostKey?: string
     sshErrNotInstalled?: string
     sshErrPlatform?: string
@@ -98,6 +99,10 @@ export function sshFailureMessage(
   }
 
   const text = raw.toLowerCase()
+
+  if (text.includes('desktop app shell')) {
+    return copy.sshErrDesktopUpdateRequired || raw
+  }
 
   if (text.includes('host key')) {
     return copy.sshErrHostKey || raw

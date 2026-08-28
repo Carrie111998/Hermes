@@ -86,7 +86,7 @@ import {
   BROWSER_WINDOW_WIDTH,
   buildBrowserWindowUrl
 } from './browser-windows'
-import { detectBundleSkew } from './bundle-skew'
+import { assertCurrentBundleForSsh, detectBundleSkew } from './bundle-skew'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -10155,6 +10155,8 @@ async function rollbackSshBootstrapResult(ssh, result, profile, sshConfig, bound
 }
 
 async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, source, metadata, fingerprint, lease) {
+  assertCurrentBundleForSsh(await detectRendererSkew())
+
   const scope = sshScopeKey(profile)
   const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
   const existing = sshConnections.get(scope)
@@ -10657,6 +10659,8 @@ async function testDesktopConnectionConfig(input: any = {}) {
     )
 
     try {
+      assertCurrentBundleForSsh(await detectRendererSkew())
+
       // One bounded retry on TIMEOUT only: a cold Windows backend's first
       // PowerShell exec can exceed the budget (observed live), and a timeout is
       // indeterminate — unlike auth/host-key/unreachable, which are verdicts.

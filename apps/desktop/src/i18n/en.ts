@@ -969,6 +969,8 @@ export const en: Translations = {
       sshErrUnreachable: 'Could not reach that host over SSH. Check the host, port, and your network.',
       sshErrAuth:
         'SSH authentication failed. Load your key into the ssh-agent (ssh-add) or set an IdentityFile in ~/.ssh/config — Hermes runs ssh non-interactively.',
+      sshErrDesktopUpdateRequired:
+        'This Hermes Desktop app shell is older than the installed runtime. Update or reinstall the Desktop app before checking SSH compatibility; the remote Hermes may already be compatible.',
       sshErrHostKey:
         'The host key has CHANGED since you last connected. Verify this is expected, then run ssh-keygen -R <host> and reconnect.',
       sshErrNotInstalled:

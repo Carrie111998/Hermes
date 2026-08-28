@@ -130,9 +130,18 @@ describe('shouldApplyPostBootProgressError', () => {
 
 describe('sshFailureMessage', () => {
   it('localizes SSH failures without changing non-SSH errors', () => {
-    const copy = { sshErrAuth: 'localized auth', sshErrUnknown: 'localized unknown' }
+    const copy = {
+      sshErrAuth: 'localized auth',
+      sshErrDesktopUpdateRequired: 'localized desktop update',
+      sshErrUnknown: 'localized unknown'
+    }
+
     const ssh = config({ mode: 'ssh', sshHost: 'box', remoteUrl: '' })
+
     expect(sshFailureMessage(ssh, 'SSH authentication failed', copy)).toBe('localized auth')
+    expect(sshFailureMessage(ssh, 'The Hermes Desktop app shell is behind; update it', copy)).toBe(
+      'localized desktop update'
+    )
     expect(sshFailureMessage(ssh, 'unexpected failure', copy)).toBe('localized unknown')
     expect(sshFailureMessage(config(), 'raw remote error', copy)).toBe('raw remote error')
   })

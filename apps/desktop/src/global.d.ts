@@ -828,6 +828,7 @@ export interface DesktopConnectionTestResult {
   reachable?: boolean
   sshError?:
     | 'auth-failed'
+    | 'desktop-update-required'
     | 'hermes-not-found'
     | 'host-key-changed'
     | 'timeout'

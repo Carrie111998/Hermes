@@ -833,6 +833,7 @@ export interface Translations {
       sshIncompleteHost: string
       sshErrUnreachable: string
       sshErrAuth: string
+      sshErrDesktopUpdateRequired: string
       sshErrHostKey: string
       sshErrNotInstalled: string
       sshErrPlatform: string

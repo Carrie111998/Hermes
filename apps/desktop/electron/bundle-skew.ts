@@ -41,6 +41,12 @@ export interface BundleSkewResult {
   outOfSync: boolean
 }
 
+interface DesktopSshBundleError extends Error {
+  isSshBootstrap: true
+  kind: 'desktop-update-required'
+  sshError: 'desktop-update-required'
+}
+
 export type RunGit = (
   args: string[],
   options: { cwd: string }
@@ -81,4 +87,24 @@ export async function detectBundleSkew(
   } catch {
     return NOT_STALE
   }
+}
+
+export function assertCurrentBundleForSsh(skew: BundleSkewResult): void {
+  if (!skew.outOfSync) {
+    return
+  }
+
+  const count = skew.desktopCommitsBehind
+  const distance = count === 1 ? '1 desktop commit' : `${count ?? 'multiple'} desktop commits`
+
+  const error = new Error(
+    `The Hermes Desktop app shell is ${distance} behind the installed runtime. ` +
+      'Update or reinstall the Desktop app before checking SSH compatibility; the remote Hermes may already be compatible.'
+  ) as DesktopSshBundleError
+
+  error.kind = 'desktop-update-required'
+  error.sshError = 'desktop-update-required'
+  error.isSshBootstrap = true
+
+  throw error
 }

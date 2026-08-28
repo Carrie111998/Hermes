@@ -899,6 +899,8 @@ export const ja = defineLocale({
       sshErrUnreachable: 'SSH でそのホストに到達できませんでした。ホスト、ポート、ネットワークを確認してください。',
       sshErrAuth:
         'SSH 認証に失敗しました。鍵を ssh-agent に読み込む（ssh-add）か、~/.ssh/config に IdentityFile を設定してください。Hermes は非対話的に ssh を実行します。',
+      sshErrDesktopUpdateRequired:
+        'Hermes Desktop アプリのシェルがインストール済みランタイムより古くなっています。SSH 互換性を確認する前に Desktop アプリを更新または再インストールしてください。リモートの Hermes はすでに互換性がある可能性があります。',
       sshErrHostKey:
         '前回の接続以降、ホスト鍵が変更されています。想定どおりか確認し、ssh-keygen -R <host> を実行してから再接続してください。',
       sshErrNotInstalled:

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { detectBundleSkew, isFallbackCommit, type RunGit } from './bundle-skew'
+import { assertCurrentBundleForSsh, detectBundleSkew, isFallbackCommit, type RunGit } from './bundle-skew'
 
 const REPO = '/repo'
 const STAMP = { commit: 'a'.repeat(40), source: 'ci' }
@@ -83,5 +83,22 @@ describe('detectBundleSkew', () => {
       desktopCommitsBehind: null,
       outOfSync: false
     })
+  })
+})
+
+describe('assertCurrentBundleForSsh', () => {
+  it('surfaces local shell skew instead of blaming remote compatibility', () => {
+    expect(() => assertCurrentBundleForSsh({ desktopCommitsBehind: 3, outOfSync: true })).toThrowError(
+      expect.objectContaining({
+        kind: 'desktop-update-required',
+        sshError: 'desktop-update-required',
+        message: expect.stringMatching(/Desktop app shell is 3 desktop commits behind.*remote Hermes may already be compatible/i)
+      })
+    )
+  })
+
+  it('allows SSH probing when the shell is current or skew is unknowable', () => {
+    expect(() => assertCurrentBundleForSsh({ desktopCommitsBehind: 0, outOfSync: false })).not.toThrow()
+    expect(() => assertCurrentBundleForSsh({ desktopCommitsBehind: null, outOfSync: false })).not.toThrow()
   })
 })
