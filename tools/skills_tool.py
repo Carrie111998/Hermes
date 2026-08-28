@@ -665,13 +665,22 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
     1. Explicit ``platform`` argument
     2. ``HERMES_PLATFORM`` environment variable
     3. ``HERMES_SESSION_PLATFORM`` from gateway session context
+
+    Also applies ``bundled_whitelist`` filtering: when the whitelist is active,
+    bundled-provenance skills not in ``bundled_enabled`` are treated as disabled.
     """
     try:
+        from agent.skill_utils import _bundled_whitelist_blocked
+
         from hermes_cli.config import load_config
         config = load_config()
         skills_cfg = config.get("skills", {})
         resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
         global_disabled = skills_cfg.get("disabled", [])
+        # Bundled whitelist check
+        whitelist_blocked = _bundled_whitelist_blocked(skills_cfg)
+        if name in whitelist_blocked:
+            return True
         if resolved_platform:
             platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
             if platform_disabled is not None:
