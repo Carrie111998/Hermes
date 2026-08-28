@@ -3145,6 +3145,34 @@ class TestRunConversation:
             for call in persist_session.call_args_list
         )
 
+    def test_ephemeral_user_context_survives_history_repair_reindex(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer", finish_reason="stop"
+        )
+        malformed_history = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "tool", "tool_call_id": "orphan", "content": "result"},
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                "current question",
+                conversation_history=malformed_history,
+                ephemeral_user_context="[Volatile location] 5.0, 6.0",
+            )
+
+        api_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert api_messages[-1]["role"] == "user"
+        assert api_messages[-1]["content"] == (
+            "current question\n\n[Volatile location] 5.0, 6.0"
+        )
+
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
         agent._cached_system_prompt = "stable instructions\n\nsession context"

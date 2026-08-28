@@ -49,11 +49,11 @@ async def test_registered_handler_distinguishes_one_time_and_edited_live_updates
         def __init__(self):
             self.handlers = []
 
-        def add_handler(self, handler):
+        def add_handler(self, handler, **_kwargs):
             self.handlers.append(handler)
 
     app = _RecordingApp()
-    adapter._register_update_handlers(app)
+    adapter._register_handlers(app)
     location_handlers = [
         handler
         for handler in app.handlers
