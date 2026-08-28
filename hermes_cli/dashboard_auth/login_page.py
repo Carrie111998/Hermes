@@ -46,28 +46,28 @@ _LOGIN_HTML_TEMPLATE = """\
     font-style: normal;
     font-weight: 400;
     font-display: swap;
-    src: url('/fonts/Collapse-Regular.woff2') format('woff2');
+    src: url('{prefix}/fonts/Collapse-Regular.woff2') format('woff2');
   }}
   @font-face {{
     font-family: 'Collapse';
     font-style: normal;
     font-weight: 700;
     font-display: swap;
-    src: url('/fonts/Collapse-Bold.woff2') format('woff2');
+    src: url('{prefix}/fonts/Collapse-Bold.woff2') format('woff2');
   }}
   @font-face {{
     font-family: 'Rules Compressed';
     font-style: normal;
     font-weight: 400;
     font-display: swap;
-    src: url('/fonts/RulesCompressed-Regular.woff2') format('woff2');
+    src: url('{prefix}/fonts/RulesCompressed-Regular.woff2') format('woff2');
   }}
   @font-face {{
     font-family: 'Rules Compressed';
     font-style: normal;
     font-weight: 600;
     font-display: swap;
-    src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
+    src: url('{prefix}/fonts/RulesCompressed-Medium.woff2') format('woff2');
   }}
 
   :root {{
@@ -332,14 +332,14 @@ _EMPTY_HTML = """\
     font-style: normal;
     font-weight: 400;
     font-display: swap;
-    src: url('/fonts/Collapse-Regular.woff2') format('woff2');
+    src: url('{prefix}/fonts/Collapse-Regular.woff2') format('woff2');
   }
   @font-face {
     font-family: 'Rules Compressed';
     font-style: normal;
     font-weight: 600;
     font-display: swap;
-    src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
+    src: url('{prefix}/fonts/RulesCompressed-Medium.woff2') format('woff2');
   }
   :root {
     --background-base: #170d02;
@@ -428,7 +428,7 @@ _PASSWORD_FORM_SCRIPT = """\
         password: (form.querySelector('input[name=password]') || {}).value || '',
         next: (form.querySelector('input[name=next]') || {}).value || ''
       };
-      fetch('/auth/password-login', {
+      fetch('__PREFIX__/auth/password-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -436,7 +436,7 @@ _PASSWORD_FORM_SCRIPT = """\
       }).then(function (resp) {
         if (resp.ok) {
           return resp.json().then(function (data) {
-            window.location.assign((data && data.next) || '/');
+            window.location.assign((data && data.next) || '__PREFIX__/');
           });
         }
         var msg = resp.status === 429
@@ -458,7 +458,7 @@ _PASSWORD_FORM_SCRIPT = """\
 """
 
 
-def render_login_html(*, next_path: str = "") -> str:
+def render_login_html(*, next_path: str = "", prefix: str = "") -> str:
     """Return the full HTML for ``GET /login``.
 
     ``next_path`` — when set, the post-login landing path the user
@@ -467,10 +467,19 @@ def render_login_html(*, next_path: str = "") -> str:
     end-to-end. The caller (``routes.login_page``) is responsible for
     validating ``next_path`` against the same-origin rules before we
     emit it; we still HTML-escape it as defence in depth.
+
+    ``prefix`` — reverse-proxy path prefix from ``X-Forwarded-Prefix``
+    (e.g. ``/hermes``). When non-empty, all absolute paths on the page
+    (provider buttons, fonts, password-login fetch) are emitted under
+    that prefix so a strip-prefix proxy still serves them from the
+    dashboard mount.
     """
     providers = list_session_providers()
     if not providers:
         return _EMPTY_HTML
+
+    # Normalise: empty or ``/hermes`` (no trailing slash). Never None.
+    prefix = (prefix or "").rstrip("/")
 
     if next_path:
         # URL-encode then HTML-escape. The URL-encode step matches the
@@ -491,11 +500,16 @@ def render_login_html(*, next_path: str = "") -> str:
         else:
             buttons.append(
                 f'      <a class="provider-btn" '
-                f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
+                f'href="{html.escape(prefix, quote=True)}/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
                 f'Sign in with {html.escape(p.display_name)}</a>'
             )
-    script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
+    script = (
+        _PASSWORD_FORM_SCRIPT.replace("__PREFIX__", prefix)
+        if needs_password_script
+        else ""
+    )
     return _LOGIN_HTML_TEMPLATE.format(
+        prefix=html.escape(prefix, quote=True),
         provider_buttons="\n".join(buttons),
         password_script=script,
     )
