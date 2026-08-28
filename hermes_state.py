@@ -12387,7 +12387,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "interrupted_tool_tail, finish_reason, reasoning, reasoning_content, reasoning_details, "
-        "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
+        "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
+        "_compressed_summary, timestamp, "
         "api_content, display_kind, display_metadata"
     )
 
