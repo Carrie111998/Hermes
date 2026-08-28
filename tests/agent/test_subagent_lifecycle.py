@@ -8,6 +8,7 @@ import pytest
 
 from agent import subagent_lifecycle as lifecycle_module
 from agent.subagent_lifecycle import (
+    SubagentHandle,
     SubagentInterruptionCause,
     SubagentInterruptionEvidence,
     SubagentInterruptionStage,
@@ -287,3 +288,29 @@ def test_conflicting_duplicate_callback_cannot_replace_terminal_result(lifecycle
         callback_id="same-callback",
     )
     assert lifecycle.result(handle) == original
+
+
+def test_handle_serialization_round_trips_generation(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="round-trip"))
+    assert handle.generation == 1
+    restored = SubagentHandle.from_dict(handle.to_dict())
+    assert restored == handle
+    assert restored.generation == 1
+    lifecycle.wait(handle, timeout_seconds=1)
+
+
+def test_legacy_handle_without_generation_is_accepted(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="legacy"))
+    payload = handle.to_dict()
+    payload.pop("generation")
+    legacy = SubagentHandle.from_dict(payload)
+    assert legacy.generation == 0
+    assert lifecycle.status(legacy).state is not SubagentState.UNKNOWN
+    lifecycle.wait(handle, timeout_seconds=1)
+
+
+def test_stale_generation_handle_is_rejected(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="stale-generation"))
+    stale = handle.__class__(**{**handle.to_dict(), "generation": handle.generation + 1})
+    assert lifecycle.status(stale).state is SubagentState.UNKNOWN
+    lifecycle.wait(handle, timeout_seconds=1)

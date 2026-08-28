@@ -52,7 +52,7 @@ class SubagentInterruptionCause(str, enum.Enum):
     """Authoritative reason associated with an interruption observation."""
 
     USER_CANCEL = "user_cancel"
-    USER = "user_cancel"
+    USER = "user_cancel"  # intentional alias of USER_CANCEL; same wire value
     TIMEOUT = "timeout"
     RESET = "reset"
     LEASE_LOSS = "lease_loss"
@@ -66,7 +66,7 @@ class SubagentInterruptionStage(str, enum.Enum):
 
     REQUESTED = "requested"
     SIGNAL_ACCEPTED = "signal_accepted"
-    SIGNAL = "signal_accepted"
+    SIGNAL = "signal_accepted"  # intentional alias of SIGNAL_ACCEPTED; same wire value
     OBSERVED = "observed"
     ACKNOWLEDGED = "acknowledged"
     VERIFIED_TERMINATION = "verified_termination"
@@ -705,6 +705,9 @@ class SubagentLifecycleService:
             record = _REGISTRY.records.get(handle.subagent_id)
             if record is None:
                 return None
+            # generation == 0 is a pre-field wildcard for serialized handles.
+            # It is not a freshness proof; authenticity is the capability HMAC
+            # and the active-parent session check above.
             if handle.generation not in (0, record.generation):
                 return None
             return record
