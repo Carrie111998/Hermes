@@ -189,6 +189,22 @@ def _make_hermes_provider_class() -> Optional[type]:
             request = await super()._refresh_token()
             return self._stamp_token_user_agent(request)
 
+        def _stamp_flow_user_agent(self, request):
+            """Stamp ``oauth.user_agent`` onto any UA-less SDK request.
+
+            The SDK builds metadata-discovery and dynamic-registration
+            requests as bare ``httpx.Request`` objects, so they never inherit
+            the client's default ``User-Agent``. WAFs that reject UA-less
+            requests (Revealed's ALB answers 403 to every such call, including
+            ``/.well-known/oauth-*`` and ``/register``) break the flow before
+            the browser step, so extend the configured value to the whole
+            flow — never overriding a UA the request already carries.
+            """
+            ua = getattr(self, "_hermes_token_user_agent", None)
+            if ua and request is not None and not request.headers.get("User-Agent"):
+                request.headers["User-Agent"] = ua
+            return request
+
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
             if 200 <= response.status_code < 300:
@@ -530,15 +546,17 @@ def _make_hermes_provider_class() -> Optional[type]:
             # generator via inner.asend(incoming), preserving the bidirectional
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
-            inner = super().async_auth_flow(request)
+            inner = super().async_auth_flow(self._stamp_flow_user_agent(request))
             try:
-                outgoing = await inner.__anext__()
+                outgoing = self._stamp_flow_user_agent(await inner.__anext__())
                 while True:
                     incoming = yield outgoing
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
-                    outgoing = await inner.asend(incoming)
+                    outgoing = self._stamp_flow_user_agent(
+                        await inner.asend(incoming)
+                    )
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.

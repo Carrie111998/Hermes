@@ -175,3 +175,163 @@ def test_user_agent_does_not_disturb_token_auth_preparation(tmp_path, monkeypatc
 
     assert exchange.headers["User-Agent"] == "UA/1"
     assert exchange.headers.get("Authorization", "").startswith("Basic ")
+
+
+# ---------------------------------------------------------------------------
+# Discovery and dynamic registration (the whole auth flow)
+#
+# The SDK builds metadata-discovery and /register requests as bare
+# httpx.Request objects, so they carry NO User-Agent at all. A WAF that
+# rejects UA-less requests answers 403 to /.well-known/oauth-* and
+# /register, and the flow dies with "Registration failed: 403" before the
+# browser ever opens.
+# ---------------------------------------------------------------------------
+
+
+def _drive_flow_until_authorize(provider, responses):
+    """Run the provider's real async_auth_flow, replying from ``responses``.
+
+    Returns the list of outbound requests the flow produced. ``responses`` maps
+    a URL suffix to the httpx.Response to feed back; an unscripted URL ends the
+    drive, so the flow is stopped at the dynamic-registration POST rather than
+    proceeding into the browser/loopback-callback step.
+    """
+    import httpx
+
+    sent = []
+
+    async def _run():
+        initial = httpx.Request(
+            "POST", "https://mcp.example.com/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        gen = provider.async_auth_flow(initial)
+        outbound = await gen.__anext__()
+        for _ in range(12):
+            sent.append(outbound)
+            reply = None
+            for needle, response in responses.items():
+                if str(outbound.url).endswith(needle):
+                    reply = response
+                    break
+            if reply is None:  # unscripted (the /register POST) — stop here
+                await gen.aclose()
+                return
+            reply.request = outbound
+            try:
+                outbound = await gen.asend(reply)
+            except StopAsyncIteration:
+                return
+
+    asyncio.run(_run())
+    return sent
+
+
+def _waf_responses():
+    """A 401 challenge, then metadata/registration replies."""
+    import httpx
+
+    return {
+        "/mcp": httpx.Response(
+            401,
+            headers={
+                "www-authenticate": 'Bearer error="invalid_token", '
+                'resource_metadata='
+                '"https://mcp.example.com/.well-known/oauth-protected-resource"'
+            },
+        ),
+        "oauth-protected-resource": httpx.Response(
+            200,
+            json={
+                "resource": "https://mcp.example.com",
+                "authorization_servers": ["https://mcp.example.com"],
+            },
+        ),
+        "oauth-authorization-server": httpx.Response(
+            200,
+            json={
+                "issuer": "https://mcp.example.com",
+                "authorization_endpoint": "https://mcp.example.com/oauth/authorize",
+                "token_endpoint": "https://mcp.example.com/oauth/token",
+                "registration_endpoint": "https://mcp.example.com/register",
+                "response_types_supported": ["code"],
+            },
+        ),
+    }
+
+
+def _assert_registration_reached(sent):
+    """The drive must have gotten as far as the /register POST."""
+    assert any(str(r.url).endswith("/register") for r in sent), (
+        f"flow never reached dynamic registration; sent={[str(r.url) for r in sent]}"
+    )
+
+
+@pytest.mark.parametrize("builder", [
+    pytest.param(build_oauth_auth, id="build_oauth_auth"),
+    pytest.param(_manager_builder, id="oauth_manager"),
+])
+def test_discovery_and_registration_carry_the_configured_user_agent(
+    builder, tmp_path, monkeypatch
+):
+    """Every request in the flow gets the UA — not just the token endpoint.
+
+    Without this, a UA-rejecting WAF 403s discovery/registration and the
+    OAuth flow fails before the browser step.
+    """
+    provider = _build_provider_via(
+        builder, monkeypatch, tmp_path,
+        {"user_agent": "hermes-agent/1.0", "cimd": False},
+    )
+
+    sent = _drive_flow_until_authorize(provider, _waf_responses())
+
+    _assert_registration_reached(sent)
+    for request in sent:
+        assert request.headers.get("User-Agent") == "hermes-agent/1.0", (
+            f"{request.url} went out without the configured User-Agent"
+        )
+
+
+@pytest.mark.parametrize("builder", [
+    pytest.param(build_oauth_auth, id="build_oauth_auth"),
+    pytest.param(_manager_builder, id="oauth_manager"),
+])
+def test_flow_requests_keep_their_own_user_agent(builder, tmp_path, monkeypatch):
+    """A UA already on the request is never overwritten."""
+    import httpx
+
+    provider = _build_provider_via(
+        builder, monkeypatch, tmp_path,
+        {"user_agent": "hermes-agent/1.0", "cimd": False},
+    )
+
+    async def _run():
+        initial = httpx.Request(
+            "POST", "https://mcp.example.com/mcp",
+            headers={"User-Agent": "caller/9"},
+        )
+        gen = provider.async_auth_flow(initial)
+        first = await gen.__anext__()
+        return first
+
+    assert asyncio.run(_run()).headers["User-Agent"] == "caller/9"
+
+
+@pytest.mark.parametrize("builder", [
+    pytest.param(build_oauth_auth, id="build_oauth_auth"),
+    pytest.param(_manager_builder, id="oauth_manager"),
+])
+def test_unconfigured_user_agent_leaves_flow_requests_untouched(
+    builder, tmp_path, monkeypatch
+):
+    """No oauth.user_agent → the flow behaves exactly as before."""
+    provider = _build_provider_via(builder, monkeypatch, tmp_path, {"cimd": False})
+
+    sent = _drive_flow_until_authorize(provider, _waf_responses())
+
+    _assert_registration_reached(sent)
+    for request in sent:
+        if str(request.url).endswith("/mcp"):
+            continue  # the caller's own request, not built by the SDK
+        assert request.headers.get("User-Agent") is None
