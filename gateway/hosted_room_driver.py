@@ -46,10 +46,12 @@ TASK_STATUSES = frozenset({
 TERMINAL_STATUSES = frozenset({"settled", "failed", "cancelled"})
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
-_TASK_PAYLOAD_REQUIRED_FIELDS = frozenset(
-    {"target_profile", "prompt", "source_event_seq"}
-)
-_TASK_PAYLOAD_OPTIONAL_FIELDS = frozenset({"target_member_id"})
+_TASK_PAYLOAD_REQUIRED_FIELDS = frozenset({
+    "target_profile",
+    "prompt",
+    "source_event_seq",
+})
+_TASK_PAYLOAD_OPTIONAL_FIELDS = frozenset({"attachments", "target_member_id"})
 _LEASE_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -251,6 +253,13 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
         normalized["target_member_id"] = _identifier(
             value["target_member_id"], label="target_member_id"
         )
+    if "attachments" in value:
+        from gateway.hosted_room_attachments import validate_task_manifest
+
+        attachments = validate_task_manifest(value["attachments"])
+        if not attachments:
+            raise DriverValidationError("attachments must not be empty when present")
+        normalized["attachments"] = attachments
     encoded = json.dumps(
         normalized,
         ensure_ascii=True,
