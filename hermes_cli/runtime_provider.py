@@ -779,7 +779,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
-                        "model": entry.get("default_model", ""),
+                        # The named providers.<key> dict's default-model field is
+                        # keyed ``default_model`` by the CLI picker but ``model``
+                        # by the Desktop custom-endpoint panel (#71298). Treat
+                        # them as synonyms so whichever surface wrote it, the
+                        # runtime resolves it.
+                        "model": entry.get("default_model") or entry.get("model") or "",
                     }
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
