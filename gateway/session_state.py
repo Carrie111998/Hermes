@@ -73,6 +73,9 @@ class TurnState:
     # preserves that: release/rebind only match when generation is current.
     lease_token: Any = None
     lease_generation: Optional[int] = None
+    # MessageEvent.message_id of the event that started this turn; used by
+    # edit-supersede (#35535) to correlate inbound edits with in-flight turns.
+    active_message_id: Optional[str] = None
 
     def clear(self) -> None:
         """Reset the per-turn slot (agent / start ts / lease / busy-ack).
@@ -85,6 +88,7 @@ class TurnState:
         self.started_ts = 0.0
         self.lease = None
         self.busy_ack_ts = 0.0
+        self.active_message_id = None
 
 
 @dataclass
