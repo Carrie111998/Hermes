@@ -8,6 +8,7 @@ import { Progress } from '@/components/ui/progress'
 import { getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Check, ChevronDown, ChevronLeft, KeyRound, Loader2 } from '@/lib/icons'
+import { isSubmitEnter } from '@/lib/ime'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { cn } from '@/lib/utils'
 import { $desktopBoot, type DesktopBootState } from '@/store/boot'
@@ -666,7 +667,7 @@ export function ApiKeyForm({
           autoFocus
           className="font-mono"
           onChange={e => setValue(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && void submit()}
+          onKeyDown={e => isSubmitEnter(e) && void submit()}
           placeholder={
             currentRedacted ??
             (alreadySet ? t.onboarding.replaceCurrent : option.placeholder || t.onboarding.pasteApiKey)
@@ -679,7 +680,7 @@ export function ApiKeyForm({
             autoComplete="off"
             className="font-mono"
             onChange={e => setLocalKey(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && void submit()}
+            onKeyDown={e => isSubmitEnter(e) && void submit()}
             placeholder={t.onboarding.localApiKeyPlaceholder}
             type="password"
             value={localKey}

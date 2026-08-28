@@ -25,6 +25,7 @@ import type {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
+import { isSubmitEnter } from '@/lib/ime'
 import { DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { setMainModelAssignment } from '@/store/cron-model-impact'
@@ -811,7 +812,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                   className={cn('min-w-60 flex-1', CONTROL_TEXT)}
                   onChange={event => setApiKeyDraft(event.target.value)}
                   onKeyDown={event => {
-                    if (event.key === 'Enter') {
+                    if (isSubmitEnter(event)) {
                       void activateApiKeyProvider()
                     }
                   }}

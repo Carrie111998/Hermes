@@ -20,6 +20,7 @@ import { usePointerQuiet } from '@/components/ui/keyboard-first'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isSubmitEnter } from '@/lib/ime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
@@ -330,7 +331,7 @@ export function ModelCatalogMenu({
             event.preventDefault()
             event.stopPropagation()
             stepKb(event.key === 'ArrowDown' ? 1 : -1)
-          } else if (event.key === 'Enter') {
+          } else if (isSubmitEnter(event)) {
             event.preventDefault()
             event.stopPropagation()
             commitKbRow()
