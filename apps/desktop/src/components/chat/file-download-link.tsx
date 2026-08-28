@@ -1,5 +1,7 @@
+import { useStore } from '@nanostores/react'
 import { type ComponentProps, useState } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { translateNow } from '@/i18n'
 import { downloadGatewayMediaFile, mediaExternalUrl, mediaName } from '@/lib/media'
 import { isUnsafeRevealPath } from '@/lib/reveal-path-guard'
@@ -19,6 +21,7 @@ interface FileDownloadLinkProps extends Omit<ComponentProps<'a'>, 'download' | '
  * copied instead of opened in their associated application.
  */
 export function FileDownloadLink({ children, className, path, ...props }: FileDownloadLinkProps) {
+  const storedSessionId = useStore(useSessionView().$storedId)
   const [saving, setSaving] = useState(false)
   const name = mediaName(path)
   const unsafe = isUnsafeRevealPath(path)
@@ -31,7 +34,7 @@ export function FileDownloadLink({ children, className, path, ...props }: FileDo
     setSaving(true)
 
     try {
-      const result = await downloadGatewayMediaFile(path)
+      const result = await downloadGatewayMediaFile(path, storedSessionId)
 
       if (result.saved && !result.canceled) {
         notify({ durationMs: 1500, kind: 'info', message: translateNow('fileMenu.downloadSaved') })

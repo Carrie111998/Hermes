@@ -15,6 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 
+import { sensitiveFileBlockReason } from './hardening'
 import { isUnsafeRevealPath } from './reveal-path-guard'
 
 // Minimal shape of the response objects we consume. Both Node's
@@ -335,7 +336,7 @@ export function filenameFromContentDisposition(value: unknown): string {
 export function gatewayFilePath(rawPath: unknown): string {
   const value = String(rawPath || '').trim()
 
-  if (!value || isUnsafeRevealPath(value)) {
+  if (!value || isUnsafeRevealPath(value) || sensitiveFileBlockReason(value)) {
     return ''
   }
 
@@ -346,11 +347,11 @@ export function gatewayFilePath(rawPath: unknown): string {
   try {
     const normalized = normalizeGatewayFilePath(decodeURIComponent(new URL(value).pathname))
 
-    return isUnsafeRevealPath(normalized) ? '' : normalized
+    return isUnsafeRevealPath(normalized) || sensitiveFileBlockReason(normalized) ? '' : normalized
   } catch {
     const normalized = normalizeGatewayFilePath(value.replace(/^file:\/\//i, ''))
 
-    return isUnsafeRevealPath(normalized) ? '' : normalized
+    return isUnsafeRevealPath(normalized) || sensitiveFileBlockReason(normalized) ? '' : normalized
   }
 }
 

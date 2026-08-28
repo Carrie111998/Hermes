@@ -1,6 +1,7 @@
 import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import { capitalize } from '@/lib/text'
 import { $connection } from '@/store/session'
+import { knownOwnerForSession } from '@/store/session-states'
 
 export type MediaKind = 'audio' | 'image' | 'video' | 'file'
 
@@ -204,19 +205,24 @@ export async function gatewayMediaDataUrl(path: string): Promise<string> {
 // avoids browser/OS downloads losing OAuth cookies and avoids the data-URL cap
 // used by preview endpoints.
 export async function downloadGatewayMediaFile(
-  path: string
+  path: string,
+  sessionId?: null | string
 ): Promise<{ canceled?: boolean; path?: string; saved: boolean }> {
   const file = filePathFromMediaPath(path)
   const conn = $connection.get()
+  const owner = knownOwnerForSession(sessionId)
+  const route = owner && typeof owner === 'object' ? owner : null
+  const connectionId = route?.connectionId || conn?.connectionId
+  const profile = route?.targetProfile || route?.profile || (typeof owner === 'string' ? owner : conn?.profile)
 
   if (!window.hermesDesktop?.saveGatewayFile) {
     throw new Error('Desktop file download bridge is unavailable')
   }
 
   return window.hermesDesktop.saveGatewayFile({
-    connectionId: conn?.connectionId,
+    connectionId,
     path: file,
-    profile: conn?.profile,
+    profile,
     suggestedName: mediaName(file)
   })
 }

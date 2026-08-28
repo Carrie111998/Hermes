@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $connection } from '@/store/session'
+import { $connection, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
 
 import {
   downloadGatewayMediaFile,
@@ -243,6 +243,7 @@ describe('downloadGatewayMediaFile', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    _resetSessionOwnerHintsForTests({ storage: true })
     $connection.set(null)
   })
 
@@ -257,6 +258,25 @@ describe('downloadGatewayMediaFile', () => {
       path: '/Users/me/project/a b.md',
       profile: 'docker-gw',
       suggestedName: 'a b.md'
+    })
+  })
+
+  it('pins a transcript download to the viewed session owner, not the ambient connection', async () => {
+    setSessionOwnerHint('stored-remote', {
+      connectionId: 'session-ssh',
+      mode: 'remote',
+      profile: 'desktop-name',
+      targetProfile: 'gateway-name'
+    })
+    $connection.set({ connectionId: 'ambient-local', mode: 'local', profile: 'default' } as never)
+
+    await downloadGatewayMediaFile('/srv/report.md', 'stored-remote')
+
+    expect(saveGatewayFile).toHaveBeenCalledWith({
+      connectionId: 'session-ssh',
+      path: '/srv/report.md',
+      profile: 'gateway-name',
+      suggestedName: 'report.md'
     })
   })
 

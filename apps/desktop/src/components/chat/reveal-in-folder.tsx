@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { type ReactNode, useState } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
 import {
   ContextMenu,
@@ -15,7 +16,7 @@ import { revealDesktopPath } from '@/lib/desktop-fs'
 import { pickRevealLabel } from '@/lib/file-manager'
 import { isUnsafeRevealPath } from '@/lib/reveal-path-guard'
 import { notify, notifyError } from '@/store/notifications'
-import { $connection } from '@/store/session'
+import { isSessionRemote } from '@/store/session-states'
 
 /**
  * Right-click menu over a transcript file affordance (filename download link,
@@ -29,10 +30,10 @@ import { $connection } from '@/store/session'
  */
 export function RevealInFolderTrigger({ children, path }: { children: ReactNode; path: string }) {
   const { t } = useI18n()
-  const connection = useStore($connection)
+  const storedSessionId = useStore(useSessionView().$storedId)
   const [open, setOpen] = useState(false)
 
-  if (connection?.mode === 'remote') {
+  if (isSessionRemote(storedSessionId)) {
     return <>{children}</>
   }
 

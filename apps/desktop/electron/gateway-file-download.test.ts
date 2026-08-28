@@ -422,6 +422,14 @@ test('gatewayFilePath rejects network and device paths before any download reque
   }
 })
 
+test('gatewayFilePath matches the main file guard for credential dotfiles', () => {
+  for (const value of ['/tmp/.env', '/home/me/.netrc', 'C:\\Users\\me\\.npmrc', 'file:///tmp/.pypirc']) {
+    assert.equal(gatewayFilePath(value), '', value)
+  }
+
+  assert.equal(gatewayFilePath('/tmp/.env.example'), '/tmp/.env.example')
+})
+
 test('isNotFoundError matches only HTTP 404', () => {
   const notFound: any = new Error('404: missing')
 
