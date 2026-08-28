@@ -1543,8 +1543,9 @@ def _skill_manage_batch(
 
     Scope rules:
     - all ops target the top-level ``name`` (one skill per batch);
-    - ``delete`` is not batchable (it's a standalone decision, and its
-      recoverable-archive path doesn't compose with rollback);
+    - ``delete`` only as the SOLE op (its recoverable-archive path doesn't
+      compose with rollback) — routed straight to the single-op handler,
+      preserving absorbed_into/archive semantics;
     - ``create`` only as the FIRST op.
     """
     import shutil
@@ -1555,19 +1556,32 @@ def _skill_manage_batch(
         return tool_error("operations must be a non-empty array.", success=False)
     if len(operations) > _BATCH_MAX_OPS:
         return tool_error(f"operations is capped at {_BATCH_MAX_OPS} ops per call.", success=False)
+    # delete: sole-op only; route through the normal single-op path so the
+    # gate, archive, ledger, and curator absorbed_into semantics all apply.
+    if any(isinstance(op, dict) and op.get("action") == "delete" for op in operations):
+        if len(operations) != 1:
+            return tool_error(
+                "delete must be the SOLE op in its call — it doesn't "
+                "compose with other ops' rollback.",
+                success=False,
+            )
+        op = operations[0]
+        return skill_manage(
+            action="delete",
+            name=name,
+            absorbed_into=op.get("absorbed_into"),
+            task_id=task_id,
+            session_id=session_id,
+        )
     for i, op in enumerate(operations):
         if not isinstance(op, dict) or not op.get("action"):
             return tool_error(f"operations[{i}] needs an 'action'.", success=False)
         act = op["action"]
-        if act == "delete":
-            return tool_error(
-                "delete is not batchable — call it as a standalone action.",
-                success=False,
-            )
         if act not in _BATCH_OP_ACTIONS:
             return tool_error(
                 f"operations[{i}]: unknown action '{act}'. "
-                f"Batchable: {', '.join(sorted(_BATCH_OP_ACTIONS))}.",
+                f"Batchable: {', '.join(sorted(_BATCH_OP_ACTIONS))}; "
+                "delete must be sole.",
                 success=False,
             )
         if act == "create" and i != 0:
@@ -1926,118 +1940,100 @@ def skill_manage(
 
 SKILL_MANAGE_SCHEMA = {
     "name": "skill_manage",
+    # ONE call shape (memory-tool pattern, maintainer-directed): every call
+    # is an operations array on one skill — a single edit is a list of one.
+    # The legacy flat fields (action/content/old_string/...) are still
+    # ACCEPTED by the handler for old transcripts and staged-write replay,
+    # but no longer advertised. absorbed_into: see NOTE below.
     "description": (
         "Create, update, or delete skills — your procedural memory for "
-        f"recurring task types. Actions: create (lands in {display_hermes_home()}/skills/), "
-        "patch (targeted old_string/new_string fix — preferred), delete, "
-        "write_file/remove_file (supporting files). Existing skills are "
-        "modified wherever they live. Keep the description's first 57 chars "
-        "a self-contained trigger: 'Use when <trigger>. <one-line "
-        "behavior>.' — skill_view() shows full format conventions."
+        "recurring task types. Every call applies an operations array to "
+        "ONE skill, atomically (a single edit is a list of one; a failure "
+        "rolls the skill back). Ops: create (full SKILL.md; lands in "
+        f"{display_hermes_home()}/skills/), patch (targeted "
+        "old_string/new_string fix — preferred; content alone REPLACES the "
+        "whole file, read it via skill_view() first), write_file/"
+        "remove_file (supporting files), delete (sole op only). Existing "
+        "skills are modified wherever they live. Keep the description's "
+        "first 57 chars a self-contained trigger: 'Use when <trigger>. "
+        "<one-line behavior>.' — skill_view() shows format conventions."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {
+            "name": {
                 "type": "string",
-                "enum": ["create", "patch", "delete", "write_file", "remove_file"],
-                "description": "The action to perform. Omit when using 'operations'."
+                "description": (
+                    "Skill name (lowercase, hyphens/underscores, max 64 "
+                    "chars); an existing skill's name unless creating."
+                )
             },
             "operations": {
                 "type": "array",
                 "description": (
-                    "Batch shape: several operations on THIS skill, atomic "
-                    "(any failure rolls the whole skill back). Items carry "
-                    "an action plus that action's fields; create only "
-                    "first, delete not batchable. E.g. create + its "
-                    "reference files in one call."
+                    "Ordered ops for this skill. create first-only; "
+                    "delete alone-only."
                 ),
                 "items": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["create", "patch", "write_file", "remove_file"]
+                            "enum": ["create", "patch", "delete", "write_file", "remove_file"]
                         },
-                        "content": {"type": "string"},
-                        "category": {"type": "string"},
-                        "file_path": {"type": "string"},
-                        "file_content": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"},
-                        "replace_all": {"type": "boolean"}
+                        "content": {
+                            "type": "string",
+                            "description": (
+                                "Full SKILL.md text (YAML frontmatter + "
+                                "markdown body) for create, or a full "
+                                "rewrite on patch."
+                            )
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": "Optional category subdir for create (e.g. 'devops')."
+                        },
+                        # patch args: same fuzzy-matching semantics as the
+                        # `patch` tool — teach only skill-specific facts here.
+                        "old_string": {
+                            "type": "string",
+                            "description": "Text to find (patch; same matching semantics as the patch tool)."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Replacement (patch); empty string deletes the match."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "patch: replace all occurrences (default false)."
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": (
+                                "Path RELATIVE to the skill's own directory, "
+                                "e.g. 'references/api.md' — no leading slash, "
+                                "never absolute. write_file/remove_file: "
+                                "required; first segment references/, "
+                                "templates/, scripts/, or assets/. patch: "
+                                "optional (default SKILL.md)."
+                            )
+                        },
+                        "file_content": {
+                            "type": "string",
+                            "description": "Content for write_file."
+                        }
                     },
                     "required": ["action"]
                 }
             },
-            "name": {
-                "type": "string",
-                "description": (
-                    "Skill name (lowercase, hyphens/underscores, max 64 "
-                    "chars); an existing skill's name for every action "
-                    "except create."
-                )
-            },
-            "content": {
-                "type": "string",
-                "description": (
-                    "Full SKILL.md content (YAML frontmatter + markdown "
-                    "body). Required for 'create'. On 'patch' (without "
-                    "old_string) it REPLACES the whole file — read it via "
-                    "skill_view() first."
-                )
-            },
-            # patch args: same fuzzy-matching semantics as the `patch` tool
-            # (uniqueness unless replace_all, context-for-uniqueness advice
-            # lives there) — teach only the skill-specific facts here.
-            "old_string": {
-                "type": "string",
-                "description": (
-                    "Text to find (for 'patch'; same matching semantics as "
-                    "the patch tool)."
-                )
-            },
-            "new_string": {
-                "type": "string",
-                "description": (
-                    "Replacement text (for 'patch'); empty string deletes "
-                    "the match."
-                )
-            },
-            "replace_all": {
-                "type": "boolean",
-                "description": "For 'patch': replace all occurrences (default: false)."
-            },
-            "category": {
-                "type": "string",
-                "description": (
-                    "Optional category subdirectory for 'create' (e.g. "
-                    "'devops', 'mlops')."
-                )
-            },
-            "file_path": {
-                "type": "string",
-                "description": (
-                    "Path RELATIVE to the skill's own directory, e.g. "
-                    "'references/api.md' — no leading slash, never absolute. "
-                    "write_file/remove_file: required; first segment must be "
-                    "references/, templates/, scripts/, or assets/. patch: "
-                    "optional (default SKILL.md)."
-                )
-            },
-            "file_content": {
-                "type": "string",
-                "description": "Content for write_file."
-            },
-            # NOTE: the handler also accepts `absorbed_into` on delete — the
-            # curator's consolidation pass declares merge-vs-prune intent with
-            # it. Deliberately NOT advertised in this schema: only curator
-            # sessions need it, the curator's own prompt documents it, and the
-            # curator-context delete guard's error re-teaches it on omission
-            # (_curator_consolidation_delete_guard). Keeping it out saves
-            # ~100 tokens on every call of every other session.
+            # NOTE: the handler also accepts the legacy flat single-op shape
+            # (action/content/old_string/new_string/replace_all/category/
+            # file_path/file_content) — old transcripts and staged-write
+            # replay depend on it — plus `absorbed_into` on delete ops
+            # (curator-only vocabulary; the curator's prompt documents it and
+            # the delete guard's error re-teaches it). None are advertised.
         },
-        "required": ["name"],  # action for single ops; operations for batch
+        "required": ["name", "operations"],
     },
 }
 

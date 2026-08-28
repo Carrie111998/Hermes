@@ -71,10 +71,19 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.home, "skills", "fresh")))
 
     def test_validation_rules(self):
-        # delete not batchable
+        # delete as SOLE op routes to the real delete (works)
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
         r = self._call("probe", [{"action": "delete"}])
+        self.assertTrue(r["success"], r)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "skills", "probe")))
+        # delete mixed with other ops rejected
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        r = self._call("probe", [
+            {"action": "patch", "old_string": "Step 1.", "new_string": "X."},
+            {"action": "delete"},
+        ])
         self.assertFalse(r["success"])
-        self.assertIn("standalone", r["error"])
+        self.assertIn("SOLE", r["error"])
         # create must be first
         r = self._call("x", [
             {"action": "write_file", "file_path": "references/a.md", "file_content": "a"},
