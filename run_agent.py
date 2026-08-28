@@ -144,6 +144,10 @@ from model_tools import (
 from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
+from tools.tool_result_sanitization import (
+    sanitize_tool_result_for_sink,
+    sanitize_tool_result_projection_for_sink,
+)
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -2352,6 +2356,19 @@ class AIAgent:
                     and sanitize_context(content).strip() != content.strip()
                 ):
                     _row_api_content = content
+                # The session database is a durable external sink.  Tool
+                # results can arrive here through bypass/transform paths that
+                # did not pass through the primary executor, so enforce the
+                # same projection at the writer boundary rather than relying
+                # on upstream callers.  Keep model-facing messages untouched;
+                # only the row values handed to SQLite are sanitized.
+                if role == "tool":
+                    if content is not None:
+                        content = sanitize_tool_result_for_sink(content)
+                    if _row_api_content is not None:
+                        _row_api_content = sanitize_tool_result_for_sink(
+                            _row_api_content
+                        )
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
@@ -2374,6 +2391,10 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                if role == "tool" and tool_calls_data is not None:
+                    tool_calls_data = sanitize_tool_result_projection_for_sink(
+                        tool_calls_data
+                    )
                 _row = {
                     "role": role,
                     "content": content,

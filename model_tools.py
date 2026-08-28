@@ -39,7 +39,10 @@ from tools.registry import (
     tool_error,
 )
 from toolsets import resolve_toolset, validate_toolset
-from tools.tool_result_sanitization import sanitize_tool_result_for_sink
+from tools.tool_result_sanitization import (
+    sanitize_tool_result_for_sink,
+    sanitize_tool_result_projection_for_sink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1227,7 +1230,7 @@ def _emit_post_tool_call_hook(
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
-            args=function_args,
+            args=sanitize_tool_result_projection_for_sink(function_args),
             result=safe_result,
             task_id=task_id or "",
             session_id=session_id or "",
@@ -1238,10 +1241,15 @@ def _emit_post_tool_call_hook(
             status=status,
             error_type=error_type,
             error_message=safe_error_message,
-            middleware_trace=list(middleware_trace or []),
+            middleware_trace=sanitize_tool_result_projection_for_sink(
+                list(middleware_trace or [])
+            ),
         )
     except Exception as _hook_err:
-        logger.debug("post_tool_call hook error: %s", _hook_err)
+        logger.debug(
+            "post_tool_call hook error: %s",
+            sanitize_tool_result_for_sink(_hook_err),
+        )
 
 
 def handle_function_call(
@@ -1629,7 +1637,7 @@ def handle_function_call(
                 hook_results = invoke_hook(
                     "transform_tool_result",
                     tool_name=function_name,
-                    args=function_args,
+                    args=sanitize_tool_result_projection_for_sink(function_args),
                     result=safe_result,
                     task_id=task_id or "",
                     session_id=session_id or "",
@@ -1646,7 +1654,10 @@ def handle_function_call(
                         result = hook_result
                         break
         except Exception as _hook_err:
-            logger.debug("transform_tool_result hook error: %s", _hook_err)
+            logger.debug(
+                "transform_tool_result hook error: %s",
+                sanitize_tool_result_for_sink(_hook_err),
+            )
 
         return result
 
@@ -1679,8 +1690,10 @@ def handle_function_call(
             duration_ms=duration_ms,
             status="error",
             error_type=type(e).__name__,
-            error_message=str(e),
-            middleware_trace=list(_tool_middleware_trace),
+            error_message=sanitize_tool_result_for_sink(e),
+            middleware_trace=sanitize_tool_result_projection_for_sink(
+                list(_tool_middleware_trace)
+            ),
         )
         return result
 

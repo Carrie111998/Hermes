@@ -1,5 +1,8 @@
 """Tests for tools/tool_result_storage.py -- 3-layer tool result persistence."""
 
+import multiprocessing
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +28,18 @@ from tools.tool_result_storage import (
     get_spillover_dir,
     maybe_persist_tool_result,
 )
+
+
+def _cross_process_spillover_writer(barrier, queue):
+    """Publish the same logical filename from an independent process."""
+    import tools.tool_result_storage as storage
+
+    barrier.wait(timeout=10)
+    path = storage._write_to_spillover(
+        "opaque-r3-process-race-SECRET-123456",
+        "same-name.txt",
+    )
+    queue.put(path)
 
 
 # ── generate_preview ──────────────────────────────────────────────────
@@ -272,6 +287,34 @@ class TestMaybePersistToolResult:
         stored = open(stored_path, encoding="utf-8").read()
         assert sentinel not in stored
         assert "redacted" in stored
+
+    def test_same_name_publication_is_unique_across_processes(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(2)
+        queue = context.Queue()
+        workers = [
+            context.Process(
+                target=_cross_process_spillover_writer,
+                args=(barrier, queue),
+            )
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+        assert all(worker.exitcode == 0 for worker in workers)
+        paths = [queue.get(timeout=5) for _ in workers]
+        assert all(paths)
+        spill_dir = tmp_path / ".hermes" / "cache" / "spillover"
+        files = sorted(spill_dir.glob("*.txt"))
+        assert len(files) == 2
+        assert len({Path(path).name for path in paths}) == 2
+        for path in files:
+            stored = path.read_text(encoding="utf-8")
+            assert "opaque-r3-process-race-SECRET-123456" not in stored
+            assert "redacted" in stored
 
 
     def test_tool_use_id_cannot_escape_storage_dir(self):

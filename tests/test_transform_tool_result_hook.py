@@ -185,6 +185,34 @@ def test_transform_hook_receives_sink_safe_projection(monkeypatch):
     assert "redacted" in captured["result"].lower()
 
 
+def test_hooks_receive_sink_safe_args_and_middleware_trace(monkeypatch):
+    raw = "opaque-r3-hook-SECRET-123456"
+    captured = {}
+
+    def _hook(hook_name, **kwargs):
+        captured[hook_name] = kwargs
+        return []
+
+    _run_handle_function_call(
+        monkeypatch,
+        tool_args={
+            "nested": {"credential": raw},
+            "url": f"https://example.test/callback?token={raw}",
+        },
+        invoke_hook=_hook,
+    )
+    # Inject the trace through the real public dispatcher path as well.
+    model_tools._emit_post_tool_call_hook(
+        function_name="dummy_tool",
+        function_args={"x": raw},
+        result="ok",
+        middleware_trace=[{"trace": raw, "bytes": b"safe"}],
+    )
+    for payload in captured.values():
+        assert raw not in repr(payload)
+        assert "redacted" in repr(payload).lower()
+
+
 def test_dispatch_exception_log_has_no_raw_traceback(caplog, monkeypatch):
     raw = "lowercasecredential1234567890abcde"
     from tools.registry import registry

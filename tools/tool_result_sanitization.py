@@ -182,18 +182,8 @@ def _mask_structured_secret_values(value: Any, *, key: str | None = None) -> Any
     return _safe_value(value, key=key)
 
 
-def sanitize_tool_result_for_sink(content: Any) -> str:
-    """Return a textual, non-reusable representation safe for every sink.
-
-    The function is total for ordinary Python result values.  JSON/config
-    secret fields are masked recursively, exact active redaction patterns are
-    applied with URL credentials enabled, and opaque credential-shaped values
-    are removed without depending on a vendor prefix.  This function must be
-    called at each sink boundary; it is not used to alter model-facing raw
-    context.
-    """
-    structured = _mask_structured_secret_values(content)
-    text = _as_text(structured)
+def _sanitize_text_for_sink(text: str) -> str:
+    """Apply the textual sink policy after values are structurally bounded."""
     text = redact_sensitive_text(
         text,
         force=True,
@@ -223,3 +213,40 @@ def sanitize_tool_result_for_sink(content: Any) -> str:
     text = _KNOWN_TOKEN_RE.sub(_REDACTED, text)
     text = _OPAQUE_MARKER_RE.sub(_REDACTED, text)
     return _mask_opaque_tokens(text)
+
+
+def sanitize_tool_result_projection_for_sink(content: Any) -> Any:
+    """Return a JSON-compatible structured projection safe for extension sinks.
+
+    Unlike :func:`sanitize_tool_result_for_sink`, this preserves mapping and
+    sequence shape for callbacks that need structured arguments.  Every string
+    leaf and key still crosses the same textual redaction boundary, while
+    unsupported, cyclic, non-finite, and excessively nested values are replaced
+    by inert markers before a plugin/UI callback can observe them.
+    """
+    value = _mask_structured_secret_values(content)
+    if isinstance(value, str):
+        return _sanitize_text_for_sink(value)
+    if isinstance(value, dict):
+        return {
+            _sanitize_text_for_sink(key) if isinstance(key, str) else key:
+            sanitize_tool_result_projection_for_sink(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_tool_result_projection_for_sink(item) for item in value]
+    return value
+
+
+def sanitize_tool_result_for_sink(content: Any) -> str:
+    """Return a textual, non-reusable representation safe for every sink.
+
+    The function is total for ordinary Python result values.  JSON/config
+    secret fields are masked recursively, exact active redaction patterns are
+    applied with URL credentials enabled, and opaque credential-shaped values
+    are removed without depending on a vendor prefix.  This function must be
+    called at each sink boundary; it is not used to alter model-facing raw
+    context.
+    """
+    structured = _mask_structured_secret_values(content)
+    return _sanitize_text_for_sink(_as_text(structured))

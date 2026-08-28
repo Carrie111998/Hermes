@@ -221,6 +221,26 @@ class TestToolProgressDispatch:
         assert completed.kwargs["is_error"] is False
         assert completed.kwargs["result"] == "hi\n"
 
+    def test_started_callbacks_receive_sink_safe_args_and_preview(self):
+        raw = "opaque-r3-codex-start-SECRET-123456"
+        agent = _make_stub_agent()
+        agent.tool_start_callback = MagicMock(name="tool_start_callback")
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "mcpToolCall",
+            "id": "mcp-1",
+            "server": "remote",
+            "tool": "fetch",
+            "arguments": {"url": f"https://example.test/?token={raw}"},
+        }))
+
+        progress = agent.tool_progress_callback.call_args
+        start = agent.tool_start_callback.call_args
+        assert raw not in repr(progress)
+        assert raw not in repr(start)
+        assert "redacted" in repr(progress).lower()
+        assert "redacted" in repr(start).lower()
+
 
 
 
@@ -399,6 +419,76 @@ class TestBridgeWiredInRuntime:
         agent.tool_progress_callback.assert_called_once()
         assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
         assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
+
+
+def _minimal_runtime_agent(session):
+    return SimpleNamespace(
+        session_cwd=None,
+        _codex_session=session,
+        compression_checkpoint_required=False,
+        _interrupt_requested=False,
+        _iters_since_skill=0,
+        _skill_nudge_interval=0,
+        valid_tool_names=set(),
+        _session_db=None,
+        session_api_calls=0,
+    )
+
+
+def test_codex_turn_exception_sanitizes_log_and_returned_error(caplog):
+    from agent import codex_runtime
+
+    raw = "opaque-r3-codex-exception-SECRET-123456"
+
+    class BrokenSession:
+        def run_turn(self, **_kwargs):
+            raise RuntimeError(raw)
+
+        def close(self):
+            pass
+
+    agent = _minimal_runtime_agent(BrokenSession())
+    with caplog.at_level("ERROR", logger="agent.codex_runtime"):
+        result = codex_runtime.run_codex_app_server_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[],
+            effective_task_id="t",
+        )
+    assert raw not in caplog.text
+    assert raw not in repr(result)
+    assert result["partial"] is True
+
+
+def test_codex_turn_error_sanitizes_retirement_log_and_return(monkeypatch, caplog):
+    from agent import codex_runtime
+    from agent.transports.codex_app_server_session import TurnResult
+
+    raw = "opaque-r3-codex-retire-SECRET-654321"
+
+    class RetiringSession:
+        def run_turn(self, **_kwargs):
+            return TurnResult(error=raw, should_retire=True)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(codex_runtime, "_record_codex_app_server_compaction", lambda *a, **k: False)
+    monkeypatch.setattr(codex_runtime, "_record_codex_app_server_usage", lambda *a, **k: {})
+    agent = _minimal_runtime_agent(RetiringSession())
+    with caplog.at_level("WARNING", logger="agent.codex_runtime"):
+        result = codex_runtime.run_codex_app_server_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[],
+            effective_task_id="t",
+        )
+    assert raw not in caplog.text
+    assert raw not in repr(result)
+    assert result["error"] is not None
+    assert result["partial"] is True
 
 
 def test_codex_completion_callbacks_and_projection_redact_nested_result():
