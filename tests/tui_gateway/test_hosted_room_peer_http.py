@@ -20,6 +20,8 @@ class FakePeer(BaseHTTPRequestHandler):
     runs = {}
     idempotency = []
     approvals = []
+    attachment_manifest = None
+    attachment_uploads = []
 
     def _json(self, value, status=200):
         body = json.dumps(value).encode()
@@ -57,6 +59,16 @@ class FakePeer(BaseHTTPRequestHandler):
                 {"run_id": run_id, "status": "started", "replayed": False},
                 202,
             )
+        if self.path == "/v1/room-members/attachments":
+            type(self).attachment_manifest = body
+            return self._json(
+                {
+                    "object": "hermes.room_attachment_batch",
+                    "complete": False,
+                    "idempotent": False,
+                },
+                201,
+            )
         if self.path == "/v1/runs/run-1/stop":
             type(self).runs["run-1"]["status"] = "cancelled"
             return self._json({"run_id": "run-1", "status": "stopping"})
@@ -64,6 +76,21 @@ class FakePeer(BaseHTTPRequestHandler):
             type(self).approvals.append(body)
             return self._json({"run_id": "run-1", "resolved": 1})
         return self._json({"error": "not found"}, 404)
+
+    def do_PUT(self):
+        length = int(self.headers.get("Content-Length", 0))
+        data = self.rfile.read(length)
+        type(self).attachment_uploads.append(
+            (self.path, self.headers.get("Authorization"), data)
+        )
+        return self._json(
+            {
+                "object": "hermes.room_attachment",
+                "complete": True,
+                "idempotent": False,
+            },
+            201,
+        )
 
     def log_message(self, *args):
         pass
@@ -75,6 +102,8 @@ def peer_server():
     FakePeer.runs = {}
     FakePeer.idempotency = []
     FakePeer.approvals = []
+    FakePeer.attachment_manifest = None
+    FakePeer.attachment_uploads = []
     server = HTTPServer(("127.0.0.1", 0), FakePeer)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -107,6 +136,21 @@ def _dispatch(**overrides):
         "capability_digest": "a" * 64,
         "trace_id": "trace-1",
         **overrides,
+    }
+
+
+def _attachment_payload():
+    import hashlib
+
+    data = b"room attachment"
+    return {
+        "attachment_id": "att_0123456789abcdef0123456789abcdef",
+        "kind": "file",
+        "name": "brief.txt",
+        "size": len(data),
+        "mime": "text/plain",
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "data": data,
     }
 
 
@@ -176,6 +220,99 @@ def test_scoped_peer_runs_client_uses_logical_session_and_durable_run(peer_serve
             "content": "Remote review complete.",
         }
     ]
+
+
+def test_peer_client_stages_digest_bound_attachments_before_dispatch(peer_server):
+    from gateway.hosted_room_peer import attachment_manifest_digest
+
+    attachment = _attachment_payload()
+    manifest = [{key: value for key, value in attachment.items() if key != "data"}]
+    dispatch = _dispatch(
+        attachment_manifest_digest=attachment_manifest_digest(manifest)
+    )
+    client = PeerRunsHTTPClient(base_url=peer_server, api_key="")
+
+    result = client.stage_attachments(
+        dispatch=dispatch,
+        attachments=[attachment],
+        grant="signed.room.grant",
+    )
+
+    assert result["complete"] is True
+    assert FakePeer.attachment_manifest["attachments"] == manifest
+    assert FakePeer.attachment_uploads == [
+        (
+            "/v1/room-members/attachments/task-1/1/"
+            "att_0123456789abcdef0123456789abcdef",
+            "HermesRoom signed.room.grant",
+            b"room attachment",
+        )
+    ]
+
+
+@pytest.mark.parametrize("redirect_status", [301, 302, 303, 307, 308])
+def test_attachment_upload_never_follows_redirect_or_forwards_grant(
+    redirect_status,
+):
+    class RedirectPeer(BaseHTTPRequestHandler):
+        redirected_requests = []
+
+        def do_PUT(self):
+            if self.path == "/sink":
+                type(self).redirected_requests.append(
+                    (self.headers.get("Authorization"), self.rfile.read())
+                )
+                self.send_response(200)
+                self.end_headers()
+                return
+            self.send_response(redirect_status)
+            self.send_header("Location", "/sink")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RedirectPeer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PeerRunsHTTPClient(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            api_key="",
+        )
+        with pytest.raises(PeerRunsHTTPError, match="refused an HTTP redirect"):
+            client._put_attachment(
+                "/upload",
+                data=b"secret bytes",
+                grant="scoped.room.grant",
+            )
+        assert RedirectPeer.redirected_requests == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_attachment_staging_rejects_broad_fallback_and_corrupt_payload(peer_server):
+    from gateway.hosted_room_peer import attachment_manifest_digest
+
+    attachment = _attachment_payload()
+    manifest = [{key: value for key, value in attachment.items() if key != "data"}]
+    dispatch = _dispatch(
+        attachment_manifest_digest=attachment_manifest_digest(manifest)
+    )
+    client = PeerRunsHTTPClient(base_url=peer_server, api_key="k" * 32)
+    with pytest.raises(PeerRunsHTTPError, match="scoped room grant"):
+        client.stage_attachments(
+            dispatch=dispatch,
+            attachments=[attachment],
+            grant="",
+        )
+    with pytest.raises(PeerRunsHTTPError, match="do not match"):
+        client.stage_attachments(
+            dispatch=dispatch,
+            attachments=[{**attachment, "data": b"wrong"}],
+            grant="signed.room.grant",
+        )
 
 
 def test_scoped_peer_runs_client_stops_exact_run(peer_server):

@@ -140,6 +140,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_room_attachments as _room_attachments
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
@@ -2259,6 +2260,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
         ]
         routes.extend(_room_grants._http_routes(self))
+        routes.extend(_room_attachments._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -7533,11 +7535,37 @@ class APIServerAdapter(BasePlatformAdapter):
         request: "web.Request",
         body: Any,
     ) -> tuple[Any, "web.Response | None"]:
-        return await _room_dispatch._normalize_room_dispatch(
+        normalized, error = await _room_dispatch._normalize_room_dispatch(
             self,
             request,
             body,
             _api_server=sys.modules[__name__],
+        )
+        if error is not None:
+            return normalized, error
+        return await _room_attachments._validate_dispatch_attachments(
+            normalized,
+            _openai_error=_openai_error,
+        )
+
+    async def _handle_room_attachment_manifest(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        return await _room_attachments._handle_room_attachment_manifest(
+            self,
+            request,
+            _openai_error=_openai_error,
+            _api_request_profile=_api_request_profile,
+        )
+
+    async def _handle_room_attachment_upload(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        return await _room_attachments._handle_room_attachment_upload(
+            self,
+            request,
+            _openai_error=_openai_error,
+            _api_request_profile=_api_request_profile,
         )
 
     async def _handle_room_member_invitation(

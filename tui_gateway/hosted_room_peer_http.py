@@ -14,7 +14,12 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from gateway.hosted_room_peer import HostedMemberDispatch, validate_room_link_url
+from gateway.hosted_room_peer import (
+    HostedMemberDispatch,
+    attachment_manifest_digest,
+    canonical_attachment_manifest,
+    validate_room_link_url,
+)
 
 
 _NOT_ADMITTED_ERRNOS = frozenset(
@@ -82,6 +87,13 @@ class PeerRunsHTTPError(RuntimeError):
         self.needs_reauthorization = bool(
             status_code in {401, 403} and error_code == "invalid_room_grant"
         )
+
+
+class _RejectAttachmentRedirects(urllib.request.HTTPRedirectHandler):
+    """Never replay scoped grants or attachment bytes to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class PeerRunsHTTPClient:
@@ -233,6 +245,142 @@ class PeerRunsHTTPClient:
             "title": f"Group: {room_id}",
             "source": source,
         }
+
+    def stage_attachments(
+        self,
+        *,
+        dispatch: Mapping[str, Any],
+        attachments: Sequence[Mapping[str, Any]],
+        grant: str,
+    ) -> Mapping[str, Any]:
+        """Push one complete, digest-bound attachment set before admission."""
+        checked = HostedMemberDispatch.from_mapping(dispatch)
+        self._require_room_grant(grant)
+        payloads: list[tuple[dict[str, Any], bytes]] = []
+        manifest_input: list[dict[str, Any]] = []
+        for raw in attachments:
+            if not isinstance(raw, Mapping):
+                raise PeerRunsHTTPError("attachment payload must be an object")
+            unknown = set(raw) - {
+                "attachment_id",
+                "kind",
+                "name",
+                "size",
+                "mime",
+                "sha256",
+                "data",
+            }
+            if unknown or "data" not in raw:
+                raise PeerRunsHTTPError("attachment payload fields are invalid")
+            data = raw["data"]
+            if not isinstance(data, (bytes, bytearray)):
+                raise PeerRunsHTTPError("attachment data must be bytes")
+            metadata = {key: value for key, value in raw.items() if key != "data"}
+            manifest_input.append(metadata)
+            payloads.append((metadata, bytes(data)))
+        try:
+            manifest = canonical_attachment_manifest(manifest_input)
+        except ValueError as exc:
+            raise PeerRunsHTTPError(str(exc)) from exc
+        digest = attachment_manifest_digest(manifest)
+        if checked.attachment_manifest_digest != digest:
+            raise PeerRunsHTTPError(
+                "attachment manifest does not match the peer dispatch"
+            )
+        for metadata, data in payloads:
+            if (
+                len(data) != int(metadata["size"])
+                or hashlib.sha256(data).hexdigest() != metadata["sha256"]
+            ):
+                raise PeerRunsHTTPError(
+                    "attachment bytes do not match their manifest"
+                )
+        registered = self._request(
+            "/v1/room-members/attachments",
+            method="POST",
+            body={
+                "hosted_room_dispatch": checked.as_mapping(),
+                "attachments": manifest,
+            },
+            room_grant=grant,
+        )
+        result: Mapping[str, Any] = registered
+        for metadata, data in payloads:
+            path = (
+                "/v1/room-members/attachments/"
+                f"{urllib.parse.quote(checked.task_id, safe='')}/"
+                f"{checked.execution_generation}/"
+                f"{urllib.parse.quote(str(metadata['attachment_id']), safe='')}"
+            )
+            try:
+                result = self._put_attachment(path, data=data, grant=grant)
+            except PeerRunsHTTPError as exc:
+                if not exc.ambiguous:
+                    raise
+                result = self._put_attachment(path, data=data, grant=grant)
+        if not result.get("complete"):
+            raise PeerRunsHTTPError("peer attachment batch is incomplete")
+        return {
+            "complete": True,
+            "manifest_digest": digest,
+            "count": len(manifest),
+        }
+
+    def _put_attachment(
+        self,
+        path: str,
+        *,
+        data: bytes,
+        grant: str,
+    ) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            method="PUT",
+            headers={
+                "Authorization": f"HermesRoom {self._require_room_grant(grant)}",
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(data)),
+                "User-Agent": "Hermes-RoomLink/1.0",
+            },
+        )
+        opener = urllib.request.build_opener(_RejectAttachmentRedirects())
+        try:
+            with opener.open(request, timeout=self.timeout_seconds) as response:
+                raw = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                detail = str(exc)
+            if exc.code in {301, 302, 303, 307, 308}:
+                raise PeerRunsHTTPError(
+                    "peer attachment upload refused an HTTP redirect",
+                    status_code=exc.code,
+                ) from exc
+            raise PeerRunsHTTPError(
+                f"peer rejected attachment upload with HTTP {exc.code}: {detail}",
+                retryable=exc.code in {408, 425, 429} or exc.code >= 500,
+                ambiguous=exc.code >= 500,
+                status_code=exc.code,
+                error_code=_response_error_code(detail),
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise PeerRunsHTTPError(
+                f"peer attachment upload is unreachable: {exc}",
+                retryable=True,
+                ambiguous=not _is_proven_pre_admission_failure(exc),
+                not_admitted=_is_proven_pre_admission_failure(exc),
+            ) from exc
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            raise PeerRunsHTTPError(
+                "peer returned non-JSON attachment data"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise PeerRunsHTTPError("peer returned a non-object attachment response")
+        return payload
 
     def dispatch(
         self,

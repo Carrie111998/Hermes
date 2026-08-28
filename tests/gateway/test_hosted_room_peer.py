@@ -15,6 +15,8 @@ from gateway.hosted_room_peer import (
     HostedRoomPeerError,
     PROTOCOL_VERSION,
     RoomLinkProbe,
+    attachment_manifest_digest,
+    canonical_attachment_manifest,
     catalog_mapping,
     issue_room_grant,
     local_room_link_endpoint,
@@ -159,6 +161,46 @@ def test_dispatch_rejects_unknown_fields_and_prompt_digest_mismatch():
         _dispatch(prompt_digest="0" * 64)
 
 
+def test_attachment_manifest_digest_is_canonical_and_binds_dispatch():
+    manifest = [
+        {
+            "attachment_id": "att_0123456789abcdef0123456789abcdef",
+            "kind": "file",
+            "name": "brief.txt",
+            "size": 5,
+            "mime": "text/plain",
+            "sha256": hashlib.sha256(b"hello").hexdigest(),
+        }
+    ]
+    normalized = canonical_attachment_manifest(manifest)
+    digest = attachment_manifest_digest(manifest)
+    assert digest == attachment_manifest_digest(normalized)
+    dispatch = _dispatch(attachment_manifest_digest=digest)
+    assert dispatch.attachment_manifest_digest == digest
+    assert dispatch.as_mapping()["attachment_manifest_digest"] == digest
+
+
+def test_text_only_dispatch_remains_wire_compatible():
+    dispatch = _dispatch()
+    assert dispatch.attachment_manifest_digest is None
+    assert "attachment_manifest_digest" not in dispatch.as_mapping()
+
+
+def test_attachment_manifest_rejects_duplicate_or_oversized_entries():
+    entry = {
+        "attachment_id": "att_0123456789abcdef0123456789abcdef",
+        "kind": "file",
+        "name": "brief.bin",
+        "size": 1,
+        "mime": "application/octet-stream",
+        "sha256": hashlib.sha256(b"x").hexdigest(),
+    }
+    with pytest.raises(HostedRoomPeerError, match="unique"):
+        canonical_attachment_manifest([entry, entry])
+    with pytest.raises(HostedRoomPeerError, match="size"):
+        canonical_attachment_manifest([{**entry, "size": 9_000_001}])
+
+
 def test_room_grant_is_scoped_to_exact_room_home_target_and_profile():
     dispatch = _dispatch()
     token = issue_room_grant(
@@ -226,6 +268,39 @@ def test_room_grant_fails_closed_for_tamper_expiry_and_permission():
         )
     with pytest.raises(HostedRoomGrantError, match="signature"):
         verify_room_grant(SECRET, token[:-1] + "A", dispatch, now=105)
+
+
+def test_room_grant_attachment_permission_is_scoped_and_expiring():
+    dispatch = _dispatch()
+    token = issue_room_grant(
+        SECRET,
+        grant_id="grant-attachment",
+        room_id=dispatch.room_id,
+        home_install_id=dispatch.home_install_id,
+        authority_gateway_id=dispatch.authority_gateway_id,
+        authority_epoch=dispatch.authority_epoch,
+        member_id=dispatch.member_id,
+        target_install_id=dispatch.target_install_id,
+        target_profile=dispatch.target_profile,
+        permissions=("attachment.stage",),
+        issued_at=100,
+        ttl_seconds=10,
+    )
+    assert verify_room_grant(
+        SECRET,
+        token,
+        dispatch,
+        permission="attachment.stage",
+        now=105,
+    )["member_id"] == dispatch.member_id
+    with pytest.raises(HostedRoomGrantError, match="expired"):
+        verify_room_grant(
+            SECRET,
+            token,
+            dispatch,
+            permission="attachment.stage",
+            now=111,
+        )
 
 
 def test_link_selection_prefers_safe_direct_then_overlay_then_relay_then_pull():

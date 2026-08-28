@@ -28,6 +28,9 @@ from typing import Any, Iterable, Literal, Mapping
 PROTOCOL_VERSION = 2
 MAX_TOKEN_BYTES = 16 * 1024
 MAX_PROMPT_BYTES = 256 * 1024
+MAX_ROOM_LINK_ATTACHMENTS = 8
+MAX_ROOM_LINK_ATTACHMENT_BYTES = 9_000_000
+MAX_ROOM_LINK_ATTACHMENT_BATCH_BYTES = 25_000_000
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _LINK_PRIORITY = {
@@ -113,6 +116,85 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("ascii")
+
+
+def canonical_attachment_manifest(value: Any) -> list[dict[str, Any]]:
+    """Validate and normalize one bounded RoomLink attachment manifest.
+
+    The manifest contains metadata and content digests only. Bytes, local paths,
+    and bearer material are deliberately outside this durable wire contract.
+    Entry order is preserved because it is part of the user-visible message.
+    """
+    if not isinstance(value, list) or not value:
+        raise HostedRoomPeerError("attachment manifest must be a non-empty list")
+    if len(value) > MAX_ROOM_LINK_ATTACHMENTS:
+        raise HostedRoomPeerError("attachment manifest has too many entries")
+    required = {"attachment_id", "kind", "name", "size", "mime", "sha256"}
+    normalized: list[dict[str, Any]] = []
+    total = 0
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            raise HostedRoomPeerError("attachment manifest entries must be objects")
+        _exact_fields(raw, required=required, label="attachment manifest entry")
+        attachment_id = _identifier(raw["attachment_id"], field="attachment_id")
+        if attachment_id in seen:
+            raise HostedRoomPeerError("attachment ids must be unique")
+        seen.add(attachment_id)
+        kind = raw["kind"]
+        if kind not in {"image", "pdf", "file"}:
+            raise HostedRoomPeerError("attachment kind is unsupported")
+        name = raw["name"]
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or len(name) > 255
+            or name.strip() in {".", ".."}
+            or any(token in name for token in ("/", "\\", "\x00", "\n", "\r"))
+        ):
+            raise HostedRoomPeerError("attachment name must be a bounded basename")
+        mime = raw["mime"]
+        if (
+            not isinstance(mime, str)
+            or not mime.strip()
+            or len(mime) > 127
+            or "/" not in mime
+        ):
+            raise HostedRoomPeerError("attachment mime is invalid")
+        size = raw["size"]
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 0 < size <= MAX_ROOM_LINK_ATTACHMENT_BYTES
+        ):
+            raise HostedRoomPeerError("attachment size is outside the RoomLink limit")
+        total += size
+        if total > MAX_ROOM_LINK_ATTACHMENT_BATCH_BYTES:
+            raise HostedRoomPeerError("attachment batch is too large")
+        normalized.append(
+            {
+                "attachment_id": attachment_id,
+                "kind": kind,
+                "name": name.strip(),
+                "size": size,
+                "mime": mime.strip().lower(),
+                "sha256": _digest(raw["sha256"], field="attachment sha256"),
+            }
+        )
+    return normalized
+
+
+def attachment_manifest_digest(value: Any) -> str:
+    """Return the canonical SHA-256 identity for a validated manifest."""
+    manifest = canonical_attachment_manifest(value)
+    return hashlib.sha256(
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
 
 
 def _b64encode(value: bytes) -> str:
@@ -429,10 +511,11 @@ class HostedMemberDispatch:
     prompt_digest: str
     capability_digest: str
     trace_id: str
+    attachment_manifest_digest: str | None = None
 
     def as_mapping(self) -> dict[str, Any]:
         """Return the canonical wire mapping used for fingerprinting."""
-        return {
+        mapping = {
             "protocol_version": self.protocol_version,
             "room_id": self.room_id,
             "home_install_id": self.home_install_id,
@@ -450,6 +533,9 @@ class HostedMemberDispatch:
             "capability_digest": self.capability_digest,
             "trace_id": self.trace_id,
         }
+        if self.attachment_manifest_digest is not None:
+            mapping["attachment_manifest_digest"] = self.attachment_manifest_digest
+        return mapping
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "HostedMemberDispatch":
@@ -471,7 +557,12 @@ class HostedMemberDispatch:
             "capability_digest",
             "trace_id",
         }
-        _exact_fields(value, required=required, label="dispatch")
+        _exact_fields(
+            value,
+            required=required,
+            optional={"attachment_manifest_digest"},
+            label="dispatch",
+        )
         prompt = value["prompt"]
         if not isinstance(prompt, str) or not prompt.strip():
             raise HostedRoomPeerError("prompt must be a non-empty string")
@@ -516,6 +607,14 @@ class HostedMemberDispatch:
                 value["capability_digest"], field="capability_digest"
             ),
             trace_id=_identifier(value["trace_id"], field="trace_id"),
+            attachment_manifest_digest=(
+                _digest(
+                    value["attachment_manifest_digest"],
+                    field="attachment_manifest_digest",
+                )
+                if "attachment_manifest_digest" in value
+                else None
+            ),
         )
 
 
@@ -589,7 +688,13 @@ def issue_room_grant(
     member_id: str,
     target_install_id: str,
     target_profile: str,
-    permissions: Iterable[str] = ("approve", "dispatch", "status", "stop"),
+    permissions: Iterable[str] = (
+        "approve",
+        "attachment.stage",
+        "dispatch",
+        "status",
+        "stop",
+    ),
     issued_at: float | None = None,
     ttl_seconds: float = 3600,
     status_ttl_seconds: float = MAX_STATUS_GRANT_TTL_SECONDS,
@@ -616,6 +721,7 @@ def issue_room_grant(
     allowed = tuple(sorted(set(permissions)))
     if not allowed or not set(allowed) <= {
         "approve",
+        "attachment.stage",
         "dispatch",
         "status",
         "stop",
