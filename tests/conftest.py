@@ -641,6 +641,23 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # Tests that want the index absent opt IN explicitly with
     # `monkeypatch.setenv` (see tests/test_state_db_fts_external_content.py).
     "HERMES_DISABLE_MESSAGE_TRIGRAM",
+    # Claude Code's session markers. detect_session_driver() reads either one
+    # and stamps origin_json {"driver": "claude-code"} onto every cli/tui
+    # session, so the same suite writes different rows depending on whether
+    # pytest was launched from an agent session or a plain terminal. Unlike the
+    # trigram knob above these are process-scoped, not User-level: they leak
+    # only into pytest spawned by an agent, never into CI and never through
+    # `scripts/run_tests.sh` (its `env -i` allowlist omits them). Unset is
+    # therefore the reference value -- pinning one instead would stamp a driver
+    # on every session, which is what CI does not do. Measured before adding:
+    # a 6604-test A/B over every file touching create_session/list_sessions_rich
+    # diffed ZERO outcomes in either direction, so this closes the leak class
+    # rather than fixing a live failure -- after two hand-workarounds for it
+    # (eaf8e22c8c's per-test delenv, and the driver in
+    # docs/superpowers/audits/2026-08-11-gateway-monolithic-run-inventory.md).
+    # Tests that want a driver stamped opt IN with monkeypatch.setenv.
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
     "TERMINAL_CWD",
     "TERMINAL_ENV",
     "TERMINAL_CONTAINER_CPU",
