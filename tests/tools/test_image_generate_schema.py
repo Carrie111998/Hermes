@@ -54,6 +54,54 @@ class TestCatalogCapabilityCoverage(unittest.TestCase):
         self.assertEqual(caps.get("modalities"), ["text"])
         self.assertFalse(caps.get("supports_upscale", False))
 
+    def test_every_intree_plugin_declares_what_it_implements(self):
+        """Fleet-wide declaration ⇄ implementation contract (maintainer
+        requirement: EVERY provider combo must carry capability info).
+
+        For each in-tree image_gen plugin: if its generate() source
+        implements an upscale pass, capabilities() must declare
+        supports_upscale — and vice versa, so a stale declaration can't
+        advertise an upscale that silently no-ops. modalities and
+        max_reference_images must always be declared."""
+        import ast
+        import pathlib
+
+        plugins_dir = (pathlib.Path(__file__).resolve().parents[2]
+                       / "plugins" / "image_gen")
+        assert plugins_dir.is_dir(), plugins_dir
+        checked = 0
+        for plugin in sorted(plugins_dir.iterdir()):
+            src_file = plugin / "__init__.py"
+            if not src_file.is_file():
+                continue
+            src = src_file.read_text(encoding="utf-8")
+            if "def capabilities" not in src:
+                continue
+            checked += 1
+            with self.subTest(provider=plugin.name):
+                # capabilities() must declare the two mandatory axes.
+                self.assertIn("modalities", src, plugin.name)
+                self.assertIn("max_reference_images", src, plugin.name)
+                # upscale: declaration ⇄ implementation, both directions.
+                declares = "supports_upscale" in src
+                # Implementation = generate() (or its helpers in the same
+                # file) reads the upscale kwarg directly, or passes it
+                # through in a delegation whitelist (fal plugin → in-tree
+                # Clarity chain).
+                implements = ('kwargs.get("upscale")' in src
+                              or "upscale_requested" in src
+                              or 'kwargs["upscale"]' in src
+                              or "def _upscale" in src
+                              or '"upscale",' in src)
+                self.assertEqual(
+                    declares, implements,
+                    f"{plugin.name}: supports_upscale declaration "
+                    f"({declares}) != implementation ({implements}) — "
+                    "declare it in capabilities() iff generate() honors it",
+                )
+        # The audit must actually have covered the fleet.
+        self.assertGreaterEqual(checked, 6, "plugin sweep found too few providers")
+
 
 class TestDynamicParamGating(unittest.TestCase):
     def _schema_for(self, model_id):
