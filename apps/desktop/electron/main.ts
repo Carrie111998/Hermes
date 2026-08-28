@@ -156,6 +156,7 @@ import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
 import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import { startDesktopFirstWindow } from './desktop-startup'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -13919,7 +13920,7 @@ function closeQuickEntryWindow() {
   quickEntryWindow = null
 }
 
-function createWindow() {
+function createWindow({ startBackend = true }: { startBackend?: boolean } = {}) {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
   mainWindow = new BrowserWindow({
@@ -14153,14 +14154,16 @@ function createWindow() {
     )
   }
 
-  // Start the Python backend NOW, in parallel with the renderer load — not on
-  // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
-  // is the dominant startup cost, and serializing it behind Chromium's load
-  // added the whole renderer load time to first-usable-composer. The promise is
-  // shared (backendConnectionState), so the renderer's getConnection() joins
-  // this in-flight boot instead of duplicating it; early boot-progress events
-  // the renderer misses are recovered by its getBootProgress() pull on mount.
-  startHermes().catch(error => rememberLog(error.stack || error.message))
+  if (startBackend) {
+    // Start the Python backend NOW, in parallel with the renderer load — not on
+    // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
+    // is the dominant startup cost, and serializing it behind Chromium's load
+    // added the whole renderer load time to first-usable-composer. The promise is
+    // shared (backendConnectionState), so the renderer's getConnection() joins
+    // this in-flight boot instead of duplicating it; early boot-progress events
+    // the renderer misses are recovered by its getBootProgress() pull on mount.
+    startHermes().catch(error => rememberLog(error.stack || error.message))
+  }
 
   mainWindow.webContents.once('did-finish-load', () => {
     // Zoom restore is handled by wireCommonWindowHandlers (shared with session
@@ -17352,17 +17355,6 @@ app.whenReady().then(() => {
     Menu.setApplicationMenu(null)
   }
 
-  installMediaPermissions()
-  installDownloadHandling()
-  registerMediaProtocol()
-  installEmbedReferer()
-  installRemoteHeaderRules()
-  registerDeepLinkProtocol()
-
-  ensureWslWindowsFonts()
-  configureSpellChecker()
-  registerPowerResumeListeners()
-  keepAwake.set(readPersistedKeepAwake())
   f12Blocked = readPersistedDisableF12()
   // Seed this before the first window exists: a picker can open before
   // startHermes() finishes resolving the configured backend.
@@ -17370,10 +17362,32 @@ app.whenReady().then(() => {
 
   setActiveGatewayProfile(primaryProfile)
   setWslBridgeProfileState(primaryProfile, !primaryBackendIsRemote())
-  // Quick Entry's global chord — registered on ready so a cold launch restores
-  // it without the renderer visiting Settings. A failed registration is logged
-  // here and surfaced in Settings via the IPC state (never silent).
-  applyQuickEntrySettings(readQuickEntrySettings())
+
+  startDesktopFirstWindow({
+    startBackend: () => startHermes(),
+    onBackendError: error =>
+      rememberLog(error instanceof Error ? error.stack || error.message : String(error)),
+    initializeRendererDependencies: () => {
+      installMediaPermissions()
+      installDownloadHandling()
+      registerMediaProtocol()
+      installEmbedReferer()
+      installRemoteHeaderRules()
+      registerDeepLinkProtocol()
+    },
+    createWindow: () => createWindow({ startBackend: false }),
+    initializeAfterWindow: () => {
+      ensureWslWindowsFonts()
+      configureSpellChecker()
+      registerPowerResumeListeners()
+      keepAwake.set(readPersistedKeepAwake())
+
+      // Quick Entry's global chord is restored on every cold launch. A failed
+      // registration remains surfaced through its IPC state; it simply no
+      // longer delays the primary window or backend.
+      applyQuickEntrySettings(readQuickEntrySettings())
+    }
+  })
 
   if (IS_MAC) {
     const reposition = () => wakeIndicatorController.reposition()
@@ -17390,7 +17404,6 @@ app.whenReady().then(() => {
   // its worker waits for the install marker to clear, then reopens every scope
   // captured by the original transaction before removing the journal entry.
   void resumeManagedSshRecoveries()
-  createWindow()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
