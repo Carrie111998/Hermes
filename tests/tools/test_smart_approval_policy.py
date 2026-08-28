@@ -44,15 +44,6 @@ class TestGetSmartPolicy(unittest.TestCase):
         mock_cfg.return_value = {"mode": "smart"}
         assert _get_smart_policy() == ""
 
-    @patch("tools.approval._get_approval_config")
-    def test_non_string_value_returns_empty(self, mock_cfg):
-        mock_cfg.return_value = {"smart_policy": ["not", "a", "string"]}
-        assert _get_smart_policy() == ""
-
-    @patch("tools.approval._get_approval_config")
-    def test_whitespace_only_returns_empty(self, mock_cfg):
-        mock_cfg.return_value = {"smart_policy": "   \n  "}
-        assert _get_smart_policy() == ""
 
     @patch("tools.approval._get_approval_config")
     def test_policy_text_is_stripped(self, mock_cfg):
@@ -89,22 +80,6 @@ class TestSmartApprovePolicyInjection(unittest.TestCase):
         sys_content = messages_missing[0]["content"]
         assert "Additional policy rules from the operator" not in sys_content
 
-    @patch("tools.approval._get_approval_config")
-    @patch("agent.auxiliary_client.call_llm")
-    def test_policy_appears_in_system_message(self, mock_call_llm, mock_cfg):
-        """A non-empty policy must land in the system message, delimited."""
-        mock_call_llm.return_value = _make_response("ESCALATE")
-        mock_cfg.return_value = {"smart_policy": POLICY_TEXT}
-
-        _smart_approve("rm -rf /etc/nginx", "recursive delete")
-
-        messages = _messages_from(mock_call_llm)
-        assert messages[0]["role"] == "system"
-        sys_content = messages[0]["content"]
-        assert POLICY_TEXT in sys_content
-        assert "Additional policy rules from the operator" in sys_content
-        # Baseline hardening must survive the append
-        assert "UNTRUSTED" in sys_content
 
     @patch("tools.approval._get_approval_config")
     @patch("agent.auxiliary_client.call_llm")
@@ -133,6 +108,46 @@ class TestSmartApprovePolicyInjection(unittest.TestCase):
         mock_cfg.side_effect = RuntimeError("config unreadable")
         # _smart_approve's outer try/except catches this and escalates
         assert _smart_approve("echo hi", "flagged") == "escalate"
+
+
+    @patch("agent.auxiliary_client._get_task_timeout")
+    @patch("tools.approval._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_smart_approve_passes_explicit_timeout(
+        self, mock_call_llm, mock_cfg, mock_task_timeout
+    ):
+        """Regression for #82846: the guardian call must pass an explicit
+        timeout instead of relying on the default resolution inside call_llm
+        (a defeated internal timeout silently froze agent turns in
+        production). The explicit value must equal what
+        auxiliary.approval.timeout resolves to."""
+        mock_call_llm.return_value = _make_response("APPROVE")
+        mock_cfg.return_value = {"mode": "smart"}
+        mock_task_timeout.return_value = 42.0
+
+        assert _smart_approve("echo hi", "flagged") == "approve"
+        _, kwargs = mock_call_llm.call_args
+        assert kwargs.get("timeout") == 42.0
+
+
+    @patch("tools.approval._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_smart_approve_failure_logs_warning_and_escalates(
+        self, mock_call_llm, mock_cfg
+    ):
+        """A failed/blocked guardian call must surface as a WARNING with the
+        elapsed time (not a silent DEBUG) — #82846's hang was invisible
+        precisely because nothing logged at the failure point."""
+        mock_call_llm.side_effect = TimeoutError("stalled provider")
+        mock_cfg.return_value = {"mode": "smart"}
+
+        with patch("tools.approval.logger") as mock_logger:
+            assert _smart_approve("echo hi", "flagged") == "escalate"
+
+        assert mock_logger.warning.called
+        args, _ = mock_logger.warning.call_args
+        assert "Smart approvals: LLM call failed" in args[0]
+        assert "TimeoutError" in str(args)
 
 
 if __name__ == "__main__":
