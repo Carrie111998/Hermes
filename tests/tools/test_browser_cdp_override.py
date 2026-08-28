@@ -14,6 +14,99 @@ class TestResolveCdpOverride:
 
         assert _resolve_cdp_override(WS_URL) == WS_URL
 
+    def test_resolves_http_discovery_endpoint_to_websocket(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            resolved = _resolve_cdp_override(HTTP_URL)
+
+        assert resolved == WS_URL
+        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+
+    def test_rebases_container_loopback_websocket_to_remote_discovery_authority(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        remote_http_url = "http://remote-browser.example:9222"
+        advertised_ws_url = "ws://127.0.0.1/devtools/browser/abc123?token=opaque"
+        expected_ws_url = (
+            "ws://remote-browser.example:9222/"
+            "devtools/browser/abc123?token=opaque"
+        )
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": advertised_ws_url}
+
+        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            resolved = _resolve_cdp_override(remote_http_url)
+
+        assert resolved == expected_ws_url
+        mock_get.assert_called_once_with(f"{remote_http_url}/json/version", timeout=10)
+
+    def test_keeps_loopback_websocket_for_loopback_discovery_authority(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        local_http_url = "http://127.0.0.1:9222"
+        advertised_ws_url = "ws://127.0.0.1/devtools/browser/abc123"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": advertised_ws_url}
+
+        with patch("tools.browser_tool.requests.get", return_value=response):
+            resolved = _resolve_cdp_override(local_http_url)
+
+        assert resolved == advertised_ws_url
+
+    def test_keeps_non_loopback_advertised_websocket_unchanged(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        remote_http_url = "http://discovery-browser.example:9222"
+        advertised_ws_url = "ws://advertised-browser.example:9222/devtools/browser/abc123"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": advertised_ws_url}
+
+        with patch("tools.browser_tool.requests.get", return_value=response):
+            resolved = _resolve_cdp_override(remote_http_url)
+
+        assert resolved == advertised_ws_url
+
+    def test_resolves_bare_ws_hostport_to_discovery_websocket(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            resolved = _resolve_cdp_override(f"ws://{HOST}:{PORT}")
+
+        assert resolved == WS_URL
+        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+
+    def test_uses_wss_for_https_discovery_when_rebasing_loopback(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        remote_https_url = "https://remote-browser.example:9443/json/version"
+        advertised_ws_url = "ws://localhost/devtools/browser/abc123"
+        expected_ws_url = "wss://remote-browser.example:9443/devtools/browser/abc123"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": advertised_ws_url}
+
+        with patch("tools.browser_tool.requests.get", return_value=response):
+            resolved = _resolve_cdp_override(remote_https_url)
+
+        assert resolved == expected_ws_url
+
+    def test_falls_back_to_raw_url_when_discovery_fails(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
+            assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
 
     def test_redacts_secret_query_params_in_success_log(self):
         from tools.browser_tool import _resolve_cdp_override
