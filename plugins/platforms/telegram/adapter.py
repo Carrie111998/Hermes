@@ -1419,6 +1419,28 @@ class TelegramAdapter(BasePlatformAdapter):
             allowed = _coerce_allow_set(adapter_allow_from)
             authorized = user_id in allowed or "*" in allowed
 
+        # Per-chat sender allowlist: groups.<chatId>.allow_from (#992a463a).
+        # Mirrors WeCom's groups.<id>.allow_from (_resolve_group_cfg /
+        # _is_group_allowed). This is an ADDITIONAL, independent gate on top
+        # of the flat group_allow_from / chat-level allowlist above — chat-
+        # level allowlisting (allowed_chats/group_allowed_chats) is unchanged;
+        # when groups.<chatId> is present for this chat, the sender must ALSO
+        # be listed in its allow_from. An entry present with allow_from: []
+        # fails closed for that chat (blocks everyone), not "ignore this key".
+        # When groups.<chatId> is absent for the chat, this gate is a no-op
+        # and the decision above (or the fallback chain below) stands.
+        if chat_type in ("group", "forum", "channel"):
+            group_cfg = self._resolve_group_cfg(source.chat_id)
+            if group_cfg is not None:
+                per_chat_allow = _coerce_allow_set(
+                    group_cfg.get("allow_from") if isinstance(group_cfg, dict) else None
+                )
+                per_chat_authorized = user_id in per_chat_allow or "*" in per_chat_allow
+                if authorized is None:
+                    authorized = per_chat_authorized
+                else:
+                    authorized = authorized and per_chat_authorized
+
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
         # not be treated as a user-id-only shortcut for real messages — only
@@ -1490,6 +1512,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         # Unauthorized DM that the gateway would pair: forward so pairing can run.
         return self._should_pass_unauthorized_dm_for_pairing(source)
+
+    def _resolve_group_cfg(self, chat_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Resolve ``extra.groups.<chat_id>`` config for a chat.
+
+        Mirrors WeCom's ``WeComAdapter._resolve_group_cfg``: reads
+        ``config.extra["groups"]`` as ``Dict[chatId, {"allow_from": [...]}]``
+        (see #992a463a / uss-platform #2353 §17 slice 4/6). Returns ``None``
+        when ``groups`` is absent/not a dict or the chat has no entry — the
+        caller treats ``None`` as "no additional gate applies", distinct from
+        an explicit ``{}``/``{"allow_from": []}`` entry which fails closed.
+        """
+        groups = self.config.extra.get("groups")
+        if not isinstance(groups, dict):
+            return None
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return None
+        if normalized_chat_id in groups and isinstance(groups[normalized_chat_id], dict):
+            return groups[normalized_chat_id]
+        lowered = normalized_chat_id.lower()
+        for key, value in groups.items():
+            if isinstance(key, str) and key.lower() == lowered and isinstance(value, dict):
+                return value
+        return None
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
