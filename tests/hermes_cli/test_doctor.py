@@ -7,6 +7,7 @@ import types
 import io
 import contextlib
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -889,19 +890,30 @@ def test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser
     assert "npm install -g agent-browser && agent-browser install" in out
 
 
+def _isolate_doctor_fix_paths(monkeypatch, tmp_path):
+    """Keep Doctor's --fix launcher paths inside this test's tmp directory."""
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(doctor_mod.Path, "home", lambda: home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    return home, project
+
+
 def _doctor_env_for_agent_browser(monkeypatch, tmp_path):
     """Shared non-Termux fixture setup for the agent-browser npx-resolution
     branch in run_doctor (hermes_cli/doctor.py ~1557-1605)."""
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
-    project = tmp_path / "project"
-    project.mkdir(exist_ok=True)
+    _, project = _isolate_doctor_fix_paths(monkeypatch, tmp_path)
 
     monkeypatch.delenv("TERMUX_VERSION", raising=False)
     monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
     monkeypatch.setattr(doctor_mod, "_DHH", str(home))
     monkeypatch.setattr(
         doctor_mod.shutil,
@@ -1540,6 +1552,7 @@ class TestDoctorStaleMaxIterationsDrift:
             env_lines.append(f"HERMES_MAX_ITERATIONS={ghost}\n")
         (hermes_home / ".env").write_text("".join(env_lines), encoding="utf-8")
 
+        _isolate_doctor_fix_paths(monkeypatch, tmp_path)
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
         monkeypatch.setattr(doctor_mod, "get_hermes_home", lambda: hermes_home)
         # Point the config helpers at the temp home.
@@ -1582,6 +1595,24 @@ class TestDoctorStaleMaxIterationsDrift:
         env_after = (hermes_home / ".env").read_text(encoding="utf-8")
         assert "HERMES_MAX_ITERATIONS" not in env_after
         assert "OPENAI_API_KEY=sk-test" in env_after  # other keys preserved
+
+    def test_fix_uses_only_disposable_launcher_paths(self, monkeypatch, tmp_path):
+        """--fix must never target the caller's launcher or worktree venv."""
+        external_launcher = tmp_path / "external" / ".local" / "bin" / "hermes"
+        external_launcher.parent.mkdir(parents=True)
+        external_launcher.write_text("external sentinel", encoding="utf-8")
+        sentinel_before = (external_launcher.lstat(), external_launcher.read_bytes())
+
+        _, hermes_home = self._run_config_section(
+            monkeypatch, tmp_path, fix=True, ghost=90, cfg_turns=400,
+            os_environ_value=400,
+        )
+
+        assert doctor_mod.HERMES_HOME == hermes_home
+        assert Path.home().is_relative_to(tmp_path)
+        assert doctor_mod.PROJECT_ROOT.is_relative_to(tmp_path)
+        assert external_launcher.lstat() == sentinel_before[0]
+        assert external_launcher.read_bytes() == sentinel_before[1]
 
 
     def test_no_drift_when_ghost_absent(self, monkeypatch, tmp_path):
