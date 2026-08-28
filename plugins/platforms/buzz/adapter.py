@@ -531,6 +531,27 @@ class BuzzAdapter(BasePlatformAdapter):
             logger.error("Buzz: no channels to watch (configure BUZZ_CHANNELS or join a channel)")
             self._set_fatal_error("config_missing", "no Buzz channels to watch", retryable=False)
             return False
+        # Membership filter: only watch channels this key can actually read.
+        # An explicit channels: entry the key is not a member of would
+        # otherwise CLOSED-loop at reconnect time (retries can never succeed).
+        member_channels: List[str] = []
+        for channel_id in watch:
+            code, _out, probe_err = await self._run_cli(
+                ["messages", "get", "--channel", channel_id, "--limit", "1"]
+            )
+            if code == 0 or "not a channel member" not in (probe_err or ""):
+                member_channels.append(channel_id)
+            else:
+                logger.warning(
+                    "Buzz: skipping channel %s — key is not a member (%s)",
+                    self._channel_names.get(channel_id, channel_id),
+                    probe_err,
+                )
+        watch = member_channels
+        if not watch:
+            logger.error("Buzz: no watchable channels remain after membership filter")
+            self._set_fatal_error("config_missing", "no Buzz channels to watch", retryable=False)
+            return False
 
         # Seed high-water marks from the newest events so a (re)start never
         # replays channel history into the agent.
@@ -615,6 +636,12 @@ class BuzzAdapter(BasePlatformAdapter):
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
+        if code != 0 and "does not match a current channel member" in (err or ""):
+            # Reply text contains @word tokens the CLI parses as mentions
+            # (e.g. "@session:..." links). Escape them with a full-width @ and
+            # retry once so the message still lands, presentation-only.
+            escaped = content.replace("@", "＠")
+            code, out, err = await self._run_cli(args, input_text=escaped)
         if code != 0:
             return SendResult(
                 success=False,
@@ -886,8 +913,30 @@ class BuzzAdapter(BasePlatformAdapter):
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
                             elif message[0] == "CLOSED":
-                                detail = message[-1] if len(message) > 2 else "subscription closed"
-                                raise ConnectionError(str(detail))
+                                detail = str(message[-1]) if len(message) > 2 else "subscription closed"
+                                closed_sub = str(message[1]) if len(message) > 2 else ""
+                                closed_channel = subscriptions.get(closed_sub)
+                                if closed_channel and (
+                                    "not a channel member" in detail
+                                    or "restricted" in detail
+                                    or "auth-required" in detail
+                                ):
+                                    # The relay rejected this subscription on
+                                    # membership grounds. Drop the channel
+                                    # instead of reconnect-looping forever —
+                                    # retrying can never succeed.
+                                    logger.warning(
+                                        "Buzz: relay rejected subscription to %s (%s) — "
+                                        "removing from watch list (not a member)",
+                                        self._channel_names.get(closed_channel, closed_channel),
+                                        detail,
+                                    )
+                                    self._channel_state.pop(closed_channel, None)
+                                    self._channel_names.pop(closed_channel, None)
+                                    self._channel_meta.pop(closed_channel, None)
+                                    subscriptions.pop(closed_sub, None)
+                                    continue
+                                raise ConnectionError(detail)
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
                 except asyncio.CancelledError:
