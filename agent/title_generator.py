@@ -702,15 +702,19 @@ def retitle_session(
         # are single-row updates; the intermediate ``derived`` state is invisible
         # and — even if the second write raced a manual /title — the CAS in
         # set_session_title would still reject the demotion cleanly.
+        #
+        # ``None``-source rows come from legacy sessions predating provenance
+        # tracking; ``_title_rank(None)`` returns the same rank as ``user`` as
+        # a safety default so passive re-titling never clobbers them. Explicit
+        # retitle is not passive — the user or an operator-configured auto-fire
+        # asked for the rewrite — so we treat None the same as llm here.
         try:
             source_fn = getattr(session_db, "get_session_title_source", None)
             demote_fn = getattr(session_db, "set_session_title_source", None)
-            if (
-                callable(source_fn)
-                and callable(demote_fn)
-                and source_fn(session_id) == "llm"
-            ):
-                demote_fn(session_id, "derived")
+            if callable(source_fn) and callable(demote_fn):
+                current_src = source_fn(session_id)
+                if current_src in ("llm", None):
+                    demote_fn(session_id, "derived")
         except Exception:
             logger.debug(
                 "Retitle pre-write demotion failed for %s (proceeding)",
