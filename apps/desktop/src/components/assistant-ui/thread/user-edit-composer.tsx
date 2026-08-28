@@ -113,32 +113,6 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   // submit and shows a spinner so confirming the edit can't race the async
   // upload and drop the gateway-side ref before it lands in the draft.
   const [staging, setStaging] = useState(false)
-  // Late callbacks (submit cooldown, blur reconcile) must never fire after
-  // unmount: dispatching then races jsdom teardown in tests and setState on a
-  // dead tree in production. Track every pending timeout and clear on unmount.
-  const pendingTimersRef = useRef<Set<number> | null>(null)
-
-  const scheduleTimeout = useCallback((fn: () => void, ms: number) => {
-    const id = window.setTimeout(() => {
-      pendingTimersRef.current?.delete(id)
-      fn()
-    }, ms)
-    
-    const pending = pendingTimersRef.current ?? new Set<number>()
-    pending.add(id)
-    pendingTimersRef.current = pending
-  }, [])
-
-  useEffect(
-    () => () => {
-      for (const id of pendingTimersRef.current ?? []) {
-        window.clearTimeout(id)
-      }
-
-      pendingTimersRef.current?.clear()
-    },
-    []
-  )
   const expanded = draft.includes('\n')
   const canSubmit = draft.trim().length > 0
   const at = useAtCompletions({ cwd, gateway, sessionId })
