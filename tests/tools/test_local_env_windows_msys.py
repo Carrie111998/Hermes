@@ -105,6 +105,7 @@ class TestWindowsToMsysPath:
         )
         assert _windows_to_msys_path(r"C:\Users\NVIDIA") == "/mnt/c/Users/NVIDIA"
 
+    @pytest.mark.windows_only
     def test_failed_bash_resolution_is_cached(self, monkeypatch):
         calls = 0
 
