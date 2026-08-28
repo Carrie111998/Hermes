@@ -716,8 +716,9 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     new) converge on the restored data.
 
     Falls back to the unlink+move approach only after holder inspection
-    proves no other process has the database or its sidecars open. Refuses
-    the destructive fallback when holder inspection is unavailable.
+    completes without finding another process that has the database or its
+    sidecars open. Refuses the destructive fallback when inspection is
+    unavailable or incomplete.
     """
     try:
         dst_conn = sqlite3.connect(str(dst))
@@ -1487,6 +1488,31 @@ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
     return home / _QUICK_SNAPSHOTS_DIR
 
 
+def _resolve_quick_snapshot_dir(
+    snapshot_id: str,
+    hermes_home: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return a contained quick-snapshot directory, or None when invalid."""
+    root = _quick_snapshot_root(hermes_home)
+    if (
+        not snapshot_id
+        or "/" in snapshot_id
+        or "\\" in snapshot_id
+        or snapshot_id in (".", "..")
+    ):
+        logger.error("Invalid snapshot_id: %s", snapshot_id)
+        return None
+
+    snap_dir = root / snapshot_id
+    try:
+        snap_dir.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
+        return None
+
+    return snap_dir if snap_dir.is_dir() else None
+
+
 def create_quick_snapshot(
     label: Optional[str] = None,
     hermes_home: Optional[Path] = None,
@@ -1767,24 +1793,8 @@ def restore_quick_snapshot(
     Returns True if at least one file was restored.
     """
     home = hermes_home or get_hermes_home()
-    root = _quick_snapshot_root(home)
-
-    # Security: reject snapshot_id values that contain path separators or
-    # traversal sequences so that `root / snapshot_id` stays inside root.
-    if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
-        logger.error("Invalid snapshot_id: %s", snapshot_id)
-        return False
-
-    snap_dir = root / snapshot_id
-
-    # Confirm the resolved path is still inside root (handles symlinks etc.)
-    try:
-        snap_dir.resolve().relative_to(root.resolve())
-    except ValueError:
-        logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
-        return False
-
-    if not snap_dir.is_dir():
+    snap_dir = _resolve_quick_snapshot_dir(snapshot_id, home)
+    if snap_dir is None:
         return False
 
     manifest_path = snap_dir / "manifest.json"
@@ -1822,9 +1832,6 @@ def restore_quick_snapshot(
                 # (gateway, dashboard, another CLI session) see the
                 # restored data instead of continuing to serve stale
                 # cached pages from a replaced inode (issue #65942).
-                # Fail closed: a False from _safe_restore_db means a live
-                # holder blocked the unlink+move fallback. Do not count
-                # that as restored or the CLI prints success anyway.
                 if not _safe_restore_db(src, dst):
                     return False
             else:

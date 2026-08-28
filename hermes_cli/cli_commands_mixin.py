@@ -329,8 +329,11 @@ class CLICommandsMixin:
             /snapshot prune [N]        — prune to N snapshots (default 20)
         """
         from hermes_cli.backup import (
-            create_quick_snapshot, list_quick_snapshots,
-            restore_quick_snapshot, prune_quick_snapshots,
+            _resolve_quick_snapshot_dir,
+            create_quick_snapshot,
+            list_quick_snapshots,
+            prune_quick_snapshots,
+            restore_quick_snapshot,
         )
         from hermes_constants import display_hermes_home
 
@@ -404,14 +407,10 @@ class CLICommandsMixin:
                     "to pick up state.db changes."
                 )
             else:
-                from hermes_constants import get_hermes_home
-
-                snap_dir = get_hermes_home() / "state-snapshots" / snap_id
-                if snap_dir.is_dir():
+                if _resolve_quick_snapshot_dir(snap_id) is not None:
                     print(
-                        "  Restore refused: another process still holds "
-                        "state.db or its WAL. Stop the gateway or dashboard "
-                        "and retry."
+                        "  Restore failed or was refused. Check the Hermes logs "
+                        "for the specific cause, then retry."
                     )
                 else:
                     print(f"  Snapshot not found: {snap_id}")
