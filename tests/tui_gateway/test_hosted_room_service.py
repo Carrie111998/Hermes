@@ -659,7 +659,10 @@ def test_partial_attachment_failure_never_submits_text_only_and_other_member_con
     )
 
 
-def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path):
+def test_restart_republishes_terminal_task_before_admitting_more(
+    tmp_path: Path,
+    monkeypatch,
+):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)
     service.local_profiles = lambda: ("default", "ops")
@@ -712,9 +715,36 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
     assert event["seq"] == 1
     assert sum(row["kind"] == "message.member" for row in events) == 1
     assert sum(row["kind"] == "turn.settled" for row in events) == 1
+    # The publication pass intentionally leaves its entry cursor cached, so
+    # one follow-up observes the terminal events it just appended.
+    service.prepare_room(binding)
+    monkeypatch.setattr(
+        discussion,
+        "reconstruct_task_plan",
+        lambda *_args, **_kwargs: pytest.fail(
+            "already-published terminal task was reconstructed again"
+        ),
+    )
+    monkeypatch.setattr(
+        discussion,
+        "plan_next_task",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unchanged room policy was replayed again"
+        ),
+    )
     service.prepare_room(binding)
     replayed = service._events("room-1")
     assert replayed == events
+
+
+def test_service_uses_low_idle_poll_with_immediate_wakeup(tmp_path: Path):
+    service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
+
+    assert service.runtime.poll_interval_seconds == 1.0
+
+    service.runtime._wake.clear()
+    service.wakeup()
+    assert service.runtime._wake.is_set()
 
 
 def test_upgrade_replays_legacy_terminal_task_then_admits_new_work(tmp_path: Path):

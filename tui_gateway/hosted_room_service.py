@@ -70,6 +70,10 @@ class HostedRoomService:
         self._link_load_error = None
         self._peer_route_status: dict[tuple[str, str], str] = {}
         self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._prepared_room_cursors: dict[
+            str,
+            tuple[int, int, tuple[tuple[str, int], ...]],
+        ] = {}
         self._artifact_clock = artifact_clock
         self._artifact_retry_min_seconds = max(0.01, float(artifact_retry_min_seconds))
         self._artifact_retry_max_seconds = max(
@@ -134,6 +138,11 @@ class HostedRoomService:
             publish_terminal=self.publish_terminal,
             pending_action=self._set_pending_action,
             attachment_loader=self._load_task_attachments,
+            # Local sends and terminal callbacks wake the worker immediately.
+            # This poll exists only for room events written by sibling gateway
+            # processes, so 1s keeps cross-process control responsive without
+            # opening several SQLite handles per room ten times each second.
+            poll_interval_seconds=1.0,
         )
 
     @property
@@ -210,7 +219,7 @@ class HostedRoomService:
             self.peer_routes[(room_id, member_id)] = route
             self.peer_clients[(room_id, member_id)] = client
             self._peer_route_status[(room_id, member_id)] = "ready"
-        self._clear_blocked_artifact_retries(room_id, member_id)
+        self._unblock_artifact_retries(room_id, member_id)
         self.runtime.wakeup()
 
     def revoke_room_routes(self, room_id: str) -> int:
@@ -460,7 +469,7 @@ class HostedRoomService:
         with self._policy_lock:
             self.peer_routes[key] = rotated_route
             self._peer_route_status[key] = "ready"
-        self._clear_blocked_artifact_retries(room_id, member_id)
+        self._unblock_artifact_retries(room_id, member_id)
 
     def _refresh_peer_attachment_catalog(
         self,
@@ -622,12 +631,26 @@ class HostedRoomService:
     ) -> bool:
         changed = False
         local_profiles = self.local_profiles()
+        published_task_ids = {
+            str(event.get("payload", {}).get("task_id") or "")
+            for event in events
+            if event.get("kind")
+            in {"turn.settled", "turn.failed", "turn.cancelled"}
+        }
+        retry_keys = self._artifact_retry_keys(str(room["room_id"]))
         for status in ("settled", "failed", "cancelled"):
             for task in driver.list_tasks(
                 self.db_path,
                 room_id=str(room["room_id"]),
                 status=status,
             ):
+                identity = task["identity"]
+                retry_key = self._artifact_retry_key(task)
+                if (
+                    identity.task_id in published_task_ids
+                    and retry_key not in retry_keys
+                ):
+                    continue
                 if status == "cancelled":
                     self._discard_cancelled_task_artifacts(
                         str(room["room_id"]),
@@ -779,6 +802,33 @@ class HostedRoomService:
             int(task["execution_generation"]),
         )
 
+    def _artifact_retry_keys(self, room_id: str) -> set[tuple[str, str, int]]:
+        with self._artifact_retry_connection() as conn:
+            rows = conn.execute(
+                """SELECT room_id, task_id, execution_generation
+                   FROM hosted_room_artifact_retries WHERE room_id=?""",
+                (room_id,),
+            ).fetchall()
+        return {
+            (str(row["room_id"]), str(row["task_id"]), int(row["execution_generation"]))
+            for row in rows
+        }
+
+    def _room_task_status_signature(self, room_id: str) -> tuple[tuple[str, int], ...]:
+        with self._artifact_retry_connection() as conn:
+            try:
+                rows = conn.execute(
+                    """SELECT status, COUNT(*) AS count
+                       FROM hosted_room_driver_tasks
+                       WHERE room_id=? GROUP BY status ORDER BY status""",
+                    (room_id,),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                rows = ()
+        return tuple((str(row["status"]), int(row["count"])) for row in rows)
+
     def _artifact_retry_due(self, task: Mapping[str, Any]) -> bool:
         key = self._artifact_retry_key(task)
         with self._artifact_retry_connection() as conn:
@@ -844,12 +894,13 @@ class HostedRoomService:
                 self._artifact_retry_key(task),
             )
 
-    def _clear_blocked_artifact_retries(self, room_id: str, member_id: str) -> None:
+    def _unblock_artifact_retries(self, room_id: str, member_id: str) -> None:
         with self._artifact_retry_connection() as conn:
             conn.execute(
-                """DELETE FROM hosted_room_artifact_retries
-                   WHERE room_id=? AND member_id=? AND blocked=1""",
-                (room_id, member_id),
+                """UPDATE hosted_room_artifact_retries
+                      SET blocked=0, next_attempt_at=0, updated_at=?
+                    WHERE room_id=? AND member_id=? AND blocked=1""",
+                (float(self._artifact_clock()), room_id, member_id),
             )
 
     def _import_terminal_artifacts(
@@ -1060,9 +1111,25 @@ class HostedRoomService:
             authority_epoch=int(room["authority_epoch"]),
         )
 
-    def prepare_room(self, binding: HostedRoomBinding) -> None:
+    def prepare_room(
+        self,
+        binding: HostedRoomBinding,
+        *,
+        force: bool = False,
+    ) -> None:
         with self._policy_lock:
             room = hosted_rooms.room_state(self.db_path, room_id=binding.room_id)
+            cursor = (
+                int(room["revision"]),
+                int(room["latest_seq"]),
+                self._room_task_status_signature(binding.room_id),
+            )
+            if (
+                not force
+                and self._prepared_room_cursors.get(binding.room_id) == cursor
+                and not self._artifact_retry_keys(binding.room_id)
+            ):
+                return
             events = self._events(binding.room_id)
             if self._publish_terminal_tasks(room, events):
                 events = self._events(binding.room_id)
@@ -1127,13 +1194,19 @@ class HostedRoomService:
                     )
             elif decision.status in {"settled", "bounded"}:
                 self._append_room_status(room, decision)
+            # Cache only the snapshot this pass actually evaluated. Another
+            # process can append a user event while terminal publication is in
+            # progress; caching a fresh end-of-pass cursor would claim that
+            # unseen event was processed and strand it forever. Our own task or
+            # event writes intentionally cause one cheap follow-up pass.
+            self._prepared_room_cursors[binding.room_id] = cursor
 
     def publish_terminal(
         self,
         binding: HostedRoomBinding,
         _task: Mapping[str, Any],
     ) -> None:
-        self.prepare_room(binding)
+        self.prepare_room(binding, force=True)
         self.runtime.wakeup()
 
     def discard_output_artifacts(self, room_id: str) -> int:
