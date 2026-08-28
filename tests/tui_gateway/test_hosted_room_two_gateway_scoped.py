@@ -83,6 +83,11 @@ async def test_in_process_scoped_transport_contract_finishes_headlessly(
     from gateway.platforms import api_server_room_attachments
 
     api_server_room_attachments._spool.cache_clear()
+    monkeypatch.setattr(
+        api_server_room_attachments,
+        "roomlink_attachments_available",
+        lambda: True,
+    )
     target = APIServerAdapter(
         PlatformConfig(enabled=True, extra={"key": "target-peer-key-1234567890"})
     )

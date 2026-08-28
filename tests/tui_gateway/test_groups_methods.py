@@ -67,8 +67,15 @@ def test_capabilities_are_honest_about_the_driver_boundary(home):
 
 
 def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch):
+    from gateway.platforms import api_server_room_attachments
+
     monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setattr(
+        api_server_room_attachments,
+        "roomlink_attachments_available",
+        lambda: True,
+    )
     result = _result(srv._methods["groups.capabilities"](1, {}))
     assert result["room_link"]["enabled"] is True
     assert result["room_link"]["profile"] == "reviewer"

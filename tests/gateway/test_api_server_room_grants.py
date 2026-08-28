@@ -70,6 +70,7 @@ def test_room_grant_helpers_delegate_through_legacy_adapter_methods(monkeypatch)
 @pytest.mark.asyncio
 async def test_capability_handler_uses_legacy_claims_monkeypatch(monkeypatch):
     from gateway import hosted_rooms
+    from gateway.platforms import api_server_room_attachments
 
     adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
     request = object()
@@ -87,6 +88,11 @@ async def test_capability_handler_uses_legacy_claims_monkeypatch(monkeypatch):
         hosted_rooms,
         "local_authority_gateway_id",
         lambda: "install-target",
+    )
+    monkeypatch.setattr(
+        api_server_room_attachments,
+        "roomlink_attachments_available",
+        lambda: True,
     )
     profile_token = api_server._api_request_profile.set("worker")
     try:
