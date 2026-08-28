@@ -8121,7 +8121,12 @@ function unaddressedGroupMentions(group, members, thread) {
  *
  *  `members` is the live roster when the caller has one (the workspace);
  *  falls back to the room's durable roster so a two-arg call still works. */
-async function stopGroupThread(group, thread, members = null) {
+async function stopGroupThread(
+  group,
+  thread,
+  members = null,
+  { preservePending = false, preserveQueueClaim = false } = {}
+) {
   const room = $groupChats.get()[group] || {}
   const roster = Array.isArray(members) && members.length ? members : room.members || []
   const turnName = room.turn || null
@@ -8131,6 +8136,16 @@ async function stopGroupThread(group, thread, members = null) {
     r.epoch = (r.epoch || 0) + 1
     r.running = false
     r.turn = null
+
+    // Explicit Stop is terminal for sends waiting behind this run. The
+    // interrupt-and-send transition opts out while its selected item owns the
+    // room and the remainder of the FIFO must survive.
+    if (!preservePending) {
+      r.pending = []
+    }
+    if (!preserveQueueClaim) {
+      r.interruptingQueue = null
+    }
 
     // Same hold shape applyGroupHoldDirective mints for "@all stop" — the
     // held-skip path (watermark consume + 'held' activity note) and every
@@ -8165,8 +8180,11 @@ async function stopGroupThread(group, thread, members = null) {
     } catch {
       /* best-effort — the epoch/hold legs above already stopped the room;
          the abandoned poll loop exits on its staleness check */
+      return false
     }
   }
+
+  return true
 }
 
 /** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
@@ -8554,10 +8572,16 @@ async function harvestStrandedUntilSettled(group, members, thread) {
   recordGroupActivity(group, { kind: 'failed', member: null, thread })
 }
 
-function runQueuedGroupMessage(group, members, queued) {
+function runQueuedGroupMessage(group, members, queued, { claimed = false } = {}) {
   const roster = Array.isArray(members) && members.length ? members : ($groupChats.get()[group] || {}).members || []
+  const roomBefore = $groupChats.get()[group] || {}
 
-  if (!queued || !roster.length) {
+  if (
+    !queued ||
+    !roster.length ||
+    roomBefore.running ||
+    (roomBefore.interruptingQueue && (!claimed || roomBefore.interruptingQueue.id !== queued.id))
+  ) {
     return false
   }
 
@@ -8566,6 +8590,9 @@ function runQueuedGroupMessage(group, members, queued) {
 
   updateGroupChat(group, room => {
     room.pending = (room.pending || []).filter(item => item.id !== queued.id)
+    if (claimed) {
+      room.interruptingQueue = null
+    }
     room.members = durableGroupChatMembers(roster)
     room.epoch = (room.epoch || 0) + 1
     room.runSequence = (room.runSequence || 0) + 1
@@ -8599,7 +8626,7 @@ function drainQueuedGroupMessage(group, members = null) {
   const room = $groupChats.get()[group] || {}
   const next = Array.isArray(room.pending) ? room.pending[0] : null
 
-  if (room.running || !next) {
+  if (room.running || room.interruptingQueue || !next) {
     return false
   }
 
@@ -8636,25 +8663,64 @@ function keepWaitingForQueuedGroupMessage(group, messageId) {
   return true
 }
 
-/** Stop the live member, then promote one selected queued send. Preserve
- * pre-existing user holds: stopGroupThread's temporary all-member holds exist
- * only long enough for the stale poll loop to observe cancellation. */
+/** Claim one queued send before crossing the async interrupt boundary. The
+ * claim remains the room owner until promotion, so composer sends stay queued
+ * and repeat actions cannot start a second drive. */
 async function interruptForQueuedGroupMessage(group, messageId, members = null) {
   const room = $groupChats.get()[group] || {}
   const queued = (room.pending || []).find(item => item.id === messageId)
 
-  if (!queued) {
+  if (!queued || room.interruptingQueue) {
     return false
   }
 
   const priorHolds = { ...(room.holds || {}) }
   const roster = Array.isArray(members) && members.length ? members : room.members || []
-  await stopGroupThread(group, queued.thread, roster)
+
+  if (!room.running) {
+    return runQueuedGroupMessage(group, roster, queued)
+  }
+
+  updateGroupChat(group, current => {
+    if (current.interruptingQueue || !(current.pending || []).some(item => item.id === messageId)) {
+      return current
+    }
+    current.pending = current.pending.filter(item => item.id !== messageId)
+    current.interruptingQueue = queued
+    return current
+  })
+
+  if (($groupChats.get()[group] || {}).interruptingQueue?.id !== messageId) {
+    return false
+  }
+
+  const interrupted = await stopGroupThread(group, queued.thread, roster, {
+    preservePending: true,
+    preserveQueueClaim: true
+  })
+  const current = $groupChats.get()[group] || {}
+
+  if (!interrupted) {
+    if (current.interruptingQueue?.id === messageId) {
+      updateGroupChat(group, latest => {
+        latest.interruptingQueue = null
+        latest.pending = [queued, ...(latest.pending || []).filter(item => item.id !== messageId)]
+        latest.holds = priorHolds
+        return latest
+      })
+    }
+    return false
+  }
+
+  if (current.interruptingQueue?.id !== messageId || current.running) {
+    return false
+  }
+
   updateGroupChat(group, current => {
     current.holds = priorHolds
     return current
   })
-  return runQueuedGroupMessage(group, roster, queued)
+  return runQueuedGroupMessage(group, roster, queued, { claimed: true })
 }
 
 /** User send into a group room. A busy room stores the send in a durable FIFO
@@ -8678,7 +8744,7 @@ function sendToGroupChat(group, members, text, thread, images) {
     queuedBehindRun: Math.max(1, Number(room.runSequence || 1))
   }
 
-  if (room.running) {
+  if (room.running || room.interruptingQueue) {
     updateGroupChat(group, current => {
       current.members = durableGroupChatMembers(members)
       current.pending = [...(current.pending || []), queued]
@@ -13311,7 +13377,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
-  const pendingQueue = Array.isArray(room.pending) ? room.pending : []
+  const pendingQueue = [
+    ...(room.interruptingQueue ? [room.interruptingQueue] : []),
+    ...(Array.isArray(room.pending) ? room.pending : [])
+  ]
   const [queueNow, setQueueNow] = useState(() => Date.now())
   const composerKey = groupComposerDraftKey(group, room)
   const composerKeyRef = useRef(composerKey)
@@ -13566,8 +13635,14 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // epoch bump + holds the loop marched on to the next member. Thread scope:
   // the run being stopped is the one the latest activity belongs to.
   const stopRoomRun = async () => {
+    const queuedCount = (room.pending || []).length + (room.interruptingQueue ? 1 : 0)
     await stopGroupThread(group, latestActivity?.thread || null, memberDescriptors())
-    host.notify({ kind: 'success', message: `Stopped ${group} — remaining turns are held until you resume` })
+    host.notify({
+      kind: 'success',
+      message: queuedCount
+        ? `Stopped ${group} — cancelled ${queuedCount} queued ${queuedCount === 1 ? 'message' : 'messages'}`
+        : `Stopped ${group} — remaining turns are held until you resume`
+    })
   }
 
   const cancelQueued = queued => {
@@ -14090,53 +14165,67 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             ...roomClarifies.map(entry =>
               jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
-            ...pendingQueue.map(queued => {
-              const waitedMs = Math.max(0, queueNow - Number(queued.at || queueNow))
-              const decisionAge = Math.max(0, queueNow - Number(queued.decisionAt || queued.at || queueNow))
-              const overdue = decisionAge >= 60_000
+            pendingQueue.length
+              ? jsx('div', {
+                  className: 'grid gap-1 border-t border-(--ui-stroke-tertiary) px-2 py-1.5 text-[0.7rem]',
+                  children: pendingQueue.map(queued => {
+                    const waitedMs = Math.max(0, queueNow - Number(queued.at || queueNow))
+                    const decisionAge = Math.max(0, queueNow - Number(queued.decisionAt || queued.at || queueNow))
+                    const overdue = decisionAge >= 60_000
+                    const interrupting = room.interruptingQueue?.id === queued.id
 
-              return jsxs('div', {
-                className:
-                  'grid gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary,#181818) px-2 py-1.5 text-[0.7rem]',
-                children: [
-                  jsxs('div', {
-                    className: 'flex items-center gap-1.5',
-                    children: [
-                      jsx(Codicon, { name: 'clock', className: 'shrink-0 text-(--ui-accent)' }),
-                      jsx('span', {
-                        className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
-                        children: `Queued — room agent busy (run #${queued.queuedBehindRun || 1}) · ${Math.floor(waitedMs / 1000)}s`
-                      }),
-                      jsx('button', {
-                        type: 'button',
-                        className: 'shrink-0 text-(--ui-accent) hover:underline',
-                        onClick: () => cancelQueued(queued),
-                        children: 'Cancel'
-                      })
-                    ]
-                  }),
-                  overdue
-                    ? jsxs('div', {
-                        className: 'flex items-center justify-end gap-2 text-[0.65rem]',
-                        children: [
-                          jsx('button', {
-                            type: 'button',
-                            className: 'text-(--ui-accent) hover:underline',
-                            onClick: () => void interruptQueued(queued),
-                            children: 'Interrupt & send'
-                          }),
-                          jsx('button', {
-                            type: 'button',
-                            className: 'text-(--ui-text-tertiary) hover:text-foreground',
-                            onClick: () => keepWaitingForQueuedGroupMessage(group, queued.id),
-                            children: 'Keep waiting'
-                          })
-                        ]
-                      })
-                    : null
-                ]
-              }, `queued:${queued.id}`)
-            }),
+                    return jsxs('div', {
+                      className: 'grid gap-1',
+                      children: [
+                        jsxs('div', {
+                          className: 'flex items-center gap-1.5',
+                          children: [
+                            jsx(Codicon, { name: 'clock', className: 'shrink-0 text-(--ui-accent)' }),
+                            jsx('span', {
+                              className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
+                              children: interrupting
+                                ? 'Interrupting current turn…'
+                                : room.running
+                                  ? `Queued — room agent busy (run #${queued.queuedBehindRun || 1}) · ${Math.floor(waitedMs / 1000)}s`
+                                  : `Queued — room stopped · ${Math.floor(waitedMs / 1000)}s`
+                            }),
+                            jsx(Button, {
+                              type: 'button',
+                              variant: 'text',
+                              size: 'inline',
+                              disabled: interrupting,
+                              'aria-label': 'Cancel queued group message',
+                              onClick: () => cancelQueued(queued),
+                              children: 'Cancel'
+                            })
+                          ]
+                        }),
+                        !interrupting && (overdue || !room.running)
+                          ? jsxs('div', {
+                              className: 'flex items-center justify-end gap-2 text-[0.65rem]',
+                              children: [
+                                jsx(Button, {
+                                  type: 'button',
+                                  variant: 'textStrong',
+                                  size: 'inline',
+                                  onClick: () => void interruptQueued(queued),
+                                  children: room.running ? 'Interrupt & send' : 'Send now'
+                                }),
+                                jsx(Button, {
+                                  type: 'button',
+                                  variant: 'text',
+                                  size: 'inline',
+                                  onClick: () => keepWaitingForQueuedGroupMessage(group, queued.id),
+                                  children: 'Keep waiting'
+                                })
+                              ]
+                            })
+                          : null
+                      ]
+                    }, `queued:${queued.id}`)
+                  })
+                })
+              : null,
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',

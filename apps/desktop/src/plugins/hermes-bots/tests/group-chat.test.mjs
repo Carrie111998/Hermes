@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, drainQueuedGroupMessage, cancelQueuedGroupMessage, keepWaitingForQueuedGroupMessage, interruptForQueuedGroupMessage, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, drainQueuedGroupMessage, cancelQueuedGroupMessage, keepWaitingForQueuedGroupMessage, interruptForQueuedGroupMessage, stopGroupThread, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -411,6 +411,104 @@ test('interrupt-and-send promotes only the selected queue item and interrupts th
   assert.equal(roomLog(gc, 'Interrupt').some(entry => entry.text === 'send this now'), true)
   assert.equal(gc.$groupChats.get().Interrupt.pending.some(item => item.id === waiting.id), true)
   assert.equal(await gc.interruptForQueuedGroupMessage('Interrupt', 'missing'), false)
+})
+
+test('interrupt-and-send is single-flight while session.interrupt is pending', async () => {
+  let releaseInterrupt
+  const interruptGate = { promise: new Promise(resolve => { releaseInterrupt = resolve }) }
+  const gc = load(() => '(pass)')
+  const request = gc.host.request
+  gc.host.request = (method, params) => {
+    if (method === 'session.interrupt') {
+      gc.requests.push({ method, params })
+      return interruptGate.promise
+    }
+    return request(method, params)
+  }
+  gc.host.requestProfile = (_route, method, params) => gc.host.request(method, params)
+  const roster = [{ name: 'research', title: '' }]
+  gc.updateGroupChat('Claim', room => {
+    room.running = true
+    room.turn = 'research'
+    room.runSequence = 3
+    room.sessions = { research: 'live-research-session' }
+    room.members = roster
+    return room
+  })
+  gc.sendToGroupChat('Claim', roster, 'promote exactly once')
+  const selected = gc.$groupChats.get().Claim.pending[0]
+
+  const first = gc.interruptForQueuedGroupMessage('Claim', selected.id, roster)
+  const second = gc.interruptForQueuedGroupMessage('Claim', selected.id, roster)
+  assert.equal(gc.$groupChats.get().Claim.interruptingQueue?.id, selected.id, 'claim is installed synchronously')
+  assert.equal(gc.$groupChats.get().Claim.sessions.research, 'live-research-session')
+  await Promise.resolve()
+  gc.sendToGroupChat('Claim', roster, 'arrived during interrupt')
+  const later = gc.$groupChats.get().Claim.pending[0]
+
+  assert.equal(gc.$groupChats.get().Claim.interruptingQueue?.id, selected.id, 'the selected send owns the room')
+  assert.equal(gc.requests.some(call => call.method === 'session.interrupt'), true, 'the interrupt RPC is in flight')
+  assert.equal(await second, false, 'a repeated action cannot share or duplicate the claim')
+  assert.equal(gc.cancelQueuedGroupMessage('Claim', selected.id), false, 'the claimed item cannot be cancelled mid-promotion')
+  assert.equal(gc.cancelQueuedGroupMessage('Claim', later.id), true, 'a later queued item remains independently cancellable')
+  assert.equal(
+    roomLog(gc, 'Claim').filter(entry => entry.text === 'promote exactly once').length,
+    0,
+    'the claimed item does not promote before interrupt settles'
+  )
+
+  releaseInterrupt({ ok: true })
+  assert.equal(await first, true)
+  assert.equal(roomLog(gc, 'Claim').filter(entry => entry.text === 'promote exactly once').length, 1)
+  assert.equal(gc.$groupChats.get().Claim.interruptingQueue, null)
+})
+
+test('explicit Stop cancels queued sends instead of leaving a false busy queue', async () => {
+  const gc = load(() => '(pass)')
+  const roster = [{ name: 'research', title: '' }]
+  gc.updateGroupChat('Stopped', room => {
+    room.running = true
+    room.turn = 'research'
+    room.sessions = { research: 'live-research-session' }
+    room.members = roster
+    return room
+  })
+  gc.sendToGroupChat('Stopped', roster, 'must not survive Stop')
+
+  assert.equal(gc.$groupChats.get().Stopped.pending.length, 1)
+  await gc.stopGroupThread('Stopped', null, roster)
+  assert.equal(gc.$groupChats.get().Stopped.running, false)
+  assert.equal(gc.$groupChats.get().Stopped.pending.length, 0)
+  assert.equal(gc.drainQueuedGroupMessage('Stopped'), false)
+  assert.equal(roomLog(gc, 'Stopped').some(entry => entry.text === 'must not survive Stop'), false)
+})
+
+test('a failed interrupt restores the claimed send without promoting it', async () => {
+  const gc = load(() => '(pass)')
+  // Let the plugin's one-time cold-start queue drain finish before constructing
+  // this runtime-only failure state.
+  await new Promise(resolve => setImmediate(resolve))
+  gc.host.request = async method => {
+    if (method === 'session.interrupt') {
+      throw new Error('interrupt unavailable')
+    }
+    return {}
+  }
+  const roster = [{ name: 'research', title: '' }]
+  gc.updateGroupChat('Rollback', room => {
+    room.running = true
+    room.turn = 'research'
+    room.sessions = { research: 'live-research-session' }
+    room.members = roster
+    return room
+  })
+  gc.sendToGroupChat('Rollback', roster, 'restore me')
+  const selected = gc.$groupChats.get().Rollback.pending[0]
+
+  assert.equal(await gc.interruptForQueuedGroupMessage('Rollback', selected.id, roster), false)
+  assert.equal(gc.$groupChats.get().Rollback.interruptingQueue, null)
+  assert.equal(gc.$groupChats.get().Rollback.pending[0].id, selected.id)
+  assert.equal(roomLog(gc, 'Rollback').some(entry => entry.text === 'restore me'), false)
 })
 
 test('concurrent groups sharing one member keep sessions, deltas, and context isolated', async () => {
