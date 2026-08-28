@@ -79,7 +79,7 @@ def _coerce_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         try:
             return int(float(value))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
 
 
@@ -134,6 +134,16 @@ def _coerce_fanout(value: Any) -> str:
         if n == 1:
             return "per_iteration"
     return "user_turn"
+
+
+def _coerce_routing(value: Any) -> dict[str, Any]:
+    """Normalize request-local direct-versus-fan-out routing policy."""
+    raw = value if isinstance(value, dict) else {}
+    mode = str(raw.get("mode") or "always").strip().lower()
+    if mode not in {"always", "never", "auto"}:
+        mode = "always"
+    threshold = max(1, _coerce_int(raw.get("threshold"), 3))
+    return {"mode": mode, "threshold": threshold}
 
 
 def coerce_privacy_filter(value: Any) -> str:
@@ -306,6 +316,7 @@ def _default_preset() -> dict[str, Any]:
         "max_tokens": 4096,
         "reference_max_tokens": None,
         "fanout": "user_turn",
+        "routing": {"mode": "always", "threshold": 3},
         "enabled": True,
     }
 
@@ -366,6 +377,7 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         # last advisor run. Also accepts the mapping form
         # {mode: every_n, n: N}, normalized to the canonical string.
         "fanout": _coerce_fanout(raw.get("fanout")),
+        "routing": _coerce_routing(raw.get("routing")),
     }
 
 
@@ -415,6 +427,7 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "max_tokens": active["max_tokens"],
         "reference_max_tokens": active.get("reference_max_tokens"),
         "fanout": active.get("fanout", "user_turn"),
+        "routing": deepcopy(active["routing"]),
         "enabled": active["enabled"],
         # MoA-level (not per-preset) toggles ride at the top level alongside
         # save_traces. privacy_filter: '' (off, default) | 'display' | 'full'

@@ -362,7 +362,9 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     if entry is not None:
         stamped_at, cached = entry
         if now - stamped_at < _RUNTIME_CACHE_TTL_SECONDS:
-            return cached
+            # Callers consume request-local fields (notably extra_body) with
+            # pop(). Never expose the cached dictionary itself.
+            return dict(cached)
     out: dict[str, Any] = {"provider": provider, "model": model}
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -387,8 +389,8 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
         # provider/model kwargs for a full TTL.
         return out
     with _runtime_cache_lock:
-        _runtime_cache[cache_key] = (now, out)
-    return out
+        _runtime_cache[cache_key] = (now, dict(out))
+    return dict(out)
 
 
 def _merge_slot_extra_body(
@@ -1159,6 +1161,32 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rendered
 
 
+def _route_turn_identity(messages: list[dict[str, Any]]) -> tuple[str, str]:
+    """Return latest user text and a cache-decoration-stable turn signature.
+
+    Only canonical visible user text participates. Assistant/tool growth,
+    prompt-cache metadata, key ordering, ephemeral MoA guidance, and provider
+    request decoration therefore cannot flip the route inside one user turn.
+    The complete user-message sequence distinguishes consecutive identical
+    prompts without depending on compressible assistant history.
+    """
+    user_texts: list[str] = []
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        text = flatten_message_text(message.get("content"))
+        if text == _ADVISORY_INSTRUCTION:
+            continue
+        if not text.strip() and isinstance(message.get("content"), list):
+            text = "[user sent non-text content (e.g. an image attachment)]"
+        user_texts.append(text)
+    latest = user_texts[-1] if user_texts else ""
+    signature = hashlib.sha256(
+        "\u0000".join(user_texts).encode("utf-8", "replace")
+    ).hexdigest()
+    return latest, signature
+
+
 
 def _extract_text(response: Any) -> str:
     try:
@@ -1614,6 +1642,11 @@ class MoAChatCompletions:
         # Normalized moa.privacy_filter mode for the current turn ('' |
         # 'display' | 'full'), refreshed from config on every create().
         self._privacy_mode: str = ""
+        # Explainable request-local decision from the conditional router. Kept
+        # on the facade for UI/observability consumers; it never changes the
+        # acting aggregator or the conversation's provider identity.
+        self.last_route_decision: Any = None
+        self._route_turn_sig: str | None = None
 
     def consume_reference_usage(self) -> tuple[Any, Any]:
         """Pop pending reference-fan-out usage + cost, resetting both to empty.
@@ -1750,7 +1783,12 @@ class MoAChatCompletions:
         agg_messages = [dict(message) for message in messages]
         if guidance:
             _attach_reference_guidance(agg_messages, str(guidance))
-        return {**prepared, "messages": agg_messages}
+        _, rebased_turn_sig = _route_turn_identity(messages)
+        return {
+            **prepared,
+            "messages": agg_messages,
+            "_route_turn_sig": rebased_turn_sig,
+        }
 
     def _call_prepared_aggregator(
         self, prepared: dict[str, Any], api_kwargs: dict[str, Any]
@@ -1908,6 +1946,11 @@ class MoAChatCompletions:
         if prepared_request is not None:
             if not isinstance(prepared_request, dict):
                 raise TypeError("_moa_prepared_request must be a dict")
+            prepared_decision = prepared_request.get("_route_decision")
+            prepared_turn_sig = prepared_request.get("_route_turn_sig")
+            if prepared_decision is not None and isinstance(prepared_turn_sig, str):
+                self.last_route_decision = prepared_decision
+                self._route_turn_sig = prepared_turn_sig
             return self._call_prepared_aggregator(prepared_request, api_kwargs)
 
         from hermes_cli.config import get_config_path, load_config
@@ -1952,6 +1995,28 @@ class MoAChatCompletions:
             if slot.get("enabled", True)
         ]
         aggregator = preset.get("aggregator") or {}
+        from agent.moa_router import decide_moa_route
+
+        latest_user_prompt, route_turn_sig = _route_turn_identity(messages)
+        if route_turn_sig == self._route_turn_sig and self.last_route_decision is not None:
+            route_decision = self.last_route_decision
+        else:
+            route_decision = decide_moa_route(
+                latest_user_prompt,
+                preset.get("routing"),
+            )
+            self._route_turn_sig = route_turn_sig
+        self.last_route_decision = route_decision
+        if not route_decision.fanout:
+            reference_models = []
+        logger.info(
+            "MoA route: preset=%s mode=%s fanout=%s score=%s reasons=%s",
+            self.preset_name,
+            route_decision.mode,
+            route_decision.fanout,
+            route_decision.score,
+            ",".join(route_decision.reasons) or "none",
+        )
         # Expose the resolved aggregator slot so session cost accounting can
         # price the aggregator's acting turn at its REAL model/provider. The
         # agent's model/provider on the MoA path are the virtual preset name
@@ -2310,6 +2375,8 @@ class MoAChatCompletions:
             "guidance": guidance,
             "aggregator": aggregator,
             "aggregator_temperature": aggregator_temperature,
+            "_route_decision": route_decision,
+            "_route_turn_sig": route_turn_sig,
         }
         if api_kwargs.pop("_moa_prepare_only", False):
             return prepared_request

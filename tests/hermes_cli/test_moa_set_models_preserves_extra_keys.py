@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from hermes_cli.web_server import MoaConfigPayload, MoaModelSlot, MoaPresetPayload, set_moa_models
+from hermes_cli.web_server import (
+    MoaConfigPayload,
+    MoaModelSlot,
+    MoaPresetPayload,
+    MoaRoutingPayload,
+    set_moa_models,
+)
 
 
 def _base_payload(**overrides) -> MoaConfigPayload:
@@ -24,6 +30,7 @@ def _base_payload(**overrides) -> MoaConfigPayload:
                 ],
                 aggregator=MoaModelSlot(provider="openrouter", model="anthropic/claude-opus-4.8"),
                 max_tokens=4096,
+                routing=MoaRoutingPayload(mode="auto", threshold=5),
                 enabled=True,
             ),
         },
@@ -73,6 +80,10 @@ class TestSetMoaModelsPreservesUndeclaredKeys:
             set_moa_models(payload)
 
         moa = saved_cfg["moa"]
+        assert moa["presets"]["default"]["routing"] == {
+            "mode": "auto",
+            "threshold": 5,
+        }
         assert moa.get("save_traces") is True, (
             "save_traces was dropped by set_moa_models"
         )
@@ -80,4 +91,93 @@ class TestSetMoaModelsPreservesUndeclaredKeys:
             "trace_dir was dropped by set_moa_models"
         )
 
+    def test_legacy_put_omitting_routing_preserves_existing_policy(self):
+        existing_cfg = {
+            "moa": {
+                "default_preset": "default",
+                "presets": {
+                    "default": {
+                        "reference_models": [
+                            {"provider": "openai-codex", "model": "gpt-5.5"},
+                        ],
+                        "aggregator": {
+                            "provider": "openrouter",
+                            "model": "anthropic/claude-opus-4.8",
+                        },
+                        "routing": {"mode": "auto", "threshold": 5},
+                    }
+                },
+            }
+        }
+        payload = MoaConfigPayload.model_validate(
+            {
+                "default_preset": "default",
+                "presets": {
+                    "default": {
+                        "reference_models": [
+                            {"provider": "openai-codex", "model": "gpt-5.5"},
+                        ],
+                        "aggregator": {
+                            "provider": "openrouter",
+                            "model": "anthropic/claude-opus-4.8",
+                        },
+                    }
+                },
+            }
+        )
+        saved_cfg = {}
 
+        with (
+            patch("hermes_cli.web_server.load_config", return_value=existing_cfg),
+            patch("hermes_cli.web_server.save_config", side_effect=lambda cfg: saved_cfg.update(cfg)),
+            patch("hermes_cli.web_server._profile_scope"),
+        ):
+            set_moa_models(payload)
+
+        assert saved_cfg["moa"]["presets"]["default"]["routing"] == {
+            "mode": "auto",
+            "threshold": 5,
+        }
+
+    def test_named_put_omitting_routing_preserves_legacy_flat_policy(self):
+        existing_cfg = {
+            "moa": {
+                "routing": {"mode": "auto", "threshold": 5},
+                "reference_models": [
+                    {"provider": "openai-codex", "model": "gpt-5.5"},
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                },
+            }
+        }
+        payload = MoaConfigPayload.model_validate(
+            {
+                "default_preset": "default",
+                "presets": {
+                    "default": {
+                        "reference_models": [
+                            {"provider": "openai-codex", "model": "gpt-5.5"},
+                        ],
+                        "aggregator": {
+                            "provider": "openrouter",
+                            "model": "anthropic/claude-opus-4.8",
+                        },
+                    }
+                },
+            }
+        )
+        saved_cfg = {}
+
+        with (
+            patch("hermes_cli.web_server.load_config", return_value=existing_cfg),
+            patch("hermes_cli.web_server.save_config", side_effect=lambda cfg: saved_cfg.update(cfg)),
+            patch("hermes_cli.web_server._profile_scope"),
+        ):
+            set_moa_models(payload)
+
+        assert saved_cfg["moa"]["presets"]["default"]["routing"] == {
+            "mode": "auto",
+            "threshold": 5,
+        }

@@ -91,6 +91,9 @@ moa:
       # reference_temperature: 0.6
       # aggregator_temperature: 0.4
       max_tokens: 4096
+      routing:
+        mode: auto       # always | auto | never
+        threshold: 3     # lower values fan out more readily
       enabled: true
 ```
 
@@ -99,6 +102,26 @@ Default preset:
 - reference: `openai-codex:gpt-5.5`
 - reference: `openrouter:deepseek/deepseek-v4-pro`
 - aggregator / acting model: `openrouter:anthropic/claude-opus-4.8`
+
+### Conditional Fusion-style routing
+
+Each preset can decide locally whether a turn needs its reference models. The
+aggregator remains the acting model on both paths, so Hermes keeps the same
+provider-specific runtime, OAuth credentials, tools, fallback behaviour, and
+conversation cache identity.
+
+- `routing.mode: always` is the backward-compatible default and runs the
+  configured advisors according to `fanout`.
+- `routing.mode: auto` uses a dependency-free, explainable intent score. It
+  favours deliberation for comparison, review, recommendation, research,
+  architecture, code, and high-stakes prompts; short lookup-style requests go
+  directly to the aggregator.
+- `routing.mode: never` skips advisors and uses the aggregator directly.
+- `routing.threshold` is a positive integer used by `auto` (default `3`). A
+  lower threshold invokes advisors more often.
+
+The route is request-local and never swaps the acting model mid-conversation.
+Every decision is logged with its score and reasons for diagnosis.
 
 ### Tuning advisor speed with `reference_max_tokens`
 
