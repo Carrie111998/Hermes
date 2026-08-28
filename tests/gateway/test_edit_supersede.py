@@ -353,8 +353,9 @@ class TestHandleEditSupersede:
         assert result is True  # handled (dropped)
         assert sk not in adapter._pending_messages
 
-    def test_pending_sentinel_edit_passed_through_to_queue(self):
-        """When the agent is _AGENT_PENDING_SENTINEL, treat the edit as uncorrelated (drop)."""
+    def test_sentinel_window_edit_dropped(self):
+        """Edit matching active_message_id during the sentinel window is dropped
+        with a distinct log; redirect/steer not called."""
         runner = _make_runner()
         sk = "test_session"
         adapter = _make_adapter()

@@ -9381,6 +9381,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._queue_or_replace_pending_event(session_key, event)
                 return True
 
+            elif running_agent is _AGENT_PENDING_SENTINEL:
+                logger.info(
+                    "Edit supersede — edit matched in-flight turn but agent "
+                    "still pending (sentinel); edit dropped for session %s",
+                    session_key,
+                )
+                return True
+
         # 3. Uncoupled edit (#35535 deliberate policy): no queued match,
         #    no in-flight match.  An isolated out-of-context correction
         #    would confuse the model — drop it silently.

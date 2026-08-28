@@ -583,3 +583,91 @@ async def test_chat_item_updated_empty_does_not_raise():
     event2 = {"type": "chatItemUpdated"}
     await adapter._handle_event(event2)
     adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_image_msg_content_produces_edit():
+    """(f) chatItemUpdated with image-type msgContent + caption: edit still
+    produces MessageEvent with message_id, is_edit=True, and caption text;
+    file metadata is not reconstructed on edits."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay = 0
+
+    event = {
+        "type": "chatItemUpdated",
+        "chatItem": {
+            "chatInfo": {
+                "type": "direct",
+                "contact": {"contactId": 42, "localDisplayName": "tester"},
+            },
+            "chatItem": {
+                "chatDir": {"type": "directRcv"},
+                "meta": {
+                    "itemId": 321,
+                    "itemTs": "2026-01-01T00:00:00Z",
+                },
+                "content": {
+                    "type": "rcvMsgContent",
+                    "msgContent": {
+                        "type": "image",
+                        "text": "a photo of a cat",
+                    },
+                },
+            },
+        },
+    }
+
+    await adapter._handle_event(event)
+    await asyncio.sleep(0.01)
+
+    adapter.handle_message.assert_called_once()
+    msg = adapter.handle_message.call_args[0][0]
+    assert msg.message_id == "321"
+    assert msg.metadata.get("is_edit") is True
+    assert msg.text == "a photo of a cat"
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_missing_itemid():
+    """(g) chatItemUpdated whose meta has no itemId: MessageEvent produced
+    WITHOUT message_id; metadata is_edit is still True. This documents the
+    fallback where the gateway treats such an edit as a non-edit (normal
+    dispatch)."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay = 0
+
+    event = {
+        "type": "chatItemUpdated",
+        "chatItem": {
+            "chatInfo": {
+                "type": "direct",
+                "contact": {"contactId": 42, "localDisplayName": "tester"},
+            },
+            "chatItem": {
+                "chatDir": {"type": "directRcv"},
+                "meta": {
+                    "itemTs": "2026-01-01T00:00:00Z",
+                    # no itemId key
+                },
+                "content": {
+                    "type": "rcvMsgContent",
+                    "msgContent": {
+                        "type": "text",
+                        "text": "edit with no itemId",
+                    },
+                },
+            },
+        },
+    }
+
+    await adapter._handle_event(event)
+    await asyncio.sleep(0.01)
+
+    adapter.handle_message.assert_called_once()
+    msg = adapter.handle_message.call_args[0][0]
+    # message_id is not set when meta.itemId is absent
+    assert not hasattr(msg, "message_id") or msg.message_id is None
+    assert msg.metadata.get("is_edit") is True
+    assert msg.text == "edit with no itemId"
