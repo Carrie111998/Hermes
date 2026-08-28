@@ -7032,6 +7032,44 @@ class TestSupportsReasoningExtraBody:
             agent.model = model
             assert agent._supports_reasoning_extra_body() is True, model
 
+    def _make_local_ollama_agent(self, *, thinking: bool):
+        agent = object.__new__(AIAgent)
+        agent.provider = "custom"
+        agent.base_url = "http://127.0.0.1:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL"
+        agent._ollama_num_ctx = 262144
+        agent._ollama_thinking_cache = {
+            (agent.model, agent.base_url): (thinking, 0.0),
+        }
+        return agent
+
+    def test_local_ollama_port_is_treated_as_ollama(self):
+        agent = object.__new__(AIAgent)
+        agent.provider = "custom"
+        agent.base_url = "http://127.0.0.1:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "qwen3-coder"
+        agent._ollama_num_ctx = None
+        assert agent._is_ollama_compatible_endpoint() is True
+
+    def test_custom_ark_endpoint_is_not_treated_as_ollama(self):
+        agent = object.__new__(AIAgent)
+        agent.provider = "custom"
+        agent.base_url = "https://ark.cn-beijing.volces.com/api/v3"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.2"
+        agent._ollama_num_ctx = None
+        assert agent._is_ollama_compatible_endpoint() is False
+
+    def test_local_ollama_non_thinking_model_is_not_reasoning_capable(self):
+        agent = self._make_local_ollama_agent(thinking=False)
+        assert agent._supports_reasoning_extra_body() is False
+
+    def test_local_ollama_thinking_model_is_reasoning_capable(self):
+        agent = self._make_local_ollama_agent(thinking=True)
+        assert agent._supports_reasoning_extra_body() is True
+
 
 class TestMemoryContextSanitization:
     """sanitize_context() helper correctness — used at provider boundaries."""
