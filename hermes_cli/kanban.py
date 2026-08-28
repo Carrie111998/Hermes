@@ -2796,7 +2796,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        ready_pending = _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
         if ready_pending and not spawned_any:
             health_state["bad_ticks"] += 1

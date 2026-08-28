@@ -9548,61 +9548,91 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+def _profile_spawnability(assignee: Optional[str]) -> Optional[bool]:
+    """Return whether *assignee* can be dispatched as a Hermes profile.
 
-    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
-
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    ``True`` and ``False`` are definitive answers. ``None`` means profile
+    introspection was unavailable; callers should retain the dispatcher's
+    existing conservative behavior and treat the row as potentially
+    spawnable. Validation is deliberately performed here instead of relying
+    only on ``profile_exists``: a synthetic database row such as ``..`` must
+    not resolve through a parent directory and look like a valid profile.
     """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
+    if not assignee:
         return False
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
     except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        # Preserve the pre-existing degraded-install behavior: without the
+        # profiles module the dispatcher still surfaces possible stuck work.
+        return None
+    try:
+        canonical = normalize_profile_name(assignee)
+        validate_profile_name(canonical)
+    except (TypeError, ValueError):
+        return False
+    try:
+        return bool(profile_exists(canonical))
+    except Exception:
+        # A filesystem/profile-store failure is not proof that the row is
+        # intentionally idle. Keep health telemetry conservative and allow
+        # the normal dispatcher path to retain its existing fallback.
+        return None
+
+
+def _has_spawnable_tasks(
+    conn: sqlite3.Connection,
+    *,
+    status: str,
+    lane: str,
+) -> bool:
+    """Return whether a task in *status* would pass dispatch admission.
+
+    The health probe must use the same respawn guard as ``dispatch_once``;
+    otherwise a task intentionally deferred by the active-PR, recent-success,
+    quota, or auth guard is misreported as stuck. Guard-probe failures remain
+    conservative: they report possible work rather than hiding a real stuck
+    dispatcher. ``lane`` is passed through so the review lane retains its
+    intentional active-PR/recent-success bypass.
+    """
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = ? AND assignee IS NOT NULL "
+        "    AND claim_lock IS NULL",
+        (status,),
+    ).fetchall()
     for row in rows:
-        if profile_exists(row["assignee"]):
+        spawnability = _profile_spawnability(row["assignee"])
+        if spawnability is False:
+            continue
+        try:
+            guard_reason = check_respawn_guard(conn, row["id"], lane=lane)
+        except Exception:
+            # Do not suppress the warning when the guard itself is unavailable.
+            return True
+        if guard_reason is None:
             return True
     return False
+
+
+def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+    """Return True iff a ready task would pass dispatch admission.
+
+    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
+    distinguish genuinely stuck spawnable work from intentionally idle rows
+    (control-plane lanes, malformed synthetic assignees, active-PR/recent-
+    success guards, or already-claimed tasks).
+    """
+    return _has_spawnable_tasks(conn, status="ready", lane="ready")
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    """Return True iff a review task would pass review dispatch admission."""
+    return _has_spawnable_tasks(conn, status="review", lane="review")
 
 
 def review_dispatch_enabled() -> bool:
