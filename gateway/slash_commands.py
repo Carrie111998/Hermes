@@ -456,6 +456,141 @@ class GatewaySlashCommandsMixin:
             f"Slash commands you can run: {runnable_str}"
         )
 
+    # ``/project`` on a messaging platform is READ-ONLY, by allowlist.
+    #
+    # The CLI and the gateway share one argparse tree, and that tree contains
+    # ``plan --file PATH`` (reads a server-local file), ``plan --file -``
+    # (reads the gateway's stdin) and the folder verbs (mutate the filesystem).
+    # None of that may be reachable from Telegram, Slack or Discord merely
+    # because it is spelled the same way. So this is an allowlist of verbs, and
+    # a second allowlist of the only flag any of them may carry — not a filter
+    # of known-bad forms, which would fail open on the next flag someone adds.
+    _PROJECT_GATEWAY_VERBS = ("status", "plan-show", "list", "ls", "show")
+    _PROJECT_GATEWAY_FLAGS = {"plan-show": ("--revision",)}
+    _PROJECT_GATEWAY_USAGE = (
+        "Usage (read-only on this platform):\n"
+        "  /project status\n"
+        "  /project plan-show <project|task> [--revision N]\n"
+        "  /project list\n"
+        "  /project show <project>"
+    )
+
+    def _project_gateway_refusal(self, verb: str) -> str:
+        """Why a verb is not reachable here, and where it is."""
+        known = {
+            "plan", "create", "add-folder", "remove-folder", "rename",
+            "set-primary", "use", "archive", "restore", "bind-board",
+        }
+        if verb in known:
+            return (
+                f"`/project {verb}` is not available from a messaging "
+                f"platform — it writes, and some project verbs read or change "
+                f"local files. Run it in a terminal:  hermes project {verb} …"
+                f"\n\n{self._PROJECT_GATEWAY_USAGE}"
+            )
+        if verb in ("approve-plan", "reject-plan"):
+            return (
+                f"`/project {verb}` is not available from a messaging "
+                f"platform. Approving a plan needs a separately authenticated "
+                f"surface, which does not ship; the terminal command only "
+                f"displays the plan and fails closed. Use `/project plan-show "
+                f"<task>` to read it."
+                f"\n\n{self._PROJECT_GATEWAY_USAGE}"
+            )
+        return (
+            f"Unknown project action: {verb}\n\n{self._PROJECT_GATEWAY_USAGE}"
+        )
+
+    async def _handle_project_command(self, event: MessageEvent) -> str:
+        """Handle /project — read-only verbs only, executed deterministically.
+
+        Returns command output as text. It never starts an agent turn, and it
+        never reaches a verb or flag outside the two allowlists above.
+        """
+        import asyncio
+        import contextlib
+        import io
+        import shlex
+
+        text = (event.text or "").strip()
+        if text.startswith("/"):
+            text = text.lstrip("/")
+        if text.startswith("project"):
+            text = text[len("project"):].lstrip()
+
+        try:
+            tokens = shlex.split(text) if text else []
+        except ValueError as exc:
+            return f"project: could not parse the command ({exc})"
+
+        if not tokens:
+            return self._PROJECT_GATEWAY_USAGE
+
+        verb = tokens[0]
+        if verb not in self._PROJECT_GATEWAY_VERBS:
+            return self._project_gateway_refusal(verb)
+
+        allowed_flags = self._PROJECT_GATEWAY_FLAGS.get(verb, ())
+        argv = [verb]
+        i = 1
+        positionals = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.startswith("-"):
+                flag, _, inline = tok.partition("=")
+                if flag not in allowed_flags:
+                    return (
+                        f"`{tok}` is not accepted by `/project {verb}` on this "
+                        f"platform.\n\n{self._PROJECT_GATEWAY_USAGE}"
+                    )
+                value = inline if inline else (
+                    tokens[i + 1] if i + 1 < len(tokens) else ""
+                )
+                if not value.isdigit():
+                    return (
+                        f"`{flag}` needs a whole number.\n\n"
+                        f"{self._PROJECT_GATEWAY_USAGE}"
+                    )
+                argv.extend([flag, value])
+                i += 1 if inline else 2
+                continue
+            positionals += 1
+            if positionals > 1:
+                return (
+                    f"`/project {verb}` takes at most one target.\n\n"
+                    f"{self._PROJECT_GATEWAY_USAGE}"
+                )
+            argv.append(tok)
+            i += 1
+
+        def _run() -> str:
+            import argparse
+
+            from hermes_cli import projects_cmd
+
+            root = argparse.ArgumentParser(prog="hermes", add_help=False)
+            sub = root.add_subparsers(dest="command")
+            projects_cmd.build_parser(sub)
+            try:
+                args = root.parse_args(["project", *argv])
+            except SystemExit:
+                # argparse writes its own message to stderr and exits; the
+                # gateway must answer with text, never die.
+                return (
+                    f"project: could not parse those arguments.\n\n"
+                    f"{self._PROJECT_GATEWAY_USAGE}"
+                )
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                projects_cmd.projects_command(args)
+            return (out.getvalue() + err.getvalue()).strip()
+
+        try:
+            output = await asyncio.to_thread(_run)
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"project: {exc}"
+        return output or "(no output)"
+
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban — delegate to the shared kanban CLI.
 

@@ -389,14 +389,37 @@ def _cmd_plan_show(args: argparse.Namespace) -> int:
 
     conn = kb.connect()
     try:
-        # A task id resolves through the gate, so what is shown is exactly the
-        # artifact that gate is waiting on — the same lookup the (unavailable)
-        # decision path would bind to.
-        if target.startswith("t_"):
-            task = kb.get_task(conn, target)
-            if task is None:
-                print(f"project: no such task: {target}", file=sys.stderr)
+        # Resolve by LOOKUP, not by spelling. ``ensure_pm_project`` accepts any
+        # identifier, so a project may legitimately be called "t_portfolio";
+        # sniffing the "t_" prefix made such a project unreadable by the caller
+        # that had just created it.
+        task = kb.get_task(conn, target)
+        project_plan = kb.get_plan(conn, target, revision)
+        has_project = project_plan is not None or (
+            revision is not None and kb.get_plan(conn, target) is not None
+        )
+
+        if revision is not None:
+            # A revision is a property of a project. Asking for one against a
+            # task is a mistake worth naming rather than quietly showing the
+            # revision its gate happens to point at.
+            if project_plan is None and task is not None:
+                print(
+                    f"project: --revision selects a project revision, and "
+                    f"{target} is a task. Omit --revision to show the plan its "
+                    f"gate is waiting on.", file=sys.stderr,
+                )
+                return 2
+            if project_plan is None:
+                print(
+                    f"project: no plan revision {revision} for project "
+                    f"{target}", file=sys.stderr,
+                )
                 return 1
+
+        elif task is not None:
+            # The gate is the time-sensitive artifact, so a task wins a
+            # collision — and the collision is disclosed rather than hidden.
             if kb.gate_state_of(conn, target) != "plan":
                 print(
                     f"project: task {target} is not awaiting plan approval",
@@ -410,14 +433,20 @@ def _cmd_plan_show(args: argparse.Namespace) -> int:
                     f"gate", file=sys.stderr,
                 )
                 return 1
+            if has_project:
+                print(
+                    f"  Note     : {target} is also a project id; showing the "
+                    f"task's gate. Use --revision to read the project instead."
+                )
             _print_plan(target, task, ctx)
             return 0
 
-        plan = kb.get_plan(conn, target, revision)
+        plan = project_plan
         if plan is None:
             which = f" revision {revision}" if revision is not None else ""
             print(
-                f"project: no plan{which} for {target}", file=sys.stderr,
+                f"project: no plan{which} for {target} — it matches no task "
+                f"and no project on this board", file=sys.stderr,
             )
             return 1
         print()

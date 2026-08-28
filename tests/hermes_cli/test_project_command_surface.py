@@ -192,7 +192,9 @@ def test_plan_show_on_a_missing_task_fails_cleanly(tmp_path, monkeypatch):
     kb.init_db()
     code, _out, err = _run(["project", "plan-show", "t_nope"])
     assert code == 1
-    assert "no such task" in err
+    # Resolution is by lookup, not by spelling, so the refusal names both
+    # namespaces rather than assuming a "t_" prefix means a task.
+    assert "matches no task and no project" in err
 
 
 def test_status_lists_a_gated_task(gated_task):
@@ -379,3 +381,152 @@ def test_project_is_curated_onto_slack_via_hermes_not_by_displacement():
     # on Telegram.
     assert "project" in slack_subcommand_map()
     assert "project" in {n for n, _ in telegram_bot_commands()}
+
+
+# ---------------------------------------------------------------------------
+# Hermes Console — the other real execution registry (commit-9 correction)
+# ---------------------------------------------------------------------------
+
+def _engine():
+    from hermes_cli.console_engine import HermesConsoleEngine
+
+    return HermesConsoleEngine()
+
+
+def test_the_console_registers_every_project_verb():
+    """The Console owns its own family list, so it can drift from argparse.
+
+    This is the same contract as the CommandDef test, against the registry
+    that actually executes in the Console.
+    """
+    registered = {p[1] for p in _engine().commands if p and p[0] == "project"}
+    assert _argparse_actions() - {"ls"} <= registered, (
+        f"missing from the Console: "
+        f"{sorted(_argparse_actions() - {'ls'} - registered)}"
+    )
+
+
+@pytest.mark.parametrize("verb", ["plan", "plan-show", "status"])
+def test_the_new_verbs_are_reachable_in_the_console(verb):
+    assert ("project", verb) in _engine().commands
+
+
+@pytest.mark.parametrize("verb,mutating", [
+    ("plan", True), ("plan-show", False), ("status", False),
+    ("approve-plan", True), ("reject-plan", True),
+])
+def test_console_mutation_classification(verb, mutating):
+    assert _engine().commands[("project", verb)].mutating is mutating
+
+
+def test_console_status_runs_read_only(board):
+    result = _engine().execute("project status")
+    assert result.status == "ok"
+    assert "no tasks are waiting" in result.output.lower()
+
+
+def test_console_plan_requires_confirmation_then_runs(board):
+    engine = _engine()
+    first = engine.execute('project plan proj-c --body "a plan"')
+    assert first.status == "confirm_required"
+    conn = kb.connect()
+    try:
+        assert kb.get_plan(conn, "proj-c") is None, "nothing written yet"
+    finally:
+        conn.close()
+
+    second = engine.execute('project plan proj-c --body "a plan"', confirmed=True)
+    assert second.status == "ok"
+    conn = kb.connect()
+    try:
+        assert kb.get_plan(conn, "proj-c")["revision"] == 1
+    finally:
+        conn.close()
+
+
+def test_console_plan_show_runs_without_confirmation(board):
+    engine = _engine()
+    engine.execute('project plan proj-d --body "drafted"', confirmed=True)
+    result = engine.execute("project plan-show proj-d")
+    assert result.status == "ok"
+    assert "drafted" in result.output
+
+
+def test_console_gate_verbs_display_then_fail_closed(gated_task):
+    """Registered so the Console mirrors the CLI, mutating so they confirm —
+    and still unable to cross the gate."""
+    engine = _engine()
+    assert engine.execute(f"project approve-plan {gated_task}").status == (
+        "confirm_required")
+    result = engine.execute(f"project approve-plan {gated_task}", confirmed=True)
+    assert "1. do the work" in result.output
+    conn = kb.connect()
+    try:
+        row = conn.execute("SELECT gate_state FROM tasks WHERE id = ?",
+                           (gated_task,)).fetchone()
+        approvals = conn.execute("SELECT COUNT(*) c FROM pm_approvals").fetchone()["c"]
+    finally:
+        conn.close()
+    assert row["gate_state"] == "plan"
+    assert approvals == 0
+
+
+# ---------------------------------------------------------------------------
+# plan-show target resolution (commit-9 correction)
+# ---------------------------------------------------------------------------
+
+def test_a_project_named_like_a_task_is_still_displayable(board):
+    """`ensure_pm_project` accepts any id, so prefix-sniffing was wrong."""
+    code, _out, _err = _run(["project", "plan", "t_portfolio", "--body", "real plan"])
+    assert code == 0
+    code, out, err = _run(["project", "plan-show", "t_portfolio"])
+    assert code == 0, err
+    assert "real plan" in out
+
+
+def test_a_gated_task_still_resolves_through_its_gate(gated_task):
+    code, out, _err = _run(["project", "plan-show", gated_task])
+    assert code == 0
+    assert "1. do the work" in out
+
+
+def test_an_explicit_revision_on_a_task_target_is_not_silently_ignored(gated_task):
+    """Revisions belong to projects. Asking for one against a task is a
+    mistake worth naming, not a request to quietly show something else."""
+    code, out, err = _run(["project", "plan-show", gated_task, "--revision", "1"])
+    assert code == 2
+    assert "revision" in err.lower()
+    assert "Revision : 2" not in out
+
+
+def test_a_task_and_project_sharing_a_spelling_resolve_deterministically(board):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="collide", assignee="pm")
+        kb.ensure_pm_project(conn, project_id=tid)
+        kb.submit_plan(conn, project_id=tid, body="PROJECT SIDE")
+
+        kb.ensure_pm_project(conn, project_id="p2")
+        kb.submit_plan(conn, project_id="p2", body="GATE SIDE")
+        assert kb.park_for_plan_approval(
+            conn, tid, project_id="p2", revision=1) is True
+    finally:
+        conn.close()
+    code, out, _err = _run(["project", "plan-show", tid])
+    assert code == 0
+    assert "GATE SIDE" in out, "the gate wins — it is the time-sensitive one"
+    assert "also a project" in out.lower(), "and the ambiguity is disclosed"
+
+
+def test_a_missing_target_names_both_possibilities(board):
+    code, _out, err = _run(["project", "plan-show", "t_nothing"])
+    assert code == 1
+    assert "task" in err.lower() and "project" in err.lower()
+
+
+def test_revisions_do_not_leak_across_projects(board):
+    _run(["project", "plan", "proj-one", "--body", "ONE r1"])
+    _run(["project", "plan", "proj-two", "--body", "TWO r1"])
+    code, out, _err = _run(["project", "plan-show", "proj-one", "--revision", "1"])
+    assert code == 0
+    assert "ONE r1" in out and "TWO r1" not in out

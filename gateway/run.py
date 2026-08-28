@@ -16787,6 +16787,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "agents": self._handle_agents_command,
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
+                "project": self._handle_project_command,
                 "subgoal": self._handle_subgoal_command,
                 "heartbeat": self._handle_heartbeat_command,
                 "yolo": self._handle_yolo_command,
@@ -18053,6 +18054,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "project":
+            return await self._handle_project_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)
