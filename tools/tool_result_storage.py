@@ -13,27 +13,8 @@ Defense against context-window overflow operates at three levels:
 
    The canonical home is ALWAYS host-side:
    ``$HERMES_HOME/cache/spillover/{tool_use_id}.txt`` — alongside the other
-   Hermes-owned caches (images, audio, documents, ...) instead of littering
-   the OS temp dir. This needs no sandbox environment, so it also works for
-   sessions that never ran a terminal command (MCP-only, cron, gateway) —
-   previously those hit the inline-truncate fallback because
-   ``get_active_env()`` returned None until the first terminal call created
-   an environment.
-
-   What the model sees depends on the backend:
-
-   - **Local backend (or no active env):** the host path itself.
-   - **Remote backends (docker/ssh/modal/daytona):** ``cache/spillover`` is
-     in the auto-mounted/synced cache-dir list (tools/credential_files.py),
-     so the reference is the translated in-sandbox path (probed for
-     readability first). When the sandbox can't see it (e.g. a persistent
-     container created before spillover joined the mount list), fall back
-     to writing a copy into the sandbox temp dir via env.execute().
-
-   The spillover dir is pruned two ways: the gateway housekeeping loop
-   sweeps it hourly with the other media caches, and a once-per-process
-   best-effort prune runs on the first spill so CLI-only installs (which
-   never run gateway housekeeping) self-clean too.
+   Hermes-owned caches. Remote backends use a translated path when mounted,
+   otherwise they receive a sandbox temp copy.
 
 3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
    results in a single assistant turn are collected, if the total exceeds
@@ -48,6 +29,7 @@ import os
 import re
 import shlex
 import threading
+import tempfile
 import time
 import uuid
 
@@ -56,6 +38,7 @@ from tools.budget_config import (
     BudgetConfig,
     DEFAULT_BUDGET,
 )
+from tools.tool_result_sanitization import sanitize_tool_result_for_sink
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -142,27 +125,29 @@ def _is_host_side_env(env) -> bool:
         return False
 
 
-def sanitize_tool_result_for_sink(content: str) -> str:
-    """Force-redact result text before it reaches a non-model sink."""
-    if not isinstance(content, str) or not content:
-        return content
-    from agent.redact import redact_sensitive_text
-    return redact_sensitive_text(
-        redact_sensitive_text(content, force=True, file_read=True, redact_url_credentials=True),
-        force=True, redact_url_credentials=True,
-    )
-
-
-def _write_to_spillover(content: str, filename: str):
-    """Write sanitized content to host spillover; return path or None."""
+def _write_to_spillover(content, filename: str):
+    """Atomically publish sanitized content to host spillover."""
+    temporary_path = None
     try:
         spill_dir = get_spillover_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
         path = spill_dir / filename
-        path.write_text(sanitize_tool_result_for_sink(content), encoding="utf-8", errors="replace")
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=spill_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as stream:
+            stream.write(sanitize_tool_result_for_sink(content))
+        os.replace(temporary_path, path)
+        temporary_path = None
     except OSError as exc:
         logger.warning("Spillover write failed for %s: %s", filename, exc)
         return None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
     _prune_spillover_once()
     return str(path)
 
@@ -245,8 +230,8 @@ def _heredoc_marker(content: str) -> str:
     return f"HERMES_PERSIST_{uuid.uuid4().hex[:8]}"
 
 
-def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
-    """Write content into the sandbox via env.execute(). Returns True on success.
+def _write_to_sandbox(content, remote_path: str, env) -> bool:
+    """Write sanitized content into the sandbox via env.execute().
 
     Pushes ``content`` through stdin rather than embedding it in the command
     string. Linux's ``MAX_ARG_STRLEN`` caps any single argv element at 128 KB
@@ -259,6 +244,7 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     the exec-arg ceiling.
     """
     storage_dir = os.path.dirname(remote_path)
+    content = sanitize_tool_result_for_sink(content)
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
     result = env.execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
@@ -335,13 +321,15 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
+    safe_content = sanitize_tool_result_for_sink(content)
+    content_length = len(content) if isinstance(content, str) else len(safe_content)
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
 
     if effective_threshold == float("inf"):
-        return content
+        return content if isinstance(content, str) else safe_content
 
-    if len(content) <= effective_threshold:
-        return content
+    if content_length <= effective_threshold:
+        return content if isinstance(content, str) else safe_content
 
     filename = _safe_result_filename(tool_use_id)
     safe_content = sanitize_tool_result_for_sink(content)
@@ -356,9 +344,9 @@ def maybe_persist_tool_result(
         if host_path is not None:
             logger.info(
                 "Persisted large tool result: %s (%s, %d chars -> %s)",
-                tool_name, tool_use_id, len(content), host_path,
+                tool_name, tool_use_id, content_length, host_path,
             )
-            return _build_persisted_message(preview, has_more, len(content), host_path)
+            return _build_persisted_message(preview, has_more, content_length, host_path)
     elif env is not None:
         # Remote backend: the spillover dir is auto-mounted (docker) or
         # file-synced (modal/ssh/daytona) into the sandbox, so reference the
@@ -368,9 +356,9 @@ def maybe_persist_tool_result(
             if visible is not None:
                 logger.info(
                     "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
-                    tool_name, tool_use_id, len(content), visible, host_path,
+                    tool_name, tool_use_id, content_length, visible, host_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), visible)
+                return _build_persisted_message(preview, has_more, content_length, visible)
         # Fallback: write into the sandbox temp dir (pre-existing containers
         # without the spillover mount, translation/probe failures).
         storage_dir = _resolve_storage_dir(env)
@@ -379,19 +367,19 @@ def maybe_persist_tool_result(
             if _write_to_sandbox(safe_content, remote_path, env):
                 logger.info(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
-                    tool_name, tool_use_id, len(content), remote_path,
+                    tool_name, tool_use_id, content_length, remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return _build_persisted_message(preview, has_more, content_length, remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
-        tool_name, len(content),
+        tool_name, content_length,
     )
     return (
         f"{preview}\n\n"
-        f"[Truncated: tool response was {len(content):,} chars. "
+        f"[Truncated: tool response was {content_length:,} chars. "
         f"Full output could not be saved to sandbox.]"
     )
 
@@ -413,6 +401,9 @@ def enforce_turn_budget(
     total_size = 0
     for i, msg in enumerate(tool_messages):
         content = msg.get("content", "")
+        if not isinstance(content, str):
+            content = sanitize_tool_result_for_sink(content)
+            msg["content"] = content
         size = len(content)
         total_size += size
         if PERSISTED_OUTPUT_TAG not in content:
