@@ -87,6 +87,22 @@ Examples:
             "secrets unless --no-redact is also passed."
         ),
     )
+    bundle_parser = debug_sub.add_parser(
+        "bundle",
+        help="Write a bounded, redacted diagnostic bundle locally (never uploads)",
+        description=(
+            "Collect an allowlisted diagnostic bundle under the active profile. "
+            "The bundle is always redacted, bounded, and local-only."
+        ),
+    )
+    bundle_parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Output filename or path below the active profile diagnostics "
+            "directory (default: debug-bundle.json); paths outside it are rejected."
+        ),
+    )
     delete_parser = debug_sub.add_parser(
         "delete",
         help="Delete a paste uploaded by 'hermes debug share'",
