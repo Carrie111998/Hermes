@@ -6,6 +6,7 @@ from hermes_cli.kanban_worker_prompt import (
     FactoryCardContractError,
     assert_factory_card_contract,
     build_worker_spawn_prompt,
+    parse_context_list,
     parse_manuals,
 )
 
@@ -63,6 +64,46 @@ def test_spawn_prompt_injects_agents_md_when_profile_home_exists(tmp_path):
     )
     assert str(agents) in prompt
     assert "read_file" in prompt
+
+
+def test_spawn_prompt_orders_board_native_context_before_manuals():
+    body = """
+GOAL: close the blocker
+REFS:
+  - /tmp/reference.txt
+CORPUS:
+  - /tmp/corpus.md
+SESSIONS:
+  - @session:default/20260827_204357_dfa73e
+MANUALS:
+  - read_file: /tmp/AGENTS.md
+  - skill_view: kanban-factory
+PROCEDURE: inspect the artifacts
+DONE: test -f /tmp/done.txt
+FAIL: handoff #3 and kanban_block
+"""
+    prompt = build_worker_spawn_prompt("t_ctx", body=body, board="ocr", assignee="ocr")
+    assert "1. Read the task body / goal contract" in prompt
+    assert "2. Check task attachments" in prompt
+    assert "3. Check parent artifacts / upstream outputs" in prompt
+    assert "4. Read curated corpus / handoff paths" in prompt
+    assert "/tmp/corpus.md" in prompt
+    assert "5. Check linked session references for audit/recovery" in prompt
+    assert "@session:default/20260827_204357_dfa73e" in prompt
+    assert "6. Load manuals / skills in order" in prompt
+
+
+def test_parse_context_list_extracts_corpus_and_sessions():
+    body = """
+CORPUS:
+  - /tmp/one.md
+  - /tmp/two.md
+SESSIONS:
+  - @session:default/abc
+  - @session:default/def
+"""
+    assert parse_context_list(body, "CORPUS") == ["/tmp/one.md", "/tmp/two.md"]
+    assert parse_context_list(body, "SESSIONS") == ["@session:default/abc", "@session:default/def"]
 
 
 # Task 3 tests (contract checker)

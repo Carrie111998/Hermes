@@ -16,6 +16,24 @@ Manual = Tuple[str, str]  # (\"read_file\", path) | (\"skill_view\", name)
 _REQUIRED_HEADINGS = ("GOAL:", "REFS:", "MANUALS:", "PROCEDURE:", "DONE:", "FAIL:")
 
 
+def parse_context_list(body: Optional[str], heading: str) -> List[str]:
+    """Extract a bullet list under ``heading`` (e.g. CORPUS, SESSIONS)."""
+    if not body:
+        return []
+    match = re.search(
+        rf"(?m)^{re.escape(heading)}:\s*\n((?:[ \t]*-[^\n]*\n)+)",
+        body,
+    )
+    if not match:
+        return []
+    out: List[str] = []
+    for raw in match.group(1).splitlines():
+        line = raw.strip()
+        if line.startswith("-"):
+            out.append(line.lstrip("- ").strip())
+    return out
+
+
 def parse_manuals(body: Optional[str]) -> List[Manual]:
     """Extract MANUALS list from card body.
     
@@ -91,6 +109,8 @@ def build_worker_spawn_prompt(
     
     board_s = board or "(current board)"
     loads = "\n".join(load_lines)
+    corpus_refs = parse_context_list(body, "CORPUS")
+    session_refs = parse_context_list(body, "SESSIONS")
     
     return (
         f"Work kanban task {task_id} on board {board_s} "
@@ -98,13 +118,19 @@ def build_worker_spawn_prompt(
         "You are a dispatcher-spawned worker. HERMES_KANBAN_BOARD is already pinned. "
         "Do not mint cards. Do not touch other boards.\n\n"
         "BEFORE any other tool:\n"
+        "1. Read the task body / goal contract.\n"
+        "2. Check task attachments.\n"
+        "3. Check parent artifacts / upstream outputs.\n"
+        f"4. Read curated corpus / handoff paths: {corpus_refs or ['(none listed)']}\n"
+        f"5. Check linked session references for audit/recovery: {session_refs or ['(none listed)']}\n"
+        "6. Load manuals / skills in order:\n"
         f"{loads}\n\n"
+        "If you block before checking an earlier rung, that is a governance defect, not a principal exception.\n"
         "Then read this task. PROCEDURE on the card is steps, not a substitute "
         "for those files. Do not guess from skill index lines.\n\n"
-        "When the DONE MEASURE is met: kanban_request_review with "
-        "metadata changed_files, verification, residual_risk and "
-        "artifacts=[the DONE file]. Do not kanban_complete to done.\n"
-        "If DONE cannot be met: kanban_block and write handoff #3. "
+        "When DONE is met: kanban_request_review with changed_files, verification, residual_risk, and artifacts=[the DONE file].\n"
+        "Do not kanban_complete to done.\n"
+        "If DONE cannot be met: kanban_block and write handoff #3.\n"
         "Until the MANUALS loads succeed, you have not started."
     )
 
