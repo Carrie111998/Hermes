@@ -959,6 +959,24 @@ class SessionSchemaMixin:
         # column gets created here.
         self._reconcile_columns(cursor)
 
+        # Keep the async ledger's additive migration ordering explicit.  Its
+        # deferred index references columns absent from pre-closeout stores;
+        # reconcile those columns before any deferred index is prepared even
+        # if the general declarative reconciler changes in the future.
+        async_columns = {
+            row[1] for row in cursor.execute(
+                "PRAGMA table_info(async_delegations)"
+            ).fetchall()
+        }
+        for name, declaration in (
+            ("origin_work_id", "TEXT NOT NULL DEFAULT ''"),
+            ("work_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in async_columns:
+                cursor.execute(
+                    f'ALTER TABLE async_delegations ADD COLUMN "{name}" {declaration}'
+                )
+
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
         # the one table-shape repair reconciliation can't express.

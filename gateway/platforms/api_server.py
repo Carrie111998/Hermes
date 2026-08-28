@@ -41,6 +41,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import errno
 import hashlib
@@ -1509,6 +1510,10 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # Process-local capability used only by gateway/wake.py self-posts.
+        # API bearer auth alone is intentionally insufficient to assert trusted
+        # delegation lifecycle identity.
+        self._internal_self_post_token = uuid.uuid4().hex
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -5052,6 +5057,40 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        internal_continuation = None
+        encoded_internal = request.headers.get(
+            "X-Hermes-Internal-Continuation", ""
+        ).strip()
+        if encoded_internal:
+            supplied_token = request.headers.get("X-Hermes-Internal-Auth", "")
+            if not hmac.compare_digest(
+                supplied_token, self._internal_self_post_token
+            ):
+                return web.json_response(
+                    _openai_error("Trusted internal continuation authentication failed"),
+                    status=403,
+                )
+            try:
+                decoded = json.loads(
+                    base64.urlsafe_b64decode(encoded_internal.encode("ascii"))
+                )
+                required = ("work_id", "delivery_id", "claim_id")
+                if not isinstance(decoded, dict) or not all(
+                    str(decoded.get(key) or "") for key in required
+                ):
+                    raise ValueError("missing closeout identity")
+                internal_continuation = {
+                    "work_id": str(decoded["work_id"]),
+                    "generation": int(decoded.get("generation") or 0),
+                    "delivery_id": str(decoded["delivery_id"]),
+                    "claim_id": str(decoded["claim_id"]),
+                }
+            except (ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+                return web.json_response(
+                    _openai_error("Invalid trusted internal continuation metadata"),
+                    status=400,
+                )
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -5272,6 +5311,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                internal_continuation=internal_continuation,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5293,6 +5333,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                internal_continuation=internal_continuation,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -7199,7 +7240,9 @@ class APIServerAdapter(BasePlatformAdapter):
         physically cannot reintroduce the silent-no-op bug (#10760) by
         forgetting to mark the channel as non-delivering. There is no
         ``async_delivery`` parameter to get wrong; the stateless HTTP path can
-        never wake the agent after the turn ends, on ANY route.
+        never provide generic push delivery. Identified requests separately
+        bind task-scoped closeout delivery because the authenticated self-post
+        path can resume that raw session id.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -7216,6 +7259,7 @@ class APIServerAdapter(BasePlatformAdapter):
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
+            closeout_delivery=bool(session_id),
             cron_session="",
         )
 
@@ -7240,6 +7284,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        internal_continuation: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7330,10 +7375,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if internal_continuation:
+                        _internal_metadata = {
+                            "work_id": str(internal_continuation["work_id"]),
+                            "generation": int(
+                                internal_continuation.get("generation") or 0
+                            ),
+                            "delivery_id": str(
+                                internal_continuation["delivery_id"]
+                            ),
+                            "claim_id": str(internal_continuation["claim_id"]),
+                        }
+                        conversation_kwargs.update({
+                            "origin_work_id": _internal_metadata["work_id"],
+                            "work_generation": _internal_metadata["generation"],
+                            "work_delivery_id": _internal_metadata["delivery_id"],
+                            "work_claim_id": _internal_metadata["claim_id"],
+                            "persist_user_display_kind": "internal_notification",
+                            "persist_user_display_metadata": _internal_metadata,
+                        })
                     result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                        **conversation_kwargs,
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,

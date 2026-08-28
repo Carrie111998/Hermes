@@ -53,12 +53,12 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
-async def _serve(handler):
+async def _serve(handler, path="/v1/chat/completions"):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
 
     app = web.Application()
-    app.router.add_post("/v1/chat/completions", handler)
+    app.router.add_post(path, handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -98,6 +98,72 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     ]
 
 
+def test_deliver_wake_secondary_profile_uses_prefixed_api_route():
+    from aiohttp import web
+
+    seen = []
+
+    async def handler(request):
+        seen.append(request.path)
+        return web.json_response({"choices": []})
+
+    async def run():
+        path = "/p/secondary/v1/chat/completions"
+        runner, port = await _serve(handler, path)
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            await deliver_wake(
+                adapter,
+                text="closeout",
+                profile="secondary",
+                session_id="raw-sid",
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen == ["/p/secondary/v1/chat/completions"]
+
+
+def test_deliver_wake_self_post_carries_authenticated_internal_metadata():
+    import base64
+    import json
+    from aiohttp import web
+
+    seen = {}
+
+    async def handler(request):
+        seen.update(request.headers)
+        return web.json_response({"choices": []})
+
+    async def run():
+        runner, port = await _serve(handler)
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            adapter._internal_self_post_token = "process-secret"
+            await deliver_wake(
+                adapter,
+                text="closeout",
+                session_id="raw-sid",
+                internal_metadata={
+                    "work_id": "w1", "generation": 2,
+                    "delivery_id": "d1", "claim_id": "c1",
+                },
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen["X-Hermes-Internal-Auth"] == "process-secret"
+    decoded = json.loads(base64.urlsafe_b64decode(
+        seen["X-Hermes-Internal-Continuation"]
+    ))
+    assert decoded == {
+        "work_id": "w1", "generation": 2,
+        "delivery_id": "d1", "claim_id": "c1",
+    }
+
+
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     """HTTP 429 (max_concurrent_runs cap) is transient — retried with backoff."""
     from aiohttp import web
@@ -123,5 +189,4 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
 

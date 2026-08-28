@@ -346,7 +346,15 @@ def _process_single_prompt(
         )
 
         # Run the agent with task_id to ensure each task gets its own isolated VM
-        result = agent.run_conversation(prompt, task_id=task_id)
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        _session_tokens = set_session_vars(
+            async_delivery=False, closeout_delivery=False
+        )
+        try:
+            result = agent.run_conversation(prompt, task_id=task_id)
+        finally:
+            clear_session_vars(_session_tokens)
         
         # Extract tool usage statistics
         tool_stats = _extract_tool_stats(result["messages"])
@@ -1377,4 +1385,3 @@ def main(
 
 if __name__ == "__main__":
     fire.Fire(main)
-

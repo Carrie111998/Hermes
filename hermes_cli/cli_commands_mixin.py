@@ -504,6 +504,18 @@ class CLICommandsMixin:
         """
         from tools.process_registry import process_registry
 
+        try:
+            from tools.async_delegation import close_work_groups_for_session
+
+            close_work_groups_for_session(
+                origin_session=str(getattr(self, "session_id", "") or ""),
+                parent_session_id=str(getattr(self, "session_id", "") or ""),
+                disposition="cancelled",
+                diagnostics="classic CLI /stop cancelled outstanding delegation work",
+            )
+        except Exception:
+            pass
+
         processes = process_registry.list_sessions()
         running = [p for p in processes if p.get("status") == "running"]
 
