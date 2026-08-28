@@ -50,6 +50,8 @@ export const ja = defineLocale({
     revealExplorer: 'エクスプローラーで表示',
     revealFileManager: '格納フォルダーを開く',
     revealInSidebar: 'ファイルツリーで表示',
+    open: '開く',
+    opening: '読み込み中…',
     copyPath: 'パスをコピー',
     copyRelativePath: '相対パスをコピー',
     download: 'ダウンロード',

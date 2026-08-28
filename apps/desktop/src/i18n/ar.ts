@@ -66,6 +66,8 @@ export const ar = defineLocale({
     revealExplorer: 'إظهار في File Explorer',
     revealFileManager: 'فتح المجلد الحاوي',
     revealInSidebar: 'إظهار في شجرة الملفات',
+    open: 'فتح',
+    opening: 'جارٍ التحميل…',
     copyPath: 'نسخ المسار',
     copyRelativePath: 'نسخ المسار النسبي',
     download: 'تنزيل',

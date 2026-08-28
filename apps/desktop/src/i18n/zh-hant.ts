@@ -50,6 +50,8 @@ export const zhHant = defineLocale({
     revealExplorer: '在檔案總管中顯示',
     revealFileManager: '開啟所在資料夾',
     revealInSidebar: '在檔案樹中顯示',
+    open: '開啟',
+    opening: '載入中…',
     copyPath: '複製路徑',
     copyRelativePath: '複製相對路徑',
     download: '下載',
