@@ -87,6 +87,12 @@ from hermes_cli.config import (
     read_raw_config,
     require_readable_config_before_write,
 )
+from hermes_cli.auth_suppression import (
+    filter_suppressed_entries as _filter_suppressed_global_entries,
+    source_is_suppressed as _source_is_suppressed,
+    suppressed_sources_for as _suppressed_sources_for,
+    suppression_union as _suppression_union,
+)
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
@@ -1696,28 +1702,12 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
 def _suppressed_sources_for_provider(
     auth_store: Dict[str, Any], provider_id: str
 ) -> set[str]:
-    """Return the union of profile and root suppressions for global fallback."""
-    local_sources = set(_suppressed_sources_for(auth_store, provider_id))
-    global_sources = set(
-        _suppressed_sources_for(_load_global_auth_store(), provider_id)
+    """Compatibility delegate to the canonical profile/root suppression owner."""
+    return _suppression_union(
+        auth_store,
+        _load_global_auth_store(),
+        provider_id,
     )
-    return local_sources | global_sources
-
-
-def _filter_suppressed_global_entries(
-    entries: List[Any], suppressed_sources: set[str]
-) -> List[Any]:
-    """Remove only global fallback entries explicitly suppressed by source."""
-    if not suppressed_sources:
-        return list(entries)
-    return [
-        entry
-        for entry in entries
-        if not (
-            isinstance(entry, dict)
-            and entry.get("source") in suppressed_sources
-        )
-    ]
 
 
 def read_credential_pool(
@@ -1942,24 +1932,6 @@ def suppress_credential_source(provider_id: str, source: str) -> None:
         _save_auth_store(auth_store)
 
 
-def _suppressed_sources_for(store: Dict[str, Any], provider_id: str) -> List[str]:
-    """The source names suppressed for ``provider_id`` in one auth store.
-
-    Both shapes of the per-provider entry are accepted: the writers above store a
-    list, but an older store may hold a mapping whose keys are the source names
-    (both migrate it in place the next time they touch it).
-    """
-    suppressed = store.get("suppressed_sources")
-    if not isinstance(suppressed, dict):
-        return []
-    entries = suppressed.get(provider_id)
-    if isinstance(entries, dict):
-        return [str(name) for name in entries]
-    if isinstance(entries, (list, tuple, set)):
-        return [str(name) for name in entries]
-    return []
-
-
 def is_source_suppressed(provider_id: str, source: str) -> bool:
     """Check if a credential source has been suppressed by the user.
 
@@ -1981,11 +1953,12 @@ def is_source_suppressed(provider_id: str, source: str) -> bool:
 
     """
     try:
-        if source in _suppressed_sources_for(_load_auth_store(), provider_id):
-            return True
-        # Returns {} in classic mode and never raises, so this is a no-op when
-        # there is no global root distinct from the profile.
-        return source in _suppressed_sources_for(_load_global_auth_store(), provider_id)
+        return _source_is_suppressed(
+            _load_auth_store(),
+            _load_global_auth_store(),
+            provider_id,
+            source,
+        )
     except Exception:
         return False
 

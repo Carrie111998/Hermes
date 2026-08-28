@@ -33,14 +33,16 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.tool_result_egress import (
+    is_multimodal_tool_result as _is_multimodal_tool_result,
+    redact_tool_result_for_egress as _redact_tool_result_for_egress,
+)
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
-    _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
-    _redact_tool_result_for_egress,
     make_tool_result_message,
 )
 from tools.terminal_tool import (

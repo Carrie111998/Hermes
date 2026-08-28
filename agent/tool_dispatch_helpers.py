@@ -33,7 +33,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.message_metadata import stamp_message_timestamp
-from agent.redact import redact_sensitive_text
+from agent.tool_result_egress import (
+    is_multimodal_tool_result as _is_multimodal_tool_result,
+    redact_tool_result_for_egress as _redact_tool_result_for_egress,
+)
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
@@ -392,20 +395,6 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left_parts[:common_len] == right_parts[:common_len]
 
 
-def _is_multimodal_tool_result(value: Any) -> bool:
-    """True if the value is a multimodal tool result envelope.
-
-    Multimodal handlers (e.g. tools/computer_use) return a dict with
-    `_multimodal=True`, a `content` key holding OpenAI-style content
-    parts, and an optional `text_summary` for string-only fallbacks.
-    """
-    return (
-        isinstance(value, dict)
-        and value.get("_multimodal") is True
-        and isinstance(value.get("content"), list)
-    )
-
-
 def _multimodal_text_summary(value: Any) -> str:
     """Extract a plain text view of a multimodal tool result.
 
@@ -450,56 +439,6 @@ def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
         value["content"] = parts
     if isinstance(value.get("text_summary"), str):
         value["text_summary"] = value["text_summary"] + hint
-
-
-def _redact_tool_result_for_egress(value: Any) -> Any:
-    """Redact model-visible tool-result text at the universal egress boundary.
-
-    Plain strings receive the normal configured redaction policy plus strict
-    URL query/userinfo masking. Multimodal envelopes and content lists are
-    rebuilt only where text-bearing parts change; image/base64 parts are kept
-    by identity so screenshot bytes cannot be altered accidentally.
-
-    ``redact_sensitive_text`` deliberately owns the global opt-out. This helper
-    does not pass ``force=True`` and therefore preserves the documented
-    ``security.redact_secrets: false`` behavior.
-    """
-
-    def _redact_text(text: str) -> str:
-        return redact_sensitive_text(text, redact_url_credentials=True)
-
-    def _redact_parts(parts: list[Any]) -> list[Any]:
-        redacted_parts: list[Any] = []
-        for part in parts:
-            if isinstance(part, str):
-                redacted_parts.append(_redact_text(part))
-                continue
-            if not isinstance(part, dict) or part.get("type") not in {
-                "text",
-                "input_text",
-                "output_text",
-            }:
-                redacted_parts.append(part)
-                continue
-            redacted_part = dict(part)
-            for field in ("text", "content"):
-                field_value = redacted_part.get(field)
-                if isinstance(field_value, str):
-                    redacted_part[field] = _redact_text(field_value)
-            redacted_parts.append(redacted_part)
-        return redacted_parts
-
-    if isinstance(value, str):
-        return _redact_text(value)
-    if isinstance(value, list):
-        return _redact_parts(value)
-    if _is_multimodal_tool_result(value):
-        redacted_value = dict(value)
-        redacted_value["content"] = _redact_parts(value.get("content") or [])
-        if isinstance(value.get("text_summary"), str):
-            redacted_value["text_summary"] = _redact_text(value["text_summary"])
-        return redacted_value
-    return value
 
 
 def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:

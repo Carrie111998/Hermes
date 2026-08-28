@@ -55,6 +55,9 @@ from tools.computer_use.backend import (
     ComputerUseBackend,
     UIElement,
 )
+from tools.computer_use.capture_targeting import (
+    capture_app_matches as _capture_app_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,85 +131,6 @@ _INPUT_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value",
 })
-
-
-_CAPTURE_SCREEN_SENTINELS = frozenset({
-    "screen", "desktop", "fullscreen", "full-screen", "all",
-})
-
-_CAPTURE_BROWSER_IDENTITY_TOKENS = frozenset({
-    "brave", "chrome", "chromium", "edge", "firefox", "msedge",
-    "opera", "safari", "vivaldi",
-})
-
-
-_CAPTURE_APP_ALIASES = {
-    "chrome": "chrome",
-    "google-chrome": "chrome",
-    "google-chrome-stable": "chrome",
-    "chrome-browser": "chrome",
-    "com-google-chrome": "chrome",
-    "firefox": "firefox",
-    "mozilla-firefox": "firefox",
-    "org-mozilla-firefox": "firefox",
-    "edge": "edge",
-    "msedge": "edge",
-    "microsoft-edge": "edge",
-    "com-microsoft-edgemac": "edge",
-    "chromium": "chromium",
-    "chromium-browser": "chromium",
-}
-
-
-def _canonical_capture_app_name(value: Any) -> str:
-    """Canonicalize exact app identities without accepting title substrings."""
-    if not isinstance(value, str):
-        return ""
-    normalized = re.sub(r"[\s_]+", "-", value.strip().casefold()).strip("-")
-    if normalized.endswith(".app"):
-        normalized = normalized[:-4]
-    return _CAPTURE_APP_ALIASES.get(normalized, normalized)
-
-
-def _capture_app_name_tokens(value: str) -> Tuple[str, ...]:
-    return tuple(re.findall(r"[a-z0-9]+", value))
-
-
-def _capture_app_matches(requested_app: Any, returned_app: Any) -> bool:
-    """Accept backend app-name variants without trusting browser window titles."""
-    requested = _canonical_capture_app_name(requested_app)
-    if requested in _CAPTURE_SCREEN_SENTINELS:
-        # The backend resolves these aliases to an OS desktop/shell window, so
-        # CaptureResult.app is intentionally the shell identity, not the alias.
-        return True
-
-    returned = _canonical_capture_app_name(returned_app)
-    if not requested or not returned:
-        return False
-    if requested == returned:
-        return True
-
-    requested_tokens = _capture_app_name_tokens(requested)
-    returned_tokens = _capture_app_name_tokens(returned)
-    requested_browsers = set(requested_tokens) & _CAPTURE_BROWSER_IDENTITY_TOKENS
-    returned_browsers = set(returned_tokens) & _CAPTURE_BROWSER_IDENTITY_TOKENS
-    if returned_browsers - requested_browsers:
-        # A non-browser request such as "Hermes" must not accept a browser
-        # window title merely because that title contains the requested word.
-        return False
-
-    if not requested_tokens or len(requested_tokens) > len(returned_tokens):
-        return False
-    width = len(requested_tokens)
-    return any(
-        all(
-            returned_token.startswith(requested_token)
-            for requested_token, returned_token in zip(
-                requested_tokens, returned_tokens[start:start + width]
-            )
-        )
-        for start in range(len(returned_tokens) - width + 1)
-    )
 
 
 def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
