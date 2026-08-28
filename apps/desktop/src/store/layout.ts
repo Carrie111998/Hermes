@@ -480,7 +480,7 @@ export function setSidebarWidth(width: number) {
 }
 
 // Below the collapse breakpoint a collapsible rail leaves the grid and lives as
-// a hover/pin overlay, so open/toggle must route through the reveal event — the
+// a pinned overlay, so open/toggle must route through the reveal event — the
 // docked `open` flag renders a 0px track invisibly. Centralised here so every
 // caller (titlebar, keybinds, session-search, reveal-file) inherits it instead
 // of re-deriving the narrow branch. Returns true when it handled the intent.
@@ -506,7 +506,13 @@ export function toggleSidebarOpen() {
 }
 
 export function toggleFileBrowserOpen() {
-  if (revealNarrowPane(FILE_BROWSER_PANE_ID, 'toggle')) {
+  if (typeof window !== 'undefined' && matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
+    // A custom/migrated layout may not currently contain the Files pane. Put
+    // it back before firing the overlay intent; NarrowOverlays accepts the
+    // alias during this same render transition.
+    revealTreePane(FILES_PANE_ID)
+    revealNarrowPane(FILE_BROWSER_PANE_ID, 'toggle')
+
     return
   }
 

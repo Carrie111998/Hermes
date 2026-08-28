@@ -1,9 +1,8 @@
 /**
- * Narrow-viewport edge overlays — the tree's take on the app's hover-reveal
+ * Narrow-viewport edge overlays — the tree's take on the app's explicit reveal
  * collapse. Collapsible panes leave the grid below the sidebar-collapse
- * breakpoint; an edge strip (hover) or PANE_TOGGLE_REVEAL_EVENT (⌘B / ⌘G /
- * titlebar toggles route here on narrow) slides the pane OVER the layout
- * instead of squeezing it. Event reveals pin; hover reveals follow the mouse.
+ * breakpoint; PANE_TOGGLE_REVEAL_EVENT (⌘B / ⌘G / titlebar toggles route here
+ * on narrow) slides the pane OVER the layout instead of squeezing it.
  */
 
 import { useStore } from '@nanostores/react'
@@ -43,6 +42,8 @@ export function NarrowOverlays() {
 
   const collapsiblesRef = useRef(collapsibles)
   collapsiblesRef.current = collapsibles
+  const panesRef = useRef(panes)
+  panesRef.current = panes
 
   // ⌘B / ⌘G's narrow branch dispatches the app's toggle-reveal event with the
   // REAL pane id — accept those via each contribution's revealAliases.
@@ -61,7 +62,13 @@ export function NarrowOverlays() {
         return
       }
 
-      const match = collapsiblesRef.current.find(p => p.id === id || paneChrome(p).revealAliases?.includes(id))
+      // Match the registry, not only the previous render's in-tree list. An
+      // explicit reveal can re-adopt/unhide a pane and dispatch its alias in
+      // the same event turn; the next render then promotes it into
+      // `collapsibles` and paints the already-recorded reveal.
+      const match = panesRef.current.find(
+        p => paneChrome(p).collapsible && (p.id === id || paneChrome(p).revealAliases?.includes(id))
+      )
 
       if (!match) {
         return
@@ -107,7 +114,6 @@ export function NarrowOverlays() {
 
   const sideOf = (c: Contribution) => (paneChrome(c).placement === 'left' ? 'left' : 'right')
   const revealed = reveal ? collapsibles.find(p => p.id === reveal.id) : undefined
-  const sides = [...new Set(collapsibles.map(sideOf))]
 
   // The revealed pane's ZONE-mates that also left the grid (the sessions zone
   // stacks SESSIONS | BOTS): the overlay mirrors the zone's tab strip so a
@@ -127,21 +133,6 @@ export function NarrowOverlays() {
 
   return (
     <>
-      {/* Hover-intent strips on each edge that has a collapsed pane. */}
-      {sides.map(side => (
-        <div
-          className={cn('absolute inset-y-0 z-30 w-1.5', side === 'left' ? 'left-0' : 'right-0')}
-          key={side}
-          onMouseEnter={() => {
-            const first = collapsibles.find(p => sideOf(p) === side)
-
-            if (first) {
-              setReveal(current => (current?.pinned ? current : { id: first.id, pinned: false }))
-            }
-          }}
-        />
-      ))}
-
       {revealed && (
         <div
           className={cn(

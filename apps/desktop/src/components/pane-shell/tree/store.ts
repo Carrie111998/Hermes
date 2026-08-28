@@ -1043,6 +1043,16 @@ export function revealTreePane(paneId: string) {
     adoptContributedPanes()
   }
 
+  // A migrated/custom tree can be missing a registered pane without carrying
+  // an explicit dismissal record. An explicit reveal must still be able to
+  // restore it; use the same adoption policy as boot (which continues to
+  // respect every intentionally dismissed pane).
+  const beforeAdoption = $layoutTree.get()
+
+  if (beforeAdoption && !findGroupOfPane(beforeAdoption, paneId)) {
+    adoptContributedPanes()
+  }
+
   // Reveal beats a hide too: clear the persisted hide-only record, or the
   // pane pops back hidden on the next launch even though it's on screen now.
   if ($hiddenStripTabs.get().has(paneId)) {
