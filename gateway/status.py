@@ -780,6 +780,15 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
     """
     if not cleanup_stale:
         return
+    # Re-check liveness immediately before unlinking.  The caller decided these
+    # files were stale from a lock probe taken earlier; during a gateway
+    # restart a new process can win the lock in that window.  Deleting its PID
+    # and lock files leaves a fully healthy gateway with no on-disk record
+    # (`get_running_pid()` -> None) that nothing recreates until the next
+    # restart — the "gateway is down but it isn't" alert.  A live lock holder
+    # means the files are not stale, so leave them alone.
+    if is_gateway_runtime_lock_active(_get_gateway_lock_path(pid_path)):
+        return
     _clear_running_pid_cache()
     try:
         pid_path.unlink(missing_ok=True)
