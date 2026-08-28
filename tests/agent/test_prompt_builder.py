@@ -8,6 +8,11 @@ import sys
 
 import pytest
 
+from agent.skill_utils import (
+    SKILL_PROMPT_DESC_LIMIT as _DESC_LIMIT,
+    extract_skill_description as _extract_desc,
+)
+
 from agent.prompt_builder import (
     _scan_context_content,
     _truncate_content,
@@ -1121,3 +1126,53 @@ class TestIndexTriggerTags:
 
         assert "poster" in compact
         assert "instagram" not in compact and "Post things" not in compact
+
+
+class TestDescriptionTruncationBoundary:
+    """WHERE a long description is cut decides how much routing signal lives.
+
+    A hard slice at 57 chars spent the budget on fragments — real skills on a
+    live install rendered as "... Scan...", "... Measu...", and worst of all
+    "Create and review Cloudflare Durable Objects. Use when bu...", cutting off
+    the "use when" clause that is the entire point of the line.
+    """
+
+    def test_prefers_a_complete_sentence_and_drops_the_ellipsis(self):
+        out = _extract_desc(
+            {"description": "Create and review Cloudflare Durable Objects. Use when building apps."}
+        )
+
+        assert out == "Create and review Cloudflare Durable Objects."
+        # A complete first sentence is a real summary, not a cut-off thought.
+        assert not out.endswith("...")
+
+    def test_falls_back_to_a_word_boundary(self):
+        out = _extract_desc(
+            {"description": "Send and receive transactional emails with Cloudflare Email Service."}
+        )
+
+        assert out == "Send and receive transactional emails with Cloudflare..."
+        assert "Cloudflare Ema..." not in out
+
+    def test_slices_mid_word_only_when_there_is_no_boundary(self):
+        out = _extract_desc({"description": "A" * 100})
+
+        assert len(out) <= _DESC_LIMIT
+        assert out.endswith("...")
+
+    def test_an_early_abbreviation_is_not_mistaken_for_a_sentence(self):
+        out = _extract_desc(
+            {"description": "Use e.g. this skill for a long description that runs past the limit."}
+        )
+
+        assert not out.startswith("Use e.g.") or len(out) > 20
+
+    def test_nothing_can_exceed_the_budget(self):
+        """The cap is a token budget in every session — it must hold."""
+        for desc in ("x" * 61, "x" * 60, "Word " * 40, "a. " * 40, "no-spaces-" * 12):
+            assert len(_extract_desc({"description": desc})) <= _DESC_LIMIT, desc
+
+    def test_short_descriptions_are_untouched(self):
+        assert _extract_desc({"description": "Short one."}) == "Short one."
+        assert _extract_desc({"description": ""}) == ""
+        assert _extract_desc({}) == ""

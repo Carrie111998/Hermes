@@ -1,15 +1,19 @@
 ---
 name: herwork
-description: HerWork mode — docs, slides, sheets, PDFs, browser, files.
-version: 1.0.0
+description: Use when asked for a finished office file, not code.
+version: 1.1.0
 author: community
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [herwork, workspace, office, documents, browser, productivity]
+    # Ordered by how well each term DISCRIMINATES: the index keeps the first
+    # three that the description does not already say, so the words a user
+    # actually types for this job come first and "productivity" — which
+    # matches everything — comes last.
+    tags: [report, deck, spreadsheet, invoice, letter, resume, herwork, workspace, productivity]
     category: productivity
-    related_skills: [docx, powerpoint, xlsx, pdf, ocr-and-documents, obsidian]
+    related_skills: [docx, powerpoint, xlsx, pdf, ocr-and-documents, obsidian, arabic-rtl-documents]
 ---
 
 # HerWork Mode
