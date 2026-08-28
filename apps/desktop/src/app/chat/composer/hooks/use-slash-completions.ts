@@ -90,6 +90,19 @@ export function canonicalizeSlashCommandCompletions(
 /** How many recent sessions to surface inline before the "Browse all…" entry. */
 const SESSION_INLINE_LIMIT = 7
 
+/** Briefly prefer catalog-backed alias labels without blocking ordinary rows. */
+const CATALOG_ALIAS_GRACE_MS = 200
+
+function waitForCatalogAliasGrace(catalogReady: Promise<void>): Promise<void> {
+  return new Promise(resolve => {
+    const timer = globalThis.setTimeout(resolve, CATALOG_ALIAS_GRACE_MS)
+    void catalogReady.then(() => {
+      globalThis.clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
 /** Live `/` completions backed by the gateway's `complete.slash` RPC. */
 export function useSlashCompletions(options: {
   gateway: HermesGateway | null
@@ -231,10 +244,11 @@ export function useSlashCompletions(options: {
         }
 
         // Start the catalog and completion requests together. Dynamic aliases
-        // live in the catalog, so command-row canonicalization must wait for
-        // that shared warm-up; otherwise a fast complete.slash response can
-        // briefly render `/btw` instead of `/background (btw)`. A catalog
-        // failure still leaves ordinary completions usable and retryable.
+        // live in the catalog, so command-row canonicalization gives that
+        // shared warm-up a short grace period; otherwise a fast complete.slash
+        // response can briefly render `/btw` instead of `/background (btw)`.
+        // The grace is bounded so a stalled catalog cannot withhold ordinary
+        // completions until the gateway's request timeout.
         const catalogReady = cachedSlashCompletion('catalog', () =>
           gateway.request<CommandsCatalogLike>('commands.catalog')
         )
@@ -255,7 +269,7 @@ export function useSlashCompletions(options: {
         const prefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
 
         if (!isArgCompletion) {
-          await catalogReady
+          await waitForCatalogAliasGrace(catalogReady)
         }
 
         const completionItems = isArgCompletion

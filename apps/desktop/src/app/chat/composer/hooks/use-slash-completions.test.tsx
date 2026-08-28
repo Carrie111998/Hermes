@@ -159,7 +159,7 @@ describe('useSlashCompletions', () => {
     expect(items[0]?.description).toBe('Run a prompt in the background')
   })
 
-  it('waits for an in-flight catalog before canonicalizing alias results', async () => {
+  it('waits briefly for an in-flight catalog before canonicalizing alias results', async () => {
     let resolveCatalog!: (catalog: CommandsCatalogLike) => void
     const catalogPromise = new Promise<CommandsCatalogLike>(resolve => {
       resolveCatalog = resolve
@@ -185,6 +185,22 @@ describe('useSlashCompletions', () => {
 
     expect(commandsOf(items)).toEqual(['/background'])
     expect(items[0]?.label).toBe('background (btw)')
+  })
+
+  it('does not withhold command completions when the catalog stalls', async () => {
+    const request = vi.fn().mockImplementation((method: string) =>
+      method === 'commands.catalog'
+        ? new Promise(() => {})
+        : Promise.resolve({ items: [{ text: '/help', display: '/help', meta: 'Show help' }] })
+    )
+    const api = harness({ request } as unknown as HermesGateway)
+
+    await act(async () => {
+      api.search('help')
+      await new Promise(resolve => setTimeout(resolve, 300))
+    })
+
+    expect(commandsOf(api.search('help'))).toEqual(['/help'])
   })
 
   it('matches aliases case-insensitively', () => {
