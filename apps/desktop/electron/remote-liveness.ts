@@ -1,9 +1,12 @@
+import { isTransientTransportError } from './api-transport'
+
 export const REMOTE_LIVENESS_TIMEOUT_MS = 10_000
 // Dispatch is synchronous user intent: a cached descriptor must prove its
 // forwarded endpoint is alive before it can be returned. Keep this probe much
 // shorter than the background liveness budget so a dead tunnel reconnects
 // promptly instead of making the click feel hung.
 export const POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS = 2_500
+export const POOLED_REMOTE_DISPATCH_COLD_START_PROBE_TIMEOUT_MS = 10_000
 export const REMOTE_LIVENESS_FAILURE_LIMIT = 3
 // Even at the capped retry path, consecutive liveness observations are at most
 // about 48s apart (ticket mint + socket open + backoff + the next status probe).
@@ -95,14 +98,6 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
 
   try {
     connection = await connectionPromise
-
-    if (currentConnectionPromise() !== connectionPromise) {
-      return reconnect()
-    }
-
-    await probe(connection, '/api/status', {
-      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
-    })
   } catch (error) {
     if (currentConnectionPromise() === connectionPromise) {
       await retire(error)
@@ -115,7 +110,77 @@ export async function ensureHealthyPooledRemoteBackendForDispatch<TConnection ex
     return reconnect()
   }
 
+  try {
+    await probe(connection, '/api/status', {
+      timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
+    })
+  } catch (error) {
+    let failure = error
+
+    if (currentConnectionPromise() !== connectionPromise) {
+      return reconnect()
+    }
+
+    if (isTransientPooledRemoteDispatchProbeFailure(error)) {
+      try {
+        await probe(connection, '/api/status', {
+          timeoutMs: POOLED_REMOTE_DISPATCH_COLD_START_PROBE_TIMEOUT_MS
+        })
+
+        if (currentConnectionPromise() !== connectionPromise) {
+          return reconnect()
+        }
+
+        return connection
+      } catch (retryError) {
+        failure = retryError
+      }
+    }
+
+    if (currentConnectionPromise() !== connectionPromise) {
+      return reconnect()
+    }
+
+    await retire(failure)
+
+    return reconnect()
+  }
+
+  if (currentConnectionPromise() !== connectionPromise) {
+    return reconnect()
+  }
+
   return connection
+}
+
+function isTransientPooledRemoteDispatchProbeFailure(error: unknown): boolean {
+  const record =
+    error && typeof error === 'object'
+      ? (error as { message?: unknown; needsOauthLogin?: unknown; statusCode?: unknown })
+      : null
+  const message = record ? String(record.message || '') : ''
+
+  // Explicit auth, HTTP, and endpoint-contract failures always win over
+  // transport-looking response text. The token transport encodes status only
+  // in the message, while the OAuth transport also exposes statusCode.
+  if (
+    record?.needsOauthLogin === true ||
+    (typeof record?.statusCode === 'number' && record.statusCode >= 100 && record.statusCode <= 599) ||
+    /^[1-5]\d{2}:(?:\s|$)/.test(message) ||
+    message.startsWith('Expected JSON from ') ||
+    message.startsWith('Invalid JSON from ')
+  ) {
+    return false
+  }
+
+  if (isTransientTransportError(error)) {
+    return true
+  }
+
+  // Both Node's token transport and Electron's OAuth transport emit this exact
+  // bounded-timeout shape. HTTP status, auth, HTML, and invalid-JSON contract
+  // errors intentionally do not match and therefore fail fast.
+  return /^Timed out connecting to Hermes backend after \d+ms$/.test(message)
 }
 
 /**
