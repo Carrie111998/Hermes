@@ -752,6 +752,19 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
 
     Used when the banner rendered before the update prefetch finished so
     startup never blocks on git/network. Prints at most once per process.
+
+    Routes through ``cprint()`` (prompt_toolkit's ANSI renderer) instead of
+    ``console.print()`` because this thread runs *after* the banner rendered
+    and may not own the foreground renderer. When the foreground is a TTY,
+    ChatConsole's ``_cprint`` path is what we want — it goes through
+    prompt_toolkit's patch_stdout. When the stdout is NOT a TTY (piped,
+    redirected, WSL bridge session), ChatConsole's inner Console was built
+    with ``force_terminal=True`` and writes raw ANSI bytes directly to
+    stdout, where they leak as ``[1;33m``-style garbage when an intermediate
+    layer (shell, mintty, wrapper) consumes the ESC character. ``cprint()``
+    handles both: prompt_toolkit renders when possible, plain ``print()``
+    falls back when no console is available. See _format_update_notice for
+    the rich-markup source string we hand off.
     """
     global _deferred_update_notice_started
     if _deferred_update_notice_started:
@@ -765,7 +778,12 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
             behind = _update_result
             if behind is None or behind == 0:
                 return
-            console.print(_format_update_notice(behind))
+            # Use cprint() (prompt_toolkit ANSI renderer) instead of
+            # console.print() so background-thread prints don't leak raw
+            # ANSI escape sequences to a non-tty stdout. The 'console'
+            # argument is intentionally unused here — kept in the signature
+            # for backwards compatibility with callers.
+            cprint(_format_update_notice(behind))
         except Exception:
             pass  # never break the session over an update notice
 
