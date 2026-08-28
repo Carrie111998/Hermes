@@ -92,6 +92,17 @@ GLOBALS = {{"__name__": "__main__", "__builtins__": __builtins__}}
 _real_stdout = sys.stdout
 
 
+def _spill_payload(text):
+    """Cap a spill by UTF-8 bytes without splitting a code point."""
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= _SPILL_CAP:
+        return text
+    marker = "\\n\\n[... spill capped ...]"
+    marker_bytes = marker.encode("utf-8")
+    prefix = encoded[: _SPILL_CAP - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
 def _bounded(text, spill_name=None):
     """Clip to the inline cap; spill the FULL text to disk when clipping.
 
@@ -105,9 +116,7 @@ def _bounded(text, spill_name=None):
         try:
             spill_path = os.path.join(_SPILL_DIR, spill_name)
             with open(spill_path, "w", encoding="utf-8", errors="replace") as f:
-                f.write(text[:_SPILL_CAP])
-                if len(text) > _SPILL_CAP:
-                    f.write("\\n\\n[... spill capped ...]")
+                f.write(_spill_payload(text))
         except Exception:
             spill_path = ""
     return text[: _CAPTURE_LIMIT], True, spill_path

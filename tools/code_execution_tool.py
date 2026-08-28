@@ -156,6 +156,19 @@ def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
 MAX_SPILLED_STDOUT_BYTES = 5_000_000
 
 
+def _cap_spill_text(stdout_text: str) -> str:
+    """Return a UTF-8-valid spill payload within the byte ceiling."""
+    stdout_bytes = stdout_text.encode("utf-8", errors="replace")
+    if len(stdout_bytes) <= MAX_SPILLED_STDOUT_BYTES:
+        return stdout_text
+
+    marker = f"\n\n[... spill capped at {MAX_SPILLED_STDOUT_BYTES:,} bytes ...]"
+    marker_bytes = marker.encode("utf-8")
+    prefix_limit = MAX_SPILLED_STDOUT_BYTES - len(marker_bytes)
+    prefix = stdout_bytes[:prefix_limit].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
 def _spill_full_stdout(stdout_text: str) -> Optional[str]:
     """Write full stdout to cache/exec; return its path (None on failure).
 
@@ -168,11 +181,7 @@ def _spill_full_stdout(stdout_text: str) -> Optional[str]:
         import hashlib
         from hermes_constants import get_hermes_dir
 
-        if len(stdout_text) > MAX_SPILLED_STDOUT_BYTES:
-            stdout_text = (
-                stdout_text[:MAX_SPILLED_STDOUT_BYTES]
-                + f"\n\n[... spill capped at {MAX_SPILLED_STDOUT_BYTES:,} bytes ...]"
-            )
+        stdout_text = _cap_spill_text(stdout_text)
         cache_dir = get_hermes_dir("cache/exec", "exec_spill")
         cache_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(

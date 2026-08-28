@@ -18,7 +18,9 @@ import pytest
 import json
 import os
 import socket
+import tempfile
 import time
+from pathlib import Path
 
 os.environ["TERMINAL_ENV"] = "local"
 
@@ -760,6 +762,39 @@ class TestInterruptHandling(unittest.TestCase):
 
 class TestHeadTailTruncation(unittest.TestCase):
     """Tests for head+tail truncation of large stdout in execute_code."""
+
+    def test_spill_cap_counts_utf8_bytes_without_invalid_text(self):
+        """A multibyte spill remains within the documented byte ceiling."""
+        from tools import code_execution_tool as cet
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "hermes_constants.get_hermes_dir", return_value=Path(tmpdir)
+        ):
+            spill_path = cet._spill_full_stdout("😀" * (cet.MAX_SPILLED_STDOUT_BYTES + 1))
+
+            assert spill_path is not None
+            raw = Path(spill_path).read_bytes()
+        assert len(raw) <= cet.MAX_SPILLED_STDOUT_BYTES
+        assert raw.decode("utf-8").endswith("[... spill capped at 5,000,000 bytes ...]")
+
+    def test_kernel_spill_cap_counts_utf8_bytes_without_invalid_text(self):
+        """The generated session-kernel runner applies the same byte ceiling."""
+        from tools import code_kernel
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {
+            "HERMES_KERNEL_SENTINEL": "test-sentinel",
+            "HERMES_KERNEL_SPILL_DIR": tmpdir,
+        }, clear=False):
+            namespace = {}
+            exec(code_kernel.KERNEL_RUNNER_SOURCE.split("def _reply")[0], namespace)
+            _clipped, clipped, spill_path = namespace["_bounded"](
+                "😀" * 5_000_001, "cell_stdout.txt"
+            )
+            raw = Path(spill_path).read_bytes()
+
+        assert clipped
+        assert len(raw) <= 5_000_000
+        assert raw.decode("utf-8").endswith("[... spill capped ...]")
 
     def _run(self, code):
         with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
