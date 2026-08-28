@@ -115,6 +115,16 @@ def _coerce_optional_number(value: Any, *, integer: bool = False) -> int | float
         return None
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Recognize provider rate limits without exposing provider details."""
+    if type(exc).__name__ == "RateLimitError":
+        return True
+    if getattr(exc, "status_code", None) == 429:
+        return True
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 429
+
+
 class _BridgeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -137,12 +147,20 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
         # Never log request bodies, authorization headers, or prompts.
         logger.debug("Hindsight Hermes LLM bridge: " + format, *args)
 
-    def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
+    def _write_json(
+        self,
+        status_code: int,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -213,6 +231,22 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
             self._write_json(exc.status_code, {"error": {"message": str(exc), "type": "invalid_request_error"}})
             return
         except Exception as exc:
+            if _is_rate_limit_error(exc):
+                logger.info(
+                    "Hindsight Hermes LLM bridge rate-limited (%s)",
+                    type(exc).__name__,
+                )
+                self._write_json(
+                    429,
+                    {
+                        "error": {
+                            "message": "Hermes LLM bridge is rate-limited",
+                            "type": "rate_limit_error",
+                        }
+                    },
+                    headers={"Retry-After": "30"},
+                )
+                return
             # Do not log provider details or exception text: SDK errors can carry
             # request content, response bodies, or credential-derived context.
             logger.warning(

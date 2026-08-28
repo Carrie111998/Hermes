@@ -103,6 +103,40 @@ def test_bridge_routes_plain_completion_to_host_facade():
     assert llm.complete_calls[0][0][1]["content"] == "Remember this"
 
 
+def test_bridge_preserves_rate_limit_status_for_hindsight_backoff():
+    class RateLimitError(Exception):
+        pass
+
+    class RateLimitedLlm(_FakeLlm):
+        def complete(self, messages, **kwargs):
+            raise RateLimitError("provider quota detail must stay private")
+
+    bridge = HermesLlmBridge(RateLimitedLlm())
+    bridge.start()
+    try:
+        with pytest.raises(HTTPError) as caught:
+            _post(
+                f"{bridge.base_url}/chat/completions",
+                bridge.api_key,
+                {
+                    "model": "hermes-inherited",
+                    "messages": [{"role": "user", "content": "rate limit"}],
+                },
+            )
+    finally:
+        bridge.close()
+
+    assert caught.value.code == 429
+    assert caught.value.headers["Retry-After"] == "30"
+    body = json.loads(caught.value.read())
+    assert body == {
+        "error": {
+            "message": "Hermes LLM bridge is rate-limited",
+            "type": "rate_limit_error",
+        }
+    }
+
+
 def test_bridge_binds_parent_runtime_inside_worker_thread():
     """The bridge must not fall back to the persisted root model."""
     from agent.auxiliary_client import _runtime_main_value
