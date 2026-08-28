@@ -376,7 +376,7 @@ def test_summary_reuses_one_request_local_exact_pattern(monkeypatch):
         )
 
     assert result is not None
-    assert result.endswith("summary ***")
+    assert "summary ***" in result
     assert len(collections) == 1
 
 

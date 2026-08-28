@@ -140,6 +140,28 @@ def _paired_messages(secret: str) -> list[dict]:
     ]
 
 
+def _paired_tool_result(content: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_77487",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "terminal",
+            "tool_call_id": "call_77487",
+            "content": content,
+        },
+    ]
+
+
 def test_provider_copy_masks_content_occurrences_and_preserves_replay_history(
     applied_secret_home,
 ):
@@ -273,14 +295,14 @@ def test_provider_copy_masks_malformed_alternate_json_fragments_without_mutation
         {"MALFORMED_JSON_SECRET": ALTERNATE_JSON_SECRET},
     )
     content = _malformed_json_with_alternate_secret("credential", fragment_kind)
-    messages = [{"role": "tool", "content": content}]
+    messages = _paired_tool_result(content)
     original = copy.deepcopy(messages)
 
     provider_bound = sanitize_api_messages(messages)
 
-    assert "***" in provider_bound[0]["content"]
-    assert ALTERNATE_JSON_SECRET not in provider_bound[0]["content"]
-    assert ALTERNATE_JSON_SPELLING not in provider_bound[0]["content"]
+    assert "***" in provider_bound[-1]["content"]
+    assert ALTERNATE_JSON_SECRET not in provider_bound[-1]["content"]
+    assert ALTERNATE_JSON_SPELLING not in provider_bound[-1]["content"]
     assert messages == original
 
 
@@ -556,7 +578,7 @@ def test_provider_marker_repetition_cannot_synthesize_active_secret(
         str(tmp_path.resolve()),
         {f"MARKER_SECRET_{index}": secret for index, secret in enumerate(active_secrets)},
     )
-    source = [{"role": "tool", "content": "******"}]
+    source = _paired_tool_result("******")
     original = copy.deepcopy(source)
     token = set_hermes_home_override(tmp_path)
     try:
@@ -564,7 +586,7 @@ def test_provider_marker_repetition_cannot_synthesize_active_secret(
     finally:
         reset_hermes_home_override(token)
 
-    content = provider_bound[0]["content"]
+    content = provider_bound[-1]["content"]
     assert all(secret not in content for secret in active_secrets)
     assert content != "[REDACTED][REDACTED]"
     assert source == original
@@ -588,7 +610,7 @@ def test_provider_marker_cannot_compose_with_unchanged_source_context(
         str(tmp_path.resolve()),
         {f"BOUNDARY_SECRET_{index}": secret for index, secret in enumerate(active_secrets)},
     )
-    source = [{"role": "tool", "content": "abx"}]
+    source = _paired_tool_result("abx")
     original = copy.deepcopy(source)
     token = set_hermes_home_override(tmp_path)
     try:
@@ -596,8 +618,8 @@ def test_provider_marker_cannot_compose_with_unchanged_source_context(
     finally:
         reset_hermes_home_override(token)
 
-    assert all(secret not in provider_bound[0]["content"] for secret in active_secrets)
-    assert provider_bound[0]["content"] == f"ab{matcher.replacement}"
+    assert all(secret not in provider_bound[-1]["content"] for secret in active_secrets)
+    assert provider_bound[-1]["content"] == f"ab{matcher.replacement}"
     assert source == original
 
 
@@ -612,7 +634,7 @@ def test_provider_nested_unicode_json_escape_replaces_complete_valid_span(
     secret = "é"
     spelling = _nest_json_string_spelling(json.dumps(secret)[1:-1], layers)
     content = f'{{"x":"{spelling}"}}'
-    source = [{"role": "tool", "content": content}]
+    source = _paired_tool_result(content)
     original = copy.deepcopy(source)
     monkeypatch.setitem(
         env_loader._SECRET_SOURCE_VALUES_BY_HOME,
@@ -625,7 +647,7 @@ def test_provider_nested_unicode_json_escape_replaces_complete_valid_span(
     finally:
         reset_hermes_home_override(token)
 
-    provider_content = provider_bound[0]["content"]
+    provider_content = provider_bound[-1]["content"]
     assert json.loads(provider_content) == {"x": "***"}
     assert secret not in provider_content
     assert spelling not in provider_content
@@ -643,7 +665,7 @@ def test_provider_simple_slash_json_escape_replaces_complete_valid_span(
     secret = "/"
     spelling = _nest_json_string_spelling(r"\/", layers)
     content = f'{{"x":"{spelling}"}}'
-    source = [{"role": "tool", "content": content}]
+    source = _paired_tool_result(content)
     original = copy.deepcopy(source)
     monkeypatch.setitem(
         env_loader._SECRET_SOURCE_VALUES_BY_HOME,
@@ -656,7 +678,7 @@ def test_provider_simple_slash_json_escape_replaces_complete_valid_span(
     finally:
         reset_hermes_home_override(token)
 
-    provider_content = provider_bound[0]["content"]
+    provider_content = provider_bound[-1]["content"]
     assert json.loads(provider_content) == {"x": "***"}
     assert secret not in provider_content
     assert spelling not in provider_content
