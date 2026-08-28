@@ -292,6 +292,50 @@ def test_attachment_upload_never_follows_redirect_or_forwards_grant(
         thread.join(timeout=5)
 
 
+@pytest.mark.parametrize("redirect_status", [301, 302, 303, 307, 308])
+def test_attachment_manifest_never_follows_redirect_or_forwards_grant(
+    redirect_status,
+):
+    class RedirectPeer(BaseHTTPRequestHandler):
+        redirected_requests = []
+
+        def do_POST(self):
+            if self.path == "/sink":
+                type(self).redirected_requests.append(
+                    (self.headers.get("Authorization"), self.rfile.read())
+                )
+                self.send_response(200)
+                self.end_headers()
+                return
+            self.send_response(redirect_status)
+            self.send_header("Location", "/sink")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RedirectPeer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PeerRunsHTTPClient(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            api_key="",
+        )
+        with pytest.raises(PeerRunsHTTPError, match="refused an HTTP redirect"):
+            client._request(
+                "/manifest",
+                method="POST",
+                body={"metadata": "private"},
+                room_grant="scoped.room.grant",
+                reject_redirects=True,
+            )
+        assert RedirectPeer.redirected_requests == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_attachment_staging_rejects_broad_fallback_and_corrupt_payload(peer_server):
     from gateway.hosted_room_peer import attachment_manifest_digest
 

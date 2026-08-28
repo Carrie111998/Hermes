@@ -684,7 +684,7 @@ class HostedRoomRuntime:
             if self._stop.is_set():
                 return
             if self._route_retry_is_deferred(task):
-                return
+                continue
             lease = self._renew_lease_if_needed(binding, lease)
             attempt = state.start_task(
                 self.db_path,
@@ -696,6 +696,11 @@ class HostedRoomRuntime:
             self._execute_attempt(binding, task, attempt)
             current = state.get_task(self.db_path, task["identity"])
             if current["status"] not in state.TERMINAL_STATUSES:
+                if (
+                    current["status"] == "queued"
+                    and self._route_retry_is_deferred(current)
+                ):
+                    continue
                 return
 
     @staticmethod
@@ -803,7 +808,7 @@ class HostedRoomRuntime:
                 prompt = str(task["payload"]["prompt"])
                 manifests = task["payload"].get("attachments") or []
                 if manifests:
-                    if self.attachment_loader is None or transport is not self.rpc:
+                    if self.attachment_loader is None:
                         raise RuntimeError(
                             "hosted attachments are unavailable for this member transport"
                         )
@@ -843,11 +848,12 @@ class HostedRoomRuntime:
                         )
                         if attachment.get("kind") == "file":
                             ref = str(staged.get("ref_text") or "").strip()
-                            if not ref:
+                            if not ref and transport is self.rpc:
                                 raise RuntimeError(
                                     "hosted file attachment returned no staged reference"
                                 )
-                            file_refs.append(f"{attachment['name']}: {ref}")
+                            if ref:
+                                file_refs.append(f"{attachment['name']}: {ref}")
                     if loaded_count != len(expected_ids):
                         raise RuntimeError(
                             "hosted attachment ownership did not match the task manifest"
@@ -987,25 +993,33 @@ class HostedRoomRuntime:
                     submit_attempted=submit_attempted,
                 )
             if submit_attempted and bool(getattr(exc, "not_admitted", False)):
-                try:
-                    state.requeue_not_admitted_task(
-                        self.db_path,
-                        attempt,
-                        clock=self.clock,
-                    )
-                except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
-                    self._drop_lease(binding.room_id)
-                    self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
-                    self._record_error(
-                        f"task {attempt.identity.task_id} not-admitted proof lost "
-                        f"its fence: {fence_exc}"
-                    )
-                else:
+                if task.get("payload", {}).get("attachments"):
                     delay = self._defer_unavailable_route(task)
+                    self._settle_failure_if_current(attempt, exc)
                     self._record_error(
                         f"task {attempt.identity.task_id} was not admitted; "
-                        f"queued for retry in {delay:g}s"
+                        f"this member is deferred for {delay:g}s"
                     )
+                else:
+                    try:
+                        state.requeue_not_admitted_task(
+                            self.db_path,
+                            attempt,
+                            clock=self.clock,
+                        )
+                    except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
+                        self._drop_lease(binding.room_id)
+                        self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
+                        self._record_error(
+                            f"task {attempt.identity.task_id} not-admitted proof lost "
+                            f"its fence: {fence_exc}"
+                        )
+                    else:
+                        delay = self._defer_unavailable_route(task)
+                        self._record_error(
+                            f"task {attempt.identity.task_id} was not admitted; "
+                            f"queued for retry in {delay:g}s"
+                        )
             elif submit_attempted:
                 self._drop_lease(binding.room_id)
                 self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at

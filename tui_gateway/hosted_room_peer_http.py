@@ -33,6 +33,7 @@ _NOT_ADMITTED_ERRNOS = frozenset(
     )
     if (value := getattr(errno, name, None)) is not None
 )
+_MAX_PEER_RESPONSE_BYTES = 1024 * 1024
 
 
 def _is_proven_pre_admission_failure(exc: BaseException) -> bool:
@@ -156,6 +157,7 @@ class PeerRunsHTTPClient:
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         room_grant: str | None = None,
+        reject_redirects: bool = False,
     ) -> dict[str, Any]:
         from hermes_cli.urllib_security import open_credentialed_url
 
@@ -179,10 +181,19 @@ class PeerRunsHTTPClient:
             headers=request_headers,
         )
         try:
-            with open_credentialed_url(
-                request, timeout=self.timeout_seconds
-            ) as response:
-                raw = response.read().decode("utf-8", "replace")
+            if reject_redirects:
+                response_context = urllib.request.build_opener(
+                    _RejectAttachmentRedirects()
+                ).open(request, timeout=self.timeout_seconds)
+            else:
+                response_context = open_credentialed_url(
+                    request, timeout=self.timeout_seconds
+                )
+            with response_context as response:
+                response_bytes = response.read(_MAX_PEER_RESPONSE_BYTES + 1)
+                if len(response_bytes) > _MAX_PEER_RESPONSE_BYTES:
+                    raise PeerRunsHTTPError("peer response exceeded the size limit")
+                raw = response_bytes.decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             try:
                 detail = exc.read().decode("utf-8", "replace")[:500]
@@ -190,7 +201,9 @@ class PeerRunsHTTPClient:
                 detail = str(exc)
             error_code = _response_error_code(detail)
             message = (
-                "peer room authorization needs renewal"
+                "peer attachment request refused an HTTP redirect"
+                if reject_redirects and exc.code in {301, 302, 303, 307, 308}
+                else "peer room authorization needs renewal"
                 if exc.code in {401, 403} and error_code == "invalid_room_grant"
                 else f"peer rejected {method} {path} with HTTP {exc.code}: {detail}"
             )
@@ -303,6 +316,7 @@ class PeerRunsHTTPClient:
                 "attachments": manifest,
             },
             room_grant=grant,
+            reject_redirects=True,
         )
         result: Mapping[str, Any] = registered
         for metadata, data in payloads:
@@ -347,7 +361,10 @@ class PeerRunsHTTPClient:
         opener = urllib.request.build_opener(_RejectAttachmentRedirects())
         try:
             with opener.open(request, timeout=self.timeout_seconds) as response:
-                raw = response.read().decode("utf-8", "replace")
+                response_bytes = response.read(_MAX_PEER_RESPONSE_BYTES + 1)
+                if len(response_bytes) > _MAX_PEER_RESPONSE_BYTES:
+                    raise PeerRunsHTTPError("peer attachment response exceeded the size limit")
+                raw = response_bytes.decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             try:
                 detail = exc.read().decode("utf-8", "replace")[:500]

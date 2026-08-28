@@ -46,6 +46,12 @@ class RoomAttachmentSpoolIncomplete(RoomAttachmentSpoolError):
     """A run was presented before its complete attachment batch."""
 
 
+def roomlink_attachments_available() -> bool:
+    """Return the single advertised capability for this installed runtime."""
+
+    return web is not None
+
+
 def _batch_key(dispatch: HostedMemberDispatch) -> str:
     identity = "\0".join(
         (
@@ -313,13 +319,27 @@ class RoomAttachmentSpool:
                 )
             path = self._file_path(str(batch["batch_key"]), attachment_id)
             if int(entry["stored"]):
-                self._read_verified(path, size=len(data), digest=digest)
+                repaired = False
+                try:
+                    self._read_verified(path, size=len(data), digest=digest)
+                except RoomAttachmentSpoolIncomplete:
+                    # SQLite may have committed immediately before a crash or
+                    # the private spool file may have been lost. The caller
+                    # just retransmitted bytes matching the durable manifest,
+                    # so repair atomically instead of poisoning the idempotent
+                    # batch until expiry.
+                    self._write_atomic(path, data)
+                    repaired = True
                 complete = self._is_complete(
                     conn,
                     str(batch["batch_key"]),
                     json.loads(str(batch["manifest_json"])),
                 )
-                return {"complete": complete, "idempotent": True}
+                return {
+                    "complete": complete,
+                    "idempotent": True,
+                    **({"repaired": True} if repaired else {}),
+                }
             used = int(
                 conn.execute(
                     """SELECT COALESCE(SUM(size), 0) AS bytes
@@ -400,6 +420,58 @@ class RoomAttachmentSpool:
                     "complete RoomLink attachments have not reached this gateway"
                 )
             return manifest
+
+    def materialize(self, dispatch: HostedMemberDispatch) -> list[dict[str, Any]]:
+        """Return verified target-local paths in the manifest's original order."""
+
+        manifest = self.require_complete(dispatch)
+        if not manifest:
+            return []
+        key = _batch_key(dispatch)
+        materialized = []
+        for item in manifest:
+            path = self._file_path(key, item["attachment_id"])
+            self._read_verified(
+                path,
+                size=item["size"],
+                digest=item["sha256"],
+            )
+            materialized.append({**item, "path": str(path)})
+        return materialized
+
+    def discard_scope(self, claims: Mapping[str, Any]) -> int:
+        """Remove every staged batch owned by one revoked room-member grant."""
+
+        removed: list[tuple[str, str]] = []
+        with self._lock, self._transaction(immediate=True) as conn:
+            rows = conn.execute(
+                """SELECT batch_key FROM roomlink_attachment_batches
+                    WHERE room_id=? AND home_install_id=? AND member_id=?
+                      AND target_install_id=? AND target_profile=?""",
+                (
+                    claims["room_id"],
+                    claims["home_install_id"],
+                    claims["member_id"],
+                    claims["target_install_id"],
+                    claims["target_profile"],
+                ),
+            ).fetchall()
+            keys = [str(row["batch_key"]) for row in rows]
+            for key in keys:
+                removed.extend(
+                    (key, str(row["attachment_id"]))
+                    for row in conn.execute(
+                        "SELECT attachment_id FROM roomlink_attachment_files WHERE batch_key=?",
+                        (key,),
+                    ).fetchall()
+                )
+                conn.execute(
+                    "DELETE FROM roomlink_attachment_batches WHERE batch_key=?",
+                    (key,),
+                )
+        for key, attachment_id in removed:
+            self._file_path(key, attachment_id).unlink(missing_ok=True)
+        return len(keys)
 
     def prune(self, *, now: float | None = None) -> int:
         checked_now = float(self.clock()) if now is None else float(now)
@@ -618,10 +690,62 @@ async def _validate_dispatch_attachments(
     try:
         dispatch = HostedMemberDispatch.from_mapping(raw_dispatch)
         if dispatch.attachment_manifest_digest is not None:
-            await asyncio.to_thread(_default_spool().require_complete, dispatch)
+            attachments = await asyncio.to_thread(
+                _default_spool().materialize,
+                dispatch,
+            )
+            image_paths = [
+                item["path"] for item in attachments if item["kind"] == "image"
+            ]
+            file_rows = [
+                item for item in attachments if item["kind"] in {"pdf", "file"}
+            ]
+            prompt = dispatch.prompt
+            if attachments:
+                labels = ", ".join(item["name"] for item in attachments)
+                prompt = f"{prompt}\n\nAttached to this Group Chat message: {labels}."
+                normalized = {
+                    **normalized,
+                    "_room_persist_user_message": (
+                        f"{dispatch.prompt}\n\n[Group Chat files: {labels}]"
+                    ),
+                }
+            if file_rows:
+                prompt += (
+                    "\nUse the file tools to inspect these target-local files:\n"
+                    + "\n".join(
+                        f"- {item['name']}: {item['path']}" for item in file_rows
+                    )
+                )
+            if image_paths:
+                from agent.image_routing import build_native_content_parts
+
+                content, skipped = await asyncio.to_thread(
+                    build_native_content_parts,
+                    prompt,
+                    image_paths,
+                )
+                if skipped:
+                    raise RoomAttachmentSpoolIncomplete(
+                        "a staged RoomLink image is no longer readable"
+                    )
+                normalized = {
+                    **normalized,
+                    "input": [{"role": "user", "content": content}],
+                }
+            else:
+                normalized = {**normalized, "input": prompt}
     except RoomAttachmentSpoolIncomplete as exc:
         return normalized, web.json_response(
             _openai_error(str(exc), code="room_attachments_incomplete"),
+            status=409,
+        )
+    except Exception:
+        return normalized, web.json_response(
+            _openai_error(
+                "The Group Chat files could not be prepared on this gateway.",
+                code="room_attachments_unavailable",
+            ),
             status=409,
         )
     return normalized, None

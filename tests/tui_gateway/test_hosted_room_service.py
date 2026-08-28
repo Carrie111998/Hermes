@@ -126,6 +126,7 @@ class _FakeRPC:
 class _FakePeerClient:
     def __init__(self) -> None:
         self.dispatches = []
+        self.staged = []
         self.revoked = []
         self.session = {"session_id": "peer-group-session"}
 
@@ -139,6 +140,10 @@ class _FakePeerClient:
     def dispatch(self, **kwargs):
         self.dispatches.append(kwargs["dispatch"])
         return {"status": "accepted", "task_id": kwargs["dispatch"]["task_id"]}
+
+    def stage_attachments(self, **kwargs):
+        self.staged.append(dict(kwargs))
+        return {"complete": True, "count": len(kwargs["attachments"])}
 
     def history(self, **kwargs):
         if not self.dispatches:
@@ -170,6 +175,24 @@ class _FakePeerClient:
 class _UnavailablePeerClient(_FakePeerClient):
     def prepare(self, **kwargs):
         raise RuntimeError("peer is offline before admission")
+
+
+class _UnavailableAttachmentPeerClient(_FakePeerClient):
+    def stage_attachments(self, **kwargs):
+        raise PeerRunsHTTPError(
+            "peer is offline before attachment admission",
+            retryable=True,
+            not_admitted=True,
+        )
+
+
+class _AmbiguousAttachmentPeerClient(_FakePeerClient):
+    def stage_attachments(self, **kwargs):
+        raise PeerRunsHTTPError(
+            "attachment upload response was lost",
+            retryable=True,
+            ambiguous=True,
+        )
 
 
 class _NotAdmittedPeerClient(_FakePeerClient):
@@ -673,6 +696,100 @@ def test_unadmitted_peer_failure_does_not_block_next_healthy_member(
     )
 
 
+@pytest.mark.parametrize(
+    "peer_client",
+    [_UnavailableAttachmentPeerClient, _AmbiguousAttachmentPeerClient],
+)
+def test_peer_attachment_failure_does_not_block_healthy_member(
+    tmp_path: Path,
+    peer_client,
+):
+    db = tmp_path / "state.db"
+    route = PeerMemberRoute(
+        home_install_id="install-home",
+        member_id="member-peer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest="a" * 64,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed-room-grant",
+        attachments=True,
+    )
+    service = HostedRoomService(
+        _server(),
+        db_path=db,
+        peer_routes={("room-1", "member-peer"): route},
+        peer_clients={"install-peer": peer_client()},
+    )
+    service.rpc = _FakeRPC()
+    service.runtime.rpc = service.rpc
+    service.local_profiles = lambda: ("local",)
+    service.create_room(
+        room_id="room-1",
+        name="Attachment fallback room",
+        members=[
+            {
+                "member_id": "member-peer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": "a" * 64,
+                },
+            },
+            {"member_id": "local", "profile": "local", "handle": "local"},
+        ],
+    )
+    data = b"release notes"
+    stored = service.put_attachment(
+        room_id="room-1",
+        upload_id="upload-fallback",
+        kind="file",
+        name="notes.txt",
+        mime="text/plain",
+        data=data,
+    )
+    manifest = [{
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }]
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-fallback-file",
+        payload={
+            "text": "Review the file together",
+            "thread_id": "thread-1",
+            "attachments": manifest,
+        },
+    )
+    _wait_for(
+        lambda: any(
+            event["kind"] == "message.member"
+            and event["payload"]["member_id"] == "local"
+            for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+    events = service._events("room-1")
+    assert any(
+        event["kind"] == "turn.failed"
+        and event["payload"]["member_id"] == "member-peer"
+        for event in events
+    )
+    assert any(
+        event["kind"] == "message.member"
+        and event["payload"]["member_id"] == "local"
+        for event in events
+    )
+
+
 def test_registered_peer_route_rehydrates_after_service_restart(tmp_path: Path):
     db = tmp_path / "state.db"
     catalog = GatewayRoomCatalog.from_mapping(
@@ -707,6 +824,67 @@ def test_registered_peer_route_rehydrates_after_service_restart(tmp_path: Path):
     assert restored.target_profile == "reviewer"
     assert restored.grant == "signed.room.grant"
     assert ("room-1", "member-peer") in restarted.peer_clients
+
+
+@pytest.mark.parametrize(("stored_support", "live_support"), [(False, True), (True, False)])
+def test_attachment_catalog_reprobe_persists_peer_upgrade_or_downgrade(
+    tmp_path: Path,
+    stored_support: bool,
+    live_support: bool,
+):
+    db = tmp_path / "state.db"
+    stored_catalog = GatewayRoomCatalog.from_mapping(
+        catalog_mapping(
+            installation_id="install-peer",
+            persistent_process=True,
+            attachments=stored_support,
+        )
+    )
+    live_catalog = catalog_mapping(
+        installation_id="install-peer",
+        persistent_process=True,
+        attachments=live_support,
+    )
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-peer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest=stored_catalog.catalog_digest,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed.room.grant",
+        attachments=stored_support,
+    )
+
+    class ProbedPeer(_FakePeerClient):
+        def probe(self, **_kwargs):
+            return {"catalog": live_catalog}
+
+    peer = ProbedPeer()
+    service = HostedRoomService(_server(), db_path=db)
+    service.register_peer_route(
+        room_id="room-1",
+        member_id="member-peer",
+        route=route,
+        client=peer,
+        target_url="https://peer.example.test",
+        catalog=stored_catalog,
+    )
+
+    refreshed = service._refresh_peer_attachment_catalog(
+        "room-1",
+        "member-peer",
+        route,
+        peer,
+    )
+
+    assert refreshed.attachments is live_support
+    assert refreshed.capability_digest == live_catalog["catalog_digest"]
+    restarted = HostedRoomService(_server(), db_path=db)
+    persisted = restarted.peer_routes[("room-1", "member-peer")]
+    assert persisted.attachments is live_support
+    assert persisted.capability_digest == live_catalog["catalog_digest"]
 
 
 def test_one_corrupt_stored_route_does_not_hide_healthy_peers(tmp_path: Path):
@@ -1422,7 +1600,11 @@ def test_stale_local_approval_cannot_resolve_replacement_request(tmp_path: Path)
 def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
     db = tmp_path / "state.db"
     catalog = GatewayRoomCatalog.from_mapping(
-        catalog_mapping(installation_id="install-peer", persistent_process=True)
+        catalog_mapping(
+            installation_id="install-peer",
+            persistent_process=True,
+            attachments=True,
+        )
     )
     route = PeerMemberRoute(
         home_install_id=hosted_rooms.local_authority_gateway_id(),
@@ -1433,6 +1615,7 @@ def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
         cancellation_scope_id="cancel-room-1",
         trace_id="trace-room-1",
         grant="signed.room.grant",
+        attachments=True,
     )
     peer = _RecoveringPeerClient()
     service = HostedRoomService(_server(), db_path=db)
@@ -1464,6 +1647,25 @@ def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
         ],
     )
     identity = driver.TaskIdentity("room-1", "task-1", "thread-1", "turn-1")
+    data = b"release notes"
+    stored = service.put_attachment(
+        room_id="room-1",
+        upload_id="upload-recovery",
+        kind="file",
+        name="notes.txt",
+        mime="text/plain",
+        data=data,
+    )
+    manifest = [{
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }]
+    service.attachments.commit_message(
+        room_id="room-1",
+        event_id="user-attachment",
+        manifest=manifest,
+        recipient_member_ids=("member-peer",),
+    )
 
     service._resolve_member_transport(
         service.bindings()[0],
@@ -1476,6 +1678,7 @@ def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
                 "target_profile": "reviewer",
                 "source_event_seq": 9,
                 "prompt": "Recover the accepted review.",
+                "attachments": manifest,
             },
         },
     )
@@ -1485,6 +1688,11 @@ def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
     assert recovered["task_id"] == "task-1"
     assert recovered["execution_generation"] == 1
     assert recovered["prompt"] == "Recover the accepted review."
+    assert peer.staged[0]["attachments"][0]["data"] == data
+    assert (
+        peer.staged[0]["dispatch"]["attachment_manifest_digest"]
+        == recovered["attachment_manifest_digest"]
+    )
 
 
 def test_stop_fence_prevents_the_next_room_member_from_starting(

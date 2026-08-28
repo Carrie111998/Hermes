@@ -198,7 +198,7 @@ def test_attachment_manifest_rejects_duplicate_or_oversized_entries():
     with pytest.raises(HostedRoomPeerError, match="unique"):
         canonical_attachment_manifest([entry, entry])
     with pytest.raises(HostedRoomPeerError, match="size"):
-        canonical_attachment_manifest([{**entry, "size": 9_000_001}])
+        canonical_attachment_manifest([{**entry, "size": 15_000_001}])
 
 
 def test_room_grant_is_scoped_to_exact_room_home_target_and_profile():

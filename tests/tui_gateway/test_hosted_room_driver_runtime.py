@@ -1751,7 +1751,7 @@ def test_second_attachment_failure_rolls_back_before_later_text_only_turn(db: Pa
     assert text_submit["staged_attachment_ids"] == []
 
 
-def test_attachment_task_never_uses_peer_transport_binary_path(db: Path):
+def test_attachment_task_uses_the_selected_member_transport(db: Path):
     identity = _identity()
     manifest = {
         "attachment_id": "att_11111111111111111111111111111111",
@@ -1773,11 +1773,11 @@ def test_attachment_task_never_uses_peer_transport_binary_path(db: Path):
     )
 
     runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
     assert runtime.stop(timeout=1.0)
 
-    assert not any(method == "stage_attachment" for method, _params in peer.calls)
-    assert not any(method == "submit" for method, _params in peer.calls)
+    assert any(method == "stage_attachment" for method, _params in peer.calls)
+    assert any(method == "submit" for method, _params in peer.calls)
 
 
 def test_task_can_stage_a_bounded_aggregate_from_multiple_messages(db: Path):

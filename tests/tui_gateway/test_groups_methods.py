@@ -73,6 +73,7 @@ def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch
     assert result["room_link"]["enabled"] is True
     assert result["room_link"]["profile"] == "reviewer"
     assert result["room_link"]["catalog"]["text"] is True
+    assert result["room_link"]["catalog"]["attachments"] is True
     assert "groups.peer.invite" in result["methods"]
     assert "groups.peer.register" in result["methods"]
 
@@ -91,7 +92,45 @@ def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch
     )
     assert invitation["target_profile"] == "reviewer"
     assert invitation["catalog"] == result["room_link"]["catalog"]
+    assert invitation["catalog"]["attachments"] is True
     assert "." in invitation["grant"]
+
+
+def test_peer_revoke_discards_the_scoped_attachment_spool(home, monkeypatch):
+    from gateway.platforms import api_server_room_attachments
+
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
+    invitation = _result(
+        srv._methods["groups.peer.invite"](
+            1,
+            {
+                "room_id": "room-revoke",
+                "home_install_id": "install-home",
+                "authority_gateway_id": "install-home",
+                "authority_epoch": 1,
+                "member_id": "member-peer",
+                "grant_id": "grant-room-revoke",
+            },
+        )
+    )
+    discarded = []
+
+    class FakeSpool:
+        def discard_scope(self, claims):
+            discarded.append(dict(claims))
+            return 1
+
+    monkeypatch.setattr(api_server_room_attachments, "_default_spool", FakeSpool)
+    result = _result(
+        srv._methods["groups.peer.revoke"](
+            2,
+            {"grant": invitation["grant"]},
+        )
+    )
+
+    assert result["revoked"] is True
+    assert discarded[0]["room_id"] == "room-revoke"
+    assert discarded[0]["member_id"] == "member-peer"
 
 
 def test_capabilities_disable_roomlink_when_run_replay_is_not_durable(

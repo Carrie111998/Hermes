@@ -25,6 +25,7 @@ from gateway.hosted_room_peer import (
     GatewayRoomCatalog,
     HostedMemberDispatch,
     PROTOCOL_VERSION,
+    attachment_manifest_digest,
 )
 from tui_gateway.hosted_room_driver import HostedRoomBinding, HostedRoomRuntime
 from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
@@ -82,6 +83,7 @@ class HostedRoomService:
                     cancellation_scope_id=stored.cancellation_scope_id,
                     trace_id=stored.trace_id,
                     grant=stored.grant,
+                    attachments=stored.catalog.attachments,
                 )
                 self.peer_routes[(stored.room_id, stored.member_id)] = route
                 self.peer_clients[(stored.room_id, stored.member_id)] = client
@@ -261,6 +263,17 @@ class HostedRoomService:
                 binding.room_id, member_id, grant
             ),
         )
+        if task.get("payload", {}).get("attachments"):
+            route = self._refresh_peer_attachment_catalog(
+                binding.room_id,
+                member_id,
+                route,
+                tracked_client,
+            )
+            if not route.attachments:
+                raise RuntimeError(
+                    "The target gateway needs an update before it can receive files in this Group Chat."
+                )
         self._recover_peer_admission(binding, task, route, tracked_client)
         return PeerHostedRoomTransport(
             binding=binding,
@@ -295,6 +308,15 @@ class HostedRoomService:
         source_event_seq = int(payload.get("source_event_seq") or 0)
         if not isinstance(prompt, str) or source_event_seq < 1 or not route.trace_id:
             raise RuntimeError("peer room admission identity is unavailable for recovery")
+        attachment_manifest = []
+        attachment_payloads = []
+        for attachment, data in self._load_task_attachments(binding, task):
+            manifest_item = {
+                **dict(attachment),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            attachment_manifest.append(manifest_item)
+            attachment_payloads.append({**manifest_item, "data": data})
         dispatch = HostedMemberDispatch.from_mapping({
             "protocol_version": PROTOCOL_VERSION,
             "room_id": identity.room_id,
@@ -312,7 +334,27 @@ class HostedRoomService:
             "prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "capability_digest": route.capability_digest,
             "trace_id": route.trace_id,
+            **(
+                {
+                    "attachment_manifest_digest": attachment_manifest_digest(
+                        attachment_manifest
+                    )
+                }
+                if attachment_manifest
+                else {}
+            ),
         })
+        if attachment_payloads:
+            stage = getattr(client, "stage_attachments", None)
+            if not callable(stage):
+                raise RuntimeError(
+                    "The target gateway needs an update before it can receive files in this Group Chat."
+                )
+            stage(
+                dispatch=dispatch.as_mapping(),
+                attachments=attachment_payloads,
+                grant=route.grant,
+            )
         recover(dispatch=dispatch.as_mapping(), grant=route.grant)
 
     def _member_is_peer(self, room_id: str, member_id: str) -> bool:
@@ -384,6 +426,70 @@ class HostedRoomService:
         with self._policy_lock:
             self.peer_routes[key] = rotated_route
             self._peer_route_status[key] = "ready"
+
+    def _refresh_peer_attachment_catalog(
+        self,
+        room_id: str,
+        member_id: str,
+        route: PeerMemberRoute,
+        client: Any,
+    ) -> PeerMemberRoute:
+        """Re-probe binary support so upgrades and downgrades fail truthfully."""
+
+        probe = getattr(client, "probe", None)
+        if not callable(probe):
+            return route
+        result = probe(grant=route.grant)
+        catalog = GatewayRoomCatalog.from_mapping(result.get("catalog"))
+        if (
+            catalog.installation_id != route.target_install_id
+            or not catalog.persistent_process
+            or not catalog.text
+        ):
+            raise RuntimeError("peer room capability identity changed")
+        key = (room_id, member_id)
+        stored = next(
+            (
+                link
+                for link in hosted_room_links.load_room_links(self.db_path)
+                if (link.room_id, link.member_id) == key
+            ),
+            None,
+        )
+        if stored is None:
+            # Explicitly supplied in-process routes are valid for tests and
+            # ephemeral callers, but cannot publish a refreshed catalog.
+            return replace(
+                route,
+                capability_digest=catalog.catalog_digest,
+                attachments=catalog.attachments,
+            )
+        refreshed = replace(
+            route,
+            capability_digest=catalog.catalog_digest,
+            attachments=catalog.attachments,
+        )
+        if (
+            stored.catalog.catalog_digest != catalog.catalog_digest
+            or stored.catalog.attachments != catalog.attachments
+        ):
+            hosted_room_links.save_room_link(
+                self.db_path,
+                hosted_room_links.make_stored_link(
+                    room_id=room_id,
+                    member_id=member_id,
+                    target_url=stored.target_url,
+                    target_profile=stored.target_profile,
+                    grant=route.grant,
+                    catalog=catalog,
+                    cancellation_scope_id=stored.cancellation_scope_id,
+                    trace_id=stored.trace_id,
+                ),
+            )
+            with self._policy_lock:
+                self.peer_routes[key] = refreshed
+                self._peer_route_status[key] = "ready"
+        return refreshed
 
     def _route_statuses(self, room_id: str | None = None) -> list[dict[str, str]]:
         with self._policy_lock:
@@ -883,7 +989,11 @@ class _RouteStatusPeerClient:
             return value
 
         def tracked(*args, **kwargs):
-            if name in {"dispatch", "recover_dispatch"} and "grant" in kwargs:
+            if name in {
+                "dispatch",
+                "recover_dispatch",
+                "stage_attachments",
+            } and "grant" in kwargs:
                 from gateway.hosted_room_peer import (
                     room_grant_needs_dispatch_refresh,
                 )

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from gateway.hosted_room_driver import TaskIdentity
+from gateway.hosted_room_peer import attachment_manifest_digest
 from tui_gateway.hosted_room_driver import HostedRoomBinding, ROOM_SESSION_SOURCE
 from tui_gateway.hosted_room_peer_transport import (
     FailoverHostedRoomPeerClient,
@@ -25,6 +26,7 @@ ROUTE = PeerMemberRoute(
     cancellation_scope_id="cancel-1",
     trace_id="trace-1",
     grant="signed-room-grant",
+    attachments=True,
 )
 
 
@@ -51,6 +53,10 @@ class FakePeerClient:
         self.task_id = dispatch["task_id"]
         return {"status": "accepted", "task_id": self.task_id}
 
+    def stage_attachments(self, **kwargs):
+        self.calls.append(("stage_attachments", kwargs))
+        return {"complete": True, "count": len(kwargs["attachments"])}
+
     def history(self, **kwargs):
         self.calls.append(("history", kwargs))
         return list(self.messages)
@@ -72,7 +78,7 @@ class FailingPeerClient(FakePeerClient):
         self.error = PeerRunsHTTPError(
             f"{method} failed",
             retryable=retryable,
-            ambiguous=method == "dispatch" and not not_admitted,
+            ambiguous=method in {"dispatch", "stage_attachments"} and not not_admitted,
             not_admitted=not_admitted,
         )
 
@@ -86,6 +92,12 @@ class FailingPeerClient(FakePeerClient):
             self.calls.append(("dispatch", kwargs))
             raise self.error
         return super().dispatch(**kwargs)
+
+    def stage_attachments(self, **kwargs):
+        if self.method == "stage_attachments":
+            self.calls.append(("stage_attachments", kwargs))
+            raise self.error
+        return super().stage_attachments(**kwargs)
 
     def status(self, **kwargs):
         if self.method == "status":
@@ -170,6 +182,69 @@ def test_peer_transport_dispatches_full_fenced_coordinates_and_exact_stop():
     assert len([call for call in client.calls if call[0] == "stop"]) == 1
 
 
+def test_peer_transport_pushes_digest_bound_bytes_before_run_admission():
+    client = FakePeerClient()
+    task = TaskIdentity("room-1", "task-files", "thread-1", "turn-files")
+    transport = PeerHostedRoomTransport(
+        binding=BINDING,
+        route=ROUTE,
+        client=client,
+        source_event_seq=7,
+        task_id=task.task_id,
+        execution_generation=3,
+    )
+    transport.create(
+        profile="reviewer",
+        title="Group: room-1",
+        source=ROOM_SESSION_SOURCE,
+    )
+    transport.begin_attachment_staging(
+        profile="reviewer",
+        session_id="group-session",
+        source=ROOM_SESSION_SOURCE,
+        execution_generation=3,
+    )
+    transport.stage_attachment(
+        profile="reviewer",
+        session_id="group-session",
+        source=ROOM_SESSION_SOURCE,
+        execution_generation=3,
+        attachment={
+            "attachment_id": "att_11111111111111111111111111111111",
+            "kind": "file",
+            "name": "brief.txt",
+            "size": 5,
+            "mime": "text/plain",
+        },
+        data=b"brief",
+    )
+
+    result = transport.submit(
+        profile="reviewer",
+        session_id="group-session",
+        prompt="Review the file.",
+        source=ROOM_SESSION_SOURCE,
+        task=task,
+        execution_generation=3,
+        on_terminal=lambda _receipt: None,
+    )
+
+    assert result["status"] == "accepted"
+    methods = [method for method, _params in client.calls]
+    assert methods.index("stage_attachments") < methods.index("dispatch")
+    staged = next(params for method, params in client.calls if method == "stage_attachments")
+    dispatched = next(params for method, params in client.calls if method == "dispatch")
+    assert staged["attachments"][0]["data"] == b"brief"
+    manifest = [
+        {
+            key: staged["attachments"][0][key]
+            for key in ("attachment_id", "kind", "name", "size", "mime", "sha256")
+        }
+    ]
+    assert dispatched["dispatch"]["attachment_manifest_digest"] == attachment_manifest_digest(manifest)
+    assert dispatched["dispatch"]["attachment_manifest_digest"] == staged["dispatch"]["attachment_manifest_digest"]
+
+
 def test_peer_transport_carries_each_turns_real_source_event_sequence():
     observed = []
     for index, source_event_seq in enumerate((7, 42), start=1):
@@ -249,6 +324,27 @@ def test_roomlink_never_falls_back_after_ambiguous_direct_failure():
     assert direct.calls[0][1]["dispatch"] is dispatch
     assert relay.calls == []
     assert client.active_link.name == "direct"
+
+
+def test_roomlink_can_fail_over_ambiguous_attachment_staging_before_admission():
+    direct = FailingPeerClient(method="stage_attachments")
+    relay = FakePeerClient()
+    client = FailoverHostedRoomPeerClient([
+        RoomLinkCandidate("direct", "direct", "install-peer", direct),
+        RoomLinkCandidate("relay", "relay", "install-peer", relay),
+    ])
+    payload = [{"attachment_id": "att_1", "data": b"file"}]
+
+    result = client.stage_attachments(
+        dispatch={"task_id": "task-1", "execution_generation": 1},
+        attachments=payload,
+        grant="grant",
+    )
+
+    assert result["complete"] is True
+    assert direct.calls[0][0] == "stage_attachments"
+    assert relay.calls[0][0] == "stage_attachments"
+    assert client.active_link.name == "relay"
 
 
 def test_roomlink_falls_back_after_proven_not_admitted_direct_failure():

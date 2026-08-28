@@ -1,5 +1,6 @@
 """RoomLink room-member grants and capability HTTP handlers."""
 
+import asyncio
 import time
 import uuid
 from typing import Any
@@ -119,13 +120,17 @@ async def _handle_room_member_invitation(
         ttl = float(body.get("ttl_seconds", 3600))
         if not 60 <= ttl <= 24 * 60 * 60:
             raise ValueError("ttl_seconds must be between 60 and 86400")
+        from gateway.platforms.api_server_room_attachments import (
+            roomlink_attachments_available,
+        )
+
         catalog = catalog_mapping(
             installation_id=target_install_id,
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
             link_modes=("direct",),
             persistent_process=True,
             text=True,
-            attachments=False,
+            attachments=roomlink_attachments_available(),
         )
         token = issue_room_grant(
             self._room_grant_secret(),
@@ -179,13 +184,17 @@ async def _handle_room_member_capabilities(
             or claims["target_install_id"] != installation_id
         ):
             raise ValueError("room grant target does not match this profile")
+        from gateway.platforms.api_server_room_attachments import (
+            roomlink_attachments_available,
+        )
+
         catalog = catalog_mapping(
             installation_id=installation_id,
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
             link_modes=("direct",),
             persistent_process=True,
             text=True,
-            attachments=False,
+            attachments=roomlink_attachments_available(),
         )
     except Exception:
         return web.json_response(
@@ -341,6 +350,16 @@ async def _handle_room_member_grant_revoke(
                 claims.get("status_expires_at", claims["expires_at"])
             ),
         )
+        try:
+            from gateway.platforms.api_server_room_attachments import (
+                _default_spool,
+            )
+
+            await asyncio.to_thread(_default_spool().discard_scope, claims)
+        except Exception:
+            # Authorization is already revoked. A failed cleanup cannot make
+            # the grant live again; bounded spool expiry remains the backstop.
+            pass
     except Exception:
         return web.json_response(
             _openai_error(

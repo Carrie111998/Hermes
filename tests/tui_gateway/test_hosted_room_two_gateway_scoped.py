@@ -58,6 +58,14 @@ def _target_app(adapter):
         "/v1/room-members/capabilities",
         adapter._handle_room_member_capabilities,
     )
+    app.router.add_post(
+        "/v1/room-members/attachments",
+        adapter._handle_room_attachment_manifest,
+    )
+    app.router.add_put(
+        "/v1/room-members/attachments/{task_id}/{execution_generation}/{attachment_id}",
+        adapter._handle_room_attachment_upload,
+    )
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
@@ -67,7 +75,14 @@ def _target_app(adapter):
 @pytest.mark.asyncio
 async def test_in_process_scoped_transport_contract_finishes_headlessly(
     tmp_path: Path,
+    monkeypatch,
 ):
+    target_home = tmp_path / "target-hermes"
+    target_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(target_home))
+    from gateway.platforms import api_server_room_attachments
+
+    api_server_room_attachments._spool.cache_clear()
     target = APIServerAdapter(
         PlatformConfig(enabled=True, extra={"key": "target-peer-key-1234567890"})
     )
@@ -108,6 +123,7 @@ async def test_in_process_scoped_transport_contract_finishes_headlessly(
         cancellation_scope_id="cancel-room-1",
         trace_id="trace-room-1",
         grant=invitation["grant"],
+        attachments=catalog["attachments"],
     )
     home = HostedRoomService(
         _server_module(),
@@ -147,10 +163,27 @@ async def test_in_process_scoped_transport_contract_finishes_headlessly(
     ) = 0
     with patch.object(target, "_create_agent", return_value=agent):
         home.start()
+        image = b"\x89PNG\r\n\x1a\nimage"
+        stored = home.put_attachment(
+            room_id="room-1",
+            upload_id="upload-1",
+            kind="image",
+            name="diagram.png",
+            mime="image/png",
+            data=image,
+        )
+        manifest = [{
+            key: stored[key]
+            for key in ("attachment_id", "kind", "name", "size", "mime")
+        }]
         home.send(
             room_id="room-1",
             event_id="user-1",
-            payload={"text": "@reviewer inspect", "thread_id": "thread-1"},
+            payload={
+                "text": "@reviewer inspect",
+                "thread_id": "thread-1",
+                "attachments": manifest,
+            },
         )
         deadline = asyncio.get_running_loop().time() + 5
         while asyncio.get_running_loop().time() < deadline:
@@ -174,5 +207,12 @@ async def test_in_process_scoped_transport_contract_finishes_headlessly(
     )
     assert reply["payload"]["text"] == "Scoped peer response."
     assert reply["actor"]["connection_id"] == "peer-target"
+    user_message = agent.run_conversation.call_args.kwargs["user_message"]
+    assert any(part.get("type") == "image_url" for part in user_message)
+    persisted = agent.run_conversation.call_args.kwargs["persist_user_message"]
+    assert persisted.endswith("[Group Chat files: diagram.png]")
+    assert "base64" not in persisted
+    assert str(target_home) not in persisted
     await server.close()
     target._run_idempotency_store.close()
+    api_server_room_attachments._spool.cache_clear()

@@ -155,12 +155,16 @@ def _(rid, params: dict) -> dict:
         derive_room_grant_secret(
             _api_server_key(profile if params.get("profile") else None)
         )
+        from gateway.platforms.api_server_room_attachments import (
+            roomlink_attachments_available,
+        )
+
         catalog = local_catalog_mapping(
             installation_id=local_authority_gateway_id(),
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
             link_modes=("direct",),
             text=True,
-            attachments=False,
+            attachments=roomlink_attachments_available(),
         )
         room_link = {
             "enabled": True,
@@ -412,12 +416,16 @@ def _(rid, params: dict) -> dict:
             target_profile=profile,
             ttl_seconds=ttl,
         )
+        from gateway.platforms.api_server_room_attachments import (
+            roomlink_attachments_available,
+        )
+
         catalog = local_catalog_mapping(
             installation_id=installation_id,
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
             link_modes=("direct",),
             text=True,
-            attachments=False,
+            attachments=roomlink_attachments_available(),
         )
         return _ok(
             rid,
@@ -460,6 +468,16 @@ def _(rid, params: dict) -> dict:
                 claims.get("status_expires_at", claims["expires_at"])
             ),
         )
+        try:
+            from gateway.platforms.api_server_room_attachments import (
+                _default_spool,
+            )
+
+            _default_spool().discard_scope(claims)
+        except Exception:
+            # The grant is already revoked. Bounded spool expiry remains the
+            # cleanup backstop and cannot restore authorization.
+            pass
         return _ok(rid, {"revoked": True})
     except Exception as exc:
         return _err(rid, 4122, str(exc))
@@ -534,6 +552,7 @@ def _(rid, params: dict) -> dict:
             ),
             trace_id=str(params.get("trace_id") or f"trace-{os.urandom(16).hex()}"),
             grant=grant,
+            attachments=catalog.attachments,
         )
         service.register_peer_route(
             room_id=room_id,

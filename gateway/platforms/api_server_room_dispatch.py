@@ -112,6 +112,10 @@ async def _normalize_room_dispatch(
             or dispatch.target_install_id != local_install
         ):
             raise ValueError("room dispatch target does not match this profile")
+        from gateway.platforms.api_server_room_attachments import (
+            roomlink_attachments_available,
+        )
+
         catalog = GatewayRoomCatalog.from_mapping(
             catalog_mapping(
                 installation_id=local_install,
@@ -119,7 +123,7 @@ async def _normalize_room_dispatch(
                 link_modes=("direct",),
                 persistent_process=True,
                 text=True,
-                attachments=False,
+                attachments=roomlink_attachments_available(),
             )
         )
         if not hmac.compare_digest(

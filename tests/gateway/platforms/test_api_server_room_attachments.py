@@ -98,6 +98,10 @@ def test_spool_is_idempotent_and_survives_restart(tmp_path: Path):
     assert stat_mode(root) == 0o700
     assert all(stat_mode(path) == 0o600 for path in root.iterdir())
 
+    materialized = restarted.materialize(dispatch)
+    assert [item["name"] for item in materialized] == ["brief.txt"]
+    assert Path(materialized[0]["path"]).read_bytes() == b"hello"
+
 
 def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
@@ -138,6 +142,19 @@ def test_spool_rejects_conflict_incomplete_and_corrupt_batches(tmp_path: Path):
     next(path for path in spool.root.iterdir() if path.is_file()).write_bytes(b"bad")
     with pytest.raises(room_attachments.RoomAttachmentSpoolIncomplete):
         spool.require_complete(dispatch)
+    repaired = spool.put(
+        claims=claims,
+        task_id=dispatch.task_id,
+        execution_generation=dispatch.execution_generation,
+        attachment_id=str(manifest[0]["attachment_id"]),
+        data=b"hello",
+    )
+    assert repaired == {
+        "complete": True,
+        "idempotent": True,
+        "repaired": True,
+    }
+    assert spool.require_complete(dispatch) == manifest
 
 
 def test_spool_expires_partial_or_stopped_attempt_data_after_restart(tmp_path: Path):
@@ -176,6 +193,35 @@ def test_spool_expires_partial_or_stopped_attempt_data_after_restart(tmp_path: P
     with pytest.raises(room_attachments.RoomAttachmentSpoolIncomplete):
         restarted.require_complete(dispatch)
     assert list(root.iterdir()) == []
+
+
+def test_revoked_member_scope_removes_only_its_staged_batches(tmp_path: Path):
+    spool = room_attachments.RoomAttachmentSpool(
+        tmp_path / "state.db",
+        root=tmp_path / "spool",
+    )
+    manifest = _manifest()
+    dispatch = _dispatch(manifest)
+    claims = {
+        "room_id": dispatch.room_id,
+        "home_install_id": dispatch.home_install_id,
+        "member_id": dispatch.member_id,
+        "target_install_id": dispatch.target_install_id,
+        "target_profile": dispatch.target_profile,
+    }
+    spool.prepare(dispatch, manifest)
+    spool.put(
+        claims=claims,
+        task_id=dispatch.task_id,
+        execution_generation=dispatch.execution_generation,
+        attachment_id=str(manifest[0]["attachment_id"]),
+        data=b"hello",
+    )
+
+    assert spool.discard_scope(claims) == 1
+    with pytest.raises(room_attachments.RoomAttachmentSpoolIncomplete):
+        spool.require_complete(dispatch)
+    assert list(spool.root.iterdir()) == []
 
 
 @pytest.fixture
@@ -309,7 +355,7 @@ async def test_api_rejects_oversized_upload_before_reading_body(attachment_api):
             data=b"x",
             headers={
                 "Authorization": f"HermesRoom {grant}",
-                "Content-Length": str(9_000_001),
+                "Content-Length": str(15_000_001),
             },
         )
         assert response.status == 413
@@ -351,4 +397,110 @@ async def test_dispatch_admission_fails_closed_until_batch_is_complete(
             "error": {"message": message, **kwargs}
         },
     ) == (text_only, None)
+    room_attachments._spool.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_materializes_files_into_the_target_run_prompt(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    room_attachments._spool.cache_clear()
+    manifest = _manifest()
+    dispatch = _dispatch(manifest)
+    claims = {
+        "room_id": dispatch.room_id,
+        "home_install_id": dispatch.home_install_id,
+        "member_id": dispatch.member_id,
+        "target_install_id": dispatch.target_install_id,
+        "target_profile": dispatch.target_profile,
+    }
+    spool = room_attachments._default_spool()
+    spool.prepare(dispatch, manifest)
+    spool.put(
+        claims=claims,
+        task_id=dispatch.task_id,
+        execution_generation=dispatch.execution_generation,
+        attachment_id=str(manifest[0]["attachment_id"]),
+        data=b"hello",
+    )
+
+    normalized, error = await room_attachments._validate_dispatch_attachments(
+        {
+            "input": dispatch.prompt,
+            "hosted_room_dispatch": dispatch.as_mapping(),
+        },
+        _openai_error=lambda message, **kwargs: {
+            "error": {"message": message, **kwargs}
+        },
+    )
+
+    assert error is None
+    assert "Attached to this Group Chat message: brief.txt." in normalized["input"]
+    assert "Use the file tools" in normalized["input"]
+    assert str(spool.root) in normalized["input"]
+    assert "aGVsbG8=" not in normalized["input"]
+    assert normalized["_room_persist_user_message"] == (
+        "Review the attached brief.\n\n[Group Chat files: brief.txt]"
+    )
+    assert str(spool.root) not in normalized["_room_persist_user_message"]
+    room_attachments._spool.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_materializes_images_as_native_multimodal_input(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    room_attachments._spool.cache_clear()
+    data = b"\x89PNG\r\n\x1a\nimage"
+    manifest = [{
+        "attachment_id": "att_0123456789abcdef0123456789abcdef",
+        "kind": "image",
+        "name": "diagram.png",
+        "size": len(data),
+        "mime": "image/png",
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }]
+    dispatch = _dispatch(manifest)
+    claims = {
+        "room_id": dispatch.room_id,
+        "home_install_id": dispatch.home_install_id,
+        "member_id": dispatch.member_id,
+        "target_install_id": dispatch.target_install_id,
+        "target_profile": dispatch.target_profile,
+    }
+    spool = room_attachments._default_spool()
+    spool.prepare(dispatch, manifest)
+    spool.put(
+        claims=claims,
+        task_id=dispatch.task_id,
+        execution_generation=dispatch.execution_generation,
+        attachment_id=str(manifest[0]["attachment_id"]),
+        data=data,
+    )
+
+    normalized, error = await room_attachments._validate_dispatch_attachments(
+        {
+            "input": dispatch.prompt,
+            "hosted_room_dispatch": dispatch.as_mapping(),
+        },
+        _openai_error=lambda message, **kwargs: {
+            "error": {"message": message, **kwargs}
+        },
+    )
+
+    assert error is None
+    content = normalized["input"][-1]["content"]
+    assert any(item.get("type") == "text" for item in content)
+    image = next(item for item in content if item.get("type") == "image_url")
+    assert image["image_url"]["url"].startswith("data:image/png;base64,")
+    assert normalized["_room_persist_user_message"] == (
+        "Review the attached brief.\n\n[Group Chat files: diagram.png]"
+    )
+    assert "base64" not in normalized["_room_persist_user_message"]
     room_attachments._spool.cache_clear()
