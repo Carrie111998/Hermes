@@ -51,3 +51,42 @@ test('A2 (RED): evalBounded returns "null" when the renderer eval is undefined',
   const { evalBounded } = deps(undefined)
   assert.equal(await evalBounded('void 0'), 'null')
 })
+
+// --- P2: status applies the same --match filter as the CDP client ---
+
+// deps with an injectable fetch returning a fixed /json/list.
+const depsWithFetch = (list, match) => {
+  const { connect } = fakeConnect('[]')
+  const t = createReadTools({
+    connect, MAX_TEXT: 80, MAX_NODES: 20, MAX_EVAL: 4000, MAX_CONSOLE: 50,
+    port: 9222, allowAct: false, match, SELECTORS: {},
+    fetchImpl: async () => ({ json: async () => list })
+  })
+  return t
+}
+
+const PAGES = [
+  { type: 'page', url: 'http://127.0.0.1:5174/#/', title: 'Hermes dev', webSocketDebuggerUrl: 'ws://a' },
+  { type: 'page', url: 'http://localhost:3000/other', title: 'Other page', webSocketDebuggerUrl: 'ws://b' }
+]
+
+test('P2 (RED): status applies the match filter — only matching targets count', async () => {
+  const t = depsWithFetch(PAGES, '5174')
+  const s = await t.status()
+  assert.equal(s.cdpAlive, true)
+  assert.equal(s.targets.length, 1, 'non-matching target must be filtered out')
+  assert.match(s.targets[0].url, /5174/)
+})
+
+test('P2 (RED): zero matching targets → cdpAlive:false even though pages exist', async () => {
+  const t = depsWithFetch(PAGES, '9999')
+  const s = await t.status()
+  assert.equal(s.cdpAlive, false, 'unreachable-matching renderer must not be reported alive')
+  assert.equal(s.mode, 'unavailable')
+})
+
+test('P2: status payload exposes the match value for self-diagnosis', async () => {
+  const t = depsWithFetch(PAGES, '5174')
+  const s = await t.status()
+  assert.equal(s.match, '5174')
+})

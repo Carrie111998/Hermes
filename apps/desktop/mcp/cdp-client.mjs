@@ -31,6 +31,16 @@ import { discoverTarget, CDP } from '../scripts/perf/lib/cdp.mjs'
 export const isConnectablePage = (t) =>
   t && t.type === 'page' && typeof t.webSocketDebuggerUrl === 'string'
 
+/**
+ * Same URL filter discoverTarget applies when picking "our" page — one source
+ * of truth so status() can never report a target the client would refuse
+ * (Bugbot P2: status counted any connectable page, client required the
+ * --match substring, so preflight said alive while the next tool failed).
+ * match === undefined/empty keeps discovery's permissive fallback semantics.
+ */
+export const matchesTarget = (url, match) =>
+  !match || String(url).includes(match)
+
 export function createCdpClient({ port, match, onConsole, discoverTargetImpl = discoverTarget, CDPImpl = CDP }) {
   let handle = null
 

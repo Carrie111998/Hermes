@@ -7,6 +7,8 @@
  * MAX_TEXT / MAX_NODES / MAX_EVAL.
  */
 
+import { isConnectablePage, matchesTarget } from '../cdp-client.mjs'
+
 /** Resolve a selector: either a SELECTORS key or a raw CSS selector. */
 export const resolveSelector = (sel, SELECTORS) => (SELECTORS && SELECTORS[sel]) || sel
 
@@ -48,11 +50,14 @@ export function createReadTools(deps) {
     let targets = []
 
     try {
-      const list = await (await fetch(`http://127.0.0.1:${deps.port}/json/list`)).json()
-      // Use the same "is connectable" predicate as the CDP client (BUG #3):
-      // a page target without a webSocketDebuggerUrl is not connectable.
+      // fetchImpl is injectable for tests; production uses global fetch.
+      const doFetch = deps.fetchImpl || fetch
+      const list = await (await doFetch(`http://127.0.0.1:${deps.port}/json/list`)).json()
+      // Two predicates, both shared with the CDP client: connectable (page +
+      // WS url) AND the --match URL filter — status must never report a
+      // target the client would refuse to connect to (Bugbot P2).
       targets = list
-        .filter((t) => t.type === 'page' && typeof t.webSocketDebuggerUrl === 'string')
+        .filter((t) => isConnectablePage(t) && matchesTarget(t.url, deps.match))
         .map((t) => ({ url: String(t.url).slice(0, 120), title: String(t.title).slice(0, 60) }))
       alive = targets.length > 0
     } catch {
@@ -64,6 +69,7 @@ export function createReadTools(deps) {
       port: deps.port,
       mode: alive ? 'dev' : 'unavailable',
       allowAct: deps.allowAct,
+      match: deps.match ?? null,
       selectors: Object.keys(SELECTORS),
       targets
     }

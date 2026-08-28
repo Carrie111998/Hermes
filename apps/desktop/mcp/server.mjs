@@ -79,6 +79,7 @@ const readDeps = createReadTools({
   SELECTORS,
   consoleRing,
   port: CFG.port,
+  match: CFG.match,
   allowAct: CFG.allowAct
 })
 const { evalBounded, status, inspect, query, consoleLog, screenshot } = readDeps
