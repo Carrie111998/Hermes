@@ -57,6 +57,24 @@ class HostedRoomPeerClient(Protocol):
         grant: str,
     ) -> Mapping[str, Any]: ...
 
+    def read_artifact(
+        self,
+        *,
+        run_id: str,
+        artifact_id: str,
+        grant: str,
+    ) -> bytes: ...
+
+    def acknowledge_artifacts(
+        self,
+        *,
+        run_id: str,
+        artifact_ids: Sequence[str],
+        manifest_digest: str,
+        message_event_id: str,
+        grant: str,
+    ) -> Mapping[str, Any]: ...
+
     def history(
         self,
         *,
@@ -170,6 +188,12 @@ class FailoverHostedRoomPeerClient:
 
     def stage_attachments(self, **kwargs):
         return self._call("stage_attachments", **kwargs)
+
+    def read_artifact(self, **kwargs):
+        return self._call("read_artifact", **kwargs)
+
+    def acknowledge_artifacts(self, **kwargs):
+        return self._call("acknowledge_artifacts", **kwargs)
 
     def history(self, **kwargs):
         return self._call("history", **kwargs)

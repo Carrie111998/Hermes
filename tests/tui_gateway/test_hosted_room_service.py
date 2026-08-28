@@ -17,6 +17,11 @@ from gateway.hosted_room_peer import (
     catalog_mapping,
     issue_room_grant,
 )
+from gateway.hosted_room_artifacts import (
+    RoomArtifactOutbox,
+    RoomArtifactScope,
+    terminal_artifact_manifest,
+)
 from tui_gateway.hosted_room_service import HostedRoomService
 from tui_gateway.hosted_room_peer_transport import PeerMemberRoute
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPError
@@ -123,6 +128,42 @@ class _FakeRPC:
         return {"resolved": 1}
 
 
+class _ArtifactRPC(_FakeRPC):
+    def __init__(self, db_path: Path) -> None:
+        super().__init__()
+        self.db_path = db_path
+        self.scope = None
+        self.output = db_path.parent / "handoff.md"
+        self.output.write_text("# Review handoff\n", encoding="utf-8")
+
+    def bind_artifact_scope(self, **kwargs):
+        installation = hosted_rooms.local_authority_gateway_id()
+        self.scope = RoomArtifactScope.from_mapping({
+            "room_id": kwargs["task"].room_id,
+            "task_id": kwargs["task"].task_id,
+            "execution_generation": kwargs["execution_generation"],
+            "member_id": kwargs["member_id"],
+            "target_profile": kwargs["profile"],
+            "home_install_id": installation,
+            "target_install_id": installation,
+            "authority_gateway_id": kwargs["authority_gateway_id"],
+            "authority_epoch": kwargs["authority_epoch"],
+        })
+
+    def submit(self, **kwargs):
+        assert self.scope is not None
+        RoomArtifactOutbox(self.db_path).put_path(
+            scope=self.scope,
+            path=self.output,
+        )
+        kwargs["on_terminal"]({
+            "status": "settled",
+            "text": "Please review the attached handoff.",
+            "artifacts": terminal_artifact_manifest(self.db_path, self.scope),
+        })
+        return {"accepted": True}
+
+
 class _FakePeerClient:
     def __init__(self) -> None:
         self.dispatches = []
@@ -175,6 +216,66 @@ class _FakePeerClient:
 class _UnavailablePeerClient(_FakePeerClient):
     def prepare(self, **kwargs):
         raise RuntimeError("peer is offline before admission")
+
+
+class _ArtifactPeerClient(_FakePeerClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.data = b"# Remote handoff\n"
+        self.item = {
+            "artifact_id": "rart_66666666666666666666666666666666",
+            "kind": "file",
+            "name": "remote.md",
+            "size": len(self.data),
+            "mime": "text/markdown",
+            "sha256": __import__("hashlib").sha256(self.data).hexdigest(),
+        }
+        import json
+
+        self.manifest = {
+            "version": 1,
+            "manifest_digest": __import__("hashlib").sha256(
+                json.dumps([self.item], sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "items": [self.item],
+        }
+        self.acks = []
+
+    def history(self, **kwargs):
+        if not self.dispatches:
+            return []
+        dispatch = self.dispatches[-1]
+        return [{
+            "role": "assistant",
+            "task_id": dispatch["task_id"],
+            "execution_generation": dispatch["execution_generation"],
+            "status": "settled",
+            "message_id": f"peer:{dispatch['task_id']}",
+            "content": "Remote draft attached.",
+            "artifacts": self.manifest,
+            "run_id": "run-remote-1",
+        }]
+
+    def read_artifact(self, **kwargs):
+        assert kwargs["run_id"] == "run-remote-1"
+        assert kwargs["artifact_id"] == self.item["artifact_id"]
+        return self.data
+
+    def acknowledge_artifacts(self, **kwargs):
+        self.acks.append(dict(kwargs))
+        return {"acknowledged": True}
+
+
+class _LostAckArtifactPeerClient(_ArtifactPeerClient):
+    def acknowledge_artifacts(self, **kwargs):
+        self.acks.append(dict(kwargs))
+        if len(self.acks) == 1:
+            raise PeerRunsHTTPError(
+                "acknowledgement response was lost",
+                retryable=True,
+                ambiguous=True,
+            )
+        return {"acknowledged": True, "changed": 0}
 
 
 class _UnavailableAttachmentPeerClient(_FakePeerClient):
@@ -437,6 +538,55 @@ def test_attachment_send_freezes_roster_stages_bytes_and_logs_metadata_only(
         raise AssertionError("late member unexpectedly received historic attachment")
 
 
+def test_bot_file_is_imported_before_member_message_and_reaches_next_bot(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _ArtifactRPC(db)
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Handoff room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-handoff-1",
+        payload={"text": "Prepare the handoff", "thread_id": "thread-1"},
+    )
+    _wait_for(
+        lambda: any(
+            event["kind"] == "message.member"
+            and event["payload"].get("attachments")
+            for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+    message = next(
+        event
+        for event in service._events("room-1")
+        if event["kind"] == "message.member" and event["payload"].get("attachments")
+    )
+    attachment = message["payload"]["attachments"][0]
+    assert attachment["name"] == "handoff.md"
+    stored = service.read_attachment(
+        room_id="room-1",
+        attachment_id=attachment["attachment_id"],
+        recipient_member_id="ops",
+    )
+    assert stored.data == b"# Review handoff\n"
+    assert RoomArtifactOutbox(db).list(rpc.scope) == []
+
+
 def test_partial_attachment_failure_never_submits_text_only_and_other_member_continues(
     tmp_path: Path,
 ):
@@ -623,6 +773,150 @@ def test_headless_room_publishes_peer_member_reply_without_desktop_transport(
     assert reply["payload"]["member_id"] == "member-reviewer"
     assert reply["payload"]["text"] == "Remote review complete."
     assert reply["actor"]["connection_id"] == "peer-review"
+
+
+def test_peer_bot_file_is_canonicalized_before_next_local_bot_receives_it(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    peer = _ArtifactPeerClient()
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-reviewer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest="a" * 64,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed-room-grant",
+        attachments=True,
+    )
+    service = HostedRoomService(
+        _server(),
+        db_path=db,
+        peer_routes={("room-1", "member-reviewer"): route},
+        peer_clients={"install-peer": peer},
+    )
+    rpc = _FakeRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("ops",)
+    service.create_room(
+        room_id="room-1",
+        name="Cross-gateway handoff",
+        members=[
+            {
+                "member_id": "member-reviewer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": "a" * 64,
+                },
+            },
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-cross-file",
+        payload={"text": "Prepare and review a handoff", "thread_id": "thread-1"},
+    )
+    _wait_for(lambda: bool(peer.acks))
+    _wait_for(
+        lambda: any(
+            method == "stage_attachment" and params["profile"] == "ops"
+            for method, params in rpc.calls
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+    reply = next(
+        event
+        for event in service._events("room-1")
+        if event["kind"] == "message.member"
+        and event["payload"]["member_id"] == "member-reviewer"
+    )
+    attachment = reply["payload"]["attachments"][0]
+    assert attachment["name"] == "remote.md"
+    assert peer.acks[0]["message_event_id"] == reply["event_id"]
+    staged = next(
+        params
+        for method, params in rpc.calls
+        if method == "stage_attachment" and params["profile"] == "ops"
+    )
+    assert staged["data"] == peer.data
+
+
+def test_lost_peer_artifact_ack_retries_without_duplicate_member_message(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    peer = _LostAckArtifactPeerClient()
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-reviewer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest="a" * 64,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed-room-grant",
+        attachments=True,
+    )
+    service = HostedRoomService(
+        _server(),
+        db_path=db,
+        peer_routes={("room-1", "member-reviewer"): route},
+        peer_clients={"install-peer": peer},
+    )
+    rpc = _FakeRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("ops",)
+    service.create_room(
+        room_id="room-1",
+        name="Lost ACK room",
+        members=[
+            {
+                "member_id": "member-reviewer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": "a" * 64,
+                },
+            },
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-lost-ack",
+        payload={"text": "Share the result", "thread_id": "thread-1"},
+    )
+    _wait_for(lambda: len(peer.acks) >= 2)
+    assert service.stop(timeout=1.0)
+    events = service._events("room-1")
+    assert sum(
+        event["kind"] == "message.member"
+        and event["payload"].get("member_id") == "member-reviewer"
+        for event in events
+    ) == 1
+    assert sum(
+        event["kind"] == "turn.settled"
+        and event["payload"].get("member_id") == "member-reviewer"
+        for event in events
+    ) == 1
     assert peer.dispatches[0]["target_profile"] == "reviewer"
 
 

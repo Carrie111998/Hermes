@@ -781,6 +781,7 @@ def _(rid, params: dict) -> dict:
         )
         if service is not None:
             service.attachments.mark_room_disbanded(tombstone["room_id"])
+            service.discard_output_artifacts(tombstone["room_id"])
         else:
             from gateway.hosted_room_attachments import HostedRoomAttachmentStore
 

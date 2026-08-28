@@ -3,6 +3,7 @@
 import asyncio
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 try:
@@ -359,6 +360,18 @@ async def _handle_room_member_grant_revoke(
         except Exception:
             # Authorization is already revoked. A failed cleanup cannot make
             # the grant live again; bounded spool expiry remains the backstop.
+            pass
+        try:
+            from gateway.hosted_room_artifacts import RoomArtifactOutbox
+            from hermes_constants import get_hermes_home
+
+            await asyncio.to_thread(
+                RoomArtifactOutbox(Path(get_hermes_home()) / "state.db").discard_claims,
+                claims,
+            )
+        except Exception:
+            # Revocation still closes access immediately. Keep cleanup
+            # best-effort so a local disk fault cannot resurrect the grant.
             pass
     except Exception:
         return web.json_response(

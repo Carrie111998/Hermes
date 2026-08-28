@@ -5464,10 +5464,10 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
-def _gui_surface_toolsets(platform: str) -> set[str]:
-    """Toolsets that exist because of the CLIENT on the other end, not the host.
+def _session_surface_toolsets(platform: str) -> set[str]:
+    """Toolsets that exist because of one session surface, not the host.
 
-    Both entries are deliberately off ``_HERMES_CORE_TOOLS`` — every other
+    These entries are deliberately off ``_HERMES_CORE_TOOLS`` — every other
     platform would carry their schema for nothing — so this resolver is the one
     gate that exposes them.
 
@@ -5482,7 +5482,13 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     surfaces = {"project"}
     if platform == "desktop":
         surfaces.add("desktop_ui")
+    if platform == "bot_room":
+        surfaces.add("bot_room")
     return surfaces
+
+
+# Backward-compatible private seam for focused tests and downstream embedders.
+_gui_surface_toolsets = _session_surface_toolsets
 
 
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
@@ -5511,7 +5517,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 # coding posture returns before the fallback path that normally
                 # adds them — without this the desktop loses its pane/project
                 # tools exactly when sitting in a repo (see below).
-                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+                return sorted({*selection, *_session_surface_toolsets(session_platform)})
         except Exception:
             pass
 
@@ -5628,7 +5634,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
         # folding them in here is the gate that exposes them on exactly the
         # surface that can answer them.
-        return sorted(enabled | _gui_surface_toolsets(session_platform))
+        return sorted(enabled | _session_surface_toolsets(session_platform))
     except Exception:
         if fallback_notice is not None:
             print(
@@ -12042,6 +12048,8 @@ def _run_prompt_submit(
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
+        room_artifact_token = None
+        room_artifact_scope = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
@@ -12077,6 +12085,28 @@ def _run_prompt_submit(
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(_profile_home_str)))
+            hosted_task = session.get("_hosted_room_task")
+            if isinstance(hosted_task, dict):
+                from gateway.hosted_room_artifacts import (
+                    RoomArtifactScope,
+                    bind_room_artifact_scope,
+                )
+
+                room_artifact_scope = RoomArtifactScope.from_mapping({
+                    key: hosted_task[key]
+                    for key in (
+                        "room_id",
+                        "task_id",
+                        "execution_generation",
+                        "member_id",
+                        "target_profile",
+                        "home_install_id",
+                        "target_install_id",
+                        "authority_gateway_id",
+                        "authority_epoch",
+                    )
+                })
+                room_artifact_token = bind_room_artifact_scope(room_artifact_scope)
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -12569,6 +12599,31 @@ def _run_prompt_submit(
                 if _error_surface:
                     payload["error_surface"] = _error_surface
             if terminal_callback is not None:
+                terminal_artifacts = None
+                if room_artifact_scope is not None:
+                    try:
+                        from gateway.hosted_room_artifacts import (
+                            RoomArtifactOutbox,
+                            terminal_artifact_manifest,
+                        )
+                        from hermes_constants import get_hermes_home
+
+                        artifact_db = Path(get_hermes_home()) / "state.db"
+                        if status == "complete":
+                            terminal_artifacts = terminal_artifact_manifest(
+                                artifact_db,
+                                room_artifact_scope,
+                            )
+                        else:
+                            RoomArtifactOutbox(artifact_db).discard(
+                                room_artifact_scope
+                            )
+                    except Exception:
+                        logger.warning(
+                            "hosted room artifact manifest failed for %s",
+                            room_artifact_scope.task_id,
+                            exc_info=True,
+                        )
                 terminal_receipt_attempted = True
                 terminal_callback(
                     {
@@ -12581,6 +12636,11 @@ def _run_prompt_submit(
                         **(
                             {"error": str(result.get("error") or raw)}
                             if status == "error" and isinstance(result, dict)
+                            else {}
+                        ),
+                        **(
+                            {"artifacts": terminal_artifacts}
+                            if terminal_artifacts is not None
                             else {}
                         ),
                     }
@@ -12841,6 +12901,10 @@ def _run_prompt_submit(
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
                 reset_secret_scope(secret_token)
+            if room_artifact_token is not None:
+                from gateway.hosted_room_artifacts import reset_room_artifact_scope
+
+                reset_room_artifact_scope(room_artifact_token)
             _clear_session_context(session_tokens)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)

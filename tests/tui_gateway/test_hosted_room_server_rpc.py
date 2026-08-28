@@ -69,6 +69,14 @@ def test_routes_exact_hidden_session_and_internal_task_proof():
 
     assert rpc.resolve_exact(profile="ops", title="Group: room", source="bot_room")["session_id"] == "tip"
     assert rpc.create(profile="ops", title="Group: room", source="bot_room")["session_id"] == "runtime"
+    rpc.bind_artifact_scope(
+        task=task,
+        execution_generation=2,
+        member_id="member-ops",
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+        profile="ops",
+    )
     rpc.submit(
         profile="ops",
         session_id="runtime",
@@ -89,7 +97,16 @@ def test_routes_exact_hidden_session_and_internal_task_proof():
         "thread_id": "thread",
         "turn_id": "turn",
         "execution_generation": 2,
+        "member_id": "member-ops",
+        "target_profile": "ops",
+        "home_install_id": submit["_hosted_task"]["home_install_id"],
+        "target_install_id": submit["_hosted_task"]["target_install_id"],
+        "authority_gateway_id": "gateway-a",
+        "authority_epoch": 1,
     }
+    assert submit["_hosted_task"]["home_install_id"] == submit["_hosted_task"][
+        "target_install_id"
+    ]
     assert submit["_hosted_terminal_callback"] is callback
 
 

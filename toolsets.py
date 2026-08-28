@@ -240,6 +240,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "bot_room": {
+        "description": "Hosted Group Chat turn capabilities (internal session surface)",
+        "tools": ["share_group_file"],
+        "includes": [],
+    },
+
     # Affordances that only exist because a GUI renderer is on the other end of
     # the connection: read/close the embedded terminal pane, open/read/close the
     # in-app browser, focus a pane, tapback a message.

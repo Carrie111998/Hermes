@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -252,7 +253,11 @@ def _run_idempotency_scope(
         claims = self._room_grant_claims(
             request,
             permission=(
-                "stop"
+                "artifact.ack"
+                if request.path.endswith("/artifacts/ack")
+                else "artifact.read"
+                if "/artifacts/" in request.path
+                else "stop"
                 if request.path.endswith("/stop")
                 else "approve"
                 if request.path.endswith("/approval")
@@ -388,6 +393,14 @@ async def _handle_runs(
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
+    room_dispatch = (
+        body.get("hosted_room_dispatch")
+        if isinstance(body, dict) and isinstance(body.get("hosted_room_dispatch"), dict)
+        else None
+    )
+    room_artifact_publication = bool(
+        isinstance(body, dict) and body.get("_room_artifact_publication") is True
+    )
 
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
     if idempotency_key and (
@@ -585,6 +598,24 @@ async def _handle_runs(
         created_at=created_at,
         session_id=session_id,
         model=body.get("model", self._model_name),
+        **(
+            {"room_artifact_scope": {
+                key: room_dispatch[key]
+                for key in (
+                    "room_id",
+                    "task_id",
+                    "execution_generation",
+                    "member_id",
+                    "target_profile",
+                    "home_install_id",
+                    "target_install_id",
+                    "authority_gateway_id",
+                    "authority_epoch",
+                )
+            }}
+            if room_dispatch is not None and room_artifact_publication
+            else {}
+        ),
     )
     if idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
@@ -663,6 +694,7 @@ async def _handle_runs(
                     requested_provider=agent_overrides.get("requested_provider"),
                     model_options=agent_overrides.get("model_options"),
                     route=route,
+                    room_dispatch=(room_dispatch if room_artifact_publication else None),
                 )
             self._active_run_agents[run_id] = agent
 
@@ -709,6 +741,8 @@ async def _handle_runs(
                 effective_task_id = session_id or run_id
                 approval_token = None
                 session_tokens = []
+                room_artifact_token = None
+                room_artifact_scope = None
                 with self._profile_scope(request_profile):
                     try:
                         # Bind approval/session identity for this API run via
@@ -733,7 +767,31 @@ async def _handle_runs(
                             browser_control_transport_family=(
                                 request_browser_control_transport_family
                             ),
+                            source="bot_room" if room_dispatch is not None else "",
                         )
+                        if room_dispatch is not None and room_artifact_publication:
+                            from gateway.hosted_room_artifacts import (
+                                RoomArtifactScope,
+                                bind_room_artifact_scope,
+                            )
+
+                            room_artifact_scope = RoomArtifactScope.from_mapping({
+                                key: room_dispatch[key]
+                                for key in (
+                                    "room_id",
+                                    "task_id",
+                                    "execution_generation",
+                                    "member_id",
+                                    "target_profile",
+                                    "home_install_id",
+                                    "target_install_id",
+                                    "authority_gateway_id",
+                                    "authority_epoch",
+                                )
+                            })
+                            room_artifact_token = bind_room_artifact_scope(
+                                room_artifact_scope
+                            )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         # /v1/runs runs its own agent lifecycle (no
                         # TurnRunner, no _run_agent) — record turn process
@@ -755,6 +813,33 @@ async def _handle_runs(
                                 room_persist_user_message
                             )
                         r = agent.run_conversation(**run_kwargs)
+                        if room_artifact_scope is not None:
+                            from gateway.hosted_room_artifacts import (
+                                RoomArtifactOutbox,
+                                terminal_artifact_manifest,
+                            )
+                            from hermes_constants import get_hermes_home
+
+                            artifact_db = Path(get_hermes_home()) / "state.db"
+                            failed = isinstance(r, dict) and (
+                                r.get("failed") or r.get("interrupted")
+                            )
+                            artifacts = (
+                                None
+                                if failed
+                                else terminal_artifact_manifest(
+                                    artifact_db,
+                                    room_artifact_scope,
+                                )
+                            )
+                            if failed:
+                                RoomArtifactOutbox(artifact_db).discard(
+                                    room_artifact_scope
+                                )
+                            if artifacts is not None:
+                                if not isinstance(r, dict):
+                                    r = {"final_response": str(r)}
+                                r["room_artifacts"] = artifacts
                     finally:
                         # Worker finished (interrupted or complete) —
                         # clear turn ownership immediately so a later
@@ -773,6 +858,15 @@ async def _handle_runs(
                             if session_tokens:
                                 try:
                                     clear_session_vars(session_tokens)
+                                except Exception:
+                                    pass
+                            if room_artifact_token is not None:
+                                try:
+                                    from gateway.hosted_room_artifacts import (
+                                        reset_room_artifact_scope,
+                                    )
+
+                                    reset_room_artifact_scope(room_artifact_token)
                                 except Exception:
                                     pass
                     u = {
@@ -817,6 +911,9 @@ async def _handle_runs(
                 )
             else:
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                room_artifacts = (
+                    result.get("room_artifacts") if isinstance(result, dict) else None
+                )
                 # Undelivered steer text (accepted after the final response;
                 # see turn_finalizer) rides on the terminal event/status so
                 # the client can replay it as the next user turn.
@@ -830,6 +927,8 @@ async def _handle_runs(
                 }
                 if pending_steer:
                     completed_event["pending_steer"] = pending_steer
+                if room_artifacts:
+                    completed_event["artifacts"] = room_artifacts
                 _put_event_if_active(completed_event)
                 self._set_run_status(
                     run_id,
@@ -837,6 +936,7 @@ async def _handle_runs(
                     output=final_response,
                     usage=usage,
                     last_event="run.completed",
+                    **({"artifacts": room_artifacts} if room_artifacts else {}),
                     **({"pending_steer": pending_steer} if pending_steer else {}),
                 )
         except asyncio.CancelledError:

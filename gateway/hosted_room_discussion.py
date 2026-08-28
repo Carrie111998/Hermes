@@ -95,6 +95,7 @@ _MEMBER_MESSAGE_FIELDS = frozenset({
     "thread_id",
     "turn_id",
 })
+_MEMBER_MESSAGE_OPTIONAL_FIELDS = frozenset({"attachments"})
 _TERMINAL_COMMON_FIELDS = frozenset({
     "discussion_event_id",
     "member_id",
@@ -788,9 +789,14 @@ def _validate_member_message(
         payload,
         label="message.member payload",
         required=_MEMBER_MESSAGE_FIELDS,
+        optional=_MEMBER_MESSAGE_OPTIONAL_FIELDS,
     )
     _validate_turn_coordinates(payload, room)
     text = payload.get("text")
+    _validate_attachments(
+        payload.get("attachments", []),
+        member_ids=tuple(member.member_id for member in room.members),
+    )
     if not isinstance(text, str) or not text.strip() or is_pass_text(text):
         raise DiscussionValidationError("message.member text must be a non-pass string")
     member = _member_by_id(room, payload.get("member_id"))
@@ -992,8 +998,6 @@ def _attachment_prompt_lines(
     entries: list[str] = []
     queued_media = False
     for event in messages:
-        if event.kind != "message.user":
-            continue
         for attachment in event.payload.get("attachments", []):
             name = json.dumps(attachment["name"], ensure_ascii=True)
             metadata = f"{attachment['mime']}, {attachment['size']} bytes"
@@ -1050,6 +1054,7 @@ def _build_prompt(
         "- Reply with one conversational message only when you have something new worth adding.",
         '- If you have nothing new to add, reply with exactly "(pass)".',
         "- Mention a teammate by handle to pull them into the next round; do not repeat points already made.",
+        "- To hand off a local file, call share_group_file; never paste a local path into chat.",
         "- Never reveal content from private conversations. Your reply is published verbatim.",
     ]
     prompt = "\n".join(lines)
@@ -1174,11 +1179,7 @@ def _bounded_task_delta(
     for event in messages:
         if not watermark < event.seq <= maximum_seq:
             continue
-        event_attachments = (
-            list(event.payload.get("attachments", []))
-            if event.kind == "message.user"
-            else []
-        )
+        event_attachments = list(event.payload.get("attachments", []))
         next_count = len(attachments) + len(event_attachments)
         next_bytes = attachment_bytes + sum(
             int(attachment["size"]) for attachment in event_attachments
@@ -1296,8 +1297,7 @@ def plan_next_task(
             watermark = watermarks.get((thread_id, member.member_id), 0)
             terminal = terminals.get((round_index, member.member_id))
             pending_attachments = any(
-                event.kind == "message.user"
-                and watermark < event.seq <= maximum_seen_seq
+                watermark < event.seq <= maximum_seen_seq
                 and event.payload.get("attachments")
                 for event in thread_messages
             )
@@ -1467,7 +1467,7 @@ def reconstruct_task_plan(
     attachments = [
         dict(attachment)
         for event in task_messages
-        if watermark < event.seq <= seen_through_seq and event.kind == "message.user"
+        if watermark < event.seq <= seen_through_seq
         for attachment in event.payload.get("attachments", [])
     ]
     reconstructed = _make_task_plan(
@@ -1551,7 +1551,18 @@ def plan_publication(
 
     if effective_status == "settled":
         text = _terminal_text(result, field="text", fallback="")
-        passed = is_pass_text(text)
+        attachments = (
+            _validate_attachments(
+                result.get("attachments", []),
+                member_ids=tuple(member.member_id for member in room.members),
+            )
+            if isinstance(result, Mapping)
+            else []
+        )
+        if attachments and (not text or is_pass_text(text)):
+            names = ", ".join(attachment["name"] for attachment in attachments)
+            text = f"Shared {names}."
+        passed = is_pass_text(text) and not attachments
         if not passed:
             member_actor = {
                 "kind": "member",
@@ -1576,6 +1587,7 @@ def plan_publication(
                         "text": text,
                         "thread_id": task.identity.thread_id,
                         "turn_id": task.identity.turn_id,
+                        **({"attachments": attachments} if attachments else {}),
                     },
                     authority_gateway_id=room.gateway_id,
                     authority_epoch=room.authority_epoch,

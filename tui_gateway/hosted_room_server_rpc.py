@@ -18,6 +18,7 @@ from types import ModuleType
 from typing import Any, Callable
 
 from gateway import hosted_room_driver as state
+from gateway import hosted_rooms
 
 
 class HostedRoomSessionError(RuntimeError):
@@ -38,6 +39,32 @@ class HostedRoomServerRPC:
         self._attachment_lock = threading.Lock()
         self._staged_attachments: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._attachment_attempts: dict[tuple[str, int], tuple[str, ...]] = {}
+        self._artifact_scopes: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def bind_artifact_scope(
+        self,
+        *,
+        task: state.TaskIdentity,
+        execution_generation: int,
+        member_id: str,
+        authority_gateway_id: str,
+        authority_epoch: int,
+        profile: str,
+    ) -> None:
+        """Bind internal publication coordinates before one local submit."""
+
+        installation_id = hosted_rooms.local_authority_gateway_id()
+        self._artifact_scopes[(task.task_id, execution_generation)] = {
+            "room_id": task.room_id,
+            "task_id": task.task_id,
+            "execution_generation": execution_generation,
+            "member_id": member_id,
+            "target_profile": profile,
+            "home_install_id": installation_id,
+            "target_install_id": installation_id,
+            "authority_gateway_id": authority_gateway_id,
+            "authority_epoch": authority_epoch,
+        }
 
     def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         handler = self.server._methods[method]
@@ -107,23 +134,26 @@ class HostedRoomServerRPC:
         execution_generation: int,
         on_terminal: Callable[[Mapping[str, Any]], None],
     ) -> Mapping[str, Any]:
-        return self._call(
-            "prompt.submit",
-            {
+        artifact_scope = self._artifact_scopes.pop(
+            (task.task_id, execution_generation),
+            None,
+        )
+        if artifact_scope is None:
+            raise HostedRoomSessionError(
+                "prompt.submit", 4120, "hosted room artifact scope is missing"
+            )
+        return self._call("prompt.submit", {
                 "profile": profile,
                 "session_id": session_id,
                 "text": prompt,
                 "source": source,
                 "_hosted_task": {
-                    "room_id": task.room_id,
-                    "task_id": task.task_id,
+                    **artifact_scope,
                     "thread_id": task.thread_id,
                     "turn_id": task.turn_id,
-                    "execution_generation": execution_generation,
                 },
                 "_hosted_terminal_callback": on_terminal,
-            },
-        )
+            })
 
     def stage_attachment(
         self,

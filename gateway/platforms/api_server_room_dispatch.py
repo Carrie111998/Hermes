@@ -99,11 +99,14 @@ async def _normalize_room_dispatch(
         dispatch = HostedMemberDispatch.from_mapping(
             body.get("hosted_room_dispatch")
         )
-        verify_room_grant(
+        grant_claims = verify_room_grant(
             self._room_grant_secret(),
             room_token,
             dispatch,
             permission="dispatch",
+        )
+        artifact_publication = {"artifact.ack", "artifact.read"} <= set(
+            grant_claims.get("permissions") or ()
         )
         active_profile = _api_request_profile.get() or "default"
         local_install = hosted_rooms.local_authority_gateway_id()
@@ -142,6 +145,7 @@ async def _normalize_room_dispatch(
             "input": dispatch.prompt,
             "session_id": session_id,
             "hosted_room_dispatch": dispatch.as_mapping(),
+            "_room_artifact_publication": artifact_publication,
         }, None
     except Exception as exc:
         return body, web.json_response(

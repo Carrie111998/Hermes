@@ -349,11 +349,23 @@ def _(rid, params: dict) -> dict:
             "thread_id",
             "turn_id",
             "execution_generation",
+            "member_id",
+            "target_profile",
+            "home_install_id",
+            "target_install_id",
+            "authority_gateway_id",
+            "authority_epoch",
         }
         if set(hosted_task) != required_hosted_fields or not all(
             isinstance(hosted_task.get(field), str) and hosted_task[field]
-            for field in required_hosted_fields - {"execution_generation"}
-        ) or not isinstance(hosted_task.get("execution_generation"), int):
+            for field in required_hosted_fields
+            - {"execution_generation", "authority_epoch"}
+        ) or any(
+            isinstance(hosted_task.get(field), bool)
+            or not isinstance(hosted_task.get(field), int)
+            or hosted_task[field] < 1
+            for field in ("execution_generation", "authority_epoch")
+        ):
             return _err(rid, 4120, "invalid hosted room turn proof")
     else:
         # Older Desktop builds know the `Group: <room-id>` session title but

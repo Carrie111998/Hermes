@@ -21,6 +21,11 @@ from gateway.hosted_room_attachments import (
     AttachmentData,
     HostedRoomAttachmentStore,
 )
+from gateway.hosted_room_artifacts import (
+    RoomArtifactOutbox,
+    RoomArtifactScope,
+    validate_terminal_artifact_manifest,
+)
 from gateway.hosted_room_peer import (
     GatewayRoomCatalog,
     HostedMemberDispatch,
@@ -599,19 +604,178 @@ class HostedRoomService:
                     task,
                     local_profiles=local_profiles,
                 )
+                result, acknowledge_artifacts = self._import_terminal_artifacts(
+                    room=room,
+                    task=task,
+                    plan=plan,
+                    events=events,
+                )
                 publication = discussion.plan_publication(
                     room,
                     events,
                     plan,
                     status=status,
-                    result=task.get("result"),
+                    result=result,
                     local_profiles=local_profiles,
                 )
                 before = len(events)
                 self._append_plan(str(room["room_id"]), publication)
+                if isinstance(result, Mapping) and result.get("attachments"):
+                    digest = plan.identity.task_id.removeprefix("dtask:")
+                    self.attachments.retain_event(
+                        room_id=str(room["room_id"]),
+                        event_id=f"dmessage:{digest}",
+                    )
+                    acknowledge_artifacts()
                 events = self._events(str(room["room_id"]))
                 changed = changed or len(events) > before
         return changed
+
+    def _import_terminal_artifacts(
+        self,
+        *,
+        room: Mapping[str, Any],
+        task: Mapping[str, Any],
+        plan: discussion.DiscussionTaskPlan,
+        events: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | Any, Any]:
+        result = task.get("result")
+        if not isinstance(result, Mapping) or not result.get("artifacts"):
+            return result, lambda: None
+        items = validate_terminal_artifact_manifest(result["artifacts"])
+        if not items:
+            return result, lambda: None
+        target = plan.member.target or {"kind": "local", "profile": plan.member.profile}
+        local_install = hosted_rooms.local_authority_gateway_id()
+        peer_route = None
+        peer_client = None
+        if target.get("kind") == "peer":
+            key = (str(room["room_id"]), plan.member.member_id)
+            peer_route = self.peer_routes.get(key)
+            peer_client = self.peer_clients.get(key)
+            if peer_route is None or peer_client is None:
+                raise RuntimeError("peer room output artifact route is unavailable")
+            target_install = peer_route.target_install_id
+            home_install = peer_route.home_install_id
+        elif target.get("kind") == "local":
+            target_install = local_install
+            home_install = local_install
+        else:
+            raise RuntimeError("room output artifact target is invalid")
+        scope = RoomArtifactScope.from_mapping({
+            "room_id": room["room_id"],
+            "task_id": plan.identity.task_id,
+            "execution_generation": int(task["execution_generation"]),
+            "member_id": plan.member.member_id,
+            "target_profile": plan.member.profile,
+            "home_install_id": home_install,
+            "target_install_id": target_install,
+            "authority_gateway_id": room["authority_gateway_id"],
+            "authority_epoch": int(room["authority_epoch"]),
+        })
+        outbox = None
+        if target.get("kind") == "local":
+            profile_root = (
+                self.root
+                if plan.member.profile == "default"
+                else self.root / "profiles" / plan.member.profile
+            )
+            outbox = RoomArtifactOutbox(profile_root / "state.db")
+        artifact_ids = tuple(item["artifact_id"] for item in items)
+        message_event_id = f"dmessage:{plan.identity.task_id.removeprefix('dtask:')}"
+        existing_message = next(
+            (
+                event
+                for event in events
+                if event.get("event_id") == message_event_id
+                and event.get("kind") == "message.member"
+            ),
+            None,
+        )
+        if existing_message is not None:
+            existing_attachments = existing_message.get("payload", {}).get("attachments")
+            if not isinstance(existing_attachments, list) or not existing_attachments:
+                raise RuntimeError("room output artifact publication changed after commit")
+            normalized = dict(result)
+            normalized["attachments"] = existing_attachments
+            if outbox is not None:
+                return normalized, lambda: outbox.acknowledge(scope, artifact_ids)
+            run_id = str(result.get("run_id") or "")
+            return normalized, lambda: peer_client.acknowledge_artifacts(
+                run_id=run_id,
+                artifact_ids=artifact_ids,
+                manifest_digest=result["artifacts"]["manifest_digest"],
+                message_event_id=message_event_id,
+                grant=peer_route.grant,
+            )
+
+        canonical: list[dict[str, Any]] = []
+        for item in items:
+            if outbox is not None:
+                metadata, data = outbox.read(scope, item["artifact_id"])
+                if metadata != item:
+                    raise RuntimeError(
+                        "room output artifact metadata changed before import"
+                    )
+            else:
+                run_id = str(result.get("run_id") or "")
+                if not run_id:
+                    raise RuntimeError("peer room output artifact run is missing")
+                data = peer_client.read_artifact(
+                    run_id=run_id,
+                    artifact_id=item["artifact_id"],
+                    grant=peer_route.grant,
+                )
+                if (
+                    len(data) != item["size"]
+                    or hashlib.sha256(data).hexdigest() != item["sha256"]
+                ):
+                    raise RuntimeError("peer room output artifact failed verification")
+            upload_digest = hashlib.sha256(
+                (
+                    f"{plan.identity.task_id}\0{task['execution_generation']}\0"
+                    f"{item['artifact_id']}"
+                ).encode()
+            ).hexdigest()[:32]
+            stored = self.attachments.put(
+                room_id=str(room["room_id"]),
+                upload_id=f"bot-output:{upload_digest}",
+                kind=item["kind"],
+                name=item["name"],
+                mime=item["mime"],
+                data=data,
+            )
+            if stored["sha256"] != item["sha256"]:
+                raise RuntimeError("room output artifact digest changed during import")
+            canonical.append({
+                key: stored[key]
+                for key in ("attachment_id", "kind", "name", "size", "mime")
+            })
+
+        digest = plan.identity.task_id.removeprefix("dtask:")
+        event_id = f"dmessage:{digest}"
+        recipient_ids = tuple(member.member_id for member in discussion.validate_room(
+            room,
+            local_profiles=self.local_profiles(),
+        ).members)
+        normalized = dict(result)
+        normalized["attachments"] = self.attachments.commit_message(
+            room_id=str(room["room_id"]),
+            event_id=event_id,
+            manifest=canonical,
+            recipient_member_ids=(*recipient_ids, "viewer"),
+            hold_until_event=True,
+        )
+        if outbox is not None:
+            return normalized, lambda: outbox.acknowledge(scope, artifact_ids)
+        run_id = str(result.get("run_id") or "")
+        return normalized, lambda: peer_client.acknowledge_artifacts(
+            run_id=run_id,
+            artifact_ids=artifact_ids,
+            manifest_digest=result["artifacts"]["manifest_digest"],
+            message_event_id=message_event_id,
+            grant=peer_route.grant,
+        )
 
     def _append_room_status(
         self,
@@ -684,6 +848,15 @@ class HostedRoomService:
     ) -> None:
         self.prepare_room(binding)
         self.runtime.wakeup()
+
+    def discard_output_artifacts(self, room_id: str) -> int:
+        """Purge local-profile output outboxes after a room is disbanded."""
+
+        changed = 0
+        for profile in self.local_profiles():
+            profile_root = self.root if profile == "default" else self.root / "profiles" / profile
+            changed += RoomArtifactOutbox(profile_root / "state.db").discard_room(room_id)
+        return changed
 
     def create_room(self, *, room_id: str, name: str, members: Any) -> dict[str, Any]:
         normalized = discussion.validate_roster(

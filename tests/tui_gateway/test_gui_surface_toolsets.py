@@ -81,6 +81,12 @@ class TestSurfaceResolution:
         for platform in ("desktop", "tui"):
             assert "project" in server._gui_surface_toolsets(platform)
 
+    def test_group_file_tool_exists_only_on_bot_room_sessions(self, no_desktop_env):
+        assert "bot_room" in server._session_surface_toolsets("bot_room")
+        assert "bot_room" not in server._session_surface_toolsets("desktop")
+        assert "bot_room" not in server._session_surface_toolsets("tui")
+        assert resolve_toolset("bot_room") == ["share_group_file"]
+
 
 class TestResolverPlumbing:
     def test_posture_path_folds_in_the_session_surface(self, no_desktop_env):

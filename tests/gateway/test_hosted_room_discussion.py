@@ -862,6 +862,71 @@ def test_attachment_task_reconstructs_after_its_terminal_publication(
     assert second.payload["attachments"] == _attachment_manifest()
 
 
+def test_member_file_publication_reaches_the_next_bot(room_db: tuple[Path, dict]):
+    db, room = room_db
+    _append_user(db, event_id="user-file-handoff", text="Prepare and share the notes.")
+    first = _next_task(room, db)
+    handoff = [_attachment(
+        "file",
+        "handoff.md",
+        "text/markdown",
+        size=42,
+        attachment_id="att_44444444444444444444444444444444",
+    )]
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="settled",
+        result={"text": "Draft attached for review.", "attachments": handoff},
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    message = next(event for event in publication.events if event.kind == "message.member")
+    assert message.payload["attachments"] == handoff
+    _append_publication(db, publication)
+
+    second = _next_task(room, db)
+    assert second.member.member_id != first.member.member_id
+    assert second.payload["attachments"] == handoff
+    assert 'Staged file "handoff.md"' in second.payload["prompt"]
+    driver.admit_task(db, second.identity, payload=second.payload, clock=time.time)
+    assert discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        driver.get_task(db, second.identity),
+        local_profiles=LOCAL_PROFILES,
+    ) == second
+
+
+def test_attachment_only_member_result_gets_readable_copy(room_db: tuple[Path, dict]):
+    db, room = room_db
+    _append_user(db, event_id="user-file-only", text="Share the finished file.")
+    task = _next_task(room, db)
+    handoff = [_attachment(
+        "file",
+        "result.md",
+        "text/markdown",
+        size=17,
+        attachment_id="att_55555555555555555555555555555555",
+    )]
+
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        task,
+        status="settled",
+        result={"text": "(pass)", "attachments": handoff},
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    message = next(event for event in publication.events if event.kind == "message.member")
+    assert message.payload["text"] == "Shared result.md."
+    assert message.payload["attachments"] == handoff
+    terminal = next(event for event in publication.events if event.kind == "turn.settled")
+    assert terminal.payload["passed"] is False
+
+
 def test_attachment_manifest_requires_frozen_member_ids():
     with pytest.raises(discussion.DiscussionValidationError, match="frozen room member"):
         discussion.validate_user_payload(

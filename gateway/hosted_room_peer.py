@@ -691,6 +691,8 @@ def issue_room_grant(
     permissions: Iterable[str] = (
         "approve",
         "attachment.stage",
+        "artifact.ack",
+        "artifact.read",
         "dispatch",
         "status",
         "stop",
@@ -722,6 +724,8 @@ def issue_room_grant(
     if not allowed or not set(allowed) <= {
         "approve",
         "attachment.stage",
+        "artifact.ack",
+        "artifact.read",
         "dispatch",
         "status",
         "stop",
@@ -830,7 +834,7 @@ def decode_room_grant(
         raise HostedRoomGrantError("room grant lifetime is invalid")
     operation_expires_at = (
         status_expires_at
-        if permission in {"approve", "status", "stop"}
+        if permission in {"approve", "artifact.ack", "artifact.read", "status", "stop"}
         else expires_at
     )
     if checked_now < issued_at - 30 or checked_now >= operation_expires_at:
