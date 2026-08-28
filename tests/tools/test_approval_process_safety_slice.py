@@ -125,6 +125,7 @@ def test_identity_verified_tree_reports_survivors(monkeypatch):
             return [Child()]
 
     monkeypatch.setattr(ProcessRegistry, "_host_pid_is_ours", classmethod(lambda cls, pid, start: True))
+    monkeypatch.setattr(ProcessRegistry, "_is_host_pid_alive", classmethod(lambda cls, pid: True))
     monkeypatch.setattr(
         ProcessRegistry,
         "_safe_host_start_time",
@@ -139,3 +140,32 @@ def test_identity_verified_tree_reports_survivors(monkeypatch):
     assert evidence.targeted_pids == (111, 222)
     assert evidence.survivors == (111, 222)
     assert evidence.status == "partial"
+
+
+def test_execute_code_interactive_cli_keeps_historical_path(monkeypatch):
+    _headless_approval(monkeypatch)
+    monkeypatch.setattr(approval, '_is_interactive_cli', lambda: True)
+    monkeypatch.setattr(approval, '_resolve_cli_approval_callback', lambda: (lambda *args, **kwargs: 'once'))
+    result = approval.check_execute_code_guard("print('benign')", 'local')
+    assert result['approved'] is True
+
+
+def test_single_query_approve_allows_dangerous_command(monkeypatch):
+    _headless_approval(monkeypatch)
+    monkeypatch.setattr(approval, '_is_single_query_approval_context', lambda: True)
+    monkeypatch.setattr(approval, '_get_single_query_approval_mode', lambda: 'approve')
+    command = ''.join(chr(x) for x in (114, 109, 32, 45, 114, 102, 32, 47)) + 'tmp/approval-slice-test'
+    result = approval.check_all_command_guards(command, 'local', operation_id='op-single-query')
+    assert result['approved'] is True
+
+
+def test_dead_pid_is_already_exited_but_recycled_pid_is_mismatch(monkeypatch):
+    called = []
+    monkeypatch.setattr(ProcessRegistry, '_is_host_pid_alive', classmethod(lambda cls, pid: pid == 222))
+    monkeypatch.setattr(ProcessRegistry, '_safe_host_start_time', staticmethod(lambda pid: 99))
+    monkeypatch.setattr(ProcessRegistry, '_terminate_host_pid_legacy', classmethod(lambda cls, pid, expected_start=None: called.append(pid)))
+    dead = ProcessRegistry._terminate_host_pid(111, 11)
+    recycled = ProcessRegistry._terminate_host_pid(222, 11)
+    assert dead.status == 'already_exited'
+    assert recycled.status == 'identity_mismatch'
+    assert called == []

@@ -921,24 +921,17 @@ class ProcessRegistry:
         primitive; this wrapper supplies the missing safety boundary and
         read-back evidence without introducing another process supervisor.
         """
+        if not cls._is_host_pid_alive(pid):
+            return TerminationEvidence(status="already_exited", pid=pid, identity_verified=False, reason="PID is no longer running")
         if expected_start is None:
-            # Keep the low-level helper backward-compatible for callers that
-            # already hold an owned process handle. Session cleanup still
-            # reports this as unverified evidence, so callers can distinguish
-            # it from an identity-checked termination.
             cls._terminate_host_pid_legacy(pid, None)
-            return TerminationEvidence(
-                status="legacy_unverified", pid=pid, identity_verified=False,
-                targeted_pids=(pid,),
-                reason="no host process start-time baseline was supplied",
-            )
-        if not cls._host_pid_is_ours(pid, expected_start):
+            return TerminationEvidence(status="legacy_unverified", pid=pid, identity_verified=False, targeted_pids=(pid,), reason="no host process start-time baseline was supplied")
+        live_start = cls._safe_host_start_time(pid)
+        if live_start is None:
+            return TerminationEvidence(status="identity_unavailable", pid=pid, identity_verified=False, reason="PID is live but its start time could not be read")
+        if live_start != expected_start:
             logger.warning("Refusing to terminate host pid %d: identity mismatch", pid)
-            return TerminationEvidence(
-                status="identity_mismatch", pid=pid, identity_verified=False,
-                reason="PID is gone or its start time changed",
-            )
-
+            return TerminationEvidence(status="identity_mismatch", pid=pid, identity_verified=False, reason="PID is live but its start time changed")
         # Snapshot descendant identities before invoking the existing tree
         # terminator. A recycled descendant PID is evidence of a different
         # process and is never included as a survivor of our tree.
@@ -2458,37 +2451,7 @@ class ProcessRegistry:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
             elif session.detached and session.pid_scope == "host" and session.pid:
-                # Identity check, not bare liveness: if the PID is gone OR was
-                # recycled onto an unrelated process, treat our process as
-                # exited and never tree-kill the stranger.  If this recovered
-                # session also carries an owned systemd scope, stop that scope
-                # before returning: a daemonized descendant may still be alive
-                # there even though the wrapper PID exited or was recycled
-                # across the gateway restart (#70716, teknium1 review).
-                if not self._host_pid_is_ours(session.pid, session.host_start_time):
-                    termination_evidence = TerminationEvidence(
-                        status="identity_mismatch", pid=session.pid,
-                        identity_verified=False,
-                        reason="PID is gone or its start time changed",
-                    )
-                    if session.systemd_unit:
-                        _stop_systemd_unit(session.systemd_unit)
-                    with session._lock:
-                        session.exited = True
-                        session.exit_code = None
-                        output = strip_ansi(session.output_buffer[-2000:])
-                    if consume_output:
-                        self._completion_consumed.add(session_id)
-                    self._move_to_finished(session)
-                    return {
-                        "status": "already_exited",
-                        "exit_code": session.exit_code,
-                        "output": output,
-                        "termination_evidence": termination_evidence.as_dict(),
-                    }
-                termination_evidence = self._terminate_host_pid(
-                    session.pid, session.host_start_time
-                )
+                termination_evidence = self._terminate_host_pid(session.pid, session.host_start_time)
             else:
                 return {
                     "status": "error",
@@ -2509,6 +2472,17 @@ class ProcessRegistry:
                     "error": "Refused to terminate process without matching identity evidence",
                     "termination_evidence": termination_evidence.as_dict(),
                 }
+
+            if termination_evidence is not None and termination_evidence.status == "already_exited":
+                with session._lock:
+                    output = strip_ansi(session.output_buffer[-2000:])
+                    if consume_output:
+                        self._completion_consumed.add(session_id)
+                    session.exited = True
+                    session.exit_code = None
+                    session.completion_reason = "already_exited"
+                self._move_to_finished(session)
+                return {"status": "already_exited", "session_id": session.id, "completion_reason": session.completion_reason, "output": output, "termination_evidence": termination_evidence.as_dict()}
 
             # If the worker was spawned in its own systemd scope (#70716),
             # stop the entire unit to reap any double-forked descendants that

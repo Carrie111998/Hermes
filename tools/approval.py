@@ -4951,7 +4951,8 @@ def check_all_command_guards(command: str, env_type: str,
                             "user_consent": False,
                         }
                     # else: tirith_fail_open is True — allow as before
-            # single_query_mode: approve — fall through to auto-approve below.
+            if _get_single_query_approval_mode() == "approve":
+                return {"approved": True, "message": None}
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -5595,7 +5596,7 @@ def check_execute_code_guard(code: str, env_type: str,
     # There is no safe implicit approval for arbitrary Python.  A background
     # invocation must name an explicit trusted policy (cron/single-query
     # approve above) or have a live approval surface.
-    if not is_gateway and not is_ask:
+    if not is_cli and not is_gateway and not is_ask:
         return {
             "approved": False,
             "message": (
