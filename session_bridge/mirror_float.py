@@ -685,9 +685,11 @@ class IdleChipArchiveWorker:
                     data = json.loads(Path(entry.path).read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     skipped += 1
+                    scan_complete = False
                     continue
                 if not isinstance(data, dict):
                     skipped += 1
+                    scan_complete = False
                     continue
                 examined += 1
                 path = Path(entry.path)

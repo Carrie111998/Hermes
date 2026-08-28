@@ -392,13 +392,15 @@ def test_lookback_bounds_the_scan(tmp_path) -> None:
     assert result == {"examined": 0, "archived": 0, "skipped": 0, "throttled": 0}
 
 
-def test_unreadable_record_counts_skipped(tmp_path) -> None:
+def test_unreadable_record_fail_closes_all_archival(tmp_path) -> None:
+    path = _write_record(tmp_path / "a", "chip1")
     _write_record(tmp_path / "a", "bad1", raw="{not json")
 
     result = _worker(tmp_path / "a").run_once()
 
     assert result["skipped"] == 1
     assert result["archived"] == 0
+    assert _load(path)["isArchived"] is False
 
 
 def test_unreadable_root_fail_closes_all_archival(
