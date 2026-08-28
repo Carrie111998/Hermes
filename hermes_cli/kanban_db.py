@@ -10586,6 +10586,7 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
     max_in_progress_per_model: Optional[int] = None,
+    max_in_progress_by_model: Optional[Mapping[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -10624,6 +10625,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             max_in_progress_by_profile=max_in_progress_by_profile,
             max_in_progress_per_model=max_in_progress_per_model,
+            max_in_progress_by_model=max_in_progress_by_model,
             reconcile_orphans=reconcile_orphans,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -10647,6 +10649,7 @@ def dispatch_once(
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 max_in_progress_by_profile=max_in_progress_by_profile,
                 max_in_progress_per_model=max_in_progress_per_model,
+                max_in_progress_by_model=max_in_progress_by_model,
                 reconcile_orphans=reconcile_orphans,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
@@ -10677,6 +10680,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
     max_in_progress_per_model: Optional[int] = None,
+    max_in_progress_by_model: Optional[Mapping[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -10927,6 +10931,43 @@ def _dispatch_once_locked(
         and not isinstance(max_in_progress_per_model, bool)
         and max_in_progress_per_model > 0
     ) else None
+
+    # Per-(provider, model) cap overrides, e.g. a locally-hosted model
+    # served by a single-concurrency inference server (llama-server -np 1)
+    # needs a real cap of 1 regardless of the global default that suits
+    # remote providers with no such physical limit. Keys are
+    # "provider/model" strings, split on the FIRST "/" only -- a model
+    # name may itself contain a slash (e.g. "poolside/laguna-xs-2.1:free"),
+    # but a provider slug never does. Live incident, 2026-08-28: a single
+    # global max_in_progress_per_model=4 let up to 4 concurrent tasks
+    # dispatch against ollama-launch/devstral-small-2:24b even though the
+    # local server only accepts one request at a time, producing
+    # "No response for 180s, Reconnecting" crashes for genuinely local
+    # profiles that were never involved in the earlier codex/local
+    # mis-accounting bug this same cap machinery was just fixed for.
+    _model_cap_overrides: dict[tuple[str, str], int] = {}
+    if isinstance(max_in_progress_by_model, Mapping):
+        for raw_key, raw_cap in max_in_progress_by_model.items():
+            if not (
+                isinstance(raw_key, str)
+                and isinstance(raw_cap, int)
+                and not isinstance(raw_cap, bool)
+                and raw_cap > 0
+            ):
+                continue
+            provider_part, sep, model_part = raw_key.partition("/")
+            provider_part = provider_part.strip()
+            model_part = model_part.strip()
+            if sep and provider_part and model_part:
+                _model_cap_overrides[(provider_part, model_part)] = raw_cap
+
+    def _cap_for_model(key: tuple[str, str]) -> Optional[int]:
+        specific = _model_cap_overrides.get(key)
+        if specific is None:
+            return _per_model_cap
+        if _per_model_cap is None:
+            return specific
+        return min(specific, _per_model_cap)
     _per_model_running: dict[tuple[str, str], int] = {}
     if _per_model_cap is not None:
         # A task normally has no persisted override -- it just runs its
@@ -11170,7 +11211,7 @@ def _dispatch_once_locked(
         if (
             _per_model_cap is not None
             and model_key is not None
-            and _per_model_running.get(model_key, 0) >= _per_model_cap
+            and _per_model_running.get(model_key, 0) >= _cap_for_model(model_key)
         ):
             result.skipped_per_model_capped.append(
                 (row["id"], model_key[0], model_key[1], _per_model_running[model_key])
@@ -11333,7 +11374,7 @@ def _dispatch_once_locked(
         if (
             _per_model_cap is not None
             and model_key is not None
-            and _per_model_running.get(model_key, 0) >= _per_model_cap
+            and _per_model_running.get(model_key, 0) >= _cap_for_model(model_key)
         ):
             result.skipped_per_model_capped.append(
                 (row["id"], model_key[0], model_key[1], _per_model_running[model_key])

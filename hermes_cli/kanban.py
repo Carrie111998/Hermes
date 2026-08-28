@@ -2693,6 +2693,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 cap = _coerce_positive_int(raw_cap)
                 if isinstance(profile, str) and profile.strip() and cap is not None:
                     max_in_progress_by_profile[profile.strip()] = cap
+        raw_model_caps = _kanban_cfg.get("max_in_progress_by_model", {})
+        max_in_progress_by_model = {}
+        if isinstance(raw_model_caps, dict):
+            for model_key, raw_cap in raw_model_caps.items():
+                cap = _coerce_positive_int(raw_cap)
+                if isinstance(model_key, str) and model_key.strip() and cap is not None:
+                    max_in_progress_by_model[model_key.strip()] = cap
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # Memory-derived default when unset (OOF-30/OOF-77) — same
         # fallback the gateway-embedded dispatcher applies, so behaviour
@@ -2712,6 +2719,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress_per_model = None
         max_in_progress_by_profile = {}
+        max_in_progress_by_model = {}
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2725,6 +2733,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
             max_in_progress_by_profile=max_in_progress_by_profile,
             max_in_progress_per_model=max_in_progress_per_model,
+            max_in_progress_by_model=max_in_progress_by_model,
         )
     if getattr(args, "json", False):
         print(json.dumps({

@@ -1777,6 +1777,17 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_model,
                     )
 
+        max_in_progress_by_model = {}
+        raw_model_caps = kanban_cfg.get("max_in_progress_by_model", {})
+        if isinstance(raw_model_caps, dict):
+            for model_key, raw_cap in raw_model_caps.items():
+                try:
+                    cap = int(raw_cap)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(model_key, str) and model_key.strip() and cap >= 1:
+                    max_in_progress_by_model[model_key.strip()] = cap
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1881,6 +1892,7 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     max_in_progress_by_profile=max_in_progress_by_profile,
                     max_in_progress_per_model=max_in_progress_per_model,
+                    max_in_progress_by_model=max_in_progress_by_model,
                     reconcile_orphans=reconcile_orphans,
                 )
             except sqlite3.DatabaseError as exc:
