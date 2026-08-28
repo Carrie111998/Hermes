@@ -129,6 +129,36 @@ describe("ProfileProvider scope alignment", () => {
     // "" = the dashboard's own profile. Alignment to the machine's sticky
     // active profile ("default") must NOT happen on an isolated dashboard.
     expect(profile).toBe("");
+    // No retargeting call may fire for the wrong profile either.
+    expect(apiMocks.setManagementProfile).not.toHaveBeenCalledWith("default");
+  });
+
+  it("does not align a dashboard running on a nonstandard HERMES_HOME (current 'custom'), even though launch routing groups it with machine dashboards", async () => {
+    // Launch routing treats ("default", "custom") as machine-dashboard
+    // profile names, but a dashboard whose HERMES_HOME is a nonstandard
+    // path serves that home's own data — aligning its scope to the
+    // machine-global sticky active profile would retarget it the same way
+    // isolated dashboards were retargeted (see issue #96712). The guard
+    // deliberately excludes "custom"; this test pins that exclusion so
+    // widening the guard back to the launch-routing tuple becomes a
+    // conscious decision.
+    apiMocks.getActiveProfile.mockResolvedValue({
+      active: "default",
+      current: "custom",
+    });
+
+    const { ProfileProvider } = await import("@/contexts/ProfileProvider");
+    renderTree(
+      <ProfileProvider>
+        <Probe />
+      </ProfileProvider>,
+    );
+    await flushEffects();
+
+    const { profile, current } = probeData();
+    expect(current).toBe("custom");
+    expect(profile).toBe("");
+    expect(apiMocks.setManagementProfile).not.toHaveBeenCalledWith("default");
   });
 
   it("still aligns the switcher to the sticky active profile on the machine dashboard", async () => {
