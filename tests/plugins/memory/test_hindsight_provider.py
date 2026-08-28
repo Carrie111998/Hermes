@@ -28,6 +28,7 @@ from plugins.memory.hindsight import (
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
+    _materialize_embedded_profile_env,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -1664,9 +1665,104 @@ class TestLoadSimpleEnv:
         """A Notepad-edited .env carries a BOM; the first key must still parse
         instead of becoming '\ufeffHINDSIGHT_LLM_API_KEY'."""
         env_path = tmp_path / ".env"
-        env_path.write_bytes("﻿HINDSIGHT_LLM_API_KEY=sk-test\n".encode("utf-8"))
+        env_path.write_bytes("\ufeffHINDSIGHT_LLM_API_KEY=sk-test\n".encode("utf-8"))
         values = _load_simple_env(env_path)
         assert values.get("HINDSIGHT_LLM_API_KEY") == "sk-test"
+
+
+class TestEmbeddedProfileEnvKeyPreservation:
+    """Regression tests: a transient empty secret lookup must never blank the
+    stored embedded-daemon LLM API key.
+
+    ``_build_embedded_profile_env`` wrote ``str(current_key or "")`` to the
+    profile env, and the daemon-start path rewrites that file on any diff — so
+    an empty lookup both destroyed the stored key and read as config drift.
+    Observed live: hermes.env came back with an empty HINDSIGHT_API_LLM_API_KEY
+    and Hindsight stopped answering.
+    """
+
+    _CONFIG = {
+        "profile": "keypres",
+        "llm_provider": "openai_compatible",
+        "llm_model": "gpt-4o-mini",
+    }
+
+    @pytest.fixture
+    def profile_home(self, tmp_path, monkeypatch):
+        """Point ~/.hindsight/profiles at a temp dir and seed a good key."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        env_path = tmp_path / ".hindsight" / "profiles" / "keypres.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        return env_path
+
+    def _seed(self, env_path, key="sk-good-existing-key"):
+        env_path.write_text(
+            "HINDSIGHT_API_LLM_PROVIDER=openai\n"
+            f"HINDSIGHT_API_LLM_API_KEY={key}\n"
+            "HINDSIGHT_API_LLM_MODEL=gpt-4o-mini\n"
+            "HINDSIGHT_API_LOG_LEVEL=info\n",
+            encoding="utf-8",
+        )
+
+    def test_transient_empty_secret_preserves_stored_key(self, profile_home, monkeypatch):
+        """The exact live failure: get_secret returns "" but a good key is on disk."""
+        self._seed(profile_home)
+        monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda *a, **kw: "")
+
+        env = _build_embedded_profile_env(dict(self._CONFIG))
+
+        assert env["HINDSIGHT_API_LLM_API_KEY"] == "sk-good-existing-key", (
+            "a transient empty secret lookup blanked the stored API key"
+        )
+
+    def test_materialize_does_not_blank_file_on_transient_miss(self, profile_home, monkeypatch):
+        """End-to-end: the file on disk must still hold the key after a rewrite."""
+        self._seed(profile_home)
+        monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda *a, **kw: "")
+
+        _materialize_embedded_profile_env(dict(self._CONFIG))
+
+        assert _load_simple_env(profile_home)["HINDSIGHT_API_LLM_API_KEY"] == (
+            "sk-good-existing-key"
+        )
+
+    def test_transient_miss_is_not_treated_as_config_drift(self, profile_home, monkeypatch):
+        """Falling back to the saved key keeps the drift check honest: a failed
+        lookup must not read as a config change and trigger a daemon restart."""
+        self._seed(profile_home)
+        monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda *a, **kw: "")
+
+        saved = _load_simple_env(profile_home)
+        expected = _build_embedded_profile_env(dict(self._CONFIG))
+
+        assert saved == expected, "a transient secret miss looked like config drift"
+
+    def test_explicit_key_still_wins(self, profile_home, monkeypatch):
+        """A real rotation must still overwrite the stored value."""
+        self._seed(profile_home)
+        monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda *a, **kw: "")
+
+        env = _build_embedded_profile_env(dict(self._CONFIG), llm_api_key="sk-rotated")
+
+        assert env["HINDSIGHT_API_LLM_API_KEY"] == "sk-rotated"
+
+    def test_config_key_still_wins_over_stored(self, profile_home, monkeypatch):
+        """A key present in config takes precedence over the on-disk fallback."""
+        self._seed(profile_home)
+        monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda *a, **kw: "")
+
+        config = dict(self._CONFIG, llm_api_key="sk-from-config")
+        env = _build_embedded_profile_env(config)
+
+        assert env["HINDSIGHT_API_LLM_API_KEY"] == "sk-from-config"
+
+    def test_no_stored_key_and_no_secret_yields_empty(self, profile_home, monkeypatch):
+        """First-run: nothing on disk, nothing resolvable => empty, not a crash."""
+        monkeypatch.setattr("plugins.memory.hindsight.get_secret", lambda *a, **kw: "")
+
+        env = _build_embedded_profile_env(dict(self._CONFIG))
+
+        assert env["HINDSIGHT_API_LLM_API_KEY"] == ""
 
 
 class TestPostSetupEnvEncoding:

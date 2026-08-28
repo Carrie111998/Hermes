@@ -597,6 +597,15 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
             or get_secret("HINDSIGHT_LLM_API_KEY", "")
         )
 
+    if not current_key:
+        # A transient miss (secret backend down, .env not yet loaded) must not
+        # be persisted: the daemon-start path rewrites this file on any diff,
+        # so an empty resolution would blank the stored key permanently — and
+        # would read as config drift. Keep whatever is already on disk.
+        current_key = _load_simple_env(_embedded_profile_env_path(config)).get(
+            "HINDSIGHT_API_LLM_API_KEY", ""
+        )
+
     current_provider = config.get("llm_provider", "")
     current_model = config.get("llm_model", "")
     current_base_url = config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
