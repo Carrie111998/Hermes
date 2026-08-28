@@ -1136,6 +1136,7 @@ print(terminal("echo umbrella")["output"])
             code="print('safe')",
             task_id="task-1",
             enabled_tools=["tool_search"],
+            reset=False,
             session_id="session-1",
             enabled_toolsets=["calendar"],
             disabled_toolsets=["private"],

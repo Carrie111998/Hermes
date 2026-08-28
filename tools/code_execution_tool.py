@@ -1418,6 +1418,9 @@ def _execute_remote(
                 timeout=timeout,
                 max_tool_calls=max_tool_calls,
                 reset=bool(reset),
+                session_id=_resolve_rpc_session_id(session_id),
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
                 idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
             )
         except Exception:
@@ -1872,6 +1875,9 @@ def execute_code(
         return execute_in_session_kernel(
             code,
             task_id=task_id or "",
+            session_id=_resolve_rpc_session_id(session_id),
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
             mode=_mode,
             child_python=_resolve_child_python(_mode),
             child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),

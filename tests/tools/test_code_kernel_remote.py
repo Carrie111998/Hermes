@@ -39,7 +39,7 @@ class ScriptedEnv:
     def get_temp_dir(self):
         return "/tmp"
 
-    def execute(self, command, cwd=None, timeout=None):
+    def execute(self, command, cwd=None, timeout=None, **_kwargs):
         self.commands.append(command)
         for needle, handler in self.handlers:
             if needle in command:
@@ -74,11 +74,23 @@ def _cell(status="ok", stdout="", execution_count=1, **kw):
     return payload
 
 
-def _run(env, code="print(1)", *, task="t1", reset=False, timeout=10):
+def _run(
+    env,
+    code="print(1)",
+    *,
+    task="t1",
+    reset=False,
+    timeout=10,
+    session_id="",
+    enabled_toolsets=None,
+    disabled_toolsets=None,
+):
     return execute_in_remote_kernel(
         code, env=env, env_type="ssh", task_env_id=task,
         sandbox_tools=frozenset({"read_file"}), timeout=timeout,
-        max_tool_calls=5, reset=reset,
+        max_tool_calls=5, reset=reset, session_id=session_id,
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
     )
 
 
@@ -94,7 +106,7 @@ class RemoteKernelBase(unittest.TestCase):
         self._poll = patch(
             "tools.code_execution_tool._rpc_poll_loop",
         )
-        self._poll.start()
+        self.poll = self._poll.start()
 
     def tearDown(self):
         self._ship.stop()
@@ -103,6 +115,22 @@ class RemoteKernelBase(unittest.TestCase):
 
 
 class TestSpawnAndReuse(RemoteKernelBase):
+    def test_cell_rpc_keeps_parent_session_scope(self):
+        env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+
+        result = _run(
+            env,
+            session_id="session-1",
+            enabled_toolsets=["calendar"],
+            disabled_toolsets=["private"],
+        )
+
+        self.assertEqual(result["status"], "success", result)
+        poll_args = self.poll.call_args.args
+        self.assertEqual(poll_args[9], "session-1")
+        self.assertEqual(poll_args[10], ["calendar"])
+        self.assertEqual(poll_args[11], ["private"])
+
     def test_first_call_spawns_second_reuses(self):
         env = ScriptedEnv(_spawn_ok_handlers(
             [_cell(stdout="one\n"), _cell(stdout="two\n", execution_count=2)],
@@ -219,11 +247,21 @@ class TestDispatchIntegration(unittest.TestCase):
              patch("tools.code_execution_tool._get_or_create_env",
                    return_value=(env, "ssh")), \
              patch("tools.code_kernel_remote.execute_in_remote_kernel",
-                   return_value=fake):
-            result = json.loads(_execute_remote("print()", "t", ["read_file"]))
+                   return_value=fake) as kernel:
+            result = json.loads(_execute_remote(
+                "print()",
+                "t",
+                ["read_file"],
+                session_id="session-1",
+                enabled_toolsets=["calendar"],
+                disabled_toolsets=["private"],
+            ))
         self.assertEqual(result["status"], "success")
         self.assertIn("kernel says hi", result["output"])
         self.assertEqual(result["kernel"]["execution_count"], 3)
+        self.assertEqual(kernel.call_args.kwargs["session_id"], "session-1")
+        self.assertEqual(kernel.call_args.kwargs["enabled_toolsets"], ["calendar"])
+        self.assertEqual(kernel.call_args.kwargs["disabled_toolsets"], ["private"])
 
     def test_execute_remote_falls_open_to_per_call(self):
         from tools.code_execution_tool import _execute_remote

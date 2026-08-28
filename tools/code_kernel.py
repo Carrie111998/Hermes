@@ -184,10 +184,19 @@ class CellAuthority:
     a stale approval/session/turn identity.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(
+        self,
+        task_id: str,
+        session_id: str = "",
+        enabled_toolsets: Optional[List[str]] = None,
+        disabled_toolsets: Optional[List[str]] = None,
+    ):
         import contextvars
 
         self.task_id = task_id
+        self.session_id = session_id
+        self.enabled_toolsets = enabled_toolsets
+        self.disabled_toolsets = disabled_toolsets
         self.ctx = contextvars.copy_context()
         self.active = True
         self._approval_cb = None
@@ -221,6 +230,7 @@ class CellAuthority:
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
         from model_tools import handle_function_call
+        from tools.code_execution_tool import _sandbox_dispatch_kwargs
 
         previous = None
         if self._callback_setters is not None:
@@ -234,7 +244,17 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            return handle_function_call(
+                tool_name,
+                tool_args,
+                **_sandbox_dispatch_kwargs(
+                    tool_name,
+                    self.task_id,
+                    self.session_id,
+                    self.enabled_toolsets,
+                    self.disabled_toolsets,
+                ),
+            )
         finally:
             if previous is not None and self._callback_setters is not None:
                 set_approval, set_sudo = self._callback_setters
@@ -632,6 +652,9 @@ def execute_in_session_kernel(
     code: str,
     *,
     task_id: str,
+    session_id: str = "",
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
     mode: str,
     child_python: str,
     child_cwd: str,
@@ -682,7 +705,12 @@ def execute_in_session_kernel(
     # snapshot a per-call RPC thread would have received — and installed
     # atomically on the kernel so the serving thread dispatches this cell's
     # tool calls under this cell's approval/session/turn identity.
-    authority = CellAuthority(task_id)
+    authority = CellAuthority(
+        task_id,
+        session_id=session_id,
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+    )
 
     with kernel.lock:
         try:
