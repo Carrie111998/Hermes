@@ -206,9 +206,14 @@ _CFG_DOTTED_RE = re.compile(
     rf"={_CFG_VALUE}",
     re.IGNORECASE,
 )
-# Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
+# Line-anchored bare key: ``password = …`` / ``export api_key=…`` at start of
+# line. Whitespace around ``=`` is captured separately so TOML formatting is
+# preserved in redacted file-tool output.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*(?:\d+\|)?[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(?P<anchored_key>^[ \t]*(?:\d+\|)?[ \t]*(?:export[ \t]+)?"
+    rf"[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)"
+    rf"(?P<anchored_sep>[ \t]*=[ \t]*)(?P<anchored_quote>['\"]?)"
+    rf"(?P<anchored_value>[^\s&]+?)(?P=anchored_quote)(?=[\s&]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -786,12 +791,7 @@ _CONFIG_FILE_EXTENSIONS = frozenset({
     ".cfg", ".conf", ".env", ".ini", ".json", ".properties", ".toml",
     ".yaml", ".yml",
 })
-_SOURCE_OR_DOC_EXTENSIONS = frozenset({
-    ".adoc", ".bash", ".c", ".cc", ".cpp", ".cs", ".fish", ".go", ".h",
-    ".hpp", ".java", ".js", ".jsx", ".kt", ".kts", ".lua", ".md", ".php",
-    ".ps1", ".py", ".pyi", ".r", ".rb", ".rs", ".rst", ".scala", ".sh",
-    ".sql", ".svelte", ".swift", ".ts", ".tsx", ".vue", ".zsh",
-})
+_CONFIG_VARIANT_EXTENSIONS = frozenset({".example", ".local", ".sample"})
 _CONFIG_BASENAME_WORDS = frozenset({"config", "configuration", "settings"})
 
 
@@ -805,10 +805,17 @@ def is_config_like_path(path: object) -> bool:
     extension = os.path.splitext(basename)[1]
     if extension in _CONFIG_FILE_EXTENSIONS:
         return True
-    if extension in _SOURCE_OR_DOC_EXTENSIONS:
-        return False
     words = re.split(r"[^a-z0-9]+", basename)
-    return any(word in _CONFIG_BASENAME_WORDS for word in words)
+    has_config_word = any(word in _CONFIG_BASENAME_WORDS for word in words)
+    if extension in _CONFIG_VARIANT_EXTENSIONS:
+        return has_config_word
+    # Unknown explicit extensions are source/data by default. This covers the
+    # broad and evolving set of code extensions (mjs/cjs/mts/cts included)
+    # without maintaining another finite allowlist. Extensionless config and
+    # settings basenames still use the conservative word fallback below.
+    if extension:
+        return False
+    return has_config_word
 
 
 def redact_patch_text(
@@ -963,7 +970,19 @@ def redact_sensitive_text(
             # text.
             if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
                 text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+
+                def _redact_anchored(m):
+                    key = m.group("anchored_key")
+                    value = m.group("anchored_value")
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    if not _key_has_secret_keyword(key):
+                        return m.group(0)
+                    sep = m.group("anchored_sep")
+                    quote = m.group("anchored_quote")
+                    return f"{key}{sep}{quote}{value_mask(value)}{quote}"
+
+                text = _CFG_ANCHORED_RE.sub(_redact_anchored, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:

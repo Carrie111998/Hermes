@@ -25,9 +25,127 @@ def test_config_like_path_recognizes_config_and_settings_surfaces(name):
     assert is_config_like_path(name)
 
 
-@pytest.mark.parametrize("name", ["settings.py", "config.ts", "config.md"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "settings.py",
+        "config.ts",
+        "config.md",
+        "config.mjs",
+        "config.cjs",
+        "config.mts",
+        "config.cts",
+    ],
+)
 def test_config_like_path_keeps_source_and_docs_conservative(name):
     assert not is_config_like_path(name)
+
+
+def test_read_file_redacts_spaced_toml_assignment(tmp_path):
+    secret = "syntheticOpaqueTomlCredential24680"
+    config = tmp_path / "providers.toml"
+    config.write_text(f'exaApiKey = "{secret}"\n', encoding="utf-8")
+
+    result = json.loads(
+        read_file_tool(str(config), task_id="config-redaction-spaced-toml-read")
+    )
+
+    assert secret not in result["content"]
+    assert 'exaApiKey = "«redacted-secret»"' in result["content"]
+
+
+def test_search_redacts_spaced_toml_assignment(tmp_path):
+    secret = "syntheticOpaqueTomlCredential24680"
+    config = tmp_path / "providers.toml"
+    config.write_text(f'exaApiKey = "{secret}"\n', encoding="utf-8")
+
+    result = json.loads(
+        search_tool(
+            pattern="exaApiKey",
+            target="content",
+            path=str(tmp_path),
+            task_id="config-redaction-spaced-toml-search",
+        )
+    )
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert secret not in rendered
+    assert "«redacted-secret»" in rendered
+
+
+def test_patch_redacts_spaced_toml_assignment(tmp_path):
+    old_secret = "syntheticOpaqueTomlCredential24680"
+    new_secret = "syntheticReplacementTomlCredential13579"
+    config = tmp_path / "providers.toml"
+    config.write_text(f'exaApiKey = "{old_secret}"\n', encoding="utf-8")
+
+    result = json.loads(
+        patch_tool(
+            path=str(config),
+            old_string=old_secret,
+            new_string=new_secret,
+            task_id="config-redaction-spaced-toml-patch",
+        )
+    )
+
+    assert result["success"] is True
+    assert old_secret not in result["diff"]
+    assert new_secret not in result["diff"]
+    assert "«redacted-secret»" in result["diff"]
+    assert config.read_text(encoding="utf-8") == f'exaApiKey = "{new_secret}"\n'
+
+
+def test_read_file_preserves_editable_json_example_in_mjs_source(tmp_path):
+    example = "syntheticEditableJsonExample24680"
+    source = tmp_path / "config.mjs"
+    source.write_text(
+        f'export const EXAMPLE = {{"exaApiKey": "{example}"}};\n', encoding="utf-8"
+    )
+
+    result = json.loads(
+        read_file_tool(str(source), task_id="source-mjs-redaction-read")
+    )
+
+    assert example in result["content"]
+
+
+def test_search_preserves_editable_json_example_in_mjs_source(tmp_path):
+    example = "syntheticEditableJsonExample24680"
+    source = tmp_path / "config.mjs"
+    source.write_text(
+        f'export const EXAMPLE = {{"exaApiKey": "{example}"}};\n', encoding="utf-8"
+    )
+
+    result = json.loads(
+        search_tool(
+            pattern="exaApiKey",
+            target="content",
+            path=str(tmp_path),
+            task_id="source-mjs-redaction-search",
+        )
+    )
+
+    assert example in json.dumps(result, ensure_ascii=False)
+
+
+def test_patch_preserves_editable_json_example_in_mjs_source(tmp_path):
+    example = "syntheticEditableJsonExample24680"
+    source = tmp_path / "config.mjs"
+    source.write_text(
+        f'export const EXAMPLE = {{"exaApiKey": "{example}"}};\n', encoding="utf-8"
+    )
+
+    result = json.loads(
+        patch_tool(
+            path=str(source),
+            old_string="EXAMPLE",
+            new_string="EDITABLE_EXAMPLE",
+            task_id="source-mjs-redaction-patch",
+        )
+    )
+
+    assert result["success"] is True
+    assert example in result["diff"]
 
 
 def test_read_file_redacts_opaque_secret_values_from_yaml_config(tmp_path):
