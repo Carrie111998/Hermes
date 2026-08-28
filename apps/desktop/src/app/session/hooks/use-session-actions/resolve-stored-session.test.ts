@@ -91,6 +91,17 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).not.toHaveBeenCalledWith('s1', 'default')
   })
 
+  it('fails closed when an explicit profile misses instead of returning a foreign same-id cache row', async () => {
+    $sessions.set([session({ cwd: '/repo/default', id: 's1', profile: 'default' })])
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    const resolved = await resolveStoredSession('s1', 'work')
+
+    expect(resolved).toBeUndefined()
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'work')
+    expect($sessions.get()).toEqual([session({ cwd: '/repo/default', id: 's1', profile: 'default' })])
+  })
+
   it('accepts a profile-less cache hit for single-profile users', async () => {
     $profiles.set(profiles('default'))
     $sessions.set([session({ id: 's1' })])
