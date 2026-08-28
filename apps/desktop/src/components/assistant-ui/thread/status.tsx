@@ -95,8 +95,8 @@ export function resolveThreadActivityPhase(evidence: ThreadActivityEvidence): Th
   return evidence.quiet ? 'quiet-running' : 'running'
 }
 
-const HintText: FC<{ children: ReactNode }> = ({ children }) => (
-  <span className={cn(SCAFFOLD_LABEL_CLASS, 'shimmer min-w-0 flex-1 truncate')}>{children}</span>
+const HintText: FC<{ children: ReactNode; shimmer?: boolean }> = ({ children, shimmer = true }) => (
+  <span className={cn(SCAFFOLD_LABEL_CLASS, shimmer && 'shimmer', 'min-w-0 flex-1 truncate')}>{children}</span>
 )
 
 /** These indicators render inside whichever transcript mounted them, so every
@@ -146,12 +146,38 @@ const DRAFTING_REVEAL_MS = 200
  * What to call the wait, if it deserves a name. Compaction outranks a draft —
  * it's rarer, slower, and explains a transcript that looks like it reset.
  */
+type StatusLabels = {
+  foregroundRunning: string
+  inputRequired: string
+  quietRunning: string
+  stalledWarning: string
+}
+
+function statusDescription(phase: ThreadActivityPhase, labels: StatusLabels): string | undefined {
+  if (phase === 'input-required') {
+    return labels.inputRequired
+  }
+
+  if (phase === 'stalled') {
+    return labels.stalledWarning
+  }
+
+  if (phase === 'quiet-running') {
+    return labels.quietRunning
+  }
+
+  if (phase === 'running' || phase === 'compacting') {
+    return labels.foregroundRunning
+  }
+
+  return undefined
+}
+
 function useStatusHint(
-  compacting: boolean,
   drafting: DraftingTool | null,
   providerWait: string,
   phase: ThreadActivityPhase,
-  labels: { inputRequired: string; quietRunning: string; stalledWarning: string }
+  labels: StatusLabels
 ): string {
   const [revealed, setRevealed] = useState(false)
   const name = drafting?.name ?? ''
@@ -168,10 +194,6 @@ function useStatusHint(
     return () => window.clearTimeout(id)
   }, [name])
 
-  if (compacting) {
-    return COMPACTION_LABEL
-  }
-
   if (phase === 'input-required') {
     return labels.inputRequired
   }
@@ -180,7 +202,11 @@ function useStatusHint(
     return labels.stalledWarning
   }
 
-  if (providerWait) {
+  if (phase === 'compacting') {
+    return COMPACTION_LABEL
+  }
+
+  if (phase === 'provider-wait' && providerWait.trim()) {
     return providerWait
   }
 
@@ -224,7 +250,8 @@ export const ResponseLoadingIndicator: FC = () => {
     stalled
   })
   const elapsed = useElapsedSeconds(true, undefined, turnStartedAt)
-  const hint = useStatusHint(compacting, drafting, providerWait, phase, {
+  const hint = useStatusHint(drafting, providerWait, phase, {
+    foregroundRunning: t.assistant.thread.foregroundRunning,
     inputRequired: t.assistant.thread.inputRequired,
     quietRunning: t.assistant.thread.quietRunning,
     stalledWarning: t.assistant.thread.stalledWarning
@@ -232,7 +259,7 @@ export const ResponseLoadingIndicator: FC = () => {
 
   return (
     <StatusRow
-      aria-description={t.assistant.thread.foregroundRunning}
+      aria-description={statusDescription(phase, { foregroundRunning: t.assistant.thread.foregroundRunning, inputRequired: t.assistant.thread.inputRequired, quietRunning: t.assistant.thread.quietRunning, stalledWarning: t.assistant.thread.stalledWarning })}
       data-slot="aui_response-loading"
       label={hint || t.assistant.thread.loadingResponse}
     >
@@ -241,7 +268,7 @@ export const ResponseLoadingIndicator: FC = () => {
         className="dither inline-block size-3 rounded-[2px] text-midground/80"
         kind="opacity"
       />
-      {hint && <HintText>{hint}</HintText>}
+      {hint && <HintText shimmer={phase !== 'input-required' && phase !== 'stalled'}>{hint}</HintText>}
       <ActivityTimerText seconds={elapsed} />
     </StatusRow>
   )
@@ -331,7 +358,8 @@ export const TurnActivityIndicator: FC = () => {
     quiet: quietSince !== undefined,
     stalled
   })
-  const hint = useStatusHint(compacting, drafting, providerWait, phase, {
+  const hint = useStatusHint(drafting, providerWait, phase, {
+    foregroundRunning: t.assistant.thread.foregroundRunning,
     inputRequired: t.assistant.thread.inputRequired,
     quietRunning: t.assistant.thread.quietRunning,
     stalledWarning: t.assistant.thread.stalledWarning
@@ -355,7 +383,7 @@ export const TurnActivityIndicator: FC = () => {
 
   return (
     <StatusRow
-      aria-description={t.assistant.thread.foregroundRunning}
+      aria-description={statusDescription(phase, { foregroundRunning: t.assistant.thread.foregroundRunning, inputRequired: t.assistant.thread.inputRequired, quietRunning: t.assistant.thread.quietRunning, stalledWarning: t.assistant.thread.stalledWarning })}
       data-slot="aui_turn-activity"
       label={hint || t.assistant.thread.loadingResponse}
     >
@@ -370,7 +398,7 @@ export const TurnActivityIndicator: FC = () => {
           kind="opacity"
         />
       )}
-      <HintText>{hint}</HintText>
+      <HintText shimmer={phase !== 'input-required' && phase !== 'stalled'}>{hint}</HintText>
       {phase !== 'input-required' && <ActivityTimerText seconds={elapsed} />}
     </StatusRow>
   )

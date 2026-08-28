@@ -2,9 +2,11 @@ import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { __resetElapsedTimerRegistryForTests } from '@/components/chat/activity-timer'
+import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { I18nProvider } from '@/i18n'
 import { $providerWaitSessions, setSessionProviderWait } from '@/store/provider-wait'
-import { $activeSessionId, $turnStartedAt } from '@/store/session'
+import { setSessionCompacting } from '@/store/compaction'
+import { $activeSessionId, $turnStartedAt, setBusy } from '@/store/session'
 
 import { resolveThreadActivityPhase, ResponseLoadingIndicator } from './status'
 
@@ -64,6 +66,7 @@ describe('ResponseLoadingIndicator timer', () => {
   it('names a prolonged provider wait in the existing response status row', () => {
     $activeSessionId.set('session-a')
     $turnStartedAt.set(Date.now())
+    setBusy(() => true)
     setSessionProviderWait('session-a', '⏳ waiting on local-model — 30s with no output yet')
 
     renderIndicator()
@@ -114,5 +117,43 @@ describe('resolveThreadActivityPhase', () => {
 
   it('does not claim a running phase for an idle session', () => {
     expect(resolveThreadActivityPhase({ ...base, busy: false })).toBe('idle')
+  })
+})
+describe('status hint', () => {
+  afterEach(() => {
+    cleanup()
+    clearClarifyRequest()
+    setSessionCompacting('session-a', false)
+    setBusy(() => false)
+    $activeSessionId.set(null)
+    $turnStartedAt.set(null)
+    $providerWaitSessions.set({})
+  })
+
+  it('uses input-required copy when input is requested during compaction', () => {
+    $activeSessionId.set('session-a')
+    $turnStartedAt.set(Date.now())
+    setBusy(() => true)
+    setSessionCompacting('session-a', true)
+    setClarifyRequest({ choices: null, multiSelect: false, question: 'q', requestId: 'req-a', sessionId: 'session-a' })
+
+    renderIndicator()
+
+    const status = screen.getByRole('status')
+    expect(status.getAttribute('aria-label')).toBe('Needs your input')
+    expect(status.getAttribute('aria-label')).not.toBe('Summarizing thread')
+    expect(status.querySelector('.shimmer')).toBeNull()
+  })
+
+  it('ignores whitespace-only provider wait in the status hint', () => {
+    $activeSessionId.set('session-a')
+    $turnStartedAt.set(Date.now())
+    setBusy(() => true)
+    setSessionProviderWait('session-a', '   ')
+
+    renderIndicator()
+
+    const status = screen.getByRole('status')
+    expect(status.getAttribute('aria-label')).toBe('Hermes is loading a response')
   })
 })
