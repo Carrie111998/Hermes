@@ -2421,6 +2421,9 @@ install_node_deps() {
         return 0
     fi
 
+    # diag: confirm node-gyp will see the managed Node's headers
+    log_info "npm_config_nodedir=$npm_config_nodedir HERMES_HOME=$HERMES_HOME node=$(command -v node 2>/dev/null)"
+
     if [ "$DISTRO" = "termux" ]; then
         log_info "Skipping automatic Node/browser dependency setup on Termux"
         log_info "Browser automation is not part of the tested Termux install path yet."
