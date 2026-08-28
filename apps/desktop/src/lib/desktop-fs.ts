@@ -90,8 +90,14 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
 /** Read an explicitly local-origin attachment from the shell, falling back to
  * the active gateway only when the local path cannot be read. */
 export async function readDesktopFileTextLocalFirst(path: string): Promise<HermesReadFileTextResult> {
+  const readFileText = window.hermesDesktop?.readFileText
+
+  if (typeof readFileText !== 'function') {
+    throw new Error("No handler registered for 'hermes:readFileText'")
+  }
+
   try {
-    const local = await window.hermesDesktop?.readFileText?.(path)
+    const local = await readFileText(path)
 
     if (local) {
       return local
@@ -105,6 +111,18 @@ export async function readDesktopFileTextLocalFirst(path: string): Promise<Herme
   }
 
   return readDesktopFileText(path)
+}
+
+/** Write an explicitly local-origin attachment through Electron, even when the
+ * active gateway is remote. */
+export async function writeDesktopFileTextLocal(path: string, content: string): Promise<{ path: string }> {
+  const writeTextFile = bridge().writeTextFile
+
+  if (!writeTextFile) {
+    throw new Error('Saving is not available')
+  }
+
+  return writeTextFile(path, content)
 }
 
 // Save UTF-8 text back to a file. Local writes go through the hardened Electron

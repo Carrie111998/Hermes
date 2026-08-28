@@ -155,6 +155,16 @@ describe('desktop filesystem facade', () => {
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-text?path=%2Fremote%2Fnote.md' })
   })
 
+  it('signals a stale preload instead of reading a local-origin path from the gateway', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    Object.defineProperty(window.hermesDesktop, 'readFileText', { configurable: true, value: undefined })
+
+    await expect(readDesktopFileTextLocalFirst('/local/note.md')).rejects.toThrow(
+      "No handler registered for 'hermes:readFileText'"
+    )
+    expect(api).not.toHaveBeenCalled()
+  })
+
   it('targets the active profile backend so a remote profile never reads local disk', async () => {
     $connection.set({ mode: 'remote', profile: 'remote-docker' } as never)
 

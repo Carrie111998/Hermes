@@ -416,7 +416,7 @@ export function useComposerActions({
           detail: rel,
           refText: `@${kind}:${formatRefValue(rel)}`,
           path,
-          localFile: true
+          localFile: kind === 'file'
         })
       }
     },

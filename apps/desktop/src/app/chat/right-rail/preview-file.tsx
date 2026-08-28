@@ -29,7 +29,8 @@ import {
   readDesktopFileDataUrlLocalFirst,
   readDesktopFileText,
   readDesktopFileTextLocalFirst,
-  writeDesktopFileText
+  writeDesktopFileText,
+  writeDesktopFileTextLocal
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
@@ -960,7 +961,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       // choice. `force` is the user picking "overwrite" from that banner.
       if (!force) {
         try {
-          const current = await readTextPreview(filePath)
+          const current = await readTextPreview(filePath, target.localFile)
 
           if (!current.binary && (current.text ?? '') !== baselineRef.current) {
             setConflict(true)
@@ -973,12 +974,16 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
         }
       }
 
-      await writeDesktopFileText(filePath, draftRef.current)
+      await (target.localFile
+        ? writeDesktopFileTextLocal(filePath, draftRef.current)
+        : writeDesktopFileText(filePath, draftRef.current))
       baselineRef.current = draftRef.current
       setDirty(false)
       setConflict(false)
       setEditing(false)
-      notifyWorkspaceChanged()
+      if (!target.localFile) {
+        notifyWorkspaceChanged()
+      }
       setSelfReload(n => n + 1)
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error))

@@ -1,11 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { readDesktopFileDataUrl } = vi.hoisted(() => ({ readDesktopFileDataUrl: vi.fn() }))
+const { readDesktopFileDataUrl, readDesktopFileText } = vi.hoisted(() => ({
+  readDesktopFileDataUrl: vi.fn(),
+  readDesktopFileText: vi.fn()
+}))
 
 vi.mock('@/lib/desktop-fs', () => ({
   isDesktopFsRemoteMode: () => true,
   readDesktopFileDataUrl,
-  readDesktopFileText: vi.fn()
+  readDesktopFileText
 }))
 
 import {
@@ -42,6 +45,16 @@ describe('remote HTML previews', () => {
       dataUrl
     })
     expect(readDesktopFileDataUrl).toHaveBeenCalledWith('/srv/report.html')
+  })
+
+  it('does not enrich an explicitly local file through the remote gateway', async () => {
+    const localTextTarget = { ...remoteTarget, previewKind: 'text' as const }
+    window.hermesDesktop.normalizePreviewTarget = vi.fn(async () => localTextTarget)
+
+    await expect(
+      normalizeOrLocalPreviewTarget('/tmp/clipboard.md', undefined, { skipRemoteEnrich: true })
+    ).resolves.toEqual(localTextTarget)
+    expect(readDesktopFileText).not.toHaveBeenCalled()
   })
 
   it('falls back to source mode when the transport is not canonical HTML', async () => {

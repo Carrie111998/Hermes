@@ -134,7 +134,9 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
     }
 
     try {
-      const preview = await normalizeOrLocalPreviewTarget(target, cwd || undefined)
+      const preview = await normalizeOrLocalPreviewTarget(target, cwd || undefined, {
+        skipRemoteEnrich: attachment.localFile
+      })
 
       if (!preview) {
         throw new Error(c.couldNotPreview(attachment.label))

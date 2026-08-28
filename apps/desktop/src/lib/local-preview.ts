@@ -259,18 +259,21 @@ async function enrichPreviewTarget(target: PreviewTarget | null): Promise<Previe
 
 export async function normalizeOrLocalPreviewTarget(
   rawTarget: string,
-  cwd?: string | null
+  cwd?: string | null,
+  options: { skipRemoteEnrich?: boolean } = {}
 ): Promise<PreviewTarget | null> {
   try {
     const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
 
     if (normalized) {
-      return enrichPreviewTarget(normalized)
+      return options.skipRemoteEnrich ? normalized : enrichPreviewTarget(normalized)
     }
   } catch {
     // Running Electron may still have the old HTML-only preview IPC. Fall
     // through to renderer-side local classification so text/images still open.
   }
 
-  return enrichPreviewTarget(localPreviewTarget(rawTarget, cwd))
+  const local = localPreviewTarget(rawTarget, cwd)
+
+  return options.skipRemoteEnrich ? local : enrichPreviewTarget(local)
 }
