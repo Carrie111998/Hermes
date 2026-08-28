@@ -1658,10 +1658,9 @@ def test_pooled_providers_entry_keeps_transport_and_policy_identity_separate(mon
 
 
 def test_named_custom_runtime_avoids_generic_custom_request_policy():
-    from agent.chat_completion_helpers import _request_policy_provider
     from providers import get_provider_profile
 
-    policy_provider = _request_policy_provider("custom", "custom:zhipuai")
+    policy_provider = rp.request_policy_provider("custom", "custom:zhipuai")
 
     assert policy_provider == "custom:zhipuai"
     assert get_provider_profile(policy_provider) is None
@@ -1669,9 +1668,24 @@ def test_named_custom_runtime_avoids_generic_custom_request_policy():
 
 
 def test_bare_custom_runtime_keeps_generic_custom_request_policy():
-    from agent.chat_completion_helpers import _request_policy_provider
+    assert rp.request_policy_provider("custom", "custom") == "custom"
 
-    assert _request_policy_provider("custom", "custom") == "custom"
+
+def test_unqualified_named_custom_uses_config_key_for_request_policy(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "myproxy": {
+                    "name": "Local",
+                    "api": "https://proxy.example/v1",
+                }
+            }
+        },
+    )
+
+    assert rp.request_policy_provider("custom", "local") == "custom:myproxy"
 
 
 def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
