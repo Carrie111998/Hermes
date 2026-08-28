@@ -36,11 +36,46 @@ class TestReadFileSchemaStatic(unittest.TestCase):
         self.assertNotIn("auto-installed", desc)
         self.assertNotIn("anydoc", desc)
 
-    def test_no_dynamic_override_registered(self):
-        from tools.file_tools import READ_FILE_SCHEMA  # noqa: F401
+    def test_pdf_wording_upgrades_with_hosted_ocr_route(self):
+        """The ONE dynamic word: text-layer → scanned-or-text, keyed on
+        hosted_ocr_available(). Nous gateway deliberately does not
+        upgrade (Parse proxy live-probed broken 2026-08-28)."""
         import tools.file_tools as ft
 
-        self.assertFalse(hasattr(ft, "_read_file_schema_overrides"))
+        with patch("tools.read_extract.hosted_ocr_available",
+                   return_value=True):
+            d = ft._read_file_schema_overrides()["description"]
+        self.assertIn("PDF (scanned or text)", d)
+        self.assertNotIn("PDF (text layer)", d)
+        with patch("tools.read_extract.hosted_ocr_available",
+                   return_value=False):
+            o = ft._read_file_schema_overrides()
+        self.assertEqual(o, {})  # base wording stands
+
+    def test_hosted_ocr_available_gate_states(self):
+        import tools.read_extract as rx
+
+        # direct key → True
+        with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={}):
+                self.assertTrue(rx.hosted_ocr_available())
+        # config false beats key
+        with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={"file_tools": {"hosted_ocr": False}}):
+                self.assertFalse(rx.hosted_ocr_available())
+        # config true without key → True (user's explicit assertion)
+        with patch.dict(rx.os.environ, {}, clear=False):
+            rx.os.environ.pop("FIRECRAWL_API_KEY", None)
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={"file_tools": {"hosted_ocr": True}}):
+                self.assertTrue(rx.hosted_ocr_available())
+        # nothing → False (Nous gateway alone must NOT upgrade wording)
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={}):
+            rx.os.environ.pop("FIRECRAWL_API_KEY", None)
+            self.assertFalse(rx.hosted_ocr_available())
 
     def test_coverage_warning_teaching_left_to_the_warning(self):
         """The response-time warning owns the recovery curriculum."""

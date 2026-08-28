@@ -230,6 +230,38 @@ def _hosted_ocr_config() -> tuple:
     return enabled, api_key, api_url
 
 
+def hosted_ocr_available() -> bool:
+    """Public probe for schema builders: is hosted OCR expected to work?
+
+    True when hosted OCR is expected to work: config ``hosted_ocr: true``
+    (the user's explicit assertion), or AUTO with a DIRECT
+    ``FIRECRAWL_API_KEY``. The Nous managed gateway deliberately does NOT
+    upgrade the schema wording yet — it resolves a token but its Parse
+    proxy was live-probed broken (HTTP 500, 2026-08-28); at runtime the
+    gateway is still attempted (free upside), but the schema only
+    promises what a route we've seen work can deliver. Used by
+    read_file's dynamic schema line to advertise "PDF (scanned or text)"
+    instead of "PDF (text layer)". Route resolution only — no network
+    I/O (schema build must stay side-effect-free); a promised route that
+    fails at conversion time lands in the NEEDS-OCR warning.
+    """
+    try:
+        import os as _os
+
+        from hermes_cli.config import load_config_readonly
+
+        try:
+            cfg = load_config_readonly()
+            section = cfg.get("file_tools") if isinstance(cfg, dict) else None
+            if isinstance(section, dict) and "hosted_ocr" in section:
+                return bool(section["hosted_ocr"])
+        except Exception:  # noqa: BLE001
+            pass
+        return bool(_os.environ.get("FIRECRAWL_API_KEY"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _needs_ocr_warning(path: str, pages, hosted_error: str = "") -> str:
     """Typed replacement for the heuristic coverage note on full-OCR PDFs.
 
