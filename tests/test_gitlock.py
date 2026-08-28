@@ -26,6 +26,7 @@ import pytest
 from hermes_cli.gitlock import (
     LOCK_NAMES,
     STALE_LOCK_MIN_AGE_SECONDS,
+    _git_proc_running,
     clear_stale_git_locks,
     is_ancestor_of_head,
 )
@@ -137,3 +138,71 @@ def test_is_ancestor_false_for_unknown_rev(repo: Path) -> None:
 
 def test_is_ancestor_false_for_nonexistent_repo(tmp_path: Path) -> None:
     assert is_ancestor_of_head(tmp_path / "missing", "HEAD") is False
+
+
+def test_git_proc_running_windows_handles_non_cp1252_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows tasklist output containing non-cp1252 / OEM bytes (e.g. 0x81) must not crash."""
+    monkeypatch.setattr(os, "name", "nt")
+
+    recorded_kwargs: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        nonlocal recorded_kwargs
+        recorded_kwargs = kwargs
+        # Simulate stdout containing 0x81 (e.g. German 'ü' in CP437 decoded with replacement or raw text)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="INFO: Es wurden keine Aufgaben ausgef\ufffdhrt (git.exe running)\r\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _git_proc_running() is True
+    assert recorded_kwargs.get("text") is True
+    assert recorded_kwargs.get("encoding") == "utf-8"
+    assert recorded_kwargs.get("errors") == "replace"
+
+
+def test_git_proc_running_windows_returns_false_when_no_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "name", "nt")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="INFO: No tasks running\r\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _git_proc_running() is False
+
+
+def test_git_proc_running_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+
+    recorded_kwargs: dict = {}
+
+    def fake_run_hit(cmd, **kwargs):
+        nonlocal recorded_kwargs
+        recorded_kwargs = kwargs
+        return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run_hit)
+    assert _git_proc_running() is True
+    assert recorded_kwargs.get("stdout") == subprocess.DEVNULL
+    assert recorded_kwargs.get("stderr") == subprocess.DEVNULL
+
+    def fake_run_miss(cmd, **kwargs):
+        return subprocess.CompletedProcess(args=cmd, returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run_miss)
+    assert _git_proc_running() is False
+
+
+def test_git_proc_running_exception_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run_raise(cmd, **kwargs):
+        raise OSError("Subprocess failed")
+
+    monkeypatch.setattr(subprocess, "run", fake_run_raise)
+    assert _git_proc_running() is False
+
