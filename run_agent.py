@@ -3983,9 +3983,10 @@ class AIAgent:
         if reason == "review_input_budget_exhausted":
             return (
                 prefix
-                + "the turn's input budget was exhausted while a tool result "
-                "was still pending, so the model never produced a final "
-                "answer. Send `continue` to resume from where it stopped."
+                + "the review's aggregate input budget was exhausted while a "
+                "tool result was still pending, so the model never produced a "
+                "final answer. The review was stopped; start a new review with "
+                "a narrower task if you still need one."
             )
         if reason == "session_persistence_failed":
             cause = persistence_cause or "unknown"

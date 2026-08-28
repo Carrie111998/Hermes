@@ -447,8 +447,135 @@ const $groupChats = atom({})
 /** Group whose room view is open in the Bots pane (secondary navigation
  *  inside the pane; a normal row click returns to the roster). */
 const $groupChatWorkspace = atom(null)
-/** Groups whose latest room activity mentions @user — the needs-you badge. */
+/** Groups whose latest room activity needs the user — the aggregate badge. */
 const $groupNeedsYou = atom({})
+/** Existing non-failure attention (member @user replies and prompts). Kept
+ *  separate so acknowledging one failure cannot clear another reason. */
+const $groupNeedsYouOther = atom({})
+
+function reportGroupChatNoticeError(error, message) {
+  try {
+    host.notifyError?.(error, message)
+  } catch {
+    // The error surface is best-effort too; a notice failure must not stop a
+    // later member turn.
+  }
+}
+
+function refreshGroupNeedsYou(group) {
+  const room = $groupChats.get()[group] || {}
+  const failures = room.unackedFailures && typeof room.unackedFailures === 'object' && !Array.isArray(room.unackedFailures)
+    ? room.unackedFailures
+    : {}
+  const needsYou = Object.keys(failures).length > 0 || Boolean($groupNeedsYouOther.get()[group])
+  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: needsYou })
+  return needsYou
+}
+
+function setGroupNeedsYouOther(group, value) {
+  const next = { ...$groupNeedsYouOther.get() }
+
+  if (value) {
+    next[group] = true
+  } else {
+    delete next[group]
+  }
+
+  $groupNeedsYouOther.set(next)
+  return refreshGroupNeedsYou(group)
+}
+
+function removeGroupNeedsYou(group) {
+  const other = { ...$groupNeedsYouOther.get() }
+  const aggregate = { ...$groupNeedsYou.get() }
+  delete other[group]
+  delete aggregate[group]
+  $groupNeedsYouOther.set(other)
+  $groupNeedsYou.set(aggregate)
+}
+
+function moveGroupNeedsYouOther(oldGroup, newGroup) {
+  const other = { ...$groupNeedsYouOther.get() }
+
+  if (Object.prototype.hasOwnProperty.call(other, oldGroup)) {
+    other[newGroup] = other[oldGroup]
+    delete other[oldGroup]
+    $groupNeedsYouOther.set(other)
+  }
+
+  refreshGroupNeedsYou(oldGroup)
+  refreshGroupNeedsYou(newGroup)
+}
+
+function markGroupFailureNeedsYou(group, memberKey) {
+  if (!memberKey) {
+    return false
+  }
+
+  try {
+    updateGroupChat(group, room => {
+      room.unackedFailures = { ...(room.unackedFailures || {}), [memberKey]: true }
+      room.failedMembers = { ...(room.failedMembers || {}), [memberKey]: true }
+      return room
+    })
+    refreshGroupNeedsYou(group)
+    return true
+  } catch (error) {
+    reportGroupChatNoticeError(error, 'Could not record the group member failure')
+    return false
+  }
+}
+
+function clearGroupFailureNeedsYou(group, memberKey) {
+  const failures = $groupChats.get()[group]?.unackedFailures || {}
+
+  if (!Object.prototype.hasOwnProperty.call(failures, memberKey)) {
+    return false
+  }
+
+  try {
+    updateGroupChat(group, room => {
+      const next = { ...(room.unackedFailures || {}) }
+      delete next[memberKey]
+      room.unackedFailures = next
+      return room
+    })
+    refreshGroupNeedsYou(group)
+    return true
+  } catch (error) {
+    reportGroupChatNoticeError(error, 'Could not acknowledge the group member failure')
+    return false
+  }
+}
+
+/** A failure stays out of the everyone-default until a USER message names it.
+ *  @everyone/@all is the existing explicit all-members override. This does
+ *  not acknowledge the needs-you failure bit. */
+function releaseGroupFailedMembers(group, mentions) {
+  const current = $groupChats.get()[group]?.failedMembers || {}
+  const keys = Object.keys(current)
+
+  if (!keys.length || (!mentions?.everyone && !mentions?.mentioned?.size)) {
+    return
+  }
+
+  updateGroupChat(group, room => {
+    const next = { ...(room.failedMembers || {}) }
+
+    if (mentions.everyone) {
+      for (const key of Object.keys(next)) {
+        delete next[key]
+      }
+    } else {
+      for (const key of mentions.mentioned) {
+        delete next[key]
+      }
+    }
+
+    room.failedMembers = next
+    return room
+  })
+}
 // Pending prompts (clarify questions AND command approvals) raised inside
 // hidden group-member sessions, keyed `${group}::${memberKey}` (#90694).
 // Members run in invisible plumbing sessions, so a member's blocking prompt
@@ -602,6 +729,56 @@ function groupChatRoomKey(name, room) {
     : `name:${String(name)}`
 }
 
+/** Failure diagnostics are untrusted model/provider text. Keep them to one
+ *  line, remove mention sigils, and bound them only after sanitisation. */
+function normalizeGroupChatFailureText(text, limit = 200) {
+  return String(text || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/@/g, '')
+    .trim()
+    .slice(0, limit)
+}
+
+function sanitizeGroupChatDiagnostic(error) {
+  return normalizeGroupChatFailureText(
+    error?.data?.reason || error?.message || error || 'turn failed'
+  ) || 'turn failed'
+}
+
+function boundedGroupMemberFlags(value) {
+  return Object.fromEntries(
+    Object.entries(value && typeof value === 'object' && !Array.isArray(value) ? value : {})
+      .filter(([, enabled]) => Boolean(enabled))
+      .slice(0, GROUP_CHAT_MAX_MEMBERS)
+      .map(([key]) => [String(key).slice(0, 256), true])
+  )
+}
+
+function compactGroupChatEntry(entry) {
+  const isFailure = entry?.code === 'member_turn_failed' || entry?.routing === 'none'
+  const kind = isFailure || entry?.from?.kind === 'member' ? 'member' : 'user'
+
+  return {
+    ...(entry?.id ? { id: String(entry.id).slice(0, 160) } : {}),
+    from: {
+      kind,
+      name: String(entry?.from?.name || (kind === 'member' ? 'Bot' : 'You')).slice(0, 128),
+      ...(entry?.from?.source ? { source: String(entry.from.source).slice(0, 128) } : {})
+    },
+    text: isFailure
+      ? normalizeGroupChatFailureText(entry?.text, GROUP_CHAT_SYNC_TEXT_CHARS)
+      : String(entry?.text || '').slice(0, GROUP_CHAT_SYNC_TEXT_CHARS),
+    at: Number(entry?.at || 0),
+    ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {}),
+    ...(entry?.routing ? { routing: String(entry.routing).slice(0, 32) } : {}),
+    ...(entry?.code ? { code: String(entry.code).slice(0, 64) } : {}),
+    ...(entry?.memberKey ? { memberKey: String(entry.memberKey).slice(0, 256) } : {}),
+    ...(entry?.memberHandle ? { memberHandle: String(entry.memberHandle).slice(0, 128) } : {}),
+    ...(entry?.needsYou === true ? { needsYou: true } : {})
+  }
+}
+
 /** Lift any historical projection shape (v1 wall-clock, v2 name-keyed) to
  *  the v3 room-key shape so one merge path serves mixed-version fleets. */
 function normalizeGroupChatSyncSnapshot(snapshot) {
@@ -661,22 +838,14 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
   }
 
   for (const [name, room] of ranked) {
-    const log = room.log.slice(-GROUP_CHAT_SYNC_MESSAGES).map(entry => ({
-      ...(entry?.id ? { id: String(entry.id).slice(0, 160) } : {}),
-      from: {
-        kind: entry?.from?.kind === 'member' ? 'member' : 'user',
-        name: String(entry?.from?.name || (entry?.from?.kind === 'member' ? 'Bot' : 'You')).slice(0, 128),
-        ...(entry?.from?.source ? { source: String(entry.from.source).slice(0, 128) } : {})
-      },
-      text: String(entry?.text || '').slice(0, GROUP_CHAT_SYNC_TEXT_CHARS),
-      at: Number(entry?.at || 0),
-      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {})
-    }))
+    const log = room.log.slice(-GROUP_CHAT_SYNC_MESSAGES).map(compactGroupChatEntry)
     const compact = {
       name: String(name).slice(0, 64),
       ...(typeof room?.roomId === 'string' && room.roomId ? { roomId: String(room.roomId).slice(0, 128) } : {}),
       log,
       revision: Math.max(0, Number(room?.syncRevision ?? room?.revision ?? 0)),
+      failedMembers: boundedGroupMemberFlags(room?.failedMembers),
+      unackedFailures: boundedGroupMemberFlags(room?.unackedFailures),
       members: (Array.isArray(room.members) ? room.members : []).slice(0, GROUP_CHAT_MAX_MEMBERS).map(member => ({
         name: String(member?.name || '').slice(0, 128),
         ...(member?.handle ? { handle: String(member.handle).slice(0, 128) } : {}),
@@ -817,14 +986,20 @@ function mergeGroupChatSyncSnapshots(
     let identity
     let members
     let image
+    let failedMembers
+    let unackedFailures
     if (localRevision > remoteRevision) {
       identity = localRoom
       members = [...(localRoom?.members || [])]
       image = localRoom?.image
+      failedMembers = boundedGroupMemberFlags(localRoom?.failedMembers)
+      unackedFailures = boundedGroupMemberFlags(localRoom?.unackedFailures)
     } else if (remoteRevision > localRevision) {
       identity = remoteRoom
       members = [...(remoteRoom?.members || [])]
       image = remoteRoom?.image
+      failedMembers = boundedGroupMemberFlags(remoteRoom?.failedMembers)
+      unackedFailures = boundedGroupMemberFlags(remoteRoom?.unackedFailures)
     } else {
       identity = localRoom || remoteRoom
       const byId = new Map()
@@ -833,6 +1008,14 @@ function mergeGroupChatSyncSnapshots(
       }
       members = [...byId.values()]
       image = Object.prototype.hasOwnProperty.call(localRoom || {}, 'image') ? localRoom.image : remoteRoom?.image
+      failedMembers = {
+        ...boundedGroupMemberFlags(remoteRoom?.failedMembers),
+        ...boundedGroupMemberFlags(localRoom?.failedMembers)
+      }
+      unackedFailures = {
+        ...boundedGroupMemberFlags(remoteRoom?.unackedFailures),
+        ...boundedGroupMemberFlags(localRoom?.unackedFailures)
+      }
     }
     rooms[key] = {
       ...(identity?.name ? { name: identity.name } : {}),
@@ -844,6 +1027,8 @@ function mergeGroupChatSyncSnapshots(
         return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
       }),
       members,
+      failedMembers,
+      unackedFailures,
       revision: Math.max(remoteRevision, localRevision),
       ...(typeof image === 'string' && image ? { image } : {})
     }
@@ -954,6 +1139,8 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
     const members = new Map(
       (Array.isArray(existing.members) ? existing.members : []).map(member => [groupChatSyncMemberKey(member), member])
     )
+    const isPreserved = preserved.has(displayName) || (localName && preserved.has(localName))
+    const stateSource = !isPreserved && remoteRevision >= localRevision ? projected : existing
 
     for (const entry of projected.log) {
       const entryKey = groupChatSyncEntryKey(entry)
@@ -965,7 +1152,6 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
         entries.set(entryKey, entry)
       }
     }
-    const isPreserved = preserved.has(displayName) || (localName && preserved.has(localName))
     if (!isPreserved) {
       if (remoteRevision > localRevision) {
         members.clear()
@@ -998,6 +1184,8 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
       sessions: existing.sessions && typeof existing.sessions === 'object' ? existing.sessions : {},
       stranded: existing.stranded && typeof existing.stranded === 'object' ? existing.stranded : {},
       members: [...members.values()],
+      failedMembers: boundedGroupMemberFlags(stateSource?.failedMembers),
+      unackedFailures: boundedGroupMemberFlags(stateSource?.unackedFailures),
       ...(projectedRoomId || existing.roomId ? { roomId: existing.roomId || projectedRoomId } : {}),
       image: isPreserved
         ? existing.image || null
@@ -1055,6 +1243,8 @@ function durableGroupChatRooms(all = $groupChats.get()) {
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
       stranded: room.stranded || {},
+      failedMembers: room.failedMembers || {},
+      unackedFailures: room.unackedFailures || {},
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
       // remote-sync path (the only caller of this function) loses its
@@ -1250,6 +1440,9 @@ async function pullGroupChatServerState(connectionId = groupChatSyncConnectionId
     deletedRooms: pending?.deletedRooms || []
   })
   $groupChats.set(merged)
+  for (const group of Object.keys(merged)) {
+    refreshGroupNeedsYou(group)
+  }
   await persistGroupChatRooms(merged)
   return true
 }
@@ -1341,6 +1534,9 @@ async function flushGroupChatServerSync(connectionId) {
           deletedRooms: pending?.deletedRooms || []
         })
         $groupChats.set(mergedRooms)
+        for (const group of Object.keys(mergedRooms)) {
+          refreshGroupNeedsYou(group)
+        }
         await persistGroupChatRooms(mergedRooms)
       }
       groupChatSyncRetryCounts.delete(id)
@@ -1377,6 +1573,9 @@ async function flushGroupChatServerSync(connectionId) {
         deletedRooms: pending?.deletedRooms || []
       })
       $groupChats.set(mergedRooms)
+      for (const group of Object.keys(mergedRooms)) {
+        refreshGroupNeedsYou(group)
+      }
       await persistGroupChatRooms(mergedRooms)
     }
     groupChatSyncRetryCounts.delete(id)
@@ -6916,6 +7115,10 @@ function resolveGroupResponders(log, members) {
   let everyone = false
 
   for (const entry of sinceLastUser) {
+    if (entry?.from?.kind === 'system' || entry?.routing === 'none') {
+      continue
+    }
+
     const parsed = parseGroupChatMentions(entry.text, members)
 
     if (parsed.everyone) {
@@ -7000,6 +7203,11 @@ function formatGroupChatLine(entry, viewerName) {
 
   if (entry.from.kind === 'user') {
     return `${entry.from.name || 'User'} (user): ${entry.text}${attached}`
+  }
+
+  if (isGroupMemberFailureEntry(entry)) {
+    const name = normalizeGroupChatFailureText(entry.from.name || 'Member', 128) || 'Member'
+    return `⚠️ ${name} turn failed: ${entry.text}${attached}`
   }
 
   const suffix = entry.from.name === viewerName ? ' (you)' : ''
@@ -7091,6 +7299,8 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
         // must too — otherwise a window restart silently releases a bot the
         // user explicitly stopped.
         holds: room.holds || {},
+        failedMembers: room.failedMembers || {},
+        unackedFailures: room.unackedFailures || {},
         // Source-qualified member descriptors keep the room whole when the
         // active connection changes and today's local members become remote.
         members: Array.isArray(room.members) ? room.members : [],
@@ -7107,7 +7317,11 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
     /* storage unavailable — room survives for this window only */
   }
   if (sync) {
-    scheduleGroupChatServerSync(all, { changedRooms: [group] })
+    try {
+      scheduleGroupChatServerSync(all, { changedRooms: [group] })
+    } catch (error) {
+      reportGroupChatNoticeError(error, 'Could not synchronise the group chat')
+    }
   }
 
   return next
@@ -7164,10 +7378,7 @@ async function disbandGroupChat(group, members) {
   // Retire the room's MAIN-window tab too (host.openWorkspace path).
   closeGroupChatMainTab(group)
 
-  const needs = { ...$groupNeedsYou.get() }
-
-  delete needs[group]
-  $groupNeedsYou.set(needs)
+  removeGroupNeedsYou(group)
   clearGroupClarify(group)
 
   // Persist the room map WITHOUT the disbanded room so it can't come back
@@ -7183,6 +7394,8 @@ async function disbandGroupChat(group, members) {
           sessions: room.sessions || {},
           sessionOwners: room.sessionOwners || {},
           members: Array.isArray(room.members) ? room.members : [],
+          failedMembers: room.failedMembers || {},
+          unackedFailures: room.unackedFailures || {},
           roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
           image: room.image || null,
           syncRevision: Math.max(0, Number(room.syncRevision || 0))
@@ -7274,13 +7487,7 @@ async function renameGroupChat(oldName, newName, members) {
 
   $groupChats.set(all)
 
-  const needs = { ...$groupNeedsYou.get() }
-
-  if (oldName in needs) {
-    needs[next] = needs[oldName]
-    delete needs[oldName]
-    $groupNeedsYou.set(needs)
-  }
+  moveGroupNeedsYouOther(oldName, next)
 
   // Mirrored clarify cards key by group name; drop the old room's — the
   // next poll re-mirrors any still-blocking question under the new name.
@@ -7348,13 +7555,18 @@ function normalizeGroupChatText(text) {
   return trimmed === GROUP_EMPTY_SENTINEL ? GROUP_EMPTY_FRIENDLY : trimmed
 }
 
-function appendGroupChatEntry(group, from, text, thread, images) {
+function isGroupMemberFailureEntry(entry) {
+  return entry?.code === 'member_turn_failed' || entry?.routing === 'none'
+}
+
+function appendGroupChatEntry(group, from, text, thread, images, metadata = {}) {
   const entry = {
     id: groupChatEntryId(),
     at: Date.now(),
     from,
     text: normalizeGroupChatText(text),
-    thread: thread || 'legacy'
+    thread: thread || 'legacy',
+    ...metadata
   }
 
   if (Array.isArray(images) && images.length) {
@@ -7381,10 +7593,55 @@ function appendGroupChatEntry(group, from, text, thread, images) {
 
   // Needs-you: a member addressing @user badges the group header.
   if (from.kind === 'member' && /@user\b/i.test(entry.text)) {
-    $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: true })
+    setGroupNeedsYouOther(group, true)
   }
 
   return entry
+}
+
+function appendGroupMemberFailureNotice(group, member, error, thread) {
+  const memberKey = groupMemberKey(member)
+  const name = normalizeGroupChatFailureText(member?.name || 'Member', 128) || 'Member'
+  const diagnostic = sanitizeGroupChatDiagnostic(error)
+  const noticeFields = {
+    routing: 'none',
+    code: 'member_turn_failed',
+    memberKey,
+    memberHandle: String(botHandle(member.name, member) || member.name || '').slice(0, 128),
+    needsYou: true
+  }
+  const prior = ($groupChats.get()[group] || {}).log?.at(-1)
+  let notice
+
+  try {
+    notice = appendGroupChatEntry(
+      group,
+      { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
+      `⚠️ ${name} turn failed: ${diagnostic}. No automatic retry; mention ${name} in a new user message to try again.`,
+      thread,
+      undefined,
+      noticeFields
+    )
+  } catch (noticeError) {
+    reportGroupChatNoticeError(noticeError, 'Could not save the group member failure notice')
+    return false
+  }
+
+  if (!notice || notice === prior) {
+    return false
+  }
+
+  if (!markGroupFailureNeedsYou(group, memberKey)) {
+    return false
+  }
+
+  try {
+    recordGroupActivity(group, { kind: 'failed', member: member.name, thread, reason: diagnostic })
+  } catch (activityError) {
+    reportGroupChatNoticeError(activityError, 'Could not show the group member failure')
+  }
+
+  return true
 }
 
 /** Fresh room identity for a group. Independent of the editable display
@@ -7673,7 +7930,7 @@ function syncGroupClarify(group, member, state) {
         }
   })
   // A blocked member is a question for the human — badge the room.
-  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: true })
+  setGroupNeedsYouOther(group, true)
 
   return true
 }
@@ -8262,6 +8519,7 @@ async function runGroupChatRounds(group, members, thread) {
   const isCurrent = () => (($groupChats.get()[group] || {}).epoch || 0) === startEpoch
   let posted = 0
   let continuations = 0
+  const failedMembers = new Set(Object.keys(($groupChats.get()[group] || {}).failedMembers || {}))
   // #94478: how this drive ended. 'settled' means quiet consensus (everyone
   // passed with nothing pending); 'capped' means a round/message/continuation
   // cap forced the exit — the activity feed must tell those apart.
@@ -8296,7 +8554,10 @@ async function runGroupChatRounds(group, members, thread) {
       // {before, thread} post-thread.
       const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
       const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
-        .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
+        .filter(member =>
+          !failedMembers.has(groupMemberKey(member)) &&
+          !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member))
+        )
       let spokeThisRound = 0
 
       for (const member of responders) {
@@ -8312,6 +8573,8 @@ async function runGroupChatRounds(group, members, thread) {
         const room = $groupChats.get()[group] || { log: [], watermarks: {} }
         const memberKey = groupMemberKey(member)
         const markKey = `${thread}::${memberKey}`
+        const turnEpoch = room.epoch || 0
+        const anchorId = room.log.length ? room.log[room.log.length - 1].id : null
         const seen = room.watermarks[markKey] || 0
         // Delta: NEW room entries, narrowed to this thread — the member's
         // turn sees only the conversation it's part of.
@@ -8372,27 +8635,13 @@ async function runGroupChatRounds(group, members, thread) {
         })
 
         let reply = null
+        let failure = null
 
         try {
           reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
-
-          // Needs-attention hook (#93091 item 3): a turn that produced a real
-          // reply (or an explicit pass) is a good turn — clear the badge.
-          // A timed-out turn also returns null but never threw; leaving any
-          // prior badge in place there is the conservative choice.
-          if (reply !== null) {
-            clearBotAttention(groupMemberKey(member))
-          }
         } catch (error) {
-          const reason = String(error?.data?.reason || '').trim()
-          recordGroupActivity(group, {
-            kind: 'failed',
-            member: member.name,
-            thread,
-            ...(reason ? { reason } : {})
-          })
-          noteBotAttention(groupMemberKey(member), reason || error?.message || error)
-          reply = null // failure notice is committed below, after the stale-turn gate
+          reply = null
+          failure = error
         }
 
         // #93127: the turn may have finished AFTER a newer user send bumped
@@ -8408,7 +8657,6 @@ async function runGroupChatRounds(group, members, thread) {
         // overshoot after a mid-turn trim and silently commit a stale turn.
         const roomNow = $groupChats.get()[group] || { log: [] }
         const epochNow = roomNow.epoch || 0
-        const anchorId = room.log.length ? room.log[room.log.length - 1].id : null
         const anchorIdx = anchorId === null ? -1 : roomNow.log.findIndex(e => e.id === anchorId)
         // Anchor trimmed away ⇒ every pre-turn entry was dropped, so every
         // surviving entry is newer — scanning the whole log stays exact.
@@ -8417,9 +8665,23 @@ async function runGroupChatRounds(group, members, thread) {
           e => e.from?.kind === 'user' && groupThreadOf(e) === thread
         )
 
-        if (!shouldCommitMemberTurn(startEpoch, epochNow, newerUserEntryInThread)) {
+        if (!shouldCommitMemberTurn(turnEpoch, epochNow, newerUserEntryInThread)) {
           recordGroupActivity(group, { kind: 'cancelled', member: member.name, thread })
           return
+        }
+
+        if (failure) {
+          const committed = appendGroupMemberFailureNotice(group, member, failure, thread)
+
+          if (committed) {
+            failedMembers.add(memberKey)
+            posted += 1
+          }
+        } else if (reply !== null) {
+          // Needs-attention hook (#93091 item 3): only a non-stale successful
+          // turn clears this member's provider attention.
+          clearBotAttention(memberKey)
+          clearGroupFailureNeedsYou(group, memberKey)
         }
 
         // The member has now seen everything up to the pre-reply log length.
@@ -8428,7 +8690,7 @@ async function runGroupChatRounds(group, members, thread) {
           return r
         })
 
-        if (reply !== null && !isGroupPassText(reply)) {
+        if (!failure && reply !== null && !isGroupPassText(reply)) {
           appendGroupChatEntry(
             group,
             { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
@@ -8466,7 +8728,9 @@ async function runGroupChatRounds(group, members, thread) {
           if (citedMembers.length && posted < GROUP_CHAT_MAX_MESSAGES) {
             const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
             const continuationResponders = citedMembers.filter(
-              member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member))
+              member =>
+                !failedMembers.has(groupMemberKey(member)) &&
+                !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member))
             )
 
             for (const member of continuationResponders) {
@@ -8477,6 +8741,8 @@ async function runGroupChatRounds(group, members, thread) {
               const room = $groupChats.get()[group] || { log: [], watermarks: {} }
               const memberKey = groupMemberKey(member)
               const markKey = `${thread}::${memberKey}`
+              const turnEpoch = room.epoch || 0
+              const anchorId = room.log.length ? room.log[room.log.length - 1].id : null
               const seen = room.watermarks[markKey] || 0
               const delta = room.log.slice(seen).filter(e => groupThreadOf(e) === thread)
 
@@ -8509,21 +8775,38 @@ async function runGroupChatRounds(group, members, thread) {
               })
 
               let continuationReply = null
+              let failure = null
 
               try {
                 continuationReply = await runGroupChatMemberTurn(group, member, prompt, thread)
-
-                if (continuationReply !== null) {
-                  clearBotAttention(memberKey)
-                }
               } catch (error) {
-                recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
-                noteBotAttention(memberKey, error?.message || error)
                 continuationReply = null
+                failure = error
               }
 
-              if (!isCurrent()) {
+              const roomNow = $groupChats.get()[group] || { log: [] }
+              const epochNow = roomNow.epoch || 0
+              const anchorIdx = anchorId === null ? -1 : roomNow.log.findIndex(entry => entry.id === anchorId)
+              const turnTail = anchorIdx >= 0 ? roomNow.log.slice(anchorIdx + 1) : roomNow.log
+              const newerUserEntryInThread = turnTail.some(
+                entry => entry.from?.kind === 'user' && groupThreadOf(entry) === thread
+              )
+
+              if (!shouldCommitMemberTurn(turnEpoch, epochNow, newerUserEntryInThread)) {
+                recordGroupActivity(group, { kind: 'cancelled', member: member.name, thread })
                 return
+              }
+
+              if (failure) {
+                const committed = appendGroupMemberFailureNotice(group, member, failure, thread)
+
+                if (committed) {
+                  failedMembers.add(memberKey)
+                  posted += 1
+                }
+              } else if (continuationReply !== null) {
+                clearBotAttention(memberKey)
+                clearGroupFailureNeedsYou(group, memberKey)
               }
 
               updateGroupChat(group, r => {
@@ -8531,7 +8814,7 @@ async function runGroupChatRounds(group, members, thread) {
                 return r
               })
 
-              if (continuationReply !== null && !isGroupPassText(continuationReply)) {
+              if (!failure && continuationReply !== null && !isGroupPassText(continuationReply)) {
                 appendGroupChatEntry(
                   group,
                   { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
@@ -8647,7 +8930,7 @@ function sendToGroupChat(group, members, text, thread, images) {
 
   const target = thread || mintGroupThreadId()
 
-  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
+  setGroupNeedsYouOther(group, false)
   // Refresh the durable room roster on every send. This backfills rooms made
   // by older Desktop builds and keeps the gateway mirror complete even when
   // members overlap across multiple groups.
@@ -8656,6 +8939,8 @@ function sendToGroupChat(group, members, text, thread, images) {
     return room
   })
   const sent = appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target, attached)
+  const mentions = parseGroupChatMentions(trimmed, members)
+  releaseGroupFailedMembers(group, mentions)
 
   const wasRunning = ($groupChats.get()[group] || {}).running === true
 
@@ -8668,7 +8953,7 @@ function sendToGroupChat(group, members, text, thread, images) {
     // releases it. Bot replies never flow through this function.
     room.holds = applyGroupHoldDirective(
       room.holds,
-      parseGroupChatMentions(trimmed, members),
+      mentions,
       trimmed,
       { at: sent?.at, byMessageId: sent?.id, thread: target },
       members.map(member => groupMemberKey(member))
@@ -14702,7 +14987,7 @@ function openGroupChat(group) {
   // The in-flight host navigation may complete underneath this workspace,
   // but it may not later close or visually steal the room the user chose.
   cancelBotOpen()
-  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
+  setGroupNeedsYouOther(group, false)
   const ownerKey = groupWorkspaceOwnerKey(group)
   setBotsWorkspaceOwner(ownerKey, null, 'New group conversations start in the group composer.')
 
@@ -15846,8 +16131,10 @@ export default {
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   // #93129: rehydrate sticky stop holds with the same shape
                   // guard as the other maps — a held bot stays held across
-                  // window restarts until explicitly released.
+                  // bot stays held across window restarts until explicitly released.
                   holds: room.holds && typeof room.holds === 'object' ? room.holds : {},
+                  failedMembers: boundedGroupMemberFlags(room.failedMembers),
+                  unackedFailures: boundedGroupMemberFlags(room.unackedFailures),
                   members: Array.isArray(room.members) ? room.members : [],
                   roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
                   image: typeof room.image === 'string' && room.image ? room.image : null,
@@ -15859,6 +16146,9 @@ export default {
             }
 
             $groupChats.set({ ...rooms, ...$groupChats.get() })
+            for (const roomName of Object.keys(rooms)) {
+              refreshGroupNeedsYou(roomName)
+            }
 
             // #93492: annotate rows orphaned before this build (their
             // connection was deleted while an older Desktop ran, so no

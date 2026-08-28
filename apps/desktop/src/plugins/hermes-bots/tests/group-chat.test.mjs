@@ -323,7 +323,70 @@ test('failed member turn posts a one-line error notice, not silence', async () =
   const notice = log[1]
   assert.equal(notice.from.kind, 'member')
   assert.equal(notice.from.name, 'builder')
-  assert.equal(notice.text, '⚠️ @user — my last turn failed (gateway hiccup); please mention me again.')
+  assert.equal(notice.routing, 'none')
+  assert.equal(notice.code, 'member_turn_failed')
+  assert.equal(notice.memberKey, 'builder')
+  assert.equal(notice.text, '⚠️ builder turn failed: gateway hiccup. No automatic retry; mention builder in a new user message to try again.')
+  assert.doesNotMatch(notice.text, /@[a-z0-9][a-z0-9._-]*/i)
+  assert.doesNotMatch(notice.text, /[\r\n]/)
+
+  const compact = gc.groupChatSyncSnapshot({ Flaky: { log: [notice], members: MEMBERS } })
+    .rooms['name:Flaky'].log[0]
+  assert.equal(compact.from.kind, 'member', 'projection must not turn a failure into a user send')
+  assert.equal(compact.routing, 'none')
+  assert.equal(compact.code, 'member_turn_failed')
+
+  // The routing guard is independent of the sanitiser: even a legacy notice
+  // containing a handle must not pull a member into the next round.
+  const polluted = { ...notice, text: '@builder', routing: 'none' }
+  const responders = gc.resolveGroupResponders([
+    { from: { kind: 'user', name: 'You' }, text: 'status', at: 1 },
+    polluted
+  ], MEMBERS)
+  assert.deepEqual(responders.map(member => member.name), MEMBERS.map(member => member.name))
+})
+
+test('failed members stay out of everyone-default until a user names them; success clears only that failure', async () => {
+  const failOnce = new Set(['research', 'builder'])
+  const gc = load(profile => {
+    if (failOnce.delete(profile)) {
+      throw new Error(`${profile} unavailable`)
+    }
+    return '(pass)'
+  })
+  const members = [{ name: 'research', title: '' }, { name: 'builder', title: '' }]
+  const waitForRoom = async () => {
+    for (let i = 0; i < 300 && (gc.$groupChats.get().Failures || {}).running; i++) {
+      await new Promise(resolve => setImmediate(resolve))
+    }
+  }
+
+  gc.sendToGroupChat('Failures', members, 'status')
+  await waitForRoom()
+  assert.deepEqual(Object.keys(gc.$groupChats.get().Failures.unackedFailures).sort(), ['builder', 'research'])
+  assert.deepEqual(Object.keys(gc.$groupChats.get().Failures.failedMembers).sort(), ['builder', 'research'])
+
+  // A later user message with no member mention clears the blanket badge
+  // state only; it must not acknowledge either member's failure.
+  gc.sendToGroupChat('Failures', members, 'status again')
+  await waitForRoom()
+  assert.deepEqual(Object.keys(gc.$groupChats.get().Failures.unackedFailures).sort(), ['builder', 'research'])
+  assert.equal(gc.calls.filter(call => call.profile === 'builder').length, 1, 'failed builder is excluded from everyone-default')
+
+  // Naming one failed member releases and successfully acknowledges only that
+  // member. The other failed member remains excluded and still needs-you.
+  gc.sendToGroupChat('Failures', members, '@research retry this')
+  await waitForRoom()
+  assert.equal(gc.calls.filter(call => call.profile === 'research').length, 2)
+  assert.equal(gc.calls.filter(call => call.profile === 'builder').length, 1)
+  assert.equal(JSON.stringify(gc.$groupChats.get().Failures.unackedFailures), JSON.stringify({ builder: true }))
+  assert.equal(gc.$groupNeedsYou.get().Failures, true)
+
+  gc.sendToGroupChat('Failures', members, '@builder retry this')
+  await waitForRoom()
+  assert.equal(gc.calls.filter(call => call.profile === 'builder').length, 2)
+  assert.equal(JSON.stringify(gc.$groupChats.get().Failures.unackedFailures), JSON.stringify({}))
+  assert.equal(gc.$groupNeedsYou.get().Failures, false)
 })
 
 test('repeated failed member turns stay within the per-run message cap', async () => {

@@ -85,7 +85,9 @@ def test_explanation_for_review_input_budget_exhausted():
     )
     assert out.startswith("⚠️ No reply: ")
     assert "input budget was exhausted" in out
-    assert "continue" in out
+    assert "continue" not in out.lower()
+    assert "resume" not in out.lower()
+    assert "start a new review" in out.lower()
 
 
 
