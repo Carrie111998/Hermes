@@ -3665,9 +3665,42 @@ def _record_npm_lockfile_hash(hermes_root: Path) -> None:
     except OSError:
         logger.debug("Could not write npm lockfile hash cache")
 
+def _finish_current_checkout_update(
+    print_completion,
+    *,
+    completion_message: str,
+    had_desktop_app_before_update: bool,
+    assume_yes: bool = False,
+    gateway_mode: bool = False,
+    pre_update_snapshot_id: str | None = None,
+) -> bool:
+    """Run the shared tail for current-checkout repair and re-exec paths."""
+    desktop_build_ok = _rebuild_desktop_after_update(
+        _m().PROJECT_ROOT / "apps" / "desktop",
+        had_desktop_app_before_update=had_desktop_app_before_update,
+    )
+    _check_and_apply_config_migration(
+        assume_yes=assume_yes,
+        gateway_mode=gateway_mode,
+        pre_update_snapshot_id=pre_update_snapshot_id,
+    )
+    if desktop_build_ok:
+        print_completion(completion_message)
+    else:
+        _print_update_summary(
+            node_failures=[],
+            desktop_build_ok=False,
+            pre_update_version=None,
+        )
+    if gateway_mode:
+        _write_gateway_update_exit_code(desktop_build_ok)
+    return desktop_build_ok
+
+
 def _repair_node_deps_on_current_checkout(
     print_completion,
     *,
+    had_desktop_app_before_update: bool,
     assume_yes: bool = False,
     gateway_mode: bool = False,
     pre_update_snapshot_id: str | None = None,
@@ -3696,12 +3729,14 @@ def _repair_node_deps_on_current_checkout(
     # _update_node_dependencies call site; it staleness-checks internally,
     # so this is a no-op when nothing changed.
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-    _check_and_apply_config_migration(
+    _finish_current_checkout_update(
+        print_completion,
+        completion_message="✓ Already up to date!",
+        had_desktop_app_before_update=had_desktop_app_before_update,
         assume_yes=assume_yes,
         gateway_mode=gateway_mode,
         pre_update_snapshot_id=pre_update_snapshot_id,
     )
-    print_completion("✓ Already up to date!")
 
 
 def _update_node_dependencies() -> list[str]:
@@ -7940,18 +7975,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
                     print("✓ Dependencies repaired!")
-                    _check_and_apply_config_migration(
+                    _finish_current_checkout_update(
+                        _print_update_completion,
+                        completion_message="✓ Update complete!",
+                        had_desktop_app_before_update=had_desktop_app_before_update,
                         assume_yes=assume_yes,
                         gateway_mode=gateway_mode,
                         pre_update_snapshot_id=pre_update_snapshot_id,
                     )
-                    _print_update_completion("✓ Update complete!")
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
                 _repair_node_deps_on_current_checkout(
                     _print_update_completion,
+                    had_desktop_app_before_update=had_desktop_app_before_update,
                     assume_yes=assume_yes,
                     gateway_mode=gateway_mode,
                     pre_update_snapshot_id=pre_update_snapshot_id,

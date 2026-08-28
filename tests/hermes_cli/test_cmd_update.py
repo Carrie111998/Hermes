@@ -1007,6 +1007,54 @@ class TestNodeRuntimeNpmResolution:
             env=ANY,
         )
 
+    def test_current_checkout_completion_rebuilds_desktop_before_success(self):
+        """Repair/re-exec paths must run the same Desktop tail as a pulled update."""
+        from hermes_cli import update_cmd
+
+        completed = []
+        with patch.object(
+            update_cmd, "_rebuild_desktop_after_update", return_value=True
+        ) as rebuild, patch.object(
+            update_cmd, "_check_and_apply_config_migration"
+        ) as migrate:
+            update_cmd._finish_current_checkout_update(
+                completed.append,
+                completion_message="✓ Update complete!",
+                had_desktop_app_before_update=True,
+                assume_yes=True,
+                gateway_mode=False,
+                pre_update_snapshot_id="snapshot-1",
+            )
+
+        rebuild.assert_called_once_with(
+            PROJECT_ROOT / "apps" / "desktop",
+            had_desktop_app_before_update=True,
+        )
+        migrate.assert_called_once_with(
+            assume_yes=True,
+            gateway_mode=False,
+            pre_update_snapshot_id="snapshot-1",
+        )
+        assert completed == ["✓ Update complete!"]
+
+    def test_current_checkout_completion_withholds_success_after_desktop_failure(
+        self, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        completed = []
+        with patch.object(
+            update_cmd, "_rebuild_desktop_after_update", return_value=False
+        ), patch.object(update_cmd, "_check_and_apply_config_migration"):
+            update_cmd._finish_current_checkout_update(
+                completed.append,
+                completion_message="✓ Update complete!",
+                had_desktop_app_before_update=True,
+            )
+
+        assert completed == []
+        assert "Update partially complete" in capsys.readouterr().out
+
     def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
         """The Windows ZIP fallback keeps Desktop intact when replacing ``apps/``.
 
