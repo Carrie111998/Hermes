@@ -221,7 +221,7 @@ With multiple profiles: saving a root-cascading map asks whether the edit applie
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `writeFrequency` | string/int | `"async"` | `"async"` (background), `"turn"` (sync per turn), `"session"` (batch on end), or integer N (every N turns) |
-| `saveMessages` | bool | `true` | Persist messages to Honcho API |
+| `saveMessages` | bool | `true` | Persist messages to Honcho API. When `false`, all automatic writes are skipped — raw turns (`sync_turn`), conclusion mirroring (`on_memory_write`), and session-end/shutdown flushes — while read and tools paths stay fully functional. |
 
 ### Session Resolution
 
