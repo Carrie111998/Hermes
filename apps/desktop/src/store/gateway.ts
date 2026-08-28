@@ -711,7 +711,9 @@ async function sharedPrimaryRoute(profile: string): Promise<boolean> {
   const desktop = window.hermesDesktop
 
   if (!desktop) {
-    return false
+    // Browser Dashboard has no Electron IPC for secondary sockets. Its
+    // same-origin gateway multiplexes named profiles over the primary socket.
+    return true
   }
 
   try {

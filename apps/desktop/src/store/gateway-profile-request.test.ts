@@ -129,6 +129,19 @@ describe('requestGatewayForProfile', () => {
     expect($gateway.get()).toBe(primary)
   })
 
+  it('uses the same-origin primary socket and adds profile scope in the browser Dashboard', async () => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+    await ensureGatewayForProfile('default')
+
+    const result = await requestGatewayForProfile('venture', 'session.list', { limit: 20, profile: 'wrong' })
+
+    expect(result).toEqual({ method: 'session.list', params: { limit: 20, profile: 'venture' } })
+    expect(primary.request).toHaveBeenCalledWith('session.list', { limit: 20, profile: 'venture' })
+    expect(secondaryGateways).toHaveLength(0)
+    expect($gateway.get()).toBe(primary)
+  })
+
   it('serializes concurrent requests while a secondary gateway is connecting', async () => {
     let releaseConnect: () => void = () => undefined
     connectGate = new Promise<void>(resolve => {
