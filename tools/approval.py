@@ -2004,7 +2004,10 @@ def _scan_dollar_paren_end(command: str, start: int) -> int | None:
 
 
 def _scan_parameter_expansion_end(
-    command: str, start: int, limit: int | None = None
+    command: str,
+    start: int,
+    limit: int | None = None,
+    outer_double_quoted: bool = False,
 ) -> int | None:
     """Return the offset after a balanced ``${...}`` parameter expansion."""
     end = len(command) if limit is None else min(limit, len(command))
@@ -2025,7 +2028,7 @@ def _scan_parameter_expansion_end(
                 quote = None
                 i += 1
                 continue
-        elif ch in ("'", '"'):
+        elif ch == '"' or (ch == "'" and not outer_double_quoted):
             quote = ch
             i += 1
             continue
@@ -2040,7 +2043,12 @@ def _scan_parameter_expansion_end(
             i = nested_end
             continue
         if command.startswith("${", i):
-            nested_end = _scan_parameter_expansion_end(command, i, end)
+            nested_end = _scan_parameter_expansion_end(
+                command,
+                i,
+                end,
+                outer_double_quoted=outer_double_quoted or quote == '"',
+            )
             if nested_end is None:
                 return None
             i = nested_end
@@ -2240,7 +2248,9 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
 def _iter_shell_command_starts(command: str):
     starts = [0]
 
-    def scan_parameter_expansion(start: int, end: int) -> None:
+    def scan_parameter_expansion(
+        start: int, end: int, outer_double_quoted: bool = False
+    ) -> None:
         """Record executable substitutions without treating ``${`` as a group."""
         quote: str | None = None
         i = start
@@ -2259,7 +2269,7 @@ def _iter_shell_command_starts(command: str):
                     quote = None
                     i += 1
                     continue
-            elif ch in ("'", '"'):
+            elif ch == '"' or (ch == "'" and not outer_double_quoted):
                 quote = ch
                 i += 1
                 continue
@@ -2275,9 +2285,19 @@ def _iter_shell_command_starts(command: str):
                 i = nested_end if nested_end is not None else end
                 continue
             if command.startswith("${", i):
-                nested_end = _scan_parameter_expansion_end(command, i, end)
+                nested_double_quoted = outer_double_quoted or quote == '"'
+                nested_end = _scan_parameter_expansion_end(
+                    command,
+                    i,
+                    end,
+                    outer_double_quoted=nested_double_quoted,
+                )
                 nested_limit = nested_end - 1 if nested_end is not None else end
-                scan_parameter_expansion(i + 2, nested_limit)
+                scan_parameter_expansion(
+                    i + 2,
+                    nested_limit,
+                    outer_double_quoted=nested_double_quoted,
+                )
                 i = nested_end if nested_end is not None else end
                 continue
             if ch == "`":
@@ -2320,9 +2340,13 @@ def _iter_shell_command_starts(command: str):
                     i = nested_end if nested_end is not None else end
                     continue
                 if command.startswith("${", i):
-                    nested_end = _scan_parameter_expansion_end(command, i, end)
+                    nested_end = _scan_parameter_expansion_end(
+                        command, i, end, outer_double_quoted=True
+                    )
                     nested_limit = nested_end - 1 if nested_end is not None else end
-                    scan_parameter_expansion(i + 2, nested_limit)
+                    scan_parameter_expansion(
+                        i + 2, nested_limit, outer_double_quoted=True
+                    )
                     i = nested_end if nested_end is not None else end
                     continue
                 i += 1
@@ -2373,7 +2397,9 @@ def _iter_shell_command_starts(command: str):
             yield start
 
 
-def _mark_command_starts(command: str, marker: str = "\n") -> str:
+def _mark_command_starts(
+    command: str, marker: str = "\n", protect_line_continuations: bool = False
+) -> str:
     """Insert a newline before each real (quote-aware) command start.
 
     ``\\n`` is already a ``_CMDPOS`` separator, so this rewrites subshell
@@ -2395,7 +2421,12 @@ def _mark_command_starts(command: str, marker: str = "\n") -> str:
     parts: list[str] = []
     previous = 0
     for offset in offsets:
-        parts.extend((command[previous:offset], marker))
+        effective_marker = (
+            f" {marker}"
+            if protect_line_continuations and command[offset - 1] == "\\"
+            else marker
+        )
+        parts.extend((command[previous:offset], effective_marker))
         previous = offset
     parts.append(command[previous:])
     return "".join(parts)
@@ -2554,10 +2585,10 @@ def _command_detection_variants(command: str):
     # still intact, then normalize the already-marked spelling. Otherwise a
     # valid data escape such as grep's `[^\"]` can become a quote delimiter
     # before this pass and hide a real command that follows the grep segment.
-    # A leading space keeps an inserted marker from becoming a backslash-newline
-    # continuation when the preceding shell token ends in a literal backslash.
+    # Protect only markers preceded by a backslash; adding spaces at every
+    # boundary needlessly inflates the hot path for long compound commands.
     marked = _normalize_command_for_detection(
-        _mark_command_starts(quote_faithful, marker=" \n")
+        _mark_command_starts(quote_faithful, protect_line_continuations=True)
     )
     if marked != normalized and marked not in seen:
         seen.add(marked)

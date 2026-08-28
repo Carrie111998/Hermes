@@ -693,6 +693,7 @@ def test_destructive_command_after_valid_quoted_grep_remains_blocked():
         r"${missing:-$(rm -rf /)}",
         r"${missing:-`rm -rf /`}",
         r"${outer:-${inner:-$(rm -rf /)}}",
+        r'''"${missing:-'$(printf safe; rm -rf /)'}"''',
     ],
 )
 def test_valid_quoted_grep_cannot_hide_expanded_root_delete(
