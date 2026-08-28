@@ -254,7 +254,7 @@ TOOLSETS = {
         "tools": [
             "read_terminal", "close_terminal",
             "open_preview", "close_preview", "read_preview", "drive_preview", "annotate_preview",
-            "read_window_below",
+            "read_window_below", "annotate_screen",
             "focus_pane", "react_to_message",
             "setup_mcp", "tour", "tip",
         ],

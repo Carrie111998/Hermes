@@ -169,6 +169,47 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
     return true
   }
 
+  if (event.type === 'screen.annotate.request') {
+    // annotate_screen tool: draw instruction marks on the transparent
+    // click-through overlay above the app behind the Hermes window. Main owns
+    // window enumeration, coordinate mapping, and the overlay window — ask it
+    // over IPC and answer. Active session only: a background turn must never
+    // paint on the user's screen (desktop AGENTS.md: offer, don't hijack).
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+    if (requestId) {
+      const annotate = window.hermesDesktop?.screenAnnotations?.annotate
+
+      const answer = (result: unknown) =>
+        $gateway.get()?.request('screen.annotate.respond', {
+          request_id: requestId,
+          text: result ? JSON.stringify(result) : ''
+        })
+
+      if (isActiveEvent) {
+        const request = {
+          action: payload?.action,
+          frame: payload?.frame,
+          shapes: payload?.shapes,
+          target: payload?.target,
+          ttl_seconds: payload?.ttl_seconds
+        }
+
+        // .catch: ipcRenderer.invoke rejects on an older shell without the
+        // handler or a main-side throw — without an empty answer the tool
+        // would stall its full timeout.
+        void Promise.resolve(annotate ? annotate(request) : null).then(answer, () => answer(null))
+      } else {
+        void answer({
+          error: 'Screen annotations only draw in the session the user is looking at.',
+          success: false
+        })
+      }
+    }
+
+    return true
+  }
+
   if (event.type === 'tour.request') {
     // tour tool: run one guided-tour action (highlight/step/discover) via
     // driver.js — on the app's own DOM or inside the preview pane's guest

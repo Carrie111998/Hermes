@@ -1566,6 +1566,16 @@ def _(rid, params: dict) -> dict:
     return _respond(rid, params, "text", allow_expired=True)
 
 
+@method("screen.annotate.respond")
+def _(rid, params: dict) -> dict:
+    # `text` is a JSON string with the annotation's outcome (annotate_screen
+    # tool) — the resolved target window, how many shapes went up, or an error
+    # naming what could not be resolved. allow_expired=True for the same
+    # reason as terminal.read: a first-time overlay window spawn on a slow
+    # machine can lose the race with the tool's bounded wait.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
 @method("mcp.setup.respond")
 def _(rid, params: dict) -> dict:
     # `result` is a JSON string of the setup card's outcome ({status, server,

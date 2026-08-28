@@ -731,6 +731,13 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
                 "user's browser rather than opening yours with "
                 "browser_navigate."
             )
+    if "annotate_screen" in names:
+        sentences.append(
+            "When they ask where something is or what to do next in that "
+            "app, annotate_screen draws the answer straight onto their "
+            "screen — a red circle on the piece, an arrow to the square — "
+            "which lands better than prose coordinates."
+        )
     sentences.append(
         "This is a prior, not a rule: when the request names its own target, "
         "follow the request.]"

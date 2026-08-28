@@ -3532,6 +3532,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "annotate_screen":
+        def _execute(next_args: dict) -> Any:
+            from tools.annotate_screen_tool import annotate_screen_tool as _annotate_screen_tool
+            return _finish_agent_tool(
+                _annotate_screen_tool(
+                    action=next_args.get("action", "draw"),
+                    target=next_args.get("target"),
+                    frame_width=next_args.get("frame_width"),
+                    frame_height=next_args.get("frame_height"),
+                    shapes=next_args.get("shapes"),
+                    ttl_seconds=next_args.get("ttl_seconds"),
+                    callback=getattr(agent, "annotate_screen_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "tour":
         def _execute(next_args: dict) -> Any:
             from tools.tour_tool import tour_tool as _tour_tool
