@@ -243,6 +243,115 @@ class TestResolveDeliveryTarget:
         }
 
 
+    def test_named_telegram_private_dm_topic_target_is_parsed(self):
+        """``telegram:<positive_chat_id>:<topic_name>`` splits into chat + topic name.
+
+        Regression for #80483: the topic name is a non-numeric label, not a
+        numeric thread id, so it must not be swallowed into the chat id.
+        """
+        job = {"deliver": "telegram:722341991:Debug"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name", return_value=None
+        ):
+            result = _resolve_delivery_target(job)
+        assert result == {
+            "platform": "telegram",
+            "chat_id": "722341991",
+            "thread_id": "Debug",
+            "_resolved_from": "explicit",
+        }
+
+
+class TestNamedTelegramTopicCronDelivery:
+    """Cron delivery of a named Telegram private-DM topic target (#80483).
+
+    ``telegram:<positive_chat_id>:<topic_name>`` must be resolved to a real
+    thread id through the live adapter (ensure_dm_topic) before text/media
+    delivery, and must fail closed when no live adapter is available.
+    """
+
+    def _telegram_cfg(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        return mock_cfg
+
+    def _run_delivery(self, adapter, *, loop_running=True, deliver="telegram:722341991:Debug"):
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        mock_cfg = self._telegram_cfg()
+        loop = MagicMock()
+        loop.is_running.return_value = loop_running
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            try:
+                import asyncio as _asyncio
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        job = {
+            "id": "named-topic-job",
+            "name": "Named Topic",
+            "deliver": deliver,
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            return _deliver_result(
+                job, "Here is the brief.",
+                adapters={Platform.TELEGRAM: adapter}, loop=loop,
+            )
+
+    def _telegram_adapter(self, resolved_thread_id: str | None = "38049"):
+        adapter = AsyncMock()
+        adapter.ensure_dm_topic = AsyncMock(return_value=resolved_thread_id)
+        adapter.send.return_value = MagicMock(
+            success=True, message_id="msg_1", raw_response=None,
+        )
+        return adapter
+
+    def test_named_topic_resolved_before_delivery(self):
+        """The topic name is resolved via ensure_dm_topic, then the resolved
+        thread id is used for the actual send."""
+        adapter = self._telegram_adapter()
+        err = self._run_delivery(adapter)
+
+        assert err is None
+        adapter.ensure_dm_topic.assert_awaited_once_with("722341991", "Debug")
+        # The send must carry the resolved thread id, not the raw topic name.
+        send_call = adapter.send.await_args
+        assert send_call is not None
+        assert send_call.args[0] == "722341991"
+        assert send_call.kwargs["metadata"]["thread_id"] == "38049"
+
+    def test_named_topic_fails_closed_without_live_adapter(self):
+        """No live adapter -> the named topic cannot be resolved -> fail closed
+        (no silent delivery into General)."""
+        adapter = self._telegram_adapter()
+        err = self._run_delivery(adapter, loop_running=False)
+
+        assert err is not None
+        assert "requires a live gateway adapter" in err
+        adapter.send.assert_not_awaited()
+
+    def test_named_topic_fails_closed_when_resolution_fails(self):
+        """ensure_dm_topic returning no thread id -> fail closed."""
+        adapter = self._telegram_adapter(resolved_thread_id=None)
+        err = self._run_delivery(adapter)
+
+        assert err is not None
+        assert "returned no thread id" in err
+        adapter.send.assert_not_awaited()
+
+
     def test_human_friendly_label_resolved_via_channel_directory(self):
         """deliver: 'whatsapp:Alice (dm)' resolves to the real JID."""
         job = {"deliver": "whatsapp:Alice (dm)"}
