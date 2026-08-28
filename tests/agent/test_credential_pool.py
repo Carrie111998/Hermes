@@ -1887,12 +1887,75 @@ def _persisted_entry(tmp_path) -> dict:
     return store["credential_pool"]["anthropic"][0]
 
 
-def test_reset_statuses_persists_cleared_cooldown_over_disk(tmp_path, monkeypatch):
-    """#84711: `hermes auth reset` must clear the persisted cooldown, not
-    resurrect it. reset_statuses() writes entries with last_status_at=None;
-    the default disk-status merge read that as a stale snapshot and restored
-    the exhausted state from auth.json after every reset."""
+def test_reset_statuses_keeps_disk_only_credential(tmp_path, monkeypatch):
+    """#84711 follow-up: the authoritative reset re-appends disk-only entries
+    via the unchanged tail loop even when preserve_disk_status=False, so a
+    concurrent/other credential on disk must survive reset_statuses()."""
     _seed_exhausted_pool(tmp_path, monkeypatch)
+    store = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    store["credential_pool"]["anthropic"].append(
+        {
+            "id": "cred-D",
+            "label": "disk-only-backup",
+            "auth_type": "api_key",
+            "priority": 1,
+            "source": "manual",
+            "access_token": "sk-D",
+        }
+    )
+    _write_auth_store(tmp_path, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.reset_statuses() == 1
+
+    final = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    final_ids = [entry["id"] for entry in final["credential_pool"]["anthropic"]]
+    assert set(final_ids) == {"cred-A", "cred-D"}
+    persisted_d = next(
+        entry for entry in final["credential_pool"]["anthropic"] if entry["id"] == "cred-D"
+    )
+    assert persisted_d["access_token"] == "sk-D"
+    persisted_a = next(
+        entry for entry in final["credential_pool"]["anthropic"] if entry["id"] == "cred-A"
+    )
+    assert persisted_a["last_status"] is None
+
+
+def test_reset_statuses_persists_cleared_legacy_pool_without_last_status_at(
+    tmp_path, monkeypatch
+):
+    """#84711 follow-up: pools written before last_status_at existed (field
+    absent from the disk copy) must also reset cleanly; the recency merge has
+    no disk timestamp to compare and must not resurrect the legacy cooldown."""
+    now = time.time()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None)
+    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-A",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-A",
+                        "last_status": "exhausted",
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "limit reached",
+                        "last_error_reset_at": now + 3 * 86400,
+                    }
+                ]
+            },
+        },
+    )
 
     from agent.credential_pool import load_pool
 

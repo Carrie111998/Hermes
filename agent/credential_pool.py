@@ -2423,6 +2423,13 @@ class CredentialPool:
                 # entries carry no last_status_at, so the default disk-status
                 # merge would read them as stale and resurrect the cooldown
                 # being reset (#84711).
+                #
+                # Deliberate race window: self._lock only guards our own
+                # mutation. A concurrent writer (e.g. the deferred refresh
+                # path, which runs outside this lock) could persist a newer
+                # cooldown between load_pool() and this _persist(); with
+                # preserve_disk_status=False the reset clobbers it. Operator
+                # intent wins — a reset must clear the cooldown it reports.
                 self._persist(preserve_disk_status=False)
             return count
 

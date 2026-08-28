@@ -1811,6 +1811,12 @@ def write_credential_pool(
     merge would always treat it as stale and resurrect the very cooldown the
     user asked to clear (#84711). Every other writer must keep the default.
     """
+    if not preserve_disk_status:
+        logger.debug(
+            "auth: write_credential_pool(%r) with preserve_disk_status=False — "
+            "disk cooldown/status merge bypassed (explicit operator reset)",
+            provider_id,
+        )
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
