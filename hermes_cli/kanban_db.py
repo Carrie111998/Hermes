@@ -9512,8 +9512,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # timeouts / nonzero exits neither consume nor extend it, and a
     # below-budget violation does not tick the unified
     # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
+    # A per-task ``max_retries`` bounds expensive repeated work, but a clean
+    # exit without a terminal Kanban call needs one recovery turn to receive
+    # its prior-attempt receipt reminder.  Preserve that minimum even when a
+    # bounded producer set ``max_retries=1``; otherwise the task is blocked
+    # before the worker can correct missing bookkeeping.  Systemic same-error
     # crashes still trip immediately.
     auto_blocked: list[str] = []
     if crash_details:
@@ -9533,10 +9536,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 task_override = (
                     trow["max_retries"] if "max_retries" in trow.keys() else None
                 )
-                violation_limit = (
+                violation_limit = max(
+                    2,
                     int(task_override)
                     if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT,
                 )
                 if streak < violation_limit:
                     # Below budget: the task is already back at ``ready``
@@ -12184,6 +12188,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+    # Every detached worker must make a durable terminal transition.  This is
+    # deliberately part of the generated context (rather than profile prose)
+    # so it survives profile/model changes and reaches bounded cron/scout
+    # workers that finish successfully but otherwise exit with rc=0.
+    lines.append("## Completion contract")
+    lines.append(
+        "Before your worker exits, call kanban_complete with a factual result, "
+        "or call kanban_block only for a concrete unresolved prerequisite. "
+        "A no-op or unavailable-evidence outcome is still a completion when "
+        "the task permits it; never exit with only conversational text."
+    )
+    lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has
