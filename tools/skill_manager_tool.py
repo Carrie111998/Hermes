@@ -1590,6 +1590,35 @@ def _skill_manage_batch(
         if preflight is not None:
             return json.dumps(preflight, ensure_ascii=False)
 
+    # --- intra-batch conflict guard: sequential last-wins semantics make
+    # these SILENTLY succeed while discarding earlier ops' work — always a
+    # confused plan, never intentional. Patch CHAINS on one file (each op
+    # building on the previous text) stay legal. ---
+    seen_writes: set = set()
+    touched_skill_md = False
+    for i, op in enumerate(operations):
+        act = op["action"]
+        if act in ("write_file", "remove_file"):
+            key = (op.get("file_path") or "").strip()
+            if key in seen_writes:
+                return tool_error(
+                    f"operations[{i}]: '{key}' already written/removed "
+                    "earlier in this batch — the later op would silently "
+                    "clobber it. One write per file per batch.",
+                    success=False,
+                )
+            seen_writes.add(key)
+        if act in ("create", "patch") and not op.get("file_path"):
+            if act == "patch" and op.get("content") and touched_skill_md:
+                return tool_error(
+                    f"operations[{i}]: full SKILL.md rewrite (content) after "
+                    "an earlier op already modified SKILL.md — the rewrite "
+                    "would silently discard that edit. Put the rewrite "
+                    "first, or fold the change into it.",
+                    success=False,
+                )
+            touched_skill_md = True
+
     # --- approval gate: stage the WHOLE batch as one pending write ---
     if not _skill_gate_bypass.get():
         try:

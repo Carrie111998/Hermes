@@ -97,6 +97,40 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertFalse(r["success"])
         self.assertIn("capped", r["error"])
 
+    def test_intra_batch_conflict_guard(self):
+        """Same-file double writes and post-edit full rewrites are always
+        a confused plan under last-wins sequencing — rejected BEFORE any
+        side effect. Patch chains and rewrite-first stay legal."""
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        # double write, write+remove: rejected
+        for ops in (
+            [{"action": "write_file", "file_path": "references/a.md", "file_content": "1"},
+             {"action": "write_file", "file_path": "references/a.md", "file_content": "2"}],
+            [{"action": "write_file", "file_path": "references/b.md", "file_content": "x"},
+             {"action": "remove_file", "file_path": "references/b.md"}],
+        ):
+            r = self._call("probe", ops)
+            self.assertFalse(r["success"], ops)
+            self.assertIn("clobber", r["error"])
+        # patch then full rewrite: rejected; rewrite-first: allowed
+        r = self._call("probe", [
+            {"action": "patch", "old_string": "Step 1.", "new_string": "P."},
+            {"action": "patch", "content": SK.format(n="probe")},
+        ])
+        self.assertFalse(r["success"])
+        self.assertIn("rewrite", r["error"])
+        r = self._call("probe", [
+            {"action": "patch", "content": SK.format(n="probe").replace("Step 1.", "F.")},
+            {"action": "patch", "old_string": "F.", "new_string": "G."},
+        ])
+        self.assertTrue(r["success"], r)
+        # patch chains stay legal
+        r = self._call("probe", [
+            {"action": "patch", "old_string": "G.", "new_string": "H."},
+            {"action": "patch", "old_string": "H.", "new_string": "I."},
+        ])
+        self.assertTrue(r["success"], r)
+
     def test_single_op_path_unchanged(self):
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
         raw = self.smt.skill_manage(
