@@ -334,3 +334,79 @@ def test_delegated_write_is_withheld_when_the_switch_is_off_only_in_the_sense_th
     """Sanity: the switch off is still a no-op for every category."""
     reg = _FakeRegistry({"a": "delegated_write", "b": "write", "c": None})
     assert filter_tools({"a", "b", "c"}, OFF, reg) == {"a", "b", "c"}
+
+
+# ---------------------------------------------------------------------------
+# Two holes found by review of the shipped classification, kept closed here.
+# ---------------------------------------------------------------------------
+
+
+def test_a_config_that_cannot_be_read_is_not_treated_as_off():
+    """CANNOT DETERMINE is not the same answer as OFF.
+
+    routing_enabled used to catch every config-read failure and return False.
+    That reads as "the user did not ask for routing", but the actual state is
+    "we do not know what the user asked for" -- and answering False there hands
+    back patch, write_file, terminal and computer_use on the strength of a YAML
+    syntax error, silently, which is the exact fail-open this module exists to
+    prevent.
+    """
+    import tools.delegate_routing as dr
+
+    class Unreadable:
+        def __call__(self):
+            raise OSError("config.yaml is not readable")
+
+    import sys
+    import types
+
+    stub = types.ModuleType("hermes_cli.config")
+    stub.load_config_readonly = Unreadable()
+    saved = sys.modules.get("hermes_cli.config")
+    sys.modules["hermes_cli.config"] = stub
+    try:
+        with pytest.raises(dr.RoutingConfigUnreadable):
+            routing_enabled()
+
+        # And the filter must not answer either -- it must not silently keep
+        # every mutating tool because the switch could not be evaluated.
+        with pytest.raises(dr.RoutingConfigUnreadable):
+            filter_tools(EVERY_MUTATOR | HARMLESS)
+    finally:
+        if saved is not None:
+            sys.modules["hermes_cli.config"] = saved
+        else:
+            del sys.modules["hermes_cli.config"]
+
+
+def test_a_non_mapping_config_is_not_treated_as_off():
+    """Same reasoning as above for a config that loaded but is not a mapping."""
+    import tools.delegate_routing as dr
+
+    with pytest.raises(dr.RoutingConfigUnreadable):
+        routing_enabled(["not", "a", "mapping"])
+
+
+def test_process_cannot_be_used_to_reach_a_shell_that_is_already_running():
+    """`process` sends arbitrary stdin, so withholding `terminal` is not enough.
+
+    It was declared "none" on the reasoning that it only manages processes
+    STARTED by `terminal`, so withholding `terminal` left it nothing to act on.
+    That misses the case that matters: a shell started BEFORE the switch went
+    on, or from another surface, is still attached, and `process` action
+    `submit` is stdin plus Enter -- which is a command line.
+    """
+    import model_tools  # noqa: F401
+    from tools.registry import registry
+
+    entry = registry._tools.get("process")
+    if entry is None:
+        pytest.skip("process tool not registered in this install")
+
+    assert entry.repo_access == "write", (
+        "process sends arbitrary stdin via its write/submit actions; declaring "
+        "it harmless leaves a route to a running shell while terminal is withheld"
+    )
+    assert "process" not in filter_tools({"process", "read_file"}, ON)
+    # Still available when the switch is off, like everything else.
+    assert "process" in filter_tools({"process", "read_file"}, OFF)

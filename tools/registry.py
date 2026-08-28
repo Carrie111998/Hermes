@@ -236,6 +236,10 @@ class ToolEntry:
         #
         #   "write"  calling it can change the working tree, or run something
         #            that can -- shells, code execution, desktop control.
+        #   "delegated_write"
+        #            it causes repository changes, but through the supervised
+        #            route the switch exists to force, so it stays available
+        #            while routing is on. delegate-wave's own session_start.
         #   "read"   reads repository contents and cannot change them.
         #   "none"   does not touch the repository at all.
         #   None     UNDECLARED. Treated as "write" by the routing filter, which

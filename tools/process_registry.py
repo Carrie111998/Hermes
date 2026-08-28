@@ -3312,5 +3312,18 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
-    repo_access="none",
+    # WRITE, because `write` and `submit` send arbitrary stdin to a running
+    # process. The original reasoning was that this tool only manages processes
+    # STARTED by `terminal`, so withholding `terminal` left it nothing to act
+    # on. That is wrong in the case that matters: a shell started BEFORE the
+    # switch was turned on, or by another surface, is still attached, and
+    # `submit` is stdin plus Enter -- a command line. Withholding `terminal`
+    # while leaving that reachable is the guarantee with a hole in it.
+    #
+    # The cost is that `list`/`poll`/`log`/`wait` go too, so background-process
+    # STATUS can no longer be read while routing is on. Splitting this one tool
+    # into a read half and a mutate half is the way to get that back; until
+    # someone does, the whole tool is withheld, because a per-action capability
+    # is not something the registry can express today.
+    repo_access="write",
 )

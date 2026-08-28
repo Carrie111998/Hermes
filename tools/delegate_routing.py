@@ -153,18 +153,55 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+class RoutingConfigUnreadable(RuntimeError):
+    """The configuration could not be read, so the switch cannot be evaluated.
+
+    Deliberately not a bool. See routing_enabled.
+    """
+
+
 def routing_enabled(config: Mapping[str, Any] | None = None) -> bool:
-    """Is the switch on? Defaults to OFF, so an existing install behaves as it did."""
+    """Is the switch on? An ABSENT key means OFF; an UNREADABLE config raises.
+
+    Those two are different questions and used to share an answer. A missing
+    `route_repo_changes` means the user never asked for routing, and returning
+    False is correct -- that is what keeps an existing install behaving as it
+    did. But a config that cannot be PARSED tells us nothing about what the
+    user asked for, and answering False there means "no policy, hand back
+    patch, write_file, terminal and computer_use" on the strength of a YAML
+    syntax error.
+
+    That is the fail-open this module's own docstring says must not exist, and
+    it is invisible: the tools come back, nothing is logged above debug, and
+    the only trace is a transcript showing Hermes editing a repository it was
+    configured never to touch.
+
+    So a read failure raises. The caller in model_tools.py is deliberately not
+    wrapped in try/except, so this surfaces as a failed turn -- which costs a
+    turn and is obvious, instead of costing the guarantee and being silent.
+    A user who never enabled routing is unaffected in practice: a missing
+    config file does not raise, only a corrupt or unreadable one does.
+    """
     if config is None:
         try:
             from hermes_cli.config import load_config_readonly
 
             config = load_config_readonly()
-        except Exception:
-            logger.debug("delegate routing: config unreadable, treating as off", exc_info=True)
-            return False
+        except Exception as exc:
+            logger.error(
+                "delegate routing: config unreadable, refusing to assume the "
+                "switch is off", exc_info=True,
+            )
+            raise RoutingConfigUnreadable(
+                "cannot read the Hermes config, so delegate-wave routing cannot "
+                "be evaluated; refusing to offer repository-mutating tools"
+            ) from exc
     if not isinstance(config, Mapping):
-        return False
+        # Same reasoning: this is "cannot determine", not "off".
+        raise RoutingConfigUnreadable(
+            f"expected a config mapping, got {type(config).__name__}; "
+            "delegate-wave routing cannot be evaluated"
+        )
     section = config.get("delegate_wave")
     if isinstance(section, Mapping) and "route_repo_changes" in section:
         return _as_bool(section.get("route_repo_changes"))

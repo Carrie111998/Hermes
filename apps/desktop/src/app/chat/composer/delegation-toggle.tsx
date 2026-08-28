@@ -30,10 +30,12 @@ export const ROUTE_REPO_CHANGES_KEY = 'delegate_wave.route_repo_changes'
  * changes is only where you reach it: the decision "should Hermes edit this
  * repository itself" belongs next to the message that is about to ask it to.
  *
- * ABSENT MEANS OFF. The backend defaults this key by absence
- * (`tools/delegate_routing.py`), so an unset config renders an off switch
- * rather than an empty one — see ABSENT_BOOLEAN_FIELDS in settings/helpers.ts
- * for the same reasoning one layer up.
+ * ABSENT MEANS OFF, but UNREADABLE MEANS NEITHER. The backend defaults this key
+ * by absence (`routing_enabled` in `tools/delegate_routing.py`), so an unset
+ * config renders an off switch rather than an empty one. A config it cannot
+ * read at all is a different case: the backend raises there rather than assume
+ * off, and this component likewise renders nothing rather than assert a state
+ * it does not have.
  */
 export function DelegationToggle({ disabled }: { disabled: boolean }) {
   const { t } = useI18n()
