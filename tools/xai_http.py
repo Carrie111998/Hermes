@@ -375,6 +375,29 @@ def resolve_xai_http_credentials(
     except Exception:
         pass
 
+    # Keep ordinary direct-tool resolution aligned with the main runtime's
+    # profile-aware singleton fallback.  Never take this path after a reactive
+    # refresh: the pool may have quarantined the bearer rejected by the server.
+    if not force_refresh:
+        try:
+            import hermes_cli.auth as auth_mod
+
+            singleton = auth_mod.resolve_xai_oauth_runtime_credentials(
+                force_refresh=False,
+            )
+            access_token = str(singleton.get("api_key") or "").strip()
+            if access_token:
+                return {
+                    "provider": "xai-oauth",
+                    "api_key": access_token,
+                    "base_url": str(
+                        singleton.get("base_url")
+                        or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
+                    ).strip().rstrip("/"),
+                }
+        except Exception:
+            pass
+
     try:
         from tools.tool_backend_helpers import resolve_provider_secret
 

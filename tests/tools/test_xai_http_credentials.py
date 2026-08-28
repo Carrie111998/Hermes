@@ -88,6 +88,84 @@ def _install_fake_oauth_pool(monkeypatch, oauth_token: str) -> None:
     monkeypatch.setattr("agent.credential_pool.load_pool", _fake_load_pool)
 
 
+def _install_empty_oauth_pool(monkeypatch) -> None:
+    class _EmptyPool:
+        def select(self):
+            return None
+
+        def try_refresh_matching(self, _hint):
+            return None
+
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool", lambda _provider_id: _EmptyPool()
+    )
+
+
+def test_default_oauth_uses_runtime_singleton_when_pool_has_no_selectable_entry(
+    monkeypatch,
+):
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "tools.xai_http.get_env_value", lambda name, default=None: default
+    )
+    _install_empty_oauth_pool(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
+        lambda **_: {
+            "provider": "xai-oauth",
+            "api_key": "singleton-oauth-token",
+            "base_url": "https://api.x.ai/v1",
+        },
+    )
+
+    creds = resolve_xai_http_credentials()
+
+    assert creds == {
+        "provider": "xai-oauth",
+        "api_key": "singleton-oauth-token",
+        "base_url": "https://api.x.ai/v1",
+    }
+
+
+def test_force_refresh_does_not_resurrect_runtime_singleton(monkeypatch):
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "tools.xai_http.get_env_value", lambda name, default=None: default
+    )
+    monkeypatch.setattr(
+        "tools.tool_backend_helpers.resolve_provider_secret",
+        lambda *_args, **_kwargs: "",
+    )
+    _install_empty_oauth_pool(monkeypatch)
+    singleton_calls = []
+
+    def _record_singleton_call(**kwargs):
+        singleton_calls.append(kwargs)
+        return {
+            "provider": "xai-oauth",
+            "api_key": "rejected-token",
+            "base_url": "https://api.x.ai/v1",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
+        _record_singleton_call,
+    )
+
+    creds = resolve_xai_http_credentials(
+        force_refresh=True,
+        api_key_hint="rejected-token",
+    )
+
+    assert creds["provider"] == "xai"
+    assert creds["api_key"] == ""
+    assert singleton_calls == []
+
+
 def test_prefer_api_key_wins_over_available_oauth(monkeypatch):
     from tools.xai_http import resolve_xai_http_credentials
 
