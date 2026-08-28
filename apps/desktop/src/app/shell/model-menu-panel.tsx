@@ -260,6 +260,7 @@ export function ModelMenuPanel({
       }
       gateway={gateway}
       includeMoa
+      ownerConnectionId={ownerConnectionId}
       profile={profile}
       request={requestGateway}
       sessionId={activeSessionId}
