@@ -166,6 +166,64 @@ describe('MessagingView profile scope', () => {
       $settingsScopeOverride.set(null)
     })
   })
+
+  it("never re-applies the previous scope's in-flight response after the switch", async () => {
+    // #96542, second race: the render-time reset blanks the rows, but a
+    // fetch that started under the OLD scope can still be in flight across
+    // the switch. Without a generation guard its late response re-applies
+    // the previous profile's platforms/pairing under the new scope until
+    // the new fetch wins. Deferred promises let the old fetch resolve
+    // strictly AFTER the switch; its snapshot must never re-enter the DOM.
+    // Pairing shares the guard, so the same shape covers both fetches.
+    const { $settingsScopeOverride } = await import('@/store/settings-scope')
+
+    const platformDeferreds: Array<(value: { platforms: MessagingPlatformInfo[] }) => void> = []
+    const pairingDeferreds: Array<(value: { approved: unknown[]; pending: unknown[] }) => void> = []
+    getMessagingPlatforms.mockImplementation(() => new Promise(resolve => platformDeferreds.push(resolve)))
+    getPairing.mockImplementation(() => new Promise(resolve => pairingDeferreds.push(resolve)))
+
+    $settingsScopeOverride.set(null)
+    await renderMessaging()
+    // Scope A's fetches are deferred (index 0) and stay pending while…
+
+    await act(async () => {
+      $settingsScopeOverride.set('profile-b')
+    })
+    // …the view switches to B, whose fetches are deferred too (index 1).
+
+    await act(async () => {
+      platformDeferreds[0]({ platforms: [platform({ id: 'a-teams', name: 'A Previous Scope' })] })
+      pairingDeferreds[0]({
+        approved: [
+          { age_minutes: 3, platform: 'a-teams', request_id: 'a1', user_id: 'a-1', user_name: 'A Paired User' }
+        ],
+        pending: []
+      })
+    })
+
+    expect(screen.queryByText('A Previous Scope')).toBeNull()
+    expect(screen.queryByText('A Paired User')).toBeNull()
+
+    await act(async () => {
+      platformDeferreds[1]({ platforms: [platform({ id: 'b-teams', name: 'B Current Scope' })] })
+      pairingDeferreds[1]({
+        approved: [
+          { age_minutes: 3, platform: 'b-teams', request_id: 'b1', user_id: 'b-1', user_name: 'B Paired User' }
+        ],
+        pending: []
+      })
+    })
+
+    // The platform name renders in both the list column and the detail
+    // heading; "at least one visible" is the contract.
+    expect(screen.getAllByText('B Current Scope').length).toBeGreaterThan(0)
+    expect(screen.getByText('B Paired User')).toBeTruthy()
+
+    // Let pending work settle and restore the shared store.
+    await act(async () => {
+      $settingsScopeOverride.set(null)
+    })
+  })
 })
 
 describe('MessagingView setup-guide link', () => {

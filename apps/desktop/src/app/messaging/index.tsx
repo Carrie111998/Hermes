@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { StatusDot, type StatusTone } from '@/components/status-dot'
@@ -149,21 +149,34 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const platformIds = useMemo(() => platforms?.map(p => p.id) ?? [], [platforms])
   const [selectedId, setSelectedId] = useRouteEnumParam('platform', platformIds, platformIds[0] ?? '')
 
+  // Generation tag for the two scope-taking fetches below. The render-time
+  // scope switch bumps it, so a fetch that started under the previous scope
+  // can detect it is stale and drop its response instead of re-applying it
+  // under the new scope (#96542: profile A's in-flight request resolving
+  // after a switch to B would repopulate B's just-cleared rows until B's
+  // own fetch wins).
+  const refreshGenerationRef = useRef(0)
+
   const refreshPlatforms = useCallback(
     async (silent = false) => {
       if (!silent) {
         setRefreshing(true)
       }
 
+      const generation = refreshGenerationRef.current
+
       try {
         const result = await getMessagingPlatforms(scopeProfile)
+        if (generation !== refreshGenerationRef.current) {
+          return
+        }
         setPlatforms(result.platforms)
       } catch (err) {
-        if (!silent) {
+        if (!silent && generation === refreshGenerationRef.current) {
           notifyError(err, m.loadFailed)
         }
       } finally {
-        if (!silent) {
+        if (!silent && generation === refreshGenerationRef.current) {
           setRefreshing(false)
         }
       }
@@ -177,8 +190,13 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   // reconnected. Failures stay silent: an older backend without the endpoint
   // should show no rows, not an error banner over a working page.
   const refreshPairing = useCallback(async () => {
+    const generation = refreshGenerationRef.current
+
     try {
       const result = await getPairing(scopeProfile)
+      if (generation !== refreshGenerationRef.current) {
+        return
+      }
       setPairing({ approved: result.approved ?? [], pending: result.pending ?? [] })
     } catch {
       // Leave the last known rows in place rather than blanking them.
@@ -211,6 +229,11 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
 
   if (prevScope !== scopeProfile) {
     setPrevScope(scopeProfile)
+    // Invalidate every fetch still in flight for the previous scope — its
+    // response belongs to a backend the view no longer shows, and applying
+    // it would resurrect the rows cleared below until the new scope's own
+    // fetch lands.
+    refreshGenerationRef.current += 1
     setPlatforms(null)
     setPairing({ approved: [], pending: [] })
     setEdits({})
