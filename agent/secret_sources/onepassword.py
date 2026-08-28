@@ -39,9 +39,11 @@ material is fingerprinted, never stored.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import logging
 import os
+import random
 import shutil
 import subprocess
 import time
@@ -64,8 +66,11 @@ logger = logging.getLogger(__name__)
 # Configuration constants
 # ---------------------------------------------------------------------------
 
-# How long to wait for a single `op read`, in seconds.
-_OP_RUN_TIMEOUT = 30
+# Independent reads share one bounded startup budget. A first attempt can use
+# at most 30 seconds globally; transport failures get one retry inside the
+# 45-second total source-resolution budget.
+_FIRST_ATTEMPT_BUDGET_SECONDS = 30.0
+_TOTAL_FETCH_BUDGET_SECONDS = 45.0
 
 # Default env var the official `op` CLI reads for service-account auth.  Users
 # can point `service_account_token_env` at a different name; we always export
@@ -157,15 +162,20 @@ def _validate_references(
     warnings: List[str] = []
     for name, ref in (references or {}).items():
         if not is_valid_env_name(name):
-            warnings.append(f"Skipping {name!r}: not a valid env-var name")
+            warnings.append(
+                f"Skipping {name!r}: not a valid env-var name (kind=ref_invalid)"
+            )
             continue
         if not isinstance(ref, str):
-            warnings.append(f"Skipping {name!r}: reference is not a string")
+            warnings.append(
+                f"Skipping {name!r}: reference is not a string (kind=ref_invalid)"
+            )
             continue
         cleaned = ref.strip()
         if not cleaned.startswith("op://"):
             warnings.append(
-                f"Skipping {name!r}: {ref!r} is not an op:// secret reference"
+                f"Skipping {name!r}: value is not an op:// secret reference "
+                "(kind=ref_invalid)"
             )
             continue
         valid[name] = cleaned
@@ -258,12 +268,22 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     return env
 
 
+class _OpReadError(RuntimeError):
+    """A classified, reference-free failure safe to surface in logs."""
+
+    def __init__(self, kind: ErrorKind, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 def _run_op_read(
     op: Path,
     reference: str,
     *,
     account: str = "",
     token_value: str = "",
+    child_env: Optional[Dict[str, str]] = None,
+    timeout: float = _FIRST_ATTEMPT_BUDGET_SECONDS,
 ) -> str:
     """Resolve a single ``op://`` reference to its value.
 
@@ -281,27 +301,24 @@ def _run_op_read(
     try:
         proc = subprocess.run(  # noqa: S603 — op path is user-trusted, argv list
             cmd,
-            env=_op_child_env(token_value),
+            env=dict(child_env) if child_env is not None else _op_child_env(token_value),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=_OP_RUN_TIMEOUT,
+            timeout=max(0.01, timeout),
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"op read timed out after {_OP_RUN_TIMEOUT}s for {reference!r}"
-        ) from exc
+        raise _OpReadError(ErrorKind.TIMEOUT, "op read timed out") from exc
     except OSError as exc:
-        raise RuntimeError(f"failed to invoke op: {exc}") from exc
+        raise _OpReadError(
+            ErrorKind.BINARY_MISSING, f"failed to invoke op: {exc}"
+        ) from exc
 
     if proc.returncode != 0:
         err = _scrub(proc.stderr or "")[:200]
-        if err:
-            raise RuntimeError(f"op read failed for {reference!r}: {err}")
-        raise RuntimeError(
-            f"op read exited {proc.returncode} for {reference!r}"
-        )
+        kind = _classify_op_error(err or f"op read exited {proc.returncode}")
+        raise _OpReadError(kind, f"op read failed (kind={kind.value})")
 
     # `op` appends a trailing newline; strip only that so a value with
     # intentional internal/edge spaces survives.  But a value that is empty or
@@ -309,8 +326,67 @@ def _run_op_read(
     # good .env/shell credential with effectively nothing.
     value = (proc.stdout or "").rstrip("\r\n")
     if not value.strip():
-        raise RuntimeError(f"op read returned an empty value for {reference!r}")
+        raise _OpReadError(ErrorKind.EMPTY_VALUE, "op read returned an empty value")
     return value
+
+
+def _retry_jitter_seconds() -> float:
+    return random.uniform(0.1, 0.5)
+
+
+def _run_read_batch(
+    *,
+    op: Path,
+    references: Dict[str, str],
+    account: str,
+    token_value: str,
+    deadline: float,
+) -> Tuple[Dict[str, str], Dict[str, ErrorKind]]:
+    """Resolve refs concurrently without waiting beyond ``deadline``."""
+    if not references:
+        return {}, {}
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining <= 0:
+        return {}, {name: ErrorKind.TIMEOUT for name in references}
+
+    # Capture the active source environment before entering worker threads:
+    # ContextVars do not propagate into ThreadPoolExecutor workers.
+    child_env = _op_child_env(token_value)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(references), 32), thread_name_prefix="op-read"
+    )
+    futures = {
+        executor.submit(
+            _run_op_read,
+            op,
+            ref,
+            account=account,
+            token_value=token_value,
+            child_env=child_env,
+            timeout=remaining,
+        ): name
+        for name, ref in references.items()
+    }
+    values: Dict[str, str] = {}
+    failures: Dict[str, ErrorKind] = {}
+    try:
+        done, pending = concurrent.futures.wait(
+            futures, timeout=max(0.0, deadline - time.monotonic())
+        )
+        for future in done:
+            name = futures[future]
+            try:
+                values[name] = future.result()
+            except _OpReadError as exc:
+                failures[name] = exc.kind
+            except Exception:
+                failures[name] = ErrorKind.INTERNAL
+        for future in pending:
+            failures[futures[future]] = ErrorKind.TIMEOUT
+            future.cancel()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return values, failures
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +403,9 @@ def fetch_onepassword_secrets(
     binary_path: str = "",
     use_cache: bool = True,
     cache_ttl_seconds: float = 300,
+    stale_if_error_seconds: float = 900,
     home_path: Optional[Path] = None,
+    _failure_kinds: Optional[Dict[str, ErrorKind]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
@@ -351,15 +429,28 @@ def fetch_onepassword_secrets(
         _refs_fingerprint(valid),
     )
 
-    if use_cache:
+    stale_candidate: Optional[CachedFetch] = None
+    cache_enabled = use_cache and cache_ttl_seconds > 0
+    if cache_enabled:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
+            logger.info("1Password source cache decision=fresh layer=memory")
             return dict(cached.secrets), warnings
         disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
         if disk_cached is not None:
             # Promote into L1 so later fetches in this process skip the disk read.
             _CACHE[cache_key] = disk_cached
+            logger.info("1Password source cache decision=fresh layer=disk")
             return dict(disk_cached.secrets), warnings
+        if stale_if_error_seconds > 0:
+            stale_candidate = cached
+            if stale_candidate is None:
+                stale_candidate = _DISK_CACHE.read(cache_key, float("inf"), home_path)
+            if stale_candidate is not None and (
+                set(stale_candidate.secrets) != set(valid)
+                or (time.time() - stale_candidate.fetched_at) > stale_if_error_seconds
+            ):
+                stale_candidate = None
 
     op = binary or find_op(binary_path)
     if op is None:
@@ -369,21 +460,93 @@ def fetch_onepassword_secrets(
             "secrets.onepassword.binary_path to its absolute location."
         )
 
-    secrets: Dict[str, str] = {}
-    read_errors = 0
-    for name in sorted(valid):
-        try:
-            secrets[name] = _run_op_read(
-                op, valid[name], account=account, token_value=token_value
-            )
-        except RuntimeError as exc:
-            warnings.append(str(exc))
-            read_errors += 1
+    started = time.monotonic()
+    total_deadline = started + _TOTAL_FETCH_BUDGET_SECONDS
+    first_deadline = min(total_deadline, started + _FIRST_ATTEMPT_BUDGET_SECONDS)
+    secrets, failures = _run_read_batch(
+        op=op,
+        references=valid,
+        account=account,
+        token_value=token_value,
+        deadline=first_deadline,
+    )
+    retryable = {
+        name: valid[name]
+        for name, kind in failures.items()
+        if kind in (ErrorKind.TIMEOUT, ErrorKind.NETWORK)
+    }
+    if retryable and time.monotonic() < total_deadline:
+        jitter = min(
+            _retry_jitter_seconds(),
+            max(0.0, total_deadline - time.monotonic()),
+        )
+        if jitter > 0:
+            time.sleep(jitter)
+        retried, retry_failures = _run_read_batch(
+            op=op,
+            references=retryable,
+            account=account,
+            token_value=token_value,
+            deadline=total_deadline,
+        )
+        secrets.update(retried)
+        for name in retryable:
+            if name in retried:
+                failures.pop(name, None)
+            else:
+                failures[name] = retry_failures.get(name, ErrorKind.TIMEOUT)
 
-    if use_cache and not read_errors and secrets:
+    elapsed = time.monotonic() - started
+    if failures:
+        kinds = sorted({kind.value for kind in failures.values()})
+        logger.warning(
+            "1Password source live resolution incomplete resolved=%d unresolved=%d "
+            "kinds=%s elapsed=%.2fs",
+            len(secrets),
+            len(failures),
+            ",".join(kinds),
+            elapsed,
+        )
+    else:
+        logger.info(
+            "1Password source live resolution complete resolved=%d elapsed=%.2fs",
+            len(secrets),
+            elapsed,
+        )
+
+    if _failure_kinds is not None:
+        _failure_kinds.update(failures)
+
+    if (
+        failures
+        and stale_candidate is not None
+        and all(
+            kind in (ErrorKind.TIMEOUT, ErrorKind.NETWORK)
+            for kind in failures.values()
+        )
+    ):
+        age = max(0.0, time.time() - stale_candidate.fetched_at)
+        logger.warning(
+            "1Password source cache decision=stale-if-error age=%ds unresolved=%d",
+            int(age),
+            len(failures),
+        )
+        warnings.append(
+            f"live resolution had {len(failures)} transport failure(s); "
+            f"using complete stale cache ({int(age)}s old)"
+        )
+        if _failure_kinds is not None:
+            _failure_kinds.clear()
+        return dict(stale_candidate.secrets), warnings
+
+    for name in sorted(failures):
+        warnings.append(f"{name} unresolved (kind={failures[name].value})")
+
+    if cache_enabled and not failures and secrets:
         entry = CachedFetch(secrets=dict(secrets), fetched_at=time.time())
+        persistence_seconds = max(cache_ttl_seconds, stale_if_error_seconds)
         _CACHE[cache_key] = entry
-        _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
+        _DISK_CACHE.write(cache_key, entry, persistence_seconds, home_path)
 
     return secrets, warnings
 
@@ -402,6 +565,7 @@ def apply_onepassword_secrets(
     binary_path: str = "",
     override_existing: bool = True,
     cache_ttl_seconds: float = 300,
+    stale_if_error_seconds: float = 900,
     home_path: Optional[Path] = None,
 ) -> FetchResult:
     """Resolve configured ``op://`` references and set them on ``os.environ``.
@@ -463,6 +627,7 @@ def apply_onepassword_secrets(
             token_env=service_account_token_env,
             binary=binary,
             cache_ttl_seconds=cache_ttl_seconds,
+            stale_if_error_seconds=stale_if_error_seconds,
             home_path=home_path,
         )
     except RuntimeError as exc:
@@ -550,6 +715,10 @@ class OnePasswordSource(SecretSource):
                 "description": "Disk+memory cache TTL; 0 disables",
                 "default": 300,
             },
+            "stale_if_error_seconds": {
+                "description": "Use a complete last-good cache after transport failures",
+                "default": 900,
+            },
             "override_existing": {
                 "description": "Resolved values overwrite .env/shell values",
                 "default": True,
@@ -566,7 +735,10 @@ class OnePasswordSource(SecretSource):
         )
         result.warnings.extend(warnings)
         if not valid:
-            if not warnings:
+            if warnings:
+                result.error = "1Password source has no valid mapped references"
+                result.error_kind = ErrorKind.REF_INVALID
+            else:
                 result.error = (
                     "secrets.onepassword.enabled is true but the env: map is "
                     "empty.  Add ENV_VAR: op://vault/item/field entries."
@@ -597,7 +769,12 @@ class OnePasswordSource(SecretSource):
             ttl = float(cfg.get("cache_ttl_seconds", 300))
         except (TypeError, ValueError):
             ttl = 300.0
+        try:
+            stale_if_error = float(cfg.get("stale_if_error_seconds", 900))
+        except (TypeError, ValueError):
+            stale_if_error = 900.0
 
+        failure_kinds: Dict[str, ErrorKind] = {}
         try:
             secrets, fetch_warnings = fetch_onepassword_secrets(
                 references=valid,
@@ -607,7 +784,9 @@ class OnePasswordSource(SecretSource):
                 ),
                 binary=binary,
                 cache_ttl_seconds=ttl,
+                stale_if_error_seconds=stale_if_error,
                 home_path=home_path,
+                _failure_kinds=failure_kinds,
             )
         except RuntimeError as exc:
             result.error = str(exc)
@@ -616,6 +795,18 @@ class OnePasswordSource(SecretSource):
 
         result.secrets = secrets
         result.warnings.extend(fetch_warnings)
+        if failure_kinds and not secrets:
+            kinds = sorted({kind.value for kind in failure_kinds.values()})
+            result.error = (
+                f"1Password source unresolved {len(failure_kinds)} mapped "
+                f"secret(s) (kinds: {','.join(kinds)})"
+            )
+            unique_kinds = set(failure_kinds.values())
+            result.error_kind = (
+                next(iter(unique_kinds))
+                if len(unique_kinds) == 1
+                else ErrorKind.INTERNAL
+            )
         return result
 
     def remediation(self, kind, cfg: dict) -> str:
@@ -645,15 +836,22 @@ def _classify_op_error(message: str) -> ErrorKind:
     if "not found on path" in lowered or "not an executable" in lowered \
             or "failed to invoke" in lowered:
         return ErrorKind.BINARY_MISSING
+    if any(tok in lowered for tok in ("session expired", "token expired",
+                                      "expired session")):
+        return ErrorKind.AUTH_EXPIRED
     if any(tok in lowered for tok in ("unauthorized", "not signed in",
-                                      "session expired", "authentication",
-                                      "401", "403")):
+                                      "authentication", "permission denied",
+                                      "forbidden", "401", "403")):
         return ErrorKind.AUTH_FAILED
     if "empty value" in lowered:
         return ErrorKind.EMPTY_VALUE
     if any(tok in lowered for tok in ("network", "connection", "resolve host",
                                       "dns")):
         return ErrorKind.NETWORK
+    if any(tok in lowered for tok in ("invalid secret reference",
+                                      "isn't a valid secret reference",
+                                      "could not find item", "could not find field")):
+        return ErrorKind.REF_INVALID
     return ErrorKind.INTERNAL
 
 

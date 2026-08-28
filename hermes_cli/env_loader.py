@@ -514,7 +514,11 @@ def load_hermes_dotenv(
     # in their gateway unit, which takes precedence (override=False below
     # ensures .op.env never clobbers a token already in the environment).
     op_env = home_path / ".op.env"
-    if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
+    if op_env.exists():
+        # Always load the protected bootstrap file so headless op flags reach
+        # child processes even when .env or the service manager already
+        # supplied the token. override=False preserves those higher-priority
+        # values, including OP_SERVICE_ACCOUNT_TOKEN.
         _load_dotenv_with_fallback(op_env, override=False)
 
     if project_env_path and project_env_path.exists():

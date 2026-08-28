@@ -13340,6 +13340,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         startup_retryable_errors: list[str] = []
         _multiplex_on = bool(getattr(self.config, "multiplex_profiles", False))
         _multiplex_skipped_platforms: list[Platform] = []
+        _required_platforms: set[Platform] = set()
+        self._required_platforms = _required_platforms
+        self._required_platform_credentials_ready: set[Platform] = set()
+
+        def _fail_required_startup(
+            names: list[str], *, invalid_config: bool = False
+        ) -> bool:
+            if invalid_config:
+                readiness = ", ".join(f"{name}=invalid_config" for name in sorted(names))
+                reason = f"Invalid gateway.required_platforms configuration: {readiness}"
+            else:
+                readiness = ", ".join(
+                    f"{name}=missing_credential" for name in sorted(names)
+                )
+                reason = f"Required platform bootstrap credential unresolved: {readiness}"
+            logger.error("Required platform readiness: %s", readiness)
+            try:
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+            except Exception:
+                pass
+            self._exit_code = (
+                GATEWAY_FATAL_CONFIG_EXIT_CODE
+                if invalid_config
+                else GATEWAY_SERVICE_RESTART_EXIT_CODE
+            )
+            self._request_clean_exit(reason)
+            self._startup_restore_in_progress = False
+            return True
+
+        # Operators may opt specific messaging surfaces into fail-fast bootstrap
+        # readiness. This check is intentionally credential-only: transient
+        # connect failures still use the existing in-process reconnect path, and
+        # the default empty list preserves fleet/cron-only fail-open behavior.
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+
+        _required_invalid: list[str] = []
+        for _required_name in getattr(self.config, "required_platforms", []):
+            try:
+                _required_platform = Platform(_required_name)
+            except ValueError:
+                _required_invalid.append(_required_name)
+                continue
+            if _required_platform not in PLATFORM_TOKEN_ENV_NAMES:
+                _required_invalid.append(_required_name)
+                continue
+            _required_platforms.add(_required_platform)
+            _required_cfg = self.config.platforms.get(_required_platform)
+            if (
+                _required_cfg is not None
+                and _required_cfg.enabled
+                and _platform_has_bot_credential(_required_platform, _required_cfg)
+            ):
+                self._required_platform_credentials_ready.add(_required_platform)
+
+        if _required_invalid:
+            return _fail_required_startup(_required_invalid, invalid_config=True)
+        _required_missing = _required_platforms - self._required_platform_credentials_ready
+        if _required_missing and not _multiplex_on:
+            return _fail_required_startup(
+                [platform.value for platform in _required_missing]
+            )
+        if _required_platforms and not _required_missing:
+            logger.info(
+                "Required platform readiness: %s",
+                ", ".join(
+                    f"{platform.value}=credential_ready"
+                    for platform in sorted(_required_platforms, key=lambda item: item.value)
+                ),
+            )
         # Initialize and connect each configured platform.
         #
         # Parallel startup connect (#83791): the original code ran a serial for-loop,
@@ -13600,6 +13671,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Startup authority is one phase, not a persistent runner mode.
             # From this point onward every adapter retry is non-evicting.
             self._platform_lock_takeover_on_start = False
+
+        # In multiplex mode a required credential may intentionally live only
+        # in a secondary profile. Defer the decision until those profile configs
+        # have been hydrated, but still distinguish missing bootstrap material
+        # from transient adapter connection failures.
+        if _multiplex_on and _required_platforms:
+            _required_missing = (
+                _required_platforms - self._required_platform_credentials_ready
+            )
+            if _required_missing:
+                return _fail_required_startup(
+                    [platform.value for platform in _required_missing]
+                )
+            logger.info(
+                "Required platform readiness: %s",
+                ", ".join(
+                    f"{platform.value}=credential_ready"
+                    for platform in sorted(
+                        _required_platforms, key=lambda item: item.value
+                    )
+                ),
+            )
 
         # A platform we skipped on the primary for a missing credential was
         # supposed to be picked up by a secondary profile that owns the token.
@@ -16159,6 +16252,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
+            if platform in getattr(
+                self, "_required_platforms", set()
+            ) and _platform_has_bot_credential(platform, platform_config):
+                self._required_platform_credentials_ready.add(platform)
             # Relay is shared process-level ingress in multiplex mode. The
             # active profile owns the one connection; connector-stamped
             # source.profile routes inbound turns to secondary profiles.

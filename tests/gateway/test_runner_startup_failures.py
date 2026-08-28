@@ -3,7 +3,10 @@ from unittest.mock import AsyncMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
+from gateway.restart import (
+    GATEWAY_FATAL_CONFIG_EXIT_CODE,
+    GATEWAY_SERVICE_RESTART_EXIT_CODE,
+)
 from gateway.run import GatewayRunner
 from gateway.status import read_runtime_status
 
@@ -355,6 +358,89 @@ async def test_runner_degrades_gracefully_when_all_adapters_missing(monkeypatch,
         "No adapter could be created" in record.message
         for record in caplog.records
     ), "Expected degraded-mode warning when all adapters are missing"
+
+
+@pytest.mark.asyncio
+async def test_required_telegram_without_resolved_token_exits_for_supervisor_retry(
+    monkeypatch, tmp_path, caplog
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="")},
+        required_platforms=["telegram"],
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert runner.adapters == {}
+    state = read_runtime_status()
+    assert state["gateway_state"] == "startup_failed"
+    assert any(
+        "Required platform readiness: telegram=missing_credential" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_required_telegram_may_resolve_from_secondary_multiplex_profile(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="")},
+        required_platforms=["telegram"],
+        multiplex_profiles=True,
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    async def _start_secondary():
+        runner._required_platform_credentials_ready.add(Platform.TELEGRAM)
+        return 1
+
+    monkeypatch.setattr(runner, "_start_secondary_profile_adapters", _start_secondary)
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is False
+    assert runner.exit_code is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required", ["telegrm", "whatsapp"])
+async def test_invalid_or_unsupported_required_platform_exits_as_fatal_config(
+    monkeypatch, tmp_path, required
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        required_platforms=[required],
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
+
+
+def test_required_platforms_default_fail_open_and_roundtrip():
+    assert GatewayConfig.from_dict({}).required_platforms == []
+    config = GatewayConfig.from_dict(
+        {"gateway": {"required_platforms": ["telegram", "telegram"]}}
+    )
+    assert config.required_platforms == ["telegram"]
+    assert config.to_dict()["required_platforms"] == ["telegram"]
+    assert GatewayConfig.from_dict(
+        {"gateway": {"required_platforms": ["telegrm"]}}
+    ).required_platforms == ["telegrm"]
 
 
 class _NonRetryableFailureAdapter(BasePlatformAdapter):

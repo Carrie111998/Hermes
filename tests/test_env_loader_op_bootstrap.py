@@ -41,6 +41,7 @@ import agent.credential_pool as credential_pool  # noqa: E402
 def _isolate_op_token(monkeypatch):
     """Each test starts with OP_SERVICE_ACCOUNT_TOKEN unset and a clean cache."""
     monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("OP_LOAD_DESKTOP_APP_SETTINGS", raising=False)
     env_loader.reset_secret_source_cache()
     yield
     env_loader.reset_secret_source_cache()
@@ -64,9 +65,57 @@ def test_op_env_autoloads_bootstrap_token_in_cron_context(tmp_path, monkeypatch)
 
     assert os.environ.get("OP_SERVICE_ACCOUNT_TOKEN") is None
 
+    seen_at_source_resolution = {}
+
+    def capture_source_environment(_home):
+        seen_at_source_resolution["token"] = os.environ.get(
+            "OP_SERVICE_ACCOUNT_TOKEN"
+        )
+
+    monkeypatch.setattr(
+        env_loader, "_apply_external_secret_sources", capture_source_environment
+    )
+
     env_loader.load_hermes_dotenv(hermes_home=home)
 
     assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "test-token"
+    assert seen_at_source_resolution["token"] == "test-token"
+
+
+def test_op_env_loads_headless_flags_when_dotenv_already_supplies_token(
+    tmp_path, monkeypatch
+):
+    """Protected op flags load without clobbering the existing bootstrap token."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=dotenv-token\n", encoding="utf-8"
+    )
+    (home / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=op-env-token\n"
+        "OP_LOAD_DESKTOP_APP_SETTINGS=false\n",
+        encoding="utf-8",
+    )
+    seen_at_source_resolution = {}
+
+    def capture_source_environment(_home):
+        seen_at_source_resolution["token"] = os.environ.get(
+            "OP_SERVICE_ACCOUNT_TOKEN"
+        )
+        seen_at_source_resolution["desktop"] = os.environ.get(
+            "OP_LOAD_DESKTOP_APP_SETTINGS"
+        )
+
+    monkeypatch.setattr(
+        env_loader, "_apply_external_secret_sources", capture_source_environment
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert seen_at_source_resolution == {
+        "token": "dotenv-token",
+        "desktop": "false",
+    }
 
 
 

@@ -88,6 +88,37 @@ def _normalize_multiplex_profile_allowlist(value: Any) -> Optional[List[str]]:
     return normalized
 
 
+def _normalize_required_platforms(value: Any) -> List[str]:
+    """Normalize gateway.required_platforms to unique known platform names."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        logger.warning(
+            "Invalid gateway.required_platforms (expected a list, got %s); "
+            "gateway startup will fail until corrected",
+            type(value).__name__,
+        )
+        return ["<invalid-config>"]
+    known = {platform.value for platform in Platform}
+    normalized: List[str] = []
+    for index, entry in enumerate(value):
+        name = str(entry).strip().lower() if isinstance(entry, str) else ""
+        if not name:
+            logger.warning("Skipping invalid gateway.required_platforms entry %r", entry)
+            name = f"<invalid-entry-{index}>"
+        elif name.startswith("<invalid-"):
+            pass
+        elif name not in known:
+            logger.warning(
+                "Unknown gateway.required_platforms entry %r; gateway startup "
+                "will fail until corrected",
+                entry,
+            )
+        if name not in normalized:
+            normalized.append(name)
+    return normalized
+
+
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
 # override. Anything not in either set — and a blank/whitespace value — is
 # treated as "unset" so it falls through to config.yaml rather than silently
@@ -981,6 +1012,9 @@ class GatewayConfig:
     # Optional named-profile allowlist for multiplex mode. None preserves the
     # historical serve-all behavior; [] serves only the default profile.
     multiplex_profile_allowlist: Optional[List[str]] = None
+    # Platforms that must resolve their bootstrap credential before startup.
+    # Empty preserves the historical cron-only fail-open behavior.
+    required_platforms: List[str] = field(default_factory=list)
 
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
@@ -1033,6 +1067,7 @@ class GatewayConfig:
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
             self.multiplex_profile_allowlist
         )
+        self.required_platforms = _normalize_required_platforms(self.required_platforms)
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
         )
@@ -1148,6 +1183,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
+            "required_platforms": self.required_platforms,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "loop_watchdog_probe_interval_s": self.loop_watchdog_probe_interval_s,
@@ -1222,6 +1258,10 @@ class GatewayConfig:
             multiplex_profile_allowlist = nested_gateway.get(
                 "multiplex_profile_allowlist"
             )
+        if "required_platforms" in data:
+            required_platforms = data.get("required_platforms")
+        else:
+            required_platforms = nested_gateway.get("required_platforms")
         if "systemd_watchdog_seconds" in data:
             systemd_watchdog_raw = data.get("systemd_watchdog_seconds")
             systemd_watchdog_key = "systemd_watchdog_seconds"
@@ -1328,6 +1368,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             multiplex_profile_allowlist=multiplex_profile_allowlist,
+            required_platforms=_normalize_required_platforms(required_platforms),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             loop_watchdog_probe_interval_s=loop_watchdog_probe_interval_s,
@@ -1485,6 +1526,14 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["multiplex_profile_allowlist"] = gateway_section[
                     "multiplex_profile_allowlist"
                 ]
+
+            if "required_platforms" in yaml_cfg:
+                gw_data["required_platforms"] = yaml_cfg["required_platforms"]
+            elif (
+                isinstance(gateway_section, dict)
+                and "required_platforms" in gateway_section
+            ):
+                gw_data["required_platforms"] = gateway_section["required_platforms"]
 
             # Profile-based routing rules: accept either top-level
             # ``profile_routes`` or the nested ``gateway.profile_routes`` form

@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest import mock
@@ -108,6 +109,94 @@ def test_fetch_happy_path(monkeypatch, tmp_path):
     assert warnings == []
 
 
+def test_op_child_receives_headless_desktop_flag(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_LOAD_DESKTOP_APP_SETTINGS", "false")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs["env"])
+        return _ok("resolved")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op.fetch_onepassword_secrets(
+        references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+    )
+
+    assert seen["OP_LOAD_DESKTOP_APP_SETTINGS"] == "false"
+
+
+def test_four_hung_reads_share_one_global_deadline(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    release = threading.Event()
+
+    def hung(*args, **kwargs):
+        release.wait(0.5)
+        raise op._OpReadError(op.ErrorKind.TIMEOUT, "op read timed out")
+
+    monkeypatch.setattr(op, "_run_op_read", hung)
+    monkeypatch.setattr(op, "_FIRST_ATTEMPT_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(op, "_TOTAL_FETCH_BUDGET_SECONDS", 0.10)
+    monkeypatch.setattr(op, "_retry_jitter_seconds", lambda: 0.0)
+
+    started = time.monotonic()
+    try:
+        secrets, warnings = op.fetch_onepassword_secrets(
+            references={f"K{i}": f"op://V/I/F{i}" for i in range(4)},
+            binary=fake_op,
+            use_cache=False,
+        )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started < 0.25
+    assert secrets == {}
+    assert len(warnings) == 4
+    assert all("kind=timeout" in warning for warning in warnings)
+
+
+def test_retry_only_timeout_and_network(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    first_kinds = {
+        "op://V/I/timeout": op.ErrorKind.TIMEOUT,
+        "op://V/I/network": op.ErrorKind.NETWORK,
+        "op://V/I/auth": op.ErrorKind.AUTH_FAILED,
+        "op://V/I/invalid": op.ErrorKind.REF_INVALID,
+    }
+    calls = {ref: 0 for ref in first_kinds}
+
+    def fake_read(_binary, reference, **kwargs):
+        calls[reference] += 1
+        if calls[reference] == 1:
+            raise op._OpReadError(first_kinds[reference], "redacted failure")
+        return "recovered"
+
+    monkeypatch.setattr(op, "_run_op_read", fake_read)
+    monkeypatch.setattr(op, "_retry_jitter_seconds", lambda: 0.0)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={
+            "TIMEOUT": "op://V/I/timeout",
+            "NETWORK": "op://V/I/network",
+            "AUTH": "op://V/I/auth",
+            "INVALID": "op://V/I/invalid",
+        },
+        binary=fake_op,
+        use_cache=False,
+    )
+
+    assert secrets == {"TIMEOUT": "recovered", "NETWORK": "recovered"}
+    assert calls == {
+        "op://V/I/timeout": 2,
+        "op://V/I/network": 2,
+        "op://V/I/auth": 1,
+        "op://V/I/invalid": 1,
+    }
+    assert {warning.split()[0] for warning in warnings} == {"AUTH", "INVALID"}
+
+
 
 
 
@@ -127,7 +216,7 @@ def test_fetch_read_failure_becomes_warning(monkeypatch, tmp_path):
     # ANSI control sequences are fully scrubbed from the surfaced message.
     assert "\x1b" not in warnings[0]
     assert "[31m" not in warnings[0]
-    assert "not signed in" in warnings[0]
+    assert "kind=auth_failed" in warnings[0]
 
 
 
@@ -195,6 +284,121 @@ def test_connect_credential_change_invalidates_cache(monkeypatch, tmp_path):
         binary=fake_op, home_path=tmp_path,
     )
     assert calls["n"] == 2  # cache key changed → refetch
+
+
+def _seed_stale_cache(tmp_path, refs, *, age_seconds=100):
+    key = (
+        op._auth_fingerprint("OP_SERVICE_ACCOUNT_TOKEN"),
+        "",
+        str(tmp_path),
+        op._refs_fingerprint(refs),
+    )
+    op._CACHE[key] = op.CachedFetch(
+        secrets={name: f"cached-{name}" for name in refs},
+        fetched_at=time.time() - age_seconds,
+    )
+
+
+@pytest.mark.parametrize("kind", [op.ErrorKind.TIMEOUT, op.ErrorKind.NETWORK])
+def test_complete_stale_cache_allowed_for_transport_errors(monkeypatch, tmp_path, kind):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/I/A", "B": "op://V/I/B"}
+    _seed_stale_cache(tmp_path, refs)
+
+    def fail(*args, **kwargs):
+        raise op._OpReadError(kind, "redacted failure")
+
+    monkeypatch.setattr(op, "_run_op_read", fail)
+    monkeypatch.setattr(op, "_retry_jitter_seconds", lambda: 0.0)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs,
+        binary=fake_op,
+        cache_ttl_seconds=1,
+        stale_if_error_seconds=900,
+        home_path=tmp_path,
+    )
+
+    assert secrets == {"A": "cached-A", "B": "cached-B"}
+    assert any("stale cache" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        op.ErrorKind.AUTH_FAILED,
+        op.ErrorKind.AUTH_EXPIRED,
+        op.ErrorKind.REF_INVALID,
+        op.ErrorKind.EMPTY_VALUE,
+    ],
+)
+def test_stale_cache_never_used_for_nontransport_errors(monkeypatch, tmp_path, kind):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/I/A"}
+    _seed_stale_cache(tmp_path, refs)
+
+    def fail(*args, **kwargs):
+        raise op._OpReadError(kind, "redacted failure")
+
+    monkeypatch.setattr(op, "_run_op_read", fail)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs,
+        binary=fake_op,
+        cache_ttl_seconds=1,
+        stale_if_error_seconds=900,
+        home_path=tmp_path,
+    )
+
+    assert secrets == {}
+    assert not any("stale cache" in warning for warning in warnings)
+
+
+def test_permission_failure_is_classified_as_nonretryable_auth_failure():
+    assert (
+        op._classify_op_error("permission denied for this vault")
+        == op.ErrorKind.AUTH_FAILED
+    )
+
+
+def test_cache_ttl_zero_still_disables_all_cache_persistence(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _ok("resolved"))
+
+    op.fetch_onepassword_secrets(
+        references={"A": "op://V/I/A"},
+        binary=fake_op,
+        cache_ttl_seconds=0,
+        stale_if_error_seconds=900,
+        home_path=tmp_path,
+    )
+
+    assert op._CACHE == {}
+    assert not op._disk_cache_path(tmp_path).exists()
+
+
+def test_incomplete_or_too_old_stale_cache_is_rejected(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/I/A", "B": "op://V/I/B"}
+    _seed_stale_cache(tmp_path, refs, age_seconds=901)
+
+    def fail(*args, **kwargs):
+        raise op._OpReadError(op.ErrorKind.NETWORK, "redacted failure")
+
+    monkeypatch.setattr(op, "_run_op_read", fail)
+    monkeypatch.setattr(op, "_retry_jitter_seconds", lambda: 0.0)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs,
+        binary=fake_op,
+        cache_ttl_seconds=1,
+        stale_if_error_seconds=900,
+        home_path=tmp_path,
+    )
+
+    assert secrets == {}
+    assert not any("stale cache" in warning for warning in warnings)
 
 
 

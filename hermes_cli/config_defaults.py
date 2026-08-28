@@ -3154,6 +3154,10 @@ DEFAULT_CONFIG = {
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
 
+        # Messaging platforms that must have bootstrap credentials at startup.
+        # Empty preserves fail-open cron-only behavior for existing installs.
+        "required_platforms": [],
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
@@ -3718,6 +3722,10 @@ DEFAULT_CONFIG = {
             # Seconds to cache resolved values in-process and on disk.  0
             # disables BOTH cache layers (no values are written to disk).
             "cache_ttl_seconds": 300,
+            # Complete last-good cache may bridge only NETWORK/TIMEOUT failures
+            # within this age window. Auth/permission/invalid-ref failures never
+            # use stale values. 0 disables stale-if-error.
+            "stale_if_error_seconds": 900,
             # When True (default), resolved values overwrite existing env
             # vars so rotating a secret in 1Password takes effect on next
             # start.  Flip to false to let .env / shell exports win locally.

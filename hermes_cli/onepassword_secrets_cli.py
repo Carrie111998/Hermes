@@ -181,6 +181,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     op_cfg["enabled"] = True
     op_cfg.setdefault("env", {})
     op_cfg.setdefault("cache_ttl_seconds", 300)
+    op_cfg.setdefault("stale_if_error_seconds", 900)
     op_cfg.setdefault("override_existing", True)
     save_config(cfg)
 
@@ -218,6 +219,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("Token in env", _yn(token_set))
     table.add_row("Override existing", _yn(bool(op_cfg.get("override_existing", True))))
     table.add_row("Cache TTL (s)", str(op_cfg.get("cache_ttl_seconds", 300)))
+    table.add_row(
+        "Stale-if-error (s)", str(op_cfg.get("stale_if_error_seconds", 900))
+    )
     if binary:
         table.add_row("op binary", f"{binary} ({_op_version(binary)})")
     else:
@@ -395,6 +399,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             binary_path=binary_path,
             override_existing=bool(op_cfg.get("override_existing", True)),
             cache_ttl_seconds=0,  # an explicit sync always resolves fresh
+            stale_if_error_seconds=0,
         )
         if result.error:
             console.print(f"[red]{result.error}[/red]")
