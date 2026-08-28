@@ -13,7 +13,7 @@ commands on an in-flight run must not be observable/veto-able by plugins.
 
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
@@ -283,10 +283,30 @@ def _make_runner():
     runner._should_send_telegram_lobby_reminder = lambda _source: False
     runner._check_slash_access = lambda _source, _command: None
     runner._begin_session_run_generation = lambda _key: 1
-    runner._release_running_agent_state = (
-        lambda key: runner._running_agents.pop(key, None)
+    release_running_agent_state = create_autospec(
+        runner._release_running_agent_state
     )
+
+    def _release_running_agent_state(
+        session_key,
+        *,
+        run_generation=None,
+        clarify_run_generation=None,
+    ):
+        return runner._running_agents.pop(session_key, None)
+
+    release_running_agent_state.side_effect = _release_running_agent_state
+    runner._release_running_agent_state = release_running_agent_state
     return runner, adapter
+
+
+def _assert_turn_release(runner):
+    from gateway.session import build_session_key
+
+    runner._release_running_agent_state.assert_called_once_with(
+        build_session_key(_make_source()),
+        clarify_run_generation=1,
+    )
 
 
 @pytest.mark.asyncio
@@ -314,6 +334,7 @@ async def test_gateway_fires_for_recognized_command(monkeypatch):
     assert captured["args_raw"] == "do it later"
     assert captured["platform"] == "telegram"
     assert captured["session_key"]
+    _assert_turn_release(runner)
 
 
 @pytest.mark.asyncio
@@ -338,6 +359,7 @@ async def test_gateway_reports_canonical_name_for_alias(monkeypatch):
 
     assert captured["command"] == "queue"
     assert captured["alias_used"] == "q"
+    _assert_turn_release(runner)
 
 
 @pytest.mark.asyncio
@@ -359,6 +381,7 @@ async def test_gateway_does_not_fire_for_plain_text(monkeypatch):
 
     await runner._handle_message(_make_event("just a normal message"))
     assert fired == []
+    _assert_turn_release(runner)
 
 
 @pytest.mark.asyncio
@@ -383,6 +406,7 @@ async def test_gateway_control_plane_intercept_excluded(monkeypatch):
     assert result == "busy-handled"
     runner._dispatch_busy_slash_command.assert_awaited_once()
     assert fired == []
+    runner._release_running_agent_state.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -407,3 +431,4 @@ async def test_gateway_hook_failure_is_non_fatal(monkeypatch):
     result = await runner._handle_message(_make_event("/queue still works"))
     assert result == {"final_response": "", "messages": []}
     assert captured["text"] == "still works"
+    _assert_turn_release(runner)

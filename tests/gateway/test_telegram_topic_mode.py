@@ -6,7 +6,7 @@ Telegram topics act as independent Hermes session lanes.
 
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
@@ -160,7 +160,9 @@ def _make_runner(session_db=None):
     runner._read_user_config = lambda: {
         "approvals": {"destructive_slash_confirm": False}
     }
-    runner._release_running_agent_state = MagicMock()
+    runner._release_running_agent_state = create_autospec(
+        runner._release_running_agent_state
+    )
     runner._evict_cached_agent = MagicMock()
     runner._clear_session_boundary_security_state = MagicMock()
     runner._set_session_reasoning_override = MagicMock()
@@ -829,4 +831,3 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
 # ---------------------------------------------------------------------------
 # Test for session-split thread_id recovery (issue #27166)
 # ---------------------------------------------------------------------------
-

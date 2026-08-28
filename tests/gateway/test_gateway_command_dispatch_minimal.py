@@ -1,6 +1,6 @@
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
@@ -98,7 +98,20 @@ def _make_runner():
     runner._should_send_telegram_lobby_reminder = lambda _source: False
     runner._check_slash_access = lambda _source, _command: None
     runner._begin_session_run_generation = lambda _key: 1
-    runner._release_running_agent_state = lambda key: runner._running_agents.pop(key, None)
+    release_running_agent_state = create_autospec(
+        runner._release_running_agent_state
+    )
+
+    def _release_running_agent_state(
+        session_key,
+        *,
+        run_generation=None,
+        clarify_run_generation=None,
+    ):
+        return runner._running_agents.pop(session_key, None)
+
+    release_running_agent_state.side_effect = _release_running_agent_state
+    runner._release_running_agent_state = release_running_agent_state
     return runner, adapter
 
 
@@ -127,5 +140,8 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
     assert captured["key"] == build_session_key(_make_source())
     assert captured["generation"] == 1
     assert runner._running_agents == {}
-
+    runner._release_running_agent_state.assert_called_once_with(
+        build_session_key(_make_source()),
+        clarify_run_generation=1,
+    )
 

@@ -21,6 +21,7 @@ Salvaged and de-scoped from the superseded Discord-only PR #33842.
 
 import asyncio
 import logging
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -293,10 +294,10 @@ class TestPostStopInterruptSwallow:
         runner._invalidate_session_run_generation = (
             lambda key, reason=None: invalidated.append((key, reason))
         )
-        released = []
-        runner._release_running_agent_state = (
-            lambda key, **kw: released.append(key)
+        release_running_agent_state = create_autospec(
+            runner._release_running_agent_state
         )
+        runner._release_running_agent_state = release_running_agent_state
         reaped = []
         reaped_event = threading.Event()
         from tools.process_registry import process_registry
@@ -316,7 +317,7 @@ class TestPostStopInterruptSwallow:
         )
 
         assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
-        assert released == [session_key]
+        release_running_agent_state.assert_called_once_with(session_key)
         assert reaped_event.wait(1)
         assert reaped == [
             (

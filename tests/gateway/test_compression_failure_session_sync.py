@@ -3,7 +3,7 @@ import sys
 import threading
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import gateway.run as gateway_run
 from gateway.config import Platform
@@ -84,6 +84,7 @@ class _CompressionThenFailureAgent:
             "api_calls": 1,
         }
 
+
     def interrupt(self, *_args, **_kwargs):
         pass
 
@@ -149,7 +150,9 @@ def _runner(session_store):
     runner._extract_cache_busting_config = lambda _config: ()
     runner._thread_metadata_for_source = lambda *_args, **_kwargs: None
     runner._sync_telegram_topic_binding = MagicMock()
-    runner._release_running_agent_state = MagicMock()
+    runner._release_running_agent_state = create_autospec(
+        runner._release_running_agent_state
+    )
     return runner
 
 
@@ -189,9 +192,10 @@ def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
 
     session_store = _SessionStore()
     runner = _runner(session_store)
+    runner._session_run_generation[SESSION_KEY] = 7
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="user-1")
 
-    result = _run_compression_failure_turn(runner, source)
+    result = _run_compression_failure_turn(runner, source, run_generation=7)
 
     assert result["failed"] is True
     assert result["session_id"] == "session-after-compression"
@@ -211,6 +215,10 @@ def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
     ]
     runner._sync_telegram_topic_binding.assert_called_once_with(
         source, session_store.entry, reason="agent-run-compression"
+    )
+    runner._release_running_agent_state.assert_called_once_with(
+        SESSION_KEY,
+        run_generation=7,
     )
 
 
@@ -344,4 +352,3 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
             ],
             "api_calls": 1,
         }
-

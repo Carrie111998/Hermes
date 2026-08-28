@@ -6,7 +6,7 @@ import asyncio
 import time
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
@@ -260,7 +260,9 @@ def _make_runner(current_source: SessionSource, entries: list[SessionEntry]):
     runner._session_run_generation = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._release_running_agent_state = MagicMock()
+    runner._release_running_agent_state = create_autospec(
+        runner._release_running_agent_state
+    )
     runner._clear_session_boundary_security_state = MagicMock()
     runner._evict_cached_agent = MagicMock()
     runner._queue_depth = MagicMock(return_value=0)
@@ -338,5 +340,4 @@ async def test_matrix_resume_cross_room_requires_explicit_flag_and_warns():
     assert "Cross-room resume" in result
     assert PROJECT_B_NAME in result
     runner.session_store.switch_session.assert_called_once()
-
 

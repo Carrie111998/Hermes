@@ -111,7 +111,13 @@ class _FakeGateway:
     def _evict_cached_agent(self, key):
         pass
 
-    def _release_running_agent_state(self, session_key, **_kwargs):
+    def _release_running_agent_state(
+        self,
+        session_key,
+        *,
+        run_generation=None,
+        clarify_run_generation=None,
+    ):
         agent = self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
         self._cleanup_agent_resources(agent)
