@@ -11130,14 +11130,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_provider = _model_cfg.get("provider") or None
                         _hyg_base_url = _model_cfg.get("base_url") or None
 
-                    # Read compression settings — only use enabled flag.
-                    # The threshold is intentionally separate from the agent's
-                    # compression.threshold (hygiene runs higher).
+                    # Read compression settings. Gateway hygiene remains a
+                    # separate, higher-threshold safety net by default, but
+                    # operators may lower it for latency-sensitive long-lived
+                    # messaging sessions.
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
+                        _raw_hyg_threshold = _comp_cfg.get("hygiene_threshold")
+                        if _raw_hyg_threshold is not None:
+                            try:
+                                _parsed_threshold = float(_raw_hyg_threshold)
+                                if 0.15 <= _parsed_threshold <= 0.95:
+                                    _hyg_threshold_pct = _parsed_threshold
+                            except (TypeError, ValueError):
+                                pass
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
