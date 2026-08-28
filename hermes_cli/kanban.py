@@ -1261,7 +1261,21 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
         try:
-            return int(handler(args) or 0)
+            rc = int(handler(args) or 0)
+            # Any kanban CLI action may have committed a terminal run. Project
+            # whatever is pending afterwards — this is the human production
+            # path, and it recovers records an earlier process left behind.
+            try:
+                from hermes_cli import kanban_db as _kb
+
+                _conn = _kb.connect(board=getattr(args, "board", None))
+                try:
+                    _kb.drain_routing_outbox(_conn)
+                finally:
+                    _conn.close()
+            except Exception:
+                pass
+            return rc
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1

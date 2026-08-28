@@ -1505,11 +1505,22 @@ CREATE TABLE IF NOT EXISTS task_runs (
 -- ``projected_at`` is the claim: a projector marks rows only after their lines
 -- are written, inside one BEGIN IMMEDIATE so concurrent projectors serialize.
 CREATE TABLE IF NOT EXISTS routing_outbox (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id       INTEGER NOT NULL UNIQUE,
-    payload      TEXT NOT NULL,
-    created_at   INTEGER NOT NULL,
-    projected_at INTEGER
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL UNIQUE,
+    -- The profile that OWNS this record. The board is shared, so whichever
+    -- process drains the outbox must still write to the originating profile's
+    -- log; a name (never a path) is stored so a payload can never redirect a
+    -- write somewhere of its choosing.
+    profile        TEXT,
+    payload        TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    projected_at   INTEGER,
+    -- Committed evidence that cannot be projected (unreadable payload,
+    -- unresolvable profile) is quarantined rather than deleted or replaced by
+    -- a synthetic "record". It stops blocking later rows and stays available
+    -- for an operator.
+    quarantined_at INTEGER,
+    error          TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2854,6 +2865,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "task_runs", "session_id", "session_id TEXT"
             )
+
+    has_outbox = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='routing_outbox'"
+    ).fetchone()
+    if has_outbox:
+        outbox_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(routing_outbox)")
+        }
+        for col, decl in (
+            ("profile", "profile TEXT"),
+            ("quarantined_at", "quarantined_at INTEGER"),
+            ("error", "error TEXT"),
+        ):
+            if col not in outbox_cols:
+                _add_column_if_missing(conn, "routing_outbox", col, decl)
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -4552,9 +4579,10 @@ def _stage_terminal_routing_record(
         # the run it describes. INSERT OR IGNORE on the UNIQUE run_id makes a
         # retried terminal path stage exactly once.
         conn.execute(
-            "INSERT OR IGNORE INTO routing_outbox (run_id, payload, created_at) "
-            "VALUES (?, ?, ?)",
-            (run_id, json.dumps(payload, ensure_ascii=False, default=str),
+            "INSERT OR IGNORE INTO routing_outbox "
+            "(run_id, profile, payload, created_at) VALUES (?, ?, ?, ?)",
+            (run_id, row["profile"],
+             json.dumps(payload, ensure_ascii=False, default=str),
              int(time.time())),
         )
     except Exception:
@@ -4565,21 +4593,32 @@ def _stage_terminal_routing_record(
 def project_routing_outbox(
     conn: sqlite3.Connection, *, limit: int = 50,
 ) -> int:
-    """Write staged terminal routing records to the log. Returns how many.
+    """Write staged terminal routing records to their owners' logs.
 
     Runs AFTER the staging transaction has committed, so a line can only
-    describe a run that really ended. The whole claim-and-write happens inside
-    one ``BEGIN IMMEDIATE``: concurrent projectors serialize, and a failed
-    write rolls the claim back so the record is retried rather than lost —
-    which is also how a record survives a temporary log outage and is projected
-    once the log returns.
+    describe a run that really ended. Called from the production paths that
+    follow a terminal write — the worker's kanban tools, the ``hermes kanban``
+    CLI, and every dispatcher tick — so a completed routed run reaches its log
+    without anyone invoking a helper by hand, and a gateway restart drains
+    whatever an earlier process left pending.
 
-    Each line carries ``record_id`` (the outbox row) so the one residual
-    duplicate window — a crash after the lines are written but before the
-    transaction commits — is detectable downstream rather than silent.
+    **Each record goes to its OWNING profile's log**, resolved from the profile
+    NAME recorded at staging time. The board is shared: a PM or default process
+    draining it must not divert a coder's accounting into its own log, and a
+    payload must never be able to name an output path.
 
-    Best-effort by contract: never raises, so draining the outbox can be
-    attached to ordinary board activity without becoming a new failure mode.
+    **Committed evidence is never destroyed.** A payload that cannot be parsed,
+    or a profile that cannot be resolved, is *quarantined* — marked with the
+    reason, left out of future batches so it cannot block later valid records,
+    and still there for an operator. It is never replaced by a synthetic
+    "record" and never counted as a success.
+
+    The claim-and-write happens inside one ``BEGIN IMMEDIATE``: concurrent
+    projectors serialize, and a failed write rolls the claim back so a log
+    outage retries rather than loses. Returns the number of records written.
+
+    Best-effort by contract: never raises, so draining can hang off ordinary
+    board activity without becoming a new failure mode.
     """
     from hermes_cli import routing_audit
 
@@ -4587,34 +4626,83 @@ def project_routing_outbox(
     try:
         with write_txn(conn):
             rows = conn.execute(
-                "SELECT id, payload FROM routing_outbox "
-                " WHERE projected_at IS NULL ORDER BY id LIMIT ?",
+                "SELECT id, run_id, profile, payload FROM routing_outbox "
+                " WHERE projected_at IS NULL AND quarantined_at IS NULL "
+                " ORDER BY id LIMIT ?",
                 (int(limit),),
             ).fetchall()
             if not rows:
                 return 0
             now = int(time.time())
+            projected: list = []
             for row in rows:
                 try:
                     fields = json.loads(row["payload"])
-                except (ValueError, TypeError):
-                    fields = {"payload_unreadable": True}
+                    if not isinstance(fields, dict):
+                        raise ValueError("payload is not an object")
+                    # Underscore-prefixed names are this module's private
+                    # channel to the writer (``_log_path``). A stored payload
+                    # must not be able to occupy one — neither to redirect the
+                    # write nor to collide with the keyword and stall the batch.
+                    fields = {k: v for k, v in fields.items()
+                              if not str(k).startswith("_")}
+                except (ValueError, TypeError) as exc:
+                    conn.execute(
+                        "UPDATE routing_outbox SET quarantined_at = ?, error = ? "
+                        " WHERE id = ?",
+                        (now, f"unreadable payload: {type(exc).__name__}",
+                         row["id"]),
+                    )
+                    _log.warning(
+                        "routing outbox: quarantined record %s (run %s): "
+                        "payload is unreadable", row["id"], row["run_id"],
+                    )
+                    continue
+                destination = routing_audit.resolve_profile_log_path(row["profile"])
+                if destination is None:
+                    conn.execute(
+                        "UPDATE routing_outbox SET quarantined_at = ?, error = ? "
+                        " WHERE id = ?",
+                        (now, f"unresolvable profile: {row['profile']!r}",
+                         row["id"]),
+                    )
+                    _log.warning(
+                        "routing outbox: quarantined record %s (run %s): "
+                        "profile %r cannot be resolved to a log",
+                        row["id"], row["run_id"], row["profile"],
+                    )
+                    continue
                 if not routing_audit.record_routing_decision(
-                    record_id=row["id"], **fields
+                    record_id=row["id"], _log_path=destination, **fields
                 ):
                     # The log is unavailable. Abort the whole claim so every
-                    # row in this batch is retried later.
+                    # row in this batch — including the quarantines above — is
+                    # reconsidered later.
                     raise RuntimeError("routing log unavailable")
+                projected.append(row["id"])
                 written += 1
-            conn.execute(
-                "UPDATE routing_outbox SET projected_at = ? "
-                " WHERE id IN (%s)" % ",".join("?" * len(rows)),
-                [now, *[r["id"] for r in rows]],
-            )
+            if projected:
+                conn.execute(
+                    "UPDATE routing_outbox SET projected_at = ? "
+                    " WHERE id IN (%s)" % ",".join("?" * len(projected)),
+                    [now, *projected],
+                )
     except Exception:
         return 0
     return written
 
+
+def drain_routing_outbox(conn: sqlite3.Connection) -> int:
+    """Production hook: project anything pending. Never raises, never blocks.
+
+    Attached to the paths that follow a committed terminal write. Kept separate
+    from :func:`project_routing_outbox` so the call sites read as what they are
+    — opportunistic recovery, not part of the operation they follow.
+    """
+    try:
+        return project_routing_outbox(conn)
+    except Exception:
+        return 0
 
 def _end_run(
     conn: sqlite3.Connection,
@@ -10930,6 +11018,10 @@ def dispatch_once(
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    # Every tick projects whatever terminal routing records are pending —
+    # including any a previous process committed before it stopped, which is
+    # how a gateway restart recovers them. Never raises.
+    drain_routing_outbox(conn)
     return result
 
 

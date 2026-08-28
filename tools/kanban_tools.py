@@ -701,6 +701,19 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+def _drain_routing_outbox(kb, conn) -> None:
+    """Project any pending terminal routing record. Never raises.
+
+    Hangs off the worker's own terminal tool calls, which are the production
+    path a routed run actually ends through, so the record reaches its log
+    without anyone invoking a projector by hand.
+    """
+    try:
+        kb.drain_routing_outbox(conn)
+    except Exception:
+        logger.debug("routing outbox drain failed", exc_info=True)
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -853,6 +866,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            # The terminal write has committed; project its routing record.
+            _drain_routing_outbox(kb, conn)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -929,6 +944,7 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
+            _drain_routing_outbox(kb, conn)
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,

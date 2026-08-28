@@ -51,10 +51,50 @@ ROUTING_DECIDED = "routing_decided"
 
 
 def _resolve_log_path() -> Path:
-    """``$HERMES_HOME/logs/routing.jsonl``, honouring profile overrides."""
+    """``$HERMES_HOME/logs/routing.jsonl`` for the CURRENT profile."""
     from hermes_constants import get_hermes_home
 
     return get_hermes_home() / "logs" / "routing.jsonl"
+
+
+def resolve_profile_log_path(profile: "str | None") -> "Path | None":
+    """The routing log belonging to *profile*, or ``None`` if unresolvable.
+
+    The kanban board is shared across profiles, so whichever process drains the
+    outbox must still write each record to the log of the profile that produced
+    it — otherwise a PM or default process performing recovery silently
+    relocates a coder's accounting into its own log.
+
+    Resolution takes a profile **name**, never a path: a stored payload must
+    not be able to choose where Hermes writes. The name goes through the
+    profiles module's own normalisation, and the answer is accepted only when
+    the resulting home actually exists (or is this process's own home). An
+    unresolvable name returns ``None`` so the caller can quarantine the record
+    rather than guess a destination.
+    """
+    from hermes_constants import get_hermes_home
+
+    name = str(profile or "").strip()
+    if not name:
+        # No owner recorded (a legacy row): this process's own log is the only
+        # defensible destination.
+        return get_hermes_home() / "logs" / "routing.jsonl"
+    try:
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            get_profile_dir,
+            normalize_profile_name,
+        )
+
+        canon = normalize_profile_name(name)
+        if canon == normalize_profile_name(get_active_profile_name() or ""):
+            return get_hermes_home() / "logs" / "routing.jsonl"
+        home = get_profile_dir(canon)
+        if home and Path(home).is_dir():
+            return Path(home) / "logs" / "routing.jsonl"
+    except Exception as exc:
+        _log.debug("routing log path for %r unresolvable: %s", name, exc)
+    return None
 
 
 _MAX_REDACT_DEPTH = 6
@@ -110,6 +150,13 @@ def record_routing_decision(**fields: Any) -> bool:
     fail: every call site treats a False as "the audit line was lost", never as
     "the operation failed".
     """
+    # Internal only: the projector supplies the OWNING profile's resolved path.
+    # It is popped before sanitisation so it can never appear in the record,
+    # and it is a `Path` the projector resolved from a profile NAME — a caller
+    # (or a stored payload) cannot smuggle a destination through `fields`.
+    destination = fields.pop("_log_path", None)
+    if destination is not None and not isinstance(destination, Path):
+        destination = None
     try:
         safe = {
             _redact_value(k): _redact_value(v) for k, v in fields.items()
@@ -124,7 +171,7 @@ def record_routing_decision(**fields: Any) -> bool:
         # `selection` is not a caller's to override: M3b has no other value.
         entry["selection"] = "manual"
         line = json.dumps(entry, separators=(",", ":"), default=str) + "\n"
-        path = _resolve_log_path()
+        path = destination if destination is not None else _resolve_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with _write_lock:
             with open(path, "a", encoding="utf-8") as fh:

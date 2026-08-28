@@ -27,6 +27,12 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
     (tmp_path / "home").mkdir()
+    # This process IS the `coder` profile, which is what a dispatcher-spawned
+    # worker actually is: `task_runs.profile` is the assignee, and the worker
+    # runs as `hermes -p <assignee>`. Tests that need a DIFFERENT draining
+    # profile override this to prove cross-profile routing.
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "coder")
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     return tmp_path
@@ -876,19 +882,19 @@ def test_a_committed_record_survives_a_log_outage_and_projects_once(
         kb.record_run_session_id(conn, run_id, "sess-1")
 
         # The log is unavailable while the run ends.
-        real_path = routing_audit._resolve_log_path
+        real_path = routing_audit.resolve_profile_log_path
 
         def boom(*a, **k):
             raise OSError("log is gone")
 
-        monkeypatch.setattr(routing_audit, "_resolve_log_path", boom)
+        monkeypatch.setattr(routing_audit, "resolve_profile_log_path", boom)
         kb.complete_task(conn, tid, summary="done")
         assert kb.project_routing_outbox(conn) == 0, "nothing could be written"
         assert _staged(run_id)["projected_at"] is None, "and nothing was claimed"
 
         # The log comes back. Restore only this attribute — monkeypatch.undo()
         # would also revert the board fixture's HERMES_KANBAN_DB.
-        monkeypatch.setattr(routing_audit, "_resolve_log_path", real_path)
+        monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real_path)
         assert kb.project_routing_outbox(conn) == 1
         assert _staged(run_id)["projected_at"] is not None
         # Draining again is a no-op: exactly once.
@@ -1068,3 +1074,312 @@ def test_mapping_keys_are_redacted_too(board, tmp_path):
         task_id="t", lane="x", meta={secret: "value"})
     raw = (tmp_path / "home" / "logs" / "routing.jsonl").read_text()
     assert "NOTAREALKEY" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Third-round: the outbox must be drained by real production paths
+# ---------------------------------------------------------------------------
+
+def _pending():
+    conn = kb.connect()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) n FROM routing_outbox "
+            " WHERE projected_at IS NULL AND quarantined_at IS NULL"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+
+
+def _quarantined():
+    conn = kb.connect()
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT run_id, error, projected_at FROM routing_outbox "
+            " WHERE quarantined_at IS NOT NULL")]
+    finally:
+        conn.close()
+
+
+def _terminal(tmp_path, home=None):
+    root = home or (tmp_path / "home")
+    path = root / "logs" / "routing.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(x) for x in path.read_text().splitlines()
+            if x.strip() and json.loads(x).get("run_ref")]
+
+
+def _routed_task(assignee="coder"):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee=assignee)
+        kb.set_routing_lane(conn, tid, "coding_routine")
+        kb.claim_task(conn, tid)
+        run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?",
+                              (tid,)).fetchone()["current_run_id"]
+    finally:
+        conn.close()
+    return tid, run_id
+
+
+def test_the_cli_production_path_projects_the_record(board, tmp_path):
+    """No helper is called by hand: `hermes kanban complete` is the surface."""
+    tid, run_id = _routed_task()
+    before = len(_terminal(tmp_path))
+    code, _out, _err = _run_cli(["kanban", "complete", tid, "--summary", "done"])
+    assert code == 0
+    assert _pending() == 0
+    after = _terminal(tmp_path)
+    assert len(after) == before + 1
+    assert after[-1]["run_ref"] == f"task_run:{run_id}"
+
+
+def test_the_worker_tool_production_path_projects_the_record(
+    board, tmp_path, monkeypatch
+):
+    import tools.kanban_tools as kt
+
+    tid, run_id = _routed_task()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+    before = len(_terminal(tmp_path))
+
+    out = kt._handle_complete({"task_id": tid, "summary": "done"})
+    assert '"ok":true' in out.replace(" ", "")
+    assert _pending() == 0
+    assert len(_terminal(tmp_path)) == before + 1
+
+
+def test_a_dispatcher_tick_drains_what_a_previous_process_left(
+    board, tmp_path, monkeypatch
+):
+    """A restart's first tick recovers committed records."""
+    from hermes_cli import routing_audit
+
+    tid, _run_id = _routed_task()
+    real = routing_audit.resolve_profile_log_path
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_path",
+                        lambda p: None)
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+    # Unresolvable → quarantined, not projected. Restore and prove the tick
+    # recovers a genuinely pending one instead.
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real)
+
+    tid2, run2 = _routed_task()
+    boom = {"n": 0}
+
+    def flaky(profile):
+        boom["n"] += 1
+        if boom["n"] == 1:
+            raise OSError("log gone")
+        return real(profile)
+
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", flaky)
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid2, summary="done")
+        assert kb.project_routing_outbox(conn) == 0
+    finally:
+        conn.close()
+    assert _pending() == 1, "the record survived the outage"
+
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _n: True)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+    finally:
+        conn.close()
+    assert _pending() == 0
+    assert any(t["run_ref"] == f"task_run:{run2}" for t in _terminal(tmp_path))
+
+
+def test_ordinary_activity_after_recovery_drains_exactly_once(
+    board, tmp_path, monkeypatch
+):
+    from hermes_cli import routing_audit
+
+    tid, run_id = _routed_task()
+    real = routing_audit.resolve_profile_log_path
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_path",
+                        lambda p: (_ for _ in ()).throw(OSError("gone")))
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+    assert _pending() == 1
+    assert _terminal(tmp_path) == []
+
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_path", real)
+    for _ in range(3):                      # ordinary CLI activity, repeatedly
+        _run_cli(["kanban", "stats"])
+    records = [t for t in _terminal(tmp_path)
+               if t["run_ref"] == f"task_run:{run_id}"]
+    assert len(records) == 1, f"exactly once: {records}"
+    assert _pending() == 0
+
+
+# --- the record goes to its OWNER's log ------------------------------------
+
+def test_a_record_is_written_to_its_owning_profiles_log(board, tmp_path, monkeypatch):
+    """A default/PM process draining the shared board must not divert it."""
+    from hermes_cli import routing_audit
+
+    coder_home = tmp_path / "profiles" / "coder"
+    (coder_home / "logs").mkdir(parents=True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: coder_home if name == "coder" else tmp_path / "home")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "default")
+
+    tid, run_id = _routed_task(assignee="coder")
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, summary="done")
+        assert kb.project_routing_outbox(conn) == 1
+    finally:
+        conn.close()
+
+    owner = _terminal(tmp_path, home=coder_home)
+    drainer = _terminal(tmp_path)
+    assert [t["run_ref"] for t in owner] == [f"task_run:{run_id}"]
+    assert drainer == [], "the draining profile's log must stay untouched"
+    assert routing_audit.resolve_profile_log_path("coder") == (
+        coder_home / "logs" / "routing.jsonl")
+
+
+def test_an_unresolvable_owner_is_quarantined_not_misrouted(board, tmp_path):
+    tid, run_id = _routed_task(assignee="ghost-profile")
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, summary="done")
+        assert kb.project_routing_outbox(conn) == 0
+    finally:
+        conn.close()
+    assert _terminal(tmp_path) == [], "never guess a destination"
+    q = _quarantined()
+    assert len(q) == 1 and q[0]["run_id"] == run_id
+    assert "unresolvable profile" in q[0]["error"]
+    assert q[0]["projected_at"] is None, "quarantine is not success"
+
+
+def test_a_payload_cannot_choose_its_own_destination(board, tmp_path):
+    """`_log_path` is internal; a stored payload must not smuggle one in."""
+    from hermes_cli import routing_audit
+
+    elsewhere = tmp_path / "elsewhere.jsonl"
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (run_id, profile, payload, created_at) "
+            "VALUES (?, ?, ?, 1)",
+            (4242, None, json.dumps(
+                {"task_id": "t", "lane": "x", "run_ref": "task_run:4242",
+                 "_log_path": str(elsewhere)})),
+        )
+        conn.commit()
+        kb.project_routing_outbox(conn)
+    finally:
+        conn.close()
+    assert not elsewhere.exists(), "a payload redirected the write"
+    assert len(_terminal(tmp_path)) == 1
+
+
+# --- malformed evidence -----------------------------------------------------
+
+def test_a_malformed_payload_is_quarantined_not_faked(board, tmp_path):
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (run_id, profile, payload, created_at) "
+            "VALUES (999, 'coder', '{not json', 1)")
+        conn.commit()
+        assert kb.project_routing_outbox(conn) == 0
+    finally:
+        conn.close()
+    assert _terminal(tmp_path) == [], "no synthetic record may be written"
+    q = _quarantined()
+    assert len(q) == 1 and q[0]["run_id"] == 999
+    assert q[0]["projected_at"] is None
+    assert "unreadable" in q[0]["error"]
+
+
+def test_a_malformed_row_does_not_block_later_valid_records(board, tmp_path):
+    """Ordering policy: a quarantined row is skipped, not a barrier."""
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (run_id, profile, payload, created_at) "
+            "VALUES (999, 'coder', '{not json', 1)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    tid, run_id = _routed_task()
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, summary="done")
+        # The malformed row sorts FIRST by id and must not stop the valid one.
+        assert kb.project_routing_outbox(conn) == 1
+    finally:
+        conn.close()
+    assert [t["run_ref"] for t in _terminal(tmp_path)] == [f"task_run:{run_id}"]
+    assert len(_quarantined()) == 1
+    assert _pending() == 0, "neither row is left pending"
+
+
+def test_a_payload_that_is_not_an_object_is_quarantined(board, tmp_path):
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (run_id, profile, payload, created_at) "
+            "VALUES (998, 'coder', '[1,2,3]', 1)")
+        conn.commit()
+        assert kb.project_routing_outbox(conn) == 0
+    finally:
+        conn.close()
+    assert _terminal(tmp_path) == []
+    assert len(_quarantined()) == 1
+
+
+def test_a_log_outage_never_fails_the_completed_task(board, tmp_path, monkeypatch):
+    from hermes_cli import routing_audit
+
+    monkeypatch.setattr(routing_audit, "resolve_profile_log_path",
+                        lambda p: (_ for _ in ()).throw(OSError("gone")))
+    tid, _run_id = _routed_task()
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, tid, summary="done") is True
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?",
+                           (tid,)).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] == "done", "the task completed despite the log outage"
+
+
+def test_the_record_id_stays_stable_for_duplicate_detection(board, tmp_path):
+    tid, run_id = _routed_task()
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, summary="done")
+        row_id = conn.execute(
+            "SELECT id FROM routing_outbox WHERE run_id = ?", (run_id,)
+        ).fetchone()["id"]
+        kb.project_routing_outbox(conn)
+    finally:
+        conn.close()
+    rec = _terminal(tmp_path)[-1]
+    assert rec["record_id"] == row_id, (
+        "the stable id is what makes the at-least-once crash window detectable"
+    )
