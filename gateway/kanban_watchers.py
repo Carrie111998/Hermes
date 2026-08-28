@@ -668,6 +668,17 @@ class GatewayKanbanWatchersMixin:
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
                     mode = sub.get("delivery_mode") or "notify"
+                    if d.get("fallback") and mode != "notify":
+                        # A fallback delivery runs on a gateway that is NOT the
+                        # subscription owner's: waking "the agent" here would
+                        # wake this gateway's agent in the owner's name (the
+                        # root agent answered for chief-of-staff tasks on the
+                        # first live run, 2026-08-28). Deliver passively only.
+                        logger.info(
+                            "kanban notifier: fallback delivery for %s downgraded %s -> notify (owner profile %s not hosted here)",
+                            sub["task_id"], mode, sub.get("notifier_profile"),
+                        )
+                        mode = "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
                     # Worker handoff carried into the synthetic wake turn below
