@@ -19,6 +19,7 @@ from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import urlsplit
 
 
 class WebhookContractError(ValueError):
@@ -36,8 +37,43 @@ class WebhookPayloadContractError(WebhookContractError):
 MAX_EVENT_TYPE_UTF8_BYTES = 1024
 MAX_ROUTE_NAME_BYTES = 128
 MAX_AUTHENTICATED_JSON_NESTING = 128
+MAX_CUSTOM_SIGNATURE_HEADER_BYTES = 16_384
+MAX_CUSTOM_SIGNATURE_TEMPLATE_BYTES = 1024
+MAX_CUSTOM_SIGNATURE_TOLERANCE_SECONDS = 86_400
 _ROUTE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_SIGNATURE_TEMPLATE_FIELD_RE = re.compile(r"\{([^{}]*)\}")
+
+_CUSTOM_SIGNATURE_KEYS = frozenset({
+    "header",
+    "signature_part",
+    "signature_prefix",
+    "timestamp_part",
+    "timestamp_header",
+    "template",
+    "algorithm",
+    "encoding",
+    "timestamp_unit",
+    "tolerance_seconds",
+})
+_CUSTOM_SIGNATURE_ALGORITHMS = MappingProxyType({
+    "sha1": "sha1",
+    "hmac_sha1": "sha1",
+    "sha256": "sha256",
+    "hmac_sha256": "sha256",
+    "sha512": "sha512",
+    "hmac_sha512": "sha512",
+})
+_CUSTOM_SIGNATURE_ENCODINGS = frozenset({"hex", "base64"})
+_CUSTOM_SIGNATURE_TIMESTAMP_UNITS = MappingProxyType({
+    "s": "seconds",
+    "second": "seconds",
+    "seconds": "seconds",
+    "ms": "milliseconds",
+    "millisecond": "milliseconds",
+    "milliseconds": "milliseconds",
+})
 
 
 _GITHUB_PULL_REQUEST_ACTIONS = frozenset({
@@ -200,6 +236,226 @@ _GITHUB_EVENT_BODY_CLASSIFIERS: Mapping[str, Callable[[Mapping[str, Any]], bool]
 GITHUB_AUTHENTICATED_EVENTS = frozenset(_GITHUB_EVENT_BODY_CLASSIFIERS)
 
 
+@dataclass(frozen=True, slots=True)
+class WebhookCustomSignatureSpec:
+    """One immutable, route-selected HMAC wire contract.
+
+    The request path never parses mutable route dictionaries. It receives this
+    normalized authority, reads exactly the declared credential fields, and
+    either verifies that one scheme or rejects the request.
+    """
+
+    header: str
+    signature_part: Optional[str]
+    signature_prefix: str
+    timestamp_part: Optional[str]
+    timestamp_header: Optional[str]
+    template: str
+    algorithm: str
+    encoding: str
+    timestamp_unit: Optional[str]
+    tolerance_seconds: Optional[int]
+
+    @property
+    def uses_timestamp(self) -> bool:
+        return self.timestamp_part is not None or self.timestamp_header is not None
+
+    @classmethod
+    def bind(
+        cls,
+        route_name: str,
+        raw: Any,
+    ) -> "WebhookCustomSignatureSpec":
+        prefix = f"route {route_name!r} custom signature"
+        if not isinstance(raw, Mapping):
+            raise WebhookContractError(f"{prefix} must be an object")
+        unknown = [
+            key
+            for key in raw
+            if not isinstance(key, str) or key not in _CUSTOM_SIGNATURE_KEYS
+        ]
+        if unknown:
+            raise WebhookContractError(f"{prefix} has unsupported field {unknown[0]!r}")
+
+        def text_field(
+            key: str,
+            *,
+            required: bool = False,
+            default: Optional[str] = None,
+            canonical_spacing: bool = True,
+        ) -> Optional[str]:
+            value = raw.get(key) if key in raw else default
+            if value is None:
+                if required:
+                    raise WebhookContractError(f"{prefix} requires non-empty {key!r}")
+                return None
+            if not isinstance(value, str):
+                raise WebhookContractError(f"{prefix} field {key!r} must be text")
+            if canonical_spacing and value != value.strip():
+                raise WebhookContractError(
+                    f"{prefix} field {key!r} must not have surrounding whitespace"
+                )
+            if required and not value:
+                raise WebhookContractError(f"{prefix} requires non-empty {key!r}")
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise WebhookContractError(
+                    f"{prefix} field {key!r} is not valid Unicode"
+                ) from exc
+            return value
+
+        header = text_field("header", required=True)
+        assert header is not None
+        if len(header) > 128 or _HTTP_TOKEN_RE.fullmatch(header) is None:
+            raise WebhookContractError(
+                f"{prefix} field 'header' must be an HTTP field-name token"
+            )
+        header = header.lower()
+
+        signature_part = text_field("signature_part")
+        timestamp_part = text_field("timestamp_part")
+        for key, value in (
+            ("signature_part", signature_part),
+            ("timestamp_part", timestamp_part),
+        ):
+            if value is not None and (
+                not value or len(value) > 128 or _HTTP_TOKEN_RE.fullmatch(value) is None
+            ):
+                raise WebhookContractError(
+                    f"{prefix} field {key!r} must be a non-empty header-part token"
+                )
+        if signature_part is not None and signature_part == timestamp_part:
+            raise WebhookContractError(
+                f"{prefix} signature_part and timestamp_part must differ"
+            )
+
+        timestamp_header = text_field("timestamp_header")
+        if timestamp_header is not None:
+            if (
+                not timestamp_header
+                or len(timestamp_header) > 128
+                or _HTTP_TOKEN_RE.fullmatch(timestamp_header) is None
+            ):
+                raise WebhookContractError(
+                    f"{prefix} field 'timestamp_header' must be an HTTP "
+                    "field-name token"
+                )
+            timestamp_header = timestamp_header.lower()
+        if timestamp_part is not None and timestamp_header is not None:
+            raise WebhookContractError(
+                f"{prefix} must choose timestamp_part or timestamp_header, not both"
+            )
+        if timestamp_header == header:
+            raise WebhookContractError(
+                f"{prefix} must use timestamp_part when both values share a header"
+            )
+
+        signature_prefix = text_field("signature_prefix", default="")
+        assert signature_prefix is not None
+        signature_prefix_bytes = signature_prefix.encode("utf-8")
+        if len(signature_prefix_bytes) > 256 or any(
+            byte < 0x20 or byte == 0x7F for byte in signature_prefix_bytes
+        ):
+            raise WebhookContractError(
+                f"{prefix} field 'signature_prefix' contains invalid header text"
+            )
+
+        template = text_field(
+            "template",
+            required=True,
+            default="{timestamp}.{body}",
+            canonical_spacing=False,
+        )
+        assert template is not None
+        template_bytes = template.encode("utf-8")
+        if len(template_bytes) > MAX_CUSTOM_SIGNATURE_TEMPLATE_BYTES:
+            raise WebhookContractError(
+                f"{prefix} template exceeds "
+                f"{MAX_CUSTOM_SIGNATURE_TEMPLATE_BYTES} UTF-8 bytes"
+            )
+        if template.count("{body}") != 1:
+            raise WebhookContractError(
+                f"{prefix} template must contain exactly one '{{body}}' marker"
+            )
+        fields = _SIGNATURE_TEMPLATE_FIELD_RE.findall(template)
+        unknown_fields = sorted(set(fields) - {"body", "timestamp"})
+        if unknown_fields:
+            raise WebhookContractError(
+                f"{prefix} template has unsupported marker {{{unknown_fields[0]}}}"
+            )
+        literal = template.replace("{body}", "").replace("{timestamp}", "")
+        if "{" in literal or "}" in literal:
+            raise WebhookContractError(f"{prefix} template contains an unmatched brace")
+        uses_timestamp = "timestamp" in fields
+        has_timestamp_source = (
+            timestamp_part is not None or timestamp_header is not None
+        )
+        if uses_timestamp != has_timestamp_source:
+            if uses_timestamp:
+                raise WebhookContractError(
+                    f"{prefix} template uses '{{timestamp}}' without a timestamp source"
+                )
+            raise WebhookContractError(
+                f"{prefix} declares a timestamp source not covered by the template"
+            )
+
+        algorithm_raw = text_field("algorithm", default="sha256")
+        assert algorithm_raw is not None
+        algorithm = _CUSTOM_SIGNATURE_ALGORITHMS.get(_normalize_token(algorithm_raw))
+        if algorithm is None:
+            raise WebhookContractError(
+                f"{prefix} algorithm must be sha1, sha256, or sha512"
+            )
+
+        encoding_raw = text_field("encoding", default="hex")
+        assert encoding_raw is not None
+        encoding = _normalize_token(encoding_raw)
+        if encoding not in _CUSTOM_SIGNATURE_ENCODINGS:
+            raise WebhookContractError(f"{prefix} encoding must be 'hex' or 'base64'")
+
+        timestamp_unit: Optional[str] = None
+        tolerance_seconds: Optional[int] = None
+        if uses_timestamp:
+            unit_raw = text_field("timestamp_unit", default="seconds")
+            assert unit_raw is not None
+            timestamp_unit = _CUSTOM_SIGNATURE_TIMESTAMP_UNITS.get(
+                _normalize_token(unit_raw)
+            )
+            if timestamp_unit is None:
+                raise WebhookContractError(
+                    f"{prefix} timestamp_unit must be seconds or milliseconds"
+                )
+            tolerance = raw.get("tolerance_seconds", 300)
+            if isinstance(tolerance, bool) or not isinstance(tolerance, int):
+                raise WebhookContractError(
+                    f"{prefix} tolerance_seconds must be an integer"
+                )
+            if not 1 <= tolerance <= MAX_CUSTOM_SIGNATURE_TOLERANCE_SECONDS:
+                raise WebhookContractError(
+                    f"{prefix} tolerance_seconds must be between 1 and "
+                    f"{MAX_CUSTOM_SIGNATURE_TOLERANCE_SECONDS}"
+                )
+            tolerance_seconds = tolerance
+        elif "timestamp_unit" in raw or "tolerance_seconds" in raw:
+            raise WebhookContractError(
+                f"{prefix} timestamp policy requires '{{timestamp}}' in the template"
+            )
+
+        return cls(
+            header=header,
+            signature_part=signature_part,
+            signature_prefix=signature_prefix,
+            timestamp_part=timestamp_part,
+            timestamp_header=timestamp_header,
+            template=template,
+            algorithm=algorithm,
+            encoding=encoding,
+            timestamp_unit=timestamp_unit,
+            tolerance_seconds=tolerance_seconds,
+        )
+
+
 @dataclass(frozen=True)
 class WebhookProviderSpec:
     """Wire facts owned by one webhook provider namespace."""
@@ -285,9 +541,133 @@ _PROVIDER_SPECS = (
     ),
     WebhookProviderSpec(
         name="linear",
+        delivery_id_headers=("Linear-Delivery", "Linear-Delivery-ID"),
+        event_headers=("Linear-Event",),
         legacy_detection_headers=("linear-signature",),
         signature_modes=("linear",),
         default_signature_mode="linear",
+    ),
+    WebhookProviderSpec(
+        name="sentry",
+        delivery_id_headers=("sentry-hook-request-id",),
+        legacy_detection_headers=("sentry-hook-signature",),
+        payload_delivery_id_keys=("id",),
+        signature_modes=("sentry",),
+        default_signature_mode="sentry",
+    ),
+    WebhookProviderSpec(
+        name="pocket",
+        aliases=("heypocket", "heypocketai"),
+        legacy_detection_headers=(
+            "X-HeyPocket-Signature",
+            "X-HeyPocket-Timestamp",
+        ),
+        payload_delivery_id_keys=("id", "event_id"),
+        signature_modes=("pocket",),
+        default_signature_mode="pocket",
+    ),
+    WebhookProviderSpec(
+        name="todoist",
+        legacy_detection_headers=("X-Todoist-Hmac-SHA256",),
+        payload_delivery_id_keys=("event_id", "id"),
+        signature_modes=("todoist",),
+        default_signature_mode="todoist",
+    ),
+    WebhookProviderSpec(
+        name="juniper_mist",
+        aliases=("mist",),
+        legacy_detection_headers=("X-Mist-Signature-v2",),
+        payload_delivery_id_keys=("id",),
+        signature_modes=("juniper_mist",),
+        default_signature_mode="juniper_mist",
+    ),
+    WebhookProviderSpec(
+        name="fireflies",
+        legacy_detection_headers=("X-Hub-Signature",),
+        payload_event_keys=("event", "eventType"),
+        signature_modes=("fireflies",),
+        default_signature_mode="fireflies",
+    ),
+    WebhookProviderSpec(
+        name="redmine",
+        legacy_detection_headers=("X-Redmine-Signature-256",),
+        payload_delivery_id_keys=("id",),
+        signature_modes=("redmine",),
+        default_signature_mode="redmine",
+    ),
+    WebhookProviderSpec(
+        name="gitea",
+        delivery_id_headers=("X-Gitea-Delivery",),
+        event_headers=("X-Gitea-Event",),
+        legacy_detection_headers=("X-Gitea-Signature",),
+        payload_delivery_id_keys=("id",),
+        signature_modes=("gitea",),
+        default_signature_mode="gitea",
+    ),
+    WebhookProviderSpec(
+        name="forgejo",
+        delivery_id_headers=("X-Forgejo-Delivery",),
+        event_headers=("X-Forgejo-Event",),
+        legacy_detection_headers=("X-Forgejo-Signature",),
+        payload_delivery_id_keys=("id",),
+        signature_modes=("forgejo",),
+        default_signature_mode="forgejo",
+    ),
+    WebhookProviderSpec(
+        name="asana",
+        legacy_detection_headers=("X-Hook-Signature",),
+        payload_delivery_id_keys=("id",),
+        signature_modes=("asana",),
+        default_signature_mode="asana",
+    ),
+    WebhookProviderSpec(
+        name="notion",
+        legacy_detection_headers=("X-Notion-Signature",),
+        signature_modes=("notion",),
+        default_signature_mode="notion",
+    ),
+    WebhookProviderSpec(
+        name="exit1",
+        legacy_detection_headers=("X-Exit1-Signature",),
+        signature_modes=("exit1",),
+        default_signature_mode="exit1",
+    ),
+    WebhookProviderSpec(
+        name="jira",
+        aliases=("atlassian",),
+        legacy_detection_headers=("X-Hub-Signature",),
+        payload_event_keys=("webhookEvent",),
+        signature_modes=("jira",),
+        default_signature_mode="jira",
+    ),
+    WebhookProviderSpec(
+        name="attio",
+        legacy_detection_headers=("Attio-Signature", "X-Attio-Signature"),
+        payload_delivery_id_keys=("id",),
+        signature_modes=("attio", "attio_x"),
+        default_signature_mode="attio",
+    ),
+    WebhookProviderSpec(
+        name="plain_token",
+        aliases=("shared_secret",),
+        legacy_detection_headers=("X-Webhook-Secret",),
+        signature_modes=("plain_token",),
+        default_signature_mode="plain_token",
+    ),
+    WebhookProviderSpec(
+        name="bearer_token",
+        aliases=("bearer",),
+        legacy_detection_headers=("Authorization",),
+        signature_modes=("bearer_token",),
+        default_signature_mode="bearer_token",
+    ),
+    WebhookProviderSpec(
+        name="trello",
+        legacy_detection_headers=("X-Trello-Webhook",),
+        payload_delivery_id_keys=("action.id",),
+        payload_event_keys=("action.type",),
+        signature_modes=("trello",),
+        default_signature_mode="trello",
     ),
     WebhookProviderSpec(
         name="hindsight",
@@ -322,6 +702,12 @@ _PROVIDER_SPECS = (
         default_signature_mode="stripe",
     ),
     WebhookProviderSpec(
+        name="custom",
+        aliases=("custom_hmac",),
+        signature_modes=("custom_hmac",),
+        default_signature_mode="custom_hmac",
+    ),
+    WebhookProviderSpec(
         name="generic",
         aliases=("generic_v1", "generic_v2"),
         legacy_detection_headers=(
@@ -352,12 +738,37 @@ _SIGNATURE_MODE_ALIASES = MappingProxyType({
     "standard_webhooks": "standard_webhooks",
     "gitlab_standard": "standard_webhooks",
     "linear": "linear",
+    "sentry": "sentry",
+    "pocket": "pocket",
+    "heypocket": "pocket",
+    "heypocketai": "pocket",
+    "todoist": "todoist",
+    "juniper_mist": "juniper_mist",
+    "mist": "juniper_mist",
+    "fireflies": "fireflies",
+    "redmine": "redmine",
+    "gitea": "gitea",
+    "forgejo": "forgejo",
+    "asana": "asana",
+    "notion": "notion",
+    "exit1": "exit1",
+    "jira": "jira",
+    "atlassian": "jira",
+    "attio": "attio",
+    "attio_x": "attio_x",
+    "plain_token": "plain_token",
+    "shared_secret": "plain_token",
+    "bearer": "bearer_token",
+    "bearer_token": "bearer_token",
+    "trello": "trello",
     "hindsight": "hindsight",
     "hindsight_hmac_sha256": "hindsight",
     "hermes": "hermes",
     "hermes_agent": "hermes",
     "stripe": "stripe",
     "stripe_signature": "stripe",
+    "custom": "custom_hmac",
+    "custom_hmac": "custom_hmac",
     "generic": "generic_v2",
     "generic_v1": "generic_v1",
     "generic_v2": "generic_v2",
@@ -368,9 +779,27 @@ _SIGNATURE_MODE_TO_PROVIDER = MappingProxyType({
     "gitlab": "gitlab",
     "standard_webhooks": "standard_webhooks",
     "linear": "linear",
+    "sentry": "sentry",
+    "pocket": "pocket",
+    "todoist": "todoist",
+    "juniper_mist": "juniper_mist",
+    "fireflies": "fireflies",
+    "redmine": "redmine",
+    "gitea": "gitea",
+    "forgejo": "forgejo",
+    "asana": "asana",
+    "notion": "notion",
+    "exit1": "exit1",
+    "jira": "jira",
+    "attio": "attio",
+    "attio_x": "attio",
+    "plain_token": "plain_token",
+    "bearer_token": "bearer_token",
+    "trello": "trello",
     "hindsight": "hindsight",
     "hermes": "hermes",
     "stripe": "stripe",
+    "custom_hmac": "custom",
     "generic_v1": "generic",
     "generic_v2": "generic",
 })
@@ -387,6 +816,20 @@ def _nonempty_scalar(value: Any) -> Optional[str]:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _payload_value(payload: Mapping[str, Any], path: str) -> Any:
+    """Resolve a bounded dotted provider field without list/index semantics."""
+
+    current: Any = payload
+    parts = path.split(".")
+    if not parts or len(parts) > 8:
+        return None
+    for part in parts:
+        if not part or not isinstance(current, Mapping):
+            return None
+        current = current.get(part)
+    return current
 
 
 def _header(headers: Mapping[str, Any], name: str) -> str:
@@ -437,6 +880,8 @@ class WebhookRouteConfig:
     signature_mode: str
     enabled: bool
     events: tuple[str, ...]
+    signature_context: Optional[str]
+    custom_signature: Optional[WebhookCustomSignatureSpec]
 
     @classmethod
     def bind(
@@ -531,6 +976,22 @@ class WebhookRouteConfig:
                     "explicit signature_mode"
                 )
 
+        custom_signature: Optional[WebhookCustomSignatureSpec] = None
+        if signature_mode == "custom_hmac":
+            if "signature" not in route:
+                raise WebhookContractError(
+                    f"route {route_name!r} custom_hmac requires a 'signature' object"
+                )
+            custom_signature = WebhookCustomSignatureSpec.bind(
+                route_name,
+                route.get("signature"),
+            )
+        elif "signature" in route:
+            raise WebhookContractError(
+                f"route {route_name!r} may declare 'signature' only with "
+                "signature_mode 'custom_hmac'"
+            )
+
         enabled_raw = route.get("enabled", True)
         if not isinstance(enabled_raw, bool):
             raise WebhookContractError(
@@ -583,6 +1044,36 @@ class WebhookRouteConfig:
                     f"{supported}"
                 )
 
+        signature_context: Optional[str] = None
+        callback_url = route.get("callback_url")
+        if provider == "trello":
+            if not isinstance(callback_url, str) or not callback_url.strip():
+                raise WebhookContractError(
+                    f"route {route_name!r} provider 'trello' requires callback_url"
+                )
+            callback_url = callback_url.strip()
+            try:
+                parsed_callback = urlsplit(callback_url)
+            except ValueError as exc:
+                raise WebhookContractError(
+                    f"route {route_name!r} has malformed callback_url"
+                ) from exc
+            if (
+                parsed_callback.scheme not in {"http", "https"}
+                or not parsed_callback.hostname
+                or parsed_callback.username is not None
+                or parsed_callback.password is not None
+                or parsed_callback.fragment
+            ):
+                raise WebhookContractError(
+                    f"route {route_name!r} has invalid Trello callback_url"
+                )
+            signature_context = callback_url
+        elif callback_url is not None:
+            raise WebhookContractError(
+                f"route {route_name!r} callback_url is valid only for Trello"
+            )
+
         return cls(
             name=route_name,
             profile=configured_profile,
@@ -591,11 +1082,29 @@ class WebhookRouteConfig:
             signature_mode=signature_mode,
             enabled=enabled_raw,
             events=events,
+            signature_context=signature_context,
+            custom_signature=custom_signature,
         )
 
     @property
     def provider_spec(self) -> WebhookProviderSpec:
         return PROVIDER_REGISTRY[self.provider]
+
+    @property
+    def hmac_algorithm(self) -> Optional[str]:
+        """Digest defining verifier-equivalent HMAC key material, if any."""
+
+        if self.signature_mode in {"gitlab", "plain_token", "bearer_token"}:
+            return None
+        if self.signature_mode == "trello":
+            return "sha1"
+        if self.signature_mode == "custom_hmac":
+            return (
+                self.custom_signature.algorithm
+                if self.custom_signature is not None
+                else None
+            )
+        return "sha256"
 
 
 @dataclass(frozen=True)
@@ -659,7 +1168,8 @@ def resolve_delivery_identity(
             (
                 candidate
                 for key in spec.authenticated_delivery_id_payload_keys
-                if (candidate := _nonempty_scalar(payload.get(key))) is not None
+                if (candidate := _nonempty_scalar(_payload_value(payload, key)))
+                is not None
             ),
             None,
         )
@@ -690,7 +1200,7 @@ def resolve_delivery_identity(
 
     if allow_authenticated_payload and route.provider_declared:
         for key in spec.payload_delivery_id_keys:
-            candidate = _nonempty_scalar(payload.get(key))
+            candidate = _nonempty_scalar(_payload_value(payload, key))
             if candidate is not None:
                 return WebhookDeliveryIdentity(route.provider, candidate)
     return None
@@ -755,7 +1265,8 @@ def resolve_event_type(
             (
                 candidate
                 for key in spec.authenticated_event_payload_keys
-                if (candidate := _nonempty_scalar(payload.get(key))) is not None
+                if (candidate := _nonempty_scalar(_payload_value(payload, key)))
+                is not None
             ),
             None,
         )
@@ -780,7 +1291,7 @@ def resolve_event_type(
         return authenticated_event(payload_event)
 
     for key in (*spec.payload_event_keys, "event_type", "type"):
-        value = _nonempty_scalar(payload.get(key))
+        value = _nonempty_scalar(_payload_value(payload, key))
         if value is not None:
             return authenticated_event(value)
     return "unknown"
@@ -854,7 +1365,7 @@ def _resolve_observed_event_type(
         (
             candidate
             for key in (*spec.payload_event_keys, "event_type", "type")
-            if (candidate := _nonempty_scalar(payload.get(key))) is not None
+            if (candidate := _nonempty_scalar(_payload_value(payload, key))) is not None
         ),
         None,
     )

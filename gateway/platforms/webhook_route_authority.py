@@ -55,8 +55,94 @@ from gateway.platforms.webhook_common import (
 
 logger = logging.getLogger(__name__)
 
+WebhookRouteKey = tuple[str, str]
+
+
+def _route_key_from_candidate(
+    raw_key: Any,
+    route: Any,
+) -> WebhookRouteKey:
+    """Return the canonical public ``(profile, route)`` registry key."""
+
+    if isinstance(raw_key, tuple):
+        if (
+            len(raw_key) != 2
+            or not isinstance(raw_key[0], str)
+            or not isinstance(raw_key[1], str)
+        ):
+            raise WebhookContractError("webhook route authority key is malformed")
+        key = raw_key
+        configured_profile = (
+            route.get("profile", "default") if isinstance(route, Mapping) else "default"
+        )
+        if configured_profile != key[0]:
+            raise WebhookContractError(
+                f"webhook route authority {key[0]!r}/{key[1]!r} carries "
+                f"profile {configured_profile!r}"
+            )
+        return key
+    if not isinstance(raw_key, str):
+        raise WebhookContractError("webhook route name must be text")
+    profile = (
+        route.get("profile", "default") if isinstance(route, Mapping) else "default"
+    )
+    if not isinstance(profile, str):
+        raise WebhookContractError("webhook route profile must be text")
+    return (profile, raw_key)
+
+
+def _qualified_route_candidates(
+    routes: Mapping[Any, Any],
+) -> dict[WebhookRouteKey, Any]:
+    """Normalize route candidates without collapsing equal names by profile."""
+
+    qualified: dict[WebhookRouteKey, Any] = {}
+    for raw_key, route in routes.items():
+        key = _route_key_from_candidate(raw_key, route)
+        if key in qualified:
+            raise WebhookContractError(
+                f"duplicate webhook route authority {key[0]!r}/{key[1]!r}"
+            )
+        qualified[key] = route
+    return qualified
+
+
+def _unique_name_facade(routes: Mapping[WebhookRouteKey, Any]) -> dict[str, Any]:
+    """Compatibility view containing only globally unambiguous route names."""
+
+    counts: dict[str, int] = {}
+    for _profile, name in routes:
+        counts[name] = counts.get(name, 0) + 1
+    return {
+        name: value for (_profile, name), value in routes.items() if counts[name] == 1
+    }
+
 
 class WebhookRouteAuthorityMixin:
+    @staticmethod
+    def _qualified_route_candidates(
+        routes: Mapping[Any, Any],
+    ) -> dict[WebhookRouteKey, Any]:
+        """Expose canonical qualification to intake without a second parser."""
+
+        return _qualified_route_candidates(routes)
+
+    def _replace_live_route_candidates(
+        self,
+        dynamic_routes: Mapping[Any, Any],
+        routes: Mapping[Any, Any],
+    ) -> None:
+        """Install qualified candidates and non-authoritative legacy facades."""
+
+        dynamic_by_key = _qualified_route_candidates(dynamic_routes)
+        routes_by_key = _qualified_route_candidates(routes)
+        self._dynamic_routes_by_key = MappingProxyType(dynamic_by_key)
+        self._routes_by_key = MappingProxyType(routes_by_key)
+        # Older tests/embedders inspect these maps. Ambiguous names are omitted
+        # so no legacy access path can choose one profile by iteration order.
+        self._dynamic_routes = _unique_name_facade(dynamic_by_key)
+        self._routes = _unique_name_facade(routes_by_key)
+
     def _intake_is_authoritative(self, profile: str) -> bool:
         """Return whether this exact shared listener may admit requests."""
 
@@ -594,34 +680,36 @@ class WebhookRouteAuthorityMixin:
 
     def _route_authentication_authority_snapshot(
         self,
-        routes: Mapping[str, Any],
+        routes: Mapping[Any, Any],
         *,
         prepared_skill_overrides: Optional[
-            Mapping[str, PreparedSkillInvocation]
+            Mapping[Any, PreparedSkillInvocation]
         ] = None,
     ) -> tuple[
         tuple[Any, ...],
         list[tuple[str, str, str, str, str, str]],
-        Mapping[str, tuple[Any, ...]],
-        Mapping[str, tuple[str, ...]],
-        Mapping[str, Optional[WebhookPreparedScript]],
-        Mapping[str, str],
-        Mapping[str, AuthenticatedRouteAuthority],
+        Mapping[WebhookRouteKey, tuple[Any, ...]],
+        Mapping[WebhookRouteKey, tuple[str, ...]],
+        Mapping[WebhookRouteKey, Optional[WebhookPreparedScript]],
+        Mapping[WebhookRouteKey, str],
+        Mapping[WebhookRouteKey, AuthenticatedRouteAuthority],
     ]:
         """Validate a complete route set and build its durable key bindings."""
 
         material_owners: dict[str, tuple[str, str, str, str]] = {}
         bindings: list[tuple[str, str, str, str, str, str]] = []
         snapshot: list[tuple[Any, ...]] = []
-        authorities: dict[str, tuple[Any, ...]] = {}
-        effective_toolsets_by_route: dict[str, tuple[str, ...]] = {}
-        prepared_scripts: dict[str, Optional[WebhookPreparedScript]] = {}
-        profile_generations: dict[str, str] = {}
+        authorities: dict[WebhookRouteKey, tuple[Any, ...]] = {}
+        effective_toolsets_by_route: dict[WebhookRouteKey, tuple[str, ...]] = {}
+        prepared_scripts: dict[WebhookRouteKey, Optional[WebhookPreparedScript]] = {}
+        profile_generations: dict[WebhookRouteKey, str] = {}
         observed_profile_generations: dict[str, str] = {}
-        bundles: dict[str, AuthenticatedRouteAuthority] = {}
+        bundles: dict[WebhookRouteKey, AuthenticatedRouteAuthority] = {}
         authority_profiles: set[str] = set()
-        for route_name in sorted(routes):
-            route = routes[route_name]
+        qualified_routes = _qualified_route_candidates(routes)
+        for route_key in sorted(qualified_routes):
+            public_profile, route_name = route_key
+            route = qualified_routes[route_key]
             if not isinstance(route, Mapping):
                 raise WebhookContractError(
                     f"route {route_name!r} configuration must be an object"
@@ -631,10 +719,17 @@ class WebhookRouteAuthorityMixin:
                 route_name,
                 route_snapshot,
                 headers={},
-                request_profile=route_snapshot.get("profile", "default"),
+                request_profile=public_profile,
             )
             self._validate_route_profile_reachable(route_snapshot, bound_route)
-            secret = route_snapshot.get("secret", self._global_secret)
+            # An explicit reference is an isolation boundary. Until Task 8
+            # resolves it inside the bound profile scope, it must not silently
+            # borrow the listener owner's global secret.
+            secret = (
+                ""
+                if "secret_ref" in route_snapshot and "secret" not in route_snapshot
+                else route_snapshot.get("secret", self._global_secret)
+            )
             if not isinstance(secret, str) or not secret:
                 raise WebhookContractError(f"route {route_name!r} has no HMAC secret")
             if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
@@ -673,7 +768,7 @@ class WebhookRouteAuthorityMixin:
                 bound_route,
                 authority_profile=owner[0],
             )
-            effective_toolsets_by_route[route_name] = effective_toolsets
+            effective_toolsets_by_route[route_key] = effective_toolsets
             prepared_script: Optional[WebhookPreparedScript] = None
             if route_snapshot.get("script"):
                 source = self._source_for_route_authority(
@@ -691,7 +786,7 @@ class WebhookRouteAuthorityMixin:
                         f"route {route_name!r} script is unavailable: "
                         f"{script_error or 'unknown error'}"
                     )
-            prepared_scripts[route_name] = prepared_script
+            prepared_scripts[route_key] = prepared_script
             script_sha256 = (
                 prepared_script.execution_sha256
                 if prepared_script is not None
@@ -703,7 +798,10 @@ class WebhookRouteAuthorityMixin:
                 authority_profile=owner[0],
             )
             prepared_skill = (
-                prepared_skill_overrides.get(route_name)
+                prepared_skill_overrides.get(route_key)
+                if prepared_skill_overrides is not None
+                and route_key in prepared_skill_overrides
+                else prepared_skill_overrides.get(route_name)
                 if prepared_skill_overrides is not None
                 and route_name in prepared_skill_overrides
                 else self._prepare_route_skill_authority(
@@ -744,7 +842,7 @@ class WebhookRouteAuthorityMixin:
                     "was snapshotted"
                 )
             observed_profile_generations[owner[0]] = profile_generation
-            profile_generations[route_name] = profile_generation
+            profile_generations[route_key] = profile_generation
             policy_sha256 = _route_policy_sha256(
                 route_snapshot,
                 owner[0],
@@ -757,9 +855,9 @@ class WebhookRouteAuthorityMixin:
             )
             if secret == _INSECURE_NO_AUTH:
                 authority = (*owner, policy_sha256, ("local-bypass",))
-                snapshot.append(authority)
-                authorities[route_name] = authority
-                bundles[route_name] = AuthenticatedRouteAuthority(
+                snapshot.append((route_key, authority))
+                authorities[route_key] = authority
+                bundles[route_key] = AuthenticatedRouteAuthority(
                     authority=authority,
                     secret=secret,
                     route_config=route_snapshot,
@@ -778,6 +876,7 @@ class WebhookRouteAuthorityMixin:
                     for fingerprint in _authentication_key_fingerprints(
                         secret,
                         bound_route.signature_mode,
+                        bound_route.hmac_algorithm,
                     )
                 )
             )
@@ -794,9 +893,9 @@ class WebhookRouteAuthorityMixin:
                 material_owners[fingerprint] = owner
                 bindings.append((fingerprint, *owner, policy_sha256))
             authority = (*owner, policy_sha256, fingerprints)
-            snapshot.append(authority)
-            authorities[route_name] = authority
-            bundles[route_name] = AuthenticatedRouteAuthority(
+            snapshot.append((route_key, authority))
+            authorities[route_key] = authority
+            bundles[route_key] = AuthenticatedRouteAuthority(
                 authority=authority,
                 secret=secret,
                 route_config=route_snapshot,
@@ -819,9 +918,18 @@ class WebhookRouteAuthorityMixin:
 
     def _bind_route_authentication_authorities(
         self,
-        routes: Mapping[str, Any],
+        routes: Mapping[Any, Any],
+        *,
+        expected_profile_generations: Optional[Mapping[str, str]] = None,
     ) -> tuple[Any, ...]:
-        """Publish one complete route-key snapshot to durable authority."""
+        """Publish one complete route-key snapshot to durable authority.
+
+        ``expected_profile_generations`` joins a profile-store snapshot to the
+        physical profile incarnation observed while it was loaded. The guard
+        runs after all bundle preparation and immediately before the durable
+        credential bind, so a profile re-home cannot publish keys for route
+        bytes captured from its prior incarnation.
+        """
 
         (
             snapshot,
@@ -832,24 +940,114 @@ class WebhookRouteAuthorityMixin:
             profile_generations,
             bundles,
         ) = self._route_authentication_authority_snapshot(routes)
+        if expected_profile_generations is not None:
+            for profile, expected in sorted(expected_profile_generations.items()):
+                if not isinstance(profile, str) or not isinstance(expected, str):
+                    raise WebhookContractError(
+                        "webhook profile-store generation proof is malformed"
+                    )
+                current = self._current_profile_authority_generation(
+                    profile,
+                    route_name="profile-store",
+                )
+                if not secrets.compare_digest(current, expected):
+                    raise WebhookContractError(
+                        f"profile {profile!r} authority changed before route "
+                        "publication"
+                    )
+            for bundle in bundles.values():
+                public_profile = bundle.route_config.get("profile", "default")
+                expected = expected_profile_generations.get(public_profile)
+                physical_profile = bundle.authority[0]
+                if (
+                    expected is not None
+                    and physical_profile == public_profile
+                    and not secrets.compare_digest(
+                        bundle.profile_generation,
+                        expected,
+                    )
+                ):
+                    raise WebhookContractError(
+                        f"profile {public_profile!r} route bundle was captured "
+                        "from a different physical incarnation"
+                    )
         if snapshot == self._authenticated_route_snapshot:
-            self._prune_rate_limit_buckets(self._authenticated_route_bundles)
+            self._prune_rate_limit_buckets(self._authenticated_route_registry)
             return snapshot
+        # A registry publication is a whole-map swap, but an unchanged exact
+        # qualified route remains the same authority generation.  Preserve its
+        # bundle object so a request that captured that route before an
+        # unrelated sibling changed is not spuriously fenced by the sibling's
+        # publication.  Dataclass equality covers the complete detached route
+        # and filter configs, secret, prepared dependencies, toolsets, durable
+        # authority, and physical-profile generation; a changed key therefore
+        # always receives a fresh object and keeps the identity fence below.
+        prior_registry = self._authenticated_route_registry
+        bundles = MappingProxyType({
+            route_key: (
+                prior_registry[route_key]
+                if route_key in prior_registry
+                and prior_registry[route_key] == candidate_bundle
+                else candidate_bundle
+            )
+            for route_key, candidate_bundle in bundles.items()
+        })
         self._authentication_authority_ledger.bind_authentication_keys(bindings)
         self._authenticated_route_snapshot = snapshot
-        self._authenticated_route_authorities = authorities
-        self._authenticated_route_effective_toolsets = effective_toolsets
-        self._authenticated_route_scripts = prepared_scripts
-        self._authenticated_route_profile_generations = profile_generations
-        # Publish last: this single reference swap is the request-facing
-        # generation token and makes the complete bundle registry atomic.
-        self._authenticated_route_bundles = bundles
+        self._authenticated_route_authorities_by_key = authorities
+        self._authenticated_route_effective_toolsets_by_key = effective_toolsets
+        self._authenticated_route_scripts_by_key = prepared_scripts
+        self._authenticated_route_profile_generations_by_key = profile_generations
+        self._authenticated_route_authorities = MappingProxyType(
+            _unique_name_facade(authorities)
+        )
+        self._authenticated_route_effective_toolsets = MappingProxyType(
+            _unique_name_facade(effective_toolsets)
+        )
+        self._authenticated_route_scripts = MappingProxyType(
+            _unique_name_facade(prepared_scripts)
+        )
+        self._authenticated_route_profile_generations = MappingProxyType(
+            _unique_name_facade(profile_generations)
+        )
+        self._authenticated_route_bundles_by_key = bundles
+        self._authenticated_route_bundles = MappingProxyType(
+            _unique_name_facade(bundles)
+        )
+        # Publish last: each immutable bundle includes its exact frozen route
+        # snapshot, so this one reference is the complete request-facing
+        # registry generation. Intake never rejoins it through candidate maps.
+        self._authenticated_route_registry = bundles
         self._prune_rate_limit_buckets(bundles)
         return snapshot
 
+    def _canonical_live_route_key(
+        self,
+        route: Any,
+        bundle: Optional[AuthenticatedRouteAuthority] = None,
+    ) -> Optional[WebhookRouteKey]:
+        """Resolve a route reference without guessing between profile siblings."""
+
+        if isinstance(route, tuple):
+            if (
+                len(route) == 2
+                and isinstance(route[0], str)
+                and isinstance(route[1], str)
+            ):
+                return (route[0], route[1])
+            return None
+        if not isinstance(route, str):
+            return None
+        if bundle is not None:
+            profile = bundle.route_config.get("profile", "default")
+            if isinstance(profile, str):
+                return (profile, route)
+        matches = [key for key in self._authenticated_route_registry if key[1] == route]
+        return matches[0] if len(matches) == 1 else None
+
     def _route_owns_unique_authenticated_secret(
         self,
-        route_name: str,
+        route_name: Any,
         secret: str,
         signature_mode: str,
         bundle: Optional[AuthenticatedRouteAuthority] = None,
@@ -860,22 +1058,24 @@ class WebhookRouteAuthorityMixin:
             if self._authenticated_route_snapshot is None:
                 # Compatibility for tests/embedders that exercise the handler
                 # without connect(). Production listeners bind before opening.
-                self._bind_route_authentication_authorities(self._routes)
-            bundle = bundle or self._authenticated_route_bundles.get(route_name)
+                self._bind_route_authentication_authorities(self._routes_by_key)
+            route_key = self._canonical_live_route_key(route_name, bundle)
+            if route_key is None:
+                return False
+            public_profile, public_route_name = route_key
+            bundle = bundle or self._authenticated_route_registry.get(route_key)
             expected = bundle.authority if bundle is not None else None
-            route = self._routes.get(route_name)
-            if bundle is None or expected is None or not isinstance(route, Mapping):
+            if bundle is None or expected is None:
                 return False
             if bundle.secret != secret:
                 return False
-            live_snapshot = _snapshot_route_config(dict(route))
-            if live_snapshot != bundle.route_config:
+            if self._authenticated_route_registry.get(route_key) is not bundle:
                 return False
             bound_route = WebhookRouteConfig.bind(
-                route_name,
+                public_route_name,
                 bundle.route_config,
                 headers={},
-                request_profile=bundle.route_config.get("profile", "default"),
+                request_profile=public_profile,
             )
             if bound_route.signature_mode != signature_mode:
                 return False
@@ -889,6 +1089,7 @@ class WebhookRouteAuthorityMixin:
                         for fingerprint in _authentication_key_fingerprints(
                             secret,
                             signature_mode,
+                            bound_route.hmac_algorithm,
                         )
                     )
                 )
@@ -906,19 +1107,22 @@ class WebhookRouteAuthorityMixin:
 
     def _live_route_authority_matches(
         self,
-        route_name: str,
+        route_name: Any,
         bundle: AuthenticatedRouteAuthority,
     ) -> bool:
         """Revalidate mutable profile grants/code against the bound snapshot."""
 
         try:
+            route_key = self._canonical_live_route_key(route_name, bundle)
+            if route_key is None:
+                return False
             _, _, authorities, _, _, _, _ = (
                 self._route_authentication_authority_snapshot(
                     {
-                        route_name: bundle.route_config,
+                        route_key: bundle.route_config,
                     },
                     prepared_skill_overrides=(
-                        {route_name: bundle.prepared_skill}
+                        {route_key: bundle.prepared_skill}
                         if bundle.prepared_skill is not None
                         and not bundle.prepared_skill.inject_prompt
                         else None
@@ -927,18 +1131,18 @@ class WebhookRouteAuthorityMixin:
             )
         except Exception:
             return False
-        return authorities.get(route_name) == bundle.authority
+        return authorities.get(route_key) == bundle.authority
 
     def _route_bundle_is_current(
         self,
-        route_name: str,
+        route_name: Any,
         bundle: AuthenticatedRouteAuthority,
     ) -> bool:
         """Check the request's exact registry object, not merely its name."""
 
-        return (
-            self._authenticated_route_bundles.get(route_name) is bundle
-            and route_name in self._routes
+        route_key = self._canonical_live_route_key(route_name, bundle)
+        return route_key is not None and (
+            self._authenticated_route_registry.get(route_key) is bundle
         )
 
     @staticmethod
@@ -964,20 +1168,98 @@ class WebhookRouteAuthorityMixin:
             for fingerprint in fingerprints
         )
 
+    def _retain_published_route_authorities(
+        self,
+        routes: Mapping[Any, Any],
+    ) -> None:
+        """Atomically retain only bundles matching exact candidate snapshots."""
+
+        qualified = _qualified_route_candidates(routes)
+        retained_keys: set[WebhookRouteKey] = set()
+        for route_key, route in qualified.items():
+            bundle = self._authenticated_route_registry.get(route_key)
+            if bundle is None or not isinstance(route, Mapping):
+                continue
+            try:
+                candidate = _snapshot_route_config(dict(route))
+            except WebhookContractError:
+                continue
+            if candidate == bundle.route_config:
+                retained_keys.add(route_key)
+        if retained_keys == set(self._authenticated_route_registry):
+            return
+        self._authenticated_route_snapshot = None
+        authorities = {
+            key: value
+            for key, value in self._authenticated_route_authorities_by_key.items()
+            if key in retained_keys
+        }
+        toolsets = {
+            key: value
+            for key, value in self._authenticated_route_effective_toolsets_by_key.items()
+            if key in retained_keys
+        }
+        scripts = {
+            key: value
+            for key, value in self._authenticated_route_scripts_by_key.items()
+            if key in retained_keys
+        }
+        generations = {
+            key: value
+            for key, value in self._authenticated_route_profile_generations_by_key.items()
+            if key in retained_keys
+        }
+        bundles = MappingProxyType({
+            key: value
+            for key, value in self._authenticated_route_registry.items()
+            if key in retained_keys
+        })
+        self._authenticated_route_authorities_by_key = MappingProxyType(authorities)
+        self._authenticated_route_effective_toolsets_by_key = MappingProxyType(toolsets)
+        self._authenticated_route_scripts_by_key = MappingProxyType(scripts)
+        self._authenticated_route_profile_generations_by_key = MappingProxyType(
+            generations
+        )
+        self._authenticated_route_authorities = MappingProxyType(
+            _unique_name_facade(authorities)
+        )
+        self._authenticated_route_effective_toolsets = MappingProxyType(
+            _unique_name_facade(toolsets)
+        )
+        self._authenticated_route_scripts = MappingProxyType(
+            _unique_name_facade(scripts)
+        )
+        self._authenticated_route_profile_generations = MappingProxyType(
+            _unique_name_facade(generations)
+        )
+        self._authenticated_route_bundles_by_key = bundles
+        self._authenticated_route_bundles = MappingProxyType(
+            _unique_name_facade(bundles)
+        )
+        # Request-facing withdrawal is one immutable registry generation swap.
+        self._authenticated_route_registry = bundles
+        self._prune_rate_limit_buckets(bundles)
+
     def _withdraw_live_route(
         self,
-        route_name: str,
+        route_name: Any,
         expected: Optional[AuthenticatedRouteAuthority] = None,
     ) -> bool:
         """Fence one route in memory until a valid rotated snapshot publishes."""
 
+        route_key = self._canonical_live_route_key(route_name, expected)
+        if route_key is None:
+            return False
         if expected is not None and (
-            self._authenticated_route_bundles.get(route_name) is not expected
+            self._authenticated_route_registry.get(route_key) is not expected
         ):
             return False
-        self._dynamic_routes.pop(route_name, None)
-        self._routes.pop(route_name, None)
-        self._prune_rate_limit_buckets()
+        dynamic = dict(self._dynamic_routes_by_key)
+        routes = dict(self._routes_by_key)
+        dynamic.pop(route_key, None)
+        routes.pop(route_key, None)
+        self._replace_live_route_candidates(dynamic, routes)
+        self._retain_published_route_authorities(routes)
         return True
 
     def _resolve_admitted_toolsets(

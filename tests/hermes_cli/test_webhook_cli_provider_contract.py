@@ -19,6 +19,7 @@ from hermes_cli.webhook import (
     _default_test_payload,
     _load_subscriptions,
     _save_subscriptions,
+    _subscriptions_path,
     _test_headers,
     webhook_command,
 )
@@ -39,14 +40,18 @@ def _args(**overrides) -> Namespace:
         "provider": "github",
         "signature_mode": "",
         "route_profile": "default",
+        "profile": "",
         "description": "",
         "skills": "",
         "deliver": "log",
         "deliver_chat_id": "",
         "secret": "test-secret",
+        "secret_fd": None,
         "payload": "",
         "script": "",
         "deliver_only": False,
+        "replace": False,
+        "json": False,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -110,12 +115,12 @@ def test_named_profile_subscription_persists_and_tests_the_prefixed_url(
 ):
     webhook_command(_args(route_profile="Ops"))
 
-    route = _load_subscriptions()["events"]
+    route = _load_subscriptions("ops")["events"]
     assert route["profile"] == "ops"
     assert "/p/ops/webhooks/events" in capsys.readouterr().out
 
     captured = _capture_urlopen(monkeypatch)
-    webhook_command(_args(webhook_action="test"))
+    webhook_command(_args(webhook_action="test", profile="ops"))
 
     assert captured["request"].full_url == "http://localhost:8644/p/ops/webhooks/events"
 
@@ -190,7 +195,7 @@ def test_real_entrypoint_preserves_route_profile_for_webhook_subcommand(
     assert os.environ["HERMES_HOME"] == original_home
     main_mod.main()
 
-    route = _load_subscriptions()["entrypoint-profile"]
+    route = _load_subscriptions("ops")["entrypoint-profile"]
     assert route["profile"] == "ops"
 
 
@@ -426,16 +431,21 @@ def test_generated_default_request_satisfies_selected_verifier(
     assert envelope.event_type == events[0]
 
 
-def test_test_command_rejects_unbound_manual_route_before_network(
+def test_test_command_rejects_corrupt_unbound_store_before_network(
     capsys,
     monkeypatch,
 ):
-    _save_subscriptions({
-        "events": {
-            "description": "manually created",
-            "secret": "test-secret",
-        }
-    })
+    path = _subscriptions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "events": {
+                "description": "manually created",
+                "secret": "test-secret",
+            }
+        }),
+        encoding="utf-8",
+    )
     called = False
 
     def _unexpected_urlopen(*_args, **_kwargs):
@@ -447,4 +457,6 @@ def test_test_command_rejects_unbound_manual_route_before_network(
     webhook_command(_args(webhook_action="test"))
 
     assert called is False
-    assert "requires an explicit provider or signature_mode" in capsys.readouterr().out
+    assert (
+        "Cannot safely access the webhook subscription store" in capsys.readouterr().out
+    )

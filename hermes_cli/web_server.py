@@ -14046,12 +14046,22 @@ async def clear_pending_pairing(profile: Optional[str] = None):
 
 
 def _webhook_route_summary(name: str, route: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    # Project only the known non-secret destination field. Never return the
+    # raw deliver_extra bag: future target fields may carry sensitive values.
+    deliver_chat_id = None
+    deliver_extra = route.get("deliver_extra")
+    if isinstance(deliver_extra, dict):
+        raw_chat_id = deliver_extra.get("chat_id")
+        if isinstance(raw_chat_id, str):
+            deliver_chat_id = raw_chat_id
+
     return {
         "name": name,
         "description": route.get("description", ""),
         "events": list(route.get("events") or []),
         "deliver": route.get("deliver", "log"),
         "deliver_only": bool(route.get("deliver_only")),
+        "deliver_chat_id": deliver_chat_id,
         "prompt": route.get("prompt", ""),
         "script": route.get("script", ""),
         "skills": list(route.get("skills") or []),

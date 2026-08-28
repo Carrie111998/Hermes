@@ -471,6 +471,7 @@ def _strict_bounded_int(
 def _authentication_key_fingerprints(
     secret: str,
     signature_mode: str,
+    hmac_algorithm: Optional[str] = "sha256",
 ) -> frozenset[bytes]:
     """Return log-safe equality keys for every reusable secret material.
 
@@ -499,19 +500,32 @@ def _authentication_key_fingerprints(
             raise WebhookContractError(
                 "webhook whsec_ secret must decode to a non-empty key"
             )
+    if hmac_algorithm is not None:
+        try:
+            digest = hashlib.new(hmac_algorithm)
+        except (TypeError, ValueError) as exc:
+            raise WebhookContractError(
+                "webhook HMAC algorithm is not supported"
+            ) from exc
+        block_size = digest.block_size
+    else:
+        block_size = 0
+
     fingerprints: set[bytes] = set()
     for material in {raw_key, effective_key}:
         fingerprints.add(hashlib.sha256(material).digest())
-        # HMAC-SHA256 first hashes keys longer than its 64-byte block, then
-        # zero-pads shorter keys. Consequently b"key" and b"key\0" (and a
-        # long key versus its 32-byte SHA-256 digest) are verifier-equivalent.
-        normalized = (
-            hashlib.sha256(material).digest()
-            if len(material) > hashlib.sha256().block_size
-            else material
-        )
-        hmac_key_block = normalized.ljust(hashlib.sha256().block_size, b"\0")
-        fingerprints.add(hashlib.sha256(hmac_key_block).digest())
+        if hmac_algorithm is not None:
+            # HMAC first hashes keys longer than the selected digest's block,
+            # then zero-pads shorter keys. Record the exact normalized block so
+            # verifier-equivalent custom SHA-1/SHA-512 keys cannot be assigned
+            # to distinct authorities.
+            normalized = (
+                hashlib.new(hmac_algorithm, material).digest()
+                if len(material) > block_size
+                else material
+            )
+            hmac_key_block = normalized.ljust(block_size, b"\0")
+            fingerprints.add(hashlib.sha256(hmac_key_block).digest())
     return frozenset(fingerprints)
 
 

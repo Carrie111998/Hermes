@@ -101,7 +101,11 @@ def _isolated_ledger_home(tmp_path, monkeypatch):
 
 def _app(adapter):
     app = web.Application(client_max_size=adapter._max_body_bytes)
-    app.router.add_get("/health", adapter._handle_health)
+    # This focused harness predates the public liveness/readiness split. Keep
+    # its historical authority assertions pointed at readiness; production
+    # connect() exposes readiness at /ready and keeps /health liveness-only.
+    app.router.add_get("/health", adapter._handle_ready)
+    app.router.add_get("/ready", adapter._handle_ready)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
     app.router.add_post(
         "/p/{profile}/webhooks/{route_name}",
@@ -446,7 +450,7 @@ class TestFilterAuthority:
             # must not stall the aiohttp event loop or its health endpoint.
             process = real_popen(*args, **kwargs)
             started.set()
-            assert release.wait(2)
+            assert release.wait(5)
             return process
 
         monkeypatch.setattr(
@@ -466,7 +470,9 @@ class TestFilterAuthority:
                 client.post("/webhooks/events", json={"value": "unsafe"})
             )
             try:
-                assert await asyncio.to_thread(started.wait, 1)
+                # Process startup competes with the full 18-worker CI shard;
+                # this wait synchronizes the test and is not the health SLA.
+                assert await asyncio.to_thread(started.wait, 5)
                 health = await asyncio.wait_for(client.get("/health"), timeout=0.5)
                 assert health.status == 200
             finally:
@@ -1379,7 +1385,7 @@ class TestHTTPComposition:
         adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_failed_agent_processing_becomes_indeterminate_for_retry(self):
+    async def test_failed_agent_processing_stages_terminal_error_once(self):
         adapter = _adapter({
             "events": {
                 "secret": _INSECURE_NO_AUTH,
@@ -1403,13 +1409,28 @@ class TestHTTPComposition:
             assert event.webhook_envelope.delivery_identity is None
             await adapter.on_processing_start(event)
             await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+            settled = adapter._operation_ledger.lookup_session(
+                event.webhook_authority.session_key
+            )
             retry = await client.post(
                 "/webhooks/events", json={"value": 1}, headers=headers
             )
             retry_body = await retry.json()
         assert first.status == 202
-        assert retry.status == 409
-        assert retry_body["status"] == "indeterminate"
+        assert settled is not None
+        assert settled.state is OperationState.SETTLED
+        assert settled.target_state is TargetState.SUPPRESSED
+        assert settled.delivery is not None
+        assert settled.delivery.content == (
+            "Webhook processing failed before a final response was produced."
+        )
+        assert dict(settled.delivery.carrier) == {
+            "v": 1,
+            "kind": "terminal_outcome",
+            "outcome": "error",
+        }
+        assert retry.status == 200
+        assert retry_body["status"] == "duplicate"
 
 
 class TestRuntimeOwnershipAndFinalCarrier:
@@ -1611,10 +1632,10 @@ class TestRuntimeOwnershipAndFinalCarrier:
         assert saturated.status == 503
         assert saturated_payload["error"].endswith("for global")
         assert degraded.status == 503
-        assert degraded_payload["status"] == "degraded"
+        assert degraded_payload["status"] == "not_ready"
         assert first.status == first_status
         assert healthy.status == 200
-        assert healthy_payload["status"] == "ok"
+        assert healthy_payload["status"] == "ready"
         assert healthy_payload["accepting_webhooks"] is True
         assert adapter._global_ledger_saturated is False
         assert adapter._operation_ledger.count() == remaining_rows
@@ -1692,12 +1713,10 @@ class TestRuntimeOwnershipAndFinalCarrier:
         assert saturated.status == 503
         assert saturated_payload["error"].endswith("for global")
         assert health.status == 503
-        assert payload == {
-            "status": "degraded",
-            "platform": "webhook",
-            "accepting_webhooks": False,
-            "error": "Durable webhook evidence capacity is exhausted",
-        }
+        assert payload["status"] == "not_ready"
+        assert payload["platform"] == "webhook"
+        assert payload["accepting_webhooks"] is False
+        assert payload["problems"] == ["Durable webhook evidence capacity is exhausted"]
         assert "Retry-After" not in health.headers
         assert replay.status == 200
         assert replay_payload["status"] == "duplicate"
@@ -1778,12 +1797,10 @@ class TestRuntimeOwnershipAndFinalCarrier:
             health_payload = await health.json()
             response = await client.post("/webhooks/events", json={"value": 1})
         assert health.status == 503
-        assert health_payload == {
-            "status": "degraded",
-            "platform": "webhook",
-            "accepting_webhooks": False,
-            "error": "Webhook intake is not active",
-        }
+        assert health_payload["status"] == "not_ready"
+        assert health_payload["platform"] == "webhook"
+        assert health_payload["accepting_webhooks"] is False
+        assert health_payload["problems"] == ["Webhook intake is not active"]
         assert health.headers["Retry-After"] == "5"
         assert response.status == 503
         assert adapter._operation_ledger.count() == 0
@@ -2139,7 +2156,7 @@ class TestRuntimeOwnershipAndFinalCarrier:
             health_payload = await health.json()
             response = await client.post("/webhooks/events", json={"value": 1})
         assert health.status == 503
-        assert health_payload["status"] == "degraded"
+        assert health_payload["status"] == "not_ready"
         assert response.status == 503
         assert adapter._operation_ledger.count() == 0
         adapter.handle_message.assert_not_awaited()
@@ -2183,7 +2200,7 @@ class TestRuntimeOwnershipAndFinalCarrier:
             health_payload = await health.json()
             response = await client.post("/webhooks/events", json={"value": 1})
         assert health.status == 503
-        assert health_payload["status"] == "degraded"
+        assert health_payload["status"] == "not_ready"
         assert response.status == 503
         assert adapter._operation_ledger.count() == 0
         adapter.handle_message.assert_not_awaited()
@@ -2197,11 +2214,9 @@ class TestRuntimeOwnershipAndFinalCarrier:
             health = await client.get("/health")
             health_payload = await health.json()
         assert health.status == 200
-        assert health_payload == {
-            "status": "ok",
-            "platform": "webhook",
-            "accepting_webhooks": True,
-        }
+        assert health_payload["status"] == "ready"
+        assert health_payload["platform"] == "webhook"
+        assert health_payload["accepting_webhooks"] is True
 
     @pytest.mark.asyncio
     async def test_runner_owned_reconnect_listener_stays_closed_through_recovery(self):
@@ -2517,7 +2532,7 @@ class TestRuntimeOwnershipAndFinalCarrier:
         assert authority.target_state is TargetState.CONFIRMED
 
     @pytest.mark.asyncio
-    async def test_real_base_pipeline_failure_becomes_indeterminate(self):
+    async def test_real_base_pipeline_failure_stages_terminal_error(self):
         adapter = _adapter({
             "events": {
                 "secret": _INSECURE_NO_AUTH,
@@ -2540,8 +2555,17 @@ class TestRuntimeOwnershipAndFinalCarrier:
         event = adapter._message_handler.await_args.args[0]
         authority = adapter._operation_ledger.lookup_session(event.source.chat_id)
         assert authority is not None
-        assert authority.state is OperationState.INDETERMINATE
-        assert authority.delivery is None
+        assert authority.state is OperationState.SETTLED
+        assert authority.target_state is TargetState.SUPPRESSED
+        assert authority.delivery is not None
+        assert authority.delivery.content == (
+            "Webhook processing failed before a final response was produced."
+        )
+        assert dict(authority.delivery.carrier) == {
+            "v": 1,
+            "kind": "terminal_outcome",
+            "outcome": "error",
+        }
 
     @pytest.mark.asyncio
     async def test_primary_reconnect_replacement_recovers_staged_target_once(self):

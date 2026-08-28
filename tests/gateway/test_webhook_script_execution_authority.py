@@ -368,13 +368,16 @@ def test_timeout_kills_descendant_that_ignores_sigterm(
             "from pathlib import Path\n"
             f"marker = Path({str(child_pid_file)!r})\n"
             f"subprocess.Popen([sys.executable, '-I', '-S', '-c', {child_source!r}])\n"
-            "deadline = time.monotonic() + 2\n"
+            "deadline = time.monotonic() + 4\n"
             "while not marker.exists() and time.monotonic() < deadline:\n"
             "    time.sleep(0.01)\n"
             "time.sleep(60)\n"
         ),
     )
-    processor.script_timeout_seconds = 1
+    # The canonical runner executes this process-heavy file beside many other
+    # subprocesses. Give the child enough time to install its SIGTERM handler
+    # and publish the PID before exercising the timeout kill path.
+    processor.script_timeout_seconds = 5
 
     started = time.monotonic()
     result = processor.run_prepared_script(prepared, {})

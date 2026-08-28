@@ -4,6 +4,8 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
+import time
 
 import pytest
 from aiohttp import web
@@ -172,10 +174,17 @@ def test_gitlab_receipt_is_credential_only_and_does_not_claim_body_or_headers():
     }
 
 
-def test_linear_mode_preserves_current_main_wire_contract():
-    body = b'{"type":"Issue"}'
+def test_linear_mode_requires_fresh_body_authenticated_timestamp():
+    timestamp = int(time.time() * 1000)
+    body = json.dumps({
+        "type": "Issue",
+        "webhookTimestamp": timestamp,
+    }).encode()
     signature = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
-    request = _Request({"linear-signature": signature})
+    request = _Request({
+        "linear-signature": signature,
+        "linear-timestamp": str(timestamp),
+    })
     assert _verifier()._validate_signature(request, body, "secret", "linear") is True
 
 

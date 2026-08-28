@@ -32,6 +32,7 @@ Security:
 """
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -131,7 +132,10 @@ from gateway.platforms.webhook_common import (
 from gateway.platforms.webhook_delivery import WebhookDeliveryMixin
 from gateway.platforms.webhook_intake import WebhookIntakeMixin
 from gateway.platforms.webhook_recovery import WebhookRecoveryMixin
-from gateway.platforms.webhook_route_authority import WebhookRouteAuthorityMixin
+from gateway.platforms.webhook_route_authority import (
+    WebhookRouteAuthorityMixin,
+    WebhookRouteKey,
+)
 
 
 class WebhookAdapter(
@@ -185,8 +189,29 @@ class WebhookAdapter(
         )
         self._dynamic_routes_integrity_recheck_after = 0.0
         self._dynamic_routes_file_present = False
-        self._routes: Dict[str, dict] = dict(self._static_routes)
+        self._routes: Dict[str, dict] = {}
+        self._replace_live_route_candidates({}, self._static_routes)
         self._authenticated_route_snapshot: Optional[tuple[Any, ...]] = None
+        self._authenticated_route_authorities_by_key: Mapping[
+            WebhookRouteKey, tuple[Any, ...]
+        ] = MappingProxyType({})
+        self._authenticated_route_effective_toolsets_by_key: Mapping[
+            WebhookRouteKey, tuple[str, ...]
+        ] = MappingProxyType({})
+        self._authenticated_route_scripts_by_key: Mapping[
+            WebhookRouteKey, Optional[WebhookPreparedScript]
+        ] = MappingProxyType({})
+        self._authenticated_route_profile_generations_by_key: Mapping[
+            WebhookRouteKey, str
+        ] = MappingProxyType({})
+        self._authenticated_route_bundles_by_key: Mapping[
+            WebhookRouteKey, AuthenticatedRouteAuthority
+        ] = MappingProxyType({})
+        self._authenticated_route_registry: Mapping[
+            WebhookRouteKey, AuthenticatedRouteAuthority
+        ] = MappingProxyType({})
+        # Name-only maps remain compatibility facades. They deliberately omit
+        # a name when more than one public profile owns it.
         self._authenticated_route_authorities: Mapping[str, tuple[Any, ...]] = (
             MappingProxyType({})
         )
@@ -451,12 +476,7 @@ class WebhookAdapter(
         self._reload_dynamic_routes()
 
         # Validate routes at startup — secret is required per route.
-        for name, route in self._routes.items():
-            request_profile = (
-                route.get("profile", "default")
-                if isinstance(route, dict)
-                else "default"
-            )
+        for (request_profile, name), route in self._routes_by_key.items():
             try:
                 bound_route = WebhookRouteConfig.bind(
                     name,
@@ -468,7 +488,11 @@ class WebhookAdapter(
                 return self._reject_connect_configuration(
                     f"Route '{name}' has invalid authority binding: {exc}"
                 )
-            secret = route.get("secret", self._global_secret)
+            secret = (
+                ""
+                if "secret_ref" in route and "secret" not in route
+                else route.get("secret", self._global_secret)
+            )
             if not isinstance(secret, str) or not secret:
                 return self._reject_connect_configuration(
                     f"Route '{name}' has no HMAC secret. "
@@ -503,7 +527,7 @@ class WebhookAdapter(
         # durable route/policy authority. Invalid routes must not consume a
         # permanent key binding when no listener could ever have opened.
         try:
-            self._bind_route_authentication_authorities(self._routes)
+            self._bind_route_authentication_authorities(self._routes_by_key)
         except (
             WebhookContractError,
             WebhookLedgerCapacityError,
@@ -526,6 +550,7 @@ class WebhookAdapter(
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/ready", self._handle_ready)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -559,14 +584,30 @@ class WebhookAdapter(
         except OSError as exc:
             await self._runner.cleanup()
             self._runner = None
+            where = self._host or "all IPv4+IPv6 interfaces"
             logger.error(
                 "[webhook] Could not bind %s:%d: %s. "
                 "Set a different host or port in config.yaml under "
                 "platforms.webhook.extra.",
-                self._host or "all IPv4+IPv6 interfaces",
+                where,
                 self._port,
                 exc,
             )
+            if getattr(exc, "errno", None) == errno.EADDRINUSE:
+                self._set_fatal_error(
+                    "webhook_port_in_use",
+                    f"Port {self._port} on {where} is already in use. Set "
+                    "platforms.webhook.extra.port to a different value, then "
+                    "resume the webhook platform.",
+                    retryable=False,
+                )
+            else:
+                self._set_fatal_error(
+                    "webhook_bind_failed",
+                    f"Could not bind the webhook listener to "
+                    f"{where}:{self._port}: {exc}",
+                    retryable=True,
+                )
             return False
         # Runner-owned listeners stay closed until the runner has published
         # this exact adapter and claimed every recoverable durable operation.
@@ -589,7 +630,10 @@ class WebhookAdapter(
         self._accepting_webhooks = standalone_intake
         self._mark_connected()
 
-        route_names = ", ".join(self._routes.keys()) or "(none configured)"
+        route_names = (
+            ", ".join(f"{profile}/{name}" for profile, name in self._routes_by_key)
+            or "(none configured)"
+        )
         logger.info(
             "[webhook] Listening on %s:%d — routes: %s",
             self._host or "* (all interfaces, IPv4+IPv6)",
@@ -853,19 +897,21 @@ class WebhookAdapter(
 
     def _prune_rate_limit_buckets(
         self,
-        bundles: Optional[Mapping[str, AuthenticatedRouteAuthority]] = None,
+        bundles: Optional[Mapping[Any, AuthenticatedRouteAuthority]] = None,
     ) -> None:
         """Discard counters whose exact published route authority is gone."""
 
         if bundles is None:
             bundles = {
-                route_name: bundle
-                for route_name, bundle in self._authenticated_route_bundles.items()
-                if route_name in self._routes
+                route_key: bundle
+                for route_key, bundle in self._authenticated_route_registry.items()
             }
         active_authorities = {
-            (str(bundle.authority[0]), route_name)
-            for route_name, bundle in bundles.items()
+            (
+                str(bundle.authority[0]),
+                route_key[1] if isinstance(route_key, tuple) else str(route_key),
+            )
+            for route_key, bundle in bundles.items()
         }
         for key in tuple(self._rate_counts):
             if key not in active_authorities:

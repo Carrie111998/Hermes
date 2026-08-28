@@ -65,7 +65,21 @@ logger = logging.getLogger(__name__)
 
 class WebhookIntakeMixin:
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """Report readiness from the same authority that gates webhook intake."""
+        """Report listener liveness without consulting downstream authorities."""
+
+        del request
+        return web.json_response({
+            "status": "ok",
+            "platform": "webhook",
+        })
+
+    async def _handle_ready(self, request: "web.Request") -> "web.Response":
+        """Report readiness from the exact authority that gates intake.
+
+        This probe deliberately exposes only bounded operational facts.  Route
+        policy, credentials, target configuration, and failure detail remain
+        private.
+        """
 
         del request
         accepting_webhooks = self._intake_is_authoritative("default")
@@ -88,23 +102,30 @@ class WebhookIntakeMixin:
             )
             return web.json_response(
                 {
-                    "status": "degraded",
+                    "status": "not_ready",
                     "platform": "webhook",
                     "accepting_webhooks": False,
+                    "host": self._host,
+                    "port": self._port,
+                    "routes": len(self._authenticated_route_bundles_by_key),
+                    "problems": [error],
                     "error": error,
                 },
                 status=503,
                 headers=({} if not global_capacity_available else {"Retry-After": "5"}),
             )
         return web.json_response({
-            "status": "ok",
+            "status": "ready",
             "platform": "webhook",
             "accepting_webhooks": True,
+            "host": self._host,
+            "port": self._port,
+            "routes": len(self._authenticated_route_bundles_by_key),
         })
 
     def _withdraw_changed_dynamic_authorities(
         self,
-        candidate_dynamic: Mapping[str, dict],
+        candidate_dynamic: Mapping[Any, dict],
     ) -> None:
         """Keep only candidate routes with the exact already-bound authority.
 
@@ -113,44 +134,426 @@ class WebhookIntakeMixin:
         available, so JSON ordering cannot choose which shared-key scope wins.
         """
 
-        unchanged: dict[str, dict] = {}
-        for route_name, route in candidate_dynamic.items():
-            if route_name not in self._dynamic_routes:
+        candidate_by_key = self._qualified_route_candidates(candidate_dynamic)
+        unchanged: dict[tuple[str, str], dict] = {}
+        for route_key, route in candidate_by_key.items():
+            if route_key not in self._dynamic_routes_by_key:
                 continue
             try:
                 _, _, authorities, _, _, _, _ = (
                     self._route_authentication_authority_snapshot({
-                        route_name: route,
+                        route_key: route,
                     })
                 )
             except (WebhookContractError, WebhookLedgerError):
                 continue
-            if authorities.get(route_name) == (
-                self._authenticated_route_authorities.get(route_name)
+            if authorities.get(route_key) == (
+                self._authenticated_route_authorities_by_key.get(route_key)
             ):
-                unchanged[route_name] = route
-        self._dynamic_routes = unchanged
-        self._routes = {**unchanged, **self._static_routes}
+                unchanged[route_key] = route
+        static_by_key = self._qualified_route_candidates(self._static_routes)
+        self._replace_live_route_candidates(
+            unchanged,
+            {**unchanged, **static_by_key},
+        )
+        self._retain_published_route_authorities(self._routes_by_key)
+
+    def _reload_multiplex_dynamic_routes(self) -> None:
+        """Publish one deterministic snapshot from every admitted profile.
+
+        The shared listener owns the socket, while each admitted profile owns
+        its own route store.  The aggregate is published through the existing
+        durable authentication binding chokepoint; the store never bypasses
+        the content hash, exact route snapshot, or revocation behavior.
+
+        Public authority is qualified by ``(profile, route name)``. Equal route
+        names in different served profiles therefore remain independent; only
+        an exact qualified static key shadows its dynamic counterpart.
+        """
+
+        from gateway.platforms.webhook_models import to_persisted_route
+        from gateway.platforms.webhook_store import (
+            WebhookRouteStoreError,
+            stores_for_served_profiles,
+        )
+        from hermes_cli.profiles import profiles_to_serve
+
+        now = time.monotonic()
+        if now < getattr(self, "_dynamic_profile_reload_after", 0.0):
+            return
+        # Publish the amplification gate before directory scans, locks, or
+        # bounded reads. A request flood can trigger at most one profile-store
+        # sweep per interval.
+        self._dynamic_profile_reload_after = (
+            now + _DYNAMIC_ROUTES_CONTENT_RECHECK_SECONDS
+        )
+        runner = self.gateway_runner
+        config = getattr(runner, "config", None)
+        previous_state = getattr(self, "_dynamic_profile_store_state", {})
+        try:
+            served_profiles = profiles_to_serve(
+                multiplex=True,
+                profile_allowlist=getattr(
+                    config,
+                    "multiplex_profile_allowlist",
+                    None,
+                ),
+            )
+            stores = stores_for_served_profiles(served_profiles)
+        except Exception as exc:
+            # Losing the admission/store set is loss of all dynamic authority.
+            # Static configuration remains independently owned.
+            candidate_dynamic: dict[tuple[str, str], dict] = {}
+            static_by_key = self._qualified_route_candidates(self._static_routes)
+            try:
+                self._bind_route_authentication_authorities(static_by_key)
+            except (WebhookContractError, WebhookLedgerError):
+                self._withdraw_changed_dynamic_authorities(candidate_dynamic)
+            else:
+                self._replace_live_route_candidates({}, static_by_key)
+                self._dynamic_profile_store_state = {}
+                self._prune_rate_limit_buckets()
+            logger.error(
+                "[webhook] Multiplex route-store admission failed; dynamic "
+                "routes withdrawn: %s",
+                exc,
+            )
+            return
+
+        profiles_in_order = sorted(stores)
+        integrity_profile: Optional[str] = None
+        if profiles_in_order:
+            cursor = int(getattr(self, "_dynamic_profile_integrity_cursor", 0))
+            integrity_profile = profiles_in_order[cursor % len(profiles_in_order)]
+            self._dynamic_profile_integrity_cursor = (cursor + 1) % len(
+                profiles_in_order
+            )
+
+        observations: dict[str, dict[str, Any]] = {}
+        profile_candidates: dict[str, dict[str, dict]] = {}
+        transient_profiles: set[str] = set()
+        for profile in profiles_in_order:
+            store = stores[profile]
+            prior = previous_state.get(profile, {})
+            try:
+                generation_before = self._current_profile_authority_generation(
+                    profile,
+                    route_name="profile-store",
+                )
+            except (OSError, WebhookContractError) as exc:
+                transient_profiles.add(profile)
+                logger.error(
+                    "[webhook] Profile %s physical store authority is "
+                    "unavailable; its dynamic routes are withdrawn: %s",
+                    profile,
+                    exc,
+                )
+                continue
+            try:
+                probed_identity = store.probe_identity()
+            except (OSError, WebhookRouteStoreError) as exc:
+                # An actual path/type/permission failure is authority loss,
+                # unlike cooperative lock contention below.
+                transient_profiles.add(profile)
+                logger.error(
+                    "[webhook] Profile %s route-store identity is unavailable; "
+                    "its dynamic routes are withdrawn: %s",
+                    profile,
+                    exc,
+                )
+                continue
+
+            try:
+                generation_after_probe = self._current_profile_authority_generation(
+                    profile,
+                    route_name="profile-store",
+                )
+            except (OSError, WebhookContractError) as exc:
+                transient_profiles.add(profile)
+                logger.error(
+                    "[webhook] Profile %s physical store authority disappeared; "
+                    "its dynamic routes are withdrawn: %s",
+                    profile,
+                    exc,
+                )
+                continue
+            if not secrets.compare_digest(
+                generation_before,
+                generation_after_probe,
+            ):
+                transient_profiles.add(profile)
+                logger.error(
+                    "[webhook] Profile %s physical store authority changed "
+                    "during identity capture; its dynamic routes are withdrawn",
+                    profile,
+                )
+                continue
+
+            has_prior = profile in previous_state
+            prior_generation = prior.get("profile_generation")
+            same_generation = isinstance(
+                prior_generation, str
+            ) and secrets.compare_digest(prior_generation, generation_before)
+            needs_integrity_read = profile == integrity_profile
+            if (
+                has_prior
+                and same_generation
+                and probed_identity == prior.get("file_identity")
+                and not needs_integrity_read
+            ):
+                prior_candidates = prior.get("candidates", {})
+                if isinstance(prior_candidates, Mapping):
+                    profile_candidates[profile] = {
+                        name: dict(route)
+                        for name, route in prior_candidates.items()
+                        if isinstance(name, str) and isinstance(route, Mapping)
+                    }
+                observations[profile] = {
+                    "content_sha256": prior.get("content_sha256"),
+                    "file_identity": probed_identity,
+                    "profile_generation": generation_before,
+                }
+                continue
+            if not has_prior and probed_identity is None:
+                # Missing is an authoritative empty store; no lock/deep read.
+                profile_candidates[profile] = {}
+                observations[profile] = {
+                    "content_sha256": None,
+                    "file_identity": None,
+                    "profile_generation": generation_before,
+                }
+                continue
+
+            try:
+                snapshot = store.load_runtime()
+            except TimeoutError:
+                # A cooperative writer still owns the lock and has not yet
+                # published its atomic rename. Retain only the prior exact
+                # snapshot for this profile and retry after the gate.
+                prior_candidates = prior.get("candidates", {})
+                if same_generation and isinstance(prior_candidates, Mapping):
+                    profile_candidates[profile] = {
+                        name: dict(route)
+                        for name, route in prior_candidates.items()
+                        if isinstance(name, str) and isinstance(route, Mapping)
+                    }
+                observations[profile] = {
+                    "content_sha256": prior.get("content_sha256"),
+                    "file_identity": prior.get("file_identity"),
+                    "profile_generation": generation_before,
+                }
+                transient_profiles.add(profile)
+                logger.debug(
+                    "[webhook] Profile %s route store is busy; retaining its "
+                    "prior exact snapshot",
+                    profile,
+                )
+                continue
+            except (OSError, WebhookRouteStoreError) as exc:
+                # A symlink/race/permission failure is not permission to keep
+                # that profile's previous keys live. Retry on the next reload.
+                transient_profiles.add(profile)
+                logger.error(
+                    "[webhook] Profile %s route store is unavailable; its "
+                    "dynamic routes are withdrawn: %s",
+                    profile,
+                    exc,
+                )
+                continue
+            try:
+                generation_after_load = self._current_profile_authority_generation(
+                    profile,
+                    route_name="profile-store",
+                )
+            except (OSError, WebhookContractError) as exc:
+                transient_profiles.add(profile)
+                logger.error(
+                    "[webhook] Profile %s physical store authority disappeared "
+                    "during load; its dynamic routes are withdrawn: %s",
+                    profile,
+                    exc,
+                )
+                continue
+            if not secrets.compare_digest(
+                generation_before,
+                generation_after_load,
+            ):
+                transient_profiles.add(profile)
+                logger.error(
+                    "[webhook] Profile %s physical store authority changed "
+                    "during load; its dynamic routes are withdrawn",
+                    profile,
+                )
+                continue
+            observations[profile] = {
+                "content_sha256": snapshot.content_sha256,
+                "file_identity": (
+                    None
+                    if snapshot.quarantined_path is not None
+                    else snapshot.file_identity
+                ),
+                "profile_generation": generation_after_load,
+            }
+            accepted_for_profile: dict[str, dict] = {}
+            if snapshot.quarantined_path is not None:
+                logger.error(
+                    "[webhook] Profile %s route store was corrupt; exact bytes "
+                    "were quarantined and its dynamic routes withdrawn",
+                    profile,
+                )
+            for name, document in snapshot.routes.items():
+                candidate = to_persisted_route(document)
+                if candidate.get("enabled", True) is not True:
+                    continue
+                # A named profile must never inherit the listener owner's
+                # process-global secret. Secret references are resolved by the
+                # profile-scoped Task 8 layer; until then they fail closed.
+                effective_secret = candidate.get("secret")
+                if (
+                    effective_secret is None
+                    and "secret_ref" not in candidate
+                    and profile == "default"
+                ):
+                    effective_secret = self._global_secret
+                if not isinstance(effective_secret, str) or not effective_secret:
+                    logger.warning(
+                        "[webhook] Profile %s dynamic route %s skipped: no "
+                        "profile-owned authentication secret is available",
+                        profile,
+                        name,
+                    )
+                    continue
+                if effective_secret == _INSECURE_NO_AUTH and not _is_loopback_host(
+                    self._host
+                ):
+                    logger.warning(
+                        "[webhook] Profile %s dynamic route %s skipped: local "
+                        "auth bypass is not allowed on this listener",
+                        profile,
+                        name,
+                    )
+                    continue
+                accepted_for_profile[name] = candidate
+            profile_candidates[profile] = accepted_for_profile
+
+        static_by_key = self._qualified_route_candidates(self._static_routes)
+        candidate_dynamic: dict[tuple[str, str], dict] = {}
+        for profile in sorted(profile_candidates):
+            for name, candidate in sorted(profile_candidates[profile].items()):
+                route_key = (profile, name)
+                if route_key not in static_by_key:
+                    candidate_dynamic[route_key] = candidate
+
+        candidate_routes = {**candidate_dynamic, **static_by_key}
+        try:
+            observed_generations = {
+                profile: observation["profile_generation"]
+                for profile, observation in observations.items()
+                if isinstance(observation.get("profile_generation"), str)
+            }
+            aggregate_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "routes": [
+                            {
+                                "profile": profile,
+                                "route": name,
+                                "config": route,
+                            }
+                            for (profile, name), route in sorted(
+                                candidate_routes.items()
+                            )
+                        ],
+                        "profile_generations": observed_generations,
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
+            self._withdraw_changed_dynamic_authorities(candidate_dynamic)
+            logger.error(
+                "[webhook] Multiplex aggregate route snapshot is not canonical: %s",
+                exc,
+            )
+            return
+
+        new_state: dict[str, dict[str, Any]] = {}
+        for profile, observation in observations.items():
+            new_state[profile] = {
+                **observation,
+                "candidates": profile_candidates.get(profile, {}),
+            }
+        if (
+            aggregate_fingerprint
+            == getattr(self, "_dynamic_profile_aggregate_sha256", None)
+            and candidate_routes == self._routes_by_key
+        ):
+            self._dynamic_profile_store_state = new_state
+            self._dynamic_profile_store_transient = tuple(sorted(transient_profiles))
+            return
+
+        try:
+            self._bind_route_authentication_authorities(
+                candidate_routes,
+                expected_profile_generations=observed_generations,
+            )
+        except (
+            WebhookContractError,
+            WebhookLedgerCapacityError,
+            WebhookLedgerTransitionError,
+        ) as exc:
+            self._withdraw_changed_dynamic_authorities(candidate_dynamic)
+            logger.error(
+                "[webhook] Multiplex dynamic route snapshot was rejected: %s",
+                exc,
+            )
+            return
+        except WebhookLedgerError as exc:
+            self._withdraw_changed_dynamic_authorities(candidate_dynamic)
+            logger.error(
+                "[webhook] Multiplex dynamic route publication is unavailable; "
+                "changed authorities withdrawn for retry: %s",
+                exc,
+            )
+            return
+
+        self._replace_live_route_candidates(candidate_dynamic, candidate_routes)
+        self._dynamic_profile_store_state = new_state
+        self._dynamic_profile_aggregate_sha256 = aggregate_fingerprint
+        self._dynamic_profile_store_transient = tuple(sorted(transient_profiles))
         self._prune_rate_limit_buckets()
+        logger.info(
+            "[webhook] Published %d multiplex dynamic route(s) from %d "
+            "profile store(s)",
+            len(candidate_dynamic),
+            len(stores),
+        )
 
     def _reload_dynamic_routes(self) -> None:
         """Atomically publish a content-versioned dynamic route snapshot."""
+
+        runner_config = getattr(getattr(self, "gateway_runner", None), "config", None)
+        if getattr(runner_config, "multiplex_profiles", False) is True:
+            self._reload_multiplex_dynamic_routes()
+            return
 
         from hermes_constants import get_hermes_home
 
         hermes_home = get_hermes_home()
         subs_path = hermes_home / _DYNAMIC_ROUTES_FILENAME
         if not subs_path.exists():
-            if self._dynamic_routes_file_present or self._dynamic_routes:
+            if self._dynamic_routes_file_present or self._dynamic_routes_by_key:
                 # File removal is itself authoritative revocation. Publish it
                 # before touching unrelated static authorities so a static
                 # policy mismatch or storage fault cannot keep deleted dynamic
                 # keys live.
-                self._dynamic_routes = {}
-                self._routes = dict(self._static_routes)
-                self._prune_rate_limit_buckets()
+                static_routes = self._qualified_route_candidates(self._static_routes)
+                self._replace_live_route_candidates({}, static_routes)
+                self._retain_published_route_authorities(static_routes)
                 try:
-                    static_routes = dict(self._static_routes)
                     self._bind_route_authentication_authorities(static_routes)
                 except (WebhookContractError, WebhookLedgerError) as exc:
                     logger.error(
@@ -189,7 +592,7 @@ class WebhookIntakeMixin:
         # authority loss, not permission to retain the previous dynamic keys.
         # Initialize the fail-closed candidate before stat/read so a removal,
         # replacement, or permission race at either syscall withdraws them.
-        candidate_dynamic: Optional[dict[str, dict]] = {}
+        candidate_dynamic: Optional[dict[Any, dict]] = {}
         try:
             path_stat = subs_path.stat()
             path_identity = (
@@ -270,10 +673,9 @@ class WebhookIntakeMixin:
             # Reject any dynamic route whose effective secret is empty —
             # an empty secret would cause _handle_webhook to skip HMAC
             # validation entirely, letting unauthenticated callers in.
-            new_dynamic: Dict[str, dict] = {}
+            new_dynamic: Dict[Any, dict] = {}
+            static_by_key = self._qualified_route_candidates(self._static_routes)
             for k, v in data.items():
-                if k in self._static_routes:
-                    continue
                 if not isinstance(v, dict):
                     logger.warning(
                         "[webhook] Dynamic route '%s' skipped: route must be an object",
@@ -304,6 +706,9 @@ class WebhookIntakeMixin:
                         )
                         continue
                 request_profile = candidate.get("profile", "default")
+                route_key = (request_profile, k)
+                if route_key in static_by_key:
+                    continue
                 try:
                     WebhookRouteConfig.bind(
                         k,
@@ -314,7 +719,11 @@ class WebhookIntakeMixin:
                 except WebhookContractError as exc:
                     logger.warning("[webhook] Dynamic route '%s' skipped: %s", k, exc)
                     continue
-                effective_secret = candidate.get("secret", self._global_secret)
+                effective_secret = (
+                    ""
+                    if "secret_ref" in candidate and "secret" not in candidate
+                    else candidate.get("secret", self._global_secret)
+                )
                 if not isinstance(effective_secret, str) or not effective_secret:
                     logger.warning(
                         "[webhook] Dynamic route '%s' skipped: 'secret' is "
@@ -334,13 +743,12 @@ class WebhookIntakeMixin:
                         self._host,
                     )
                     continue
-                new_dynamic[k] = candidate
+                new_dynamic[route_key] = candidate
 
-            candidate_routes = {**new_dynamic, **self._static_routes}
+            candidate_routes = {**new_dynamic, **static_by_key}
             candidate_dynamic = new_dynamic
             self._bind_route_authentication_authorities(candidate_routes)
-            self._dynamic_routes = new_dynamic
-            self._routes = candidate_routes
+            self._replace_live_route_candidates(new_dynamic, candidate_routes)
             self._dynamic_routes_content_sha256 = observed_digest
             self._dynamic_routes_file_identity = observed_identity
             self._dynamic_routes_rejected_content_sha256 = None
@@ -480,22 +888,92 @@ class WebhookIntakeMixin:
 
         self._reload_dynamic_routes()
         route_name = request.match_info.get("route_name", "")
-        live_route_config = self._routes.get(route_name)
-        if not isinstance(live_route_config, dict):
+        try:
+            if self._authenticated_route_snapshot is None:
+                # Compatibility for direct handler tests/embedders that replace
+                # the historical name map before first publication.
+                if not self._authenticated_route_registry and self._routes:
+                    legacy_routes = self._qualified_route_candidates(self._routes)
+                    if legacy_routes != dict(self._routes_by_key):
+                        self._replace_live_route_candidates(
+                            self._dynamic_routes,
+                            legacy_routes,
+                        )
+                self._bind_route_authentication_authorities(self._routes_by_key)
+            # One immutable carrier holds each bundle and its frozen route
+            # snapshot. Never join a candidate map to another generation.
+            route_registry = self._authenticated_route_registry
+        except (WebhookContractError, WebhookLedgerError) as exc:
+            logger.error("[webhook] Invalid route registry: %s", exc)
+            if "uses INSECURE_NO_AUTH on a non-loopback host" in str(
+                exc
+            ) and not _is_loopback_host(self._host):
+                return web.json_response(
+                    {"error": "Local auth bypass is not allowed on this host"},
+                    status=403,
+                )
+            target_unavailable = "not an outbound webhook target" in str(exc)
+            return web.json_response(
+                {
+                    "status": "unavailable" if target_unavailable else "failed",
+                    "error": (
+                        "Webhook target or grant is unavailable"
+                        if target_unavailable
+                        else "Webhook route is misconfigured"
+                    ),
+                },
+                status=503 if target_unavailable else 500,
+            )
+        raw_profile = (request.match_info.get("profile") or "").strip()
+        runner_config = getattr(
+            getattr(self, "gateway_runner", None),
+            "config",
+            None,
+        )
+        multiplexed = getattr(runner_config, "multiplex_profiles", False) is True
+        if multiplexed:
+            profile = self._resolve_request_profile(request)
+            if profile is _PROFILE_REJECTED:
+                return web.json_response(
+                    {"error": "Unknown or unconfigured profile"}, status=404
+                )
+            route_key = (profile or "default", route_name)
+            route_bundle = route_registry.get(route_key)
+        else:
+            # A self-prefix may refer either to an explicitly profile-bound
+            # route or to this gateway's canonical default route. Resolve only
+            # against those exact candidates; never fall back to a same-name
+            # sibling owned by another profile.
+            if raw_profile:
+                route_bundle = route_registry.get((
+                    raw_profile,
+                    route_name,
+                )) or route_registry.get(("default", route_name))
+            else:
+                route_bundle = route_registry.get(("default", route_name))
+            if route_bundle is None:
+                return web.json_response(
+                    {"error": f"Unknown route: {route_name}"}, status=404
+                )
+            live_route_config = route_bundle.route_config
+            profile = self._resolve_request_profile(request, live_route_config)
+            if profile is _PROFILE_REJECTED:
+                return web.json_response(
+                    {"error": "Unknown or unconfigured profile"}, status=404
+                )
+            route_key = (profile or "default", route_name)
+            route_bundle = route_registry.get(route_key)
+        if route_bundle is None:
             return web.json_response(
                 {"error": f"Unknown route: {route_name}"}, status=404
             )
+        live_route_config = route_bundle.route_config
         if live_route_config.get(
             "secret", self._global_secret
         ) == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
             return web.json_response(
                 {"error": "Local auth bypass is not allowed on this host"},
                 status=403,
-            )
-        profile = self._resolve_request_profile(request, live_route_config)
-        if profile is _PROFILE_REJECTED:
-            return web.json_response(
-                {"error": "Unknown or unconfigured profile"}, status=404
             )
         try:
             preliminary_route = WebhookRouteConfig.bind(
@@ -525,32 +1003,6 @@ class WebhookIntakeMixin:
         if not preliminary_route.enabled:
             return web.json_response(
                 {"error": f"Route disabled: {route_name}"}, status=403
-            )
-        try:
-            if self._authenticated_route_snapshot is None:
-                # Compatibility for direct handler tests/embedders. A real
-                # listener publishes every bundle before it opens intake.
-                self._bind_route_authentication_authorities(self._routes)
-            route_bundle = self._authenticated_route_bundles.get(route_name)
-            if route_bundle is None or (
-                _snapshot_route_config(live_route_config) != route_bundle.route_config
-            ):
-                raise WebhookContractError(
-                    "webhook route has no exact published authority bundle"
-                )
-        except (WebhookContractError, WebhookLedgerError) as exc:
-            logger.error("[webhook] Invalid route %s: %s", route_name, exc)
-            target_unavailable = "not an outbound webhook target" in str(exc)
-            return web.json_response(
-                {
-                    "status": "unavailable" if target_unavailable else "failed",
-                    "error": (
-                        "Webhook target or grant is unavailable"
-                        if target_unavailable
-                        else "Webhook route is misconfigured"
-                    ),
-                },
-                status=503 if target_unavailable else 500,
             )
         route_config = route_bundle.route_config
         try:
@@ -591,7 +1043,7 @@ class WebhookIntakeMixin:
             return web.json_response({"error": "Bad request"}, status=400)
         if len(raw_body) > self._max_body_bytes:
             return web.json_response({"error": "Payload too large"}, status=413)
-        if not self._route_bundle_is_current(route_name, route_bundle):
+        if not self._route_bundle_is_current(route_key, route_bundle):
             return web.json_response(
                 {
                     "status": "unavailable",
@@ -612,7 +1064,7 @@ class WebhookIntakeMixin:
                 status=403,
             )
         if not self._route_owns_unique_authenticated_secret(
-            route_name,
+            route_key,
             secret,
             bound_route.signature_mode,
             route_bundle,
@@ -814,7 +1266,7 @@ class WebhookIntakeMixin:
         # newly admitted identity. Durable duplicates/conflicts/active retries
         # above are indexed ledger results and cannot amplify filesystem,
         # profile, skill, or adapter-resolution work.
-        if not self._route_bundle_is_current(route_name, route_bundle):
+        if not self._route_bundle_is_current(route_key, route_bundle):
             release_before_effect()
             return web.json_response(
                 {
@@ -902,14 +1354,14 @@ class WebhookIntakeMixin:
                     release_before_effect()
                     raise
             bundle_still_current = self._route_bundle_is_current(
-                route_name,
+                route_key,
                 route_bundle,
             )
             if not durable_authority_matches or not bundle_still_current:
                 release_before_effect()
                 withdrew = False
                 if not durable_authority_matches and bundle_still_current:
-                    withdrew = self._withdraw_live_route(route_name, route_bundle)
+                    withdrew = self._withdraw_live_route(route_key, route_bundle)
                 if authority_error is not None:
                     logger.error(
                         "[webhook] Durable authentication authority proof failed "
@@ -932,7 +1384,7 @@ class WebhookIntakeMixin:
             try:
                 live_authority_matches = await run_authority_worker(
                     self._live_route_authority_matches,
-                    route_name,
+                    route_key,
                     route_bundle,
                 )
             except asyncio.CancelledError:
@@ -956,14 +1408,14 @@ class WebhookIntakeMixin:
                 release_before_effect()
                 raise
             bundle_still_current = self._route_bundle_is_current(
-                route_name,
+                route_key,
                 route_bundle,
             )
             if not live_authority_matches or not bundle_still_current:
                 release_before_effect()
                 withdrew = False
                 if not live_authority_matches and bundle_still_current:
-                    withdrew = self._withdraw_live_route(route_name, route_bundle)
+                    withdrew = self._withdraw_live_route(route_key, route_bundle)
                 if withdrew:
                     logger.error(
                         "[webhook] Withdrew route %s after its effective authority "
@@ -1055,7 +1507,7 @@ class WebhookIntakeMixin:
         except BaseException:
             release_before_effect()
             raise
-        if not self._route_bundle_is_current(route_name, route_bundle):
+        if not self._route_bundle_is_current(route_key, route_bundle):
             release_before_effect()
             return web.json_response(
                 {
@@ -1145,7 +1597,7 @@ class WebhookIntakeMixin:
             except Exception as exc:
                 script_worker_slots.release()
                 release_before_effect()
-                self._withdraw_live_route(route_name, route_bundle)
+                self._withdraw_live_route(route_key, route_bundle)
                 logger.error(
                     "[webhook] Script profile authority is unavailable for %s: %s",
                     route_name,
@@ -1164,7 +1616,7 @@ class WebhookIntakeMixin:
             ):
                 script_worker_slots.release()
                 release_before_effect()
-                self._withdraw_live_route(route_name, route_bundle)
+                self._withdraw_live_route(route_key, route_bundle)
                 return web.json_response(
                     {
                         "status": "unavailable",
@@ -1235,7 +1687,7 @@ class WebhookIntakeMixin:
                     },
                     status=500,
                 )
-            if not self._route_bundle_is_current(route_name, route_bundle):
+            if not self._route_bundle_is_current(route_key, route_bundle):
                 self._mark_indeterminate_or_fence(
                     authority,
                     "webhook route authority changed after script start",

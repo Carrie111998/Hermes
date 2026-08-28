@@ -29,6 +29,11 @@ from gateway.platforms.webhook_ledger import (
     WebhookLedgerError,
     WebhookLedgerTransitionError,
 )
+from gateway.platforms.webhook_terminal import (
+    WebhookTerminalOutcome,
+    terminal_outcome_carrier,
+    terminal_outcome_notice,
+)
 
 from gateway.platforms.webhook_common import (
     WebhookMessageEvent,
@@ -654,6 +659,26 @@ class WebhookRecoveryMixin:
                             current,
                             "agent completed without a provable final settlement",
                         )
+                elif outcome is ProcessingOutcome.FAILURE:
+                    try:
+                        staged = self._stage_exact_delivery(
+                            current,
+                            terminal_outcome_notice(WebhookTerminalOutcome.ERROR),
+                            terminal_outcome_carrier(WebhookTerminalOutcome.ERROR),
+                        )
+                    except BaseException as exc:
+                        self._mark_indeterminate_or_fence(
+                            current,
+                            exc,
+                            context="terminal error carrier staging failure",
+                        )
+                        if not isinstance(exc, Exception):
+                            raise
+                        return
+                    # This is the same durable target gate used by normal finals.
+                    # A pre-effect failure remains recoverable; anything after
+                    # invocation is settled indeterminate and never retried blind.
+                    await self._invoke_staged_target(staged)
                 else:
                     self._operation_ledger.mark_indeterminate(
                         current,
