@@ -7111,6 +7111,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
             },
+            synthetic=bool(event.get("_hermes_reaction")),
         )
 
         # Only react when bot is directly addressed (1:1 DM or @mention).
