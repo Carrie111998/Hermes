@@ -3927,12 +3927,15 @@ def compress_context(
         # transcript was compacted on the same id rather than rotated.
         if getattr(agent, "event_callback", None):
             try:
+                # Capture the compression summary for hooks to process (e.g., distill and embed into fleet_memory).
+                _compression_summary = getattr(agent.context_compressor, "_previous_summary", "") or ""
                 agent.event_callback("session:compress", {
                     "platform": agent.platform or "",
                     "session_id": agent.session_id,
                     "old_session_id": _old_sid or "",
                     "in_place": in_place,
                     "compression_count": agent.context_compressor.compression_count,
+                    "summary": _compression_summary,
                 })
             except Exception as e:
                 logger.debug("event_callback error on session:compress: %s", e)

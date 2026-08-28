@@ -6787,6 +6787,22 @@ def request_review(
                 "(worker ownership) or force=True (explicit operator "
                 "override) instead of clearing the live run's claim",
             )
+        # Reviewer runs (claimed from review) cannot re-enter review.
+        # t_a0723481: four reviewer PIDs called request_review instead of
+        # complete_task; governance_review_count hit 4 and minted this class
+        # of defect. Approve = complete_task. Reject = request_changes.
+        run_for_phase = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else trow["current_run_id"]
+        )
+        if _retry_status_for_run(conn, task_id, run_for_phase) == "review":
+            return _ret(
+                False,
+                "this run was claimed from review; a reviewer must call "
+                "complete_task (approve) or request_changes (reject), not "
+                "request_review",
+            )
         implementer = trow["assignee"]
         if reviewer is None:
             changes_run = conn.execute(
@@ -11262,26 +11278,14 @@ def _default_spawn(
         # override (if any). This ensures a classifier bug never blocks dispatch.
         _log.debug(f"free_model_classifier error on task {task.id}: {e}", exc_info=True)
     
-    # For free-routed tasks, invoke the free-model wrapper which implements the complete
-    # free-first cycle (OpenCode -> OpenRouter -> Haiku fallback). The wrapper handles
-    # model failures transparently so work is never lost. Do NOT add -m flags for free routes.
-    if _is_free_routed:
-        # Replace the command with an invocation of the wrapper script.
-        # The wrapper takes the prompt as its first argument and returns the output,
-        # implementing fallback logic internally.
-        # The wrapper is deployed to ~/.hermes/scripts/, NOT into the package tree.
-        # The old relative form resolved to ~/.hermes/hermes-agent/scripts/, which has
-        # never existed — so every free-routed card died with
-        #   "can't open file '.../hermes-agent/scripts/free-model-worker-wrapper.py'"
-        # and exit code 2. Measured on t_638490d8 / t_bf960213 (home board, fails=2).
-        wrapper_path = Path.home() / ".hermes" / "scripts" / "free-model-worker-wrapper.py"
-        cmd = [sys.executable, str(wrapper_path), prompt]
-    elif _resolved_model:
+    # Always keep a real hermes chat worker (toolsets + kanban_*). Never replace
+    # cmd with the tool-less `opencode run` wrapper — that path printed text and
+    # exited 0, then the mill recorded protocol_violation. Free-first is a MODEL
+    # pin on the same worker argv: -m nemotron-3.5-lightning-free --provider opencode-free.
+    # Proven 2026-08-27: hermes --cli chat -Q --toolsets terminal against that
+    # pair ran echo FREE-HERMES-TOOL-OK-20260827 and returned it.
+    if _resolved_model:
         cmd.extend(["-m", _resolved_model])
-        # Pin the provider too when the override names one, so the worker
-        # resolves the model against the intended backend instead of the
-        # profile's configured provider (mixing model X with provider Y is
-        # the classic mis-set that stalls a board).
         if _resolved_provider:
             cmd.extend(["--provider", _resolved_provider])
     # Per-task thinking depth. Independent of the model override — a task can
@@ -11289,24 +11293,25 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    # Skip hermes CLI infrastructure for free-routed tasks (they use the wrapper).
-    # For all other routes (explicit model override or Haiku default), build the full
-    # hermes chat command.
-    if not _is_free_routed:
-        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-        if worker_toolsets:
-            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-        cmd.extend([
-            "chat",
-            "-q", prompt,
-        ])
-        if task.goal_mode:
-            # Goal-mode workers must take the fully-quiet single-query path:
-            # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-            # cli.py's quiet branch. Without -Q the worker gets exactly one
-            # turn, prints text, exits rc=0, and the dispatcher records a
-            # protocol violation (incident 2026-06-09 t_d9cbe312).
-            cmd.append("-Q")
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    if worker_toolsets:
+        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    cmd.extend([
+        "chat",
+        "-q", prompt,
+    ])
+    if task.goal_mode:
+        # Goal-mode workers must take the fully-quiet single-query path:
+        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
+        # cli.py's quiet branch. Without -Q the worker gets exactly one
+        # turn, prints text, exits rc=0, and the dispatcher records a
+        # protocol violation (incident 2026-06-09 t_d9cbe312).
+        cmd.append("-Q")
+    # Free-first Haiku fallback: wrap the FULL hermes argv. On non-zero the
+    # wrapper retries the same argv with -m haiku --provider anthropic.
+    if _is_free_routed:
+        wrapper_path = Path.home() / ".hermes" / "scripts" / "free-model-worker-wrapper.py"
+        cmd = [sys.executable, str(wrapper_path), "--exec", *cmd]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

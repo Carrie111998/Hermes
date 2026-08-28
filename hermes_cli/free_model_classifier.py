@@ -188,41 +188,24 @@ def needs_tools_to_finish(title: Optional[str], body: Optional[str]) -> bool:
 
 def should_route_free_first(task_id: str, title: Optional[str], body: Optional[str], 
                            model_override: Optional[str] = None) -> bool:
-    """Determine if a task should route via free models first.
-    
-    Returns True if:
-    1. Task has no explicit model_override (use free classifier)
-    2. Task is PROVEN-SKILL (routine, deterministic)
-    3. Task is NO-CREDENTIAL (no secrets, no SoT writes, no Treva-time spend)
-    4. Task's deliverable is TEXT (the free wrapper has no tools — see
-       needs_tools_to_finish)
-    
-    Returns False if:
-    1. Task has explicit model_override (respect the override)
-    2. Task is NOT proven-skill (reasoning-heavy, management)
-    3. Task involves credentials/SoT writes/Treva time (stay on Haiku)
-    4. Task must write a file, run a command, or close a card
+    """Free is the DEFAULT first hop. Haiku is fallback, not primary.
+
+    Skip free (stay Haiku) only when:
+    1. Explicit model_override (respect the pin)
+    2. Credentials / secrets / SoT / Treva / CoS-SPM-incident (is_pii_or_sensitive)
+
+    Do NOT skip because the card needs tools. Free workers are real
+    ``hermes chat`` processes with toolsets; the old tool-less
+    ``opencode run`` wrapper is not the mill path. Skipping on
+    needs_tools_to_finish sent ~97% of mill work to paid Haiku.
+
+    Do NOT require is_proven_skill. That inverted "free first" into
+    "free only if a keyword matched."
     """
-    # Respect explicit model overrides
     if model_override:
         return False
-    
-    # The free wrapper cannot act on the world. Sending it a card whose done-condition
-    # is a file or a command produces a dead card, not a cheap one.
-    if needs_tools_to_finish(title, body):
-        return False
-
-    # Check if task is a proven-skill routine
-    if not is_proven_skill(task_id, title, body):
-        # Not a routine task — default to Haiku for reasoning/management
-        return False
-    
-    # Check for PII/sensitive/SoT patterns
     if is_pii_or_sensitive(task_id, title, body):
-        # Sensitive task — stay on Haiku for reliability
         return False
-    
-    # Passed all checks: eligible for free-first routing
     return True
 
 

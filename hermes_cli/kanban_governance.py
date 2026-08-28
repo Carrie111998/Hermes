@@ -228,30 +228,66 @@ def classify_governance_anomaly(
     return None
 
 
+def _defect_fingerprint(source_task_id: str, anomaly: GovernanceAnomaly) -> str:
+    return f"{source_task_id}:{anomaly.kind}"
+
+
+def _defect_title(source_task_id: str, anomaly: GovernanceAnomaly) -> str:
+    if anomaly.kind == "repeat_review_loop":
+        return f"Governance defect: review loop on {source_task_id}"
+    return f"Governance defect: {anomaly.kind} on {source_task_id}"
+
+
+def _existing_maintainer_defect(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    anomaly: GovernanceAnomaly,
+) -> Optional[str]:
+    """Return an open default-owned defect for this source+kind, or None.
+
+    request_review previously called materialize_maintainer_defect on every
+    increment past the threshold. t_a0723481 minted t_a93d6dc8 at count 4
+    and t_f21333d5 at count 5. Scan-path _ensure_maintainer_defect was
+    fingerprint-idempotent; this lookup is the shared fence.
+    Live cards (t_a93d6dc8) had no fingerprint line — title match still
+    counts as the same defect.
+    """
+    from hermes_cli import kanban_db as kb
+
+    fingerprint = _defect_fingerprint(source_task_id, anomaly)
+    expected_title = _defect_title(source_task_id, anomaly)
+    for task in kb.list_tasks(conn, assignee="default"):
+        if task.status in {"archived", "cancelled"}:
+            continue
+        body = task.body or ""
+        title = task.title or ""
+        if f"fingerprint: {fingerprint}" in body:
+            return task.id
+        if title == expected_title:
+            return task.id
+    return None
+
+
 def materialize_maintainer_defect(
     conn: sqlite3.Connection,
     source_task_id: str,
     anomaly: GovernanceAnomaly,
 ) -> str:
     """Convert a detected governance anomaly into a maintainer defect card.
-    
-    Creates a new task assigned to 'default' with a title describing the
-    governance defect found on the source task.
-    
-    Args:
-        conn: Database connection.
-        source_task_id: The task ID that triggered the anomaly detection.
-        anomaly: The detected GovernanceAnomaly.
-    
-    Returns:
-        The ID of the newly created defect task.
+
+    Idempotent on ``{source_task_id}:{anomaly.kind}``. A 5th review_requested
+    on the same looping task returns the existing default-owned defect
+    instead of minting a sibling (t_a93d6dc8 vs t_f21333d5).
     """
-    # Import here to avoid circular dependency
     from hermes_cli import kanban_db as kb
-    
-    # Determine defect title and body based on anomaly kind
+
+    existing = _existing_maintainer_defect(conn, source_task_id, anomaly)
+    if existing is not None:
+        return existing
+
+    fingerprint = _defect_fingerprint(source_task_id, anomaly)
+    defect_title = _defect_title(source_task_id, anomaly)
     if anomaly.kind == "repeat_review_loop":
-        defect_title = f"Governance defect: review loop on {source_task_id}"
         defect_body = (
             f"Task {source_task_id} has entered review {anomaly.counter_value} times, "
             f"exceeding threshold of {REVIEW_LOOP_THRESHOLD}.\n\n"
@@ -259,21 +295,22 @@ def materialize_maintainer_defect(
             f"This may indicate:\n"
             f"- The review goal/judge/evidence_contract is misaligned with implementation\n"
             f"- The implementation path is fundamentally flawed and needs decomposition\n"
-            f"- The review criteria are ambiguous or keep changing\n"
+            f"- The review criteria are ambiguous or keep changing\n\n"
+            f"fingerprint: {fingerprint}\n"
         )
     else:
-        defect_title = f"Governance defect: {anomaly.kind} on {source_task_id}"
-        defect_body = f"Anomaly: {anomaly.reason}"
-    
-    # Create the defect task assigned to default
-    defect_id = kb.create_task(
+        defect_body = (
+            f"Anomaly: {anomaly.reason}\n\n"
+            f"fingerprint: {fingerprint}\n"
+        )
+
+    return kb.create_task(
         conn,
         title=defect_title,
         body=defect_body,
         assignee="default",
+        idempotency_key=f"gov-defect:{fingerprint}",
     )
-    
-    return defect_id
 
 
 def scan_board_for_governance_defects(
@@ -316,45 +353,6 @@ def _ensure_maintainer_defect(
     source_task_id: str,
     anomaly: GovernanceAnomaly,
 ) -> None:
-    """Ensure a maintainer defect exists for the anomaly (idempotent).
-    
-    Creates a defect if one with the same fingerprint doesn't already exist
-    in an open state.
-    
-    Args:
-        conn: Database connection.
-        source_task_id: The task that triggered the anomaly.
-        anomaly: The detected GovernanceAnomaly.
-    """
-    # Import here to avoid circular dependency
-    from hermes_cli import kanban_db as kb
-    
-    # Fingerprint: unique identifier for this anomaly on this task
-    fingerprint = f"{source_task_id}:{anomaly.kind}"
-    
-    # Check if we already have an open defect with this fingerprint in body
-    existing_tasks = kb.list_tasks(
-        conn,
-        assignee="default",
-    )
-    
-    for task in existing_tasks:
-        if task.body and f"fingerprint: {fingerprint}" in task.body:
-            # Already have an open defect for this anomaly
-            return
-    
-    # Create new defect with fingerprint in body for idempotency
-    defect_body = (
-        f"Governance anomaly: {anomaly.reason}\n\n"
-        f"Source task: {source_task_id}\n"
-        f"Anomaly kind: {anomaly.kind}\n\n"
-        f"fingerprint: {fingerprint}"
-    )
-    
-    kb.create_task(
-        conn,
-        title=f"Governance defect: {anomaly.kind} on {source_task_id}",
-        body=defect_body,
-        assignee="default",
-    )
+    """Ensure a maintainer defect exists for the anomaly (idempotent)."""
+    materialize_maintainer_defect(conn, source_task_id, anomaly)
 

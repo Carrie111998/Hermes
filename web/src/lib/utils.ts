@@ -16,6 +16,11 @@ export const themedChrome = "font-mondwest text-display";
 
 /** Relative time from a Unix epoch timestamp (seconds). */
 export function timeAgo(ts: number): string {
+  // Defense-in-depth: a malformed row (e.g. an ISO-string timestamp written by a
+  // worker that bypassed the epoch-int create path) makes `ts` non-finite. Guard it
+  // so one bad row can't render "NaNd ago" (or, in the Intl.RelativeTimeFormat SDK
+  // variant, THROW and take down the whole board). (2026-08-25 kanban crash.)
+  if (!Number.isFinite(ts)) return "unknown";
   const delta = Date.now() / 1000 - ts;
   if (delta < 60) return "just now";
   if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;

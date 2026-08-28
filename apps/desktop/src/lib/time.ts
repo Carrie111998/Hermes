@@ -36,6 +36,15 @@ const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto', style: 'sh
 // Localized bidirectional "in 5 min" / "2 hr ago" — coarsest sensible unit so a
 // daily job reads "in 14 hr", not "in 840 min".
 export function relativeTime(targetMs: number, nowMs = Date.now()): string {
+  // Defense-in-depth: a malformed row (e.g. an ISO-string timestamp written by a
+  // worker that bypassed the epoch-int create path) yields NaN here, and
+  // Intl.RelativeTimeFormat.format(NaN) THROWS — which took down the entire kanban
+  // board view from one bad row. Guard non-finite input: render nothing rather than
+  // crash the whole surface. (2026-08-25 incident: t_test_free_01..05 ISO strings.)
+  if (!Number.isFinite(targetMs)) {
+    return ''
+  }
+
   const diff = targetMs - nowMs
   const abs = Math.abs(diff)
   const sign = diff < 0 ? -1 : 1
