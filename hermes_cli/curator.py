@@ -243,6 +243,9 @@ def _cmd_run(args) -> int:
         dry_run=dry,
         consolidate=consolidate,
     )
+    if result.get("started") is False:
+        print("curator: another review pass is already running")
+        return 1
     auto = result.get("auto_transitions", {})
     if auto:
         if dry:
