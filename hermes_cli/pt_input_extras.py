@@ -48,6 +48,43 @@ def _clear_vt100_prefix_cache() -> None:
         pass
 
 
+_orig_vt100_call_handler = None
+
+
+def _patch_vt100_parser_for_string_keys() -> None:
+    """Ensure prompt_toolkit's Vt100Parser sets KeyPress.data to the target
+    character when ANSI_SEQUENCES maps a sequence to a single-character string.
+
+    Stock prompt_toolkit's Vt100Parser passes the raw matched sequence as
+    `insert_text` (`KeyPress(key, insert_text)`). When key bindings process
+    `Keys.Any` (e.g. self_insert), they insert `event.data * event.arg`.
+    Without this patch, extended Shift+letter sequences (e.g. `\\x1b[27;2;83~`
+    or `\\x1b[83;2u`) decode to `KeyPress(key='S', data='\\x1b[27;2;83~')`,
+    causing `self_insert` to dump the raw escape sequence into the prompt
+    buffer instead of the character ('S') (#97413).
+    """
+    global _orig_vt100_call_handler
+    try:
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return
+
+    if _orig_vt100_call_handler is not None:
+        return
+
+    _orig = Vt100Parser._call_handler
+    _orig_vt100_call_handler = _orig
+
+    def _call_handler(self, key, insert_text):
+        if isinstance(key, str) and not isinstance(key, Keys) and len(key) == 1:
+            insert_text = key
+        return _orig(self, key, insert_text)
+
+    Vt100Parser._call_handler = _call_handler
+
+
+
 def install_shift_enter_alias() -> int:
     """Map Shift+Enter byte sequences to the (Escape, ControlM) key tuple
     that Alt+Enter produces, so the existing Alt+Enter newline handler
@@ -492,7 +529,10 @@ def install_modify_other_keys_aliases() -> int:
     if changed:
         _clear_vt100_prefix_cache()
 
+    _patch_vt100_parser_for_string_keys()
+
     return changed
+
 
 
 def install_ignored_terminal_sequences() -> int:
