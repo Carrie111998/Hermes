@@ -130,8 +130,7 @@ def _write_to_spillover(content, filename: str):
     """Atomically publish sanitized content without same-name aliasing."""
     temporary_path = None
     safe_content = sanitize_tool_result_for_sink(content)
-    if not isinstance(filename, str) or not filename:
-        filename = "tool_result.txt"
+    if not isinstance(filename, str) or not filename: filename = "tool_result.txt"
     if os.path.basename(filename) != filename or _UNSAFE_RESULT_FILENAME_CHARS.search(filename):
         filename = _safe_result_filename(filename)
     try:
@@ -139,19 +138,20 @@ def _write_to_spillover(content, filename: str):
         spill_dir.mkdir(parents=True, exist_ok=True)
         with _spillover_publish_lock:
             path = spill_dir / filename
-            if path.exists():
-                path = spill_dir / (
-                    f"{path.stem}_{uuid.uuid4().hex[:16]}{path.suffix}"
-                )
-            fd, temporary_path = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=spill_dir
-            )
-            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as stream:
-                stream.write(safe_content)
-            os.replace(temporary_path, path)
-            temporary_path = None
+            fd, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=spill_dir)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as stream: stream.write(safe_content)
+            for _ in range(100):
+                try:
+                    os.link(temporary_path, path)
+                    os.unlink(temporary_path); temporary_path = None
+                    break
+                except FileExistsError:
+                    path = spill_dir / f"{path.stem}_{uuid.uuid4().hex[:16]}{path.suffix}"
+                    continue
+            else:
+                raise FileExistsError("could not reserve a unique spillover path")
     except Exception as exc:
-        logger.warning("Spillover write failed for %s: %s", filename, exc)
+        logger.warning("Spillover write failed for %s: %s", sanitize_tool_result_for_sink(filename), sanitize_tool_result_for_sink(exc))
         return None
     finally:
         if temporary_path is not None:

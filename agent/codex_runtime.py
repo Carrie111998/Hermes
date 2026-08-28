@@ -24,7 +24,10 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
-from tools.tool_result_sanitization import sanitize_tool_result_for_sink
+from tools.tool_result_sanitization import (
+    sanitize_tool_result_for_sink,
+    sanitize_tool_result_projection_for_sink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +425,10 @@ def _codex_item_to_args(item: dict) -> dict:
 def _codex_item_to_preview(item: dict) -> Any:
     """Short human-readable preview for the tool.started bubble. Returns
     None when no useful preview is available (Hermes' UI tolerates None)."""
+    # Preview construction is itself an external display sink.  Normalize the
+    # complete item first so command text, paths, and structured arguments all
+    # use the same total projection as callback args.
+    item = sanitize_tool_result_projection_for_sink(item)
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
         cmd = item.get("command") or ""
@@ -471,10 +478,9 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     if item_type == "mcpToolCall":
         error = item.get("error")
         if error:
+            safe_error = sanitize_tool_result_for_sink(error)
             return (
-                sanitize_tool_result_for_sink(
-                    f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
-                ),
+                sanitize_tool_result_for_sink(f"[error] {safe_error[:1000]}"),
                 True,
             )
         result = item.get("result")
@@ -550,17 +556,20 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def _fire_tool_started(item: dict) -> None:
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
-        args = _codex_item_to_args(item)
+        safe_item = sanitize_tool_result_projection_for_sink(item)
+        safe_name = sanitize_tool_result_for_sink(name)
+        args = _codex_item_to_args(safe_item)
         if item_id:
-            started[item_id] = (name, args, time.monotonic())
+            started[item_id] = (safe_name, args, time.monotonic())
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
-                cb("tool.started", name, _codex_item_to_preview(item), args)
+                cb("tool.started", safe_name, _codex_item_to_preview(safe_item), args)
             except Exception:
                 logger.debug(
-                    "tool_progress_callback raised on tool.started for %s",
-                    name, exc_info=True,
+                    "tool_progress_callback raised on tool.started for %s: %s",
+                    safe_name,
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
         # Authoritative stable-ID tool card (TUI / desktop). Fires
         # alongside tool_progress so surfaces that render structured tool
@@ -572,7 +581,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 start_cb(_stable_call_id(item, name), name, args)
             except Exception:
                 logger.debug(
-                    "tool_start_callback raised for %s", name, exc_info=True,
+                    "tool_start_callback raised for %s: %s",
+                    safe_name,
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
 
     def _fire_tool_completed(item: dict) -> None:
@@ -597,8 +608,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                    duration=duration, is_error=is_error, result=result)
             except Exception:
                 logger.debug(
-                    "tool_progress_callback raised on tool.completed for %s",
-                    name, exc_info=True,
+                    "tool_progress_callback raised on tool.completed for %s: %s",
+                    sanitize_tool_result_for_sink(name),
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
         complete_cb = getattr(agent, "tool_complete_callback", None)
         if complete_cb is not None:
@@ -607,7 +619,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 complete_cb(_stable_call_id(item, name), name, args, result)
             except Exception:
                 logger.debug(
-                    "tool_complete_callback raised for %s", name, exc_info=True,
+                    "tool_complete_callback raised for %s: %s",
+                    sanitize_tool_result_for_sink(name),
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
 
     def _fire_text_delta(params: dict) -> None:
@@ -778,7 +792,8 @@ def run_codex_app_server_turn(
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
-        logger.exception("codex app-server turn failed")
+        safe_error = sanitize_tool_result_for_sink(exc)
+        logger.error("codex app-server turn failed: %s", safe_error)
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -798,7 +813,7 @@ def run_codex_app_server_turn(
             agent.clear_interrupt()
         return {
             "final_response": (
-                f"Codex app-server turn failed: {exc}. "
+                f"Codex app-server turn failed: {safe_error}. "
                 f"Fall back to default runtime with `/codex-runtime auto`."
             ),
             "messages": messages,
@@ -811,7 +826,7 @@ def run_codex_app_server_turn(
                 if _interrupt_message
                 else {}
             ),
-            "error": str(exc),
+            "error": safe_error,
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -832,9 +847,14 @@ def run_codex_app_server_turn(
     # rather than riding the broken process. Mirrors openclaw beta.8's
     # "retire timed-out app-server clients" fix.
     if getattr(turn, "should_retire", False):
+        safe_turn_error = (
+            sanitize_tool_result_for_sink(turn.error)
+            if turn.error is not None
+            else None
+        )
         logger.warning(
             "codex app-server session retired (turn error: %s)",
-            turn.error,
+            safe_turn_error,
         )
         try:
             agent._codex_session.close()
@@ -955,7 +975,11 @@ def run_codex_app_server_turn(
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": (
+            sanitize_tool_result_for_sink(turn.error)
+            if turn.error is not None
+            else None
+        ),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

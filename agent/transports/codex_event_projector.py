@@ -245,9 +245,11 @@ class CodexEventProjector:
         result = item.get("result")
         error = item.get("error")
         if error:
-            content = sanitize_tool_result_for_sink(
-                f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
-            )
+            # Sanitize before any serialization.  Codex MCP errors are
+            # untrusted structured values and may be cyclic, deeply nested, or
+            # backed by hostile conversion methods.
+            safe_error = sanitize_tool_result_for_sink(error)
+            content = sanitize_tool_result_for_sink(f"[error] {safe_error[:1000]}")
         elif result is not None:
             content = sanitize_tool_result_for_sink(result)[:4000]
         else:

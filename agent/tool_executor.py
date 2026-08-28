@@ -1056,7 +1056,10 @@ def _begin_tool_execution(
                 "tool.started", function_name, preview, display_args
             )
         except Exception as callback_error:
-            logging.debug("Tool progress callback error: %s", callback_error)
+            logging.debug(
+                "Tool progress callback error: %s",
+                sanitize_tool_result_for_sink(callback_error),
+            )
 
     if agent.tool_start_callback:
         try:
@@ -1868,7 +1871,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     result=display_function_result,
                 )
             except Exception as cb_err:
-                logging.debug("Tool progress callback error: %s", cb_err)
+                logging.debug(
+                    "Tool progress callback error: %s",
+                    sanitize_tool_result_for_sink(cb_err),
+                )
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
@@ -1892,7 +1898,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     tool_call_id, name, display_args, display_function_result,
                 )
             except Exception as cb_err:
-                logging.debug("Tool complete callback error: %s", cb_err)
+                logging.debug(
+                    "Tool complete callback error: %s",
+                    sanitize_tool_result_for_sink(cb_err),
+                )
 
         if (
             risk_metadata is not None
@@ -1909,7 +1918,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     risk_metadata=risk_metadata,
                 )
             except Exception as cb_err:
-                logging.debug("Tool output risk callback error: %s", cb_err)
+                logging.debug(
+                    "Tool output risk callback error: %s",
+                    sanitize_tool_result_for_sink(cb_err),
+                )
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     # Keep /steer pending until the final post-budget drain below.  The model

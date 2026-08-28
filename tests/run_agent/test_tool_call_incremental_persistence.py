@@ -220,6 +220,32 @@ def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_
     assert len(_durable_messages(db_path, session_id)) == 2
 
 
+def test_session_flush_sanitizes_bypass_tool_rows_and_sidecars(tmp_path):
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "sink-safe-tool-row"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    raw = "opaque-r3-session-SECRET-123456"
+    messages = [{
+        "role": "tool",
+        "tool_name": "bypass_tool",
+        "tool_call_id": "call-1",
+        "content": {"nested": raw, "url": f"https://example.test/?token={raw}"},
+        "api_content": raw,
+        "tool_calls": [{"arguments": raw}],
+    }]
+    try:
+        assert agent._flush_messages_to_session_db(messages, []) is True
+    finally:
+        db.close()
+
+    durable = _durable_messages(db_path, session_id)
+    assert len(durable) == 1
+    assert durable[0]["role"] == "tool"
+    assert raw not in repr(durable[0])
+    assert "redacted" in repr(durable[0]).lower()
+
+
 def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     agent = _make_agent()
     tool_call = _mock_tool_call(call_id="must-not-run")
