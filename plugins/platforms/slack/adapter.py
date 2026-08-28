@@ -8051,12 +8051,15 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> str:
         """Recover a nearby self-authored root report for a fresh-data request."""
         session_store = getattr(self, "_session_store", None)
-        ensure_loaded = getattr(session_store, "_ensure_loaded", None)
-        if callable(ensure_loaded):
-            ensure_loaded()
+        list_sessions = getattr(session_store, "list_sessions", None)
+        try:
+            session_entries: Any = list_sessions() if callable(list_sessions) else []
+        except Exception as exc:
+            logger.warning("[Slack] Failed to snapshot re-query sessions: %s", exc)
+            session_entries = []
         canonical_threads = {
             str(origin.thread_id)
-            for entry in getattr(session_store, "_entries", {}).values()
+            for entry in session_entries
             if (origin := getattr(entry, "origin", None))
             and origin.platform == Platform.SLACK
             and str(origin.chat_id) == str(channel_id)

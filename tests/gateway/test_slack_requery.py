@@ -73,7 +73,9 @@ def _adapter(messages, *, session_entries=None, thread_messages=None):
         ),
     )
     adapter._get_client = lambda *_args, **_kwargs: client
-    adapter._session_store = SimpleNamespace(_entries=session_entries or {})
+    adapter._session_store = SimpleNamespace(
+        list_sessions=MagicMock(return_value=list((session_entries or {}).values()))
+    )
     return adapter, client
 
 
@@ -133,6 +135,41 @@ async def test_root_requery_prefers_canonical_cron_session_hours_later():
     client.conversations_replies.assert_awaited_once_with(
         channel="C1", ts="100.0", limit=1, inclusive=True
     )
+    client.conversations_history.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_root_requery_uses_lock_safe_session_snapshot_during_mutation():
+    cron_entry = SimpleNamespace(
+        origin=SimpleNamespace(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            thread_id="100.0",
+            user_id="system:cron",
+        )
+    )
+
+    class MutatingEntries(dict):
+        def values(self):
+            values = super().values()
+            self["concurrent"] = SimpleNamespace(origin=None)
+            return values
+
+    adapter, client = _adapter(
+        [],
+        thread_messages=[
+            {"ts": "100.0", "user": "U_BOT", "text": "항공권 보고 " * 10},
+        ],
+    )
+    adapter._session_store = SimpleNamespace(
+        _entries=MutatingEntries({"cron": cron_entry}),
+        list_sessions=MagicMock(return_value=[cron_entry]),
+    )
+
+    context = await adapter._fetch_requery_context("C1", "20000.0")
+
+    assert "항공권 보고" in context
+    adapter._session_store.list_sessions.assert_called_once_with()
     client.conversations_history.assert_not_awaited()
 
 
