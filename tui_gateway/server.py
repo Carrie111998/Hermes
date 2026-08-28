@@ -10979,6 +10979,14 @@ def _collect_kanban_notifications(session: dict) -> list:
     is the subset that may become an agent turn. Human plan/deploy gate events
     appear only in the first list — they are shown and audited, never submitted
     as a prompt (G11).
+
+    **Delivery is at-most-once, not exactly-once.** The cursor is claimed here,
+    before the caller emits anything, so a crash or an exception between the
+    claim and ``_emit`` leaves the cursor advanced and that notification
+    undisplayed. This window is inherited from the original TUI notifier design
+    and is unchanged by the gate split; the event itself always survives in
+    ``task_events``, so the board remains the durable record. Do not describe
+    this surface as exactly-once.
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):

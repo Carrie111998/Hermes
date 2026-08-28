@@ -11,6 +11,8 @@ Synthetic markers only. No real credential appears in this file.
 """
 
 import asyncio
+import json
+import unicodedata
 
 import pytest
 
@@ -271,31 +273,29 @@ def test_push_adapter_notify_wake_delivers_the_gate_text_and_no_turn(
     assert _unseen(tid, GATE_KINDS) == [], "delivered event must be consumed"
 
 
-def test_non_push_notify_wake_gate_only_batch_is_not_recorded_as_delivered(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("mode", ["notify", "notify+wake"])
+def test_non_push_gate_batch_is_recorded_not_consumed_and_not_retried(
+    tmp_path, monkeypatch, mode
 ):
-    """The regression: 0 sends + 0 wakes must not advance the cursor."""
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "nonpush-nw.db"))
+    """A non-push adapter has no passive channel and a gate never wakes.
+
+    Attempting the send anyway (the first correction) was still lossy: an
+    ApiServerAdapter refuses by design, so twelve doomed attempts trip
+    MAX_SEND_FAILURES and DELETE a live subscription. The truthful behaviour is
+    to record the non-delivery on the task and leave the subscription alone.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / f"np-{mode}.db"))
     kb.init_db()
-    tid = _subscribed_task("notify+wake")
+    tid = _subscribed_task(mode)
     _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
     adapter = NonPushAdapter()
     _tick(monkeypatch, adapter)
     assert adapter.handled == [], "a gate event must never wake"
-    assert adapter.sent, "the passive send must be attempted, not skipped"
-    assert _unseen(tid, GATE_KINDS), "undelivered event was consumed"
-
-
-def test_non_push_notify_only_gate_batch_also_stays_unseen(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "nonpush-n.db"))
-    kb.init_db()
-    tid = _subscribed_task("notify")
-    _emit(tid, "plan_rejected", {"operator": "op", "project_id": "p",
-                                 "revision": 1})
-    adapter = NonPushAdapter()
-    _tick(monkeypatch, adapter)
-    assert adapter.handled == []
-    assert _unseen(tid, GATE_KINDS)
+    assert adapter.sent == [], "no send may be attempted on a dead channel"
+    rows = _undeliverable_rows(tid)
+    assert len(rows) == 1, "the non-delivery must be on the task"
+    assert rows[0]["event_kind"] == "plan_awaiting_approval"
+    assert _subs(tid), "the subscription must survive"
 
 
 def test_non_push_notify_wake_still_skips_the_send_when_a_wake_will_happen(
@@ -490,3 +490,243 @@ def test_the_eight_actionable_wake_kinds_are_unchanged(tmp_path, monkeypatch):
         "completed", "blocked", "gave_up", "crashed", "timed_out",
         "review_requested", "changes_requested", "block_loop_detected",
     }
+
+
+# ---------------------------------------------------------------------------
+# Non-push delivery is durable, not lossy (second-round review)
+# ---------------------------------------------------------------------------
+
+def _events(tid):
+    conn = kb.connect()
+    try:
+        return [(r["kind"], r["payload"]) for r in conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def _undeliverable_rows(tid):
+    return [json.loads(p) for k, p in _events(tid)
+            if k == "gate_notification_undeliverable"]
+
+
+def _subs(tid):
+    conn = kb.connect()
+    try:
+        return kb.list_notify_subs(conn, task_id=tid)
+    finally:
+        conn.close()
+
+
+def test_the_undeliverable_audit_kind_is_never_claimed_or_woken():
+    """It must not be in TERMINAL_KINDS, or the notifier would recurse."""
+    assert "gate_notification_undeliverable" not in kw.TERMINAL_KINDS
+    assert "gate_notification_undeliverable" not in kw.WAKE_KINDS
+
+
+@pytest.mark.parametrize("gate_first", [True, False])
+def test_non_push_mixed_batch_records_the_gate_instead_of_consuming_it(
+    tmp_path, monkeypatch, gate_first
+):
+    """The actionable self-post is NOT delivery for the gate half."""
+    monkeypatch.setenv("HERMES_KANBAN_DB",
+                       str(tmp_path / f"np-mixed-{gate_first}.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify+wake")
+
+    import gateway.wake as wake_mod
+    posted = []
+
+    async def _record(adapter, *, text, session_id="", source=None):
+        posted.append(text)
+
+    monkeypatch.setattr(wake_mod, "deliver_wake", _record)
+
+    gate = ("plan_awaiting_approval", {"project_id": "p", "revision": 1})
+    done = ("completed", {"summary": "work finished"})
+    for kind, payload in ([gate, done] if gate_first else [done, gate]):
+        _emit(tid, kind, payload)
+
+    adapter = NonPushAdapter()
+    _tick(monkeypatch, adapter)
+
+    assert len(posted) == 1, "the actionable event is still delivered"
+    assert "cannot cross this gate" not in posted[0].lower()
+    assert "awaiting a human plan decision" not in posted[0].lower()
+    assert adapter.sent == [], "no doomed send may be attempted"
+
+    rows = _undeliverable_rows(tid)
+    assert len(rows) == 1, "the gate half must be recorded, not consumed"
+    assert rows[0]["event_kind"] == "plan_awaiting_approval"
+    assert rows[0]["delivery_mode"] == "notify+wake"
+    assert "no passive channel" in rows[0]["reason"]
+
+
+def test_non_push_gate_only_never_exhausts_the_failure_counter(
+    tmp_path, monkeypatch
+):
+    """A structurally unsupported send must not delete a live subscription."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "np-exhaust.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify+wake")
+    _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
+
+    # ONE persistent runner: the failure counter lives on it across ticks.
+    runner = _runner(NonPushAdapter())
+    attempts = 0
+    for _ in range(14):
+        runner._running = True
+        runner.adapters = {Platform.TELEGRAM: NonPushAdapter()}
+        asyncio.run(_one_tick(monkeypatch, runner))
+        attempts += len(runner.adapters[Platform.TELEGRAM].sent)
+
+    assert attempts == 0, "no send may be attempted on a channel that cannot send"
+    assert _subs(tid), "the subscription must survive"
+    assert len(_undeliverable_rows(tid)) == 1, "recorded once, not every tick"
+
+
+def test_non_push_gate_only_keeps_working_for_later_actionable_events(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "np-later.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify+wake")
+    _emit(tid, "plan_rejected", {"operator": "op", "project_id": "p",
+                                 "revision": 1})
+    adapter = NonPushAdapter()
+    _tick(monkeypatch, adapter)
+    assert len(_undeliverable_rows(tid)) == 1
+
+    import gateway.wake as wake_mod
+    posted = []
+
+    async def _record(adapter, *, text, session_id="", source=None):
+        posted.append(text)
+
+    monkeypatch.setattr(wake_mod, "deliver_wake", _record)
+    _emit(tid, "completed", {"summary": "done"})
+    _tick(monkeypatch, NonPushAdapter())
+    assert len(posted) == 1, "the subscription still delivers actionable work"
+
+
+def test_wake_only_gate_batch_is_recorded_as_undeliverable(tmp_path, monkeypatch):
+    """The documented wake-only choice is now auditable, not invisible."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wakeonly-audit.db"))
+    kb.init_db()
+    tid = _subscribed_task("wake")
+    _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
+    adapter = PushAdapter()
+    _tick(monkeypatch, adapter)
+    assert adapter.sent == []
+    assert adapter.handled == []
+    rows = _undeliverable_rows(tid)
+    assert len(rows) == 1
+    assert rows[0]["delivery_mode"] == "wake"
+    assert "wake-only" in rows[0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Path / Unicode / surrogate attacks (second-round review)
+# ---------------------------------------------------------------------------
+
+PATH_ATTACKS = [
+    "/Users/example/My Secret/config.yaml",
+    "file:///Users/example/private/config.yaml",
+    "/Volumes/PrivateDrive/company/secrets.txt",
+    "/opt/homebrew/etc/private.conf",
+    "/root/.ssh/id_rsa",
+    "/Applications/Hermes.app/Contents/Resources/x",
+    "/Library/Keychains/login.keychain-db",
+    "/srv/data/customer/export.csv",
+    r"C:\Users\example\secret.txt",
+]
+
+LEAK_FRAGMENTS = (
+    "Secret/config", "private/config", "PrivateDrive", "homebrew/etc",
+    ".ssh/id_rsa", "Hermes.app", "Keychains", "customer/export",
+    "example\\secret",
+)
+
+UNICODE_ATTACKS = [
+    "operator\u202eevil",          # RIGHT-TO-LEFT OVERRIDE
+    "op\u202areordered\u202c",     # LRE / PDF
+    "op\u2066hidden\u2069x",       # isolates
+    "ad\u200bmin",                 # zero width space
+    "a\u200d\u200cb",              # ZWJ / ZWNJ
+    "x\ufeffy",                    # BOM
+    "x\ud800y",                    # lone surrogate
+]
+
+
+@pytest.mark.parametrize("value", PATH_ATTACKS)
+def test_local_paths_are_redacted_without_leaking_the_tail(value):
+    out = ge.safe_display_value(value, limit=200)
+    for fragment in LEAK_FRAGMENTS:
+        assert fragment not in out, f"{value!r} leaked {fragment!r} as {out!r}"
+
+
+@pytest.mark.parametrize("value", UNICODE_ATTACKS)
+def test_unicode_format_controls_and_surrogates_are_removed(value):
+    out = ge.safe_display_value(value, limit=200)
+    for ch in out:
+        assert unicodedata.category(ch) not in ("Cf", "Cs"), repr(out)
+    out.encode("utf-8")  # must never raise inside an adapter's encoder
+
+
+def test_ordinary_prose_after_a_path_survives():
+    out = ge.safe_display_value(
+        "/Users/me/x and then the plan was approved", limit=200)
+    assert "and then the plan was approved" in out
+    assert "/Users/me/x" not in out
+
+
+def test_a_lone_surrogate_cannot_even_be_stored(tmp_path, monkeypatch):
+    """Defence in depth: the DB layer rejects it, and so does the formatter."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "surrogate.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify")
+    with pytest.raises(UnicodeEncodeError):
+        _emit(tid, "plan_approved", {"operator": "x\ud800y"})
+    # The formatter still neutralises it for any non-DB caller.
+    out = ge.safe_display_value("x\ud800y")
+    assert all(unicodedata.category(c) not in ("Cf", "Cs") for c in out)
+    out.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "value", PATH_ATTACKS + [v for v in UNICODE_ATTACKS if v.isprintable()
+                             or "\ud800" not in v])
+def test_attacks_are_neutralised_through_the_real_notifier(
+    tmp_path, monkeypatch, value
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB",
+                       str(tmp_path / f"atk-{abs(hash(value))}.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify")
+    _emit(tid, "plan_approved", {"operator": value, "project_id": value,
+                                 "revision": 1, "landing_status": value,
+                                 "reason": value})
+    adapter = PushAdapter()
+    _tick(monkeypatch, adapter)
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    for fragment in LEAK_FRAGMENTS:
+        assert fragment not in text
+    for ch in text:
+        assert unicodedata.category(ch) not in ("Cf", "Cs")
+    text.encode("utf-8")
+
+
+@pytest.mark.parametrize("value", PATH_ATTACKS + UNICODE_ATTACKS)
+def test_attacks_are_neutralised_through_the_shared_renderer(value):
+    out = ge.render_gate_event(
+        "gate_release_refused", {"via": value, "gate_state": value,
+                                 "reason": value},
+        task_id="t_1", board_slug=value, assignee=value,
+    )
+    for fragment in LEAK_FRAGMENTS:
+        assert fragment not in out
+    for ch in out:
+        assert unicodedata.category(ch) not in ("Cf", "Cs")
+    out.encode("utf-8")

@@ -800,7 +800,47 @@ class GatewayKanbanWatchersMixin:
                         # creator is woken via the self-post below instead.
                         from gateway.wake import adapter_supports_push
 
-                        if (not adapter_supports_push(adapter) and wake_agent
+                        _push_ok = adapter_supports_push(adapter)
+                        # A gate event is passive by construction: it is never
+                        # carried by the wake self-post, and the self-post is
+                        # the ONLY channel a non-push adapter has. So on such a
+                        # subscription there is no way to deliver it, and on a
+                        # ``wake``-only subscription the subscriber has declined
+                        # the only channel there is.
+                        #
+                        # Do not attempt a send that cannot succeed: an
+                        # ApiServerAdapter refuses by design, so twelve doomed
+                        # attempts would trip MAX_SEND_FAILURES and DELETE a
+                        # live subscription. Do not silently consume it either.
+                        # Record the fact on the task instead — an auditable,
+                        # operator-visible row — and move on. (G11.)
+                        _undeliverable = ""
+                        if kind in PLAN_GATE_NOTIFY_KINDS:
+                            if not _push_ok:
+                                _undeliverable = (
+                                    "adapter has no passive channel and a gate "
+                                    "event is never carried by a wake"
+                                )
+                            elif not send_passive:
+                                _undeliverable = (
+                                    "wake-only subscription declined passive "
+                                    "delivery and a gate event never wakes"
+                                )
+                        if _undeliverable:
+                            logger.info(
+                                "kanban notifier: gate event %s for %s is not "
+                                "deliverable on %s (%s); recorded on the task",
+                                kind, sub["task_id"], platform_str,
+                                _undeliverable,
+                            )
+                            await _to_thread_process_service(
+                                self._kanban_record_undeliverable,
+                                sub, kind, platform_str, _undeliverable,
+                                board_slug,
+                            )
+                            continue
+
+                        if (not _push_ok and wake_agent
                                 and batch_wake_kinds):
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
@@ -1191,6 +1231,36 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
             )
+        finally:
+            conn.close()
+
+    def _kanban_record_undeliverable(
+        self, sub: dict, kind: str, platform: str, reason: str,
+        board: Optional[str] = None,
+    ) -> None:
+        """Sync helper: record that a gate notification could not be delivered.
+
+        Best-effort and audit-only. The kind is deliberately NOT in
+        ``TERMINAL_KINDS``, so no notifier ever claims it and this cannot
+        recurse. It exists so "nobody was told" is a fact on the task rather
+        than an absence, without waking anyone or deleting a subscription.
+        """
+        from hermes_cli import kanban_db as _kb
+        try:
+            conn = _kb.connect(board=board)
+        except Exception:
+            return
+        try:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, sub["task_id"], "gate_notification_undeliverable",
+                    {"event_kind": kind, "platform": platform,
+                     "reason": reason,
+                     "delivery_mode": sub.get("delivery_mode") or "notify"},
+                )
+        except Exception:
+            # Auditing a non-delivery must never become an outage.
+            pass
         finally:
             conn.close()
 

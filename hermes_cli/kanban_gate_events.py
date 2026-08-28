@@ -27,6 +27,7 @@ partial and legacy payloads, so the renderer owns outbound safety.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any, Mapping, Optional
 
 # Emitted by ``hermes_cli.kanban_db``:
@@ -50,9 +51,24 @@ GATE_EMOJI: dict[str, str] = {
 
 # Absolute local paths. Kept here (rather than imported from the gateway) so
 # the TUI surface does not have to import the gateway to render safely.
+#
+# Two things the first version got wrong, both reproduced by review:
+#   * a path segment containing a space ("/Users/me/My Secret/config.yaml")
+#     matched only up to the space and leaked "Secret/config.yaml";
+#   * only seven roots were covered, so /Volumes, /opt, /root, /Applications
+#     and a "file://" URL survived intact.
+#
+# A space is consumed ONLY when a "/" follows before the next delimiter — that
+# continues a path through "My Secret/config" without swallowing the ordinary
+# prose after "/Users/me/x and then ...".
+_PATH_ROOTS = (
+    "Users|home|root|Volumes|Applications|Library|System|opt|srv|mnt|media|"
+    "private|tmp|var|etc|usr|workspace|data"
+)
+_PATH_TAIL = r"(?:[^/\s,;'\"]| (?=[^\s,;'\"]*/))*"
 _LOCAL_PATH_RE = re.compile(
-    r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
-    r"[A-Za-z]:\\[^\s,;]+)"
+    rf"(?:file://)?(?<![\w:])/(?:{_PATH_ROOTS})\b(?:/{_PATH_TAIL})*"
+    r"|[A-Za-z]:\\[^\s,;]+"
 )
 
 # Everything outside printable text. C0 (minus the whitespace that
@@ -109,6 +125,19 @@ def safe_display_value(value: Any, *, limit: int = IDENT_LIMIT) -> str:
 
     text = _LOCAL_PATH_RE.sub("[local path]", text)
     text = _CONTROL_RE.sub("", text)
+    # Unicode format characters (Cf) carry bidi overrides and isolates
+    # (U+202E, U+2066-2069) and zero-width joiners — display injection that is
+    # invisible to the C0/C1 filter above. Surrogates (Cs) are worse than
+    # invisible: a lone one makes the returned string raise inside an adapter's
+    # UTF-8 encoder, which would turn a notification into an outage.
+    if not text.isascii():
+        text = "".join(
+            ch for ch in text if unicodedata.category(ch) not in ("Cf", "Cs")
+        )
+        # Belt and braces: anything that still cannot round-trip UTF-8 is
+        # replaced rather than returned, so the contract "safe to deliver
+        # anywhere" holds literally.
+        text = text.encode("utf-8", "replace").decode("utf-8", "replace")
     text = " ".join(text.split())
     if limit > 0 and len(text) > limit:
         text = text[: max(1, limit - 1)].rstrip() + "…"
