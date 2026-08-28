@@ -84,8 +84,11 @@ class ApprovalBoundary:
             ).encode("utf-8")
         ).hexdigest()
         policy_digest = hashlib.sha256(
-            json.dumps(policy if policy is not None else {}, sort_keys=True,
-                       default=str, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                policy if policy is not None else {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
         ).hexdigest()
         return cls(
             operation_id=operation_id or f"approval:{intent}",
@@ -126,6 +129,8 @@ def _typed_approval_result(
         elif result.get("status") in {"approval_required", "pending_approval"}:
             outcome = ApprovalOutcome.PENDING
         else:
+            # Last-resort mapping for untyped legacy dicts only. Prefer a
+            # producer-set outcome over message phrasing.
             text = str(result.get("message") or "").lower()
             outcome = (
                 ApprovalOutcome.TIMEOUT if "timed out" in text or "timeout" in text

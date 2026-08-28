@@ -933,8 +933,10 @@ class ProcessRegistry:
             logger.warning("Refusing to terminate host pid %d: identity mismatch", pid)
             return TerminationEvidence(status="identity_mismatch", pid=pid, identity_verified=False, reason="PID is live but its start time changed")
         # Snapshot descendant identities before invoking the existing tree
-        # terminator. A recycled descendant PID is evidence of a different
-        # process and is never included as a survivor of our tree.
+        # terminator. Children spawned after this snapshot are outside
+        # targets; the post-kill survivor check is best-effort. A recycled
+        # descendant PID is evidence of a different process and is never
+        # included as a survivor of our tree.
         targets = [(pid, expected_start)]
         try:
             import psutil

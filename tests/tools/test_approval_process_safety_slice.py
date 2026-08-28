@@ -169,3 +169,39 @@ def test_dead_pid_is_already_exited_but_recycled_pid_is_mismatch(monkeypatch):
     assert dead.status == 'already_exited'
     assert recycled.status == 'identity_mismatch'
     assert called == []
+
+
+def test_typed_non_interactive_outcome_is_preserved():
+    result = approval._typed_approval_result(
+        {
+            "approved": False,
+            "message": "blocked without matching substrings",
+            "outcome": approval.ApprovalOutcome.NON_INTERACTIVE,
+        },
+        command="echo test",
+        env_type="local",
+        operation_id="op-typed",
+    )
+    assert result["outcome"] is approval.ApprovalOutcome.NON_INTERACTIVE
+    assert result["retryable"] is False
+
+
+def test_untyped_generic_deny_is_denied():
+    result = approval._typed_approval_result(
+        {"approved": False, "message": "user declined the request"},
+        command="echo test",
+        env_type="local",
+        operation_id="op-denied",
+    )
+    assert result["outcome"] is approval.ApprovalOutcome.DENIED
+    assert result["retryable"] is False
+
+
+def test_policy_digest_stable_for_primitive_policy():
+    first = approval.ApprovalBoundary.for_request(
+        "echo test", "local", operation_id="op-digest", policy={"mode": "ask", "cron": False, "single_query": False}
+    )
+    second = approval.ApprovalBoundary.for_request(
+        "echo test", "local", operation_id="op-digest", policy={"single_query": False, "cron": False, "mode": "ask"}
+    )
+    assert first.policy_digest == second.policy_digest
