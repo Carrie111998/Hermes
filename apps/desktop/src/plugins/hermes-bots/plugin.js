@@ -7190,18 +7190,19 @@ async function renameGroupChat(oldName, newName, members) {
     return null
   }
 
+  // Active drives and recovery timers are keyed by the room name. Do not move
+  // that ownership out from under them; once the room and its durable queue
+  // are idle the same rename is safe and preserves the immutable roomId.
+  const currentRoom = $groupChats.get()[oldName]
+  if (currentRoom?.running || currentRoom?.interruptingQueue || currentRoom?.pending?.length) {
+    host.notify({ kind: 'error', message: 'Wait for the room and its queued messages to finish before renaming it.' })
+    return null
+  }
+
   // Move the room record wholesale — log, watermarks, sessions, members,
   // picture, and runtime flags all belong to the same room under its new name.
   const all = { ...$groupChats.get() }
   const room = all[oldName]
-
-  // Active drives and recovery timers are keyed by the room name. Do not move
-  // that ownership out from under them; once the room and its durable queue
-  // are idle the same rename is safe and preserves the immutable roomId.
-  if (room?.running || room?.interruptingQueue || room?.pending?.length) {
-    host.notify({ kind: 'error', message: 'Wait for the room and its queued messages to finish before renaming it.' })
-    return null
-  }
 
   if (room) {
     migrateGroupComposerDraft(groupComposerDraftKey(oldName, room), groupComposerDraftKey(next, room))
