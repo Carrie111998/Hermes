@@ -222,6 +222,51 @@ class TestMaybePersistToolResult:
         assert env.execute.call_args[1]["stdin_data"] == content
 
 
+    def test_direct_spillover_write_redacts_sensitive_bytes(self, tmp_path, monkeypatch):
+        """The low-level spill sink must not accept raw result bytes."""
+        import tools.tool_result_storage as storage
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        sentinel = "sk-r3-cand-001-nonreusable-1234567890"
+        path = storage._write_to_spillover(
+            f"ordinary {sentinel} "
+            f'{{"apiKey": "{sentinel}"}} '
+            f"https://example.test/callback?token={sentinel}",
+            "direct.txt",
+        )
+
+        assert path is not None
+        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "direct.txt").read_text()
+        assert sentinel not in stored
+        assert "redacted" in stored
+
+
+    def test_persisted_preview_and_sink_are_redacted(self, tmp_path, monkeypatch):
+        """The preview and every persistence representation omit raw secrets."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        sentinel = "sk-r3-cand-001-nonreusable-1234567890"
+        content = (
+            "x" * 40_000
+            + f" ordinary {sentinel} "
+            + f'{{"nested": {{"token": "{sentinel}"}}}} '
+            + f"https://example.test/callback?token={sentinel}"
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_redact",
+            env=None,
+            threshold=30_000,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert sentinel not in result
+        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "tc_redact.txt").read_text()
+        assert sentinel not in stored
+        assert "redacted" in stored
+
+
     def test_tool_use_id_cannot_escape_storage_dir(self):
         env = MagicMock()
         # Readability probe fails -> in-sandbox write is the reference path.
