@@ -297,7 +297,8 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref) so a stale ref can't fake an up-to-date report.
         ancestor = subprocess.run(
             ["git", "merge-base", "--is-ancestor", upstream_rev, "HEAD"],
-            capture_output=True, timeout=5, cwd=str(repo_dir),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, cwd=str(repo_dir),
         )
         if ancestor.returncode == 0:
             return 0
@@ -346,7 +347,8 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         fetch_args.append("--quiet")
         fetch_proc = subprocess.run(
             fetch_args,
-            capture_output=True, timeout=10,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10,
             cwd=str(repo_dir),
         )
         fetch_ok = fetch_proc.returncode == 0
