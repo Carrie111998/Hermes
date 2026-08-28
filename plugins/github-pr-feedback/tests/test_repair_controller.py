@@ -380,7 +380,10 @@ def test_repair_controller_routes_a_stale_pr_base_into_the_refresh_lane(
     assert "git fetch --quiet --no-tags --no-recurse-submodules" in (
         kanban.tasks[0].instructions
     )
-    assert "require `FETCH_HEAD` to equal" in kanban.tasks[0].instructions
+    assert f"git cat-file -e {'c' * 40}^{{commit}}" in kanban.tasks[0].instructions
+    assert "must not be compared to the immutable target base SHA" in (
+        kanban.tasks[0].instructions
+    )
     assert "-m hermes_cli.main github-pr-feedback complete-feedback" in (
         kanban.tasks[0].instructions
     )
