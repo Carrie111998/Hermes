@@ -47,6 +47,27 @@ def _is_hermes_entrypoint(token: str) -> bool:
     )
 
 
+# ``-p``/``--profile`` never reaches ``build_top_level_parser()``: it is
+# pre-parsed by hand in ``main._apply_profile_override`` before argparse runs.
+_EXTRA_VALUE_FLAGS = frozenset({"-p", "--profile"})
+
+
+def _top_level_value_flags() -> tuple[frozenset[str], frozenset[str]]:
+    """(required-value, optional-value) top-level flags, from the real parser.
+
+    Imported lazily so this module keeps its one-way, import-time-cheap
+    relationship with the CLI; the callee caches per process.  A broken import
+    degrades to the profile flag alone rather than taking the scan down.
+    """
+    try:
+        from hermes_cli._parser import top_level_value_flag_sets
+
+        required, optional = top_level_value_flag_sets()
+        return frozenset(required) | _EXTRA_VALUE_FLAGS, frozenset(optional)
+    except Exception:
+        return _EXTRA_VALUE_FLAGS, frozenset()
+
+
 def _cmdline_runs_subcommand(command: str, subcommands: tuple[str, ...]) -> bool:
     """True when *command* invokes hermes with one of *subcommands*.
 
@@ -63,6 +84,17 @@ def _cmdline_runs_subcommand(command: str, subcommands: tuple[str, ...]) -> bool
     before the first long option, while prose only ever reaches the cmdline as
     the value of one (``--query ...``), so cutting the token list at the first
     ``--`` separates the two without a regex.
+
+    Short flags take values too, and they live in exactly the region scanned
+    here — before any ``--``.  ``hermes -p dashboard chat`` (a profile named
+    "dashboard") would otherwise read its own ``-p`` value as the subcommand
+    and report a chat process as a server, so ``--stop`` would kill it.  Flag
+    values are skipped using the same parser-derived sets ``main.py`` uses for
+    its own argv scans, which is what keeps this from drifting off the argparse
+    surface — the drift behind #93530, where ``hermes --reasoning high chat``
+    misread ``high`` as the subcommand.  ``-p``/``--profile`` is added on top
+    because it is pre-parsed by hand in ``_apply_profile_override`` and so
+    never reaches the parser those sets are built from.
     """
     tokens = command.split()
     entry = next(
@@ -71,11 +103,25 @@ def _cmdline_runs_subcommand(command: str, subcommands: tuple[str, ...]) -> bool
     )
     if entry is None:
         return False
-    for tok in tokens[entry + 1 :]:
+    value_flags, optional_value_flags = _top_level_value_flags()
+    i = entry + 1
+    while i < len(tokens):
+        tok = tokens[i]
         if tok.startswith("--"):
             break
+        if tok in value_flags and i + 1 < len(tokens):
+            i += 2
+            continue
+        if (
+            tok in optional_value_flags
+            and i + 1 < len(tokens)
+            and not tokens[i + 1].startswith("-")
+        ):
+            i += 2
+            continue
         if tok in subcommands:
             return True
+        i += 1
     return False
 
 

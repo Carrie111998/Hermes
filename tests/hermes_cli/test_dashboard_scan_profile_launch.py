@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from hermes_cli import dashboard_procs
 from hermes_cli.dashboard_procs import (
     _SUBCOMMANDS,
     _cmdline_runs_subcommand,
@@ -74,6 +75,71 @@ class TestCmdlineRunsSubcommand:
     )
     def test_ignores_non_launches(self, command):
         assert _cmdline_runs_subcommand(command, _SUBCOMMANDS) is False
+
+
+class TestValueFlagsAreNotSubcommands:
+    """A short flag's value must not be read as the subcommand.
+
+    Short flags take values and sit in exactly the region this scan walks —
+    before any ``--``. A profile, toolset or skill named "dashboard" would
+    otherwise make an ordinary chat process look like a running server, and
+    ``--stop`` would kill it.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Profile named after a subcommand (-p is pre-parsed by hand).
+            "/usr/local/bin/hermes -p dashboard chat",
+            "/usr/local/bin/hermes -p serve chat",
+            # Parser-derived flags: -t/--toolsets, -s/--skills, -m/--model.
+            "/usr/local/bin/hermes -t dashboard chat",
+            "/usr/local/bin/hermes -s serve chat",
+            "/usr/local/bin/hermes -m dashboard chat",
+            "/opt/hermes/venv/bin/python3 -m hermes_cli.main -p dashboard chat",
+        ],
+    )
+    def test_flag_value_is_not_a_launch(self, command):
+        assert _cmdline_runs_subcommand(command, _SUBCOMMANDS) is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The same flags must not hide a launch that follows them.
+            "/usr/local/bin/hermes -m gpt-4 dashboard",
+            "/usr/local/bin/hermes -p carmelo -t coding dashboard --port 9119",
+        ],
+    )
+    def test_launch_after_a_flag_value_still_matches(self, command):
+        assert _cmdline_runs_subcommand(command, _SUBCOMMANDS) is True
+
+    def test_optional_value_flag_consumes_a_bare_word(self):
+        """``-c``/``--continue`` takes an optional value, so ``hermes -c serve``
+        resumes a session named "serve" rather than starting a server — the
+        same reading ``main._apply_profile_override`` gives it."""
+        assert _cmdline_runs_subcommand(
+            "/usr/local/bin/hermes -c serve", _SUBCOMMANDS
+        ) is False
+
+    def test_falls_back_to_the_profile_flag_when_the_parser_is_unavailable(self, monkeypatch):
+        """A broken parser import must not take the whole scan down."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def boom(name, *args, **kwargs):
+            if name == "hermes_cli._parser":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", boom)
+        assert dashboard_procs._top_level_value_flags() == (
+            frozenset({"-p", "--profile"}),
+            frozenset(),
+        )
+        assert _cmdline_runs_subcommand(
+            "/usr/local/bin/hermes -p dashboard chat", _SUBCOMMANDS
+        ) is False
 
 
 class TestParseDashboardRuntime:
