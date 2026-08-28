@@ -426,3 +426,36 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     assert result["response_previewed"] is False
 
 
+
+
+def test_classify_persistence_error_transient_null_systemerror_is_locked():
+    """The CPython sqlite3 'returned NULL without setting an exception'
+    SystemError is a transient driver glitch on a HEALTHY database (#94258):
+    integrity_check clean, BEGIN IMMEDIATE + ROLLBACK succeed, disk has
+    space. It must land in the 'locked' (transient, retry-later) bucket so
+    the turn explanation says "storage was busy, send it again" instead of
+    the generic unknown-caused advice."""
+    import sqlite3
+
+    from hermes_state import classify_persistence_error
+
+    assert (
+        classify_persistence_error(
+            SystemError(
+                "<hermes_cli.sqlite_safe_read.TrackedConnection object at "
+                "0x7f3a1c2b3d40> returned NULL without setting an exception"
+            )
+        )
+        == "locked"
+    )
+    assert (
+        classify_persistence_error(
+            sqlite3.OperationalError(
+                "statement returned NULL without setting an exception"
+            )
+        )
+        == "locked"
+    )
+    # The phrase must not swallow unrelated errors.
+    assert classify_persistence_error("database is locked") == "locked"
+    assert classify_persistence_error("something else entirely") == "unknown"
