@@ -623,4 +623,3 @@ try:
     import msvcrt
 except Exception:
     msvcrt = None
-
