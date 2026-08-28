@@ -56,9 +56,11 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   `on_processing_complete` resolves failures/cancellations promptly.
 - **Task store:** every task (including terminal ones, bounded to the last
   500) stays queryable via `tasks/get` / `tasks/list`, and `tasks/subscribe`
-  reattaches to a running task's stream via store watchers. A watchdog fails
-  orphaned tasks after 5 minutes (idempotent transitions — no double
-  counting in metrics).
+  reattaches to a running task's stream via store watchers. Observation
+  timeout is **not** terminal (A2A §3.1.3): `_await_reply` keeps waiting for
+  the live session instead of writing `TASK_STATE_FAILED` / `[agent did not
+  reply in time]`. A watchdog may fail **orphaned** tasks after 5 minutes,
+  but skips ids that still have a live pending waiter.
 - **input-required:** the platform hint tells the agent to start a reply with
   `[INPUT_REQUIRED]` when it needs clarification; the adapter maps that to
   `TASK_STATE_INPUT_REQUIRED` with the question in `status.message`.
