@@ -61,7 +61,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from hermes_constants import secure_parent_dir
-from tools.mcp_oauth_storage import OAuthStorageLifecycleMixin
+from tools.mcp_oauth_storage import (
+    OAuthStorageLifecycleMixin,
+    _safe_file,
+    _safe_token_dir,
+    _validate_components,
+    _write_exclusive,
+    _read_file,
+    lifecycle_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -402,12 +410,13 @@ def _can_open_browser() -> bool:
 
 
 def _read_json(path: Path) -> dict | None:
-    """Read a JSON file, returning None if it doesn't exist or is invalid."""
-    if not path.exists():
-        return None
+    """Read a JSON file without following symlink/reparse-point paths."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        raw = _read_file(path)
+        if raw is None:
+            return None
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to read %s: %s", path, exc)
         return None
 
@@ -422,7 +431,9 @@ def _write_json(path: Path, data: dict) -> None:
     tokens to other local users between create and chmod. Mirrors the fix
     in ``agent/google_oauth.py`` (#19673).
     """
+    _validate_components(path, include_leaf=False)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_components(path, include_leaf=False)
     # Tighten parent dir to 0o700 so siblings can't traverse to the creds.
     # No-op on Windows (POSIX mode bits aren't enforced); ignore failures.
     # secure_parent_dir refuses to chmod /, top-level dirs, or the
@@ -542,7 +553,8 @@ class HermesTokenStorage(OAuthStorageLifecycleMixin):
                 # Mock tokens or unusual shapes: skip the expires_at write
                 # rather than fail persistence.
                 pass
-        _write_json(self._tokens_path(), payload)
+        with lifecycle_lock(self):
+            _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
     # -- client info -------------------------------------------------------
@@ -564,7 +576,11 @@ class HermesTokenStorage(OAuthStorageLifecycleMixin):
             if getattr(info, "client_secret", None) and data.get("token_endpoint_auth_method") in (None, "none", ""):
                 data["token_endpoint_auth_method"] = "client_secret_post"
                 info = OAuthClientInformationFull.model_validate(data)
-                _write_json(self._client_info_path(), info.model_dump(mode="json", exclude_none=True))
+                with lifecycle_lock(self):
+                    _write_json(
+                        self._client_info_path(),
+                        info.model_dump(mode="json", exclude_none=True),
+                    )
             return info
         except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Corrupt client info at %s -- ignoring: %s", self._client_info_path(), exc)
@@ -579,7 +595,8 @@ class HermesTokenStorage(OAuthStorageLifecycleMixin):
         # so this flow and subsequent retries use client_secret_post.
         if data.get("client_secret") and data.get("token_endpoint_auth_method") in (None, "none", ""):
             data["token_endpoint_auth_method"] = "client_secret_post"
-        _write_json(self._client_info_path(), data)
+        with lifecycle_lock(self):
+            _write_json(self._client_info_path(), data)
         logger.debug("OAuth client info saved for %s", self._server_name)
 
     # -- oauth server metadata --------------------------------------------
@@ -591,7 +608,8 @@ class HermesTokenStorage(OAuthStorageLifecycleMixin):
     # forces a full browser re-authorization.
 
     def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
-        _write_json(self._meta_path(), metadata.model_dump(exclude_none=True, mode="json"))
+        with lifecycle_lock(self):
+            _write_json(self._meta_path(), metadata.model_dump(exclude_none=True, mode="json"))
         logger.debug("OAuth metadata saved for %s", self._server_name)
 
     def load_oauth_metadata(self) -> "OAuthMetadata | None":
@@ -619,8 +637,13 @@ class HermesTokenStorage(OAuthStorageLifecycleMixin):
         """
         path = self._cimd_rejected_path()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch()
+            with lifecycle_lock(self):
+                _safe_token_dir(self, create=True)
+                if not _safe_file(path):
+                    try:
+                        _write_exclusive(path, b"")
+                    except FileExistsError:
+                        _safe_file(path)
         except OSError as exc:  # non-fatal — worst case we retry CIMD later
             logger.debug("Could not record CIMD rejection at %s: %s", path, exc)
 
@@ -1646,7 +1669,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         return OAuthClientMetadata.model_validate(metadata_kwargs)
 
 
-def _invalidate_tokens_on_client_change(
+def _invalidate_tokens_on_client_change_unlocked(
     storage: "HermesTokenStorage",
     new_client_id: str,
     new_client_secret: str | None,
@@ -1701,6 +1724,18 @@ def _invalidate_tokens_on_client_change(
         )
 
 
+def _invalidate_tokens_on_client_change(
+    storage: "HermesTokenStorage",
+    new_client_id: str,
+    new_client_secret: str | None,
+) -> None:
+    """Serialize configured-client invalidation with all OAuth persistence."""
+    with lifecycle_lock(storage):
+        _invalidate_tokens_on_client_change_unlocked(
+            storage, new_client_id, new_client_secret
+        )
+
+
 def _maybe_preregister_client(
     storage: "HermesTokenStorage",
     cfg: dict,
@@ -1733,7 +1768,11 @@ def _maybe_preregister_client(
         info_dict["scope"] = cfg["scope"]
 
     client_info = OAuthClientInformationFull.model_validate(info_dict)
-    _write_json(storage._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
+    with lifecycle_lock(storage):
+        _write_json(
+            storage._client_info_path(),
+            client_info.model_dump(mode="json", exclude_none=True),
+        )
     logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
 
 
