@@ -215,3 +215,24 @@ def test_a_parked_task_is_not_dispatchable(board):
         assert kb.claim_task(conn, tid) is None, "a gated task cannot be claimed"
     finally:
         conn.close()
+
+
+def test_the_block_discloses_that_nothing_shipped_parks_a_task():
+    """The gate is a kernel; guidance that implies a running workflow misleads.
+
+    An orchestrator told a task "can be parked" and given no parking tool will
+    look for the thing that parks it — the same failure mode as an approval
+    surface it is told exists. `tests/agent/test_pm_surface_contract.py` proves
+    the surface side of this claim behaviourally.
+    """
+    assert "no shipped surface parks" in PM_PLAN_GATE_GUIDANCE
+    assert (
+        "no tool, CLI command, or profile puts a task at a plan gate today"
+        in PM_PLAN_GATE_GUIDANCE
+    )
+
+
+def test_the_block_does_not_offer_the_orchestrator_a_gate_it_cannot_reach():
+    """It may describe the gate; it may not imply the reader can work it."""
+    for overclaim in ("you can park", "park the task", "release the gate"):
+        assert overclaim not in PM_PLAN_GATE_GUIDANCE.lower(), overclaim

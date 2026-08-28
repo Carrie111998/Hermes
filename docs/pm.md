@@ -1,13 +1,20 @@
 # Project management: plans, gates, and what approval actually guarantees
 
-Hermes' PM workflow puts a human plan gate in the middle of an otherwise
-autonomous board. This page is about what that gate is — and, more importantly,
-what it is not.
+Hermes has a plan-gate **kernel**: a representation for holding a task at a
+human plan gate, the release path that would cross it, the refusals around it,
+and the audit trail under it. It does not have a PM workflow you can run.
+**No shipped CLI command or tool parks a task at a plan gate, and none releases
+one.** This page is about what that gate is — and, more importantly, what it is
+not.
 
-Every factual claim below is checked against the code by
-`tests/hermes_cli/test_assurance_statement.py` and
-`tests/agent/test_pm_plan_gate_guidance.py`. Where a thing is not built, this
-page says so rather than describing the plan for it.
+The load-bearing architecture claims below are checked against the code by
+`tests/hermes_cli/test_assurance_statement.py`,
+`tests/agent/test_pm_plan_gate_guidance.py`, and
+`tests/agent/test_pm_surface_contract.py`: the assurance statement's wording
+and the locations that carry it, the gate's representation, the absence of an
+approval surface, and the absence of a shipped surface that parks. The prose
+around those claims is not individually pinned by a test. Where a thing is not
+built, this page says so rather than describing the plan for it.
 
 ## The assurance statement
 
@@ -37,7 +44,12 @@ page says so rather than describing the plan for it.
 
 This text is canonical. `approval_broker.ASSURANCE_STATEMENT` is the source,
 and `approval_broker.ASSURANCE_LOCATIONS` lists where it is reproduced and
-which acceptance locations are still deferred.
+which acceptance locations are still deferred. The word-for-word equivalence
+check in `tests/hermes_cli/test_assurance_statement.py` is written by hand
+against the four implemented locations — one test per file, not generated from
+a structured path manifest — so a fifth location added to the manifest needs
+its own extraction written there too. The manifest test catches the mismatch;
+it cannot write the extraction for you.
 
 ## How a plan gate is represented
 
@@ -58,6 +70,25 @@ task and is untouched by any of this.
 `VALID_GATE_STATES` declares `{"plan", "deploy"}`, but **only `plan` has a
 writer**. There is no deploy gate: nothing parks a task at one, and nothing
 releases one. The constant reserves the name.
+
+## Nothing shipped puts a task at a plan gate
+
+`park_for_plan_approval()` in `hermes_cli/kanban_db.py` is the only writer of
+`gate_state = 'plan'`, and it has **no production caller**. Outside that module
+every non-test reference to it is a prose comment. The `hermes project` command
+has no park verb, and `plan_submit` records a plan revision without binding a
+task to anything.
+
+So the plan gate is a kernel, not a workflow. Everything in the two sections
+below describes what happens *once a task is gated* — which today only
+same-user code calling the kernel directly can arrange. The tests that drive a
+real gate transition, including the prompt byte-stability tests in
+`tests/agent/test_pm_plan_gate_guidance.py`, park that way deliberately: they
+are evidence about the kernel's behaviour, and they are not evidence that a
+sanctioned path to reach it exists.
+
+Building that path — a parking verb or tool — is not a documentation change.
+It needs its own design and its own review, and it is not in this slice.
 
 ## What being gated does
 
@@ -113,10 +144,17 @@ Drafting is not approving. Neither tool changes a task status, clears
 previous revision, which is why re-submitting to force a decision only creates
 more for a human to read.
 
+Authoring is the whole of the orchestrator's reach. It cannot park a task at a
+gate and it cannot release one, because no tool on its surface does either.
+
 Orchestrator profiles also receive `PM_PLAN_GATE_GUIDANCE` in their system
-prompt, saying the same things this page says. Ordinary kanban workers do not:
-they are never spawned on a parked task, so they never meet a gate, and their
-prompt is unchanged.
+prompt, saying the same things this page says. Its wording is held to the
+`plan_submit` schema and to the string that tool returns on success, because
+those reach the same model in the same context: three surfaces that disagreed
+about whether an approval path exists would be resolved by a capable model
+going to look for it. Ordinary kanban workers receive none of it: they are
+never spawned on a gated task, so they never meet a gate, and their prompt is
+unchanged.
 
 ## Phases
 

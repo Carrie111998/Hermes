@@ -10,14 +10,25 @@ match against ``approval_broker.ASSURANCE_STATEMENT``.
 Four of the specification's six acceptance locations exist. The other two are
 surfaces that have not been built — there is no desktop approval dialog and no
 ``hermes project doctor``. ``approval_broker.ASSURANCE_LOCATIONS`` is the
-manifest of both sets, and the tests below drive off it rather than a list
-repeated here. An absence test is a reminder, not a delivered location, and is
-labelled as such.
+manifest of both sets, and ``test_the_manifest_matches_what_is_actually_carried``
+drives off it. The equivalence checks themselves do not: there is one
+hand-written extraction per implemented file, tied to those four paths, not
+generated from a structured path manifest. Four locations do not justify the
+generator; a fifth needs its own extraction added here, and the manifest test
+is what makes that omission visible.
 
+TWO REMINDERS, NOT TWO GUARANTEES
+---------------------------------
 The deferred surfaces are pinned by what is actually true — no approval adapter
 resolves, and the ``project`` parser has no ``doctor`` verb — rather than by
 grepping the desktop tree, where passive gate wording would look the same as an
 approval dialog.
+
+That is a present-state check and its limits are worth stating. The adapter
+assertion fails the day an approval adapter resolves; it would NOT fail for a
+desktop approval dialog that ships disabled, display-only, or wired to a
+different seam. Whoever builds that UI owes the statement whether or not this
+file turns red.
 """
 
 import re
@@ -141,11 +152,17 @@ def test_the_module_does_not_claim_more_locations_than_it_has():
 
 # --- the two deferred locations, pinned by what is true --------------------
 
-def test_no_approval_surface_ships_so_there_is_no_desktop_dialog():
-    """The desktop dialog's absence is a fact about adapters, not about text.
+def test_no_approval_adapter_resolves_today():
+    """A present-state reminder that the desktop dialog is still deferred.
 
     A grep for gate wording under `apps/desktop` would also match the passive
-    gate display, which is not an approval surface. This is the real check.
+    gate display, which is not an approval surface, so this asserts the thing
+    that would actually have to change: an adapter resolving.
+
+    Its limit, stated rather than implied: a desktop approval dialog shipped
+    disabled, display-only, or wired to a different seam would leave this test
+    green. It is a reminder that the location is owed, not a tripwire that
+    fires on every possible UI.
     """
     from hermes_cli import approval_broker as ab
 

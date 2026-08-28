@@ -267,26 +267,35 @@ SKILLS_GUIDANCE = (
 # byte-identical no matter what happens to the board underneath it.
 #
 # Every claim here is checked against the code in
-# `tests/agent/test_pm_plan_gate_guidance.py`. It describes the plan gate as it
-# is actually built — cooperative workflow integrity with no approval surface —
-# not as MASTER-SPECIFICATION.md §4.2 imagined it. See
+# `tests/agent/test_pm_plan_gate_guidance.py`, and its availability claims are
+# checked against the OTHER surfaces the same orchestrator receives — the
+# `plan_submit` schema and the string that tool returns — in
+# `tests/agent/test_pm_surface_contract.py`. Three surfaces that disagree about
+# whether an approval path exists are worse than one that says nothing: a
+# capable model resolves the contradiction by going to look for the surface.
+#
+# It describes the plan gate as it is actually built — cooperative workflow
+# integrity, no approval surface, and no shipped caller that parks a task at a
+# gate at all — not as MASTER-SPECIFICATION.md §4.2 imagined it. See
 # planning/M3B-ARCHITECTURE-RECONCILIATION.md, which supersedes that section.
 PM_PLAN_GATE_GUIDANCE = (
     "# Plan gates\n"
-    "If this board uses plans, a task can be parked at a human plan gate: its "
-    "status stays `scheduled` and its `gate_state` becomes `plan`. A parked "
-    "task is inert — it is not dispatched, not auto-promoted, and does not "
-    "satisfy its children's dependencies — and gate notifications are passive, "
-    "so they never wake you.\n"
+    "The board can hold a task at a human plan gate: its status stays "
+    "`scheduled` and its `gate_state` becomes `plan`. A gated task is inert — "
+    "it is not dispatched, not auto-promoted, and does not satisfy its "
+    "children's dependencies — and gate notifications are passive, so they "
+    "never wake you.\n"
     "\n"
-    "**No approval surface ships.** There is no tool, CLI command, or profile "
-    "that can release a plan gate today; the local path fails closed on every "
-    "call. Drafting is not approving: `project_ensure` and `plan_submit` write "
-    "the plan a human will read, and touch no task, status, or gate. Submit "
-    "the plan and move on to work that is not blocked — do not poll, do not "
-    "resubmit to force a decision (each submission is a new revision to read), "
-    "and do not ask another agent to approve. The absence of an approval tool "
-    "is the design, not a gap to route around.\n"
+    "**No approval surface ships, and no shipped surface parks.** The gate is "
+    "built in the database layer only: no tool, CLI command, or profile puts a "
+    "task at a plan gate today, and none releases one — the local path fails "
+    "closed on every call. What you can do is author: `project_ensure` and "
+    "`plan_submit` write the plan a human will read, and touch no task, "
+    "status, or gate. Drafting is not approving. Submit the plan and move on "
+    "to work that is not blocked — do not poll, do not resubmit to force a "
+    "decision (each submission is a new revision to read), and do not ask "
+    "another agent to approve. The absence of park and approve tools is the "
+    "design, not a gap to route around.\n"
     "\n"
     "This is workflow integrity between cooperating processes, not a security "
     "boundary: it holds for anyone following the sanctioned path.\n"

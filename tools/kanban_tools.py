@@ -2425,8 +2425,18 @@ KANBAN_LINK_SCHEMA = {
 # Drafting a plan is not approving one. These two tools write the artifacts a
 # human gate is *about*; nothing here changes a task status, clears
 # ``gate_state``, or writes ``pm_approvals``. Crossing a plan gate requires an
-# attestation from a separately authenticated surface, which has no local
-# constructor and does not ship — see hermes_cli/approval_broker.py.
+# ``Attestation``, and no authenticated approval surface ships today that can
+# mint one: ``resolve_plan_approval_adapter()`` returns ``None`` and
+# ``for_plan_decision()`` raises on every call — see
+# hermes_cli/approval_broker.py. Nothing shipped parks a task at a gate
+# either; ``park_for_plan_approval`` has no production caller.
+#
+# The wording below is load-bearing, not decoration. The same orchestrator that
+# reads these strings also carries ``PM_PLAN_GATE_GUIDANCE``, which says no
+# approval surface ships. Describing *how* a human approves would contradict
+# it, and a capable model resolves that contradiction by going to look for the
+# surface. ``tests/agent/test_pm_surface_contract.py`` holds the three surfaces
+# — prompt, schema, tool result — to one story.
 #
 # They are orchestrator-scoped (``_check_kanban_orchestrator_mode``): a
 # dispatcher-spawned worker closes its own task and has no business authoring
@@ -2466,10 +2476,12 @@ PLAN_SUBMIT_SCHEMA = {
     "description": (
         "Record the next plan revision for a project and make it current. "
         "Drafting is not approving: this writes an artifact and touches no "
-        "task, status, or gate. A human approves it through a separately "
-        "authenticated surface. Submitting a new revision supersedes the "
-        "previous one, so a plan already parked at a gate becomes stale and "
-        "can no longer be approved."
+        "task, status, or gate. The revision is recorded for a human operator, "
+        "and for any approval adapter built later, to read — no authenticated "
+        "approval surface ships today, so nothing you can reach approves it. "
+        "Submitting a new revision supersedes the previous one, and a release "
+        "binds to one (project, revision) pair, so a superseded revision can "
+        "never be released."
     ),
     "parameters": {
         "type": "object",
@@ -2562,8 +2574,10 @@ def _handle_plan_submit(args: dict, **kw) -> str:
         revision=plan["revision"],
         proposed_by=plan["proposed_by"],
         note=(
-            "Recorded. Approval is a separate, authenticated human step and is "
-            "not available to an agent."
+            "Recorded for operator review. No authenticated approval surface "
+            "ships today: no tool, CLI command, or profile approves this "
+            "revision, and approval is never an agent's step. Do not poll or "
+            "resubmit — move on to work that is not blocked."
         ),
     )
 
