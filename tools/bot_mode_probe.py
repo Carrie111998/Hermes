@@ -274,7 +274,10 @@ def _build_section(home: Path) -> str:
         "explicitly asked.\n"
         f'When YOU receive a "Message from 🤖 <name> (@<handle>):" message, a '
         "teammate agent is talking to you (not the user): address them, reply "
-        "concisely via message_agent to their handle, and if it is a pure FYI "
+        "concisely via message_agent to their handle. That message_agent call "
+        "IS your reply — do NOT add a further remark addressed to the user "
+        "after it in the same turn (no \"I'll relay it to you\" / \"all good\" "
+        "wrap-up); end the turn on the tool call. If it is a pure FYI "
         "with nothing to add, staying silent is fine — never ping-pong "
         "acknowledgements.\n"
         f"You are `@{handle}`. Your teammates (live roster; roles from their "
