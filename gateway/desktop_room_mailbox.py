@@ -105,6 +105,63 @@ def _authority_hash(value: Any) -> str:
     return authority_hash
 
 
+def authorize_attachment_read(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    command_id: Any,
+    consumer_id: Any,
+    lease_token: Any,
+    authority_token: Any,
+    clock: Any = time.time,
+) -> None:
+    """Require the live command lease and room authority before byte access."""
+
+    room_id = _room_identifier(room_id)
+    command_id = _identifier(command_id, label="command_id")
+    consumer_id = _identifier(consumer_id, label="consumer_id")
+    lease_token = _identifier(lease_token, label="lease_token")
+    authority_token = _identifier(authority_token, label="authority_token")
+    authority_hash = hashlib.sha256(authority_token.encode("utf-8")).hexdigest()
+    now = float(clock())
+    with _transaction(db_path) as conn:
+        authorized = conn.execute(
+            """SELECT 1
+                 FROM desktop_room_commands AS command
+                 JOIN desktop_room_authorities AS authority
+                   ON authority.room_id = command.room_id
+                 JOIN desktop_room_owners AS owner
+                   ON owner.room_id = command.room_id
+                WHERE command.command_id = ?
+                  AND command.room_id = ?
+                  AND command.action = 'send'
+                  AND command.state = 'claimed'
+                  AND command.lease_owner = ?
+                  AND command.lease_token = ?
+                  AND command.lease_expires_at > ?
+                  AND authority.consumer_id = ?
+                  AND authority.authority_hash = ?
+                  AND owner.consumer_id = ?
+                  AND owner.expires_at > ?
+                LIMIT 1""",
+            (
+                command_id,
+                room_id,
+                consumer_id,
+                lease_token,
+                now,
+                consumer_id,
+                authority_hash,
+                consumer_id,
+                now,
+            ),
+        ).fetchone()
+    if authorized is None:
+        raise DesktopRoomMailboxError(
+            "attachment read is not authorized by the live Desktop command lease"
+        )
+
+
 def _room_commitments(value: Any) -> list[tuple[str, str]]:
     if not isinstance(value, (list, tuple)):
         raise DesktopRoomMailboxError("room commitments must be a list")
