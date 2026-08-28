@@ -3059,24 +3059,221 @@ def _pin_kanban_board_env() -> None:
         pass
 
 
-def _sync_bundled_skills_quietly() -> None:
+_STARTUP_SKILLS_STAMP_SCHEMA = b"hermes-startup-skills-v1\0"
+
+
+def _hash_startup_skills_path(digest, path: Path, *, label: str) -> None:
+    """Add one bounded path tree to the startup fingerprint."""
+    digest.update(label.encode("utf-8", errors="surrogatepass"))
+    digest.update(b"\0")
+    try:
+        if path.is_symlink():
+            digest.update(b"link\0")
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogatepass"))
+            return
+        if path.is_file():
+            digest.update(b"file\0")
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            return
+        if path.is_dir():
+            digest.update(b"dir\0")
+            for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+                relative = child.relative_to(path).as_posix()
+                _hash_startup_skills_path(digest, child, label=f"{label}/{relative}")
+            return
+    except OSError:
+        digest.update(b"unreadable")
+        return
+    digest.update(b"missing")
+
+
+def _startup_skills_fingerprint() -> str | None:
+    """Fingerprint every input that can change automatic bundled-skill sync.
+
+    The normal sync hashes every bundled skill and can recursively inspect the
+    installed skill tree to recover upstream moves. On an unchanged checkout,
+    a revision plus bounded dirty-path fingerprint proves that work redundant.
+    External skill trees remain on the full sync path because they can mutate
+    independently of this checkout and profile.
+    """
+    if os.environ.get("HERMES_FORCE_BUNDLED_SKILLS_SYNC") == "1":
+        return None
+    if os.environ.get("HERMES_BUNDLED_SKILLS"):
+        return None
+
+    try:
+        from hashlib import sha256
+
+        from hermes_cli._subprocess_compat import windows_hide_flags
+        from hermes_cli.config import read_raw_config
+
+        raw_config = read_raw_config() or {}
+        skills_config = raw_config.get("skills", {})
+        if isinstance(skills_config, dict) and skills_config.get("external_dirs"):
+            return None
+
+        revision = _read_git_revision_fingerprint(PROJECT_ROOT)
+        if not revision:
+            return None
+
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(PROJECT_ROOT),
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                "skills",
+                "optional-skills",
+            ],
+            capture_output=True,
+            timeout=5,
+            check=False,
+            creationflags=windows_hide_flags(),
+        )
+        if status.returncode != 0:
+            return None
+
+        digest = sha256()
+        digest.update(_STARTUP_SKILLS_STAMP_SCHEMA)
+        digest.update(revision.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0status\0")
+        digest.update(status.stdout)
+
+        root = PROJECT_ROOT.resolve()
+        for record in status.stdout.split(b"\0"):
+            # Porcelain -z records start with "XY ". A rename's second record
+            # is its old path and has no status prefix; the raw status bytes
+            # above already include it while the destination record supplies
+            # the content that will actually be synchronized.
+            if len(record) < 4 or record[2:3] != b" ":
+                continue
+            relative = Path(os.fsdecode(record[3:]))
+            candidate = (PROJECT_ROOT / relative).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                return None
+            _hash_startup_skills_path(
+                digest,
+                candidate,
+                label=f"source:{relative.as_posix()}",
+            )
+
+        hermes_home = get_hermes_home()
+        profile_inputs = (
+            hermes_home / "config.yaml",
+            hermes_home / ".no-bundled-skills",
+            hermes_home / "skills" / ".bundled_manifest",
+            hermes_home / "skills" / ".curator_suppressed",
+            hermes_home / "skills" / ".hub" / "lock.json",
+        )
+        for path in profile_inputs:
+            _hash_startup_skills_path(
+                digest,
+                path,
+                label=f"profile:{path.relative_to(hermes_home).as_posix()}",
+            )
+        return digest.hexdigest()
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        return None
+
+
+def _startup_skills_stamp_path() -> Path:
+    return get_hermes_home() / "skills" / ".startup_sync_stamp"
+
+
+def _write_startup_skills_stamp(fingerprint: str) -> None:
+    stamp = _startup_skills_stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    temporary = stamp.with_name(
+        f".{stamp.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.write_text(fingerprint + "\n", encoding="utf-8")
+        os.replace(temporary, stamp)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _bundled_skills_startup_cache_hit(fingerprint: str | None) -> bool:
+    """Return whether the last successful startup sync covers these inputs."""
+    if not fingerprint:
+        return False
+    try:
+        return _startup_skills_stamp_path().read_text(encoding="utf-8").strip() == fingerprint
+    except OSError:
+        return False
+
+
+def _sync_bundled_skills_quietly(*, cache_checked: bool = False) -> None:
     """Seed ``~/.hermes/skills/`` with the bundled skill library on first launch.
 
     Called from any CLI entrypoint that the user might use as their first
     interaction with Hermes — chat, dashboard (the desktop GUI's backend),
-    and gateway. The skills_sync module is manifest-based and idempotent:
-    skipped skills cost ~milliseconds, so calling this repeatedly is fine.
+    and gateway. A startup fingerprint avoids repeating the recursive
+    reconciliation when every relevant input matches the previous run.
 
     Failures are swallowed because skills are an enhancement, not a hard
     dependency. Hermes still functions without them; the user just sees an
     empty skills library.
     """
+    if not cache_checked:
+        fingerprint = _startup_skills_fingerprint()
+        if _bundled_skills_startup_cache_hit(fingerprint):
+            logger.info("Bundled skill startup sync cache hit")
+            return
+
     try:
         from tools.skills_sync import sync_skills
 
         sync_skills(quiet=True)
+        completed_fingerprint = _startup_skills_fingerprint()
+        if completed_fingerprint:
+            _write_startup_skills_stamp(completed_fingerprint)
     except Exception:
-        pass
+        logger.debug("Bundled skill startup sync failed", exc_info=True)
+
+
+def _start_bundled_skills_sync_background() -> threading.Thread | None:
+    """Run an uncached bundled-skill sync alongside independent startup work."""
+    fingerprint = _startup_skills_fingerprint()
+    if _bundled_skills_startup_cache_hit(fingerprint):
+        logger.info("Bundled skill startup sync cache hit")
+        return None
+
+    thread = threading.Thread(
+        target=lambda: _sync_bundled_skills_quietly(cache_checked=True),
+        name="dashboard-skills-sync",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _start_gateway_module_warmup_background() -> threading.Thread:
+    """Pre-import first-request modules while other server setup proceeds."""
+
+    def _warm() -> None:
+        from hermes_cli.server_startup import warm_gateway_modules
+
+        warm_gateway_modules()
+
+    thread = threading.Thread(
+        target=_warm,
+        name="dashboard-gateway-warmup",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _resolve_use_tui(args) -> bool:
@@ -12113,6 +12310,11 @@ def cmd_dashboard(args):
     except Exception:
         pass
 
+    # Start independent initialization early, then join at the same visibility
+    # boundary used by the former serial path before importing web_server.
+    _skills_sync_thread = _start_bundled_skills_sync_background()
+    _gateway_warmup_thread = _start_gateway_module_warmup_background()
+
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
@@ -12126,12 +12328,6 @@ def cmd_dashboard(args):
         )
         print(f"Import error: {e}")
         sys.exit(1)
-
-    # Seed bundled skills on first dashboard launch so the desktop GUI's
-    # skills picker / agent skill discovery sees the bundled library.
-    # cmd_chat does this in its own pre-dispatch block; the dashboard
-    # backend is the desktop's primary entrypoint and needs the same.
-    _sync_bundled_skills_quietly()
 
     # Bridge terminal.* config into the TERMINAL_* env vars for THIS process,
     # mirroring the CLI (cli.py env_mappings) and gateway (gateway/run.py
@@ -12240,6 +12436,10 @@ def cmd_dashboard(args):
             "Background MCP tool discovery failed at dashboard startup",
             exc_info=True,
         )
+
+    if _skills_sync_thread is not None:
+        _skills_sync_thread.join()
+    _gateway_warmup_thread.join()
 
     from hermes_cli.web_server import start_server
 
