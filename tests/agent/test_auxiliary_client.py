@@ -2163,6 +2163,207 @@ class TestTransientTransportRetry:
         assert mock_chain.call_args.kwargs["failure_scope"].value == "model"
         assert mock_chain.call_args.kwargs["failed_model"] == "some-model"
 
+    def test_httpx_connect_error_reaches_endpoint_fallback(self, monkeypatch):
+        """HTTPX's real ConnectError must enter endpoint-scoped fallback."""
+        import httpx
+        from agent.backend_identity import FailureScope
+
+        primary = MagicMock()
+        primary.base_url = "https://unreachable.example/v1"
+        primary.chat.completions.create.side_effect = httpx.ConnectError(
+            "All connection attempts failed"
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://healthy.example/v1"
+        fallback.chat.completions.create.return_value = {"fallback": True}
+        monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 0)
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+            ) as mock_chain,
+        ):
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert result == {"fallback": True}
+        assert mock_chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+        assert mock_chain.call_args.kwargs["failed_model"] is None
+
+    def test_exhausted_5xx_reaches_fallback(self, monkeypatch):
+        """A bounded 5xx retry must transition to provider fallback."""
+        class _ServerError(Exception):
+            status_code = 500
+
+        primary = MagicMock()
+        primary.base_url = "https://busy.example/v1"
+        primary.chat.completions.create.side_effect = _ServerError("internal server error")
+        fallback = MagicMock()
+        fallback.base_url = "https://healthy.example/v1"
+        fallback.chat.completions.create.return_value = {"fallback": True}
+        monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 1)
+        monkeypatch.setattr("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0)
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+            ) as mock_chain,
+        ):
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.call_count == 2
+        assert mock_chain.called
+
+
+class TestAsyncTransportFallbackResiduals:
+    @pytest.mark.asyncio
+    async def test_async_httpx_connect_error_reaches_endpoint_fallback(self, monkeypatch):
+        import httpx
+        from agent.backend_identity import FailureScope
+
+        primary = MagicMock()
+        primary.base_url = "https://unreachable.example/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://healthy.example/v1"
+        fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+        monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 0)
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openrouter", "some-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "some-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda response, _task, **_kw: response,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+            ) as mock_chain,
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback, "fallback-model"),
+            ),
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert result == {"fallback": True}
+        assert mock_chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+
+    @pytest.mark.asyncio
+    async def test_async_exhausted_408_reaches_fallback(self, monkeypatch):
+        class _RequestTimeout(Exception):
+            status_code = 408
+
+        primary = MagicMock()
+        primary.base_url = "https://busy.example/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=_RequestTimeout("request timeout")
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://healthy.example/v1"
+        fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+        monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 1)
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openrouter", "some-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "some-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda response, _task, **_kw: response,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+            ) as mock_chain,
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback, "fallback-model"),
+            ),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.call_count == 2
+        assert mock_chain.called
+
+
+class TestTopLevelFallbackIdentity:
+    def test_indexed_label_exclusion_and_entry_identity(self, monkeypatch):
+        from agent.auxiliary_client import _try_main_fallback_chain
+        from agent.backend_identity import FailureScope
+
+        entries = [
+            {
+                "provider": "custom",
+                "model": "model-a",
+                "base_url": "https://tenant-a.example/v1",
+                "api_key": "entry-key-a",
+            },
+            {
+                "provider": "custom",
+                "model": "model-b",
+                "base_url": "https://tenant-b.example/v1",
+                "api_key": "entry-key-b",
+            },
+        ]
+        config = {"fallback_providers": entries}
+        first_client = MagicMock(base_url=entries[0]["base_url"])
+        second_client = MagicMock(base_url=entries[1]["base_url"])
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.auxiliary_client._read_main_provider", return_value="main"),
+            patch("agent.auxiliary_client._read_main_model", return_value="main-model"),
+            patch("agent.auxiliary_client._read_main_base_url", return_value="https://main.example/v1"),
+            patch("agent.auxiliary_client._read_main_api_key", return_value="main-key"),
+            patch(
+                "agent.auxiliary_client._resolve_fallback_entry",
+                side_effect=[(first_client, "model-a"), (second_client, "model-b")],
+            ) as resolver,
+        ):
+            first = _try_main_fallback_chain(
+                task="session_search",
+                failed_provider="other",
+                failed_model="failed-model",
+                failure_scope=FailureScope.MODEL,
+            )
+            second = _try_main_fallback_chain(
+                task="session_search",
+                failed_provider="other",
+                failed_model="failed-model",
+                failure_scope=FailureScope.MODEL,
+                excluded_labels={first[2]},
+            )
+        assert first[2] == "fallback_providers[0](custom)"
+        assert second[2] == "fallback_providers[1](custom)"
+        assert resolver.call_args_list[0].args[0] == entries[0]
+        assert resolver.call_args_list[1].args[0] == entries[1]
+
 
 class TestFailureScopeFallbackEligibility:
     @staticmethod
@@ -2284,6 +2485,31 @@ class TestIsConnectionError:
         from agent.auxiliary_client import _is_connection_error
         err = Exception("Connection refused")
         assert _is_connection_error(err) is True
+
+    def test_httpx_connect_error_variants_and_nested_dns(self):
+        import httpx
+        from agent.auxiliary_client import (
+            _is_connection_error,
+            _is_endpoint_unreachable_error,
+        )
+
+        all_failed = httpx.ConnectError("All connection attempts failed")
+        dns = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        assert _is_connection_error(all_failed) is True
+        assert _is_endpoint_unreachable_error(all_failed) is True
+        assert _is_connection_error(dns) is True
+        assert _is_endpoint_unreachable_error(dns) is True
+
+    def test_httpx_reset_stays_transient_not_endpoint_scoped(self):
+        import httpx
+        from agent.auxiliary_client import (
+            _is_connection_error,
+            _is_endpoint_unreachable_error,
+        )
+
+        err = httpx.ReadError("connection reset by peer")
+        assert _is_connection_error(err) is True
+        assert _is_endpoint_unreachable_error(err) is False
 
 
 

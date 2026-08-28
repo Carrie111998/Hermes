@@ -4452,23 +4452,65 @@ def _is_timeout_error(exc: Exception) -> bool:
 
 
 def _is_endpoint_unreachable_error(exc: Exception) -> bool:
-    """Recognize failures that prove the endpoint itself cannot be reached."""
-    error_type = type(exc).__name__.lower()
-    if error_type in {"connectionrefusederror", "gaierror", "addressnotavailable"}:
-        return True
-    text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in (
-            "connection refused",
-            "name or service not known",
-            "temporary failure in name resolution",
-            "getaddrinfo failed",
-            "dns failure",
-            "no route to host",
-            "network is unreachable",
-        )
-    )
+    """Recognize failures that prove the endpoint itself cannot be reached.
+
+    HTTPX wraps the useful OS error in ``ConnectError`` (and sometimes in a
+    second ``ConnectError`` cause), so inspect a short exception chain rather
+    than only the outer display type.  A reset/premature-close is deliberately
+    excluded: it proves a transient stream blip, not that every model behind
+    the endpoint is unavailable.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    for _ in range(5):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        error_type = type(current).__name__.lower()
+        text = str(current).lower()
+        if any(
+            marker in text
+            for marker in (
+                "connection reset",
+                "incomplete chunked read",
+                "peer closed connection",
+                "response ended prematurely",
+                "unexpected eof",
+                "remoteprotocolerror",
+                "localprotocolerror",
+            )
+        ):
+            current = current.__cause__ or current.__context__
+            continue
+        if error_type in {
+            "connectionrefusederror",
+            "gaierror",
+            "addressnotavailable",
+        }:
+            return True
+        if error_type in {"connecterror", "connecttimeouterror"} and (
+            "all connection attempts failed" in text
+            or "failed to establish a new connection" in text
+            or "cannot connect" in text
+            or "connect timeout" in text
+        ):
+            return True
+        if any(
+            marker in text
+            for marker in (
+                "connection refused",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "getaddrinfo failed",
+                "nodename nor servname provided",
+                "dns failure",
+                "no route to host",
+                "network is unreachable",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -4487,13 +4529,18 @@ def _is_connection_error(exc: Exception) -> bool:
         pass
     # urllib3 / httpx / httpcore connection errors
     err_type = type(exc).__name__
-    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
+    if any(kw in err_type for kw in (
+        "Connection", "Connect", "Timeout", "DNS", "SSL", "ReadError",
+        "WriteError", "RemoteProtocol", "LocalProtocol",
+    )):
         return True
     err_lower = str(exc).lower()
     if any(kw in err_lower for kw in (
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable",
         "timed out", "connection reset",
+        "all connection attempts failed", "nodename nor servname provided",
+        "getaddrinfo failed", "failed to establish a new connection",
         # httpcore / httpx streaming premature-close errors.  These surface
         # when a proxy or provider drops the connection mid-stream and are
         # transient by nature — the request should be retried or rerouted.
@@ -5233,24 +5280,46 @@ def _auth_refresh_provider_for_route(
 
 
 def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[Dict[str, Any]]:
-    """Resolve the configured ``fallback_chain`` entry a label points at.
+    """Resolve the fallback entry a stable indexed label points at.
 
-    Labels minted by :func:`_try_configured_fallback_chain` carry the entry
-    index in our own stable format (``fallback_chain[<i>](<provider>)``).
-    Returns ``None`` when the label is not a configured-chain candidate or
-    the index no longer resolves to a dict entry.
+    Labels minted by the configured and top-level selectors carry the entry
+    index in a stable format. This is only a compatibility fallback for
+    callers that did not attach the selected entry to the client; the normal
+    execution path uses that attached identity so credentials/pools cannot be
+    reconstructed from a display label.
     """
-    if not task or not fb_label:
+    if not fb_label:
         return None
-    m = re.match(r"fallback_chain\[(\d+)\]", fb_label)
-    if not m:
+    match = re.match(r"fallback_chain\[(\d+)\]", fb_label)
+    source = "task"
+    if not match:
+        match = re.match(r"fallback_providers\[(\d+)\]", fb_label)
+        source = "main"
+    if not match:
         return None
     try:
-        chain = _get_auxiliary_task_config(task).get("fallback_chain")
-        entry = chain[int(m.group(1))] if isinstance(chain, list) else None
+        if source == "task":
+            if not task:
+                return None
+            chain = _get_auxiliary_task_config(task).get("fallback_chain")
+        else:
+            from hermes_cli.config import load_config_readonly
+            from hermes_cli.fallback_config import get_fallback_chain
+            chain = get_fallback_chain(load_config_readonly())
+        entry = chain[int(match.group(1))] if isinstance(chain, list) else None
     except Exception:
         return None
     return entry if isinstance(entry, dict) else None
+
+
+def _fallback_entry_for_candidate(
+    task: Optional[str], fb_client: Any, fb_label: str
+) -> Dict[str, Any]:
+    """Return the selected entry without losing top-level identity metadata."""
+    attached = getattr(fb_client, "_hermes_fallback_entry", None)
+    if isinstance(attached, dict):
+        return attached
+    return _fallback_chain_entry(task, fb_label) or {}
 
 
 def _coerce_positive_timeout(raw: Any) -> Optional[float]:
@@ -5421,7 +5490,9 @@ def _call_fallback_candidate_sync(
     On an auth error: refresh the candidate's provider credentials and retry
     once with a rebuilt client; if the retry also auth-fails (non-refreshable
     expired token), mark the provider unhealthy and return ``None`` so the
-    caller can continue to the next fallback layer. Non-auth errors raise.
+    caller can continue to the next fallback layer. Non-auth errors are
+    recorded in ``fallback_error_sink`` and also return ``None`` so sibling
+    candidates are attempted.
 
     ``effective_timeout`` is the task-level deadline; a configured-chain
     candidate with its own ``timeout`` entry gets that instead, so a
@@ -5438,7 +5509,7 @@ def _call_fallback_candidate_sync(
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
     task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
-    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    fallback_entry = _fallback_entry_for_candidate(task, fb_client, fb_label)
     fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
         task,
         actual_provider=destination.provider,
@@ -5498,6 +5569,25 @@ def _call_fallback_candidate_sync(
             )
             if fallback_error_sink is not None:
                 fallback_error_sink.append(fb_err)
+            return None
+        if _fallback_entry_has_isolated_credentials(fallback_entry):
+            if fallback_entry.get("credential_pool"):
+                _recover_provider_pool(
+                    destination.provider,
+                    fb_err,
+                    failed_api_key=str(
+                        getattr(fb_client, "api_key", "")
+                        or _fallback_entry_api_key(fallback_entry)
+                        or ""
+                    ),
+                )
+            if fallback_error_sink is not None:
+                fallback_error_sink.append(fb_err)
+            logger.warning(
+                "Auxiliary %s: isolated fallback candidate %s has a stale "
+                "credential (%s) — continuing chain",
+                task or "call", fb_label, fb_err,
+            )
             return None
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -5623,7 +5713,7 @@ async def _call_fallback_candidate_async(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
-    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    fallback_entry = _fallback_entry_for_candidate(task, fb_client, fb_label)
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5660,6 +5750,25 @@ async def _call_fallback_candidate_async(
             )
             if fallback_error_sink is not None:
                 fallback_error_sink.append(fb_err)
+            return None
+        if _fallback_entry_has_isolated_credentials(fallback_entry):
+            if fallback_entry.get("credential_pool"):
+                _recover_provider_pool(
+                    destination.provider,
+                    fb_err,
+                    failed_api_key=str(
+                        getattr(fb_client, "api_key", "")
+                        or _fallback_entry_api_key(fallback_entry)
+                        or ""
+                    ),
+                )
+            if fallback_error_sink is not None:
+                fallback_error_sink.append(fb_err)
+            logger.warning(
+                "Auxiliary %s: isolated fallback candidate %s has a stale "
+                "credential (%s) — continuing chain",
+                task or "call", fb_label, fb_err,
+            )
             return None
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -6186,6 +6295,14 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     return resolve_entry_api_key(entry)
 
 
+def _fallback_entry_has_isolated_credentials(entry: Dict[str, Any]) -> bool:
+    """Whether an entry must not fall back to provider-wide credentials."""
+    return any(
+        str(entry.get(field) or "").strip()
+        for field in ("api_key", "key_env", "api_key_env", "credential_pool")
+    )
+
+
 def _backend_identity_for_entry(
     entry: Dict[str, Any],
     *,
@@ -6222,6 +6339,7 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     )
     if client is not None:
         try:
+            client._hermes_fallback_entry = dict(entry)
             client._hermes_fallback_destination = _fallback_destination_from_entry(
                 entry, client, resolved_model
             )
@@ -6339,7 +6457,7 @@ def _try_main_fallback_chain(
                 task or "call", reason, failed_provider or "auto", label,
                 resolved_model or fb_model,
             )
-            return fb_client, resolved_model or fb_model, fb_provider
+            return fb_client, resolved_model or fb_model, label
         tried.append(label)
 
     if tried:
@@ -10665,6 +10783,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_transient_transport_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -10688,6 +10807,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_transient_transport_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -11424,6 +11544,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_transient_transport_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -11439,6 +11560,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_transient_transport_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -11473,7 +11595,7 @@ async def _async_call_llm_impl(
             _chain_failed_model = (
                 final_model if failure_scope is FailureScope.MODEL else None
             )
-            _failed_base_url = _base_info or resolved_base_url
+            _failed_base_url = _client_base or resolved_base_url
             _failed_api_key = next(
                 (
                     value for value in (
