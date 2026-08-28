@@ -1003,9 +1003,10 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     # Find the most recent event that put this task into ready.
     # ``created`` covers tasks born ready; ``promoted`` covers parent-
     # done auto-promotion; ``reclaimed`` covers TTL/crash recovery;
-    # ``unblocked`` covers human-driven resumes.
+    # ``unblocked`` covers human-driven resumes; ``review_reopened`` covers
+    # review self-heal reopening a card for a fresh dispatch attempt.
     READY_TRANSITION_KINDS = {
-        "created", "promoted", "reclaimed", "unblocked",
+        "created", "promoted", "reclaimed", "unblocked", "review_reopened",
     }
     last_ready_ts = 0
     for ev in events:
