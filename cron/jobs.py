@@ -3763,7 +3763,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         rj["schedule"][SCHEDULE_TZ_KEY] = configured_tz
                         needs_save = True
                         break
-            elif configured_tz and stamped_tz != configured_tz:
+            elif configured_tz and stamped_tz != configured_tz and not manual_run:
                 rebased_schedule = dict(schedule)
                 rebased_schedule[SCHEDULE_TZ_KEY] = configured_tz
                 new_next = compute_next_run(rebased_schedule, now.isoformat())

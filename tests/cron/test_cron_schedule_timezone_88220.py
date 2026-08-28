@@ -36,6 +36,7 @@ from cron.jobs import (  # noqa: E402
     get_job,
     parse_schedule,
     save_jobs,
+    trigger_job,
 )
 
 
@@ -262,6 +263,29 @@ class TestGatewayRestartDoesNotShiftTheJob:
 # =============================================================================
 
 class TestConfiguredZoneChange:
+    def test_zone_change_does_not_drop_pending_manual_run(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A timezone rebase must wait until a run-now request is consumed."""
+        use_zone(monkeypatch, "Asia/Shanghai", datetime(2026, 8, 17, 8, 0))
+        job = a_job()
+        job["schedule"]["tz"] = "Asia/Shanghai"
+        save_jobs([job])
+
+        triggered = trigger_job("job-1", extra_prompt="use the fresh numbers")
+        assert triggered is not None
+        manual_run_at = triggered["manual_run_at"]
+
+        # Same instant, but the operator has changed the configured timezone.
+        # Rebase must not replace the arbitrary run-now timestamp before it is
+        # returned to the scheduler.
+        use_zone(monkeypatch, "Europe/Berlin", datetime(2026, 8, 17, 2, 0))
+        due = get_due_jobs()
+
+        assert [item["id"] for item in due] == ["job-1"]
+        assert due[0]["manual_run_at"] == manual_run_at
+        assert due[0]["manual_run_prompt"] == "use the fresh numbers"
+
     def test_zone_change_rebases_and_restamps_once(self, tmp_cron_dir, monkeypatch):
         job = a_job()
         job["schedule"]["tz"] = "Asia/Shanghai"
