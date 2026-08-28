@@ -120,3 +120,66 @@ class TestResumeDisplayCompacted:
         assert "live q1" not in [m["content"] for m in display_history]
         # The compacted rows remain reachable.
         assert "old q1" in [m["content"] for m in display_history]
+
+
+class TestBoundedUncompactedResume:
+    """Never-compacted lineages must not pay the archived-history cost.
+
+    The archived-row fetch and the cross-generation dedupe are only needed
+    when compaction-archived rows exist. A lineage without them (the common
+    case) must stay on the active-only SELECT and skip the O(total rows)
+    dedupe — the same bounded-read gate ``get_messages`` gains in #97440 —
+    while compacted lineages keep the full archived-history semantics.
+    """
+
+    def _seed_uncompacted(self, db):
+        db.create_session("s1", source="cli")
+        db.append_messages_batch(
+            "s1",
+            [
+                message
+                for index in range(6)
+                for message in (
+                    {"role": "user", "content": f"q {index}"},
+                    {"role": "assistant", "content": f"a {index}"},
+                )
+            ],
+        )
+    def test_uncompacted_resume_skips_display_dedupe(self, db, monkeypatch):
+        """No archived rows → the dedupe helper must not run at all."""
+        self._seed_uncompacted(db)
+        dedupe_calls = []
+        original = db._dedupe_compacted_display_rows
+
+        def _spied(rows):
+            dedupe_calls.append(len(rows))
+            return original(rows)
+
+        monkeypatch.setattr(db, "_dedupe_compacted_display_rows", _spied)
+
+        model_history, display_history = db.get_resume_conversations("s1")
+
+        assert dedupe_calls == []
+        assert [m["content"] for m in display_history] == [
+            text for index in range(6) for text in (f"q {index}", f"a {index}")
+        ]
+
+    def test_compacted_resume_still_runs_display_dedupe(self, db, monkeypatch):
+        """Archived rows exist → the dedupe helper must run (gate opens)."""
+        _seed_compacted(db)
+        dedupe_calls = []
+        original = db._dedupe_compacted_display_rows
+
+        def _spied(rows):
+            dedupe_calls.append(len(rows))
+            return original(rows)
+
+        monkeypatch.setattr(db, "_dedupe_compacted_display_rows", _spied)
+
+        _, display_history = db.get_resume_conversations("s1")
+
+        assert len(dedupe_calls) == 1
+        # Archived rows were fetched (4 old turns), not just the live set.
+        assert dedupe_calls[0] > len([m for m in db.get_messages("s1")])
+        for archived in ("old q1", "old a1", "old q2", "old a2"):
+            assert archived in [m["content"] for m in display_history]

@@ -12058,6 +12058,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rows are part of the lineage), so serving both from one lineage SELECT
         halves the resume's DB work versus two separate calls, with byte-identical
         output (see test_get_resume_conversations_matches_separate_reads).
+
+        A payload-free probe gates the archived-row fetch and the display
+        dedupe: lineages with no compaction-archived rows (the common case)
+        stay on the active-only SELECT and skip the cross-generation dedupe
+        entirely — nothing to dedupe — while compacted lineages keep the full
+        archived-history semantics above.
         """
         session_ids = (
             [session_id]
@@ -12066,20 +12072,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
+            # Bounded-read gate (same shape as the get_messages gate in #97440):
+            # only a lineage that actually contains compaction-archived rows can
+            # have cross-generation copies to dedupe. The payload-free probe
+            # keeps never-compacted lineages — the common case — on the cheap
+            # active-only SELECT and out of the O(total rows) dedupe below. A
+            # concurrent compaction committing after the probe cannot mix
+            # duplicate generations into this response: its archived originals
+            # stay active=0 and out of the active-only fetch.
+            has_archived = conn.execute(
+                "SELECT 1 FROM messages "
+                f"WHERE session_id IN ({placeholders}) "
+                "AND active = 0 AND compacted = 1 LIMIT 1",
+                tuple(session_ids),
+            ).fetchone()
+            # ``active`` is selected so the model-fed projection below can
+            # re-filter to active rows only — the model must never see
+            # compaction-archived rows, only the summary + protected tail.
+            # When archived rows exist, the display projection keeps them and
+            # dedupes cross-generation copies with the SAME helper
+            # ``get_messages`` uses for ``include_compacted`` reads, so resume
+            # and paged REST reads of one session agree on what the
+            # transcript shows (#95906).
             rows = conn.execute(
-                # ``active`` is selected so the model-fed projection below can
-                # re-filter to active rows only — the model must never see
-                # compaction-archived rows, only the summary + protected tail.
-                # The display projection keeps them and dedupes cross-generation
-                # copies with the SAME helper ``get_messages`` uses for
-                # ``include_compacted`` reads, so resume and paged REST reads
-                # of one session agree on what the transcript shows (#95906).
                 f"SELECT session_id, active, {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders}) "
-                "AND (active = 1 OR compacted = 1) "
+                + (
+                    "AND (active = 1 OR compacted = 1) "
+                    if has_archived
+                    else "AND active = 1 "
+                )
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
                 # for why timestamp ordering is unsafe.
-                "ORDER BY id",
+                + "ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -12102,8 +12127,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # summaries after a process restart (marker survives restart).
             include_summary_markers=True,
         )
+        display_rows = (
+            self._dedupe_compacted_display_rows(rows) if has_archived else rows
+        )
         display_history = self._rows_to_conversation(
-            self._dedupe_compacted_display_rows(rows),
+            display_rows,
             session_id=session_id,
             include_ancestors=True,
             repair_alternation=False,
