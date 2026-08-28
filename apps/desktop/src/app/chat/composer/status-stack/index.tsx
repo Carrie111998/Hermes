@@ -25,6 +25,7 @@ import {
   type StatusGroup,
   stopBackgroundProcess
 } from '@/store/composer-status'
+import { $gateway } from '@/store/gateway'
 import { refreshSessionGoal } from '@/store/goals'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
 import { $threadScrolledUp } from '@/store/thread-scroll'
@@ -89,6 +90,7 @@ interface ComposerStatusStackProps {
 export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
+  const gateway = useStore($gateway)
   // Subscribe to THIS session's slice only. Both maps churn on other
   // sessions' activity (subagent ticks, background polls, preview updates in
   // any tile); a whole-map `useStore` re-rendered every mounted stack — one
@@ -102,8 +104,10 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
   const groups = useMemo(() => groupStatusItems(items), [items])
 
-  // Seed from the registry on session open; event-driven refreshes (terminal /
-  // process tool completions) live in use-message-stream.
+  // Seed from the registry on session open and again when the gateway binding
+  // becomes available or changes. The composer can mount before the socket is
+  // ready; depending only on sessionId leaves a stale goal chip forever when
+  // that first refresh returns early.
   useEffect(() => {
     if (sessionId) {
       // Opening/rebinding a session is a fresh runtime binding: clear any
@@ -113,7 +117,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
       void refreshBackgroundProcesses(sessionId)
       void refreshSessionGoal(sessionId)
     }
-  }, [sessionId])
+  }, [gateway, sessionId])
 
   const hasRunningBackground = groups.some(g => g.type === 'background' && g.items.some(i => i.state === 'running'))
 
