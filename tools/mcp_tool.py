@@ -6172,13 +6172,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         and _stdio_dead_result
                     ):
                         # Dead children but stale server.session, so the
-                        # transport-down path above never fired — signal the
-                        # server task to respawn and return a clean
-                        # reconnecting error. No explicit _bump_server_error:
-                        # the error return flows through the handler's JSON
-                        # parse, which already bumps once.
+                        # transport-down path above never fired. Signal the
+                        # server task to respawn and raise a transport error
+                        # instead of returning a serialized tool result. The
+                        # outer handler then bumps the transport breaker
+                        # exactly once; completed functional-error results
+                        # remain transport successes and still reset it.
                         if _signal_reconnect(server):
-                            return tool_error(
+                            raise TimeoutError(
                                 f"MCP server '{server_name}' stdio subprocess is "
                                 f"dead and reconnect was requested. Do NOT retry "
                                 f"immediately — give it a few seconds to respawn."
