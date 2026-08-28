@@ -61,4 +61,5 @@ registry.register(
     schema=CLOSE_PREVIEW_SCHEMA,
     handler=lambda args, **kw: close_preview_tool(url=args.get("url") or ""),
     emoji="🖼️",
+    repo_access="none",
 )

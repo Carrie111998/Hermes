@@ -114,7 +114,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
@@ -4592,6 +4592,10 @@ _server_trust_levels: Dict[str, str] = {}
 # Keyed on config rather than on a server-name string so the coupling survives
 # the user renaming their server, and so nothing has to hardcode "delegate_wave".
 _server_wants_caller_session: Dict[str, bool] = {}
+
+# Per-server repository capability, straight from config. Consumed by
+# tools/delegate_routing.py through the registry; see _record_tool_trust_metadata.
+_server_repo_access: Dict[str, Any] = {}
 _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
 
 _TRUST_FULL = "full"
@@ -4637,6 +4641,61 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     return hint is True
 
 
+def _resolve_mcp_repo_access(config: dict, raw_name: str, registry_name: str):
+    """One MCP tool's declared repository capability, or None (meaning withheld).
+
+    PER TOOL, NOT PER SERVER, AND THAT DISTINCTION IS THE WHOLE POINT.
+
+    A server-wide `repo_access: none` would hand a blanket permission to every
+    tool that server might ever expose. delegate-wave adding
+    `direct_apply_patch` next month would inherit "harmless" from a line written
+    before it existed -- which is precisely the future-tool hole that replacing
+    the built-in name list was meant to close, reopened one layer out.
+
+    So the config form is a MAPPING from the server's own tool name:
+
+        delegate_wave:
+          repo_access:
+            session_start: delegated_write
+            session_poll: none
+
+    A tool absent from that mapping is undeclared, and undeclared is withheld.
+
+    A bare string is still accepted, but ONLY when it is restrictive. A server
+    default may make things stricter than the fallback; it may never make them
+    laxer, because a lax default is exactly the blanket grant this avoids.
+    """
+    declared = (config or {}).get("repo_access")
+
+    if isinstance(declared, Mapping):
+        for key in (raw_name, registry_name):
+            if key in declared:
+                return declared[key]
+        return None
+
+    if isinstance(declared, str):
+        if declared.strip().lower() == "write":
+            # A restrictive server-wide default: everything from this server is
+            # treated as a direct mutator unless a mapping says otherwise.
+            return "write"
+        logger.warning(
+            "MCP server config declares a server-wide repo_access=%r. A "
+            "permissive server-wide default would grant every FUTURE tool from "
+            "this server the same permission, so it is ignored; declare "
+            "repo_access as a per-tool mapping instead. Treating %r as "
+            "undeclared (withheld while delegate-wave routing is on).",
+            declared, raw_name,
+        )
+        return None
+
+    if declared is not None:
+        logger.warning(
+            "MCP server config declares repo_access of unsupported type %r; "
+            "treating %r as undeclared (withheld).", type(declared).__name__, raw_name,
+        )
+    return None
+
+
 def _record_tool_trust_metadata(
     server_name: str, config: dict, tools: List[Any]
 ) -> None:
@@ -4648,6 +4707,9 @@ def _record_tool_trust_metadata(
         _server_wants_caller_session[server_name] = bool(
             (config or {}).get("send_caller_session_context", False)
         )
+        # Kept for diagnostics only. The value that decides anything is
+        # resolved PER TOOL at registration -- see _resolve_mcp_repo_access.
+        _server_repo_access[server_name] = (config or {}).get("repo_access")
         hints = _tool_read_only_hints.setdefault(server_name, {})
         for tool in tools:
             name = getattr(tool, "name", None)
@@ -7256,6 +7318,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         candidates.append(
             {
                 "registry_name": schema["name"],
+                "raw_name": mcp_tool.name,
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
@@ -7279,6 +7342,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         candidates.append(
             {
                 "registry_name": schema["name"],
+                "raw_name": handler_key,
                 "origin": f"generated utility {handler_key!r}",
                 "schema": schema,
                 "handler": handler_factories[handler_key](
@@ -7392,6 +7456,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=candidate["check_fn"],
             is_async=False,
             description=candidate["schema"]["description"],
+            # Declared PER TOOL in the server's config. None when this
+            # particular tool was not declared -- including a tool that appeared
+            # on the server today -- which the routing filter treats as write.
+            repo_access=_resolve_mcp_repo_access(
+                config, candidate.get("raw_name", ""), registry_name
+            ),
         )
 
         # The pre-check above is advisory only. Multiple servers connect in

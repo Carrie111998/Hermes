@@ -135,4 +135,5 @@ registry.register(
     is_async=False,
     description="Read Feishu document content",
     emoji="\U0001f4c4",
+    repo_access="none",
 )

@@ -4549,4 +4549,5 @@ registry.register(
         provider=args.get("provider")),
     check_fn=check_tts_requirements,
     emoji="🔊",
+    repo_access="none",
 )

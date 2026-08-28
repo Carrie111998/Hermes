@@ -13,7 +13,7 @@ that delegated children were covered.
 import pytest
 
 from tools import delegate_routing
-from tools.delegate_routing import MUTATING_TOOLS, filter_tools, routing_enabled, status_label
+from tools.delegate_routing import filter_tools, routing_enabled, status_label
 
 ON = {"delegate_wave": {"route_repo_changes": True}}
 OFF = {"delegate_wave": {"route_repo_changes": False}}
@@ -33,40 +33,131 @@ def test_off_by_default_so_an_existing_install_is_unchanged():
     assert status_label({}) == ""
 
 
+class _FakeEntry:
+    def __init__(self, repo_access):
+        self.repo_access = repo_access
+
+
+class _FakeRegistry:
+    """A registry containing exactly the tools a test declares.
+
+    The point of these tests is that the policy consults DECLARATIONS, so the
+    fixture has to be able to invent a tool that has never existed. A test that
+    could only use the real registry could never prove the interesting claim:
+    that a tool nobody has written yet is handled correctly.
+    """
+
+    def __init__(self, declarations):
+        self._entries = {n: _FakeEntry(a) for n, a in declarations.items()}
+
+    def get_entry(self, name, scope=None):
+        return self._entries.get(name)
+
+
 def test_on_withholds_every_way_of_changing_a_repository():
-    """The list is enumerated, so the test enumerates it too rather than sampling.
+    """Enumerated through declarations rather than through a list of names."""
+    declarations = {t: "write" for t in EVERY_MUTATOR}
+    declarations.update({t: "read" for t in HARMLESS})
+    reg = _FakeRegistry(declarations)
 
-    A test that only checked `patch` and `write_file` would have passed against
-    the first version, which left desktop control available.
-    """
-    remaining = filter_tools(EVERY_MUTATOR | HARMLESS, ON)
+    remaining = filter_tools(EVERY_MUTATOR | HARMLESS, ON, reg)
     assert remaining == HARMLESS, f"still offered: {sorted(remaining & EVERY_MUTATOR)}"
-    for tool in EVERY_MUTATOR:
-        assert tool in MUTATING_TOOLS, f"{tool} is a mutation vector and must be listed"
 
 
-def test_desktop_control_is_not_forgotten():
-    """Named on its own because it was, once.
+def test_a_brand_new_mutating_tool_is_blocked_without_being_named_anywhere():
+    """THE REASON THE NAME LIST WAS REPLACED.
 
-    computer_use is "Universal desktop control": with it, an editor is a GUI away
-    and every other entry in the list is decoration. It was missed by a
-    pattern-matched first draft that looked for words like "write" and "edit".
+    `MUTATING_TOOLS` was correct only for the tools that existed when someone
+    last read it. This tool has never existed; nothing anywhere knows its name;
+    it declares write and is withheld for that reason alone.
     """
-    assert "computer_use" in MUTATING_TOOLS
-    assert "computer_use" not in filter_tools({"computer_use", "read_file"}, ON)
-
-
-def test_deferred_and_indirect_execution_count_too():
-    """A scheduled command runs later; a browser driver runs code now.
-
-    Neither looks like an editor, and both end at a shell.
-    """
-    assert "cronjob" in MUTATING_TOOLS
-    assert "browser_exec" in MUTATING_TOOLS
-    assert "execute_code" in MUTATING_TOOLS, (
-        "execute_code calls other tools programmatically -- leaving it would route "
-        "around every other entry in this set"
+    reg = _FakeRegistry({
+        "quantum_refactorer_9000": "write",
+        "read_file": "read",
+    })
+    remaining = filter_tools({"quantum_refactorer_9000", "read_file"}, ON, reg)
+    assert remaining == {"read_file"}
+    assert "quantum_refactorer_9000" not in remaining, (
+        "a newly registered mutating tool was offered because no list mentions it"
     )
+
+
+def test_a_brand_new_read_only_tool_is_still_offered():
+    """The other half. Withholding everything would be trivially 'safe' and useless."""
+    reg = _FakeRegistry({
+        "repository_archaeologist": "read",
+        "weather_lookup": "none",
+        "patch": "write",
+    })
+    remaining = filter_tools({"repository_archaeologist", "weather_lookup", "patch"}, ON, reg)
+    assert remaining == {"repository_archaeologist", "weather_lookup"}
+
+
+@pytest.mark.parametrize("declared", [None, "", "  ", "WRITE-ish", "readonly", 42, True, ["read"]])
+def test_missing_or_nonsense_metadata_fails_closed(declared):
+    """UNDECLARED AND MISLABELLED BOTH MEAN WITHHELD.
+
+    A default of "harmless" would turn every oversight -- a new built-in nobody
+    classified, a plugin, a typo in a config -- into a silent hole. Note that
+    True is included: a truthy non-string must not be mistaken for permission.
+    """
+    reg = _FakeRegistry({"mystery_tool": declared, "read_file": "read"})
+    remaining = filter_tools({"mystery_tool", "read_file"}, ON, reg)
+    assert remaining == {"read_file"}, (
+        f"repo_access={declared!r} was treated as permission to offer the tool"
+    )
+
+
+def test_a_tool_missing_from_the_registry_entirely_is_withheld():
+    """A name that resolves to nothing is not evidence that it is safe."""
+    reg = _FakeRegistry({"read_file": "read"})
+    assert filter_tools({"ghost_tool", "read_file"}, ON, reg) == {"read_file"}
+
+
+def test_case_and_whitespace_in_a_declaration_are_tolerated():
+    """Declarations are written by hand, in config as well as in code."""
+    reg = _FakeRegistry({"a": " Read ", "b": "NONE", "c": "Write"})
+    assert filter_tools({"a", "b", "c"}, ON, reg) == {"a", "b"}
+
+
+def test_every_registered_builtin_declares_its_capability():
+    """WHERE THE COST OF FAILING CLOSED IS PAID.
+
+    Undeclared means withheld, so an unclassified tool silently disappears while
+    the switch is on. This test moves that cost onto whoever adds a tool, at the
+    time they add it, instead of onto the person wondering where their tool went.
+    """
+    import model_tools  # noqa: F401  -- triggers builtin discovery
+    from tools.registry import registry
+
+    undeclared = sorted(
+        name for name, entry in registry._tools.items()
+        if not getattr(entry, "repo_access", None)
+        and not name.startswith("mcp__")  # MCP declares via its server config
+    )
+    assert not undeclared, (
+        "these registered tools declare no repo_access and will be withheld "
+        f"whenever delegate-wave routing is on: {undeclared}"
+    )
+
+
+def test_the_seven_known_mutators_still_declare_write():
+    """The classification is new; the judgement behind it is not.
+
+    These seven were chosen by hand, argued about, and one (computer_use) was
+    missed by a pattern-matched first draft. Pinning them here means the move to
+    metadata cannot quietly reclassify one as harmless.
+    """
+    import model_tools  # noqa: F401
+    from tools.registry import registry
+
+    for tool in EVERY_MUTATOR:
+        entry = registry._tools.get(tool)
+        if entry is None:
+            continue  # not every install has every toolset available
+        assert entry.repo_access == "write", (
+            f"{tool} now declares {entry.repo_access!r}; it is a mutation vector"
+        )
 
 
 def test_a_failure_while_the_switch_is_on_does_not_hand_the_tools_back(monkeypatch):
@@ -148,3 +239,98 @@ def test_the_guidance_names_the_route_that_remains():
     assert "session_start" in delegate_routing.GUIDANCE
     assert "delegate_wave" in delegate_routing.GUIDANCE
     assert status_label(ON) == "Delegate Wave ON"
+
+
+# --- MCP: capability is declared per tool, never per server --------------------
+
+def test_a_new_tool_on_an_already_declared_mcp_server_is_withheld():
+    """THE FALSIFICATION THAT CLOSES THE FUTURE-TOOL HOLE ON THE MCP SIDE.
+
+    Replacing the built-in name list removed the "correct only for the tools that
+    existed when someone last read it" failure -- and a server-wide
+    `repo_access: none` would have reintroduced it one layer out. delegate-wave
+    shipping `direct_apply_patch` tomorrow would inherit "harmless" from a line
+    written today, and Hermes would be handed a direct mutator by a switch whose
+    entire purpose is to withhold them.
+
+    So the server's declaration is a MAPPING, and a tool missing from it is
+    undeclared. This test asks for a tool that no config has ever mentioned.
+    """
+    from tools.mcp_tool import _resolve_mcp_repo_access
+
+    config = {
+        "repo_access": {
+            "session_start": "delegated_write",
+            "session_poll": "none",
+        }
+    }
+
+    # Everything the server declares today resolves as declared.
+    assert _resolve_mcp_repo_access(config, "session_start", "mcp__dw__session_start") == "delegated_write"
+    assert _resolve_mcp_repo_access(config, "session_poll", "mcp__dw__session_poll") == "none"
+
+    # A tool that appears on that same server tomorrow does not.
+    newcomer = _resolve_mcp_repo_access(config, "direct_apply_patch", "mcp__dw__direct_apply_patch")
+    assert newcomer is None, (
+        "a newly discovered MCP tool inherited a capability nobody declared for it"
+    )
+
+    # And the routing filter withholds it for exactly that reason.
+    reg = _FakeRegistry({
+        "mcp__dw__session_start": "delegated_write",
+        "mcp__dw__direct_apply_patch": newcomer,
+    })
+    remaining = filter_tools(
+        {"mcp__dw__session_start", "mcp__dw__direct_apply_patch"}, ON, reg
+    )
+    assert remaining == {"mcp__dw__session_start"}
+
+
+def test_a_permissive_server_wide_default_is_refused():
+    """A server-wide value may make things STRICTER, never laxer.
+
+    `repo_access: none` on the server entry is the blanket grant this design
+    exists to prevent, so it is ignored rather than honoured -- loudly, because
+    somebody wrote it intending it to do something.
+    """
+    from tools.mcp_tool import _resolve_mcp_repo_access
+
+    for permissive in ("none", "read", "delegated_write", " NONE "):
+        assert _resolve_mcp_repo_access({"repo_access": permissive}, "x", "mcp__s__x") is None, (
+            f"server-wide repo_access={permissive!r} granted permission to every future tool"
+        )
+
+    # Restrictive is allowed: it can only withhold more.
+    assert _resolve_mcp_repo_access({"repo_access": "write"}, "x", "mcp__s__x") == "write"
+
+
+def test_the_sanctioned_route_is_allowed_by_category_not_by_name():
+    """session_start survives the switch because of WHAT IT DECLARES.
+
+    Nothing in the policy knows the string "session_start", "delegate_wave", or
+    "mcp__". A tool is allowed through because it declared delegated_write, and
+    any tool that declares it would be -- which is the property that makes this a
+    rule rather than an exception.
+    """
+    reg = _FakeRegistry({
+        "mcp__delegate_wave__session_start": "delegated_write",
+        "mcp__delegate_wave__session_poll": "none",
+        "mcp__other_vendor__commission_work": "delegated_write",
+        "mcp__delegate_wave__direct_apply_patch": "write",
+        "patch": "write",
+    })
+    remaining = filter_tools(set(reg._entries), ON, reg)
+    assert remaining == {
+        "mcp__delegate_wave__session_start",
+        "mcp__delegate_wave__session_poll",
+        "mcp__other_vendor__commission_work",
+    }
+    assert "mcp__delegate_wave__direct_apply_patch" not in remaining, (
+        "a directly-mutating tool was allowed because of the server it came from"
+    )
+
+
+def test_delegated_write_is_withheld_when_the_switch_is_off_only_in_the_sense_that_nothing_is():
+    """Sanity: the switch off is still a no-op for every category."""
+    reg = _FakeRegistry({"a": "delegated_write", "b": "write", "c": None})
+    assert filter_tools({"a", "b", "c"}, OFF, reg) == {"a", "b", "c"}

@@ -484,6 +484,7 @@ registry.register(
     handler=_handle_list_entities,
     check_fn=_check_ha_available,
     emoji="🏠",
+    repo_access="none",
 )
 
 registry.register(
@@ -493,6 +494,7 @@ registry.register(
     handler=_handle_get_state,
     check_fn=_check_ha_available,
     emoji="🏠",
+    repo_access="none",
 )
 
 registry.register(
@@ -502,6 +504,7 @@ registry.register(
     handler=_handle_list_services,
     check_fn=_check_ha_available,
     emoji="🏠",
+    repo_access="none",
 )
 
 registry.register(
@@ -511,4 +514,5 @@ registry.register(
     handler=_handle_call_service,
     check_fn=_check_ha_available,
     emoji="🏠",
+    repo_access="none",
 )

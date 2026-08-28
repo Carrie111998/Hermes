@@ -1191,6 +1191,7 @@ registry.register(
     requires_env=[],
     is_async=True,
     emoji="🎬",
+    repo_access="none",
 )
 
 registry.register(
@@ -1202,6 +1203,7 @@ registry.register(
     requires_env=[],
     is_async=True,
     emoji="🎬",
+    repo_access="none",
 )
 
 registry.register(
@@ -1213,6 +1215,7 @@ registry.register(
     requires_env=[],
     is_async=True,
     emoji="🎬",
+    repo_access="none",
 )
 
 registry.register(
@@ -1224,6 +1227,7 @@ registry.register(
     requires_env=[],
     is_async=True,
     emoji="🎬",
+    repo_access="none",
 )
 
 registry.register(
@@ -1235,6 +1239,7 @@ registry.register(
     requires_env=[],
     is_async=True,
     emoji="🎬",
+    repo_access="none",
 )
 
 registry.register(
@@ -1246,4 +1251,5 @@ registry.register(
     requires_env=[],
     is_async=True,
     emoji="📖",
+    repo_access="none",
 )

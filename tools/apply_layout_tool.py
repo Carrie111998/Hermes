@@ -71,4 +71,5 @@ registry.register(
     schema=APPLY_LAYOUT_SCHEMA,
     handler=lambda args, **kw: apply_layout_tool(preset=args.get("preset", "")),
     emoji="🧱",
+    repo_access="none",
 )

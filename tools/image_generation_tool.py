@@ -2133,4 +2133,5 @@ registry.register(
     is_async=False,   # sync fal_client API to avoid "Event loop is closed" in gateway
     emoji="🎨",
     dynamic_schema_overrides=_build_dynamic_image_schema,
+    repo_access="none",
 )

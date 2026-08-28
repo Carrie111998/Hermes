@@ -5480,6 +5480,7 @@ registry.register(
     ),
     check_fn=check_browser_navigate_requirements,
     emoji="🌐",
+    repo_access="none",
 )
 registry.register(
     name="browser_snapshot",
@@ -5494,6 +5495,7 @@ registry.register(
     ),
     check_fn=check_browser_snapshot_requirements,
     emoji="📸",
+    repo_access="none",
 )
 registry.register(
     name="browser_click",
@@ -5507,6 +5509,7 @@ registry.register(
     ),
     check_fn=check_browser_click_requirements,
     emoji="👆",
+    repo_access="none",
 )
 registry.register(
     name="browser_type",
@@ -5520,6 +5523,7 @@ registry.register(
     ),
     check_fn=check_browser_type_requirements,
     emoji="⌨️",
+    repo_access="none",
 )
 registry.register(
     name="browser_scroll",
@@ -5533,6 +5537,7 @@ registry.register(
     ),
     check_fn=check_browser_scroll_requirements,
     emoji="📜",
+    repo_access="none",
 )
 registry.register(
     name="browser_back",
@@ -5546,6 +5551,7 @@ registry.register(
     ),
     check_fn=check_browser_back_requirements,
     emoji="◀️",
+    repo_access="none",
 )
 registry.register(
     name="browser_press",
@@ -5559,6 +5565,7 @@ registry.register(
     ),
     check_fn=check_browser_press_requirements,
     emoji="⌨️",
+    repo_access="none",
 )
 
 registry.register(
@@ -5573,6 +5580,7 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="🖼️",
+    repo_access="none",
 )
 registry.register(
     name="browser_vision",
@@ -5586,6 +5594,7 @@ registry.register(
     ),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
+    repo_access="none",
 )
 registry.register(
     name="browser_console",
@@ -5599,4 +5608,5 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+    repo_access="none",
 )

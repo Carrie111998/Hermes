@@ -199,4 +199,5 @@ registry.register(
         callback=kw.get("callback"),
     ),
     emoji="🧭",
+    repo_access="none",
 )

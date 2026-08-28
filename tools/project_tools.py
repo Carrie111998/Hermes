@@ -148,6 +148,7 @@ registry.register(
         "parameters": {"type": "object", "properties": {}},
     },
     handler=lambda args, **kw: project_list(task_id=kw.get("task_id")),
+    repo_access="none",
 )
 
 registry.register(
@@ -173,6 +174,7 @@ registry.register(
     handler=lambda args, **kw: project_create(
         name=args.get("name", ""), path=args.get("path"), task_id=kw.get("task_id")
     ),
+    repo_access="none",
 )
 
 registry.register(
@@ -194,4 +196,5 @@ registry.register(
         },
     },
     handler=lambda args, **kw: project_switch(project=args.get("project", ""), task_id=kw.get("task_id")),
+    repo_access="none",
 )

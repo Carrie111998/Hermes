@@ -21,16 +21,16 @@ tools that can mutate a repository are not offered at all -- the model cannot
 call what it cannot see -- and the accompanying note explains the one route that
 remains. That is what "mechanically disallowed" has to mean to be worth saying.
 
-WHAT IS WITHHELD is enumerated at MUTATING_TOOLS below, with the reasoning for
-each -- including the ones considered and deliberately left available.
+WHAT IS WITHHELD is whatever declares repo_access="write" at registration, plus
+anything that declares nothing at all. There is no list of names here to fall out
+of date; see the reasoning below _ALLOWED_WHEN_ROUTING.
 
-Two of those choices are worth stating up here because they have a visible cost.
-`terminal` is withheld even though it is mostly used for reading, because
-`echo > file` is an edit and leaving it would make the guarantee a slogan; the
-price is that Hermes can no longer run `git status` to answer a question about
-the working tree. And the first version of the list was a pattern guess that
-missed `computer_use` -- "Universal desktop control" -- which could simply open an
-editor and type. The list is enumerated from the registry now, not matched.
+One choice is worth stating up here because it has a visible cost. `terminal`
+declares "write" even though it is mostly used for reading, because `echo > file`
+is an edit and leaving it available would make the guarantee a slogan; the price
+is that Hermes can no longer run `git status` to answer a question about the
+working tree. The other cost is structural: an unclassified tool disappears while
+the switch is on, which is the price of never silently offering a mutating one.
 
 Reading and searching remain, which covers most of what an investigation needs.
 Anything further is a reason to turn the switch off rather than to weaken it.
@@ -45,48 +45,86 @@ logger = logging.getLogger(__name__)
 
 CONFIG_KEY = "delegate_wave_route_repo_changes"
 
-# The tools that can change a repository, or run something that can.
+# HOW A TOOL IS JUDGED: BY WHAT IT DECLARES, NOT BY ITS NAME.
 #
-# Named explicitly rather than matched by pattern: a substring rule would quietly
-# start withholding a future tool nobody considered, and quietly stop withholding
-# one that gets renamed. The first version of this list WAS a pattern guess and it
-# missed computer_use -- "Universal desktop control", which can simply open an
-# editor and type. So this is enumerated from the registry, with the reasoning for
-# each kept where the next person will look.
+# This used to be MUTATING_TOOLS -- a frozenset of seven names. Enumerating beat
+# pattern-matching (the first version was a pattern guess and it missed
+# computer_use, "Universal desktop control", which can simply open an editor and
+# type), but a name list has a failure mode that no amount of care fixes: it is
+# correct only for the tools that existed when somebody last read it. The eighth
+# mutating tool -- added upstream next month, or by a plugin this afternoon --
+# is offered, silently, because nobody thought to add its name here.
 #
-#   patch, write_file   direct edits
-#   terminal            arbitrary shell; `echo > file` is an edit
-#   execute_code        runs Python that can call any other tool -- an escape
-#                       hatch around every other entry in this set
-#   computer_use        drives the desktop; an editor is a GUI away
-#   cronjob             schedules commands, so it is deferred shell access
-#   browser_exec        "the `code` argument" -- arbitrary code driving a browser
+# Every registered tool now declares repo_access at registration:
 #
-# CONSIDERED AND DELIBERATELY LEFT AVAILABLE, so the next reader does not have to
-# re-derive it:
+#   "write"            calling it can change the working tree from THIS
+#                      process, or run something that can
+#   "delegated_write"  it causes repository changes, but through the sanctioned
+#                      supervised route rather than by editing anything here
+#   "read"             reads repository contents, cannot change them
+#   "none"             does not touch the repository at all
 #
-#   browser_cdp     evaluates JS inside a page. It can cause a download, which
-#                   lands in the browser's download directory rather than the
-#                   working tree, and the person would see it. Withholding it
-#                   would cost ordinary web work for a vector that cannot reach
-#                   the repository unaided. One line to add if that judgement is
-#                   ever shown wrong.
-#   process         manages background processes STARTED by terminal. With
-#                   terminal withheld there is nothing for it to have started.
-#   skill_manage,   write to HERMES_HOME, not to the repository under discussion.
-#   memory, kanban_*
-#   delegate_task   children are AIAgents built through the same tool-assembly
-#                   path, so they inherit this filter. Proved by regression
-#                   rather than assumed -- see tests/test_delegate_routing.py.
-MUTATING_TOOLS = frozenset({
-    "patch",
-    "write_file",
-    "execute_code",
-    "terminal",
-    "computer_use",
-    "cronjob",
-    "browser_exec",
-})
+# "delegated_write" exists because calling delegate-wave's session_start "none"
+# was a comfortable lie: it plainly causes a repository to change. What makes it
+# allowable while the switch is on is not that it is harmless, it is that it is
+# THE ROUTE THE SWITCH EXISTS TO FORCE. Saying that out loud keeps the vocabulary
+# honest, and leaves room for a future tool that mutates directly to be
+# classified "write" even though it lives on the same server.
+#
+# and this module asks the registry rather than consulting a list. A new
+# mutating tool is withheld the day it appears, without being named anywhere.
+#
+# UNDECLARED MEANS WITHHELD. That is the load-bearing half.
+#
+# A tool with no repo_access -- a new built-in whose author did not classify it,
+# a plugin, an MCP server's tool -- is treated as "write" and withheld while the
+# switch is on. The alternative is a default of "harmless", which converts every
+# oversight into a silent hole in the guarantee. Erring towards withholding costs
+# a tool the model could have used and is visible immediately; erring the other
+# way costs the guarantee and is invisible until a transcript shows Hermes
+# editing a repository it was configured never to touch.
+#
+# The cost is real and deliberate: with the switch on, an unclassified tool
+# disappears. tests/test_delegate_routing.py asserts that every registered
+# built-in declares one, so that cost lands on whoever adds a tool, at the time
+# they add it, rather than on the guarantee.
+#
+# MCP TOOLS declare through their server's config (repo_access on the server
+# entry), because Hermes cannot know what a third-party tool does. Undeclared MCP
+# servers are withheld under the same rule -- including, deliberately,
+# delegate-wave's own: the server that is the sanctioned route still has to say
+# so out loud rather than be special-cased by name.
+_ALLOWED_WHEN_ROUTING = frozenset({"read", "none", "delegated_write"})
+_VALID_ACCESS = frozenset({"write", "delegated_write", "read", "none"})
+
+
+def _declared_access(name, registry_obj=None):
+    """What one tool declared, normalised, or None when it declared nothing."""
+    try:
+        from tools.registry import repo_access_of
+    except Exception:  # pragma: no cover - import cycle guard
+        logger.exception("delegate routing: registry unavailable")
+        return None
+    value = repo_access_of(name, registry_obj)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        # A non-string declaration is a mistake, not a permission. Treated as
+        # undeclared, which means withheld.
+        logger.warning(
+            "delegate routing: tool %r declared a non-string repo_access %r; "
+            "treating as undeclared (withheld)", name, value,
+        )
+        return None
+    normalised = value.strip().lower()
+    if normalised not in _VALID_ACCESS:
+        logger.warning(
+            "delegate routing: tool %r declared unknown repo_access %r; "
+            "treating as undeclared (withheld)", name, value,
+        )
+        return None
+    return normalised
+
 
 GUIDANCE = (
     "DELEGATE-WAVE ROUTING IS ON.\n"
@@ -133,11 +171,12 @@ def routing_enabled(config: Mapping[str, Any] | None = None) -> bool:
     return _as_bool(config.get(CONFIG_KEY))
 
 
-def filter_tools(tool_names: Iterable[str], config: Mapping[str, Any] | None = None) -> set[str]:
-    """Remove the tools that could change a repository, when the switch is on.
+def filter_tools(tool_names: Iterable[str], config: Mapping[str, Any] | None = None,
+                 registry_obj: Any = None) -> set[str]:
+    """Keep only the tools that declared they cannot change the repository.
 
-    A no-op when it is off, which is the default -- this must not change what an
-    existing install offers unless somebody asked for it.
+    A no-op when the switch is off, which is the default -- this must not change
+    what an existing install offers unless somebody asked for it.
 
     RAISES rather than degrades when the switch is on and something is wrong. See
     the caller: with this switch on, failing to filter is worse than failing to
@@ -146,12 +185,31 @@ def filter_tools(tool_names: Iterable[str], config: Mapping[str, Any] | None = N
     names = set(tool_names)
     if not routing_enabled(config):
         return names
-    withheld = names & MUTATING_TOOLS
+
+    kept, withheld, undeclared = set(), set(), set()
+    for name in names:
+        access = _declared_access(name, registry_obj)
+        if access is None:
+            undeclared.add(name)
+        elif access in _ALLOWED_WHEN_ROUTING:
+            kept.add(name)
+        else:
+            withheld.add(name)
+
     if withheld:
         logger.info(
-            "delegate-wave routing on: withholding %s", ", ".join(sorted(withheld))
+            "delegate-wave routing on: withholding %s (declared write)",
+            ", ".join(sorted(withheld)),
         )
-    return names - MUTATING_TOOLS
+    if undeclared:
+        # Named individually because this is the case a person has to act on:
+        # either the tool should be classified, or the switch is costing them
+        # something they wanted.
+        logger.warning(
+            "delegate-wave routing on: withholding %s (no repo_access declared; "
+            "undeclared is treated as write)", ", ".join(sorted(undeclared)),
+        )
+    return kept
 
 
 def status_label(config: Mapping[str, Any] | None = None) -> str:

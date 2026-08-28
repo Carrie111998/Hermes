@@ -2023,6 +2023,7 @@ registry.register(
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
+    repo_access="none",
 )
 # ── skill_view repeat-view dedup ────────────────────────────────────────
 # Per-task cache of (skill name, file_path) -> (skill file mtime+size).
@@ -2184,4 +2185,5 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+    repo_access="none",
 )

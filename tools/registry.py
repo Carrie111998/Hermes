@@ -207,12 +207,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "repo_access",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 repo_access=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +232,29 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # WHAT THIS TOOL CAN DO TO A REPOSITORY. See tools/delegate_routing.py.
+        #
+        #   "write"  calling it can change the working tree, or run something
+        #            that can -- shells, code execution, desktop control.
+        #   "read"   reads repository contents and cannot change them.
+        #   "none"   does not touch the repository at all.
+        #   None     UNDECLARED. Treated as "write" by the routing filter, which
+        #            is the whole point: a tool nobody classified is withheld
+        #            rather than offered. A new mutating tool is blocked the day
+        #            it is added, without anyone remembering to list its name.
+        self.repo_access = repo_access
+
+
+def repo_access_of(name, registry_obj=None):
+    """The declared repository capability of one tool, or None if undeclared.
+
+    Separate from the ToolRegistry class so the routing filter can ask about a
+    name without importing policy into the registry: the registry records what a
+    tool declared, and delegate_routing decides what to do about it.
+    """
+    reg = registry_obj if registry_obj is not None else registry
+    entry = reg.get_entry(name)
+    return getattr(entry, "repo_access", None) if entry is not None else None
 
 
 class _PluginOverridePolicy:
@@ -775,6 +799,7 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        repo_access: Optional[str] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -870,6 +895,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                repo_access=repo_access,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by

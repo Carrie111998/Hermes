@@ -63,4 +63,5 @@ registry.register(
     schema=FOCUS_PANE_SCHEMA,
     handler=lambda args, **kw: focus_pane_tool(pane=args.get("pane", "")),
     emoji="🪟",
+    repo_access="none",
 )

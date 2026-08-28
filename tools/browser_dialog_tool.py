@@ -145,4 +145,5 @@ registry.register(
     ),
     check_fn=_browser_dialog_check,
     emoji="💬",
+    repo_access="none",
 )

@@ -3312,4 +3312,5 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
+    repo_access="none",
 )
