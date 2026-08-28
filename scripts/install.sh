@@ -492,6 +492,18 @@ configure_managed_node_npm_prefix() {
     printf 'prefix=%s\n' "$(dirname "$link_dir")" > "$HERMES_HOME/node/etc/npmrc"
 }
 
+# Make node-gyp compile native addons (node-pty, etc.) against the managed
+# Node's own headers instead of resolving a host Node's install dir. The dev
+# sandbox exports npm_config_nodedir from the *host*'s `command -v node`
+# (e.g. /usr/local on a runner), which has no headers — node-gyp then fails
+# with "common.gypi not found". The managed Node ships include/node/, so point
+# node-gyp at it once the managed Node is on PATH.
+point_node_gyp_at_managed_node() {
+    if [ -d "$HERMES_HOME/node/include/node" ]; then
+        export npm_config_nodedir="$HERMES_HOME/node"
+    fi
+}
+
 get_hermes_command_path() {
     local link_dir
     link_dir="$(get_command_link_dir)"
@@ -954,6 +966,7 @@ check_node() {
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
     if [ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \
         && node_satisfies_build "$("$HERMES_HOME/node/bin/node" --version)"; then
+        point_node_gyp_at_managed_node
         export PATH="$HERMES_HOME/node/bin:$PATH"
         log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
         HAS_NODE=true
@@ -1078,6 +1091,7 @@ install_node() {
     ln -sf "$HERMES_HOME/node/bin/npx"  "$node_link_dir/npx"
 
     configure_managed_node_npm_prefix
+    point_node_gyp_at_managed_node
 
     export PATH="$HERMES_HOME/node/bin:$PATH"
 
