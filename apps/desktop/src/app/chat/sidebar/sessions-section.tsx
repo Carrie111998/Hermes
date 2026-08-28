@@ -99,11 +99,12 @@ interface SidebarSessionsSectionProps {
   onToggle: () => void
   sessions: SessionInfo[]
   activeSessionId: null | string
-  onResumeSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
+  onToggleUnread: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
   rootClassName?: string
@@ -180,6 +181,7 @@ export function SidebarSessionsSection({
   onArchiveSession,
   onBranchSession,
   onTogglePin,
+  onToggleUnread,
   onNewSessionInWorkspace,
   pinned,
   rootClassName,
@@ -255,16 +257,21 @@ export function SidebarSessionsSection({
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
         onDelete: () => onDeleteSession(session.id),
         onPin: () => onTogglePin(sessionPinId(session)),
-        onResume: () => onResumeSession(session.id),
+        onToggleUnread: () => onToggleUnread(session.id),
+        onResume: () => onResumeSession(session.id, session),
         reorderable: draggable && !branchStem,
         session,
-        showProfile: showProfileTags
+        showProfile: showProfileTags,
+        unread: session.unread === true
       }
 
+      // Key by (profile, id): twins with the same stored id in two profiles
+      // are distinct rows (#92454) — a bare-id key makes React misattribute
+      // one twin's rendered state to the other.
       return draggable && !branchStem ? (
-        <SortableSidebarSessionRow key={session.id} {...rowProps} />
+        <SortableSidebarSessionRow key={`${session.profile ?? ''}::${session.id}`} {...rowProps} />
       ) : (
-        <SidebarSessionRow key={session.id} {...rowProps} />
+        <SidebarSessionRow key={`${session.profile ?? ''}::${session.id}`} {...rowProps} />
       )
     },
     [
@@ -275,6 +282,7 @@ export function SidebarSessionsSection({
       onDeleteSession,
       onResumeSession,
       onTogglePin,
+      onToggleUnread,
       pinned,
       showProfileTags
     ]
@@ -459,6 +467,7 @@ export function SidebarSessionsSection({
         onDeleteSession={onDeleteSession}
         onResumeSession={onResumeSession}
         onTogglePin={onTogglePin}
+        onToggleUnread={onToggleUnread}
         pinned={pinned}
         rows={flatRows}
         showProfileTags={showProfileTags}
@@ -515,9 +524,11 @@ interface SortableSessionRowProps {
   session: SessionInfo
   isPinned: boolean
   isSelected: boolean
+  unread: boolean
   onArchive: () => void
   onDelete: () => void
   onPin: () => void
+  onToggleUnread: () => void
   onResume: () => void
 }
 
