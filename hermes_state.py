@@ -2820,6 +2820,55 @@ def preflight_db_writability(
             _ensure_writable(p)
 
 
+def _restrict_state_db_permissions(
+    db_path: Path,
+    *,
+    create_main: bool = False,
+) -> None:
+    """Best-effort owner-only permissions for state.db and its sidecars.
+
+    SQLite creates WAL/SHM sidecars with the main database's mode on POSIX, so
+    securing the main file before the WAL pragma prevents permissive umasks
+    from producing 0644 sidecars.  The second pass after schema setup covers
+    existing sidecars and filesystems with different creation behaviour.
+    """
+    if sys.platform.startswith("win"):
+        return
+
+    if create_main and not db_path.exists():
+        try:
+            fd = os.open(
+                db_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        except OSError:
+            logger.debug(
+                "Failed to create state database with private permissions: %s",
+                db_path,
+                exc_info=True,
+            )
+        else:
+            os.close(fd)
+
+    for candidate in (
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    ):
+        try:
+            if candidate.exists():
+                candidate.chmod(0o600)
+        except OSError:
+            logger.debug(
+                "Failed to restrict state database permissions for %s",
+                candidate,
+                exc_info=True,
+            )
+
+
 def _connect_repair_durable(
     db_path: Path, *, timeout: float = 5.0
 ) -> sqlite3.Connection:
@@ -4694,6 +4743,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
 
+            # Pre-create a missing main file at 0600 and tighten restored or
+            # legacy files before SQLite derives WAL/SHM modes from it.
+            _restrict_state_db_permissions(self.db_path, create_main=True)
+
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
                     str(self.db_path),
@@ -4715,6 +4768,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
+                _restrict_state_db_permissions(self.db_path)
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
