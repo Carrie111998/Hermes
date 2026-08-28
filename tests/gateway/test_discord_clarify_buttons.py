@@ -30,7 +30,6 @@ from plugins.platforms.discord.adapter import (  # noqa: E402
     DiscordAdapter,
 )
 from gateway.config import PlatformConfig  # noqa: E402
-from gateway.platforms.base import utf16_len  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +43,15 @@ def _make_adapter(*, allowed_users=None, allowed_roles=None):
     adapter._allowed_user_ids = set(allowed_users or [])
     adapter._allowed_role_ids = set(allowed_roles or [])
     return adapter
+
+
+def _choices_field_value(embed) -> str:
+    for field in embed.fields:
+        if isinstance(field, dict) and field.get("name") == "Choices":
+            return field.get("value") or ""
+        if getattr(field, "name", None) == "Choices":
+            return field.value
+    return ""
 
 
 def _clear_clarify_state():
@@ -86,45 +94,24 @@ class TestClarifyChoiceViewConstruction:
     """The view should build numeric buttons plus an Other button."""
 
 
-    def test_truncates_long_choice_label(self):
+    def test_long_choice_uses_short_numeric_button_label(self):
         long_choice = "x" * 200
         view = ClarifyChoiceView(
             choices=[long_choice],
             clarify_id="cidZ",
             allowed_user_ids=set(),
         )
-        # 78 chars + single-char ellipsis in the body, plus "1. " prefix.
-        # Uses U+2026 (…) instead of "..." to fit the 80-char Discord cap.
-        first_label = view.children[0].label
-        assert first_label.startswith("1. ")
-        assert first_label.endswith("\u2026")
-        # Final label total <= 80 (Discord cap on button labels)
-        assert len(first_label) <= 80
+        assert view.children[0].label == "1"
 
 
-    def test_truncates_long_no_space_choice_on_soft_boundary(self):
-        # A long choice with soft boundaries (commas, hyphens) but no spaces
-        # should still cut on a soft boundary, not mid-word. We use an input
-        # where position 76 is NOT a soft boundary — the test only passes
-        # if the renderer actively searches backward for a soft char
-        # rather than blindly cutting at the budget limit.
+    def test_no_space_choice_still_uses_short_numeric_button_label(self):
         long_choice = "a" * 30 + "-" + "b" * 30 + "-" + "c" * 30 + "-" + "d" * 30
-        # 30a-30b-30c-30d = 30 + 1 + 30 + 1 + 30 + 1 + 30 = 123 chars
-        # Position 76 is 'b' (a mid-word alpha). The renderer must look back
-        # for a '-' to cut on.
         view = ClarifyChoiceView(
             choices=[long_choice],
             clarify_id="cidSB",
             allowed_user_ids=set(),
         )
-        first_label = view.children[0].label
-        assert first_label.endswith("\u2026")
-        assert len(first_label) <= 80
-        body = first_label[len("1. "):].rstrip("\u2026")
-        last_char = body[-1]
-        assert last_char in {"-", ",", ".", ")", " "}, (
-            f"Label cuts mid-word at {last_char!r}: {first_label!r}"
-        )
+        assert view.children[0].label == "1"
 
 
 # ===========================================================================
@@ -232,6 +219,52 @@ class TestDiscordSendClarify:
         assert isinstance(kwargs["view"], ClarifyChoiceView)
         # 3 choice buttons + 1 Other
         assert len(kwargs["view"].children) == 4
+        assert [button.label for button in kwargs["view"].children[:-1]] == ["1", "2", "3"]
+        choices_text = _choices_field_value(kwargs["embed"])
+        assert "red" in choices_text and "green" in choices_text and "blue" in choices_text
+
+    @pytest.mark.asyncio
+    async def test_choices_field_respects_discord_1024_character_cap(self):
+        adapter = _make_adapter()
+        channel = MagicMock()
+        sent_msg = MagicMock(id=999)
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        await adapter.send_clarify(
+            chat_id="9001",
+            question="Pick",
+            choices=[f"choice-{index}-" + "x" * 100 for index in range(24)],
+            clarify_id="cid-cap",
+            session_key="sk-cap",
+        )
+
+        value = _choices_field_value(channel.send.call_args.kwargs["embed"])
+        assert len(value) <= 1024
+        assert value.endswith("Pick a button below, or click ✏️ Other to type a custom answer.")
+
+    @pytest.mark.asyncio
+    async def test_plain_content_respects_discord_2000_character_cap(self):
+        adapter = _make_adapter()
+        channel = MagicMock()
+        sent_msg = MagicMock(id=1000)
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        await adapter.send_clarify(
+            chat_id="9001",
+            question="Pick one of these detailed choices",
+            choices=[f"choice-{index}-" + "x" * 200 for index in range(24)],
+            clarify_id="cid-content-cap",
+            session_key="sk-content-cap",
+        )
+
+        content = channel.send.call_args.kwargs["content"]
+        assert len(content) <= 2000
+        assert "[additional choice text truncated]" in content
+        assert content.endswith(
+            "Pick a button below, or click ✏️ Other to type a custom answer."
+        )
 
     @pytest.mark.asyncio
     async def test_open_ended_omits_view(self):
@@ -290,7 +323,9 @@ class TestDiscordSendClarify:
         assert len(choice_labels) == 1, (
             f"Expected 1 choice, got {len(choice_labels)}: {choice_labels!r}"
         )
-        assert "real choice" in choice_labels[0]
+        assert choice_labels == ["1"]
+        choice_text = _choices_field_value(kwargs["embed"])
+        assert "real choice" in choice_text
         for label in choice_labels:
             assert "only_name_here" not in label, f"name leaked: {label!r}"
             assert "only_value_here" not in label, f"value leaked: {label!r}"

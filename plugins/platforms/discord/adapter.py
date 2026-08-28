@@ -7689,9 +7689,20 @@ class DiscordAdapter(BasePlatformAdapter):
             clean_choices = clean_choices[:24]
 
             if clean_choices:
+                option_lines_full = "\n".join(
+                    f"**{index + 1}.** {choice}"
+                    for index, choice in enumerate(clean_choices)
+                )
+                embed_suffix = (
+                    "\n\nPick a button below, or click ✏️ Other to type a custom answer."
+                )
+                option_lines = option_lines_full
+                if len(option_lines) + len(embed_suffix) > 1024:
+                    budget = 1024 - len(embed_suffix) - 3
+                    option_lines = option_lines[:budget] + "..."
                 embed.add_field(
                     name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
+                    value=f"{option_lines}{embed_suffix}",
                     inline=False,
                 )
                 view = ClarifyChoiceView(
@@ -7707,16 +7718,43 @@ class DiscordAdapter(BasePlatformAdapter):
                     inline=False,
                 )
                 view = None
+                option_lines_full = ""
 
-            # Mirror the question in plain content — embeds are invisible on
-            # some clients (see send_exec_approval).
-            clarify_tail = (
-                "\n\nPick one below, or click ✏️ Other to type a custom answer."
-                if clean_choices
-                else "\n\nReply in this channel with your answer."
-            )
+            # Mirror full choice text in plain content because embeds may be
+            # hidden and mobile button labels have almost no usable width.
+            content_header = "❓ **Hermes needs your input**"
+            question_text = str(question or "").strip()
+            if clean_choices:
+                instruction = (
+                    "Pick a button below, or click ✏️ Other to type a custom answer."
+                )
+                truncation_notice = "\n[additional choice text truncated]"
+                # Reserve enough plain-content space for the prompt itself.
+                # _self_contained_prompt_content() will cap a longer question
+                # to this same budget while preserving the tail verbatim.
+                question_reserve = min(len(question_text), 500)
+                fixed_length = (
+                    len(f"{content_header}\n\n")
+                    + question_reserve
+                    + len("\n\n")
+                    + len("\n\n")
+                    + len(instruction)
+                )
+                options_budget = max(0, self.MAX_MESSAGE_LENGTH - fixed_length)
+                mirrored_options = option_lines_full
+                if len(mirrored_options) > options_budget:
+                    text_budget = max(0, options_budget - len(truncation_notice))
+                    mirrored_options = (
+                        mirrored_options[:text_budget].rstrip()
+                        + truncation_notice
+                    )
+                clarify_tail = (
+                    f"\n\n{mirrored_options}\n\n{instruction}"
+                )
+            else:
+                clarify_tail = "\n\nReply in this channel with your answer."
             content = self._self_contained_prompt_content(
-                "❓ **Hermes needs your input**", str(question or "").strip(),
+                content_header, question_text,
                 tail=clarify_tail,
             )
             msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
@@ -9642,50 +9680,8 @@ def _define_discord_view_classes() -> None:
             self.resolved = False
 
             for index, choice in enumerate(self.choices):
-                # Discord button labels are capped at 80 chars. On mobile the
-                # visible width is much narrower (often <40 chars before it
-                # wraps to 2 lines and the second line gets cut off), so we
-                # cap aggressively and cut at a word boundary when possible
-                # to keep the trailing text readable.
-                #
-                # Cut strategy (most-preferred to least-preferred):
-                #   1. Last space in the trailing half of the budget
-                #      (cleanest word boundary)
-                #   2. Last soft boundary in the trailing half of the
-                #      budget (hyphen, comma, period, paren)
-                #   3. Hard cut at the budget limit (last resort)
-                prefix = f"{index + 1}. "
-                budget = _DISCORD_BUTTON_LABEL_LIMIT - utf16_len(prefix)
-                if utf16_len(choice) <= budget:
-                    label_body = choice
-                else:
-                    truncated = _prefix_within_utf16_limit(
-                        choice,
-                        max(0, budget - utf16_len(_DISCORD_ELLIPSIS)),
-                    ).rstrip()
-                    cut_at = -1
-                    # 1. Last space in the trailing half of the budget.
-                    space = truncated.rfind(" ")
-                    if space >= len(truncated) // 2:
-                        cut_at = space
-                    # 2. Soft boundary — only if no word boundary found.
-                    # Find the latest soft boundary in the trailing half
-                    # of the budget; that maximizes preserved text length.
-                    # Cut AT the soft boundary (inclusive) so the label
-                    # ends on the soft char (e.g. "-" or ",") rather than
-                    # on the alpha char that followed it.
-                    if cut_at < 0:
-                        latest_soft = max(
-                            (truncated.rfind(s) for s in ("-", ",", ".", ")")),
-                            default=-1,
-                        )
-                        if latest_soft >= len(truncated) // 2:
-                            cut_at = latest_soft + 1
-                    if cut_at > 0:
-                        truncated = truncated[:cut_at]
-                    label_body = truncated.rstrip() + _DISCORD_ELLIPSIS
                 button = discord.ui.Button(
-                    label=f"{prefix}{label_body}",
+                    label=str(index + 1),
                     style=discord.ButtonStyle.primary,
                     custom_id=f"clarify:{clarify_id}:{index}",
                 )
