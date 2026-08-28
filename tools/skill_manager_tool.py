@@ -1780,7 +1780,7 @@ SKILL_MANAGE_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["create", "patch", "delete", "write_file", "remove_file"],
-                "description": "The action to perform."
+                "description": ("Action to perform. Required params per action: ""create (requires: name, content), ""patch (requires: name, and either old_string+new_string for a targeted replacement or content alone for a full rewrite — not both), ""delete (requires: name), ""write_file (requires: name, file_path e.g. 'references/guide.md', file_content), ""remove_file (requires: name, file_path)")
             },
             "name": {
                 "type": "string",
