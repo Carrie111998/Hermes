@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -453,6 +454,50 @@ class DelayedInterimAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class InactivityOwnershipAgent:
+    """Park until the inline timeout path interrupts this exact old turn."""
+
+    started = threading.Event()
+    release = threading.Event()
+    timeout_ready = threading.Event()
+    instances = []
+
+    @classmethod
+    def reset(cls):
+        cls.started = threading.Event()
+        cls.release = threading.Event()
+        cls.timeout_ready = threading.Event()
+        cls.instances = []
+
+    def __init__(self, **_kwargs):
+        self.tools = []
+        self.interrupts = []
+        type(self).instances.append(self)
+
+    def run_conversation(self, _message, **_kwargs):
+        type(self).started.set()
+        assert type(self).release.wait(2.0)
+        return {
+            "final_response": "old turn unwound",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+    def get_activity_summary(self):
+        idle = 60.0 if type(self).timeout_ready.is_set() else 0.0
+        return {
+            "seconds_since_activity": idle,
+            "last_activity_desc": "parked test turn",
+            "current_tool": None,
+            "api_call_count": 1,
+            "max_iterations": 2,
+        }
+
+    def interrupt(self, reason):
+        self.interrupts.append(reason)
+        type(self).release.set()
 
 
 def _make_runner(adapter):
@@ -1557,6 +1602,119 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     assert result["final_response"] == "done"
     assert 'first command' in all_progress_text
     assert 'second command' not in all_progress_text
+
+
+@pytest.mark.asyncio
+async def test_inline_inactivity_timeout_preserves_replacement_clarify(
+    monkeypatch,
+    tmp_path,
+):
+    """The asyncio timeout path cannot erase a post-/new replacement prompt."""
+    from tools import clarify_gateway as cm
+
+    InactivityOwnershipAgent.reset()
+    cm.clear_all()
+    run_task = None
+    try:
+        fake_dotenv = types.ModuleType("dotenv")
+        fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = InactivityOwnershipAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0.01")
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT_WARNING", "0")
+
+        adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+        runner = _make_runner(adapter)
+        gateway_run = importlib.import_module("gateway.run")
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {"api_key": "***"},
+        )
+        # Isolate the asyncio poll branch: the detached watcher/reaper has its
+        # own regression above and must not be the actor that clears state here.
+        monkeypatch.setattr(
+            gateway_run,
+            "_watch_gateway_turn_inactivity",
+            lambda **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            gateway_run,
+            "_abandon_timed_out_gateway_turn",
+            lambda **_kwargs: False,
+        )
+        original_wait = asyncio.wait
+
+        async def _fast_wait(awaitables, timeout=None, **kwargs):
+            return await original_wait(awaitables, timeout=0.01, **kwargs)
+
+        monkeypatch.setattr(gateway_run.asyncio, "wait", _fast_wait)
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            thread_id=None,
+        )
+        session_key = "agent:main:telegram:dm:12345"
+        runner._session_run_generation[session_key] = 1
+        old_entry = cm.register(
+            "inline-timeout-old",
+            session_key,
+            "Old prompt",
+            ["old"],
+            run_generation=1,
+        )
+
+        run_task = asyncio.create_task(
+            runner._run_agent(
+                message="old turn",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="old-session",
+                session_key=session_key,
+                run_generation=1,
+            )
+        )
+        assert await asyncio.to_thread(InactivityOwnershipAgent.started.wait, 2.0)
+
+        # Model the /new ordering: the boundary clears the old prompt, bumps
+        # generation, then the replacement turn registers its prompt before
+        # the old timeout path resumes.
+        assert cm.clear_session(session_key) == 1
+        assert old_entry.event.is_set()
+        assert runner._invalidate_session_run_generation(
+            session_key,
+            reason="test_new",
+        ) == 2
+        replacement = cm.register(
+            "inline-timeout-replacement",
+            session_key,
+            "Replacement prompt",
+            ["new"],
+            run_generation=2,
+        )
+        InactivityOwnershipAgent.timeout_ready.set()
+
+        result = await asyncio.wait_for(run_task, timeout=2.0)
+        assert "inactive" in result["final_response"].lower()
+        assert InactivityOwnershipAgent.instances[0].interrupts == [
+            "Execution timed out (inactivity)"
+        ]
+        assert cm.get_entry(replacement.clarify_id) is replacement
+        assert not replacement.event.is_set()
+        assert cm.resolve_gateway_clarify(replacement.clarify_id, "new") is True
+        assert cm.wait_for_response(replacement.clarify_id, timeout=0.1) == "new"
+    finally:
+        InactivityOwnershipAgent.release.set()
+        if run_task is not None and not run_task.done():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        cm.clear_all()
 
 
 @pytest.mark.asyncio

@@ -67,6 +67,65 @@ def test_thread_watchdog_reaps_only_processes_created_by_timed_out_turn(monkeypa
     ]
 
 
+def test_stale_thread_watchdog_preserves_replacement_clarify(monkeypatch):
+    """Detached inactivity cleanup owns only its captured run generation."""
+    from tools import clarify_gateway as cm
+
+    agent = _IdleAgent()
+    worker_done, timeout_fired, cleanup_lock = _state()
+    monkeypatch.setattr(
+        process_registry,
+        "kill_started_since",
+        lambda *_args, **_kwargs: 0,
+    )
+    cm.clear_all()
+    try:
+        old_entry = cm.register(
+            "watchdog-old",
+            "shared-session",
+            "Old prompt",
+            ["old"],
+            run_generation=1,
+        )
+        replacement = cm.register(
+            "watchdog-replacement",
+            old_entry.session_key,
+            "Replacement prompt",
+            ["new"],
+            run_generation=2,
+        )
+
+        watchdog = threading.Thread(
+            target=_watch_gateway_turn_inactivity,
+            kwargs={
+                "agent_holder": [agent],
+                "task_id": "session-a",
+                "process_baseline": frozenset(),
+                "timeout": 30.0,
+                "worker_done": worker_done,
+                "timeout_fired": timeout_fired,
+                "cleanup_lock": cleanup_lock,
+                "poll_interval": 0.01,
+                "is_still_current": lambda: False,
+                "session_key": old_entry.session_key,
+                "run_generation": 1,
+            },
+        )
+        watchdog.start()
+        watchdog.join(timeout=1.0)
+
+        assert not watchdog.is_alive()
+        assert timeout_fired.is_set()
+        assert old_entry.event.is_set()
+        assert cm.get_entry(old_entry.clarify_id) is None
+        assert cm.get_entry(replacement.clarify_id) is replacement
+        assert not replacement.event.is_set()
+        assert cm.resolve_gateway_clarify(replacement.clarify_id, "new") is True
+        assert cm.wait_for_response(replacement.clarify_id, timeout=0.1) == "new"
+    finally:
+        cm.clear_all()
+
+
 def test_completed_worker_wins_race_and_preserves_background_process(monkeypatch):
     agent = _IdleAgent()
     worker_done, timeout_fired, cleanup_lock = _state()

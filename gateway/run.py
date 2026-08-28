@@ -938,7 +938,13 @@ def _approval_send_outcome(future, timeout: float) -> str:
     return "failed"
 
 
-def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | None":
+def _clarify_send_disposition(
+    fut,
+    *,
+    clarify_id: str,
+    session_key: str,
+    clarify_mod,
+) -> "str | None":
     """Decide whether a clarify prompt send aborts the wait, per the boundary rule.
 
     Same physics as the exec-approval card: the scheduling future can hit its
@@ -958,7 +964,7 @@ def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | N
         # Couldn't deliver the prompt — clean up and return the sentinel so
         # the agent can fall back to a sensible default rather than hanging.
         logger.warning("Clarify send failed definitively; clearing registration")
-        clarify_mod.clear_session(session_key)
+        clarify_mod.clear_session(session_key, clarify_id=clarify_id)
         return "[clarify prompt could not be delivered]"
     if outcome == "ambiguous":
         logger.warning(
@@ -978,7 +984,10 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     the (probably rendered) card still resolves.
     """
     abort = _clarify_send_disposition(
-        fut, session_key=session_key, clarify_mod=clarify_mod
+        fut,
+        clarify_id=clarify_id,
+        session_key=session_key,
+        clarify_mod=clarify_mod,
     )
     if abort is not None:
         return abort
@@ -3503,6 +3512,7 @@ def _abandon_timed_out_gateway_turn(
     cleanup_lock: threading.Lock,
     is_still_current: Optional[Callable[[], bool]] = None,
     session_key: Optional[str] = None,
+    run_generation: Optional[int] = None,
 ) -> bool:
     """Interrupt one timed-out turn and reap only processes it created."""
     with cleanup_lock:
@@ -3518,7 +3528,10 @@ def _abandon_timed_out_gateway_turn(
     agent = agent_holder[0] if agent_holder else None
     if agent is not None:
         try:
-            _clear_pending_clarify_session(session_key or "")
+            _clear_pending_clarify_session(
+                session_key or "",
+                run_generation=run_generation,
+            )
             request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT)
         except Exception:
             logger.debug("Timed-out agent interrupt failed", exc_info=True)
@@ -3551,6 +3564,7 @@ def _watch_gateway_turn_inactivity(
     poll_interval: float = 5.0,
     is_still_current: Optional[Callable[[], bool]] = None,
     session_key: Optional[str] = None,
+    run_generation: Optional[int] = None,
 ) -> None:
     """Thread watchdog that remains runnable when gateway asyncio is starved."""
     while not worker_done.wait(max(0.01, poll_interval)):
@@ -3574,6 +3588,7 @@ def _watch_gateway_turn_inactivity(
             cleanup_lock=cleanup_lock,
             is_still_current=is_still_current,
             session_key=session_key,
+            run_generation=run_generation,
         )
         return
 
@@ -6166,7 +6181,10 @@ class TurnRunner:
                 getattr(self._runner, "_running", True) is False
                 or getattr(self._runner, "_draining", False) is True
             ):
-                _clarify_mod.clear_session(ctx.session_key or "")
+                _clarify_mod.clear_session(
+                    ctx.session_key or "",
+                    clarify_id=clarify_id,
+                )
                 return "[clarify unavailable while gateway is shutting down]"
 
             # For WeCom native streaming: finalize the current stream before
@@ -10634,6 +10652,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
+        _busy_run_generation = getattr(
+            getattr(_busy_state, "persistent", None),
+            "run_generation",
+            None,
+        )
 
         busy_text_mode = self._effective_busy_text_mode(event.source)
         if (
@@ -10772,7 +10795,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif not _interrupt_text and _media_urls:
                     _interrupt_text = _build_media_placeholder(event)
-                _clear_pending_clarify_session(session_key)
+                _clear_pending_clarify_session(
+                    session_key,
+                    run_generation=_busy_run_generation,
+                )
                 running_agent.interrupt(_interrupt_text)
             except Exception:
                 pass  # don't let interrupt failure block the ack
@@ -18138,6 +18164,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _ra_state = self._peek_session_state(_quick_key)
             running_agent = _ra_state.turn.agent if _ra_state else None
+            _running_generation = getattr(
+                getattr(_ra_state, "persistent", None),
+                "run_generation",
+                None,
+            )
             if running_agent is _AGENT_PENDING_SENTINEL:
                 # Agent is being set up but not ready yet.
                 if event.get_command() == "stop":
@@ -18261,7 +18292,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
-            _clear_pending_clarify_session(_quick_key)
+            _clear_pending_clarify_session(
+                _quick_key,
+                run_generation=_running_generation,
+            )
             running_agent.interrupt(_interrupt_text)
             # NOTE: self._pending_messages was write-only (never consumed).
             # The actual interrupt message is delivered via adapter._pending_messages
@@ -29904,7 +29938,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 elif not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
-                            _clear_pending_clarify_session(session_key)
+                            _clear_pending_clarify_session(
+                                session_key,
+                                run_generation=run_generation,
+                            )
                             agent.interrupt(pending_text)
                             _interrupt_detected.set()
                             # Abort streaming TTS on barge-in (#60671).
@@ -30142,6 +30179,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "poll_interval": 5.0,
                         "is_still_current": _turn_is_current,
                         "session_key": session_key,
+                        "run_generation": _turn_run_generation,
                     },
                     name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                     daemon=True,
@@ -30193,7 +30231,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _clear_pending_clarify_session(session_key)
+                            _clear_pending_clarify_session(
+                                session_key,
+                                run_generation=run_generation,
+                            )
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
                             # Abort streaming TTS on barge-in (#60671).
@@ -30264,6 +30305,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "cleanup_lock": _turn_cleanup_lock,
                                 "is_still_current": _turn_is_current,
                                 "session_key": session_key,
+                                "run_generation": _turn_run_generation,
                             },
                             name=f"gateway-turn-reaper-{_turn_task_id[:12]}",
                             daemon=True,
@@ -30297,7 +30339,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _clear_pending_clarify_session(session_key)
+                            _clear_pending_clarify_session(
+                                session_key,
+                                run_generation=run_generation,
+                            )
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
                             # Abort streaming TTS on barge-in (#60671).
@@ -30332,7 +30377,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
                 if _timed_out_agent:
-                    _clear_pending_clarify_session(session_key)
+                    _clear_pending_clarify_session(
+                        session_key,
+                        run_generation=run_generation,
+                    )
                     request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT)
 
                 _timeout_mins = int(_agent_timeout // 60) or 1

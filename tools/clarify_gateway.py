@@ -787,6 +787,7 @@ def clear_session(
     session_key: str,
     *,
     run_generation: Optional[int] = None,
+    clarify_id: Optional[str] = None,
 ) -> int:
     """Resolve and drop matching pending clarifies for a session.
 
@@ -801,6 +802,14 @@ def clear_session(
     without cancelling the replacement's prompt.  Omitting it remains the
     conversation-boundary operation and clears every generation.
 
+    When ``clarify_id`` is provided, only that exact prompt is cleared.  Prompt
+    delivery failure uses this narrower selector because its delayed future may
+    settle after a replacement prompt has already registered under the same
+    session and generation.  Selection and mutation happen in one primitive-
+    lock transaction.  This function never enters ``SessionStore``; callers
+    already inside a route transaction therefore preserve the process-wide
+    ``SessionStore._lock -> clarify_gateway._lock`` order.
+
     First-writer-wins: an entry whose event is already set has been resolved
     by a real response (button callback or text intercept).  Session cleanup
     must NOT overwrite that response with the empty cancellation sentinel —
@@ -814,6 +823,9 @@ def clear_session(
         for cid in ids:
             entry = _entries.get(cid)
             if entry is None:
+                continue
+            if clarify_id is not None and cid != clarify_id:
+                retained_ids.append(cid)
                 continue
             if (
                 run_generation is not None
