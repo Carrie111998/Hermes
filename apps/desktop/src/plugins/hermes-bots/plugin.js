@@ -7772,7 +7772,10 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
     // delivered (the #93127 commit check decides its fate, not this loop).
     const roomDuringPoll = $groupChats.get()[group] || {}
 
-    if ((roomDuringPoll.epoch || 0) !== dispatchEpoch && (roomDuringPoll.holds || {})[memberKey]) {
+    if (
+      (roomDuringPoll.epoch || 0) !== dispatchEpoch &&
+      ((roomDuringPoll.holds || {})[memberKey] || dispatchEpoch <= (roomDuringPoll.cancelledThroughEpoch ?? -1))
+    ) {
       return null
     }
 
@@ -8133,7 +8136,13 @@ async function stopGroupThread(
   const stamp = { at: Date.now(), byMessageId: null, thread: thread || null }
 
   updateGroupChat(group, r => {
+    const stoppedEpoch = r.epoch || 0
     r.epoch = (r.epoch || 0) + 1
+    // The interrupt RPC only acknowledges cancellation; it does not wait for
+    // the old renderer poll to observe it. Keep a generation fence so that
+    // poll cannot consume a promoted turn after interrupt-and-send restores
+    // the user's sticky holds.
+    r.cancelledThroughEpoch = Math.max(r.cancelledThroughEpoch ?? -1, stoppedEpoch)
     r.running = false
     r.turn = null
 
@@ -8636,7 +8645,11 @@ function drainQueuedGroupMessage(group, members = null) {
 function cancelQueuedGroupMessage(group, messageId) {
   const room = $groupChats.get()[group]
 
-  if (!room || !(room.pending || []).some(item => item.id === messageId)) {
+  if (
+    !room ||
+    room.interruptingQueue?.id === messageId ||
+    !(room.pending || []).some(item => item.id === messageId)
+  ) {
     return false
   }
 
@@ -8650,7 +8663,11 @@ function cancelQueuedGroupMessage(group, messageId) {
 function keepWaitingForQueuedGroupMessage(group, messageId) {
   const room = $groupChats.get()[group]
 
-  if (!room || !(room.pending || []).some(item => item.id === messageId)) {
+  if (
+    !room ||
+    room.interruptingQueue?.id === messageId ||
+    !(room.pending || []).some(item => item.id === messageId)
+  ) {
     return false
   }
 
@@ -8685,7 +8702,8 @@ async function interruptForQueuedGroupMessage(group, messageId, members = null) 
     if (current.interruptingQueue || !(current.pending || []).some(item => item.id === messageId)) {
       return current
     }
-    current.pending = current.pending.filter(item => item.id !== messageId)
+    // Keep the claimed item in the durable FIFO while the interrupt RPC is in
+    // flight. A window close or crash must not lose the user's message.
     current.interruptingQueue = queued
     return current
   })
@@ -8704,7 +8722,6 @@ async function interruptForQueuedGroupMessage(group, messageId, members = null) 
     if (current.interruptingQueue?.id === messageId) {
       updateGroupChat(group, latest => {
         latest.interruptingQueue = null
-        latest.pending = [queued, ...(latest.pending || []).filter(item => item.id !== messageId)]
         latest.holds = priorHolds
         return latest
       })
@@ -13377,10 +13394,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
-  const pendingQueue = [
-    ...(room.interruptingQueue ? [room.interruptingQueue] : []),
-    ...(Array.isArray(room.pending) ? room.pending : [])
-  ]
+  const pendingQueue = Array.isArray(room.pending) ? room.pending : []
   const [queueNow, setQueueNow] = useState(() => Date.now())
   const composerKey = groupComposerDraftKey(group, room)
   const composerKeyRef = useRef(composerKey)
@@ -13655,7 +13669,11 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     const promoted = await interruptForQueuedGroupMessage(group, queued.id, memberDescriptors())
 
     if (!promoted) {
-      host.notifyError?.(new Error('queued message not found'), 'That queued message is no longer waiting')
+      const stillWaiting = ($groupChats.get()[group]?.pending || []).some(item => item.id === queued.id)
+      host.notifyError?.(
+        new Error(stillWaiting ? 'group interrupt failed' : 'queued message not found'),
+        stillWaiting ? 'Could not interrupt the current turn; the message is still queued' : 'That queued message is no longer waiting'
+      )
     }
   }
 

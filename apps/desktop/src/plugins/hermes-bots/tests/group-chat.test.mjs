@@ -441,10 +441,12 @@ test('interrupt-and-send is single-flight while session.interrupt is pending', a
   const first = gc.interruptForQueuedGroupMessage('Claim', selected.id, roster)
   const second = gc.interruptForQueuedGroupMessage('Claim', selected.id, roster)
   assert.equal(gc.$groupChats.get().Claim.interruptingQueue?.id, selected.id, 'claim is installed synchronously')
+  assert.equal(gc.$groupChats.get().Claim.pending[0].id, selected.id, 'the in-flight claim stays in the durable FIFO')
+  assert.equal(gc.storageWrites.get('group-chats').Claim.pending[0].id, selected.id, 'reload cannot lose the claimed send')
   assert.equal(gc.$groupChats.get().Claim.sessions.research, 'live-research-session')
   await Promise.resolve()
   gc.sendToGroupChat('Claim', roster, 'arrived during interrupt')
-  const later = gc.$groupChats.get().Claim.pending[0]
+  const later = gc.$groupChats.get().Claim.pending.at(-1)
 
   assert.equal(gc.$groupChats.get().Claim.interruptingQueue?.id, selected.id, 'the selected send owns the room')
   assert.equal(gc.requests.some(call => call.method === 'session.interrupt'), true, 'the interrupt RPC is in flight')
@@ -461,6 +463,7 @@ test('interrupt-and-send is single-flight while session.interrupt is pending', a
   assert.equal(await first, true)
   assert.equal(roomLog(gc, 'Claim').filter(entry => entry.text === 'promote exactly once').length, 1)
   assert.equal(gc.$groupChats.get().Claim.interruptingQueue, null)
+  assert.equal(gc.$groupChats.get().Claim.pending.some(item => item.id === selected.id), false)
 })
 
 test('explicit Stop cancels queued sends instead of leaving a false busy queue', async () => {
@@ -483,7 +486,7 @@ test('explicit Stop cancels queued sends instead of leaving a false busy queue',
   assert.equal(roomLog(gc, 'Stopped').some(entry => entry.text === 'must not survive Stop'), false)
 })
 
-test('a failed interrupt restores the claimed send without promoting it', async () => {
+test('a failed interrupt preserves the claimed send in its original FIFO position', async () => {
   const gc = load(() => '(pass)')
   // Let the plugin's one-time cold-start queue drain finish before constructing
   // this runtime-only failure state.
@@ -502,13 +505,37 @@ test('a failed interrupt restores the claimed send without promoting it', async 
     room.members = roster
     return room
   })
-  gc.sendToGroupChat('Rollback', roster, 'restore me')
-  const selected = gc.$groupChats.get().Rollback.pending[0]
+  gc.sendToGroupChat('Rollback', roster, 'stay first')
+  gc.sendToGroupChat('Rollback', roster, 'restore me in place')
+  gc.sendToGroupChat('Rollback', roster, 'stay last')
+  const selected = gc.$groupChats.get().Rollback.pending[1]
+  const originalOrder = gc.$groupChats.get().Rollback.pending.map(item => item.id)
 
   assert.equal(await gc.interruptForQueuedGroupMessage('Rollback', selected.id, roster), false)
   assert.equal(gc.$groupChats.get().Rollback.interruptingQueue, null)
-  assert.equal(gc.$groupChats.get().Rollback.pending[0].id, selected.id)
-  assert.equal(roomLog(gc, 'Rollback').some(entry => entry.text === 'restore me'), false)
+  assert.deepEqual(gc.$groupChats.get().Rollback.pending.map(item => item.id), originalOrder)
+  assert.equal(roomLog(gc, 'Rollback').some(entry => entry.text === 'restore me in place'), false)
+})
+
+test('interrupt fencing survives sticky-hold restoration until the old poll exits', async () => {
+  const gc = load(() => '(pass)')
+  const roster = [{ name: 'research', title: '' }]
+  gc.updateGroupChat('Fence', room => {
+    room.running = true
+    room.turn = 'research'
+    room.epoch = 8
+    room.sessions = { research: 'live-research-session' }
+    room.members = roster
+    room.holds = { research: { at: 1, byMessageId: 'sticky', thread: 'old' } }
+    return room
+  })
+  gc.sendToGroupChat('Fence', roster, 'promote after interrupt')
+  const selected = gc.$groupChats.get().Fence.pending[0]
+
+  assert.equal(await gc.interruptForQueuedGroupMessage('Fence', selected.id, roster), true)
+  const room = gc.$groupChats.get().Fence
+  assert.equal(room.cancelledThroughEpoch, 8, 'the stopped drive remains fenced after promotion')
+  assert.equal(room.holds.research.byMessageId, 'sticky', 'the user hold is restored without erasing the fence')
 })
 
 test('concurrent groups sharing one member keep sessions, deltas, and context isolated', async () => {
