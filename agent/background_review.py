@@ -1291,6 +1291,7 @@ def _run_review_in_thread(
                     "providers_order",
                     "provider_sort",
                     "provider_require_parameters",
+                    "provider_quantizations",
                     "provider_data_collection",
                 ):
                     _pref_val = getattr(agent, _pref_attr, None)
