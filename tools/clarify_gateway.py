@@ -32,8 +32,10 @@ Two delivery paths from the adapter:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
@@ -214,6 +216,172 @@ def _label_matches(text: str, choice: object) -> bool:
     return strip_recommended(text).casefold() == strip_recommended(str(choice)).casefold()
 
 
+_ENGLISH_ORDINALS = {
+    "first": 0,
+    "second": 1,
+    "third": 2,
+    "fourth": 3,
+    "fifth": 4,
+    "sixth": 5,
+    "seventh": 6,
+    "eighth": 7,
+    "ninth": 8,
+    "tenth": 9,
+}
+_KOREAN_ORDINALS = {
+    "첫번째": 0,
+    "첫째": 0,
+    "두번째": 1,
+    "둘째": 1,
+    "세번째": 2,
+    "셋째": 2,
+    "네번째": 3,
+    "넷째": 3,
+    "다섯번째": 4,
+    "여섯번째": 5,
+    "일곱번째": 6,
+    "여덟번째": 7,
+    "아홉번째": 8,
+    "열번째": 9,
+}
+_CHOICE_PREFIX_RE = re.compile(
+    r"^\s*(?:option\s*)?\d+\s*(?:[.)\]:-]|번\b)\s*",
+    re.IGNORECASE,
+)
+_RECOMMENDATION_MARKER_RE = re.compile(
+    r"\s*\((?:recommended|recommendation|추천)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalized_choice_phrase(text: object, *, choice_label: bool = False) -> str:
+    """Return a Unicode-stable comparison form for one typed choice phrase."""
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold().strip()
+    value = _RECOMMENDATION_MARKER_RE.sub("", value)
+    if choice_label:
+        value = _CHOICE_PREFIX_RE.sub("", value)
+    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
+    return " ".join(value.split())
+
+
+def _compact_choice_phrase(text: str) -> str:
+    return "".join(char for char in text if char.isalnum())
+
+
+def _ordinal_choice_index(text: str) -> Optional[int]:
+    """Resolve conservative English/Korean ordinal-only replies."""
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold().strip()
+    compact = re.sub(r"[\s._-]+", "", normalized)
+    if compact in _ENGLISH_ORDINALS:
+        return _ENGLISH_ORDINALS[compact]
+    if compact in _KOREAN_ORDINALS:
+        return _KOREAN_ORDINALS[compact]
+    numeric = re.fullmatch(r"(\d+)(?:st|nd|rd|th|번|번째)", compact)
+    if numeric:
+        return int(numeric.group(1)) - 1
+    return None
+
+
+def _is_recommendation_reply(text: str) -> bool:
+    normalized = _normalized_choice_phrase(text)
+    compact = _compact_choice_phrase(normalized)
+    return compact in {
+        "recommended",
+        "recommendation",
+        "recommendedone",
+        "recommendedoption",
+        "therecommendedone",
+        "추천",
+        "추천안",
+        "추천으로",
+        "추천한걸로",
+        "추천옵션",
+    }
+
+
+def _has_distinctive_fragment(normalized: str) -> bool:
+    """Reject tiny/common fragments before attempting unique containment."""
+    compact = _compact_choice_phrase(normalized)
+    if len(compact) < 3 or len(normalized) > 120:
+        return False
+    tokens = normalized.split()
+    for token in tokens:
+        if any(ord(char) > 127 for char in token) and len(token) >= 2:
+            return True
+        if any(char.isdigit() for char in token) and len(token) >= 2:
+            return True
+        if len(token) >= 4:
+            return True
+    return False
+
+
+def _match_abbreviated_single_choice(
+    text: str,
+    choices: List[str],
+) -> tuple[Optional[str], bool]:
+    """Return ``(canonical_choice, looked_like_selection)``.
+
+    Only an ordinal, explicit recommendation intent, or a fragment matching
+    exactly one choice is accepted. Multiple matches are selection-shaped but
+    intentionally unresolved so the gateway keeps the prompt armed.
+    """
+    ordinal = _ordinal_choice_index(text)
+    if ordinal is not None:
+        if 0 <= ordinal < len(choices):
+            return str(choices[ordinal]).strip(), True
+        return None, True
+
+    if _is_recommendation_reply(text):
+        recommended = [
+            str(choice).strip()
+            for choice in choices
+            if _RECOMMENDATION_MARKER_RE.search(
+                unicodedata.normalize("NFKC", str(choice)).strip()
+            )
+        ]
+        if len(recommended) == 1:
+            return recommended[0], True
+        return None, bool(recommended)
+
+    query = _normalized_choice_phrase(text)
+    if not _has_distinctive_fragment(query):
+        return None, False
+    query_compact = _compact_choice_phrase(query)
+    query_tokens = set(query.split())
+    matches: List[str] = []
+    for choice in choices:
+        canonical = str(choice).strip()
+        candidate = _normalized_choice_phrase(canonical, choice_label=True)
+        candidate_compact = _compact_choice_phrase(candidate)
+        candidate_tokens = set(candidate.split())
+        if (
+            query in candidate
+            or (len(query_compact) >= 4 and query_compact in candidate_compact)
+            or (query_tokens and query_tokens.issubset(candidate_tokens))
+        ):
+            matches.append(canonical)
+    if len(matches) == 1:
+        return matches[0], True
+    return None, len(matches) > 1
+
+
+def _selection_retry_message(entry: _ClarifyEntry) -> str:
+    """User-facing retry hint for an invalid or ambiguous typed selection."""
+    count = len(entry.choices or [])
+    if entry.multi_select:
+        return (
+            "I couldn't map that reply to the available options. "
+            "Reply with listed numbers (for example `1,3`) or exact labels."
+        )
+    numbers = ", ".join(str(index) for index in range(1, min(count, 4) + 1))
+    if count > 4:
+        numbers += ", …"
+    return (
+        "I couldn't map that reply to one option. "
+        f"Reply with {numbers or 'a listed number'}, or a more specific phrase."
+    )
+
+
 # Outcomes for typed clarify replies. Gateway uses these to decide whether to
 # cancel a pending prompt (free prose deadlock break) or keep it armed so the
 # user can retry a selection-like invalid reply (out-of-range / bad list).
@@ -362,6 +530,13 @@ def _coerce_text_response_detailed(
         if _label_matches(text, choice):
             return str(choice).strip(), None
 
+    abbreviated, looked_like_selection = _match_abbreviated_single_choice(
+        text,
+        entry.choices,
+    )
+    if abbreviated is not None:
+        return abbreviated, None
+
     # For text fallback or awaiting_text mode, accept custom text
     # For native interactive multi-choice mode, reject with a reason
     if entry.awaiting_text:
@@ -369,6 +544,8 @@ def _coerce_text_response_detailed(
 
     # Out-of-range / non-canonical integer is a failed selection, not prose.
     if is_int:
+        return None, "invalid_selection"
+    if looked_like_selection:
         return None, "invalid_selection"
     return None, "prose"
 
