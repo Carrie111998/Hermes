@@ -1028,6 +1028,61 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
     assert observed == {"history": runtime_id, "info": runtime_id}
 
 
+def test_retry_terminal_reconciliation_clears_blocked_room(db: Path):
+    identity = _identity()
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        ttl_seconds=0.05,
+        clock=time.time,
+    )
+    _admit(db, identity)
+    attempt = state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    time.sleep(0.06)
+    recovery_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="recovery-process",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    state.recover_room(db, recovery_lease, clock=time.time)
+    state.release_lease(db, recovery_lease, clock=time.time)
+    rpc = FakeSessionRPC(auto_complete=False)
+    rpc.add_session(
+        active=False,
+        task_id=identity.task_id,
+        history=[
+            {
+                "role": "assistant",
+                "task_id": identity.task_id,
+                "execution_generation": attempt.execution_generation,
+                "status": "settled",
+                "message_id": "reply:retry-recovered",
+                "content": "Recovered response.",
+            }
+        ],
+    )
+    runtime = _runtime(db, rpc)
+    runtime._blocked_rooms.add(ROOM_ID)
+
+    settled = runtime.retry_indeterminate(identity)
+
+    assert settled["status"] == "settled"
+    assert ROOM_ID not in runtime.status()["blocked_rooms"]
+
+
 def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
     db: Path,
 ):
@@ -1070,11 +1125,13 @@ def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
 
     rpc.info = cancelled_info
     runtime = _runtime(db, rpc)
+    runtime._blocked_rooms.add(ROOM_ID)
 
     cancelled = runtime.retry_indeterminate(identity)
 
     assert cancelled["status"] == "cancelled"
     assert cancelled["execution_generation"] == attempt.execution_generation
+    assert ROOM_ID not in runtime.status()["blocked_rooms"]
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
@@ -1568,6 +1625,9 @@ def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path):
 
     runtime.start()
     _wait_for(lambda: ROOM_ID in runtime.status()["blocked_rooms"])
+    inspected_calls = len(rpc.calls)
+    time.sleep(0.2)
+    assert len(rpc.calls) == inspected_calls
     assert runtime.stop(timeout=1.0)
 
     assert state.get_task(db, identity)["status"] == "indeterminate"

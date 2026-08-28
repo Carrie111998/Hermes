@@ -405,6 +405,8 @@ class HostedRoomRuntime:
                 result=inspection.terminal.result,
                 clock=self.clock,
             )
+            with self._status_lock:
+                self._blocked_rooms.discard(identity.room_id)
             if self.publish_terminal is not None:
                 self.publish_terminal(binding, resolved)
             return resolved
@@ -418,6 +420,8 @@ class HostedRoomRuntime:
                 cancel_id=f"remote-cancel:{task['execution_generation']}",
                 clock=self.clock,
             )
+            with self._status_lock:
+                self._blocked_rooms.discard(identity.room_id)
             if self.publish_terminal is not None:
                 self.publish_terminal(binding, resolved)
             return resolved
@@ -1212,6 +1216,17 @@ class HostedRoomRuntime:
             room_id=binding.room_id,
             status="indeterminate",
         )
+        with self._status_lock:
+            if not unresolved:
+                self._blocked_rooms.discard(binding.room_id)
+                return False
+            if binding.room_id in self._blocked_rooms:
+                # One unresolved inspection is enough. Re-reading a large
+                # hidden session every 100 ms starves the explicit Retry RPC
+                # on the same per-profile turn lock and burns a CPU core. The
+                # user action removes this fence after it safely requeues or
+                # reconciles the exact task.
+                return True
         for task in unresolved:
             inspection = self._inspect_recovery_session(binding, task)
             if inspection.status == "cancelled":
