@@ -148,6 +148,26 @@ Group access is controlled by the `SIGNAL_GROUP_ALLOWED_USERS` env var:
 | Set with group IDs | Only listed groups are monitored (e.g., `groupId1,groupId2`). |
 | Set to `*` | The bot responds in any group it's a member of. |
 
+### Mention Gating in Groups
+
+With `SIGNAL_REQUIRE_MENTION=true` (or `require_mention: true` in the platform
+config), the bot only answers group messages that @mention its account. The
+check accepts either the account's phone number or its Signal UUID (ACI) in the
+mention metadata — modern Signal clients often omit the number and send only
+the UUID.
+
+**Linked-device accounts:** when Hermes is linked to your own Signal account,
+the bot shares your phone number and has no separate identity, so no real
+@mention can target it. Set a plaintext trigger word instead:
+
+```bash
+SIGNAL_TRIGGER_ALIAS=hermes    # Case-insensitive; any group message containing
+                               # this word passes the mention gate
+```
+
+The alias also works alongside real @mentions — either one lets the message
+through.
+
 ---
 
 ## Features

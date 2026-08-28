@@ -553,6 +553,133 @@ def _make_dm_envelope(sender: str, attachments: list, text: str = "") -> dict:
     }
 
 
+def _make_group_envelope(sender: str, text: str, mentions: list, group_id: str = "grp1") -> dict:
+    """Build a minimal signal-cli group envelope with @mention metadata."""
+    return {
+        "envelope": {
+            "sourceNumber": sender,
+            "sourceName": "Test User",
+            "sourceUuid": "aaaaaaaa-0000-0000-0000-000000000001",
+            "timestamp": 1700000000000,
+            "dataMessage": {
+                "timestamp": 1700000000000,
+                "message": text,
+                "expiresInSeconds": 0,
+                "viewOnce": False,
+                "attachments": [],
+                "mentions": mentions,
+                "groupInfo": {"groupId": group_id, "type": "DELIVER"},
+            },
+        }
+    }
+
+
+class TestSignalGroupMentionFilter:
+    """require_mention gate: UUID-only mention metadata and trigger alias (#65071).
+
+    Modern Signal clients only carry the UUID (ACI) in @mention metadata —
+    ``number`` is often empty, always so for linked-device accounts. The gate
+    must compare against the bot's cached UUID, and a configurable plaintext
+    trigger alias must bypass the gate for linked accounts that can never
+    receive a real @mention.
+    """
+
+    BOT = "+15551234567"
+    BOT_UUID = "3eb65f7a-6a00-4263-a72c-280a262aa28b"
+    OTHER_UUID = "b2187174-cd8e-4bb5-9f7f-dd6d6890d9e7"
+
+    async def _dispatch(self, monkeypatch, envelope, *, cache_bot_uuid=True, **extra):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account=self.BOT,
+            group_allowed="*",
+            require_mention=True,
+            **extra,
+        )
+        if cache_bot_uuid:
+            # Populated in production by syncMessage echoes / contact sync.
+            adapter._remember_recipient_identifiers(self.BOT, self.BOT_UUID)
+        adapter._rpc, _ = _stub_rpc(None)
+        dispatched = []
+
+        async def _fake_handle_message(event):
+            dispatched.append(event)
+
+        adapter.handle_message = _fake_handle_message
+        await adapter._handle_envelope(envelope)
+        return dispatched
+
+    @pytest.mark.asyncio
+    async def test_uuid_only_mention_matches_cached_bot_uuid(self, monkeypatch):
+        """Mention metadata with UUID but no number must pass the gate (#65071)."""
+        envelope = _make_group_envelope(
+            "+15559876543",
+            "\uFFFC hello bot",
+            [{"start": 0, "length": 1, "uuid": self.BOT_UUID}],
+        )
+        dispatched = await self._dispatch(monkeypatch, envelope)
+        assert dispatched, "UUID-only @mention of the bot was dropped by require_mention"
+
+    @pytest.mark.asyncio
+    async def test_number_mention_still_matches(self, monkeypatch):
+        envelope = _make_group_envelope(
+            "+15559876543",
+            "\uFFFC hello bot",
+            [{"start": 0, "length": 1, "number": self.BOT, "uuid": self.BOT_UUID}],
+        )
+        dispatched = await self._dispatch(monkeypatch, envelope)
+        assert dispatched
+
+    @pytest.mark.asyncio
+    async def test_foreign_uuid_mention_is_dropped(self, monkeypatch):
+        """A mention of someone else must not pass the gate."""
+        envelope = _make_group_envelope(
+            "+15559876543",
+            "\uFFFC take a look",
+            [{"start": 0, "length": 1, "uuid": self.OTHER_UUID}],
+        )
+        dispatched = await self._dispatch(monkeypatch, envelope)
+        assert not dispatched
+
+    @pytest.mark.asyncio
+    async def test_uuid_mention_without_cache_is_dropped(self, monkeypatch):
+        """Before the bot's UUID is learned, a UUID-only mention can't match."""
+        envelope = _make_group_envelope(
+            "+15559876543",
+            "\uFFFC hello",
+            [{"start": 0, "length": 1, "uuid": self.BOT_UUID}],
+        )
+        dispatched = await self._dispatch(monkeypatch, envelope, cache_bot_uuid=False)
+        assert not dispatched
+
+    @pytest.mark.asyncio
+    async def test_trigger_alias_bypasses_gate(self, monkeypatch):
+        """trigger_alias lets linked-device accounts respond without a real @mention."""
+        envelope = _make_group_envelope("+15559876543", "Hey Hermes, what time is it?", [])
+        dispatched = await self._dispatch(monkeypatch, envelope, trigger_alias="hermes")
+        assert dispatched, "trigger alias did not bypass the mention gate"
+
+    @pytest.mark.asyncio
+    async def test_trigger_alias_is_case_insensitive(self, monkeypatch):
+        envelope = _make_group_envelope("+15559876543", "HERMES ping", [])
+        dispatched = await self._dispatch(monkeypatch, envelope, trigger_alias="Hermes")
+        assert dispatched
+
+    @pytest.mark.asyncio
+    async def test_no_alias_no_mention_is_dropped(self, monkeypatch):
+        envelope = _make_group_envelope("+15559876543", "just chatting", [])
+        dispatched = await self._dispatch(monkeypatch, envelope)
+        assert not dispatched
+
+    @pytest.mark.asyncio
+    async def test_alias_from_env_var(self, monkeypatch):
+        """SIGNAL_TRIGGER_ALIAS env var configures the alias when extra doesn't."""
+        monkeypatch.setenv("SIGNAL_TRIGGER_ALIAS", "jarvis")
+        envelope = _make_group_envelope("+15559876543", "ok jarvis do it", [])
+        dispatched = await self._dispatch(monkeypatch, envelope)
+        assert dispatched
+
+
 class TestSignalInboundMessageTypeClassification:
     """_handle_envelope must set MessageType.DOCUMENT for application/* and text/* attachments.
 

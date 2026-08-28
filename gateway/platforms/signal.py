@@ -309,6 +309,18 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             self.require_mention = os.getenv("SIGNAL_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
 
+        # Trigger alias — plaintext fallback for the mention filter (#65071).
+        # A linked-device account shares the user's phone number and has no
+        # separate Signal identity, so no real @mention can ever target the
+        # bot; Signal also replaces display names with U+FFFC in the raw
+        # message text, so name matching can't work either. When set, a group
+        # message containing this word (case-insensitive) passes the
+        # require_mention gate as if the bot had been @mentioned.
+        _alias_cfg = extra.get("trigger_alias")
+        if _alias_cfg is None:
+            _alias_cfg = _sig_secret("SIGNAL_TRIGGER_ALIAS", "")
+        self.trigger_alias = str(_alias_cfg or "").strip().lower()
+
         # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
         # (reactions fire before run.py's auth gate, so without this check
@@ -664,15 +676,33 @@ class SignalAdapter(BasePlatformAdapter):
         # Mention filter: in groups, only process messages that @mention the bot account
         if is_group and self.require_mention:
             account_norm = self._account_normalized
-            # Check rendered mention tags OR raw mention metadata
-            mentioned_in_text = account_norm and (
-                f"@{account_norm}" in (text or "")
+            bot_uuid = (
+                self._recipient_uuid_by_number.get(account_norm)
+                if account_norm
+                else None
             )
+            # Check rendered mention tags OR raw mention metadata. When the
+            # mention metadata carried no number, _render_mentions falls back
+            # to the UUID, so the rendered tag must be checked both ways.
+            mentioned_in_text = bool(account_norm) and (
+                f"@{account_norm}" in (text or "")
+                or bool(bot_uuid and f"@{bot_uuid}" in (text or ""))
+            )
+            # Modern Signal clients only put the UUID (ACI) in @mention
+            # metadata — ``number`` is often empty, especially for linked
+            # accounts (#65071) — so a comparison against the phone number
+            # alone never matches. Also compare against the bot's own UUID,
+            # cached from envelope traffic (syncMessage echoes populate it).
             mentioned_in_metadata = any(
-                m.get("number") == account_norm or m.get("uuid") == account_norm
+                m.get("number") == account_norm
+                or m.get("uuid") == account_norm
+                or bool(bot_uuid and m.get("uuid") == bot_uuid)
                 for m in (data_message.get("mentions") or [])
             )
-            if not mentioned_in_text and not mentioned_in_metadata:
+            alias_matched = bool(self.trigger_alias) and (
+                self.trigger_alias in (text or "").lower()
+            )
+            if not mentioned_in_text and not mentioned_in_metadata and not alias_matched:
                 logger.debug(
                     "Signal: ignoring group message (require_mention=true, bot not mentioned)"
                 )

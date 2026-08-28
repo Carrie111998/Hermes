@@ -148,6 +148,18 @@ sudo hermes gateway install --system   # 仅 Linux：开机自启系统服务
 | 设置群组 ID | 仅监听列出的群组（如 `groupId1,groupId2`）。 |
 | 设置为 `*` | 机器人在其所在的任意群组中均会响应。 |
 
+### 群组中的 @提及门控
+
+设置 `SIGNAL_REQUIRE_MENTION=true`（或在平台配置中设置 `require_mention: true`）后，机器人只回应 @提及了其账号的群组消息。检查同时接受提及元数据中的电话号码和 Signal UUID（ACI）——现代 Signal 客户端往往只发送 UUID 而省略号码。
+
+**关联设备账号：** 当 Hermes 以关联设备方式接入你自己的 Signal 账号时，机器人与你共用同一个电话号码，没有独立身份，因此无法被真正 @提及。此时可以设置一个纯文本触发词：
+
+```bash
+SIGNAL_TRIGGER_ALIAS=hermes    # 不区分大小写；任何包含该词的群组消息都会通过提及门控
+```
+
+触发词与真正的 @提及可以同时使用——满足其一即可。
+
 ---
 
 ## 功能特性
