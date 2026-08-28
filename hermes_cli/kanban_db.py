@@ -11946,18 +11946,24 @@ def _default_spawn(
             if sk:
                 cmd.extend(["--skills", sk])
     explicit_local_route = _resolve_explicit_local_task_route(task)
+    # ``local_first`` is a default-route policy, not a directive to erase a
+    # card's deliberate provider/model selection.  Remote task pins still go
+    # through the normal egress firewall and may fail closed or activate the
+    # configured fallback chain; silently replacing them here sends tasks to
+    # the wrong capability class (for example, PR repair to a small local
+    # model) and can turn a bounded job into a long provider-stall loop.
+    has_explicit_task_model = bool(str(task.model_override or "").strip())
     local_first_route = (
         _resolve_local_first_route(parsed_profile)
-        if _kanban_local_first_enabled()
+        if _kanban_local_first_enabled() and not has_explicit_task_model
         else None
     )
     selected_local_route = explicit_local_route or local_first_route
     if selected_local_route is not None:
         # An explicit local task pin has precedence over the profile's local
-        # fallback. A remote task override remains subject to local-first
-        # policy, avoiding a guaranteed egress rejection for protected task
-        # context while preserving the configured profile route and
-        # fail-closed firewall for any later fallback attempt.
+        # fallback.  Explicit remote task pins are handled by the branch
+        # below, where the provider is preserved and the normal fail-closed
+        # egress policy remains authoritative.
         local_provider, local_model = selected_local_route
         _log.info(
             "kanban worker %s: local route %s/%s selected before spawn (%s)",
