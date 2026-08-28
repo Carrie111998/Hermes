@@ -1622,6 +1622,32 @@ CREATE TABLE IF NOT EXISTS pm_plans (
 -- operator_display is a human-readable label ONLY. It is NOT an identity
 -- boundary: Hermes runs as the same OS user as its agents, so this column
 -- records who the operator claims to be, not who they are proven to be.
+--
+-- ASSURANCE STATEMENT (canonical — see approval_broker.ASSURANCE_STATEMENT)
+--
+-- Hermes approval gates are an integrity control, not a security boundary
+-- against arbitrary code execution as your own user account.
+--
+-- Hermes workers run as the same OS user as you, with terminal and filesystem
+-- access. Any process running as that user can read the credentials on disk.
+-- Approval gates therefore provide strong, tested protection against:
+--
+-- - a worker or agent approving its own plan (accidental self-approval),
+-- - approval reached through ordinary tool invocation, on any surface,
+-- - prompt injection that emits an approval command,
+-- - approval of a stale plan whose text has since changed,
+-- - replay of a previous approval,
+-- - confused-deputy approval of a different project or board.
+--
+-- They do not provide a cryptographic boundary against a deliberately
+-- adversarial process running as your user. Production deployment additionally
+-- requires an authenticated surface whose credentials are not deliberately
+-- exposed to workers, which raises the cost of bypass without eliminating it
+-- under full local compromise.
+--
+-- A genuine adversarial-agent boundary requires an independent security domain:
+-- separate OS identities, an external approval service the agent cannot reach,
+-- or hardware-backed confirmation. None of these is in Phase 1.
 CREATE TABLE IF NOT EXISTS pm_approvals (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     subject          TEXT NOT NULL,

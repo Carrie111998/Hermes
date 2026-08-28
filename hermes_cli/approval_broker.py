@@ -51,6 +51,32 @@ binding, the single-use nonce, the TTL, and the atomic transaction in
 machinery accepts it unchanged. None of it had to be rebuilt, because none of it
 was what failed — the *surface* was.
 
+ASSURANCE STATEMENT (canonical — reproduced verbatim in six locations)
+----------------------------------------------------------------------
+Hermes approval gates are an integrity control, not a security boundary
+against arbitrary code execution as your own user account.
+
+Hermes workers run as the same OS user as you, with terminal and filesystem
+access. Any process running as that user can read the credentials on disk.
+Approval gates therefore provide strong, tested protection against:
+
+- a worker or agent approving its own plan (accidental self-approval),
+- approval reached through ordinary tool invocation, on any surface,
+- prompt injection that emits an approval command,
+- approval of a stale plan whose text has since changed,
+- replay of a previous approval,
+- confused-deputy approval of a different project or board.
+
+They do not provide a cryptographic boundary against a deliberately
+adversarial process running as your user. Production deployment additionally
+requires an authenticated surface whose credentials are not deliberately
+exposed to workers, which raises the cost of bypass without eliminating it
+under full local compromise.
+
+A genuine adversarial-agent boundary requires an independent security domain:
+separate OS identities, an external approval service the agent cannot reach,
+or hardware-backed confirmation. None of these is in Phase 1.
+
 NOTE ON THE LOOPBACK DESKTOP SURFACE
 ------------------------------------
 The loopback token is **not** independent authentication and must never be
@@ -69,6 +95,39 @@ import socket
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+# The canonical assurance statement. Every other location reproduces these
+# words; the medium sets the wrapping and the comment or quote prefix, and
+# `test_assurance_statement.py` compares them word-for-word after normalising
+# both away. Editing the words here without editing the other five locations
+# fails that test — which is the point: one claim about what Hermes guarantees,
+# not six that drift apart.
+ASSURANCE_STATEMENT = """\
+Hermes approval gates are an integrity control, not a security boundary
+against arbitrary code execution as your own user account.
+
+Hermes workers run as the same OS user as you, with terminal and filesystem
+access. Any process running as that user can read the credentials on disk.
+Approval gates therefore provide strong, tested protection against:
+
+- a worker or agent approving its own plan (accidental self-approval),
+- approval reached through ordinary tool invocation, on any surface,
+- prompt injection that emits an approval command,
+- approval of a stale plan whose text has since changed,
+- replay of a previous approval,
+- confused-deputy approval of a different project or board.
+
+They do not provide a cryptographic boundary against a deliberately
+adversarial process running as your user. Production deployment additionally
+requires an authenticated surface whose credentials are not deliberately
+exposed to workers, which raises the cost of bypass without eliminating it
+under full local compromise.
+
+A genuine adversarial-agent boundary requires an independent security domain:
+separate OS identities, an external approval service the agent cannot reach,
+or hardware-backed confirmation. None of these is in Phase 1.
+"""
+
 
 # Attestations expire quickly: the window between a human reading a plan and
 # confirming it is seconds, and a long-lived object is a replay target.
