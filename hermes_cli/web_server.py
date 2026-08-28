@@ -751,27 +751,39 @@ def _dashboard_public_hosts() -> frozenset[str]:
 
 
 def _collect_provider_skip_reasons() -> "list[str]":
-    """Every bundled dashboard-auth provider's LAST_SKIP_REASON, prefixed.
+    """Every loaded dashboard-auth provider's LAST_SKIP_REASON, prefixed.
 
-    All four bundled providers (nous / basic / self_hosted / drain) expose the
-    module-level ``LAST_SKIP_REASON`` contract for the gate's fail-closed
-    branch; reading only nous left the other three's skip reasons invisible —
-    an operator hitting the gate with `basic` installed-but-unconfigured just
-    saw "no providers" (#88959). Import failures count as no reason (the
-    provider may not be installed at all).
+    Provider plugins are imported by the plugin manager under the
+    ``hermes_plugins.*`` namespace (``_NS_PARENT``), so ``register()`` — the
+    only writer of ``LAST_SKIP_REASON`` — runs on the manager's module
+    object. Importing ``plugins.dashboard_auth.<name>`` here instead would
+    materialize a second module object from the same file whose
+    ``register()`` never ran, so every reason would read empty — the
+    pre-existing nous-only branch never fired for exactly that reason.
+    Reading off the plugin objects the manager already holds after
+    discovery also covers third-party ``dashboard_auth/*`` plugins instead
+    of a hardcoded name list. Discovery/lookup failures count as no reason
+    (the provider may not be installed at all).
     """
     reasons: "list[str]" = []
-    for provider_name in ("nous", "basic", "self_hosted", "drain"):
-        try:
-            provider_mod = __import__(
-                f"plugins.dashboard_auth.{provider_name}",
-                fromlist=["LAST_SKIP_REASON"],
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()  # idempotent — register() must have run first
+        manager = get_plugin_manager()
+        for lookup_key, loaded in sorted(manager._plugins.items()):
+            if not lookup_key.startswith("dashboard_auth/"):
+                continue
+            reason = (
+                getattr(loaded.module, "LAST_SKIP_REASON", "")
+                if loaded.module is not None
+                else ""
             )
-            reason = getattr(provider_mod, "LAST_SKIP_REASON", "")
             if reason:
+                provider_name = lookup_key.partition("/")[-1]
                 reasons.append(f"  • {provider_name}: {reason}")
-        except Exception:
-            pass
+    except Exception:
+        pass
     return reasons
 
 
