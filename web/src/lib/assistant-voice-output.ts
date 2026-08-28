@@ -21,7 +21,8 @@ export function speakAssistantFinal(
   synthesis: SpeechSynthesisLike,
   text: string,
   onSettled: () => void,
-): { cancel(): void } {
+): { cancel(): void } | null {
+  if (typeof SpeechSynthesisUtterance !== "function") return null;
   const utterance = new SpeechSynthesisUtterance(text);
   let settled = false;
   const settle = () => {

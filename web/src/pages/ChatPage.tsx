@@ -185,6 +185,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const wsRef = useRef<WebSocket | null>(null);
   const voiceTurnRef = useRef(false);
   const voicePlaybackRef = useRef<{ cancel(): void } | null>(null);
+  const pendingVoiceReturnRef = useRef<(() => void) | null>(null);
   const stickToBottomRef = useRef(true);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
@@ -512,7 +513,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   };
 
   const submitVoiceTranscript = useCallback((transcript: string) => {
-    if (!submitVoiceTranscriptToPty(() => wsRef.current, transcript)) {
+    if (!submitVoiceTranscriptToPty(
+      () => wsRef.current,
+      transcript,
+      (ready) => {
+        pendingVoiceReturnRef.current = ready;
+      },
+      () => setBanner("Chat disconnected before the voice transcript could be submitted."),
+    )) {
       setBanner("Chat disconnected before the voice transcript could be sent.");
       return;
     }
@@ -532,7 +540,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const playback = speakAssistantFinal(window.speechSynthesis, text, () => {
       if (voicePlaybackRef.current === playback) voicePlaybackRef.current = null;
     });
-    voicePlaybackRef.current = playback;
+    if (playback) voicePlaybackRef.current = playback;
   }, [cancelVoicePlayback]);
 
   useEffect(() => cancelVoicePlayback, [cancelVoicePlayback]);
@@ -1344,17 +1352,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // bottom as each chunk COMMITS (xterm write callback) instead of
       // guessing with a fixed delay, and release the pin the moment the user
       // scrolls up to read the backlog (#59591).
-      const followScroll = shouldFollowPtyOutput(
+      const shouldFollowScroll = shouldFollowPtyOutput(
         effectiveResume,
         stickToBottomRef.current,
-      )
-        ? () => termRef.current?.scrollToBottom()
-        : undefined;
-      term.write(rendered, followScroll);
+      );
+      const submitReturn = pendingVoiceReturnRef.current;
+      term.write(rendered, () => {
+        if (shouldFollowScroll) termRef.current?.scrollToBottom();
+        if (submitReturn && pendingVoiceReturnRef.current === submitReturn) {
+          pendingVoiceReturnRef.current = null;
+          submitReturn();
+        }
+      });
       noteResumePtyChunk(rendered);
     };
 
     ws.onclose = (ev) => {
+      const failPendingVoiceReturn = pendingVoiceReturnRef.current;
+      pendingVoiceReturnRef.current = null;
       // Drain buffered sanitizer state. A buffered partial escape is dropped
       // (writing an unterminated CSI would wedge xterm's parser); a buffered
       // newline run is emitted collapsed.
@@ -1379,6 +1394,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       const why = ev.reason ? ` reason=${ev.reason}` : "";
       console.warn(`[chat] PTY WebSocket closed code=${ev.code}${why}`);
       setLastCloseCode(ev.code);
+      if (failPendingVoiceReturn) {
+        if (!ev.wasClean || ev.code === 1001 || ev.code === 1006) {
+          scheduleReconnect(ev.code);
+        } else {
+          setPtyState("closed");
+        }
+        failPendingVoiceReturn();
+        return;
+      }
       if (ev.code === 4401) {
         if (maybeReloadForLoopbackWsAuthFailure(ev.code)) {
           return;
