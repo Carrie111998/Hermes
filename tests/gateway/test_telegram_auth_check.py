@@ -460,3 +460,80 @@ def test_per_chat_groups_allow_from_does_not_apply_to_dms():
 
     msg = _make_message(from_user_id=111, chat_id=111, chat_type="dm")
     assert adapter._is_user_authorized_from_message(msg) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: groups.<chatId>.allow_from must never bypass the chat-level
+# allowed_chats/group_allowed_chats gate (t_450b1946 / uss-platform #2353
+# §17 slice 4/6 follow-up). Confirmed bug: PR-97104 let the per-chat sender
+# gate independently decide `authorized` before the chat-level allowlist
+# was consulted, so a sender listed in groups.<chatId>.allow_from could
+# speak in a chat that was never allowlisted at the chat level at all.
+# Mirrors WeCom's _is_group_allowed ordering: chat-level resolves FIRST,
+# per-chat sender filter applies only as an additional AND on top of it.
+# ---------------------------------------------------------------------------
+
+
+def test_per_chat_allow_from_does_not_bypass_chat_level_allowed_chats():
+    """Sender matches groups.<chatId>.allow_from but the chat itself is not
+    in allowed_chats -> must be REJECTED, not authorized.
+
+    Exact repro from the task: allowed_chats excludes -100999, but
+    groups.-100999.allow_from lists sender 222 -- 222 must still be
+    rejected because the chat never passed the chat-level gate.
+    """
+    adapter = _make_adapter(
+        allowed_chats=["-100111"],
+        groups={"-100999": {"allow_from": ["222"]}},
+    )
+
+    msg = _make_message(from_user_id=222, chat_id=-100999, chat_type="group")
+    assert adapter._is_user_authorized_from_message(msg) is False
+
+
+def test_per_chat_allow_from_does_not_bypass_group_allowed_chats():
+    """Same bypass, but via the runner-facing group_allowed_chats gate
+    instead of the response-facing allowed_chats gate.
+    """
+    adapter = _make_adapter(
+        group_allowed_chats=["-100111"],
+        groups={"-100999": {"allow_from": ["222"]}},
+    )
+
+    msg = _make_message(from_user_id=222, chat_id=-100999, chat_type="group")
+    assert adapter._is_user_authorized_from_message(msg) is False
+
+
+def test_chat_level_allowed_sender_level_rejected_is_still_rejected():
+    """Inverse: chat-level allowlist accepts the chat, but the sender fails
+    the per-chat groups.<chatId>.allow_from filter -> must be REJECTED.
+
+    Exercises the real chat-level path (not a stub runner that never gets
+    called): allowed_chats explicitly includes -100123, so chat-level
+    resolves True, but sender 111 is not in groups.-100123.allow_from.
+    """
+    adapter = _make_adapter(
+        allowed_chats=["-100123"],
+        groups={"-100123": {"allow_from": ["222"]}},
+    )
+
+    msg = _make_message(from_user_id=111, chat_id=-100123, chat_type="group")
+    assert adapter._is_user_authorized_from_message(msg) is False
+
+    # Listed sender in the allowed chat is still authorized.
+    msg_ok = _make_message(from_user_id=222, chat_id=-100123, chat_type="group")
+    assert adapter._is_user_authorized_from_message(msg_ok) is True
+
+
+def test_per_chat_allow_from_bypass_blocked_even_with_flat_group_allow_from_matching():
+    """Belt-and-suspenders: even when the flat group_allow_from gate would
+    have separately authorized the sender, an excluded chat still rejects.
+    """
+    adapter = _make_adapter(
+        allowed_chats=["-100111"],
+        group_allow_from=["222"],
+        groups={"-100999": {"allow_from": ["222"]}},
+    )
+
+    msg = _make_message(from_user_id=222, chat_id=-100999, chat_type="group")
+    assert adapter._is_user_authorized_from_message(msg) is False

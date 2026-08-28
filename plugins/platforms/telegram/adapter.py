@@ -1421,10 +1421,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Per-chat sender allowlist: groups.<chatId>.allow_from (#992a463a).
         # Mirrors WeCom's groups.<id>.allow_from (_resolve_group_cfg /
-        # _is_group_allowed). This is an ADDITIONAL, independent gate on top
-        # of the flat group_allow_from / chat-level allowlist above — chat-
-        # level allowlisting (allowed_chats/group_allowed_chats) is unchanged;
-        # when groups.<chatId> is present for this chat, the sender must ALSO
+        # _is_group_allowed) — including WeCom's ORDERING: _is_group_allowed
+        # resolves chat-level policy FIRST and returns False immediately if
+        # the chat itself isn't allowed, THEN applies the per-chat sender
+        # filter as an additional, sequential AND. Replicate that here: this
+        # gate must never be able to independently satisfy `authorized`
+        # before chat-level allowlisting (allowed_chats/group_allowed_chats /
+        # TELEGRAM_ALLOWED_CHATS / TELEGRAM_GROUP_ALLOWED_CHATS) has actually
+        # run — otherwise a sender who matches groups.<chatId>.allow_from for
+        # a chat that was never allowlisted at the chat level bypasses that
+        # gate entirely (t_450b1946 / uss-platform #2353 §17 slice 4/6 fix).
+        #
+        # When groups.<chatId> is present for this chat, the sender must ALSO
         # be listed in its allow_from. An entry present with allow_from: []
         # fails closed for that chat (blocks everyone), not "ignore this key".
         # When groups.<chatId> is absent for the chat, this gate is a no-op
@@ -1436,10 +1444,35 @@ class TelegramAdapter(BasePlatformAdapter):
                     group_cfg.get("allow_from") if isinstance(group_cfg, dict) else None
                 )
                 per_chat_authorized = user_id in per_chat_allow or "*" in per_chat_allow
-                if authorized is None:
-                    authorized = per_chat_authorized
+
+                # Resolve chat-level authorization FIRST (WeCom ordering).
+                # `chat_level_authorized` is None when no chat-level
+                # allowlist is configured at all (unrestricted — the runner
+                # fallback below still applies normally); False when a
+                # configured allowlist excludes this chat (hard reject,
+                # independent of any per-chat sender match); True when a
+                # configured allowlist explicitly includes this chat.
+                chat_level_authorized = self._telegram_chat_level_authorized(source.chat_id)
+
+                if chat_level_authorized is False:
+                    # Chat itself never passed the chat-level gate — no
+                    # sender can be authorized here via the per-chat gate,
+                    # regardless of groupAccess/allow_from matches.
+                    authorized = False
+                elif chat_level_authorized is True:
+                    # Chat-level gate explicitly passed; per-chat sender
+                    # filter is now a sequential AND on top of it.
+                    authorized = per_chat_authorized and (
+                        authorized if authorized is not None else True
+                    )
                 else:
-                    authorized = authorized and per_chat_authorized
+                    # No chat-level allowlist configured at all — preserve
+                    # prior behavior (this gate ANDs with any flat
+                    # group_allow_from decision, or stands alone).
+                    if authorized is None:
+                        authorized = per_chat_authorized
+                    else:
+                        authorized = authorized and per_chat_authorized
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -8620,6 +8653,41 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_chat_level_authorized(self, chat_id: Optional[str]) -> Optional[bool]:
+        """Resolve chat-level group authorization for ``chat_id``.
+
+        Mirrors WeCom's ``_is_group_allowed`` chat-scope check so the
+        per-chat ``groups.<chatId>.allow_from`` sender gate
+        (``_is_user_authorized_from_message``) can consult it BEFORE
+        applying the sender filter, instead of being able to independently
+        decide ``authorized`` and skip chat-level allowlisting entirely
+        (t_450b1946 / uss-platform #2353 §17 slice 4/6).
+
+        Consults both chat-scope allowlists the codebase recognizes for
+        Telegram groups — ``group_allowed_chats``/``TELEGRAM_GROUP_ALLOWED_CHATS``
+        (the runner's own authorization gate, see
+        ``gateway/authz_mixin.py::_is_user_authorized``) and
+        ``allowed_chats``/``TELEGRAM_ALLOWED_CHATS`` (the response gate) —
+        with the same AND semantics as ``_telegram_observe_allowed_chats``:
+        when both are configured, the chat must satisfy both.
+
+        Returns:
+            ``None`` when neither allowlist is configured (unrestricted —
+            the caller falls through to its normal, unrestricted decision
+            chain unchanged). ``True``/``False`` when at least one allowlist
+            is configured and the chat passes/fails it.
+        """
+        normalized_chat_id = str(chat_id or "").strip()
+        group_allowed = self._telegram_group_allowed_chats()
+        response_allowed = self._telegram_allowed_chats()
+        if not group_allowed and not response_allowed:
+            return None
+        if group_allowed and normalized_chat_id not in group_allowed:
+            return False
+        if response_allowed and normalized_chat_id not in response_allowed:
+            return False
+        return True
 
     def _telegram_observe_allowed_chats(self) -> set[str]:
         """Chats where observed group context may use a shared source.
