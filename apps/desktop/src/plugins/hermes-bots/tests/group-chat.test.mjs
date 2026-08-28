@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
-const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES, GROUP_CHAT_MAX_MEMBERS };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -304,7 +304,7 @@ test('hard caps: chatty members stop at GROUP_CHAT_MAX_MESSAGES total', async ()
   assert.ok(memberMessages.length <= gc.GROUP_CHAT_MAX_MESSAGES, `posted ${memberMessages.length}`)
 })
 
-test('failed member turn is a pass, not a room error', async () => {
+test('failed member turn posts a one-line error notice, not silence', async () => {
   const gc = load(profile => {
     if (profile === 'builder') {
       throw new Error('gateway hiccup')
@@ -318,7 +318,94 @@ test('failed member turn is a pass, not a room error', async () => {
   }
 
   const log = roomLog(gc, 'Flaky')
-  assert.equal(log.length, 1) // just the user message; no error entries
+  // user message + the failed member's one-line error notice
+  assert.equal(log.length, 2)
+  const notice = log[1]
+  assert.equal(notice.from.kind, 'member')
+  assert.equal(notice.from.name, 'builder')
+  assert.equal(notice.routing, 'none')
+  assert.equal(notice.code, 'member_turn_failed')
+  assert.equal(notice.memberKey, 'builder')
+  assert.equal(notice.text, '⚠️ builder turn failed: gateway hiccup. No automatic retry; mention builder in a new user message to try again.')
+  assert.doesNotMatch(notice.text, /@[a-z0-9][a-z0-9._-]*/i)
+  assert.doesNotMatch(notice.text, /[\r\n]/)
+
+  const compact = gc.groupChatSyncSnapshot({ Flaky: { log: [notice], members: MEMBERS } })
+    .rooms['name:Flaky'].log[0]
+  assert.equal(compact.from.kind, 'member', 'projection must not turn a failure into a user send')
+  assert.equal(compact.routing, 'none')
+  assert.equal(compact.code, 'member_turn_failed')
+
+  // The routing guard is independent of the sanitiser: even a legacy notice
+  // containing a handle must not pull a member into the next round.
+  const polluted = { ...notice, text: '@builder', routing: 'none' }
+  const responders = gc.resolveGroupResponders([
+    { from: { kind: 'user', name: 'You' }, text: 'status', at: 1 },
+    polluted
+  ], MEMBERS)
+  assert.deepEqual(responders.map(member => member.name), MEMBERS.map(member => member.name))
+})
+
+test('failed members stay out of everyone-default until a user names them; success clears only that failure', async () => {
+  const failOnce = new Set(['research', 'builder'])
+  const gc = load(profile => {
+    if (failOnce.delete(profile)) {
+      throw new Error(`${profile} unavailable`)
+    }
+    return '(pass)'
+  })
+  const members = [{ name: 'research', title: '' }, { name: 'builder', title: '' }]
+  const waitForRoom = async () => {
+    for (let i = 0; i < 300 && (gc.$groupChats.get().Failures || {}).running; i++) {
+      await new Promise(resolve => setImmediate(resolve))
+    }
+  }
+
+  gc.sendToGroupChat('Failures', members, 'status')
+  await waitForRoom()
+  assert.deepEqual(Object.keys(gc.$groupChats.get().Failures.unackedFailures).sort(), ['builder', 'research'])
+  assert.deepEqual(Object.keys(gc.$groupChats.get().Failures.failedMembers).sort(), ['builder', 'research'])
+
+  // A later user message with no member mention clears the blanket badge
+  // state only; it must not acknowledge either member's failure.
+  gc.sendToGroupChat('Failures', members, 'status again')
+  await waitForRoom()
+  assert.deepEqual(Object.keys(gc.$groupChats.get().Failures.unackedFailures).sort(), ['builder', 'research'])
+  assert.equal(gc.calls.filter(call => call.profile === 'builder').length, 1, 'failed builder is excluded from everyone-default')
+
+  // Naming one failed member releases and successfully acknowledges only that
+  // member. The other failed member remains excluded and still needs-you.
+  gc.sendToGroupChat('Failures', members, '@research retry this')
+  await waitForRoom()
+  assert.equal(gc.calls.filter(call => call.profile === 'research').length, 2)
+  assert.equal(gc.calls.filter(call => call.profile === 'builder').length, 1)
+  assert.equal(JSON.stringify(gc.$groupChats.get().Failures.unackedFailures), JSON.stringify({ builder: true }))
+  assert.equal(gc.$groupNeedsYou.get().Failures, true)
+
+  gc.sendToGroupChat('Failures', members, '@builder retry this')
+  await waitForRoom()
+  assert.equal(gc.calls.filter(call => call.profile === 'builder').length, 2)
+  assert.equal(JSON.stringify(gc.$groupChats.get().Failures.unackedFailures), JSON.stringify({}))
+  assert.equal(gc.$groupNeedsYou.get().Failures, false)
+})
+
+test('repeated failed member turns stay within the per-run message cap', async () => {
+  const gc = load(() => {
+    throw new Error('provider unavailable')
+  })
+  const manyMembers = Array.from(
+    { length: gc.GROUP_CHAT_MAX_MEMBERS },
+    (_, index) => ({ name: `builder-${index}`, title: '' })
+  )
+
+  gc.sendToGroupChat('Outage', manyMembers, 'anyone around?')
+  for (let i = 0; i < 400 && (gc.$groupChats.get().Outage || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  const memberMessages = roomLog(gc, 'Outage').filter(e => e.from.kind === 'member')
+  assert.ok(memberMessages.length <= gc.GROUP_CHAT_MAX_MEMBERS)
+  assert.ok(memberMessages.length <= gc.GROUP_CHAT_MAX_MESSAGES)
 })
 
 test('delta injection: a second user send only feeds members the NEW messages', async () => {

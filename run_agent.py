@@ -3980,6 +3980,14 @@ class AIAgent:
                 "the model produced no follow-up text. Send `continue` to "
                 "let it summarize."
             )
+        if reason == "review_input_budget_exhausted":
+            return (
+                prefix
+                + "the review's aggregate input budget was exhausted while a "
+                "tool result was still pending, so the model never produced a "
+                "final answer. The review was stopped; start a new review with "
+                "a narrower task if you still need one."
+            )
         if reason == "session_persistence_failed":
             cause = persistence_cause or "unknown"
             if cause == "compression":
