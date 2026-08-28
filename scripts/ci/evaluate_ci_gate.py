@@ -45,8 +45,8 @@ def main() -> int:
             output.write(f"needs-json={needs_json}\n")
 
     for name, result in sorted(compact.items()):
-        icon = "✅" if result in _ACCEPTED_RESULTS else "❌"
-        print(f"{icon} {name}: {result}")
+        status = "[ok]" if result in _ACCEPTED_RESULTS else "[blocked]"
+        print(f"{status} {name}: {result}")
     if blocked:
         print(f"::error::{len(blocked)} job(s) did not complete: {', '.join(blocked)}")
         return 1
