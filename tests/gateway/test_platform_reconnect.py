@@ -29,6 +29,7 @@ class StubAdapter(BasePlatformAdapter):
         # Records the is_reconnect value of every connect() call so tests can
         # assert that the watcher distinguishes reconnect from cold boot (#46621).
         self.connect_calls: list[bool] = []
+        self.disconnect_calls = 0
 
     async def connect(self, *, is_reconnect: bool = False):
         self.connect_calls.append(is_reconnect)
@@ -38,6 +39,7 @@ class StubAdapter(BasePlatformAdapter):
         return self._succeed
 
     async def disconnect(self):
+        self.disconnect_calls += 1
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
@@ -198,6 +200,88 @@ class TestPlatformReconnectWatcher:
             f"watcher must pass is_reconnect=True; got {succeed_adapter.connect_calls!r}"
         )
         assert Platform.TELEGRAM in runner.adapters
+
+    @pytest.mark.asyncio
+    async def test_shutdown_after_connect_disposes_candidate_without_publishing(self):
+        """A connect that loses the shutdown race cannot escape teardown."""
+
+        runner = _make_runner()
+        runner._draining = False
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": platform_config,
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+        }
+        candidate = StubAdapter(succeed=True)
+        real_sleep = asyncio.sleep
+
+        async def connect_finishes_after_shutdown(*_args, **_kwargs):
+            runner._running = False
+            runner._draining = True
+            return True
+
+        async def immediate_sleep(_delay):
+            await real_sleep(0)
+
+        with (
+            patch.object(runner, "_create_adapter", return_value=candidate),
+            patch.object(
+                runner,
+                "_connect_adapter_with_timeout",
+                new=AsyncMock(side_effect=connect_finishes_after_shutdown),
+            ),
+            patch("asyncio.sleep", side_effect=immediate_sleep),
+        ):
+            await runner._platform_reconnect_watcher()
+
+        assert Platform.TELEGRAM not in runner.adapters
+        assert Platform.TELEGRAM in runner._failed_platforms
+        assert candidate.disconnect_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_connect_disposes_unpublished_candidate(self):
+        """CancelledError must not bypass cleanup of an in-flight candidate."""
+
+        runner = _make_runner()
+        runner._draining = False
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": platform_config,
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+        }
+        candidate = StubAdapter(succeed=True)
+        connect_entered = asyncio.Event()
+        never_finishes = asyncio.Event()
+        real_sleep = asyncio.sleep
+
+        async def blocking_connect(*_args, **_kwargs):
+            connect_entered.set()
+            await never_finishes.wait()
+            return True
+
+        async def immediate_sleep(_delay):
+            await real_sleep(0)
+
+        with (
+            patch.object(runner, "_create_adapter", return_value=candidate),
+            patch.object(
+                runner,
+                "_connect_adapter_with_timeout",
+                new=AsyncMock(side_effect=blocking_connect),
+            ),
+            patch("asyncio.sleep", side_effect=immediate_sleep),
+        ):
+            watcher = asyncio.create_task(runner._platform_reconnect_watcher())
+            await asyncio.wait_for(connect_entered.wait(), timeout=1)
+            watcher.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await watcher
+
+        assert Platform.TELEGRAM not in runner.adapters
+        assert Platform.TELEGRAM in runner._failed_platforms
+        assert candidate.disconnect_calls == 1
 
     @pytest.mark.asyncio
     async def test_cold_connect_defaults_to_is_reconnect_false(self):

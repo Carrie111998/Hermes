@@ -456,7 +456,7 @@ hermes webhook <subscribe|list|remove|test>
 
 | 子命令 | 说明 |
 |------------|-------------|
-| `subscribe` / `add` | 创建 webhook 路由。返回要在你的服务上配置的 URL 和 HMAC 密钥。 |
+| `subscribe` / `add` | 创建 webhook 路由，并打印路由 URL、绑定的 provider/signature mode、secret/token，以及可用的服务商专用请求头提示。 |
 | `list` / `ls` | 显示所有 agent 创建的订阅。 |
 | `remove` / `rm` | 删除动态订阅。不影响 config.yaml 中的静态路由。 |
 | `test` | 发送测试 POST 以验证订阅是否正常工作。 |
@@ -470,16 +470,23 @@ hermes webhook subscribe <name> [options]
 | 选项 | 说明 |
 |--------|-------------|
 | `--prompt` | 带有 `{dot.notation}` payload 引用的 prompt 模板。 |
-| `--events` | 要接受的逗号分隔事件类型（如 `issues,pull_request`）。为空则接受所有。 |
+| `--events` | 以逗号分隔的事件过滤器。GitHub 允许一个已认证正文类别（`check_run`、`pull_request`、`push`、`issues` 或 `ping`）；GitLab 允许一个精确请求头值。为空时不进行过滤：路由绑定的 GitHub/GitLab 请求解析为 `unknown`，而以正文为权限来源的服务商仍可从已认证 payload 解析事件。 |
+| `--provider` | 显式服务商契约（默认：`github`），例如 `github`、`gitlab`、`svix`、`standard_webhooks`、`stripe`、`hermes` 或 `generic`。 |
+| `--signature-mode` | 显式验证器覆盖；通用发送方推荐使用 `generic_v2`。 |
+| `--route-profile` | 有权接收此路由的 gateway profile（默认：`default`）。任何显式命名 profile 即使在单 profile 模式下也使用 `/p/<profile>/webhooks/<name>`（此时名称必须是当前运行的 profile）；multiplex 模式只增加可同时服务多个名称的能力。顶层 `--profile` 标志用于选择运行 CLI 的本地 Hermes profile，两者含义不同。 |
 | `--description` | 人类可读的描述。 |
 | `--skills` | 为 agent 运行加载的逗号分隔 skill 名称。 |
-| `--deliver` | 投递目标：`log`（默认）、`telegram`、`discord`、`slack`、`github_comment`。 |
+| `--deliver` | 投递目标：`log`（默认）、`telegram`、`discord`、`slack`、`github_comment`。`github_comment` 还要求路由绑定的 `deliver_extra.repo` 和正整数 `deliver_extra.pr_number`；当前 CLI 没有设置这些字段的标志，因此该目标应使用完整静态路由（或谨慎编辑完整动态条目并换用全新 secret）。 |
 | `--deliver-chat-id` | 跨平台投递的目标聊天/频道 ID。 |
-| `--secret` | 自定义 HMAC 密钥。省略时自动生成。 |
+| `--secret` | 自定义服务商验证 secret/token。省略时自动生成。 |
 | `--deliver-only` | 跳过 agent——将渲染后的 `--prompt` 作为字面消息投递。零 LLM 成本，亚秒级投递。要求 `--deliver` 为真实目标（非 `log`）。 |
-| `--script` | 位于 `~/.hermes/scripts/` 下的过滤/转换脚本。webhook payload 以 JSON 形式通过 stdin 传入；JSON stdout 会替换 payload，空 stdout、`[SILENT]` 或非零退出码会忽略该 webhook。参见[脚本过滤与转换](../user-guide/messaging/webhooks.md#script-filters-and-transforms)。 |
+| `--script` | 位于活动 profile 的 `$HERMES_HOME/scripts/` 下（通常为 `~/.hermes/scripts/`）的过滤/转换脚本。webhook payload 以 JSON 形式通过 stdin 传入；JSON stdout 会替换 payload，空 stdout 或 `[SILENT]` 会抑制投递。静态脚本错误会阻止监听器启动；无效动态候选会被跳过或撤销。执行开始后的超时或非零退出会返回 HTTP 500，标记结果为不确定，并持久阻止同一投递身份重试。参见[脚本过滤与转换](../user-guide/messaging/webhooks.md#script-filters-and-transforms)。 |
 
-订阅持久化到 `~/.hermes/webhook_subscriptions.json`，webhook 适配器无需重启 gateway 即可热重载。
+订阅持久化到活动 profile 的 `$HERMES_HOME/webhook_subscriptions.json`（通常为 `~/.hermes/webhook_subscriptions.json`；命名 profile 通常使用 `~/.hermes/profiles/<name>/webhook_subscriptions.json`），webhook 适配器无需重启 gateway 即可热重载。适配器在连接时和每个传入 webhook 之前检查文件：元数据变化会在下一次检查中加载；元数据未变化时，受限的 SHA-256 内容复查最多大约每秒一次。
+
+`subscribe` 默认使用 `--provider github`；这不是服务商自动探测。所有非 GitHub 发送方都应显式设置 `--provider`，并在适用时设置 `--signature-mode`。`hermes webhook test` 会生成符合服务商结构的默认正文，但 `--payload` 会原样发送你提供的 JSON：为自定义正文签名，并不会让它自动满足 GitHub 事件分类器或其他服务商的 payload 契约。
+
+当 webhook 绑定地址省略、为 loopback，或为通配地址（`0.0.0.0` / `::`）时，`subscribe` 打印的是**本地测试 URL（Local test URL）**。不要把该 URL 配置给外部服务商；必须通过公网 HTTPS 反向代理暴露完全相同的路由路径。例如，本地的 `/p/ops/webhooks/build` 在公网 URL 中也必须保持为 `/p/ops/webhooks/build`。配置了非 loopback 绑定地址时，输出会改为标记 **Callback URL**。`hermes webhook test` 有意直接向配置的/本地 gateway 地址发送请求，不会测试公网反向代理。
 
 ## `hermes doctor`
 

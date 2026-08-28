@@ -3030,6 +3030,12 @@ class BasePlatformAdapter(ABC):
     # set this to False to stay correct-by-default.
     supports_async_delivery: bool = True
 
+    # Some adapters own a stronger, domain-specific final-delivery ledger.
+    # Those adapters must not also be enrolled in the generic best-effort
+    # obligation ledger: two independent recovery authorities can race and
+    # turn one final response into duplicate external effects.
+    owns_final_delivery_ledger: bool = False
+
     # Whether this adapter's ``send()`` splits long content into multiple
     # messages via ``truncate_message()``.  When True, the delivery router
     # (gateway/delivery.py) skips gateway-level truncation and lets the
@@ -3077,6 +3083,12 @@ class BasePlatformAdapter(ABC):
     # "interactive_resume", True)`` — no per-platform branching at the call
     # site.
     interactive_resume: bool = True
+
+    # Whether the gateway's generic restart path may synthesize a new agent
+    # turn for this adapter's interrupted sessions. Domain transports with an
+    # exact operation ledger can set this false so a generic session replay
+    # cannot bypass an indeterminate-operation fence.
+    allows_automatic_session_resume: bool = True
 
     # Back-reference to the running ``GatewayRunner``, injected by
     # ``gateway/run.py`` after the adapter is created. Adapters consume it via
@@ -4688,6 +4700,20 @@ class BasePlatformAdapter(ABC):
         notice — never echo the local audio_path into chat, since it is a
         host filesystem path that would leak the Hermes home layout.
         """
+        if getattr(self, "owns_final_delivery_ledger", False) is True:
+            # A ledger-owned final is one exact carrier. Converting an
+            # unsupported voice attachment into a second text send would let
+            # this fallback notice claim that carrier before the prepared
+            # agent final reaches the adapter's durable mutation gate.
+            logger.warning(
+                "[%s] send_voice fallback refused for ledger-owned final",
+                self.name,
+            )
+            return SendResult(
+                success=False,
+                error="Voice delivery is unavailable for ledger-owned finals",
+            )
+
         # audio_path is intentionally NOT included in the chat text — it is a
         # host-local path that leaks filesystem layout. The path is logged for
         # operator diagnostics instead.
@@ -6495,6 +6521,37 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            if response and getattr(self, "owns_final_delivery_ledger", False):
+                # A domain ledger owns one exact final object, not the generic
+                # gateway's sequence of text, image, audio, document, and
+                # fallback-notice sends. Hand the complete response to that
+                # adapter once, before extraction can split it into separately
+                # mutating calls.
+                delivery_adapter = self._final_delivery_adapter(event.source)
+                if not getattr(
+                    delivery_adapter, "owns_final_delivery_ledger", False
+                ):
+                    raise RuntimeError(
+                        "ledger-owned final delivery adapter is unavailable"
+                    )
+                final_content = delivery_adapter.prepare_ledger_owned_final_content(
+                    str(response),
+                    session_key=session_key,
+                )
+                logger.info(
+                    "[%s] Sending one ledger-owned final response (%d chars) to %s",
+                    delivery_adapter.name,
+                    len(final_content),
+                    event.source.chat_id,
+                )
+                result = await delivery_adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=final_content,
+                    reply_to=_reply_anchor_for_event(event),
+                    metadata=_mark_notify_metadata(_thread_metadata),
+                )
+                _record_delivery(result)
+                response = None
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
@@ -6700,9 +6757,15 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    if (
+                        not is_ephemeral_response
+                        and not getattr(
+                            delivery_adapter, "owns_final_delivery_ledger", False
+                        )
+                        and not str(event.text or "")
+                        .lstrip()
+                        .startswith(("/", self.typed_command_prefix or "!"))
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -7393,18 +7456,47 @@ class BasePlatformAdapter(ABC):
         the ``toolsets`` key in ``webhook_subscriptions.json``.
         """
         return None
-    
+
+    def resolved_toolsets_for_source(
+        self, source: "SessionSource"
+    ) -> Optional[List[str]]:
+        """Return an exact, already-validated source grant when available.
+
+        Unlike :meth:`toolsets_for_source`, this list is not resolved again
+        against mutable config, plugin defaults, or newly enabled MCP servers.
+        ``None`` means no exact carrier; ``[]`` is an explicit deny-all grant.
+        """
+
+        return None
+
+    def prepare_ledger_owned_final_content(
+        self,
+        content: str,
+        *,
+        session_key: str,
+    ) -> str:
+        """Build the one final carrier consumed by an adapter-owned ledger.
+
+        Adapters that set :attr:`owns_final_delivery_ledger` bypass the generic
+        text/media fan-out and receive exactly one final send. They may
+        deterministically reduce unsupported attachment directives here before
+        that content is durably staged.
+        """
+
+        del session_key
+        return content
+
     def format_message(self, content: str) -> str:
         """
         Format a message for this platform.
-        
+
         Override in subclasses to handle platform-specific formatting
         (e.g., Telegram MarkdownV2, Discord markdown).
-        
+
         Default implementation returns content as-is.
         """
         return content
-    
+
     @staticmethod
     def truncate_message(
         content: str,

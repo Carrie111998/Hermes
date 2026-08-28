@@ -73,10 +73,10 @@ class TestResolutionOrder:
 
 
 class TestMissingProfileWarning:
-    """Tests for warning when a profile doesn't exist on disk."""
+    """Explicit missing profiles fail closed instead of changing authority."""
     
     def test_nonexistent_profile_warning(self, mock_runner, discord_source, caplog):
-        """When source.profile points to a nonexistent profile, log a WARNING."""
+        """A removed source.profile is rejected with a warning."""
         discord_source.profile = "nonexistent"
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
@@ -85,10 +85,8 @@ class TestMissingProfileWarning:
                 with patch("hermes_cli.profiles.profile_exists", return_value=False):
                     with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
                         with caplog.at_level(logging.WARNING):
-                            result = mock_runner._resolve_profile_home_for_source(discord_source)
-                            
-                            # Should fall back to global HERMES_HOME
-                            assert result == Path("/hermes")
+                            with pytest.raises(ProfileRouteRejected):
+                                mock_runner._resolve_profile_home_for_source(discord_source)
                             
                             # Should have logged a warning
                             assert len(caplog.records) == 1
@@ -105,24 +103,27 @@ class TestMissingProfileWarning:
 class TestExceptionHandling:
     """Tests for exception handling in profile resolution."""
     
-    def test_get_profile_dir_exception_logs_warning(self, mock_runner, discord_source, caplog):
-        """When get_profile_dir raises an exception, log a WARNING with context."""
+    def test_get_profile_dir_exception_rejects_explicit_profile(
+        self, mock_runner, discord_source, caplog
+    ):
+        """Resolution errors cannot fall back to another profile's home."""
         discord_source.profile = "bad-profile"
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir", side_effect=ValueError("Invalid profile name")):
                 with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
                     with caplog.at_level(logging.WARNING):
-                        result = mock_runner._resolve_profile_home_for_source(discord_source)
-                        
-                        # Should fall back to global HERMES_HOME
-                        assert result == Path("/hermes")
+                        with pytest.raises(ProfileRouteRejected):
+                            mock_runner._resolve_profile_home_for_source(discord_source)
                         
                         # Should have logged a warning with exception info
                         assert len(caplog.records) == 1
                         assert caplog.records[0].levelname == "WARNING"
                         assert "bad-profile" in caplog.records[0].message
-                        assert "Failed to resolve profile directory" in caplog.records[0].message
+                        assert (
+                            "Failed to resolve explicit profile directory"
+                            in caplog.records[0].message
+                        )
     
 
 
@@ -136,10 +137,11 @@ class TestRoutingConsultation:
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
                 mock_get_dir.return_value = Path("/hermes/profiles/routed")
-                
+
                 mock_runner._profile_name_for_source = MagicMock(return_value="routed")
-                
-                mock_runner._resolve_profile_home_for_source(discord_source)
+
+                with patch("hermes_cli.profiles.profile_exists", return_value=True):
+                    mock_runner._resolve_profile_home_for_source(discord_source)
                 
                 # Should have called routing
                 mock_runner._profile_name_for_source.assert_called_once_with(discord_source)
@@ -385,5 +387,3 @@ class TestMultiplexGate:
         discord_source.profile = None
 
         assert mock_runner._profile_name_for_source(discord_source) is None
-
-

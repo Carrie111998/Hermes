@@ -23,12 +23,18 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, SendResult
-from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+from gateway.platforms.webhook import (
+    WebhookAdapter,
+    _INSECURE_NO_AUTH,
+    _PROFILE_AUTHORITY_INCARNATION_FILENAME,
+)
+from gateway.platforms.webhook_ledger import OperationState
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_adapter(routes, **extra_kw) -> WebhookAdapter:
     extra = {"host": "127.0.0.1", "port": 0, "routes": routes}
@@ -48,10 +54,15 @@ def _wire_mock_target(adapter: WebhookAdapter, platform_name: str = "telegram"):
     """Attach a gateway_runner with a mocked target adapter."""
     mock_target = AsyncMock()
     mock_target.send = AsyncMock(return_value=SendResult(success=True))
+    mock_target.config = PlatformConfig(enabled=True)
 
     mock_runner = MagicMock()
-    mock_runner.adapters = {Platform(platform_name): mock_target}
+    mock_runner.adapters = {
+        Platform.WEBHOOK: adapter,
+        Platform(platform_name): mock_target,
+    }
     mock_runner.config.get_home_channel.return_value = None
+    mock_runner._authorization_adapter = None
 
     adapter.gateway_runner = mock_runner
     return mock_target
@@ -61,6 +72,7 @@ def _wire_mock_target(adapter: WebhookAdapter, platform_name: str = "telegram"):
 # Core behaviour: agent bypass
 # ===================================================================
 
+
 class TestDeliverOnlyBypassesAgent:
     """The whole point of the feature — handle_message must not be called."""
 
@@ -69,6 +81,7 @@ class TestDeliverOnlyBypassesAgent:
         routes = {
             "match-alert": {
                 "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
                 "deliver": "telegram",
                 "deliver_only": True,
                 "deliver_extra": {"chat_id": "12345"},
@@ -87,9 +100,7 @@ class TestDeliverOnlyBypassesAgent:
         adapter.handle_message = _capture
 
         app = _create_app(adapter)
-        body = json.dumps(
-            {"payload": {"user": "alice", "other": "bob"}}
-        ).encode()
+        body = json.dumps({"payload": {"user": "alice", "other": "bob"}}).encode()
 
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
@@ -104,7 +115,7 @@ class TestDeliverOnlyBypassesAgent:
             data = await resp.json()
             assert data["status"] == "delivered"
             assert data["route"] == "match-alert"
-            assert data["target"] == "telegram"
+            assert data["target"] == "platform"
 
         # Let any background tasks settle before asserting no agent call
         await asyncio.sleep(0.05)
@@ -124,14 +135,15 @@ class TestDeliverOnlyBypassesAgent:
 # HTTP status codes
 # ===================================================================
 
-class TestDeliverOnlyStatusCodes:
 
+class TestDeliverOnlyStatusCodes:
     @pytest.mark.asyncio
     async def test_delivery_failure_returns_502(self):
         """If the target adapter returns SendResult(success=False), 502."""
         routes = {
             "r": {
                 "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
                 "deliver": "telegram",
                 "deliver_only": True,
                 "deliver_extra": {"chat_id": "c-1"},
@@ -154,7 +166,7 @@ class TestDeliverOnlyStatusCodes:
             assert resp.status == 502
             data = await resp.json()
             # Generic error — no adapter-level detail leaks
-            assert data["error"] == "Delivery failed"
+            assert data["error"] == "Webhook target outcome requires reconciliation"
             assert "rate limited" not in json.dumps(data)
 
 
@@ -162,15 +174,15 @@ class TestDeliverOnlyStatusCodes:
 # Startup validation
 # ===================================================================
 
+
 class TestDeliverOnlyStartupValidation:
-
-
     @pytest.mark.asyncio
     async def test_deliver_only_with_real_target_accepted(self):
         """Sanity check — a valid deliver_only config passes validation."""
         routes = {
             "good": {
                 "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
                 "deliver": "telegram",
                 "deliver_only": True,
                 "deliver_extra": {"chat_id": "c-1"},
@@ -193,8 +205,8 @@ class TestDeliverOnlyStartupValidation:
 # Security + reliability invariants still hold
 # ===================================================================
 
-class TestDeliverOnlySecurityInvariants:
 
+class TestDeliverOnlySecurityInvariants:
     @pytest.mark.asyncio
     async def test_hmac_still_enforced(self):
         """deliver_only does NOT bypass HMAC validation."""
@@ -202,6 +214,7 @@ class TestDeliverOnlySecurityInvariants:
         routes = {
             "r": {
                 "secret": secret,
+                "provider": "github",
                 "deliver": "telegram",
                 "deliver_only": True,
                 "deliver_extra": {"chat_id": "c-1"},
@@ -226,25 +239,118 @@ class TestDeliverOnlySecurityInvariants:
 
 
 # ===================================================================
-# Unit: _direct_deliver dispatch
+# Durable GitHub target dispatch
 # ===================================================================
 
-class TestDirectDeliverUnit:
 
+class TestDirectDeliverUnit:
+    @pytest.mark.asyncio
+    async def test_profile_rotation_after_prepare_never_crosses_running_gate(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter({
+            "r": {
+                "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "c-1"},
+                "prompt": "must not deliver",
+            }
+        })
+        target = _wire_mock_target(adapter)
+        adapter._bind_route_authentication_authorities(adapter._routes)
+        token_path = tmp_path / _PROFILE_AUTHORITY_INCARNATION_FILENAME
+        prior_generation = adapter._authenticated_route_bundles["r"].profile_generation
+        original_prepare = adapter._operation_ledger.prepare
+        prepared_carriers = []
+
+        def rotate_after_prepare(*args, **kwargs):
+            prepared = original_prepare(*args, **kwargs)
+            prepared_carriers.append(prepared)
+            token_path.unlink()
+            return prepared
+
+        monkeypatch.setattr(
+            adapter._operation_ledger,
+            "prepare",
+            rotate_after_prepare,
+        )
+        mark_running = MagicMock(wraps=adapter._operation_ledger.mark_running)
+        monkeypatch.setattr(
+            adapter._operation_ledger,
+            "mark_running",
+            mark_running,
+        )
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.post(
+                "/webhooks/r",
+                json={"event": "rotate-after-prepare"},
+                headers={"X-GitHub-Delivery": "direct-generation-seam"},
+            )
+
+            assert response.status == 409
+            assert (await response.json())["status"] == "indeterminate"
+
+        assert len(prepared_carriers) == 1
+        restored = adapter._operation_ledger.lookup_session(
+            prepared_carriers[0].session_key
+        )
+        assert restored is not None
+        assert restored.state is OperationState.INDETERMINATE
+        mark_running.assert_not_called()
+        target.send.assert_not_awaited()
+        assert token_path.read_text(encoding="ascii").strip() != prior_generation
 
     @pytest.mark.asyncio
     async def test_dispatches_to_github_comment(self):
-        adapter = _make_adapter({})
-        with patch.object(
-            adapter, "_deliver_github_comment",
-            new=AsyncMock(return_value=SendResult(success=True)),
-        ) as mock_gh:
-            result = await adapter._direct_deliver(
-                "review body",
-                {
-                    "deliver": "github_comment",
-                    "deliver_extra": {"repo": "org/r", "pr_number": "1"},
-                },
-            )
-            assert result.success is True
-            mock_gh.assert_awaited_once()
+        adapter = _make_adapter({
+            "review": {
+                "secret": _INSECURE_NO_AUTH,
+                "provider": "github",
+                "deliver": "github_comment",
+                "deliver_only": True,
+                "deliver_extra": {"repo": "org/r", "pr_number": "1"},
+                "prompt": "review body",
+            }
+        })
+        completed = MagicMock(returncode=0, stdout="posted", stderr="")
+        with (
+            patch(
+                "gateway.platforms.webhook_route_authority.shutil.which",
+                return_value="/usr/bin/gh",
+            ),
+            patch.object(
+                adapter,
+                "_run_github_comment",
+                return_value=completed,
+            ) as mock_gh,
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                response = await cli.post(
+                    "/webhooks/review",
+                    json={"number": 1},
+                    headers={"X-GitHub-Delivery": "direct-gh-1"},
+                )
+                assert response.status == 200
+                payload = await response.json()
+                assert payload["status"] == "delivered"
+                assert payload["settlement"] == "confirmed"
+
+        mock_gh.assert_called_once()
+        executable, target, content, environment = mock_gh.call_args.args
+        assert executable == "/usr/bin/gh"
+        assert target == {
+            "v": 1,
+            "kind": "github_comment",
+            "profile": "default",
+            "repo": "org/r",
+            "pr_number": 1,
+        }
+        assert content == "review body"
+        assert environment["GH_PROMPT_DISABLED"] == "1"
+        assert environment["GH_NO_UPDATE_NOTIFIER"] == "1"

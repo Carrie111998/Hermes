@@ -28,7 +28,7 @@ Webhook payload 包含攻击者可控的数据——PR 标题、commit 消息和
 ## 前提条件
 
 - Hermes Agent 已安装并运行（`hermes gateway`）
-- [`gh` CLI](https://cli.github.com/) 已安装并在 gateway 主机上完成认证（`gh auth login`）
+- [`gh` CLI](https://cli.github.com/) 已安装并完成认证：`gh pr diff` 在配置的 terminal 后端中运行，而最终的 `github_comment` 投递在 gateway 主机上运行。使用 Docker 或 SSH terminal 后端时，两处环境都必须分别具备所需的 `gh` 与凭证。
 - 你的 Hermes 实例有一个可公网访问的 URL（如果在本地运行，请参阅[使用 ngrok 进行本地测试](#local-testing-with-ngrok)）
 - 对 GitHub 仓库的管理员权限（管理 webhook 所需）
 
@@ -44,13 +44,16 @@ platforms:
     enabled: true
     extra:
       port: 8644          # 默认值；如果该端口被其他服务占用，请修改
-      rate_limit: 30      # 每条路由每分钟最大请求数（非全局上限）
+      rate_limit: 30      # 每个 profile/路由滑动 60 秒内的新身份数
 
       routes:
         github-pr-review:
+          provider: github
+          signature_mode: github
           secret: "your-webhook-secret-here"   # 必须与 GitHub webhook secret 完全一致
           events:
             - pull_request
+          toolsets: ["terminal"]                 # 运行 gh 所需的显式授权
 
           # agent 被指示在审查前先获取实际的 diff。
           # {number} 和 {repository.full_name} 从 GitHub payload 中解析。
@@ -63,12 +66,13 @@ platforms:
             Description: {pull_request.body}
             URL: {pull_request.html_url}
 
-            If the action is "closed" or "labeled", stop here and do not post a comment.
+            If the action is "closed" or "labeled", respond with [SILENT].
 
             Otherwise:
             1. Run: gh pr diff {number} --repo {repository.full_name}
             2. Review the code changes for correctness, security issues, and clarity.
-            3. Write a concise, actionable review comment and post it.
+            3. Return only a concise, actionable review comment. Do not post it yourself;
+               the github_comment delivery target posts the final response exactly once.
 
           deliver: github_comment
           deliver_extra:
@@ -80,15 +84,17 @@ platforms:
 
 | 字段 | 说明 |
 |---|---|
-| `secret`（路由级别） | 该路由的 HMAC secret。如果省略，则回退到 `extra.secret` 全局配置。 |
-| `events` | 要接受的 `X-GitHub-Event` 请求头值列表。空列表 = 接受所有。 |
+| `provider` | 将此路由绑定到 GitHub 验证器；请求头不能选择 provider。 |
+| `secret`（路由级别） | 该路由的 HMAC secret。全局 `extra.secret` 回退值仅在恰好一条已认证路由使用时有效；否则每条路由都必须使用唯一密钥材料。 |
+| `events` | 最多配置一个已认证 GitHub 事件类别。支持 `check_run`、`pull_request`、`push`、`issues`、`ping`；请求头与已签名正文结构必须同时匹配。空列表不按事件过滤，但事件权限解析为 `unknown`。 |
+| `toolsets` | 替换此路由受限的 webhook 默认工具集。`gh pr diff` 需要 `terminal`；若 prompt 不再使用 shell，请移除此授权。 |
 | `prompt` | 模板；`{field}` 和 `{nested.field}` 从 GitHub payload 中解析。 |
 | `deliver` | `github_comment` 通过 `gh pr comment` 发布。`log` 仅写入 gateway 日志。 |
 | `deliver_extra.repo` | 从 payload 中解析为例如 `org/repo`。 |
 | `deliver_extra.pr_number` | 从 payload 中解析为 PR 编号。 |
 
 :::note Payload 中不包含代码
-GitHub webhook payload 包含 PR 元数据（标题、描述、分支名、URL），但**不包含 diff**。上方的 prompt 指示 agent 运行 `gh pr diff` 来获取实际变更。`terminal` 工具已包含在默认的 `hermes-webhook` 工具集中，无需额外配置。
+GitHub webhook payload 包含 PR 元数据（标题、描述、分支名、URL），但**不包含 diff**。上方的 prompt 指示 agent 在配置的 terminal 后端中运行 `gh pr diff` 来获取实际变更。默认 `hermes-webhook` 工具集出于安全考虑不包含 `terminal`；本路由因此显式授予 `toolsets: ["terminal"]`，并用它替换此路由的平台默认工具集。最终 `github_comment` 投递由 gateway 主机上的 `gh` 独立执行；prompt 只应返回评论文本，不能再次发布。
 :::
 
 ---
@@ -102,14 +108,14 @@ hermes gateway
 你应该看到：
 
 ```
-[webhook] Listening on 0.0.0.0:8644 — routes: github-pr-review
+[webhook] Listening on * (all interfaces, IPv4+IPv6):8644 — routes: github-pr-review
 ```
 
 验证其是否正在运行：
 
 ```bash
 curl http://localhost:8644/health
-# {"status": "ok", "platform": "webhook"}
+# {"status": "ok", "platform": "webhook", "accepting_webhooks": true}
 ```
 
 ---
@@ -124,7 +130,7 @@ curl http://localhost:8644/health
    - **Which events?** → 选择单个事件 → 勾选 **Pull requests**
 3. 点击 **Add webhook**
 
-GitHub 会立即发送一个 `ping` 事件以确认连接。该事件会被安全忽略——`ping` 不在你的 `events` 列表中——并返回 `{"status": "ignored", "event": "ping"}`。它仅在 DEBUG 级别记录日志，因此不会在默认日志级别的控制台中显示。
+GitHub 会立即发送一个已签名的 `ping` 事件以确认连接。此路由精确绑定 `pull_request`，因此该投递会返回 HTTP `401`（`Invalid authenticated webhook metadata`）。`X-GitHub-Event` 值与 HMAC 覆盖的 JSON 正文结构必须同时匹配，所以修改 ping 的请求头也不能把它变成 pull-request 事件。这是预期行为；之后已签名的 `pull_request` 投递才是功能测试。
 
 ---
 
@@ -150,23 +156,36 @@ ngrok http 8644
 
 复制 `https://...ngrok-free.app` URL 并将其用作你的 GitHub Payload URL。在 ngrok 免费版中，每次 ngrok 重启后 URL 都会变化——每次会话都需要更新你的 GitHub webhook。付费 ngrok 账户可获得静态域名。
 
-你可以直接用 `curl` 对静态路由进行冒烟测试——无需 GitHub 账户或真实 PR。
+你可以直接用 `curl` 对静态路由进行冒烟测试——无需 GitHub 账户或真实 PR。请添加一条使用独立 secret 的 log-only 路由，避免测试时修改生产路由已绑定到密钥的策略：
 
-:::tip 本地测试时使用 `deliver: log`
-在测试时，将配置中的 `deliver: github_comment` 改为 `deliver: log`。否则 agent 将尝试向测试 payload 中的假 `org/repo#99` 仓库发布评论，这将会失败。对 prompt 输出满意后，再切换回 `deliver: github_comment`。
+```yaml
+# 位于 platforms.webhook.extra.routes 内：
+github-pr-review-smoke:
+  provider: github
+  signature_mode: github
+  events: [pull_request]
+  secret: "a-distinct-smoke-test-secret"
+  prompt: |
+    Summarize this test PR payload:
+    PR #{number}: {pull_request.title} in {repository.full_name}
+  deliver: log
+```
+
+:::tip 为什么使用第二条路由？
+Secret 会永久绑定到路由名称、profile、验证器、prompt、toolset 和投递策略。把生产路由的 `deliver` 从 `github_comment` 改为 `log` 后继续复用原 secret 会被拒绝；独立路由能让两套权限保持明确。
 :::
 
 ```bash
-SECRET="your-webhook-secret-here"
-BODY='{"action":"opened","number":99,"pull_request":{"title":"Test PR","body":"Adds a feature.","user":{"login":"testuser"},"head":{"ref":"feat/x"},"base":{"ref":"main"},"html_url":"https://github.com/org/repo/pull/99"},"repository":{"full_name":"org/repo"}}'
+SECRET="a-distinct-smoke-test-secret"
+BODY='{"action":"opened","number":99,"pull_request":{"id":701,"number":99,"state":"open","title":"Test PR","body":"Adds a feature.","user":{"login":"testuser"},"head":{"ref":"feat/x"},"base":{"ref":"main"},"html_url":"https://github.com/org/repo/pull/99"},"repository":{"id":801,"full_name":"org/repo"},"sender":{"id":901,"login":"testuser"}}'
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print "sha256="$2}')
 
-curl -s -X POST http://localhost:8644/webhooks/github-pr-review \
+curl -s -X POST http://localhost:8644/webhooks/github-pr-review-smoke \
   -H "Content-Type: application/json" \
   -H "X-GitHub-Event: pull_request" \
   -H "X-Hub-Signature-256: $SIG" \
   -d "$BODY"
-# Expected: {"status":"accepted","route":"github-pr-review","event":"pull_request","delivery_id":"..."}
+# HTTP 202: {"status":"accepted","route":"github-pr-review-smoke","event":"pull_request","delivery_id":"...","deduplication":"authenticated_body_sha256"}
 ```
 
 然后观察 agent 运行：
@@ -182,12 +201,21 @@ tail -f "${HERMES_HOME:-$HOME/.hermes}/logs/gateway.log"
 
 ## 过滤特定 action
 
-GitHub 会针对多种 action 发送 `pull_request` 事件：`opened`、`synchronize`、`reopened`、`closed`、`labeled` 等。`events` 列表仅按 `X-GitHub-Event` 请求头值过滤——无法在路由级别按 action 子类型过滤。
+GitHub 会针对多种 action 发送 `pull_request` 事件：`opened`、`synchronize`、`reopened`、`closed`、`labeled` 等。路由会同时绑定 `X-GitHub-Event` 值与已认证的 pull-request 正文类别；随后可用路由级 `filters` 按 `action` 等 payload 字段进一步筛选。
 
-第一步中的 prompt 已通过指示 agent 对 `closed` 和 `labeled` 事件提前停止来处理这一问题。
+第一步的 prompt 会为 `closed` 和 `labeled` action 返回 `[SILENT]`。
 
 :::warning Agent 仍会运行并消耗 token（令牌）
-"stop here" 指令会阻止有意义的审查，但无论 action 如何，agent 仍会对每个 `pull_request` 事件运行至完成。GitHub webhook 只能按事件类型（`pull_request`、`push`、`issues` 等）过滤——无法按 action 子类型（`opened`、`closed`、`labeled`）过滤。路由级别没有针对子 action 的过滤器。对于高流量仓库，请接受这一成本，或通过 GitHub Actions workflow 在上游进行过滤，有条件地调用你的 webhook URL。
+`[SILENT]` 会抑制最终投递，但每个 `pull_request` action 仍会运行 agent 并消耗 token。请在 agent 唤醒前使用路由级 `filters`。Filters 属于密钥绑定的执行策略，因此要同时在路由和 GitHub 中换用**全新 secret**；复用旧 secret 进行此编辑会被拒绝：
+
+```yaml
+secret: "NEW-FILTERED-WEBHOOK-SECRET"
+filters:
+  - field: "action"
+    in: ["opened", "synchronize", "reopened"]
+```
+
+对于高流量仓库，还可通过 GitHub Actions workflow 在上游按条件调用 webhook URL。
 :::
 
 > 不支持 Jinja2 或条件模板语法。`{field}` 和 `{nested.field}` 是唯一支持的替换方式。其他内容会原样传递给 agent。
@@ -205,19 +233,23 @@ platforms:
     extra:
       routes:
         github-pr-review:
-          secret: "your-webhook-secret-here"
+          provider: github
+          signature_mode: github
+          secret: "NEW-SKILL-BOUND-WEBHOOK-SECRET"
           events: [pull_request]
+          toolsets: ["terminal"]
           prompt: |
             A pull request event was received (action: {action}).
             PR #{number}: {pull_request.title} by {pull_request.user.login}
             URL: {pull_request.html_url}
 
-            If the action is "closed" or "labeled", stop here and do not post a comment.
+            If the action is "closed" or "labeled", respond with [SILENT].
 
             Otherwise:
             1. Run: gh pr diff {number} --repo {repository.full_name}
             2. Review the diff using your review guidelines.
-            3. Write a concise, actionable review comment and post it.
+            3. Return only a concise, actionable review comment. Do not post it yourself;
+               the github_comment target posts the final response exactly once.
           skills:
             - review
           deliver: github_comment
@@ -226,29 +258,38 @@ platforms:
             pr_number: "{number}"
 ```
 
+添加或修改 skill 会改变密钥绑定策略。请把示例中的值替换为从未使用过的新 secret，并同步更新 GitHub webhook；不能继续使用此前无 skill 路由的 secret。
+
 > **注意：** 列表中只有第一个找到的 skill 会被加载。Hermes 不会叠加多个 skill——后续条目会被忽略。
 
 ---
 
 ## 将响应发送到 Slack 或 Discord
 
-将路由中的 `deliver` 和 `deliver_extra` 字段替换为你的目标平台：
+改变 `deliver` 或 `deliver_extra` 会改变密钥绑定策略。请同时将 `secret` 换成从未使用过的新值，并在 GitHub webhook 设置中同步更新。以下是两个互斥的目标示例：
+
+Slack：
 
 ```yaml
 # 在 platforms.webhook.extra.routes.<route-name> 内部：
-
-# Slack
+secret: "NEW-SLACK-BOUND-WEBHOOK-SECRET"
 deliver: slack
 deliver_extra:
   chat_id: "C0123456789"   # Slack 频道 ID（省略则使用配置的默认频道）
+  scope_id: "T0123456789"  # 此频道所属的 Slack 工作区/团队 ID
+```
 
-# Discord
+Discord：
+
+```yaml
+# 在 platforms.webhook.extra.routes.<route-name> 内部：
+secret: "NEW-DISCORD-BOUND-WEBHOOK-SECRET"
 deliver: discord
 deliver_extra:
   chat_id: "987654321012345678"  # Discord 频道 ID（省略则使用默认频道）
 ```
 
-目标平台也必须在 gateway 中启用并连接。如果省略 `chat_id`，响应将发送到该平台配置的默认频道。
+目标平台也必须在 gateway 中启用并连接。如果省略 `chat_id`，响应将发送到该平台配置的默认频道。模板化的 Slack `chat_id` 必须显式绑定匹配的工作区/团队 `scope_id`；静态频道可由已连接的适配器确立 scope，但显式配置可消除歧义。
 
 有效的 `deliver` 值：`log` · `github_comment` · `telegram` · `discord` · `slack` · `signal` · `sms`
 
@@ -256,25 +297,28 @@ deliver_extra:
 
 ## GitLab 支持
 
-同一适配器也适用于 GitLab。GitLab 使用 `X-Gitlab-Token` 进行认证（纯字符串匹配，非 HMAC）——Hermes 会自动处理两者。
+同一适配器也适用于 GitLab。GitLab 使用 `X-Gitlab-Token` 进行认证（纯字符串匹配，非 HMAC），但 Hermes 不会从请求头自动猜测 provider；路由必须显式声明 `provider: gitlab`。
 
 对于事件过滤，GitLab 将 `X-GitLab-Event` 设置为 `Merge Request Hook`、`Push Hook`、`Pipeline Hook` 等值。在 `events` 中使用精确的请求头值：
 
 ```yaml
+provider: gitlab
+signature_mode: gitlab
+secret: "your-gitlab-secret-token"
 events:
   - Merge Request Hook
 ```
 
-GitLab 的 payload 字段与 GitHub 不同——例如，MR 标题使用 `{object_attributes.title}`，MR 编号使用 `{object_attributes.iid}`。发现完整 payload 结构最简单的方式是使用 GitLab webhook 设置中的 **Test** 按钮，结合 **Recent Deliveries** 日志。或者，在路由配置中省略 `prompt`——Hermes 将把完整 payload 作为格式化 JSON 直接传递给 agent，agent 的响应（在 gateway 日志中通过 `deliver: log` 可见）将描述其结构。
+GitLab 的 payload 字段与 GitHub 不同——例如，MR 标题使用 `{object_attributes.title}`，MR 编号使用 `{object_attributes.iid}`。发现完整 payload 结构最简单的方式是使用 GitLab webhook 设置中的 **Test** 按钮，结合 **Recent Deliveries** 日志。或者，在路由配置中省略 `prompt`——Hermes 会向 agent 传递一个最多 4,000 UTF-8 字节、可解析并带有明确 `truncated` 标记的原始 payload 信封。
 
 ---
 
 ## 安全说明
 
 - **永远不要在生产环境中使用 `INSECURE_NO_AUTH`**——它会完全禁用签名验证。仅用于本地开发。
-- **定期轮换你的 webhook secret**，并在 GitHub（webhook 设置）和你的 `config.yaml` 中同步更新。
-- **速率限制**默认为每条路由每分钟 30 次请求（可通过 `extra.rate_limit` 配置）。超出限制返回 `429`。
-- **重复投递**（webhook 重试）通过 1 小时的幂等性缓存进行去重。缓存键依次为 `X-GitHub-Delivery`（如果存在）、`X-Request-ID`、毫秒级时间戳。当两个投递 ID 请求头都未设置时，重试**不会**去重。
+- **路由名称、profile、provider、签名模式或执行策略发生变化时轮换 webhook secret**，并在 GitHub 与 `config.yaml` 中同步更新。密钥材料会跨 profile 永久绑定到原始路由策略，不能重新分配。
+- **速率限制**默认在每个 profile/路由的滑动 60 秒窗口内准入 30 个新身份（可通过 `extra.rate_limit` 配置）。持久化重复或已活动身份不会再次占用配额；新身份超限返回 `429`。
+- **重复投递**由基于已认证请求正文生成的持久重放凭证阻止。GitHub 的正文签名不认证 `X-GitHub-Delivery` 或 `X-Request-ID`，因此这些观察到的请求头仅用于诊断，绝不会控制重放身份。该凭证在进程重启后仍有效，并非一小时的内存缓存。
 - **Prompt 注入：** PR 标题、描述和 commit 消息均为攻击者可控内容。恶意 PR 可能尝试操纵 agent 的行为。当暴露在公网时，请在沙箱环境（Docker、VM）中运行 gateway。
 
 ---
@@ -285,12 +329,12 @@ GitLab 的 payload 字段与 GitHub 不同——例如，MR 标题使用 `{objec
 |---|---|
 | `401 Invalid signature` | config.yaml 中的 secret 与 GitHub webhook secret 不匹配 |
 | `404 Unknown route` | URL 中的路由名称与 `routes:` 中的键不匹配 |
-| `429 Rate limit exceeded` | 每条路由每分钟 30 次请求已超出——在 GitHub UI 中重新投递测试事件时常见；等待一分钟或提高 `extra.rate_limit` |
+| `429 Rate limit exceeded` | 新身份超过滑动 60 秒配额；等待最早准入身份离开窗口，或提高 `extra.rate_limit` |
 | 未发布评论 | `gh` 未安装、不在 PATH 中，或未完成认证（`gh auth login`） |
-| Agent 运行但无评论 | 检查 gateway 日志——如果 agent 输出为空或仅为"SKIP"，投递仍会被尝试 |
+| Agent 运行但无评论 | 有意的 autonomous silence 响应（`[SILENT]`，包括该标记后附带解释文字）会按设计抑制目标投递。若并非预期静默，请在 gateway 日志中检查 prompt 与完整 agent 输出。 |
 | 端口已被占用 | 在 config.yaml 中修改 `extra.port` |
 | Agent 运行但仅审查了 PR 描述 | prompt 中未包含 `gh pr diff` 指令——diff 不在 webhook payload 中 |
-| 看不到 ping 事件 | 被忽略的事件仅在 DEBUG 日志级别返回 `{"status":"ignored","event":"ping"}`——检查 GitHub 的投递日志（仓库 → Settings → Webhooks → 你的 webhook → Recent Deliveries） |
+| GitHub 将初始 ping 标记为失败 | 对 `events: [pull_request]` 路由来说这是预期行为：其请求头和已认证正文都属于 `ping` 而非 `pull_request`，因此返回 `401`。请改为确认之后已签名的 pull-request 投递。 |
 
 **GitHub 的 Recent Deliveries 标签页**（仓库 → Settings → Webhooks → 你的 webhook）显示每次投递的精确请求头、payload、HTTP 状态和响应体。这是无需查看服务器日志即可诊断故障的最快方式。
 
@@ -303,18 +347,21 @@ platforms:
   webhook:
     enabled: true
     extra:
-      host: "0.0.0.0"         # 绑定地址（默认：0.0.0.0）
+      # 默认省略 host，监听所有 IPv4 + IPv6 接口；如需限制请显式设置地址
       port: 8644               # 监听端口（默认：8644）
-      secret: ""               # 可选的全局回退 secret
-      rate_limit: 30           # 每条路由每分钟请求数
-      max_body_bytes: 1048576  # payload 大小限制，单位字节（默认：1 MB）
+      secret: ""               # 仅当恰好一条已认证路由使用时才可作为回退
+      rate_limit: 30           # 每个 profile/路由滑动 60 秒内的新身份数
+      max_body_bytes: 1048576  # 默认值及硬上限：1 MiB
 
       routes:
         <route-name>:
+          provider: github       # 显式 provider/验证器绑定
+          signature_mode: github
           secret: "required-per-route"
-          events: []            # [] = 接受所有；否则列出 X-GitHub-Event 值
+          events: []            # [] = 不过滤/unknown；否则配置一个受支持事件
           prompt: ""            # {field} / {nested.field} 从 payload 中解析
           skills: []            # 加载第一个匹配的 skill（仅一个）
+          toolsets: []          # 显式的每路由替换；terminal 不是默认工具
           deliver: "log"        # log | github_comment | telegram | discord | slack | signal | sms
           deliver_extra: {}     # github_comment 需要 repo + pr_number；其他平台需要 chat_id
 ```

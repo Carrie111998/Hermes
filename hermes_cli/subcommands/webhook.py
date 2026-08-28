@@ -31,6 +31,22 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
     wh_sub.add_argument(
         "--events", default="", help="Comma-separated event types to accept"
     )
+    wh_sub.add_argument(
+        "--provider",
+        default="github",
+        help="Webhook provider contract (default: github)",
+    )
+    wh_sub.add_argument(
+        "--signature-mode",
+        default="",
+        help="Explicit verifier override for providers that require one",
+    )
+    wh_sub.add_argument(
+        "--route-profile",
+        dest="route_profile",
+        default="default",
+        help="Gateway profile authorized to receive this route (default: default)",
+    )
     wh_sub.add_argument("--description", default="", help="What this subscription does")
     wh_sub.add_argument(
         "--skills", default="", help="Comma-separated skill names to load"
@@ -59,8 +75,10 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
         "--script",
         default="",
         help="Filter/transform script under ~/.hermes/scripts/. The route "
-        "payload is passed as JSON on stdin; empty stdout, [SILENT], or a "
-        "nonzero exit code ignores the webhook.",
+        "payload is passed as JSON on stdin; empty stdout or [SILENT] "
+        "suppresses delivery. A timeout or nonzero exit after execution "
+        "starts returns HTTP 500 as indeterminate and fences same-delivery "
+        "retries.",
     )
 
     webhook_subparsers.add_parser(

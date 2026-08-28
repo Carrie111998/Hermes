@@ -20,7 +20,7 @@ For the full webhook platform reference (all config options, delivery types, dyn
 :::
 
 :::warning Prompt injection risk
-Webhook payloads contain attacker-controlled data — PR titles, commit messages, and descriptions can contain malicious instructions. When your webhook endpoint is exposed to the internet, run the gateway in a sandboxed environment (Docker, SSH backend). See the [security section](#security-notes) below.
+Webhook payloads contain attacker-controlled data — PR titles, commit messages, and descriptions can contain malicious instructions. Hermes does not add an OS sandbox for a route's terminal grant. Isolate the configured terminal backend with Docker, a VM, or an SSH policy, and remember that final `github_comment` delivery runs separately on the gateway host. See the [security section](#security-notes) below.
 :::
 
 ---
@@ -28,7 +28,8 @@ Webhook payloads contain attacker-controlled data — PR titles, commit messages
 ## Prerequisites
 
 - Hermes Agent installed and running (`hermes gateway`)
-- [`gh` CLI](https://cli.github.com/) installed and authenticated on the gateway host (`gh auth login`)
+- [`gh` CLI](https://cli.github.com/) installed and authenticated in the configured terminal backend, where the agent runs `gh pr diff`
+- `gh` also installed and authenticated on the gateway host, where the `github_comment` delivery adapter runs `gh pr comment` (this can be the same installation for a local backend)
 - A publicly reachable URL for your Hermes instance (see [Local testing with ngrok](#local-testing-with-ngrok) if running locally)
 - Admin access to the GitHub repository (required to manage webhooks)
 
@@ -44,13 +45,16 @@ platforms:
     enabled: true
     extra:
       port: 8644          # default; change if another service occupies this port
-      rate_limit: 30      # max requests per minute per route (not a global cap)
+      rate_limit: 30      # new identities per profile/route per sliding 60 seconds
 
       routes:
         github-pr-review:
+          provider: github
+          signature_mode: github
           secret: "your-webhook-secret-here"   # must match the GitHub webhook secret exactly
           events:
             - pull_request
+          toolsets: ["terminal"]                 # explicit grant required for gh
 
           # The agent is instructed to fetch the actual diff before reviewing.
           # {number} and {repository.full_name} are resolved from the GitHub payload.
@@ -63,12 +67,13 @@ platforms:
             Description: {pull_request.body}
             URL: {pull_request.html_url}
 
-            If the action is "closed" or "labeled", stop here and do not post a comment.
+            If the action is "closed" or "labeled", respond with [SILENT].
 
             Otherwise:
             1. Run: gh pr diff {number} --repo {repository.full_name}
             2. Review the code changes for correctness, security issues, and clarity.
-            3. Write a concise, actionable review comment and post it.
+            3. Return a concise, actionable review comment. Do not post it yourself;
+               the configured github_comment target posts the final response.
 
           deliver: github_comment
           deliver_extra:
@@ -80,15 +85,18 @@ platforms:
 
 | Field | Description |
 |---|---|
-| `secret` (route-level) | HMAC secret for this route. Falls back to `extra.secret` global if omitted. |
-| `events` | List of `X-GitHub-Event` header values to accept. Empty list = accept all. |
+| `provider` | Binds this route to the GitHub verifier; request headers cannot select a provider. |
+| `signature_mode` | Explicitly binds GitHub's `X-Hub-Signature-256` verifier. |
+| `secret` (route-level) | HMAC secret for this route. A global `extra.secret` fallback is valid only when exactly one authenticated route uses it; otherwise every route needs unique key material. |
+| `events` | At most one authenticated GitHub event class. Supported values are `check_run`, `pull_request`, `push`, `issues`, and `ping`; the header and signed body shape must both match. Empty list accepts without event dispatch authority (`event=unknown`). |
+| `toolsets` | Replaces the constrained webhook defaults for this route. `terminal` is required for `gh pr diff`; remove it if you change the prompt to avoid shell access. |
 | `prompt` | Template; `{field}` and `{nested.field}` resolve from the GitHub payload. |
 | `deliver` | `github_comment` posts via `gh pr comment`. `log` just writes to the gateway log. |
 | `deliver_extra.repo` | Resolves to e.g. `org/repo` from the payload. |
 | `deliver_extra.pr_number` | Resolves to the PR number from the payload. |
 
 :::note The payload does not contain code
-The GitHub webhook payload includes PR metadata (title, description, branch names, URLs) but **not the diff**. The prompt above instructs the agent to run `gh pr diff` to fetch the actual changes. The default `hermes-webhook` toolset is deliberately constrained (web search/extract, vision, clarify — **no terminal**) because webhook payloads can carry untrusted content. To let this route run `gh`, add a per-route toolset grant: `toolsets: ["terminal", "web"]` on the route config — see [Per-route toolsets](/docs/user-guide/messaging/webhooks#per-route-toolsets).
+The GitHub webhook payload includes PR metadata (title, description, branch names, URLs) but **not the diff**. The prompt above instructs the agent to run `gh pr diff` to fetch the actual changes. The default `hermes-webhook` toolset is deliberately constrained (web search/extract, vision, clarify — **no terminal**) because webhook payloads can carry untrusted content. This route therefore grants exactly `toolsets: ["terminal"]`; that replaces the platform default for this route. See [Per-route toolsets](/docs/user-guide/messaging/webhooks#per-route-toolsets).
 :::
 
 ---
@@ -102,14 +110,14 @@ hermes gateway
 You should see:
 
 ```
-[webhook] Listening on 0.0.0.0:8644 — routes: github-pr-review
+[webhook] Listening on * (all interfaces, IPv4+IPv6):8644 — routes: github-pr-review
 ```
 
 Verify it's running:
 
 ```bash
 curl http://localhost:8644/health
-# {"status": "ok", "platform": "webhook"}
+# {"status":"ok","platform":"webhook","accepting_webhooks":true}
 ```
 
 ---
@@ -124,7 +132,7 @@ curl http://localhost:8644/health
    - **Which events?** → Select individual events → check **Pull requests**
 3. Click **Add webhook**
 
-GitHub will immediately send a `ping` event to confirm the connection. It is safely ignored — `ping` is not in your `events` list — and returns `{"status": "ignored", "event": "ping"}`. It is only logged at DEBUG level, so it won't appear in the console at the default log level.
+GitHub will immediately send a signed `ping` event to confirm the connection. Because this route binds exactly `pull_request`, that delivery is rejected with HTTP `401` (`Invalid authenticated webhook metadata`). Both the `X-GitHub-Event` value and the HMAC-covered JSON body shape must match, so relabeling the ping header cannot turn it into a pull-request event. This is expected; a later signed `pull_request` delivery is the functional test.
 
 ---
 
@@ -150,23 +158,36 @@ ngrok http 8644
 
 Copy the `https://...ngrok-free.app` URL and use it as your GitHub Payload URL. On the free ngrok tier the URL changes each time ngrok restarts — update your GitHub webhook each session. Paid ngrok accounts get a static domain.
 
-You can smoke-test a static route directly with `curl` — no GitHub account or real PR needed.
+You can smoke-test a static route directly with `curl` — no GitHub account or real PR needed. Add a separate log-only route with its own secret so testing does not mutate the key-bound policy of the production route:
 
-:::tip Use `deliver: log` when testing locally
-Change `deliver: github_comment` to `deliver: log` in your config while testing. Otherwise the agent will attempt to post a comment to the fake `org/repo#99` repo in the test payload, which will fail. Switch back to `deliver: github_comment` once you're satisfied with the prompt output.
+```yaml
+# Inside platforms.webhook.extra.routes:
+github-pr-review-smoke:
+  provider: github
+  signature_mode: github
+  events: [pull_request]
+  secret: "a-distinct-smoke-test-secret"
+  prompt: |
+    Summarize this test PR payload:
+    PR #{number}: {pull_request.title} in {repository.full_name}
+  deliver: log
+```
+
+:::tip Why use a second route?
+The secret is permanently bound to its route name, profile, verifier, prompt, tools, and delivery policy. Reusing the production secret after changing `deliver` from `github_comment` to `log` is rejected; a separate route keeps both authorities unambiguous.
 :::
 
 ```bash
-SECRET="your-webhook-secret-here"
-BODY='{"action":"opened","number":99,"pull_request":{"title":"Test PR","body":"Adds a feature.","user":{"login":"testuser"},"head":{"ref":"feat/x"},"base":{"ref":"main"},"html_url":"https://github.com/org/repo/pull/99"},"repository":{"full_name":"org/repo"}}'
+SECRET="a-distinct-smoke-test-secret"
+BODY='{"action":"opened","number":99,"pull_request":{"id":701,"number":99,"state":"open","title":"Test PR","body":"Adds a feature.","user":{"login":"testuser"},"head":{"ref":"feat/x"},"base":{"ref":"main"},"html_url":"https://github.com/org/repo/pull/99"},"repository":{"id":801,"full_name":"org/repo"},"sender":{"id":901,"login":"testuser"}}'
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print "sha256="$2}')
 
-curl -s -X POST http://localhost:8644/webhooks/github-pr-review \
+curl -s -X POST http://localhost:8644/webhooks/github-pr-review-smoke \
   -H "Content-Type: application/json" \
   -H "X-GitHub-Event: pull_request" \
   -H "X-Hub-Signature-256: $SIG" \
   -d "$BODY"
-# Expected: {"status":"accepted","route":"github-pr-review","event":"pull_request","delivery_id":"..."}
+# HTTP 202: {"status":"accepted","route":"github-pr-review-smoke","event":"pull_request","delivery_id":"...","deduplication":"authenticated_body_sha256"}
 ```
 
 Then watch the agent run:
@@ -182,14 +203,15 @@ tail -f "${HERMES_HOME:-$HOME/.hermes}/logs/gateway.log"
 
 ## Filtering to specific actions
 
-GitHub sends `pull_request` events for many actions: `opened`, `synchronize`, `reopened`, `closed`, `labeled`, etc. The `events` list filters by the `X-GitHub-Event` header value, and route-level `filters` can narrow by payload fields such as `action`.
+GitHub sends `pull_request` events for many actions: `opened`, `synchronize`, `reopened`, `closed`, `labeled`, etc. The route binds both the `X-GitHub-Event` value and authenticated pull-request body class; route-level `filters` can then narrow by payload fields such as `action`.
 
-The prompt in Step 1 already handles this by instructing the agent to stop early for `closed` and `labeled` events.
+The prompt in Step 1 already handles this by returning `[SILENT]` for `closed` and `labeled` events.
 
 :::warning The agent still runs and consumes tokens
-The "stop here" instruction prevents a meaningful review, but the agent still runs to completion for every `pull_request` event regardless of action. Prefer filtering before the agent wakes:
+The `[SILENT]` instruction suppresses final delivery, but the agent still runs for every `pull_request` event regardless of action. Prefer filtering before the agent wakes. Because filters are part of the key-bound execution policy, set a **fresh route secret** and update the GitHub webhook secret at the same time; reusing the original secret with this edit is rejected.
 
 ```yaml
+secret: "fresh-secret-for-filtered-policy"
 filters:
   - field: "action"
     in: ["opened", "synchronize", "reopened"]
@@ -204,7 +226,7 @@ For high-volume repositories, you can still filter upstream with a GitHub Action
 
 ## Using a skill for consistent review style
 
-Load a [Hermes skill](/user-guide/features/skills) to give the agent a consistent review persona. Add `skills` to your route inside `platforms.webhook.extra.routes` in `config.yaml`:
+Load a [Hermes skill](/user-guide/features/skills) to give the agent a consistent review persona. A skill changes the key-bound execution policy, so use a fresh secret in both this route and the GitHub webhook rather than adding it under the old secret:
 
 ```yaml
 platforms:
@@ -213,19 +235,23 @@ platforms:
     extra:
       routes:
         github-pr-review:
-          secret: "your-webhook-secret-here"
+          provider: github
+          signature_mode: github
+          secret: "fresh-secret-for-skilled-policy"
           events: [pull_request]
+          toolsets: ["terminal"]
           prompt: |
             A pull request event was received (action: {action}).
             PR #{number}: {pull_request.title} by {pull_request.user.login}
             URL: {pull_request.html_url}
 
-            If the action is "closed" or "labeled", stop here and do not post a comment.
+            If the action is "closed" or "labeled", respond with [SILENT].
 
             Otherwise:
             1. Run: gh pr diff {number} --repo {repository.full_name}
             2. Review the diff using your review guidelines.
-            3. Write a concise, actionable review comment and post it.
+            3. Return a concise, actionable review comment. Do not post it yourself;
+               the configured github_comment target posts the final response.
           skills:
             - review
           deliver: github_comment
@@ -240,23 +266,30 @@ platforms:
 
 ## Sending responses to Slack or Discord instead
 
-Replace the `deliver` and `deliver_extra` fields inside your route with your target platform:
+Delivery kind and target fields are part of the key-bound execution policy. To switch an existing route, rotate to a fresh secret in both the route and GitHub, then replace `deliver` and `deliver_extra` with one of these targets:
+
+Slack:
 
 ```yaml
 # Inside platforms.webhook.extra.routes.<route-name>:
-
-# Slack
+secret: "fresh-secret-for-this-slack-policy"
 deliver: slack
 deliver_extra:
   chat_id: "C0123456789"   # Slack channel ID (omit to use the configured home channel)
+  scope_id: "T0123456789"  # Slack workspace/team ID for this channel
+```
 
-# Discord
+Discord:
+
+```yaml
+# Inside platforms.webhook.extra.routes.<route-name>:
+secret: "fresh-secret-for-this-discord-policy"
 deliver: discord
 deliver_extra:
   chat_id: "987654321012345678"  # Discord channel ID (omit to use home channel)
 ```
 
-The target platform must also be enabled and connected in the gateway. If `chat_id` is omitted, the response is sent to that platform's configured home channel.
+The target platform must also be enabled and connected in the gateway. If `chat_id` is omitted, the response is sent to that platform's configured home channel. A templated Slack `chat_id` requires an explicit route-bound `scope_id`; for a static channel, the adapter may establish that scope from the connected workspace, but specifying it removes ambiguity.
 
 Valid `deliver` values: `log` · `github_comment` · `telegram` · `discord` · `slack` · `signal` · `sms`
 
@@ -264,26 +297,35 @@ Valid `deliver` values: `log` · `github_comment` · `telegram` · `discord` · 
 
 ## GitLab support
 
-The same adapter works with GitLab. GitLab uses `X-Gitlab-Token` for authentication (plain string match, not HMAC) — Hermes handles both automatically.
+The same adapter works with GitLab, but the route must explicitly bind the GitLab verifier. Request headers never select or auto-detect a provider. GitLab uses `X-Gitlab-Token` for authentication (plain string match, not HMAC), so give it a separate route and secret from GitHub.
 
-For event filtering, GitLab sets `X-GitLab-Event` to values like `Merge Request Hook`, `Push Hook`, `Pipeline Hook`. Use the exact header value in `events`:
+For event filtering, GitLab sets `X-GitLab-Event` to values like `Merge Request Hook`, `Push Hook`, and `Pipeline Hook`. A GitLab route may bind at most one of these unsigned header values; use the exact value:
 
 ```yaml
-events:
-  - Merge Request Hook
+# Inside platforms.webhook.extra.routes:
+gitlab-mr-review:
+  provider: gitlab
+  signature_mode: gitlab
+  secret: "a-distinct-gitlab-token"
+  events:
+    - Merge Request Hook
+  prompt: |
+    Review GitLab MR !{object_attributes.iid}: {object_attributes.title}
+    Return a concise review based on the authenticated payload metadata.
+  deliver: log
 ```
 
-GitLab payload fields differ from GitHub's — e.g. `{object_attributes.title}` for the MR title and `{object_attributes.iid}` for the MR number. The easiest way to discover the full payload structure is GitLab's **Test** button in your webhook settings, combined with the **Recent Deliveries** log. Alternatively, omit `prompt` from your route config — Hermes will then pass the full payload as formatted JSON directly to the agent, and the agent's response (visible in the gateway log with `deliver: log`) will describe its structure.
+GitLab payload fields differ from GitHub's — e.g. `{object_attributes.title}` for the MR title and `{object_attributes.iid}` for the MR number. The easiest way to discover the full payload structure is GitLab's **Test** button in your webhook settings, combined with the **Recent Deliveries** log. Alternatively, omit `prompt` from your route config — Hermes then passes a parseable raw-payload envelope bounded to 4,000 UTF-8 bytes (with an explicit `truncated` marker) to the agent.
 
 ---
 
 ## Security notes
 
 - **Never use `INSECURE_NO_AUTH`** in production — it disables signature validation entirely. It is only for local development.
-- **Rotate your webhook secret** periodically and update it in both GitHub (webhook settings) and your `config.yaml`.
-- **Rate limiting** is 30 req/min per route by default (configurable via `extra.rate_limit`). Exceeding it returns `429`.
-- **Duplicate deliveries** (webhook retries) are deduplicated via a 1-hour idempotency cache. The cache key is `X-GitHub-Delivery` if present, then `X-Request-ID`, then a millisecond timestamp. When neither delivery ID header is set, retries are **not** deduplicated.
-- **Prompt injection:** PR titles, descriptions, and commit messages are attacker-controlled. Malicious PRs could attempt to manipulate the agent's actions. Run the gateway in a sandboxed environment (Docker, VM) when exposed to the public internet.
+- **Rotate your webhook secret** in both GitHub and `config.yaml` whenever the route name, profile, provider, signature mode, or execution policy changes. Key material is permanently bound across profiles to its original route policy and cannot be reassigned.
+- **Rate limiting** admits 30 new identities per profile/route in a sliding 60-second window by default (configurable via `extra.rate_limit`). Durable duplicates and already-active identities do not consume another slot; a new identity over quota returns `429`.
+- **Duplicate deliveries** are fenced by a durable replay proof derived from the authenticated request body. GitHub's body signature does not authenticate `X-GitHub-Delivery` or `X-Request-ID`, so those observed headers are diagnostic only and never control replay identity. The proof survives process restarts; it is not a one-hour memory cache.
+- **Prompt injection and tool authority:** PR titles, descriptions, and commit messages are attacker-controlled. `toolsets: ["terminal"]` grants trusted local-code capability; Hermes does not add an OS sandbox. Isolate the configured terminal backend with Docker, a VM, or SSH policy. That isolation does not cover `github_comment`: its final `gh pr comment` command runs on the gateway host under the adapter's fixed target authority.
 
 ---
 
@@ -293,12 +335,13 @@ GitLab payload fields differ from GitHub's — e.g. `{object_attributes.title}` 
 |---|---|
 | `401 Invalid signature` | Secret in config.yaml doesn't match GitHub webhook secret |
 | `404 Unknown route` | Route name in the URL doesn't match the key in `routes:` |
-| `429 Rate limit exceeded` | 30 req/min per route exceeded — common when re-delivering test events from GitHub's UI; wait a minute or raise `extra.rate_limit` |
-| No comment posted | `gh` not installed, not on PATH, or not authenticated (`gh auth login`) |
-| Agent runs but no comment | Check the gateway log — if the agent output was empty or just "SKIP", delivery is still attempted |
+| `429 Rate limit exceeded` | The sliding 60-second quota for new identities was exceeded; wait until the oldest admitted identity leaves the window or raise `extra.rate_limit` |
+| Agent cannot fetch the diff | Check `gh` installation and authentication in the configured terminal backend |
+| Review succeeds but no comment is posted | Check `gh` installation and authentication on the gateway host; `github_comment` delivery runs there |
+| Agent runs but no comment | An intentional autonomous silence response (`[SILENT]`, including that marker followed by explanatory prose) suppresses target delivery by design. If silence was unexpected, inspect the prompt and completed agent output in the gateway log. |
 | Port already in use | Change `extra.port` in config.yaml |
 | Agent runs but reviews only the PR description | The prompt isn't including the `gh pr diff` instruction — the diff is not in the webhook payload |
-| Can't see the ping event | Ignored events return `{"status":"ignored","event":"ping"}` at DEBUG log level only — check GitHub's delivery log (repo → Settings → Webhooks → your webhook → Recent Deliveries) |
+| GitHub marks the initial ping failed | Expected for an `events: [pull_request]` route: its header and authenticated body classify as `ping`, not `pull_request`, so the route returns `401`. Confirm a subsequent signed pull-request delivery instead. |
 
 **GitHub's Recent Deliveries tab** (repo → Settings → Webhooks → your webhook) shows the exact request headers, payload, HTTP status, and response body for every delivery. It is the fastest way to diagnose failures without touching your server logs.
 
@@ -311,17 +354,21 @@ platforms:
   webhook:
     enabled: true
     extra:
+      host: null                # default: all interfaces on IPv4 and IPv6
       port: 8644               # listen port (default: 8644)
-      secret: ""               # optional global fallback secret
-      rate_limit: 30           # requests per minute per route
-      max_body_bytes: 1048576  # payload size limit in bytes (default: 1 MB)
+      secret: ""               # fallback only when exactly one authenticated route uses it
+      rate_limit: 30           # new identities per profile/route per sliding 60 seconds
+      max_body_bytes: 1048576  # default and hard maximum: 1 MiB
 
       routes:
         <route-name>:
+          provider: github       # explicit provider/verifier binding
+          signature_mode: github
           secret: "required-per-route"
-          events: []            # [] = accept all; otherwise list X-GitHub-Event values
+          events: []            # [] = unfiltered/unknown; otherwise one supported event
           prompt: ""            # {field} / {nested.field} resolved from payload
           skills: []            # first matching skill is loaded (only one)
+          toolsets: []          # explicit per-route replacement; terminal is not a default
           deliver: "log"        # log | github_comment | telegram | discord | slack | signal | sms
           deliver_extra: {}     # repo + pr_number for github_comment; chat_id for others
 ```
