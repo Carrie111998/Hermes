@@ -3,6 +3,7 @@ import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } fro
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
+import { type DelegateWaveWake, parseDelegateWaveWake } from '@/components/assistant-ui/thread/delegate-wave-wake'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
@@ -260,6 +261,40 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
   )
 }
 
+const DelegateWaveWakeCard: FC<{ wake: DelegateWaveWake }> = ({ wake }) => {
+  const styles = {
+    completed: { icon: 'check', surface: 'border-emerald-500/35 bg-emerald-500/8', tone: 'text-emerald-500' },
+    question: { icon: 'question', surface: 'border-amber-500/35 bg-amber-500/8', tone: 'text-amber-500' },
+    ready: { icon: 'eye', surface: 'border-violet-500/35 bg-violet-500/8', tone: 'text-violet-500' },
+    failed: { icon: 'error', surface: 'border-rose-500/35 bg-rose-500/8', tone: 'text-rose-500' }
+  } as const
+
+  const style = styles[wake.kind]
+
+  return (
+    <div
+      className={cn(
+        'mx-auto flex w-[min(86%,44rem)] items-start gap-3 rounded-xl border px-3 py-2.5 shadow-xs',
+        style.surface
+      )}
+      data-delegate-wave-kind={wake.kind}
+      data-slot="aui_delegate-wave-wake-card"
+    >
+      <span className={cn('mt-0.5 grid size-7 shrink-0 place-items-center rounded-lg bg-current/10', style.tone)}>
+        <Codicon className="text-current" name={style.icon} size="0.875rem" />
+      </span>
+      <span className="min-w-0">
+        <span className={cn('block text-[0.6875rem] font-semibold uppercase tracking-[0.08em]', style.tone)}>
+          Delegate Wave · {wake.label}
+        </span>
+        <span className="mt-0.5 block wrap-anywhere text-[0.8125rem] leading-5 text-foreground/85">
+          {wake.summary}
+        </span>
+      </span>
+    </div>
+  )
+}
+
 export const UserMessage: FC<{
   onCancel?: () => Promise<void> | void
   onRequestRestoreConfirm?: (messageId: string, target: RestoreMessageTarget) => void
@@ -368,6 +403,21 @@ export const UserMessage: FC<{
   }, [])
 
   useResizeObserver(measureClamp, clampInnerRef)
+
+  const delegateWaveWake = parseDelegateWaveWake(messageText.trim())
+
+  if (delegateWaveWake) {
+    return (
+      <MessagePrimitive.Root
+        className="flex w-full min-w-0 flex-col items-stretch pb-(--conversation-turn-gap)"
+        data-role="user"
+        data-slot="aui_user-message-root"
+      >
+        <DelegateWaveWakeCard wake={delegateWaveWake} />
+        <MessageTimelineTimestamp className="self-center" />
+      </MessagePrimitive.Root>
+    )
+  }
 
   // Injected background-process notification, not a human prompt — render the
   // compact system-style notice (after all hooks above have run).
