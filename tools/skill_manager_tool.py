@@ -1518,9 +1518,166 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             new_string=payload.get("new_string"),
             replace_all=payload.get("replace_all", False),
             absorbed_into=payload.get("absorbed_into"),
+            operations=payload.get("operations"),
         )
     finally:
         _skill_gate_bypass.reset(token)
+
+
+_BATCH_OP_ACTIONS = {"create", "patch", "write_file", "remove_file"}
+_BATCH_MAX_OPS = 20
+
+
+def _skill_manage_batch(
+    name: str,
+    operations,
+    task_id: str = None,
+    session_id: str = None,
+) -> str:
+    """Apply a sequence of operations to ONE skill atomically.
+
+    The memory-tool pattern (#95681 arc): create + N supporting files, or
+    a SKILL.md fix plus the script it references, land in one call — all
+    or nothing. On any op failure the skill directory is restored to its
+    pre-batch state (including full removal when the batch created it).
+
+    Scope rules:
+    - all ops target the top-level ``name`` (one skill per batch);
+    - ``delete`` is not batchable (it's a standalone decision, and its
+      recoverable-archive path doesn't compose with rollback);
+    - ``create`` only as the FIRST op.
+    """
+    import shutil
+    import tempfile
+
+    # --- validate shape up front (no side effects before this passes) ---
+    if not isinstance(operations, list) or not operations:
+        return tool_error("operations must be a non-empty array.", success=False)
+    if len(operations) > _BATCH_MAX_OPS:
+        return tool_error(f"operations is capped at {_BATCH_MAX_OPS} ops per call.", success=False)
+    for i, op in enumerate(operations):
+        if not isinstance(op, dict) or not op.get("action"):
+            return tool_error(f"operations[{i}] needs an 'action'.", success=False)
+        act = op["action"]
+        if act == "delete":
+            return tool_error(
+                "delete is not batchable — call it as a standalone action.",
+                success=False,
+            )
+        if act not in _BATCH_OP_ACTIONS:
+            return tool_error(
+                f"operations[{i}]: unknown action '{act}'. "
+                f"Batchable: {', '.join(sorted(_BATCH_OP_ACTIONS))}.",
+                success=False,
+            )
+        if act == "create" and i != 0:
+            return tool_error("create must be the first op in a batch.", success=False)
+        preflight = _background_review_preflight(act, name)
+        if preflight is not None:
+            return json.dumps(preflight, ensure_ascii=False)
+
+    # --- approval gate: stage the WHOLE batch as one pending write ---
+    if not _skill_gate_bypass.get():
+        try:
+            from tools import write_approval as wa
+        except Exception:
+            wa = None  # fail open, matching _apply_skill_write_gate
+        if wa is not None:
+            decision = wa.evaluate_gate(wa.SKILLS)
+            if decision.blocked:
+                return tool_error(decision.message, success=False)
+            if not decision.allow:
+                payload = {"action": "batch", "name": name, "operations": operations}
+                acts = ", ".join(op["action"] for op in operations)
+                gist = f"batch({len(operations)} ops: {acts}) on skill '{name}'"
+                record = wa.stage_write(
+                    wa.SKILLS, payload, summary=gist, origin=wa.current_origin()
+                )
+                return json.dumps(
+                    {"success": True, "staged": True, "pending_id": record["id"],
+                     "gist": gist, "message": decision.message},
+                    ensure_ascii=False,
+                )
+
+    # --- snapshot for rollback ---
+    pre = _find_skill(name)
+    pre_dir = Path(pre["path"]) if pre else None
+    snapshot = None
+    if pre_dir is not None and pre_dir.is_dir():
+        snapshot = Path(tempfile.mkdtemp(prefix="skill_batch_")) / pre_dir.name
+        try:
+            shutil.copytree(pre_dir, snapshot)
+        except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
+            return tool_error(f"Could not snapshot skill for atomic batch: {exc}", success=False)
+
+    def _rollback() -> str:
+        try:
+            post = _find_skill(name)
+            post_dir = Path(post["path"]) if post else None
+            if snapshot is not None:
+                if post_dir is not None and post_dir.is_dir():
+                    shutil.rmtree(post_dir)
+                shutil.copytree(snapshot, pre_dir)
+                return "rolled back to pre-batch state"
+            # Batch created the skill: remove what the partial batch made.
+            if post_dir is not None and post_dir.is_dir():
+                shutil.rmtree(post_dir)
+            return "partially-created skill removed"
+        except Exception as exc:  # noqa: BLE001
+            return f"ROLLBACK FAILED ({exc}) — inspect the skill manually"
+
+    # --- execute ops through the normal single-op path (gate bypassed:
+    #     the batch already cleared/staged it above; ledger + telemetry
+    #     fire per-op, which is the audit granularity we want) ---
+    results = []
+    token = _skill_gate_bypass.set(True)
+    try:
+        for i, op in enumerate(operations):
+            raw = skill_manage(
+                action=op["action"],
+                name=name,
+                content=op.get("content"),
+                category=op.get("category"),
+                file_path=op.get("file_path"),
+                file_content=op.get("file_content"),
+                old_string=op.get("old_string"),
+                new_string=op.get("new_string"),
+                replace_all=op.get("replace_all", False),
+                task_id=task_id,
+                session_id=session_id,
+            )
+            try:
+                parsed = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                parsed = {"success": False, "error": "unparseable op result"}
+            if not parsed.get("success"):
+                note = _rollback()
+                return json.dumps(
+                    {"success": False,
+                     "error": (
+                         f"operations[{i}] ({op['action']}) failed: "
+                         f"{parsed.get('error', 'unknown error')} — batch aborted, {note}."
+                     ),
+                     "failed_index": i,
+                     "completed_before_failure": i},
+                    ensure_ascii=False,
+                )
+            results.append({"action": op["action"],
+                            "file_path": op.get("file_path"),
+                            "success": True})
+    finally:
+        _skill_gate_bypass.reset(token)
+        if snapshot is not None:
+            try:
+                shutil.rmtree(snapshot.parent)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return json.dumps(
+        {"success": True, "skill": name, "operations_applied": len(results),
+         "results": results},
+        ensure_ascii=False,
+    )
 
 
 # Debounce state for the sync push hook. A burst of skill_manage writes
@@ -1586,12 +1743,21 @@ def skill_manage(
     absorbed_into: str = None,
     task_id: str = None,
     session_id: str = None,
+    operations=None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
 
+    ``operations``: batch shape — a list of {action, ...} dicts applied to
+    ONE skill atomically (see _skill_manage_batch). When set, the flat
+    single-op fields are ignored and ``action`` may be omitted/'batch'.
+
     Returns JSON string with results.
     """
+    if operations is not None:
+        return _skill_manage_batch(
+            name, operations, task_id=task_id, session_id=session_id
+        )
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
@@ -1775,7 +1941,34 @@ SKILL_MANAGE_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["create", "patch", "delete", "write_file", "remove_file"],
-                "description": "The action to perform."
+                "description": "The action to perform. Omit when using 'operations'."
+            },
+            "operations": {
+                "type": "array",
+                "description": (
+                    "Batch shape: several operations on THIS skill, atomic "
+                    "(any failure rolls the whole skill back). Items carry "
+                    "an action plus that action's fields; create only "
+                    "first, delete not batchable. E.g. create + its "
+                    "reference files in one call."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["create", "patch", "write_file", "remove_file"]
+                        },
+                        "content": {"type": "string"},
+                        "category": {"type": "string"},
+                        "file_path": {"type": "string"},
+                        "file_content": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean"}
+                    },
+                    "required": ["action"]
+                }
             },
             "name": {
                 "type": "string",
@@ -1844,7 +2037,7 @@ SKILL_MANAGE_SCHEMA = {
             # (_curator_consolidation_delete_guard). Keeping it out saves
             # ~100 tokens on every call of every other session.
         },
-        "required": ["action", "name"],
+        "required": ["name"],  # action for single ops; operations for batch
     },
 }
 
@@ -1867,6 +2060,7 @@ registry.register(
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
+        operations=args.get("operations"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id")),
     emoji="📝",
