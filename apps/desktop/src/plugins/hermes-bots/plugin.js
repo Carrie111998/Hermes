@@ -6691,23 +6691,108 @@ function knownGroups(metaByName) {
 // ── group chats: bounded round-robin coordination over a shared room log ─────
 //
 // Behavioral model (clean-room): a group conversation is ONE ordered room log
-// owned by the plugin. A user send triggers at most GROUP_CHAT_MAX_ROUNDS
-// serial round-robin rounds over the member roster — never parallel, no LLM
-// router. Who speaks each round is a deterministic @mention parse since the
-// last user message (mentioned members only, else everyone); whether a member
-// actually speaks is its own turn's choice — replying with exactly "(pass)"
-// (or nothing, or failing) is silence. Hard caps end every turn; a round in
-// which everyone passed means the conversation settled. Each member runs its
-// turn in its OWN persistent per-group Hermes session and is fed only the
-// room messages that are NEW since it last saw the room.
+// owned by the plugin. A user send triggers at most `effectiveCap` serial
+// round-robin rounds over the member roster — never parallel, no LLM router.
+// Who speaks each round is a deterministic @mention parse since the last user
+// message (mentioned members only, else everyone); whether a member actually
+// speaks is its own turn's choice — replying with exactly "(pass)" (or
+// nothing, or failing) is silence. Hard caps end every turn; a round in which
+// everyone passed means the conversation settled. Each member runs its turn in
+// its OWN persistent per-group Hermes session and is fed only the room
+// messages that are NEW since it last saw the room.
 
-const GROUP_CHAT_MAX_ROUNDS = 10
+// ── group chat config: model-aware round cap + token-budget guard ─────────────
+// Default round cap for paid models. Configurable via group_chat.max_rounds in config.yaml.
+// Free models (detected by :free suffix or group_chat.free_models list) use
+// group_chat.max_rounds_free (null = unlimited). Token-budget guard is the hard ceiling.
+const DEFAULT_GROUP_CHAT_MAX_ROUNDS = 3
+const DEFAULT_GROUP_CHAT_MAX_ROUNDS_FREE = null // null = unlimited
+const DEFAULT_GROUP_CHAT_TOKEN_BUDGET = 80000
+const GROUP_CHAT_MAX_ROUNDS_HARD_CAP = 20
 
 // #94478 review: continuation rounds are bounded independently of the message cap so a pathological mention chain can't consume the room's whole budget on handoffs.
 const GROUP_CHAT_MAX_MESSAGES = 10
 const GROUP_CHAT_MAX_CONTINUATIONS = 2
 const GROUP_CHAT_HISTORY_LIMIT = 24
 const GROUP_CHAT_MAX_MEMBERS = 6
+
+/**
+ * Read group chat config from config.yaml with safe defaults.
+ * Returns { max_rounds, max_rounds_free, token_budget, free_models }
+ */
+async function getGroupChatConfig() {
+  try {
+    if (host && typeof host.request === 'function') {
+      const res = await host.request('config.get', { key: 'group_chat' })
+      if (res && typeof res === 'object') {
+        const cfg = res.value || res
+        return {
+          max_rounds: Number(cfg.max_rounds != null ? cfg.max_rounds : DEFAULT_GROUP_CHAT_MAX_ROUNDS),
+          max_rounds_free: cfg.max_rounds_free != null ? cfg.max_rounds_free : DEFAULT_GROUP_CHAT_MAX_ROUNDS_FREE,
+          token_budget: Number(cfg.token_budget != null ? cfg.token_budget : DEFAULT_GROUP_CHAT_TOKEN_BUDGET),
+          free_models: Array.isArray(cfg.free_models) ? cfg.free_models : []
+        }
+      }
+    }
+  } catch (e) {
+    // Fallback to defaults if config unavailable
+  }
+  return {
+    max_rounds: DEFAULT_GROUP_CHAT_MAX_ROUNDS,
+    max_rounds_free: DEFAULT_GROUP_CHAT_MAX_ROUNDS_FREE,
+    token_budget: DEFAULT_GROUP_CHAT_TOKEN_BUDGET,
+    free_models: []
+  }
+}
+
+/**
+ * Detect whether a model is free-tier.
+ * Heuristic: :free suffix (OpenRouter), or model name in group_chat.free_models list.
+ */
+function isFreeModel(modelName, config) {
+  const name = String(modelName || '').trim()
+  if (!name) return false
+  // :free suffix (OpenRouter convention)
+  if (/:free$/i.test(name)) return true
+  // Explicit list from config
+  if (config.free_models.some(pattern => name.toLowerCase().includes(pattern.toLowerCase()))) return true
+  return false
+}
+
+/**
+ * Get the effective round cap for the current model.
+ * Free models: max_rounds_free (null = Infinity, clamped to HARD_CAP)
+ * Paid models: max_rounds (default 3)
+ */
+function getEffectiveRoundCap(modelName, config) {
+  if (isFreeModel(modelName, config)) {
+    const cap = config.max_rounds_free
+    if (cap === null || cap === undefined || cap === Infinity) return GROUP_CHAT_MAX_ROUNDS_HARD_CAP
+    return Math.min(Number(cap), GROUP_CHAT_MAX_ROUNDS_HARD_CAP)
+  }
+  return Math.min(Number(config.max_rounds), GROUP_CHAT_MAX_ROUNDS_HARD_CAP)
+}
+
+/**
+ * Get current model name from host state or gateway.
+ */
+async function getCurrentModelName() {
+  try {
+    // Try host.state.model first
+    if (host && host.state && host.state.model) {
+      const m = await Promise.resolve(host.state.model.get && host.state.model.get())
+      if (m) return String(m).trim()
+    }
+    // Fallback: model.options RPC
+    if (host && typeof host.request === 'function') {
+      const res = await host.request('model.options', {})
+      if (res && res.model) return String(res.model).trim()
+    }
+  } catch (e) {
+    // Ignore
+  }
+  return ''
+}
 
 /** "(pass)" (loosely: pass / (pass) / pass.) or empty = the member stayed silent. */
 function isGroupPassText(text) {
@@ -8180,8 +8265,23 @@ async function runGroupChatRounds(group, members, thread) {
   // cap forced the exit — the activity feed must tell those apart.
   let exitKind = 'settled'
 
+  // Read config and detect model for effective round cap
+  const gcConfig = getGroupChatConfig()
+  const modelName = await getCurrentModelName()
+  const effectiveCap = getEffectiveRoundCap(modelName, gcConfig)
+  const isFree = isFreeModel(modelName, gcConfig)
+
+  // Token-budget guard: cumulative tokens consumed this drive. When the room log's
+  // cumulative token estimate exceeds gcConfig.token_budget, the drive exits as 'capped'
+  // independent of round count. This is the real safety net for pathological cascades.
+  let driveTokens = 0
+  const tokenBudget = Number(gcConfig.token_budget) || DEFAULT_GROUP_CHAT_TOKEN_BUDGET
+
+  // Rough token estimate: ~4 chars/token. Sum of all text in the room log for this thread.
+  const estimateTokens = (text) => Math.ceil(String(text || '').length / 4)
+
   try {
-    for (let round = 0; round < GROUP_CHAT_MAX_ROUNDS; round++) {
+    for (let round = 0; round < effectiveCap; round++) {
       // Deliver any replies that finished after their turn timed out —
       // every member, not just this round's responders, so long work is
       // late, never lost.
@@ -8192,6 +8292,16 @@ async function runGroupChatRounds(group, members, thread) {
         }
 
         await harvestStrandedGroupReply(group, member)
+      }
+
+      // Token-budget check at the top of each round: if the room log for this thread
+      // has consumed our budget, stop driving turns. (#96553)
+      const roomLogAtRoundStart = (($groupChats.get()[group] || {}).log || []).filter(e => groupThreadOf(e) === thread)
+      driveTokens = roomLogAtRoundStart.reduce((sum, e) => sum + estimateTokens(e.text), 0)
+      if (driveTokens >= tokenBudget) {
+        exitKind = 'capped'
+        recordGroupActivity(group, { kind: 'capped', member: null, thread, reason: 'token-budget' })
+        return
       }
 
       const roomLog = (($groupChats.get()[group] || {}).log || []).filter(e => groupThreadOf(e) === thread)
@@ -8482,7 +8592,7 @@ async function runGroupChatRounds(group, members, thread) {
       }
     }
 
-    // All GROUP_CHAT_MAX_ROUNDS rounds ran with someone still speaking —
+    // All rounds ran with someone still speaking —
     // the round cap ended the drive, not consensus. (#94478)
     exitKind = 'capped'
   } finally {

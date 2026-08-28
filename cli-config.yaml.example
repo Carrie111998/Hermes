@@ -1546,6 +1546,23 @@ delegation:
   #                                           # planning quality stays with the frontier parent.
 
 # =============================================================================
+# Group Chat Configuration
+# =============================================================================
+# Multi-bot group chat round-robin coordination. A user send triggers at most
+# `max_rounds` serial rounds over the member roster. Free models (detected by
+# :free suffix or `free_models` list) use `max_rounds_free` instead.
+# `token_budget` is a hard ceiling — the drive exits when cumulative tokens
+# exceed this, independent of round count.
+#
+# group_chat:
+#   max_rounds: 3                  # Paid models — default 3 (range: 1-20)
+#   max_rounds_free: null          # Free models — null = unlimited (range: 1-20)
+#   token_budget: 80000            # Hard token ceiling per drive (default: 80000)
+#   free_models: []                # Additional free model patterns (substring match)
+#     # - "google/gemini-2.0-flash"
+#     # - "qwen/qwq-32b"
+
+# =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
 # =============================================================================
 # AI-native persistent memory via Honcho (https://honcho.dev/).
