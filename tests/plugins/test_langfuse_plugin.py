@@ -2512,6 +2512,92 @@ class TestTurnTraceIdPublishing:
 
         assert get_session_env("HERMES_LANGFUSE_TRACE_ID", "") == "live-turn-trace"
 
+    def test_finish_trace_leaves_a_live_turns_id_alone_when_the_mirror_lags(self, monkeypatch):
+        """A stale reap must not blank a live turn whose env mirror lags behind.
+
+        A delegate_task child publishes its trace to the ContextVar only — the
+        process-global mirror deliberately keeps the parent's id (see
+        ``set_current_turn_trace_id``).  Reaping the parent's dangling trace from
+        inside the child's context therefore matches on the mirror, and clearing
+        on that match alone would blank the child's live ContextVar: the very
+        store the subprocess-env bridge treats as authoritative.  Withdraw the
+        mirror, leave the ContextVar.
+        """
+        import os
+
+        from agent.delegation_context import delegated_child_context
+        from gateway.session_context import get_session_env, set_current_turn_trace_id
+
+        mod = self._fresh_plugin()
+        client = self._client()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+
+        stale = self._start(mod, client)
+        mod._TRACE_STATE["stale-key"] = stale
+
+        with delegated_child_context():
+            # ContextVar-only publish: the mirror still holds the stale id.
+            set_current_turn_trace_id("live-child-trace")
+            assert os.environ.get("HERMES_LANGFUSE_TRACE_ID") == "abc123deadbeef"
+
+            mod._finish_trace("stale-key")
+
+            assert get_session_env("HERMES_LANGFUSE_TRACE_ID", "") == "live-child-trace", (
+                "withdrawing a stale id must not blank the live turn's ContextVar"
+            )
+            assert os.environ.get("HERMES_LANGFUSE_TRACE_ID") is None, (
+                "the stale id must still be withdrawn from the process-global mirror"
+            )
+
+    def test_finish_trace_withdraws_id_published_in_another_context(self, monkeypatch):
+        """A cross-task finish must still withdraw the finished turn's id.
+
+        ``_finish_trace`` can run in a different async task than the one that
+        opened the trace (``on_session_finalize`` / ``on_session_end`` reaping a
+        turn that never finalized). The finishing task's ContextVar is ``""``
+        (a fresh session bind), so the task-local read alone would miss the id;
+        the guard must fall back to the process-global ``os.environ`` mirror and
+        withdraw it there instead of leaving a stale id for the next turn.
+        """
+        import os
+
+        import gateway.session_context as sc
+        from gateway.session_context import get_session_env, set_session_vars
+
+        mod = self._fresh_plugin()
+        client = self._client()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+
+        state = self._start(mod, client)
+        mod._TRACE_STATE["task-key"] = state
+        assert os.environ.get("HERMES_LANGFUSE_TRACE_ID") == "abc123deadbeef"
+
+        # The finishing task bound a fresh session (ContextVar -> "") without
+        # touching the process-global mirror, which still holds the finished id.
+        # set_session_vars latches the process-wide "engaged" flag, which
+        # switches the subprocess-env bridge's leak policy for every later test
+        # in this process — restore it.
+        saved_engaged = sc._session_context_engaged
+        try:
+            set_session_vars(session_key="k:other", session_id="sess-other", source="cli")
+            assert get_session_env("HERMES_LANGFUSE_TRACE_ID", "") == ""
+
+            mod._finish_trace("task-key")
+        finally:
+            sc._session_context_engaged = saved_engaged
+
+        assert os.environ.get("HERMES_LANGFUSE_TRACE_ID") is None, (
+            "a cross-task finish must withdraw the id from the env mirror, not "
+            "leave a stale trace id to leak to the next turn's subprocesses"
+        )
+        assert get_session_env("HERMES_LANGFUSE_TRACE_ID", "") == "", (
+            "the finishing task's own ContextVar must be left as it bound it"
+        )
+
     def test_publishing_failure_never_breaks_tracing(self, monkeypatch):
         """A Hermes build without the setter must still open the root trace."""
         import gateway.session_context as sc

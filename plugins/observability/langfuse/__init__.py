@@ -908,16 +908,36 @@ def _publish_turn_trace_id(trace_id: str) -> None:
 def _unpublish_turn_trace_id(trace_id: str) -> None:
     """Withdraw a finished turn's trace id (see :func:`_publish_turn_trace_id`).
 
-    Only clears when *trace_id* is still the published one, so a cleanup pass
-    that reaps another key's dangling trace (``on_session_end``) cannot
-    unpublish the id a live turn is still handing to its subprocesses.
+    The id lives in two stores: the task-local ContextVar (authoritative for the
+    subprocess-env bridge once the session machinery is engaged) and the
+    process-global ``os.environ`` mirror (the CLI/cron fallback, skipped on the
+    delegated-child path).  They can hold different ids, so each is checked and
+    withdrawn on its own:
+
+    * ContextVar holds *trace_id* — the ordinary same-task finish.  Clear
+      through the setter, which drops the mirror too.
+    * Only the mirror holds *trace_id* — ``_finish_trace`` ran in a different
+      task than ``_start_root_trace`` published in (a session-end reap, or any
+      teardown deferred to a background task), so this task never had the id to
+      begin with.  Pop the mirror alone: blanking the ContextVar here would
+      unpublish whatever *this* task is publishing, which may be a live turn —
+      a delegated child's ContextVar-only publish leaves exactly that shape.
+    * Neither holds it — a newer turn has already published over it.  Nothing to
+      withdraw.
+
+    So a stale reap can never unpublish the id a live turn is still handing to
+    its subprocesses, and a cross-task finish still cleans up after itself.
+    Note the ContextVar has two "absent" spellings (``_UNSET`` before any bind,
+    ``""`` after a clear) and neither can carry an id across a task boundary —
+    only the mirror can, which is why it has to be consulted separately.
     """
     try:
         from gateway.session_context import get_session_env, set_current_turn_trace_id
 
-        if get_session_env("HERMES_LANGFUSE_TRACE_ID", "") != trace_id:
-            return
-        set_current_turn_trace_id("")
+        if get_session_env("HERMES_LANGFUSE_TRACE_ID", "") == trace_id:
+            set_current_turn_trace_id("")
+        elif os.environ.get("HERMES_LANGFUSE_TRACE_ID") == trace_id:
+            os.environ.pop("HERMES_LANGFUSE_TRACE_ID", None)
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"clearing turn trace id failed: {exc}")
 

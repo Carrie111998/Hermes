@@ -232,6 +232,13 @@ def set_current_turn_trace_id(trace_id: str) -> None:
     the parent turn's id for every later parent subprocess.  The ContextVar
     write is task-local and stays correct for the child's own tools.
 
+    Clearing writes ``""`` to the ContextVar rather than restoring ``_UNSET``,
+    so the var has two "absent" spellings: ``_UNSET`` (never published in this
+    context — the bridge strips the var, or falls back to ``os.environ`` when no
+    host is engaged) and ``""`` (published and finished — the bridge exports it
+    empty, masking any stale mirror).  Both read as "no active turn trace"; they
+    differ only in whether the ``os.environ`` fallback still applies.
+
     A trace id is a hex identifier, not a secret — it carries no content and
     needs no redaction.
     """
