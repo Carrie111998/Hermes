@@ -266,7 +266,12 @@ import {
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
-import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import {
+  loadNativeTokenSet,
+  type NativeTokenStoreIo,
+  persistNativeTokenSet,
+  rewriteNativeTokenStore
+} from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
 import { createParentStartMarkerResolver, parentWatchdogEnv } from './parent-process-identity'
@@ -7495,9 +7500,27 @@ function _nativeTokenStoreIo(): NativeTokenStoreIo {
     encrypt: encryptDesktopSecret,
     decrypt: decryptDesktopSecret,
     readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
+    readBackupStoreText: () => fs.readFileSync(`${_nativeTokenStorePath()}.bak`, 'utf8'),
     writeStoreText: (text: string) => {
-      fs.mkdirSync(path.dirname(_nativeTokenStorePath()), { recursive: true })
-      fs.writeFileSync(_nativeTokenStorePath(), text, { mode: 0o600 })
+      const target = _nativeTokenStorePath()
+      const backup = `${target}.bak`
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+
+      // Keep the last complete predecessor before publishing the replacement.
+      // Both writes use temp-file + rename; an interrupted write therefore
+      // leaves either the old primary, the old backup, or a complete new file.
+      if (fs.existsSync(target)) {
+        const current = fs.readFileSync(target, 'utf8')
+        try {
+          const parsed = JSON.parse(current)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            writeSecretFileAtomic(backup, current, { encoding: 'utf8' })
+          }
+        } catch {
+          // Preserve an existing valid backup when the primary is corrupt.
+        }
+      }
+      writeSecretFileAtomic(target, text, { encoding: 'utf8' })
     },
     rememberLog
   }
@@ -7524,13 +7547,15 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
 }
 
 function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet) {
-  _nativeTokens.set(baseUrl, tokens)
+  // Publish first. A failed atomic write must not leave memory claiming a
+  // credential that a fresh process cannot recover.
   _persistNativeTokens(baseUrl, tokens)
+  _nativeTokens.set(baseUrl, tokens)
 }
 
 function _clearNativeTokens(baseUrl: string) {
-  _nativeTokens.delete(baseUrl)
   _persistNativeTokens(baseUrl, null)
+  _nativeTokens.delete(baseUrl)
 }
 
 // True when we hold native bearer tokens for this gateway (the native-flow
@@ -8507,23 +8532,22 @@ function secretStoragePolicy(): SecretStoragePolicy {
 }
 
 function setSecretStoragePolicy(next: SecretStoragePolicy) {
-  _secretStoragePolicy = { on: next.on === true, migrated: next.migrated === true }
-  writeSecretStoragePolicy(_secretStoragePolicy, _secretStoragePolicyIo)
+  const normalized = { on: next.on === true, migrated: next.migrated === true }
+  // Publish the policy before changing the process cache. If the atomic write
+  // fails, this process must continue using the previously committed policy.
+  writeSecretStoragePolicy(normalized, _secretStoragePolicyIo)
+  _secretStoragePolicy = normalized
 }
 
-const {
-  encryptDesktopSecret,
-  decryptDesktopSecret,
-  decryptRemoteHeaders,
-  encryptIncomingRemoteHeaders
-} = createDesktopSecretStorage({
-  getPolicy: secretStoragePolicy,
-  safeStorage,
-  classifyStoredSecret,
-  normalizeRemoteHeaders,
-  safeStorageEncoding: SAFE_STORAGE_ENCODING,
-  encryptStrict: encryptDesktopSecretStrict
-})
+const { encryptDesktopSecret, decryptDesktopSecret, decryptRemoteHeaders, encryptIncomingRemoteHeaders } =
+  createDesktopSecretStorage({
+    getPolicy: secretStoragePolicy,
+    safeStorage,
+    classifyStoredSecret,
+    normalizeRemoteHeaders,
+    safeStorageEncoding: SAFE_STORAGE_ENCODING,
+    encryptStrict: encryptDesktopSecretStrict
+  })
 
 /**
  * Keychain availability as the renderer should see it. With encryption
@@ -8591,84 +8615,145 @@ function rewriteAllStoredSecrets(shouldRewrite: (secret: any) => boolean, reenco
     writeDesktopConnectionsRegistry({ ...registry, connections: registry.connections.map(rewriteBlock) })
   }
 
-  // Native OAuth token store: baseUrl → blob.
-  const io = _nativeTokenStoreIo()
-
-  try {
-    const store = JSON.parse(io.readStoreText())
-
-    if (store && typeof store === 'object' && !Array.isArray(store)) {
-      const entries = Object.entries(store)
-
-      if (entries.some(([, v]) => shouldRewrite(v))) {
-        touched = true
-        io.writeStoreText(JSON.stringify(Object.fromEntries(entries.map(([k, v]) => [k, reencode(v)]))))
-      }
-    }
-  } catch {
-    // Missing/corrupt native token store: nothing to rewrite.
+  // Native OAuth token store: baseUrl → blob. The store module rejects a
+  // corrupt primary before mutation and publishes the complete replacement via
+  // the atomic owner-only writer supplied above.
+  if (rewriteNativeTokenStore(shouldRewrite, reencode, _nativeTokenStoreIo())) {
+    touched = true
   }
 
   return touched
 }
 
-/**
- * One-shot legacy migration: builds before the policy wrote every secret as a
- * safeStorage blob. When a user explicitly turns encryption OFF, decrypt each
- * stored blob once and rewrite it as plain so no future launch touches the
- * keychain. Marked `migrated` whether or not every blob decrypts — a
- * broken keychain costs at most ONE prompt (this pass), never one per
- * launch; blobs that would not decrypt are left in place and simply read as
- * absent from then on (classifyStoredSecret → 'drop'), so opting encryption
- * back ON later can still recover them on a healthy keychain.
- *
- * Runs before createWindow() so every later read sees the final encodings.
- */
-function migrateLegacyEncryptedSecretsOnce() {
-  const policy = secretStoragePolicy()
+const SECRET_STORAGE_TRANSITION_PATH = path.join(app.getPath('userData'), 'secret-storage-transition.json')
 
-  if (policy.on || policy.migrated) {
+type SecretStorageTransition = { targetOn: boolean; targetMigrated: boolean }
+
+function writeSecretStorageTransition(transition: SecretStorageTransition) {
+  writeSecretFileAtomic(SECRET_STORAGE_TRANSITION_PATH, JSON.stringify(transition), { encoding: 'utf8' })
+}
+
+function readSecretStorageTransition(): SecretStorageTransition | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SECRET_STORAGE_TRANSITION_PATH, 'utf8'))
+    if (typeof parsed?.targetOn !== 'boolean' || typeof parsed?.targetMigrated !== 'boolean') {
+      throw new Error('invalid transition state')
+    }
+    return parsed
+  } catch (error) {
+    if ((error as any)?.code === 'ENOENT') {
+      return null
+    }
+    throw new Error(
+      `Secret storage transition marker is corrupt: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+}
+
+function clearSecretStorageTransition() {
+  try {
+    fs.rmSync(SECRET_STORAGE_TRANSITION_PATH, { force: true })
+  } catch (error) {
+    throw new Error(
+      `Secret storage transition completed but its recovery marker could not be removed: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+}
+
+function decryptSecretForMigration(secret: any): string {
+  if (secret?.encoding !== SAFE_STORAGE_ENCODING || !secret.value) {
+    return ''
+  }
+
+  try {
+    return safeStorage.decryptString(Buffer.from(String(secret.value), 'base64'))
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Run the multi-store rewrite behind a durable marker. The marker is written
+ * before the first destination and removed only after every destination and
+ * the target policy have been atomically published. A restart can therefore
+ * resume an interrupted transition from the marker without trusting memory.
+ */
+function runSecretStorageTransition(
+  targetOn: boolean,
+  targetMigrated: boolean,
+  shouldRewrite: (secret: any) => boolean,
+  reencode: (secret: any) => any
+) {
+  writeSecretStorageTransition({ targetOn, targetMigrated })
+  rewriteAllStoredSecrets(shouldRewrite, reencode)
+  setSecretStoragePolicy({ on: targetOn, migrated: targetMigrated })
+  clearSecretStorageTransition()
+}
+
+function recoverSecretStorageTransition() {
+  const transition = readSecretStorageTransition()
+  if (!transition) {
     return
   }
 
-  const needsMigration = (secret: any) => classifyStoredSecret(secret, policy) === 'migrate'
+  const shouldRewrite = transition.targetOn
+    ? (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
+    : (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
+  const reencode = transition.targetOn
+    ? (secret: any) => (shouldRewrite(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret)
+    : (secret: any) => {
+        if (!shouldRewrite(secret)) {
+          return secret
+        }
+        const plaintext = decryptSecretForMigration(secret)
+        return plaintext ? { encoding: 'plain', value: plaintext } : secret
+      }
 
-  const reencode = (secret: any) => {
-    if (!needsMigration(secret)) {
-      return secret
-    }
+  runSecretStorageTransition(transition.targetOn, transition.targetMigrated, shouldRewrite, reencode)
+}
 
-    const plaintext = decryptDesktopSecret(secret)
+/**
+ * One-shot legacy migration. The default policy is secure and migrates legacy
+ * plaintext blobs when possible; an explicit `{ on: false, migrated: true }`
+ * remains a durable opt-out and is never silently overridden. Both directions
+ * use the same recovery marker, and `migrated` is not committed after failure.
+ */
+function migrateLegacyEncryptedSecretsOnce() {
+  recoverSecretStorageTransition()
+  const policy = secretStoragePolicy()
 
-    // Undecryptable now (locked/absent keychain): keep the blob for a
-    // potential future opt-in, but post-migration reads treat it as unset.
-    return plaintext ? { encoding: 'plain', value: plaintext } : secret
+  if (policy.migrated) {
+    return
   }
 
-  let touchedKeychain = false
+  const targetOn = policy.on
+  const shouldRewrite = targetOn
+    ? (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
+    : (secret: any) => classifyStoredSecret(secret, policy) === 'migrate'
+  const reencode = targetOn
+    ? (secret: any) => (shouldRewrite(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret)
+    : (secret: any) => {
+        if (!shouldRewrite(secret)) {
+          return secret
+        }
+        const plaintext = decryptSecretForMigration(secret)
+        return plaintext ? { encoding: 'plain', value: plaintext } : secret
+      }
 
   try {
-    touchedKeychain = rewriteAllStoredSecrets(needsMigration, reencode)
+    runSecretStorageTransition(targetOn, true, shouldRewrite, reencode)
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
-
-    rememberLog(`[secret-storage] legacy migration pass failed: ${detail}`)
-  }
-
-  setSecretStoragePolicy({ on: false, migrated: true })
-
-  if (touchedKeychain) {
-    rememberLog('[secret-storage] migrated legacy keychain-encrypted secrets to opt-out storage (one-shot pass)')
+    rememberLog(`[secret-storage] legacy migration pass failed; migration remains pending: ${detail}`)
+    return
   }
 }
 
 /**
  * Settings → Gateway toggle: flip keychain-backed encryption and re-encode
- * every stored secret to match. Turning ON encrypts plain blobs through
- * strict safeStorage (throws loudly when the keychain is unusable — the
- * toggle stays off and the renderer shows the error). Turning OFF decrypts
- * back to plain; this is user-initiated, so a keychain prompt here is
- * expected and acceptable.
+ * every stored secret to match. The marker is durable before the first rewrite,
+ * and policy publication is the final step, so a crash cannot commit a secure
+ * policy over a partially migrated set.
  */
 function applySecretStorageEncryption(on: boolean) {
   const enable = on === true
@@ -8680,7 +8765,6 @@ function applySecretStorageEncryption(on: boolean) {
   if (enable) {
     const needsEncrypt = (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
 
-    // Probe FIRST so an unusable keychain fails before any store is touched.
     if (
       !(() => {
         try {
@@ -8695,38 +8779,22 @@ function applySecretStorageEncryption(on: boolean) {
       )
     }
 
-    setSecretStoragePolicy({ on: true, migrated: true })
-
-    try {
-      rewriteAllStoredSecrets(needsEncrypt, secret =>
-        needsEncrypt(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret
-      )
-    } catch (error) {
-      // Encryption failed midway: revert the policy so reads keep working
-      // against whatever encodings are on disk (mixed stores read fine —
-      // decryptDesktopSecret handles both encodings under either policy).
-      setSecretStoragePolicy({ on: false, migrated: true })
-      throw error
-    }
-
+    runSecretStorageTransition(true, true, needsEncrypt, secret =>
+      needsEncrypt(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret
+    )
     return { on: true }
   }
 
-  // Turning OFF is an explicit user action: decrypt everything back to plain
-  // while the keychain is still readable, then flip the policy.
   const needsDecrypt = (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
 
-  rewriteAllStoredSecrets(needsDecrypt, (secret: any) => {
+  runSecretStorageTransition(false, true, needsDecrypt, secret => {
     if (!needsDecrypt(secret)) {
       return secret
     }
 
-    const plaintext = decryptDesktopSecret(secret)
-
+    const plaintext = decryptSecretForMigration(secret)
     return plaintext ? { encoding: 'plain', value: plaintext } : secret
   })
-
-  setSecretStoragePolicy({ on: false, migrated: true })
 
   return { on: false }
 }
@@ -8891,14 +8959,10 @@ function readDesktopConnectionConfig() {
 
     const parsed = JSON.parse(raw)
 
-    // NOT done here: migrating a legacy non-safeStorage token payload to
-    // ciphertext at rest. Deferred deliberately — it has to honor the opt-in
-    // plaintext choice PR #62319 adds (re-encrypting it converts a portable
-    // credential into a keychain-bound one and can lose the token), write
-    // through sanitizeConnectionProfiles below rather than persisting raw
-    // `parsed`, and tell the user to ROTATE, since every existing backup copy
-    // still holds the old secret. Do not add it without those three.
-
+    // Legacy plaintext is migrated before the first window by
+    // migrateLegacyEncryptedSecretsOnce(). This read path remains deliberately
+    // side-effect free: it only parses and tightens the existing file, while
+    // the durable transition marker owns all re-encoding writes.
     if (parsed && typeof parsed === 'object') {
       const remote = parsed.remote && typeof parsed.remote === 'object' ? parsed.remote : {}
       // authMode lives on the remote sub-object: 'oauth' (cookie + ws-ticket)
@@ -9362,7 +9426,11 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
   const remoteHeaders =
-    input.remoteHeaders && typeof input.remoteHeaders === 'object' ? input.remoteHeaders : existingBlock.headers
+    input.remoteHeaders && typeof input.remoteHeaders === 'object'
+      ? encryptIncomingRemoteHeaders(input.remoteHeaders, existingBlock.headers, {
+          allowPlainText: input.allowPlainTextToken
+        })
+      : existingBlock.headers
 
   // Persist decision lives in hardening.resolvePersistedRemoteToken so the
   // IPC-propagation seam (allowPlainTextToken → encryptDesktopSecret opt-in) is
@@ -17260,10 +17328,10 @@ app.whenReady().then(() => {
     safeStorageApi: safeStorage
   })
 
-  // Keychain encryption defaults ON. Explicit opt-out migration converts
-  // legacy safeStorage-encrypted secrets to plain once after the user turns
-  // encryption off. Must run before createWindow() and the first connection
-  // resolution.
+  // Keychain encryption defaults ON. Before the first window, the durable
+  // transition migrates no-marker legacy plaintext to safeStorage, while the
+  // explicit `{ on: false, migrated: true }` opt-out remains untouched. A
+  // crash leaves a marker that the next launch resumes before connections load.
   migrateLegacyEncryptedSecretsOnce()
 
   if (IS_MAC) {

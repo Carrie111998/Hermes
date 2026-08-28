@@ -287,9 +287,15 @@ export function findElectron(): string {
   // In dev mode, we use the `electron` binary directly (not the packaged app).
   // The dev:electron script in package.json does exactly this: `electron .`
   // after building. We replicate that here.
-  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
+  const localElectronCandidates = [
+    path.join(DESKTOP_ROOT, 'node_modules', 'electron', 'dist', 'electron'),
+    path.join(DESKTOP_ROOT, 'node_modules', 'electron', 'dist', 'electron.exe'),
+    path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron'),
+    path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron.exe'),
+  ]
+  const localElectron = localElectronCandidates.find((candidate) => fs.existsSync(candidate))
 
-  if (fs.existsSync(localElectron)) {
+  if (localElectron) {
     return localElectron
   }
 

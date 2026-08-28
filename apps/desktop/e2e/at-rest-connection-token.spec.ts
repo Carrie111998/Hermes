@@ -42,23 +42,20 @@
  * separate credential file would break the test while being *more* correct.
  * The load-bearing assertion is the raw-bytes absence of the secret.
  *
- * Six enforced at-rest paths plus one documented gap:
+ * Five enforced at-rest paths:
  *
  *   1. A NEWLY configured token (ACTIVE). The app's own write path routes
  *      through the strict `encryptDesktopSecret`; this test holds it there
  *      against regression, and pins the mode of the file it actually wrote.
  *   2. An EXISTING `connection.json` at the old 0644 (ACTIVE). Covers the
- *      read-side tighten, and ONLY the mode — its token is already ciphertext,
- *      which is what keeps it independent of the migration test 5 defers.
+ *      read-side tighten, and ONLY the mode — its token is already ciphertext.
  *   3. A CORRUPT `connection.json` at 0644 (ACTIVE). The tighten must not be
- *      gated on the parse succeeding: a truncated file still holds the token
- *      bytes, and the parse failure is swallowed, so nothing would ever come
- *      back for it.
+ *      gated on the parse succeeding: a truncated file still holds token
+ *      bytes, and parse failure is swallowed.
  *   4. A malformed policy object (ACTIVE). Hand-edited policy values must not
  *      downgrade the real write path to plaintext.
- *   5. An EXISTING plaintext `connection.json` (`test.fixme`). Legacy payloads
- *      are deliberately NOT migrated yet. The test is kept, disabled, with a
- *      precise reason — see the block comment above it.
+ *   5. An EXISTING plaintext `connection.json` (ACTIVE). A no-marker legacy
+ *      payload is migrated through the startup transition and remains usable.
  *
  * ── Correcting the record on test 4 ─────────────────────────────────────
  *
@@ -1105,40 +1102,12 @@ test.describe('remote gateway session token at rest', () => {
   })
 
   /**
-   * DEFERRED GAP — legacy plaintext payloads are not migrated.
-   *
-   * Held as `fixme` rather than deleted: the fixture below is the correct
-   * fixture for the population that a migration must eventually cover, and
-   * the harness (seed → boot-poll → authoritative re-save → raw-bytes scan →
-   * wire check) is the harness such a migration needs. Keeping it typechecked
-   * and listed makes the gap visible in `--list` and in every report; deleting
-   * it would make the gap invisible and cost the next implementer this setup.
-   *
-   * It is NOT enabled because the migration it asserted was reviewed
-   * DO NOT SHIP. Before this can be un-fixme'd, three prerequisites (see the
-   * header, and the matching note in electron/main.ts readDesktopConnectionConfig):
-   *
-   *   1. Sequence with #62319's opt-in plaintext marker, so a user who
-   *      deliberately chose plaintext is not silently overridden. This
-   *      fixture has NO marker, so it stays in scope for migration — but the
-   *      implementation must be able to tell the two apart.
-   *   2. Write through the config sanitizer, not around it.
-   *   3. Surface ROTATION guidance. Re-encrypting cannot un-expose a secret
-   *      that is already in a backup; it only prevents future exposure.
-   *
-   * Un-fixme'ing this without (1) risks destroying a deliberate user choice,
-   * and without (3) it reports a remediation it did not actually perform.
+   * A no-marker legacy plaintext file is migrated by the startup transition.
+   * The explicit opt-out state is `{ on: false, migrated: true }`, so this
+   * fixture remains an unambiguous migration contract and checks the real
+   * connection.json write path plus restart usability.
    */
   test('an existing plaintext connection.json is migrated off plaintext and keeps working', async () => {
-    test.fixme(
-      true,
-      'Deferred: legacy plaintext connection.json is intentionally NOT migrated. ' +
-        'Affected population is pre-release bb/gui installs (incl. the desktop-pr20059-installers build) ' +
-        'plus hand-edited configs — mainline never wrote a plaintext gateway token. ' +
-        'Blocked on: (1) #62319 opt-in-marker coordination, (2) writing through the config sanitizer, ' +
-        '(3) surfacing token-rotation guidance. Re-encrypting alone does not remediate an already-backed-up secret.'
-    )
-
     const fake = gateway!
     sandbox = createSandbox('at-rest-migrate')
 

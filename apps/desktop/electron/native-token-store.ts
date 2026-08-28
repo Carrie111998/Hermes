@@ -42,28 +42,77 @@ export interface NativeTokenStoreIo {
   decrypt: (secret: any) => string
   /** Raw store-file text. Throws when the file is absent — treated as empty. */
   readStoreText: () => string
-  /** Persist the store-file text (main.ts writes mode 0600 under userData). */
+  /** Optional predecessor retained for recovery after an interrupted publish. */
+  readBackupStoreText?: () => string
+  /** The caller must provide an atomic, owner-only publication primitive. */
   writeStoreText: (text: string) => void
   rememberLog?: (message: string) => void
 }
 
+/** Parse a native token store without accepting arrays or scalar JSON. */
+function parseStoreText(text: string): Record<string, any> | null {
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 /**
- * baseUrl → encrypted payload. A missing, unreadable, or hand-mangled store
- * reads as empty rather than throwing: a failed *read* falls to the next rung.
- *
- * Arrays are rejected alongside every other non-object shape: assigning
- * store[baseUrl] on an array would set a non-index property, which
- * JSON.stringify drops on the way back out — the write would look like it
- * succeeded and the tokens would be gone on the next launch.
+ * Read the newest valid store. A malformed primary is recoverable from the
+ * predecessor retained by the atomic publisher; an absent or unrecoverable
+ * store is empty for the read path.
  */
 function readStore(io: NativeTokenStoreIo): Record<string, any> {
   try {
-    const parsed = JSON.parse(io.readStoreText())
+    const parsed = parseStoreText(io.readStoreText())
+    if (parsed) {
+      return parsed
+    }
+  } catch {
+    // Missing/corrupt primary: try the retained predecessor below.
+  }
 
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  try {
+    const backup = io.readBackupStoreText ? parseStoreText(io.readBackupStoreText()) : null
+    return backup || {}
   } catch {
     return {}
   }
+}
+
+/**
+ * Read before a mutation. Unlike the load path, a corrupt store must not be
+ * silently replaced by an empty object and thereby discard other gateways.
+ */
+function readStoreForWrite(io: NativeTokenStoreIo): Record<string, any> {
+  let primary: string
+
+  try {
+    primary = io.readStoreText()
+  } catch (error) {
+    if ((error as any)?.code === 'ENOENT') {
+      return {}
+    }
+    throw error
+  }
+
+  const parsed = parseStoreText(primary)
+  if (parsed) {
+    return parsed
+  }
+
+  try {
+    const backup = io.readBackupStoreText ? parseStoreText(io.readBackupStoreText()) : null
+    if (backup) {
+      return backup
+    }
+  } catch {
+    // Report the primary corruption below; no valid predecessor exists.
+  }
+
+  throw new Error('Native OAuth token store is corrupt; refusing to overwrite it.')
 }
 
 /**
@@ -96,20 +145,15 @@ function redactGatewayUrl(baseUrl: string): string {
  * into whatever other gateways are already stored.
  */
 export function persistNativeTokenSet(baseUrl: string, tokens: NativeTokenSet | null, io: NativeTokenStoreIo): void {
-  const store = readStore(io)
+  const store = readStoreForWrite(io)
 
   if (tokens) {
     // Encrypt the whole set as one blob so the refresh token never lands in
-    // plaintext on disk. Deliberately outside the try below: an unusable
-    // keychain is an authoritative write failure and must surface to the
-    // caller, not be logged away as if the tokens were saved.
+    // plaintext on disk. An unusable keychain is an authoritative write
+    // failure and must surface to the caller, not be logged away.
     const secret = io.encrypt(JSON.stringify(tokens))
 
     if (!secret) {
-      // A null blob is the same failure as a throw, only quieter. Storing it
-      // would replace a good entry with nothing: the write would report
-      // success, the next launch would show signed out, and the refresh token
-      // would be unrecoverable. Fail before touching the store.
       throw new Error('Secure token storage returned no encrypted payload; refusing to overwrite stored native tokens.')
     }
 
@@ -118,13 +162,25 @@ export function persistNativeTokenSet(baseUrl: string, tokens: NativeTokenSet | 
     delete store[baseUrl]
   }
 
-  try {
-    io.writeStoreText(JSON.stringify(store))
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
+  // main.ts supplies a temp-file + rename publisher. Do not catch this: the
+  // in-memory cache must not claim a token was persisted when publication failed.
+  io.writeStoreText(JSON.stringify(store))
+}
 
-    io.rememberLog?.(`[native-oauth] failed to persist tokens: ${detail}`)
+/** Re-encode every stored gateway through one atomic store publication. */
+export function rewriteNativeTokenStore(
+  shouldRewrite: (secret: StoredTokenSecret) => boolean,
+  reencode: (secret: StoredTokenSecret) => StoredTokenSecret,
+  io: NativeTokenStoreIo
+): boolean {
+  const store = readStoreForWrite(io)
+  const entries = Object.entries(store)
+  if (!entries.some(([, value]) => shouldRewrite(value))) {
+    return false
   }
+
+  io.writeStoreText(JSON.stringify(Object.fromEntries(entries.map(([key, value]) => [key, reencode(value)]))))
+  return true
 }
 
 /**
