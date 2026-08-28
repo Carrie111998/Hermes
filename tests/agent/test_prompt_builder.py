@@ -1082,6 +1082,29 @@ class TestIndexTriggerTags:
         assert "AirTag" in result and "GPS" in result
         assert "hardware," not in result  # already in the description
 
+    def test_non_latin_tags_reach_the_index(self):
+        """The vocabulary a non-English user types must survive the filter.
+
+        An ASCII-only word regex found nothing inside an Arabic or Chinese tag,
+        so the tag looked like it contributed no new words and was dropped —
+        making every non-Latin tag in the library unreachable.
+        """
+        arabic = _index_description("وثائق", ["عربي", "ترجمة", "وثائق"])
+        assert "عربي" in arabic and "ترجمة" in arabic
+        # ...and dedup still works in that script: the description says it.
+        assert arabic.count("وثائق") == 1
+
+        assert "中文" in _index_description("文档", ["中文", "翻译"])
+
+    def test_a_non_string_tag_cannot_kill_the_whole_index(self):
+        """Snapshots are JSON on disk and need not come from this build.
+
+        The org-labeling loop that renders these lines has no per-entry guard,
+        so one bad cached tag would take out the entire skills prompt rather
+        than one line of it.
+        """
+        assert "123" in _index_description("desc", [123, "ok"])
+
     def test_a_demoted_category_stays_names_only(self, monkeypatch, tmp_path):
         """Demotion exists to reclaim tokens; tags must not sneak back in."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

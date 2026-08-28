@@ -1627,7 +1627,11 @@ def _write_skills_snapshot(
 # +1073 against a 2,670-token index.
 _MAX_INDEX_TAGS = 3
 
-_TAG_WORD_RE = re.compile(r"[a-z0-9]+")
+# Unicode-aware on purpose. `[a-z0-9]+` matched nothing in an Arabic or
+# Chinese tag, so `words` came back empty and the tag was dropped as
+# "contributing nothing" — silently making non-Latin tags unreachable,
+# which is exactly the vocabulary a non-English user types.
+_TAG_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def _skill_tags(frontmatter: dict) -> list:
@@ -1660,10 +1664,16 @@ def _index_description(description: str, tags) -> str:
     if not tags:
         return description
 
-    said = set(_TAG_WORD_RE.findall(description.lower()))
+    said = set(_TAG_WORD_RE.findall(str(description).casefold()))
     novel = []
     for tag in tags:
-        words = set(_TAG_WORD_RE.findall(tag.lower()))
+        # str(): a snapshot is JSON on disk and is not guaranteed to have come
+        # from this build. One int in one cached tag list would otherwise raise
+        # inside the org-labeling loop, which has no per-entry guard — killing
+        # the whole skills prompt, not one line of it.
+        tag = str(tag)
+        # casefold, not lower: it folds ß/İ and the Unicode cases lower() misses.
+        words = set(_TAG_WORD_RE.findall(tag.casefold()))
         if words and not words <= said:
             novel.append(tag)
             # The unit is the WORD, not the tag string: a later tag survives
