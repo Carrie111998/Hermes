@@ -8253,6 +8253,136 @@ def _refuse_if_gated(
     return True
 
 
+def ensure_pm_project(
+    conn: sqlite3.Connection, *, project_id: str, name: Optional[str] = None,
+) -> dict:
+    """Return the ``pm_projects`` row for *project_id*, creating it if absent.
+
+    Requesting a project is not crossing a gate, so this is safe for a PM agent
+    to call. Idempotent: a second call with the same id returns the existing
+    row untouched — the name is never silently rewritten, because the row's
+    ``plan_revision`` is the authority ``release_plan_gate`` checks against and
+    quietly mutating a project record around it would be surprising.
+    """
+    _assert_not_delegated_child_mutation()
+    pid = str(project_id or "").strip()
+    if not pid:
+        raise ValueError("project_id is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, slug, name, plan_revision FROM pm_projects WHERE id = ?",
+            (pid,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO pm_projects (id, slug, name, plan_revision, "
+                " lifecycle_status, created_at) "
+                "VALUES (?, ?, ?, 0, 'planning', ?)",
+                (pid, pid, (name or pid).strip() or pid, int(time.time())),
+            )
+            row = conn.execute(
+                "SELECT id, slug, name, plan_revision FROM pm_projects "
+                "WHERE id = ?", (pid,),
+            ).fetchone()
+    return dict(row)
+
+
+def submit_plan(
+    conn: sqlite3.Connection, *, project_id: str, body: str,
+    proposed_by: Optional[str] = None,
+) -> dict:
+    """Record the next plan revision for a project. Returns the new row.
+
+    Drafting a plan is not approving one: this writes an artifact and nothing
+    else. It never touches ``tasks.status`` or ``gate_state``, so a PM agent
+    may call it freely — parking the task at the gate is a separate step, and
+    crossing the gate is not available locally at all.
+
+    The insert and the ``pm_projects.plan_revision`` bump share one
+    ``write_txn``, and the revision is derived from the project row under that
+    lock rather than from a caller-supplied number. ``release_plan_gate``
+    refuses any revision that is not the project's current one, so two
+    concurrent drafts cannot both remain approvable.
+    """
+    _assert_not_delegated_child_mutation()
+    pid = str(project_id or "").strip()
+    if not pid:
+        raise ValueError("project_id is required")
+    text = body if isinstance(body, str) else ""
+    if not text.strip():
+        raise ValueError("a plan body is required")
+    with write_txn(conn):
+        proj = conn.execute(
+            "SELECT plan_revision FROM pm_projects WHERE id = ?", (pid,),
+        ).fetchone()
+        if proj is None:
+            raise ValueError(f"project {pid} not found")
+        revision = int(proj["plan_revision"] or 0) + 1
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO pm_plans (project_id, revision, body, proposed_by, "
+            " proposed_at) VALUES (?, ?, ?, ?, ?)",
+            (pid, revision, text, proposed_by, now),
+        )
+        bumped = conn.execute(
+            "UPDATE pm_projects SET plan_revision = ? "
+            "WHERE id = ? AND plan_revision = ?",
+            (revision, pid, revision - 1),
+        )
+        if bumped.rowcount != 1:
+            # Another writer advanced the project inside this transaction's
+            # window. Raising rolls the insert back with it, so a revision
+            # never outlives the bump that made it current.
+            raise ValueError("plan revision advanced concurrently; retry")
+    return {"project_id": pid, "revision": revision, "body": text,
+            "proposed_by": proposed_by, "proposed_at": now}
+
+
+def get_plan(
+    conn: sqlite3.Connection, project_id: str,
+    revision: Optional[int] = None,
+) -> Optional[dict]:
+    """Read one plan revision, or the project's current one. Read-only."""
+    pid = str(project_id or "").strip()
+    if not pid:
+        return None
+    if revision is None:
+        proj = conn.execute(
+            "SELECT plan_revision FROM pm_projects WHERE id = ?", (pid,),
+        ).fetchone()
+        if proj is None or not int(proj["plan_revision"] or 0):
+            return None
+        revision = int(proj["plan_revision"])
+    row = conn.execute(
+        "SELECT project_id, revision, body, proposed_by, proposed_at, "
+        " root_task_id, approved_by, approved_at, rejected_at, reject_reason "
+        "FROM pm_plans WHERE project_id = ? AND revision = ?",
+        (pid, int(revision)),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_gated_tasks(conn: sqlite3.Connection) -> list:
+    """Every task currently parked at a human gate. Read-only.
+
+    The one query a human needs to answer "what is waiting on me?" without
+    being able to act on the answer from here.
+    """
+    rows = conn.execute(
+        "SELECT id, title, assignee, status, gate_state, created_at "
+        "FROM tasks WHERE gate_state IS NOT NULL AND gate_state != '' "
+        "ORDER BY created_at DESC, id"
+    ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        ctx = plan_gate_context(conn, row["id"])
+        item["project_id"] = (ctx or {}).get("project_id")
+        item["revision"] = (ctx or {}).get("revision")
+        out.append(item)
+    return out
+
+
 def plan_gate_context(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
     """Resolve the plan a gated task is waiting on, straight from the database.
 

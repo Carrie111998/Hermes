@@ -344,6 +344,24 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc"),
                busy_policy="dispatch"),
+    # One definition drives the CLI help entry, tab-completion, the gateway
+    # command list, the Telegram bot menu and the Slack slash map. The verbs
+    # themselves live in hermes_cli/projects_cmd.py; a test asserts this tuple
+    # and that parser's subcommands stay identical, so the registry cannot
+    # drift away from what the command actually accepts.
+    #
+    # Not cli_only: a human standing at a plan gate is often not at the
+    # terminal that owns the board. Nothing here can CROSS a gate — the two
+    # gate verbs display the plan and fail closed — so surfacing the command
+    # on messaging platforms grants no authority.
+    CommandDef("project", "Named multi-folder workspaces, plans, and human gates",
+               "Tools & Skills", args_hint="[subcommand]",
+               subcommands=("create", "list", "ls", "show", "add-folder",
+                            "remove-folder", "rename", "set-primary", "use",
+                            "archive", "restore", "bind-board", "plan",
+                            "plan-show", "status", "approve-plan",
+                            "reject-plan"),
+               busy_policy="dispatch"),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -1368,7 +1386,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+# ``project`` joins this list rather than displacing an existing native slash:
+# Slack's cap truncates in registry order, so adding a 51st command silently
+# dropped ``insights`` off the end (caught by test_telegram_parity). It is a
+# multi-verb administrative command like ``platform`` and ``init``, so
+# ``/hermes project …`` is the right shape for it on Slack anyway.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "project"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
