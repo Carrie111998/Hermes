@@ -1,3 +1,8 @@
+> [!NOTE]
+> jediswimmer fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). This clone is behind upstream. Not a Titans Rift product. Install, models, and gateway docs: follow upstream.
+
+`hermes-agent · fork of NousResearch/hermes-agent · jediswimmer`
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
