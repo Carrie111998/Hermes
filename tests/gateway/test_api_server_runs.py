@@ -154,6 +154,46 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("final_response", "partial"),
+        [("", False), ("partial answer", True)],
+    )
+    async def test_incomplete_agent_result_reports_failed_run(
+        self, adapter, final_response, partial
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": final_response,
+                    "completed": False,
+                    "partial": partial,
+                    "error": "response truncated",
+                }
+                mock_agent.session_prompt_tokens = 10
+                mock_agent.session_completion_tokens = 5
+                mock_agent.session_total_tokens = 15
+                mock_create.return_value = mock_agent
+
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+
+                for _ in range(40):
+                    status_response = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_response.json()
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "failed"
+        assert status["last_event"] == "run.failed"
+        assert status["completed"] is False
+        assert status["partial"] is partial
+        assert status["output"] == final_response
+        assert status["error"] == "response truncated"
+
+    @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
