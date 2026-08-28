@@ -269,6 +269,8 @@ async def _handle_room_member_grant_refresh(
             MAX_DISPATCH_GRANT_TTL_SECONDS,
             remaining,
         )
+        permissions = set(claims["permissions"])
+        permissions.update({"artifact.ack", "artifact.read"})
         token = issue_room_grant(
             self._room_grant_secret(),
             grant_id=f"grant-refresh-{uuid.uuid4().hex}",
@@ -279,7 +281,7 @@ async def _handle_room_member_grant_refresh(
             member_id=claims["member_id"],
             target_install_id=installation_id,
             target_profile=profile,
-            permissions=claims["permissions"],
+            permissions=permissions,
             issued_at=now,
             ttl_seconds=dispatch_ttl,
             status_expires_at=hard_expiry,

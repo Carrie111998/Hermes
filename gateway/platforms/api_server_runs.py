@@ -789,6 +789,12 @@ async def _handle_runs(
                                     "authority_epoch",
                                 )
                             })
+                            from gateway.hosted_room_artifacts import RoomArtifactOutbox
+                            from hermes_constants import get_hermes_home
+
+                            RoomArtifactOutbox(
+                                Path(get_hermes_home()) / "state.db"
+                            ).discard_superseded(room_artifact_scope)
                             room_artifact_token = bind_room_artifact_scope(
                                 room_artifact_scope
                             )

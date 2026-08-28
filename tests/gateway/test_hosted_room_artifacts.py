@@ -129,6 +129,22 @@ def test_cancel_and_disband_purge_only_the_matching_scope(tmp_path: Path):
     assert len(outbox.list(other_room)) == 1
 
 
+def test_new_execution_generation_reclaims_crash_stranded_output(tmp_path: Path):
+    db = tmp_path / "state.db"
+    path = tmp_path / "handoff.md"
+    path.write_text("handoff\n", encoding="utf-8")
+    outbox = RoomArtifactOutbox(db)
+    crashed = _scope(execution_generation=1)
+    retry = _scope(execution_generation=2)
+    other_task = _scope(task_id="dtask:other", execution_generation=1)
+    outbox.put_path(scope=crashed, path=path)
+    outbox.put_path(scope=other_task, path=path)
+
+    assert outbox.discard_superseded(retry) == 1
+    assert outbox.list(crashed) == []
+    assert len(outbox.list(other_task)) == 1
+
+
 @pytest.mark.parametrize(
     ("name", "data", "kind", "mime"),
     [
@@ -162,3 +178,30 @@ def test_output_artifact_rejects_mislabeled_image(tmp_path: Path):
             scope=_scope(),
             path=path,
         )
+
+
+@pytest.mark.parametrize("name", [".env", "auth.json", "config.yaml"])
+def test_share_group_file_rejects_sibling_profile_state(
+    tmp_path: Path,
+    monkeypatch,
+    name: str,
+):
+    root = tmp_path / "hermes"
+    alpha = root / "profiles" / "alpha"
+    beta = root / "profiles" / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir(parents=True)
+    candidate = beta / name
+    candidate.write_text("do not share\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    home_token = set_hermes_home_override(alpha)
+    scope_token = bind_room_artifact_scope(_scope(target_profile="alpha"))
+    try:
+        result = json.loads(share_group_file(str(candidate)))
+    finally:
+        reset_room_artifact_scope(scope_token)
+        reset_hermes_home_override(home_token)
+    assert result == {
+        "ok": False,
+        "error": "Files owned by another Hermes profile cannot be shared.",
+    }

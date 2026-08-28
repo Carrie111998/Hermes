@@ -49,7 +49,8 @@ def share_group_file(path: str, *, name: str | None = None) -> str:
     try:
         from gateway.platforms.base import validate_media_delivery_path
         from gateway.session_context import get_session_env
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        from agent.file_safety import get_read_block_error
 
         candidate = Path(str(path or "")).expanduser()
         if candidate.is_symlink():
@@ -62,9 +63,29 @@ def share_group_file(path: str, *, name: str | None = None) -> str:
             raise RoomArtifactError(
                 "That file cannot be shared. Move it to the workspace or a Hermes media folder and try again."
             )
+        resolved = Path(safe_path).resolve(strict=True)
+        active_home = Path(get_hermes_home()).resolve(strict=False)
+        profiles_root = Path(get_default_hermes_root()).resolve(strict=False) / "profiles"
+        try:
+            resolved.relative_to(profiles_root)
+        except ValueError:
+            pass
+        else:
+            try:
+                resolved.relative_to(active_home)
+            except ValueError as exc:
+                raise RoomArtifactError(
+                    "Files owned by another Hermes profile cannot be shared."
+                ) from exc
+            if active_home == profiles_root.parent:
+                raise RoomArtifactError(
+                    "Files owned by another Hermes profile cannot be shared."
+                )
+        if get_read_block_error(str(resolved)):
+            raise RoomArtifactError("Hermes credential and internal state files cannot be shared.")
         stored = RoomArtifactOutbox(Path(get_hermes_home()) / "state.db").put_path(
             scope=scope,
-            path=safe_path,
+            path=resolved,
             name=name,
         )
         return json.dumps({

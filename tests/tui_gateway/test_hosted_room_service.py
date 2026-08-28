@@ -857,6 +857,7 @@ def test_lost_peer_artifact_ack_retries_without_duplicate_member_message(
     tmp_path: Path,
 ):
     db = tmp_path / "state.db"
+    now = [0.0]
     peer = _LostAckArtifactPeerClient()
     route = PeerMemberRoute(
         home_install_id=hosted_rooms.local_authority_gateway_id(),
@@ -874,6 +875,9 @@ def test_lost_peer_artifact_ack_retries_without_duplicate_member_message(
         db_path=db,
         peer_routes={("room-1", "member-reviewer"): route},
         peer_clients={"install-peer": peer},
+        artifact_clock=lambda: now[0],
+        artifact_retry_min_seconds=10,
+        artifact_retry_max_seconds=40,
     )
     rpc = _FakeRPC()
     service.rpc = rpc
@@ -904,9 +908,28 @@ def test_lost_peer_artifact_ack_retries_without_duplicate_member_message(
         event_id="user-lost-ack",
         payload={"text": "Share the result", "thread_id": "thread-1"},
     )
-    _wait_for(lambda: len(peer.acks) >= 2)
+    _wait_for(lambda: len(peer.acks) == 1)
     assert service.stop(timeout=1.0)
-    events = service._events("room-1")
+    resumed = HostedRoomService(
+        _server(),
+        db_path=db,
+        peer_routes={("room-1", "member-reviewer"): route},
+        peer_clients={"install-peer": peer},
+        artifact_clock=lambda: now[0],
+        artifact_retry_min_seconds=10,
+        artifact_retry_max_seconds=40,
+    )
+    resumed.rpc = rpc
+    resumed.runtime.rpc = rpc
+    resumed.local_profiles = lambda: ("ops",)
+    binding = resumed.bindings()[0]
+    for _ in range(10):
+        resumed.prepare_room(binding)
+    assert len(peer.acks) == 1
+    now[0] = 10.0
+    resumed.prepare_room(binding)
+    _wait_for(lambda: len(peer.acks) == 2)
+    events = resumed._events("room-1")
     assert sum(
         event["kind"] == "message.member"
         and event["payload"].get("member_id") == "member-reviewer"

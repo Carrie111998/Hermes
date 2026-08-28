@@ -223,6 +223,56 @@ def test_hosted_terminal_receipt_failure_keeps_crash_marker(
     assert read_turn_marker(marker_home, "session-key") is not None
 
 
+def test_hosted_artifact_finalize_failure_never_settles_text_only(
+    emits, turn_env, marker_home, monkeypatch
+):
+    from gateway import hosted_room_artifacts
+
+    receipts = []
+    monkeypatch.setattr(
+        hosted_room_artifacts,
+        "terminal_artifact_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("disk fault")),
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *_args, **_kwargs: {"final_response": "Draft attached."},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="bot_room",
+        _hosted_room_task={
+            "room_id": "room-1",
+            "task_id": "dtask:artifact",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+            "execution_generation": 1,
+            "member_id": "member-writer",
+            "target_profile": "writer",
+            "home_install_id": "install-home",
+            "target_install_id": "install-home",
+            "authority_gateway_id": "gateway-home",
+            "authority_epoch": 1,
+        },
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=receipts.append,
+    )
+
+    assert receipts == [{
+        "status": "failed",
+        "text": "Draft attached.",
+        "error": "A Group Chat file could not be finalized.",
+    }]
+
+
 def test_continuation_turn_records_attempt_and_original_prompt(
     emits, turn_env, marker_home
 ):
@@ -440,4 +490,3 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 
 # ── End to end: continuation runs a real turn and clears the marker ────
-

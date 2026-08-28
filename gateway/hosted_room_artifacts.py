@@ -146,6 +146,24 @@ class RoomArtifactOutbox:
             ).fetchall()
         for row in acknowledged:
             (self.blob_root / str(row["blob_name"])).unlink(missing_ok=True)
+        cutoff = time.time() - 3600
+        with self._connect() as conn:
+            referenced = {
+                str(row["blob_name"])
+                for row in conn.execute(
+                    "SELECT blob_name FROM hosted_room_output_artifacts"
+                ).fetchall()
+            }
+        for path in self.blob_root.iterdir():
+            try:
+                if (
+                    path.is_file()
+                    and path.name not in referenced
+                    and path.stat().st_mtime < cutoff
+                ):
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
 
     def _connect(self) -> sqlite3.Connection:
         from hermes_state import apply_wal_with_fallback
@@ -459,6 +477,43 @@ class RoomArtifactOutbox:
                 except Exception:
                     continue
                 if scope.room_id == room_id:
+                    rows_to_delete.append(row)
+            if rows_to_delete:
+                conn.executemany(
+                    "DELETE FROM hosted_room_output_artifacts WHERE artifact_id=?",
+                    ((row["artifact_id"],) for row in rows_to_delete),
+                )
+                conn.commit()
+        for row in rows_to_delete:
+            (self.blob_root / str(row["blob_name"])).unlink(missing_ok=True)
+        return len(rows_to_delete)
+
+    def discard_superseded(self, scope: RoomArtifactScope) -> int:
+        """Purge older execution generations for the same logical task."""
+
+        rows_to_delete: list[sqlite3.Row] = []
+        with self._lock, self._connect() as conn:
+            self._initialize(conn)
+            rows = conn.execute(
+                "SELECT * FROM hosted_room_output_artifacts WHERE acknowledged_at IS NULL"
+            ).fetchall()
+            current = scope.as_mapping()
+            for row in rows:
+                try:
+                    candidate = RoomArtifactScope.from_mapping(
+                        json.loads(row["scope_json"])
+                    )
+                except Exception:
+                    continue
+                mapping = candidate.as_mapping()
+                if (
+                    candidate.execution_generation < scope.execution_generation
+                    and all(
+                        mapping[key] == current[key]
+                        for key in current
+                        if key != "execution_generation"
+                    )
+                ):
                     rows_to_delete.append(row)
             if rows_to_delete:
                 conn.executemany(

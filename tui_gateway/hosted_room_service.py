@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import sqlite3
 import threading
 import time
 from collections import Counter
@@ -11,7 +12,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Callable
 
 from gateway import hosted_room_discussion as discussion
 from gateway import hosted_room_driver as driver
@@ -52,6 +53,9 @@ class HostedRoomService:
         db_path: Path | str | None = None,
         peer_routes: Mapping[tuple[str, str], PeerMemberRoute] | None = None,
         peer_clients: Mapping[Any, HostedRoomPeerClient] | None = None,
+        artifact_clock: Callable[[], float] = time.time,
+        artifact_retry_min_seconds: float = 1.0,
+        artifact_retry_max_seconds: float = 60.0,
     ) -> None:
         self.server = server
         self.db_path = Path(db_path or hosted_rooms.default_db_path())
@@ -61,6 +65,13 @@ class HostedRoomService:
         self._link_load_error = None
         self._peer_route_status: dict[tuple[str, str], str] = {}
         self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._artifact_clock = artifact_clock
+        self._artifact_retry_min_seconds = max(0.01, float(artifact_retry_min_seconds))
+        self._artifact_retry_max_seconds = max(
+            self._artifact_retry_min_seconds,
+            float(artifact_retry_max_seconds),
+        )
+        self._prepare_artifact_retry_store()
         self.peer_routes = {}
         self.peer_clients = {}
         try:
@@ -598,23 +609,39 @@ class HostedRoomService:
                 room_id=str(room["room_id"]),
                 status=status,
             ):
+                if not self._artifact_retry_due(task):
+                    continue
+                publication_status = status
                 plan = discussion.reconstruct_task_plan(
                     room,
                     events,
                     task,
                     local_profiles=local_profiles,
                 )
-                result, acknowledge_artifacts = self._import_terminal_artifacts(
-                    room=room,
-                    task=task,
-                    plan=plan,
-                    events=events,
-                )
+                try:
+                    result, acknowledge_artifacts = self._import_terminal_artifacts(
+                        room=room,
+                        task=task,
+                        plan=plan,
+                        events=events,
+                    )
+                except Exception as exc:
+                    if bool(getattr(exc, "retryable", False)) or isinstance(
+                        exc, (ConnectionError, OSError, TimeoutError)
+                    ):
+                        self._defer_artifact_retry(task, exc)
+                        continue
+                    result = {
+                        "error": "A Group Chat file could not be verified.",
+                        "reason_code": "artifact_verification_failed",
+                    }
+                    acknowledge_artifacts = lambda: None
+                    publication_status = "failed"
                 publication = discussion.plan_publication(
                     room,
                     events,
                     plan,
-                    status=status,
+                    status=publication_status,
                     result=result,
                     local_profiles=local_profiles,
                 )
@@ -626,10 +653,106 @@ class HostedRoomService:
                         room_id=str(room["room_id"]),
                         event_id=f"dmessage:{digest}",
                     )
-                    acknowledge_artifacts()
+                    try:
+                        acknowledge_artifacts()
+                    except Exception as exc:
+                        if bool(getattr(exc, "retryable", False)) or isinstance(
+                            exc, (ConnectionError, OSError, TimeoutError)
+                        ):
+                            self._defer_artifact_retry(task, exc)
+                            continue
+                        self._defer_artifact_retry(task, exc, permanent=True)
+                        continue
+                self._clear_artifact_retry(task)
                 events = self._events(str(room["room_id"]))
                 changed = changed or len(events) > before
         return changed
+
+    def _artifact_retry_connection(self) -> sqlite3.Connection:
+        from hermes_state import apply_wal_with_fallback
+
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        apply_wal_with_fallback(conn, db_label="state.db (room artifact retries)")
+        return conn
+
+    def _prepare_artifact_retry_store(self) -> None:
+        with self._artifact_retry_connection() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS hosted_room_artifact_retries (
+                    room_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    execution_generation INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    next_attempt_at REAL NOT NULL,
+                    blocked INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(room_id, task_id, execution_generation)
+                )"""
+            )
+
+    @staticmethod
+    def _artifact_retry_key(task: Mapping[str, Any]) -> tuple[str, str, int]:
+        identity = task["identity"]
+        return (
+            identity.room_id,
+            identity.task_id,
+            int(task["execution_generation"]),
+        )
+
+    def _artifact_retry_due(self, task: Mapping[str, Any]) -> bool:
+        key = self._artifact_retry_key(task)
+        with self._artifact_retry_connection() as conn:
+            row = conn.execute(
+                """SELECT next_attempt_at, blocked FROM hosted_room_artifact_retries
+                   WHERE room_id=? AND task_id=? AND execution_generation=?""",
+                key,
+            ).fetchone()
+        return row is None or (
+            not bool(row["blocked"])
+            and self._artifact_clock() >= float(row["next_attempt_at"])
+        )
+
+    def _defer_artifact_retry(
+        self,
+        task: Mapping[str, Any],
+        _exc: Exception,
+        *,
+        permanent: bool = False,
+    ) -> None:
+        key = self._artifact_retry_key(task)
+        now = float(self._artifact_clock())
+        with self._artifact_retry_connection() as conn:
+            row = conn.execute(
+                """SELECT attempts FROM hosted_room_artifact_retries
+                   WHERE room_id=? AND task_id=? AND execution_generation=?""",
+                key,
+            ).fetchone()
+            attempts = 1 if row is None else int(row["attempts"]) + 1
+            delay = min(
+                self._artifact_retry_max_seconds,
+                self._artifact_retry_min_seconds * (2 ** min(attempts - 1, 16)),
+            )
+            conn.execute(
+                """INSERT INTO hosted_room_artifact_retries
+                   (room_id, task_id, execution_generation, attempts,
+                    next_attempt_at, blocked, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(room_id, task_id, execution_generation) DO UPDATE SET
+                    attempts=excluded.attempts,
+                    next_attempt_at=excluded.next_attempt_at,
+                    blocked=excluded.blocked,
+                    updated_at=excluded.updated_at""",
+                (*key, attempts, now + delay, int(permanent), now),
+            )
+
+    def _clear_artifact_retry(self, task: Mapping[str, Any]) -> None:
+        with self._artifact_retry_connection() as conn:
+            conn.execute(
+                """DELETE FROM hosted_room_artifact_retries
+                   WHERE room_id=? AND task_id=? AND execution_generation=?""",
+                self._artifact_retry_key(task),
+            )
 
     def _import_terminal_artifacts(
         self,

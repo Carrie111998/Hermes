@@ -12106,6 +12106,12 @@ def _run_prompt_submit(
                         "authority_epoch",
                     )
                 })
+                from gateway.hosted_room_artifacts import RoomArtifactOutbox
+                from hermes_constants import get_hermes_home
+
+                RoomArtifactOutbox(
+                    Path(get_hermes_home()) / "state.db"
+                ).discard_superseded(room_artifact_scope)
                 room_artifact_token = bind_room_artifact_scope(room_artifact_scope)
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
@@ -12600,6 +12606,7 @@ def _run_prompt_submit(
                     payload["error_surface"] = _error_surface
             if terminal_callback is not None:
                 terminal_artifacts = None
+                artifact_finalize_failed = False
                 if room_artifact_scope is not None:
                     try:
                         from gateway.hosted_room_artifacts import (
@@ -12619,16 +12626,25 @@ def _run_prompt_submit(
                                 room_artifact_scope
                             )
                     except Exception:
+                        artifact_finalize_failed = status == "complete"
                         logger.warning(
                             "hosted room artifact manifest failed for %s",
                             room_artifact_scope.task_id,
                             exc_info=True,
                         )
+                        try:
+                            RoomArtifactOutbox(artifact_db).discard(
+                                room_artifact_scope
+                            )
+                        except Exception:
+                            pass
                 terminal_receipt_attempted = True
                 terminal_callback(
                     {
                         "status": (
-                            "cancelled"
+                            "failed"
+                            if artifact_finalize_failed
+                            else "cancelled"
                             if status == "interrupted"
                             else "failed" if status == "error" else "settled"
                         ),
@@ -12636,6 +12652,11 @@ def _run_prompt_submit(
                         **(
                             {"error": str(result.get("error") or raw)}
                             if status == "error" and isinstance(result, dict)
+                            else {}
+                        ),
+                        **(
+                            {"error": "A Group Chat file could not be finalized."}
+                            if artifact_finalize_failed
                             else {}
                         ),
                         **(
