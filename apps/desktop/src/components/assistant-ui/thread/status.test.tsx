@@ -118,6 +118,16 @@ describe('resolveThreadActivityPhase', () => {
   it('does not claim a running phase for an idle session', () => {
     expect(resolveThreadActivityPhase({ ...base, busy: false })).toBe('idle')
   })
+
+  it('masks provider wait text while compaction is in progress', () => {
+    expect(
+      resolveThreadActivityPhase({
+        ...base,
+        compacting: true,
+        providerWait: 'waiting on local-model'
+      })
+    ).toBe('compacting')
+  })
 })
 describe('status hint', () => {
   afterEach(() => {

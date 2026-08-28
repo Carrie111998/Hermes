@@ -70,6 +70,9 @@ export interface ThreadActivityEvidence {
  * Reduce the already session-scoped evidence to one honest label family.
  * Provider text is intentionally not interpreted: a missing deadline stays
  * missing rather than becoming a fabricated timeout or countdown.
+ * Compaction is evaluated before provider-wait, so a compaction in progress
+ * masks coexisting provider wait text. The quiet flag is only meaningful for
+ * turn-activity surfaces; the pre-first-token spinner passes quiet: false.
  */
 export function resolveThreadActivityPhase(evidence: ThreadActivityEvidence): ThreadActivityPhase {
   if (evidence.awaitingInput) {
@@ -246,6 +249,8 @@ export const ResponseLoadingIndicator: FC = () => {
     busy,
     compacting,
     providerWait,
+    // Intentionally false: this row is the pre-first-token spinner and has no
+    // quiet state. quiet-running is owned by TurnActivityIndicator via quietSince.
     quiet: false,
     stalled
   })
