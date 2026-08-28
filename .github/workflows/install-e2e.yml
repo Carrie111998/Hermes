@@ -57,6 +57,7 @@ jobs:
   # Which released versions do we test updating FROM? Resolved once and shared
   # by both route matrices, so the two routes cover the same set.
   pick-releases:
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Pick release tags
     runs-on: ubuntu-latest
     timeout-minutes: 5
