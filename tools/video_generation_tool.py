@@ -586,12 +586,16 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
 
     properties["model"] = static_props["model"]
 
+    required = ["prompt"]
+    if can_i2v and not t2v:
+        required.append("image_url")
+
     return {
         "description": "\n".join(parts),
         "parameters": {
             "type": "object",
             "properties": properties,
-            "required": ["prompt"],
+            "required": required,
         },
     }
 
