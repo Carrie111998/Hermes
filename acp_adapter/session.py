@@ -647,8 +647,15 @@ class SessionManager:
         # Honor agent.max_turns like the CLI, gateway, and cron paths do.
         # load_config() already folds the legacy root-level ``max_turns`` into
         # ``agent.max_turns``; resolve_turn_limit() handles the unlimited
-        # spellings (none / unlimited / -1 / ...).  When the key is absent the
-        # AIAgent constructor default applies, so nothing is forwarded.
+        # spellings (none / unlimited / -1 / ...).
+        #
+        # The ``is not None`` guard is the load-bearing check, not the dict
+        # guard: load_config() starts from a DEFAULT_CONFIG deepcopy, so
+        # ``agent.max_turns`` is materialised on every load and carries the
+        # schema default (``None`` = unlimited) when the user never set it.
+        # Leaving it unforwarded in that case defers to the AIAgent
+        # constructor default rather than coupling ACP to whichever sentinel
+        # resolve_turn_limit(None) happens to return.
         agent_cfg = config.get("agent")
         configured_max_turns = agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None
         if configured_max_turns is not None:

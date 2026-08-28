@@ -113,7 +113,29 @@ class TestCreateSession:
 
         assert state.agent.kwargs["max_iterations"] == sys.maxsize
 
-    def test_make_agent_omits_max_iterations_when_max_turns_unset(self, monkeypatch):
+    def test_make_agent_omits_max_iterations_for_default_config_payload(self, monkeypatch):
+        """The shape ``load_config()`` really returns when the user never set a cap.
+
+        ``load_config()`` starts from a ``DEFAULT_CONFIG`` deepcopy, so
+        ``agent.max_turns`` is materialised on every load and carries the schema
+        default instead of being absent.  This is the production invariant the
+        ``is not None`` guard in ``_make_agent`` exists for.
+        """
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["agent"]["max_turns"] is None
+
+        self._patch_make_agent_env(monkeypatch, {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "agent": {"max_turns": DEFAULT_CONFIG["agent"]["max_turns"]},
+            "mcp_servers": {},
+        })
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert "max_iterations" not in state.agent.kwargs
+
+    def test_make_agent_omits_max_iterations_when_agent_block_missing(self, monkeypatch):
         self._patch_make_agent_env(monkeypatch, {
             "model": {"default": "fake-model", "provider": "fake-provider"},
             "mcp_servers": {},
