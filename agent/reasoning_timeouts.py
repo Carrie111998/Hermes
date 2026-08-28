@@ -131,6 +131,20 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     # reasoning variants.
     ("ox-alpha", 300),
     ("x-preview-f-free", 300),
+    # Z.AI GLM-5.3 — hybrid reasoning model: emits ``reasoning_content``
+    # before final content on EVERY request (measured 2026-08-28: even a
+    # trivial "reply OK" prompt thinks first; flash and non-flash alike).
+    # Without a floor entry the non-stream stale default is 90s, and the
+    # stale watchdog kills the call mid-thinking whenever the reasoning
+    # phase exceeds it under load — observed as three consecutive
+    # delegated-skeptic deaths (2x glm-5.3-flash, 1x glm-5.3) on
+    # 2026-08-26/27/28, each "Non-streaming API call timed out after 90s
+    # with no response" at ~278s = 3 retries.  Floor matches the
+    # deepseek-v4 class (600s): same reasoning_content emission pattern.
+    # ``glm-5.3`` right-anchors so glm-5.3-flash and any -YYYYMMDD
+    # suffix variant match as derivatives.
+    ("glm-5.3", 600),
+    ("glm-5.2", 600),
 )
 
 

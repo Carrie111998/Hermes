@@ -85,6 +85,14 @@ import pytest
     ("x-ai/grok-4.5", 300.0),
     ("x-ai/grok-4.6", 300.0),
     ("x-ai/grok-4-fast-non-reasoning", 180.0),
+    # Z.AI GLM-5.x — hybrid reasoning (reasoning_content before content on
+    # every request, flash and non-flash alike). Bare glm-5.3 right-anchors
+    # so flash and -YYYYMMDD variants match as derivatives; glm-4.x does not.
+    ("glm-5.3", 600.0),
+    ("glm-5.3-flash", 600.0),
+    ("zai-coding/glm-5.3", 600.0),
+    ("glm-5.3-20260801", 600.0),
+    ("glm-5.2", 600.0),
 ])
 def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
