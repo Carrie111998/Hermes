@@ -183,81 +183,51 @@ def _anydoc_missing_error(path: str) -> str:
 def _hosted_ocr_config() -> tuple:
     """Resolve hosted-OCR settings: (enabled, api_key, api_url).
 
-    ``file_tools.hosted_ocr`` in config.yaml:
-      true    — always attempt hosted OCR on NeedsOcrError
-      false   — never (warning path only)
-      unset   — AUTO: attempt only when a Firecrawl route exists —
-                direct FIRECRAWL_API_KEY first, else the Nous managed
-                gateway. No document leaves the box on a route the user
-                hasn't already trusted with their web traffic.
-
-    NOTE (live-probed 2026-08-28): the Nous firecrawl gateway did NOT yet
-    proxy the Parse endpoint (uniform HTTP 500 on /v2/parse) while
-    scrape/search worked. The gateway route is therefore attempt-and-
-    fall-through: a failure lands in the NEEDS-OCR warning (which
-    recommends local-OCR skills) rather than being retried or trusted.
-    When the gateway grows Parse support this lights up with no code
-    change. Never raises.
+    Maintainer decision: the ONLY route is a direct ``FIRECRAWL_API_KEY``
+    (anydoc defaults api_url to https://api.firecrawl.dev). The Nous
+    managed gateway is NOT used — its Parse proxy was live-probed broken
+    (uniform HTTP 500, 2026-08-28) while scrape/search worked; revisit
+    when the gateway grows Parse support. ``file_tools.hosted_ocr``:
+    false disables even with a key; true/unset → enabled iff key
+    present. Never raises.
     """
-    enabled = None
+    api_key = os.environ.get("FIRECRAWL_API_KEY") or None
+    enabled = api_key is not None
     try:
         from hermes_cli.config import load_config_readonly
 
         cfg = load_config_readonly()
         section = cfg.get("file_tools") if isinstance(cfg, dict) else None
-        if isinstance(section, dict) and "hosted_ocr" in section:
-            enabled = bool(section["hosted_ocr"])
+        if isinstance(section, dict) and section.get("hosted_ocr") is False:
+            enabled = False
     except Exception:  # noqa: BLE001
-        enabled = None
-
-    api_key = os.environ.get("FIRECRAWL_API_KEY") or None
-    api_url = None
-    if api_key is None:
-        # Nous managed gateway: OAuth token as key, gateway as base URL.
-        try:
-            import tools.web_tools as _wt
-
-            if _wt.resolve_managed_tool_gateway(
-                "firecrawl", token_reader=_wt._peek_nous_access_token
-            ) is not None:
-                api_key = _wt._peek_nous_access_token()
-                api_url = _wt.build_vendor_gateway_url("firecrawl")
-        except Exception:  # noqa: BLE001
-            pass
-
-    if enabled is None:
-        enabled = api_key is not None
-    return enabled, api_key, api_url
+        pass
+    return enabled, api_key, None
 
 
 def hosted_ocr_available() -> bool:
-    """Public probe for schema builders: is hosted OCR expected to work?
+    """Public probe for read_file's schema line: is hosted OCR unlocked?
 
-    True when hosted OCR is expected to work: config ``hosted_ocr: true``
-    (the user's explicit assertion), or AUTO with a DIRECT
-    ``FIRECRAWL_API_KEY``. The Nous managed gateway deliberately does NOT
-    upgrade the schema wording yet — it resolves a token but its Parse
-    proxy was live-probed broken (HTTP 500, 2026-08-28); at runtime the
-    gateway is still attempted (free upside), but the schema only
-    promises what a route we've seen work can deliver. Used by
-    read_file's dynamic schema line to advertise "PDF (scanned or text)"
-    instead of "PDF (text layer)". Route resolution only — no network
-    I/O (schema build must stay side-effect-free); a promised route that
-    fails at conversion time lands in the NEEDS-OCR warning.
+    Maintainer decision: ONE gate — a direct ``FIRECRAWL_API_KEY`` in the
+    environment. Nothing else unlocks the "PDF (scanned or text)" wording
+    (not the Nous gateway — Parse proxy live-probed broken 2026-08-28 —
+    and not config assertions). ``file_tools.hosted_ocr: false`` still
+    disables. Env probe only — no network at schema-build time; a key
+    that fails at conversion time lands in the NEEDS-OCR warning.
     """
     try:
-        import os as _os
-
-        from hermes_cli.config import load_config_readonly
-
+        if not os.environ.get("FIRECRAWL_API_KEY"):
+            return False
         try:
+            from hermes_cli.config import load_config_readonly
+
             cfg = load_config_readonly()
             section = cfg.get("file_tools") if isinstance(cfg, dict) else None
-            if isinstance(section, dict) and "hosted_ocr" in section:
-                return bool(section["hosted_ocr"])
+            if isinstance(section, dict) and section.get("hosted_ocr") is False:
+                return False
         except Exception:  # noqa: BLE001
             pass
-        return bool(_os.environ.get("FIRECRAWL_API_KEY"))
+        return True
     except Exception:  # noqa: BLE001
         return False
 

@@ -53,6 +53,8 @@ class TestReadFileSchemaStatic(unittest.TestCase):
         self.assertEqual(o, {})  # base wording stands
 
     def test_hosted_ocr_available_gate_states(self):
+        """Maintainer decision: ONLY a direct FIRECRAWL_API_KEY unlocks —
+        not config true, not the Nous gateway."""
         import tools.read_extract as rx
 
         # direct key → True
@@ -65,17 +67,38 @@ class TestReadFileSchemaStatic(unittest.TestCase):
             with patch("hermes_cli.config.load_config_readonly",
                        return_value={"file_tools": {"hosted_ocr": False}}):
                 self.assertFalse(rx.hosted_ocr_available())
-        # config true without key → True (user's explicit assertion)
+        # config true WITHOUT key → False (key is the one gate)
         with patch.dict(rx.os.environ, {}, clear=False):
             rx.os.environ.pop("FIRECRAWL_API_KEY", None)
             with patch("hermes_cli.config.load_config_readonly",
                        return_value={"file_tools": {"hosted_ocr": True}}):
-                self.assertTrue(rx.hosted_ocr_available())
-        # nothing → False (Nous gateway alone must NOT upgrade wording)
+                self.assertFalse(rx.hosted_ocr_available())
+        # nothing → False (Nous gateway alone must NOT unlock)
         with patch("hermes_cli.config.load_config_readonly",
                    return_value={}):
             rx.os.environ.pop("FIRECRAWL_API_KEY", None)
             self.assertFalse(rx.hosted_ocr_available())
+
+    def test_runtime_route_is_direct_key_only(self):
+        """_hosted_ocr_config never resolves the Nous gateway: api_url is
+        always None (anydoc defaults to api.firecrawl.dev) and enabled
+        tracks the key."""
+        import tools.read_extract as rx
+
+        with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={}):
+                enabled, key, url = rx._hosted_ocr_config()
+        self.assertTrue(enabled)
+        self.assertEqual(key, "fc-x")
+        self.assertIsNone(url)
+        with patch("hermes_cli.config.load_config_readonly",
+                   return_value={}):
+            rx.os.environ.pop("FIRECRAWL_API_KEY", None)
+            enabled, key, url = rx._hosted_ocr_config()
+        self.assertFalse(enabled)
+        self.assertIsNone(key)
+        self.assertIsNone(url)
 
     def test_coverage_warning_teaching_left_to_the_warning(self):
         """The response-time warning owns the recovery curriculum."""
