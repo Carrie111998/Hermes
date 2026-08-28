@@ -33,6 +33,28 @@ _LOCAL_PATH_RE = re.compile(
 )
 
 
+def _mobile_excerpt(value: Any, limit: int) -> str:
+    """Return a bounded excerpt that never ends in a silent partial word."""
+    text = "" if value is None else str(value)
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit == 1:
+        return "…"
+    excerpt = text[: limit - 1].rstrip()
+    if " " in excerpt:
+        excerpt = excerpt.rsplit(" ", 1)[0]
+    return f"{excerpt}…"
+
+
+def _first_line_excerpt(value: Any, limit: int) -> str:
+    """Return a bounded excerpt from the first non-empty line."""
+    text = "" if value is None else str(value)
+    lines = text.strip().splitlines()
+    return _mobile_excerpt(lines[0] if lines else text, limit)
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
@@ -44,9 +66,7 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     )
     reason = _LOCAL_PATH_RE.sub("[local path]", reason)
     reason = " ".join(reason.split())
-    if len(reason) > limit:
-        reason = reason[: limit - 1].rstrip() + "…"
-    return reason
+    return _mobile_excerpt(reason, limit)
 
 
 def _resolve_auto_decompose_settings(
@@ -589,13 +609,11 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
+                                h = _first_line_excerpt(payload_summary, 200)
                                 handoff = f"\n{h}"
                                 wake_handoff = h
                             elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
+                                r = _first_line_excerpt(task.result, 160)
                                 handoff = f"\n{r}"
                                 wake_handoff = r
                             msg = (
@@ -605,12 +623,12 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                reason = f": {_mobile_excerpt(ev.payload['reason'], 160)}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\n{_mobile_excerpt(ev.payload['error'], 200)}"
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
@@ -639,15 +657,12 @@ class GatewayKanbanWatchersMixin:
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
                                 summary = str(ev.payload["summary"])
-                                handoff = f"\n{summary[:200]}"
+                                handoff = f"\n{_first_line_excerpt(summary, 200)}"
                                 # Carry the worker's handoff into the wake turn
                                 # like ``completed`` does: a reviewer woken with
                                 # a bare "ready for review" has to re-read the
                                 # board to learn what was implemented.
-                                lines = summary.strip().splitlines()
-                                wake_handoff = (
-                                    lines[0][:200] if lines else summary[:200]
-                                )
+                                wake_handoff = _first_line_excerpt(summary, 200)
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
@@ -680,7 +695,7 @@ class GatewayKanbanWatchersMixin:
                             recurrences = None
                             if ev.payload:
                                 if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
+                                    reason = f": {_mobile_excerpt(ev.payload['reason'], 160)}"
                                 recurrences = ev.payload.get("recurrences")
                             rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
                             msg = (

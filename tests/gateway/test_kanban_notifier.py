@@ -2,10 +2,13 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import pytest
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
+    _first_line_excerpt,
+    _mobile_excerpt,
     _release_singleton_lock,
 )
 from gateway.run import GatewayRunner
@@ -79,6 +82,120 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def test_completed_handoff_uses_explicit_word_boundary_truncation(
+    tmp_path, monkeypatch,
+):
+    """Long completion handoffs must not end in a silent partial word."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "handoff-truncation.db"))
+    kb.init_db()
+    tid = _create_completed_subscription(
+        summary="A durable event can be replayed safely. " * 20,
+    )
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    handoff = adapter.sent[0]["text"].split("\n", 1)[1]
+    assert handoff.endswith("…"), "truncated handoffs need an explicit marker"
+    assert handoff.removesuffix("…").endswith("replayed")
+
+
+@pytest.mark.parametrize(
+    ("helper", "value", "limit", "expected"),
+    [
+        pytest.param(
+            _mobile_excerpt,
+            "alpha beta gamma delta",
+            14,
+            "alpha beta…",
+            id="normal-whitespace",
+        ),
+        pytest.param(
+            _first_line_excerpt,
+            "first line\nsecond line must be omitted",
+            40,
+            "first line",
+            id="first-line-newline",
+        ),
+        pytest.param(
+            _mobile_excerpt,
+            "é界🙂é界🙂",
+            5,
+            "é界🙂é…",
+            id="multibyte-text",
+        ),
+        pytest.param(
+            _mobile_excerpt,
+            "x" * 20,
+            8,
+            "xxxxxxx…",
+            id="long-unbroken-token",
+        ),
+    ],
+)
+def test_excerpt_helpers_cover_boundary_inputs(helper, value, limit, expected):
+    """Excerpt helpers preserve Unicode and mark every truncation."""
+    result = helper(value, limit)
+
+    assert result == expected
+    assert len(result) <= limit
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload_key"),
+    [
+        pytest.param("completed", "summary", id="completed-handoff"),
+        pytest.param("blocked", "reason", id="blocked-reason"),
+        pytest.param("gave_up", "error", id="gave-up-error"),
+        pytest.param("review_requested", "summary", id="review-request-wake"),
+        pytest.param("block_loop_detected", "reason", id="block-loop"),
+    ],
+)
+def test_notifier_excerpt_categories_preserve_word_boundaries(
+    tmp_path, monkeypatch, kind, payload_key,
+):
+    """Every notifier category uses a bounded, word-aware excerpt."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / f"{kind}.db"))
+    kb.init_db()
+    excerpt_input = "alpha beta " + ("q" * 500) + "\nsecond line must be omitted"
+    is_review = kind == "review_requested"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="excerpt category",
+            assignee="worker",
+            session_id=("agent:main:telegram:dm:chat-1" if is_review else None),
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm" if is_review else None,
+            delivery_mode="notify+wake" if is_review else "notify",
+        )
+        payload: dict[str, object] = {payload_key: excerpt_input}
+        if kind == "block_loop_detected":
+            payload.update({"recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT})
+        kb._append_event(conn, tid, kind, payload)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert message.endswith("alpha beta…")
+    assert "q" * 20 not in message
+    assert "second line must be omitted" not in message
+    if is_review:
+        assert "alpha beta…" in _wake_text(adapter)
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
