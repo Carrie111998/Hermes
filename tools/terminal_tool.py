@@ -3224,6 +3224,36 @@ def terminal_tool(
                     "status": "blocked",
                 }, ensure_ascii=False)
 
+            # The background curator has a fully ledgered write surface
+            # (skill_manage). A terminal mv/cp/rm under a skills root writes
+            # the same files with no ledger entry, so a later archive
+            # snapshots an already-stripped package and `hermes curator
+            # rollback` restores a hollow skill (issue #96962). Blocked here
+            # rather than in the approval layer: the curator runs headless, so
+            # --yolo / approvals.mode=off / force=True must not lift it.
+            from tools.skills_write_guard import (
+                detect_skills_tree_mutation,
+                guard_active as _skills_guard_active,
+            )
+
+            _skills_hit, _skills_msg = (
+                detect_skills_tree_mutation(command, guard_cwd)
+                if _skills_guard_active()
+                else (False, None)
+            )
+            if _skills_hit:
+                logger.warning(
+                    "Blocked un-ledgered background-curator skills write "
+                    "(command: %s)",
+                    _safe_command_preview(command),
+                )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": _skills_msg,
+                    "status": "blocked",
+                }, ensure_ascii=False)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
