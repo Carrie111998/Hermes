@@ -1752,7 +1752,10 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
-        global_policy_block=parent_global_policy,
+        # The child AIAgent injects this exact frozen snapshot into its normal
+        # system prompt. Keep the focused ephemeral prompt free of a duplicate
+        # global block.
+        global_policy_block="",
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
