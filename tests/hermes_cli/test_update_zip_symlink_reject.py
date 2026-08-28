@@ -74,7 +74,10 @@ def test_update_via_zip_rejects_symlink_member(tmp_path, monkeypatch):
         # That's the contract: a malicious ZIP must fail the update, not
         # silently materialize a symlink.
         with pytest.raises(SystemExit) as exc_info:
-            _update_via_zip(args)
+            _update_via_zip(
+                args,
+                origin_url="https://github.com/mikexia930/hermes-agent.git",
+            )
         assert exc_info.value.code == 1
 
     # Belt: confirm extractall never produced the link.
@@ -124,7 +127,10 @@ def test_update_via_zip_accepts_normal_member(tmp_path, monkeypatch, capsys):
          patch("subprocess.check_call"):
         fake_run.return_value = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         try:
-            hermes_main._update_via_zip(args)
+            hermes_main._update_via_zip(
+                args,
+                origin_url="https://github.com/mikexia930/hermes-agent.git",
+            )
         except SystemExit:
             pass
 

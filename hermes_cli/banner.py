@@ -138,7 +138,6 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 # (e.g. nix-built hermes — no local git history to count against).
 UPDATE_AVAILABLE_NO_COUNT = -1
 
-_UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
 
@@ -153,8 +152,10 @@ def _canonical_github_remote(url: str | None) -> str:
         value = "github.com/" + value[len("ssh://git@github.com/"):]
     else:
         parsed = urlparse(value)
-        if parsed.netloc and parsed.path:
-            value = f"{parsed.netloc}{parsed.path}"
+        if parsed.hostname and parsed.path:
+            # Use hostname rather than netloc so credentials in an HTTPS
+            # remote can never leak into the compare API URL.
+            value = f"{parsed.hostname}{parsed.path}"
     value = value.strip().rstrip("/")
     if value.endswith(".git"):
         value = value[:-4]
@@ -193,7 +194,32 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     return (result.stdout or "").strip()
 
 
-def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
+def _https_probe_url(url: str | None) -> Optional[str]:
+    """Return a non-interactive HTTPS probe URL for known SSH remotes."""
+    if not url:
+        return None
+
+    value = url.strip()
+    host = ""
+    path = ""
+    if value.startswith("git@") and ":" in value:
+        host, path = value[4:].split(":", 1)
+    elif value.startswith("ssh://"):
+        parsed = urlparse(value)
+        host, path = parsed.hostname or "", parsed.path.lstrip("/")
+    else:
+        return value
+
+    if host.lower() not in {"github.com", "gitee.com"}:
+        return value
+
+    path = path.rstrip("/")
+    return f"https://{host.lower()}/{path}"
+
+
+def _github_compare_behind(
+    current_rev: str, target_rev: str, origin_url: str | None = None
+) -> Optional[int]:
     """Exact behind-count via the GitHub compare API for uncountable graphs.
 
     Shallow installer clones and ls-remote-only probes know the two tip SHAs
@@ -206,10 +232,11 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     """
     if not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
         return None
-    url = (
-        "https://api.github.com/repos/nousresearch/hermes-agent/"
-        f"compare/{current_rev}...{target_rev}"
-    )
+    canonical = _canonical_github_remote(origin_url)
+    if not canonical.startswith("github.com/"):
+        return None
+    repository = canonical.removeprefix("github.com/")
+    url = f"https://api.github.com/repos/{repository}/compare/{current_rev}...{target_rev}"
     try:
         import urllib.request
 
@@ -239,11 +266,14 @@ def _is_full_sha(value: Optional[str]) -> bool:
     )
 
 
-def _upstream_main_sha() -> Optional[str]:
-    """Tip SHA of upstream main via HTTPS ls-remote (no auth, no prompts)."""
+def _origin_main_sha(origin_url: str | None) -> Optional[str]:
+    """Tip SHA of the installed repository's main branch."""
+    probe_url = _https_probe_url(origin_url)
+    if not probe_url:
+        return None
     try:
         result = subprocess.run(
-            ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
+            ["git", "ls-remote", probe_url, "refs/heads/main"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
@@ -251,61 +281,34 @@ def _upstream_main_sha() -> Optional[str]:
         return None
     if result.returncode != 0 or not result.stdout:
         return None
-    upstream_rev = result.stdout.split()[0]
-    return upstream_rev or None
+    origin_rev = result.stdout.split()[0]
+    return origin_rev or None
 
 
-def _check_via_rev(local_rev: str) -> Optional[int]:
-    """Compare an embedded git revision to upstream main via ls-remote.
+def _check_via_rev(local_rev: str, repo_dir: Path | None = None) -> Optional[int]:
+    """Compare an embedded git revision to the checkout's origin main branch.
 
     Returns 0 if up-to-date, the exact behind-count when the GitHub compare
     API can recover it, ``UPDATE_AVAILABLE_NO_COUNT`` if behind by an unknown
     amount, or ``None`` on failure.
     """
-    upstream_rev = _upstream_main_sha()
-    if not upstream_rev:
+    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir) if repo_dir else None
+    origin_rev = _origin_main_sha(origin_url)
+    if not origin_rev:
         return None
-    if upstream_rev == local_rev:
+    if origin_rev == local_rev:
         return 0
     # Behind, but ls-remote only knows tip SHAs. Try to recover the exact
     # count from the GitHub compare API before falling back to the sentinel.
     # ahead_by == 0 with differing tips means the remote tip is reachable from
     # our HEAD — a local-ahead checkout, i.e. NOT behind.
-    counted = _github_compare_behind(local_rev, upstream_rev)
+    counted = _github_compare_behind(local_rev, origin_rev, origin_url)
     return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     """Count commits behind origin/main in a local checkout."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        if not head_rev:
-            return None
-        # Passive probe via HTTPS ls-remote (never SSH — no hardware-key
-        # prompts). Tip SHAs alone can't distinguish "behind" from a local
-        # carried commit sitting AHEAD of origin/main, and misreporting an
-        # ahead checkout as behind nudges the user into `hermes update`,
-        # which can wipe their carried work.
-        upstream_rev = _upstream_main_sha()
-        if upstream_rev is None:
-            return None
-        if upstream_rev == head_rev:
-            return 0
-        # Local-ahead: the remote tip is an ancestor of HEAD. Checked against
-        # the FRESH upstream SHA (not the possibly stale origin/main tracking
-        # ref) so a stale ref can't fake an up-to-date report.
-        ancestor = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", upstream_rev, "HEAD"],
-            capture_output=True, timeout=5, cwd=str(repo_dir),
-        )
-        if ancestor.returncode == 0:
-            return 0
-        # Genuinely behind (or diverged). Recover the exact count via the
-        # GitHub compare API; a local-only HEAD 404s there, which safely
-        # degrades to the honest no-count sentinel — never a fabricated 1.
-        counted = _github_compare_behind(head_rev, upstream_rev)
-        return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
@@ -340,7 +343,10 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        probe_url = _https_probe_url(origin_url) if _is_ssh_remote(origin_url) else "origin"
+        fetch_args = ["git", "fetch", probe_url or "origin", "main"]
+        if _is_ssh_remote(origin_url) and probe_url and probe_url != origin_url:
+            fetch_args.append("main:refs/remotes/origin/main")
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -393,7 +399,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # Recover the exact count from the GitHub compare API when possible
         # (ahead_by == 0 means local-ahead ⇒ up to date); otherwise report the
         # honest "update available, count unknown" sentinel.
-        counted = _github_compare_behind(head_rev, target_rev)
+        counted = _github_compare_behind(head_rev, target_rev, origin_url)
         return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
     try:
@@ -413,9 +419,9 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
-    Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
-    it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    Two paths: source checkouts compare against their own ``origin/main``;
+    packaged builds without a checkout have no repository source to follow and
+    therefore report no update state.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -454,22 +460,21 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    if embedded_rev:
-        behind = _check_via_rev(embedded_rev)
+    # Prefer the running code's location over the profile-scoped path.
+    # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
+    # Path(__file__) always resolves to the actual installed checkout.
+    repo_dir = Path(__file__).parent.parent.resolve()
+    if not (repo_dir / ".git").exists():
+        repo_dir = hermes_home / "hermes-agent"
+    if not (repo_dir / ".git").exists():
+        # No git checkout and no embedded revision — can't determine update
+        # status. This is the Docker path (already short-circuited above) or
+        # an unsupported install without a source tree.
+        behind = None
+    elif embedded_rev:
+        behind = _check_via_rev(embedded_rev, repo_dir)
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
-            # No git checkout and no embedded revision — can't determine
-            # update status. This is the Docker path (already short-circuited
-            # above) or an unsupported install without a source tree.
-            behind = None
-        else:
-            behind = _check_via_local_git(repo_dir)
+        behind = _check_via_local_git(repo_dir)
 
     try:
         # Don't cache inconclusive results (None). A None means the check
@@ -526,16 +531,16 @@ _git_banner_state_cache: Optional[tuple] = None  # (state_or_None,) once compute
 
 
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
-    """Return upstream/local git hashes for the startup banner.
+    """Return origin/local git hashes for the startup banner.
 
     For source installs and dev images this runs ``git rev-parse`` against
     the active checkout.  When no checkout is available — the canonical case
     is the published Docker image, which excludes ``.git`` from the build
     context — we fall back to the baked-in build SHA (see
     ``hermes_cli/build_info.py``) and return it as a frozen
-    ``upstream == local`` state with ``ahead=0``.  A built image is by
+    ``origin == local`` state with ``ahead=0``.  A built image is by
     definition pinned to one commit, so "ahead" is always zero and the
-    banner correctly shows ``· upstream <sha>`` with no carried-commits
+    banner correctly shows ``· origin <sha>`` with no carried-commits
     annotation.
 
     Cached per-process (default ``repo_dir`` only): the state costs 2-3 git
@@ -561,21 +566,21 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
             from hermes_cli.build_info import get_build_sha
             baked = get_build_sha(short=8)
             if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
+                return {"origin": baked, "local": baked, "ahead": 0}
         except Exception:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    origin = _git_short_hash(repo_dir, "origin/main")
     local = _git_short_hash(repo_dir, "HEAD")
-    if not upstream or not local:
+    if not origin or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
         # Fall back to the baked build SHA if available.
         try:
             from hermes_cli.build_info import get_build_sha
             baked = get_build_sha(short=8)
             if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
+                return {"origin": baked, "local": baked, "ahead": 0}
         except Exception:
             pass
         return None
@@ -596,7 +601,7 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     except Exception:
         ahead = 0
 
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+    return {"origin": origin, "local": local, "ahead": max(ahead, 0)}
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
@@ -654,15 +659,15 @@ def format_banner_version_label() -> str:
     if not state:
         return base
 
-    upstream = state["upstream"]
+    origin = state["origin"]
     local = state["local"]
     ahead = int(state.get("ahead") or 0)
 
-    if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
+    if ahead <= 0 or origin == local:
+        return f"{base} · origin {origin}"
 
     carried_word = "commit" if ahead == 1 else "commits"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
+    return f"{base} · origin {origin} · local {local} (+{ahead} carried {carried_word})"
 
 
 # =========================================================================

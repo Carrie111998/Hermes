@@ -277,14 +277,10 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_on_fork_checks_upstream_when_origin_up_to_date(
+    def test_update_on_fork_does_not_consult_upstream_when_origin_up_to_date(
         self, mock_run, _mock_which, mock_args, capsys
     ):
-        """Regression for issue #26172: forks whose local HEAD already matches
-        origin/main must still consult upstream/main before printing
-        "Already up to date!" — otherwise a fork that's caught up to its own
-        origin but behind NousResearch/hermes-agent silently misses updates.
-        """
+        """An installed fork follows origin, even when an upstream remote exists."""
         from hermes_cli import main as hm
 
         mock_run.side_effect = _make_run_side_effect(
@@ -301,7 +297,7 @@ class TestCmdUpdateBranchFallback:
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_not_called()
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -832,10 +828,10 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_main_always_uses_origin_even_when_upstream_exists(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """The default check must not switch update sources because upstream exists."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
@@ -844,21 +840,15 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
-        # Compare ref is upstream/main (upstream fetch succeeded).
+        # The upstream remote is irrelevant to installed update checks.
+        assert not any("fetch" in c and "upstream" in c for c in commands), commands
+        # Compare ref is always origin/main.
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+        assert any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
 
 class TestCmdUpdateZipBranchRefusal:
-    """``hermes update --branch=<non-main>`` must refuse on the ZIP fallback path.
-
-    The ZIP fallback hard-codes a GitHub archive URL for main.zip; honoring
-    --branch arbitrarily would require remote-branch existence checks the
-    fallback can't easily do. Refusing is the right move — silently lying
-    about which branch got installed is the bug --branch was meant to prevent.
-    """
+    """``hermes update --branch=<non-main>`` remains unsupported on ZIP fallback."""
 
     def test_zip_fallback_refuses_non_main_branch(self, capsys):
         from hermes_cli.main import _update_via_zip
@@ -1048,7 +1038,11 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(hm, "_is_windows", lambda: True)
         monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
         monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
-        monkeypatch.setattr(hm, "_get_origin_url", lambda *_args: "")
+        monkeypatch.setattr(
+            hm,
+            "_get_origin_url",
+            lambda *_args: "https://github.com/mikexia930/hermes-agent.git",
+        )
         monkeypatch.setattr(
             hm,
             "_desktop_packaged_executable",

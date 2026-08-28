@@ -23,6 +23,7 @@ import hermes_cli.banner as banner
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+ORIGIN_URL = "https://github.com/mikexia930/hermes-agent.git"
 
 
 def _compare_payload(ahead):
@@ -57,25 +58,25 @@ def _patch_urlopen(payload):
 
 def test_compare_behind_returns_ahead_by():
     with _patch_urlopen({"ahead_by": 61, "status": "ahead"}):
-        assert banner._github_compare_behind(SHA_A, SHA_B) == 61
+        assert banner._github_compare_behind(SHA_A, SHA_B, ORIGIN_URL) == 61
 
 
 def test_compare_behind_zero_means_local_ahead():
     with _patch_urlopen({"ahead_by": 0, "status": "behind"}):
-        assert banner._github_compare_behind(SHA_A, SHA_B) == 0
+        assert banner._github_compare_behind(SHA_A, SHA_B, ORIGIN_URL) == 0
 
 
 def test_compare_behind_rejects_short_shas_without_network():
     with patch("urllib.request.urlopen") as mock_open:
-        assert banner._github_compare_behind("abc123", SHA_B) is None
-        assert banner._github_compare_behind(SHA_A, "") is None
-        assert banner._github_compare_behind(None, SHA_B) is None
+        assert banner._github_compare_behind("abc123", SHA_B, ORIGIN_URL) is None
+        assert banner._github_compare_behind(SHA_A, "", ORIGIN_URL) is None
+        assert banner._github_compare_behind(None, SHA_B, ORIGIN_URL) is None
     mock_open.assert_not_called()
 
 
 def test_compare_behind_network_failure_returns_none():
     with patch("urllib.request.urlopen", side_effect=OSError("offline")):
-        assert banner._github_compare_behind(SHA_A, SHA_B) is None
+        assert banner._github_compare_behind(SHA_A, SHA_B, ORIGIN_URL) is None
 
 
 @pytest.mark.parametrize(
@@ -90,7 +91,7 @@ def test_compare_behind_network_failure_returns_none():
 )
 def test_compare_behind_rejects_malformed_payloads(payload):
     with _patch_urlopen(payload):
-        assert banner._github_compare_behind(SHA_A, SHA_B) is None
+        assert banner._github_compare_behind(SHA_A, SHA_B, ORIGIN_URL) is None
 
 
 # ---------------------------------------------------------------------------
@@ -102,36 +103,49 @@ def _ls_remote_result(sha):
     return MagicMock(returncode=0, stdout=f"{sha}\trefs/heads/main\n")
 
 
-def test_check_via_rev_recovers_exact_count():
+def _check_via_rev_run(sha):
+    def fake_run(cmd, **kwargs):
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return MagicMock(returncode=0, stdout=f"{ORIGIN_URL}\n")
+        return _ls_remote_result(sha)
+
+    return fake_run
+
+
+def test_check_via_rev_recovers_exact_count(tmp_path):
+    repo_dir = tmp_path / "hermes-agent"
     with patch(
-        "hermes_cli.banner.subprocess.run", return_value=_ls_remote_result(SHA_B)
+        "hermes_cli.banner.subprocess.run", side_effect=_check_via_rev_run(SHA_B)
     ), patch.object(banner, "_github_compare_behind", return_value=61) as compare:
-        assert banner._check_via_rev(SHA_A) == 61
-    compare.assert_called_once_with(SHA_A, SHA_B)
+        assert banner._check_via_rev(SHA_A, repo_dir) == 61
+    compare.assert_called_once_with(SHA_A, SHA_B, ORIGIN_URL)
 
 
-def test_check_via_rev_falls_back_to_sentinel_offline():
+def test_check_via_rev_falls_back_to_sentinel_offline(tmp_path):
     """FAIL-BEFORE (class): this path returned a fabricated 1 via callers."""
+    repo_dir = tmp_path / "hermes-agent"
     with patch(
-        "hermes_cli.banner.subprocess.run", return_value=_ls_remote_result(SHA_B)
+        "hermes_cli.banner.subprocess.run", side_effect=_check_via_rev_run(SHA_B)
     ), patch.object(banner, "_github_compare_behind", return_value=None):
-        assert banner._check_via_rev(SHA_A) == banner.UPDATE_AVAILABLE_NO_COUNT
+        assert banner._check_via_rev(SHA_A, repo_dir) == banner.UPDATE_AVAILABLE_NO_COUNT
 
 
-def test_check_via_rev_up_to_date_short_circuits_compare():
+def test_check_via_rev_up_to_date_short_circuits_compare(tmp_path):
+    repo_dir = tmp_path / "hermes-agent"
     with patch(
-        "hermes_cli.banner.subprocess.run", return_value=_ls_remote_result(SHA_A)
+        "hermes_cli.banner.subprocess.run", side_effect=_check_via_rev_run(SHA_A)
     ), patch.object(banner, "_github_compare_behind") as compare:
-        assert banner._check_via_rev(SHA_A) == 0
+        assert banner._check_via_rev(SHA_A, repo_dir) == 0
     compare.assert_not_called()
 
 
-def test_check_via_rev_local_ahead_reports_up_to_date():
+def test_check_via_rev_local_ahead_reports_up_to_date(tmp_path):
     """ahead_by == 0 with differing tips = local commits on top, not behind."""
+    repo_dir = tmp_path / "hermes-agent"
     with patch(
-        "hermes_cli.banner.subprocess.run", return_value=_ls_remote_result(SHA_B)
+        "hermes_cli.banner.subprocess.run", side_effect=_check_via_rev_run(SHA_B)
     ), patch.object(banner, "_github_compare_behind", return_value=0):
-        assert banner._check_via_rev(SHA_A) == 0
+        assert banner._check_via_rev(SHA_A, repo_dir) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import hermes_cli.update_cmd as update_cmd
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+ORIGIN_URL = "https://github.com/mikexia930/hermes-agent.git"
 
 
 def _git_responder(*, shallow: bool, count: str):
@@ -69,7 +70,7 @@ def _run_count_block(*, shallow: bool, raw_count: str, api_count):
                 target_sha = sub.run(
                     git_cmd + ["rev-parse", "origin/main"], capture_output=True, text=True
                 ).stdout.strip()
-                counted = _github_compare_behind(head_sha, target_sha)
+                counted = _github_compare_behind(head_sha, target_sha, ORIGIN_URL)
                 commit_count = counted if counted is not None else -1
     return commit_count
 

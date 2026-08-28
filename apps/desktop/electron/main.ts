@@ -370,7 +370,7 @@ import {
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
+import { httpsProbeRemote, isSshRemote } from './update-remote'
 import {
   collectRelaunchArgs,
   observeUpdaterHandoff,
@@ -2882,7 +2882,7 @@ async function resolveHealedBranch(updateRoot, branch) {
   }
 
   const originUrl = await getOriginUrl(updateRoot)
-  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+  const remote = isSshRemote(originUrl) ? httpsProbeRemote(originUrl) : 'origin'
   const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
 
   if (probe.code !== 2) {
@@ -2917,66 +2917,18 @@ async function checkUpdates() {
   branch = await resolveHealedBranch(updateRoot, branch)
   const originUrl = await getOriginUrl(updateRoot)
 
-  if (isOfficialSshRemote(originUrl)) {
-    const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
-
-    const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
-      git(['rev-parse', 'HEAD']),
-      runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`], { cwd: updateRoot }),
-      git(['status', '--porcelain']),
-      git(['rev-parse', '--abbrev-ref', 'HEAD'])
-    ])
-
-    const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
-
-    if (target.code !== 0 || !targetSha) {
-      return {
-        supported: true,
-        branch,
-        error: 'fetch-failed',
-        message: firstLine(target.stderr) || 'git ls-remote failed.',
-        hermesRoot: updateRoot,
-        fetchedAt: Date.now()
-      }
-    }
-
-    // Passive SSH-official checks only know tip SHAs (ls-remote) — never
-    // fabricate a "1 commit behind". Recover the exact count via the GitHub
-    // compare API when possible; otherwise behind stays null ("update
-    // available, count unknown") and updateAvailable carries the signal.
-    // ahead_by === 0 with differing tips means the remote tip is reachable
-    // from our HEAD — a local carried commit sitting AHEAD, not behind:
-    // flagging that as an update nudges the user into wiping their work.
-    const tipsEqual = Boolean(currentSha && currentSha === targetSha)
-
-    const sshBehind = tipsEqual
-      ? 0
-      : await fetchCompareBehindCount({ currentSha, originUrl: OFFICIAL_REPO_HTTPS_URL, targetSha })
-
-    const upToDate = tipsEqual || sshBehind === 0
-
-    return {
-      supported: true,
-      branch,
-      currentBranch,
-      behind: upToDate ? 0 : sshBehind,
-      updateAvailable: !upToDate,
-      currentSha,
-      targetSha,
-      commits: [],
-      dirty: dirtyStr.length > 0,
-      hermesRoot: updateRoot,
-      fetchedAt: Date.now()
-    }
-  }
-
   // Self-heal abandoned git lock files before fetching. A stale
   // .git/shallow.lock from a crashed/interrupted fetch otherwise fails every
   // later fetch ("Unable to create '.git/shallow.lock': File exists") and this
   // check reports 'fetch-failed' forever — git never removes these itself.
   await clearStaleGitLocks(updateRoot)
 
-  const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+  const probeRemote = isSshRemote(originUrl) ? httpsProbeRemote(originUrl) : 'origin'
+  const fetchArgs = ['fetch', '--quiet', probeRemote || 'origin', branch]
+  if (isSshRemote(originUrl) && probeRemote && probeRemote !== originUrl) {
+    fetchArgs.push(`${branch}:refs/remotes/origin/${branch}`)
+  }
+  const fetched = await runGit(fetchArgs, { cwd: updateRoot })
 
   if (fetched.code !== 0) {
     return {
