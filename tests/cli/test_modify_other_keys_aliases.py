@@ -560,3 +560,59 @@ def test_lock_bits_on_cmd_backspace_alias():
     assert _parse("\x1b[127;137u") == [Keys.ControlU]  # Cmd+Backspace + NumLock
     assert _parse("\x1b[127;73u") == [Keys.ControlU]   # Cmd+Backspace + Caps
     assert _parse("\x1b[3;137~") == [Keys.ControlK]    # Cmd+FwdDel + NumLock
+
+
+# ---------------------------------------------------------------------------
+# Literal-char entries: KeyPress.data must be the char, not the raw sequence
+# (#97413) — the stock Keys.Any binding inserts event.data into the buffer.
+# ---------------------------------------------------------------------------
+
+def _parse_presses(byte_seq: str):
+    """Feed bytes through the VT100 parser, returning full KeyPress objects."""
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    out: list[KeyPress] = []
+    parser = Vt100Parser(out.append)
+    for ch in byte_seq:
+        parser.feed(ch)
+    parser.flush()
+    return out
+
+
+@pytest.mark.parametrize("letter", [chr(c) for c in range(ord('a'), ord('z') + 1)])
+def test_shift_letter_data_is_the_uppercase_char(letter):
+    """Shift+<letter> under either protocol must carry the uppercase char as
+    ``KeyPress.data`` — the raw sequence leaks into the prompt buffer
+    otherwise (Ghostty modifyOtherKeys=2, #97413)."""
+    for seq in (f"\x1b[27;2;{ord(letter)}~", f"\x1b[{ord(letter)};2u"):
+        presses = _parse_presses(seq)
+        assert [(kp.key, kp.data) for kp in presses] == [(letter.upper(), letter.upper())], (
+            f"{seq!r} must produce KeyPress(key={letter.upper()!r}, "
+            f"data={letter.upper()!r}), got {[(kp.key, kp.data) for kp in presses]}"
+        )
+
+
+def test_shift_space_data_is_a_space():
+    """Shift+Space must insert a space via data, not the raw sequence."""
+    for seq in ("\x1b[27;2;32~", "\x1b[32;2u"):
+        presses = _parse_presses(seq)
+        assert [(kp.key, kp.data) for kp in presses] == [(" ", " ")], seq
+
+
+def test_kitty_keypad_digit_data_is_the_digit():
+    """Kitty keypad digits (PUA codepoints) must carry the digit as data."""
+    presses = _parse_presses("\x1b[57399u")  # KP_0
+    assert [(kp.key, kp.data) for kp in presses] == [("0", "0")]
+
+
+def test_plain_typed_char_data_unchanged():
+    """Ordinary typed characters keep key == data (patch must not touch them)."""
+    assert [(kp.key, kp.data) for kp in _parse_presses("sx")] == [("s", "s"), ("x", "x")]
+
+
+def test_ctrl_combo_data_keeps_raw_sequence():
+    """Keys-enum targets (Ctrl combos) keep the stock data semantics — only
+    literal-char entries get the data substitution."""
+    presses = _parse_presses("\x1b[27;5;97~")  # Ctrl+a (codepoint of 'a')
+    assert len(presses) == 1
+    assert presses[0].key == Keys.ControlA
+    assert presses[0].data == "\x1b[27;5;97~"

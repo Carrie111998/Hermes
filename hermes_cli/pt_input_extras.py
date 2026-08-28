@@ -48,6 +48,53 @@ def _clear_vt100_prefix_cache() -> None:
         pass
 
 
+def _install_literal_char_data_patch() -> bool:
+    """Deliver literal-char table entries with the char itself as ``KeyPress.data``.
+
+    ``ANSI_SEQUENCES`` entries installed for Shift+letter (→ uppercase char,
+    e.g. ``\\x1b[27;2;83~`` → ``'S'``), Shift+Space (→ ``' '``) and kitty
+    keypad digits map an escape sequence to a *bare character*. prompt_toolkit
+    then emits ``KeyPress(key=<char>, data=<raw escape sequence>)`` because
+    the parser passes the matched prefix as ``data`` — and the stock
+    ``Keys.Any`` binding inserts ``event.data``, so the raw sequence leaks
+    into the prompt buffer as literal text (#97413: Ghostty under
+    modifyOtherKeys=2 re-encodes every Shift+letter this way).
+
+    Stock prompt_toolkit never maps escape sequences to bare characters, so
+    wrapping ``Vt100Parser._call_handler`` to substitute the char as ``data``
+    only affects Hermes-installed literal entries: plain typed characters
+    (``key == data``), ``Keys`` enum targets and tuple expansions
+    (``data=''`` after the first element) all fall outside the condition.
+    Idempotent via a module sentinel.
+    """
+    try:
+        import prompt_toolkit.input.vt100_parser as _vt100_mod
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return False
+
+    if getattr(_vt100_mod, "_hermes_literal_char_patched", False):
+        return True
+
+    _orig_call_handler = _vt100_mod.Vt100Parser._call_handler
+
+    def _patched_call_handler(self_parser, key, insert_text):
+        if (
+            isinstance(key, str)
+            and not isinstance(key, Keys)
+            and len(key) == 1
+            and isinstance(insert_text, str)
+            and insert_text.startswith("\x1b")
+            and insert_text != key
+        ):
+            insert_text = key
+        return _orig_call_handler(self_parser, key, insert_text)
+
+    _vt100_mod.Vt100Parser._call_handler = _patched_call_handler
+    _vt100_mod._hermes_literal_char_patched = True
+    return True
+
+
 def install_shift_enter_alias() -> int:
     """Map Shift+Enter byte sequences to the (Escape, ControlM) key tuple
     that Alt+Enter produces, so the existing Alt+Enter newline handler
@@ -491,6 +538,11 @@ def install_modify_other_keys_aliases() -> int:
     # created before this install (or in earlier tests) can't misparse.
     if changed:
         _clear_vt100_prefix_cache()
+
+    # Literal-char entries installed above (Shift+letter, Shift+Space, kitty
+    # keypad digits) must carry the char as KeyPress.data, or the raw escape
+    # sequence leaks into the prompt buffer via the Keys.Any insert (#97413).
+    _install_literal_char_data_patch()
 
     return changed
 
