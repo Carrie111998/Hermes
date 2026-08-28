@@ -265,6 +265,48 @@ def test_session_info_carries_project_for_owned_cwd(tmp_path):
     assert info["project"]["name"] == "Proj"
 
 
+def test_session_info_uses_owning_profiles_project_registry(monkeypatch, tmp_path):
+    """A multiplexed sfb session must not borrow default's same-named project."""
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    default_home = tmp_path / "default-home"
+    sfb_home = tmp_path / "sfb-home"
+    default_db = default_home / "projects.db"
+    sfb_db = sfb_home / "projects.db"
+
+    with pdb.connect_closing(default_db) as conn:
+        default_id = pdb.create_project(
+            conn,
+            name="Default SFB",
+            folders=[str(repo)],
+            primary_path=str(repo),
+        )
+    with pdb.connect_closing(sfb_db) as conn:
+        sfb_id = pdb.create_project(
+            conn,
+            name="Profile SFB",
+            folders=[str(repo)],
+            primary_path=str(repo),
+        )
+
+    monkeypatch.setattr(pdb, "projects_db_path", lambda: default_db)
+
+    info = server._session_info(
+        None,
+        {
+            "cwd": str(repo),
+            "profile_home": str(sfb_home),
+            "session_key": "sfb-session",
+        },
+    )
+
+    assert info["project"]["id"] == sfb_id
+    assert info["project"]["id"] != default_id
+    assert info["project"]["name"] == "Profile SFB"
+
+
 def test_update_and_archive(tmp_path):
     pid = _call("projects.create", {"name": "Orig", "folders": [str(tmp_path)]})["project"]["id"]
 
