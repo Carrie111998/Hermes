@@ -8354,6 +8354,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         and safe to call from any other consumer of the system prompt.
         Raises ``ValueError`` when EVERY requested skill was unknown —
         the same contract the old synchronous path enforced in cmd_chat.
+        Raises ``TimeoutError`` rather than starting a Kanban worker without
+        its pinned skills when the preload is still running after the join.
         """
         if getattr(self, "_preload_skills_finalized", False):
             return
@@ -8362,6 +8364,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._preload_skills_finalized = True
             return
         thread.join(timeout=120)
+        if thread.is_alive() and os.environ.get("HERMES_KANBAN_TASK"):
+            raise TimeoutError("Pinned skill preload timed out after 120 seconds")
         self._preload_skills_finalized = True
         err = getattr(self, "_preload_skills_error", None)
         if err is not None:
