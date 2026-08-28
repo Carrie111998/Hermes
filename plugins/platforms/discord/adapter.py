@@ -156,11 +156,13 @@ from gateway.platforms.helpers import (
 )
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
+    AudioFormat,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
     SendResult,
+    StreamingTTSHandle,
     cache_image_from_url,
     cache_image_from_bytes,
     cache_audio_from_url,
@@ -952,6 +954,26 @@ class VoiceReceiver:
             stderr=subprocess.PIPE,
             creationflags=windows_hide_flags(),
         )
+
+
+class _DiscordStreamingTTSHandle(StreamingTTSHandle):
+    """Streaming-TTS handle carrying the Discord sink state.
+
+    ``child`` is the mixer's StreamingSpeechChild being fed; ``resample_carry``
+    holds the leftover byte when a provider chunk splits a 16-bit sample.
+    """
+
+    def __init__(
+        self,
+        chat_id: str,
+        audio_format: AudioFormat,
+        guild_id: int,
+        child: Any,
+    ) -> None:
+        super().__init__(chat_id=chat_id, audio_format=audio_format)
+        self.guild_id = guild_id
+        self.child = child
+        self.resample_carry = bytearray()
 
 
 def _read_dm_role_auth_guild() -> Optional[int]:
@@ -4440,11 +4462,15 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ambient_pcm_cache = pcm
         return pcm
 
-    async def _install_voice_mixer(self, guild_id: int, vc) -> None:
-        """Create a VoiceMixer, start the ambient bed, and play it on the VC.
+    async def _install_voice_mixer(self, guild_id: int, vc, *, with_ambient: bool = True) -> None:
+        """Create a VoiceMixer and play it on the VC.
 
         The mixer runs continuously for the life of the connection: one
-        ``vc.play(mixer)`` call, never stopped until leave.
+        ``vc.play(mixer)`` call, never stopped until leave.  ``with_ambient``
+        controls the idle "thinking" bed — True on the /voice join path when
+        ``discord.voice_fx`` is enabled, False when the mixer is installed
+        on demand as a streaming-TTS playback target for a voice_fx-off
+        deployment.
         """
         try:
             from voice_mixer import VoiceMixer
@@ -4456,9 +4482,11 @@ class DiscordAdapter(BasePlatformAdapter):
             duck_gain=float(self._voice_fx_cfg.get("duck_gain", 0.06)),
             speech_gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)),
         )
-        ambient = await asyncio.to_thread(self._get_ambient_pcm)
-        if ambient:
-            mixer.set_ambient(ambient)
+        ambient = None
+        if with_ambient:
+            ambient = await asyncio.to_thread(self._get_ambient_pcm)
+            if ambient:
+                mixer.set_ambient(ambient)
 
         def _after(error):
             if error:
@@ -4741,6 +4769,113 @@ class DiscordAdapter(BasePlatformAdapter):
                     receiver.resume()
         finally:
             self._reset_voice_timeout(guild_id)
+
+    # ------------------------------------------------------------------
+    # Streaming TTS sink (issue #94462)
+    # ------------------------------------------------------------------
+    # Implements the gateway's streaming-TTS adapter contract
+    # (gateway/platforms/base.py, #60671) on top of the continuous
+    # VoiceMixer: each LLM sentence is synthesised and written as PCM while
+    # the model is still generating, instead of waiting for the full reply
+    # and then synthesising one whole file.  Perceptually this turns
+    # "silence for the whole agent run, then a voice note" into a spoken
+    # reply that starts with the first sentence.
+
+    def _voice_guild_for_chat(self, chat_id: str) -> Optional[int]:
+        """Return the guild whose bound text channel is *chat_id*, when the
+        bot is currently connected to a voice channel there."""
+        for gid, text_ch_id in getattr(self, "_voice_text_channels", {}).items():
+            if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
+                return gid
+        return None
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: AudioFormat) -> bool:
+        """True when *chat_id* is bound to a live Discord voice connection."""
+        return self._voice_guild_for_chat(chat_id) is not None
+
+    async def begin_streaming_tts(
+        self,
+        chat_id: str,
+        audio_format: AudioFormat,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[StreamingTTSHandle]:
+        """Open a streaming speech segment on the guild's voice mixer."""
+        try:
+            from voice_mixer import StreamingSpeechChild
+        except ImportError:
+            from .voice_mixer import StreamingSpeechChild
+
+        guild_id = self._voice_guild_for_chat(chat_id)
+        if guild_id is None:
+            return None
+        mixer = await self._ensure_voice_mixer(guild_id)
+        if mixer is None:
+            return None
+        speech_gain = float(
+            getattr(self, "_voice_fx_cfg", {}).get("speech_gain", 1.0) or 1.0
+        )
+        child = StreamingSpeechChild(gain=speech_gain)
+        # Same voice-socket warm-up lead as the one-shot mixer path, so the
+        # first streamed word isn't clipped either.
+        lead = self._lead_silence_bytes()
+        if lead:
+            child.append(lead)
+        mixer.play_speech_stream(child)
+        return _DiscordStreamingTTSHandle(chat_id, audio_format, guild_id, child)
+
+    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> None:
+        """Resample one provider PCM chunk to mixer format and queue it."""
+        if handle.aborted or not chunk:
+            return
+        try:
+            from voice_mixer import resample_to_mixer_pcm
+        except ImportError:
+            from .voice_mixer import resample_to_mixer_pcm
+
+        pcm = resample_to_mixer_pcm(
+            chunk,
+            handle.audio_format.sample_rate,
+            handle.audio_format.channels,
+            state=handle.resample_carry,
+        )
+        handle.child.append(pcm)
+
+    async def finish_streaming_tts(self, handle: StreamingTTSHandle, *, interrupted: bool = False) -> None:
+        """End the stream: play out the buffered tail unless interrupted."""
+        if interrupted or handle.aborted:
+            handle.child.abort()
+        else:
+            handle.child.finish()
+
+    async def abort_streaming_tts(self, handle: StreamingTTSHandle, error: Optional[str] = None) -> None:
+        """Drop buffered and future audio immediately (idempotent)."""
+        handle.aborted = True
+        handle.child.abort()
+
+    async def _ensure_voice_mixer(self, guild_id: int):
+        """Return the guild's VoiceMixer, installing one when missing.
+
+        ``join_voice_channel`` installs the mixer only when
+        ``discord.voice_fx.enabled`` is set; streaming TTS needs a continuous
+        playback target regardless, so a bare mixer (no ambient idle bed —
+        that stays gated on voice_fx) is installed on demand here.
+        """
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+        if mixer is not None:
+            return mixer
+        vc = self._voice_clients.get(guild_id)
+        if vc is None or not vc.is_connected():
+            return None
+        fx_enabled = bool(getattr(self, "_voice_fx_cfg", {}).get("enabled"))
+        try:
+            await self._install_voice_mixer(guild_id, vc, with_ambient=fx_enabled)
+        except Exception as e:
+            logger.warning(
+                "[%s] Could not install voice mixer for streaming TTS (guild=%d): %s",
+                self.name, guild_id, e,
+            )
+            return None
+        return self._voice_mixers.get(guild_id)
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""
