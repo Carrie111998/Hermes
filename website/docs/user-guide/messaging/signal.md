@@ -181,6 +181,10 @@ Signal messages render with **native formatting** instead of literal markdown ch
 
 None of this requires additional config. Native quotes are validated against the `signal-cli` 0.14.6 contract: both the original message timestamp and its author must be available. If Hermes cannot validate both fields, it sends the response normally without a quote instead of risking a failed delivery.
 
+### Long Messages
+
+Signal caps a single message at **8,000 characters**. Hermes splits longer responses into numbered chunks (`(1/3)`, `(2/3)`, …) automatically instead of truncating them. This applies to every delivery path — live conversation replies, cron job deliveries, `hermes send`, and MCP `send_message` calls — and native formatting (bold, italic, code, spoilers) is preserved across chunk boundaries.
+
 ### Typing Indicators
 
 The bot sends typing indicators while processing messages, refreshing every 8 seconds.
