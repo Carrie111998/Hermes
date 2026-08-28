@@ -229,6 +229,44 @@ class TestRunSingleChildSchemaValidation:
         # exactly ONE retry — bounded
         assert len(child.calls) == 2
 
+    def test_schema_invalid_after_retry_fails_closed(self):
+        """A schema-invalid result must not be reported as completed (#96355).
+
+        The child produced a non-empty summary, so the old status derivation
+        (summary present -> "completed") exposed status="completed" with
+        schema_valid=false. A structured delegation whose machine-readable
+        contract was not fulfilled has failed.
+        """
+        child = _StubChild(["nope", "still nope"])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        entry = _run(child)
+        assert entry["status"] == "failed"
+        assert entry["schema_valid"] is False
+
+    def test_retry_exception_degrades_to_failed_status(self):
+        child = _StubChild(["nope"])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        original = child.run_conversation
+
+        def flaky(user_message, task_id=None, **kw):
+            if child.calls:
+                raise RuntimeError("child died on retry")
+            return original(user_message, task_id=task_id, **kw)
+
+        child.run_conversation = flaky
+        entry = _run(child)
+        assert entry["status"] == "failed"
+        assert entry["schema_valid"] is False
+
+    def test_schema_valid_completion_keeps_completed_status(self):
+        # Control: a valid structured delegation is still "completed".
+        child = _StubChild(['{"city": "Berlin"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        entry = _run(child)
+        assert entry["status"] == "completed"
+        assert entry["schema_valid"] is True
+
     def test_retry_exception_degrades_to_invalid(self):
         child = _StubChild(["nope"])
         child._delegate_output_schema = ADDRESS_SCHEMA
