@@ -1540,6 +1540,7 @@ _SHELL_PUNCTUATION = {";", "&", "&&", "|", "||", "(", ")", "{", "}"}
 _MAX_DETECTION_COMMAND_CHARS = 128_000
 _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
+_MAX_PARAMETER_EXPANSIONS = 256
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
 
@@ -1553,6 +1554,11 @@ def _command_parser_limit_exceeded(command: str) -> bool:
     closed rather than allowing an uninspected suffix to execute.
     """
     if len(command) > _MAX_DETECTION_COMMAND_CHARS:
+        return True
+    # Parameter-expansion scanners recurse for nested `${...}`. Bound their
+    # input before parsing so adversarial nesting fails closed instead of
+    # reaching Python's recursion limit or repeatedly rescanning nested spans.
+    if command.count("${") > _MAX_PARAMETER_EXPANSIONS:
         return True
     # Long separator-free input has no compound-command utility and otherwise
     # makes every legacy regex inspect one giant token. Reject it before any
