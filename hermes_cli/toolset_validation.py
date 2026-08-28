@@ -18,6 +18,7 @@ from typing import Callable, List
 def validate_platform_toolsets(
     platform_toolsets: object,
     is_valid_toolset: Callable[[str], bool],
+    plugin_toolset_names: object = None,
 ) -> List[str]:
     """Return human-readable warnings for a ``platform_toolsets`` mapping.
 
@@ -38,6 +39,13 @@ def validate_platform_toolsets(
             ``dict`` values carry toolset entries; anything else yields no
             warnings (nothing to validate).
         is_valid_toolset: Predicate returning ``True`` for a known toolset name.
+        plugin_toolset_names: Optional iterable of plugin-registered toolset
+            names (e.g. ``eikon``, ``buzz``, ``a2a``). These only appear in the
+            tool registry after plugins load — which is after config-time
+            validation runs — so ``is_valid_toolset`` alone flags them as
+            unknown even though they resolve fine at runtime. Treat any name
+            carried here as valid too (callers pass the union of
+            ``known_plugin_toolsets`` from config).
 
     Returns:
         A list of warning strings (empty when everything is valid).
@@ -46,13 +54,18 @@ def validate_platform_toolsets(
     if not isinstance(platform_toolsets, dict) or not platform_toolsets:
         return warnings
 
+    known_plugin = set(plugin_toolset_names) if plugin_toolset_names else set()
+
+    def _is_valid(name: str) -> bool:
+        return bool(is_valid_toolset(name)) or name in known_plugin
+
     valid_count = 0
     for platform, raw in platform_toolsets.items():
         names = raw if isinstance(raw, list) else [raw]
         for name in names:
             if not isinstance(name, str) or not name:
                 continue
-            if is_valid_toolset(name):
+            if _is_valid(name):
                 valid_count += 1
                 continue
             suggestion = f"hermes-{platform}"
