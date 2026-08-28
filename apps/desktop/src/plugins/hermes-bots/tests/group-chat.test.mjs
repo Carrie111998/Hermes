@@ -572,6 +572,29 @@ test('a restored queue waits for durable member sessions to become idle before d
   assert.equal(roomLog(gc, 'Restored').some(entry => entry.text === 'wait for the old backend turn'), true)
 })
 
+test('restored queue replay fails closed on an unknown session status payload', async () => {
+  const gc = load(() => '(pass)')
+  await new Promise(resolve => setImmediate(resolve))
+  const roster = [{ name: 'research', title: '' }]
+  gc.host.request = async () => ({})
+  gc.host.requestProfile = (_route, method, params) => gc.host.request(method, params)
+  gc.updateGroupChat('Unknown', room => {
+    room.running = true
+    room.members = roster
+    room.sessions = { research: 'unknown-status-session' }
+    return room
+  })
+  gc.sendToGroupChat('Unknown', roster, 'do not replay without idle evidence')
+  gc.updateGroupChat('Unknown', room => {
+    room.running = false
+    return room
+  })
+
+  assert.equal(await gc.drainQueuedGroupMessageWhenIdle('Unknown', roster), false)
+  assert.equal(gc.$groupChats.get().Unknown.pending.length, 1)
+  assert.equal(roomLog(gc, 'Unknown').some(entry => entry.text === 'do not replay without idle evidence'), false)
+})
+
 test('send-now promotes the selected non-head item only after session-idle verification', async () => {
   const gc = load(() => '(pass)')
   const roster = [{ name: 'research', title: '' }]

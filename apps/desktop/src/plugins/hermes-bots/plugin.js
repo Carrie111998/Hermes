@@ -8528,7 +8528,7 @@ async function runGroupChatRounds(group, members, thread) {
       // Busy sends stay outside the live log until the current drive settles,
       // then advance FIFO. This avoids prompt.submit's busy redirect/interrupt
       // policy and gives the UI a real, cancellable queue item meanwhile.
-      void drainQueuedGroupMessage(group, members)
+      scheduleQueuedGroupRecovery(group, members)
 
       // #89545: the loop's harvest pass only ran at the top of each round of
       // an ACTIVE loop — a member whose turn timed out after the final round
@@ -8623,7 +8623,7 @@ function runQueuedGroupMessage(group, members, queued, { claimed = false } = {})
       room.turn = null
       return room
     })
-    void drainQueuedGroupMessage(group, roster)
+    scheduleQueuedGroupRecovery(group, roster)
   })
   return true
 }
@@ -8674,7 +8674,19 @@ async function drainQueuedGroupMessageWhenIdle(group, members = null, messageId 
       return false
     }
 
-    if (state?.inflight || state?.running || state?.pending_clarify || state?.pending_approval) {
+    const hasBusyState =
+      state &&
+      typeof state === 'object' &&
+      (Object.prototype.hasOwnProperty.call(state, 'inflight') ||
+        Object.prototype.hasOwnProperty.call(state, 'running'))
+
+    if (
+      !hasBusyState ||
+      state.inflight ||
+      state.running ||
+      state.pending_clarify ||
+      state.pending_approval
+    ) {
       return false
     }
   }
@@ -8689,6 +8701,73 @@ async function drainQueuedGroupMessageWhenIdle(group, members = null, messageId 
   }
 
   return runQueuedGroupMessage(group, roster, queued)
+}
+
+const groupQueueRecoveryTimers = new Map()
+const GROUP_QUEUE_RECOVERY_INTERVAL_MS = 5000
+const GROUP_QUEUE_RECOVERY_MAX_TRIES = 120
+let groupQueueRecoveryDisposed = false
+
+/** Retry a durable queue after ambiguous submit failures or renderer reloads.
+ * Every attempt rechecks backend session state; the bound prevents a dead
+ * gateway from creating a permanent timer. Manual Send now remains available. */
+function scheduleQueuedGroupRecovery(group, members = null, attempt = 0) {
+  if (
+    groupQueueRecoveryDisposed ||
+    groupQueueRecoveryTimers.has(group) ||
+    typeof setTimeout !== 'function'
+  ) {
+    return
+  }
+
+  const run = async () => {
+    const room = $groupChats.get()[group] || {}
+
+    if (room.running || room.interruptingQueue || !room.pending?.length) {
+      groupQueueRecoveryTimers.delete(group)
+      return
+    }
+
+    if (await drainQueuedGroupMessageWhenIdle(group, members)) {
+      groupQueueRecoveryTimers.delete(group)
+      return
+    }
+
+    const current = $groupChats.get()[group] || {}
+    if (
+      !groupQueueRecoveryDisposed &&
+      attempt + 1 < GROUP_QUEUE_RECOVERY_MAX_TRIES &&
+      !current.running &&
+      !current.interruptingQueue &&
+      current.pending?.length
+    ) {
+      const timer = setTimeout(
+        () => {
+          groupQueueRecoveryTimers.delete(group)
+          scheduleQueuedGroupRecovery(group, members, attempt + 1)
+        },
+        GROUP_QUEUE_RECOVERY_INTERVAL_MS
+      )
+      groupQueueRecoveryTimers.set(group, timer)
+    } else {
+      groupQueueRecoveryTimers.delete(group)
+    }
+  }
+
+  // Reserve the group synchronously so concurrent settle/error paths cannot
+  // launch duplicate status probes before the async attempt starts.
+  groupQueueRecoveryTimers.set(group, null)
+  void run()
+}
+
+function stopQueuedGroupRecovery() {
+  groupQueueRecoveryDisposed = true
+  for (const timer of groupQueueRecoveryTimers.values()) {
+    if (timer !== null) {
+      clearTimeout(timer)
+    }
+  }
+  groupQueueRecoveryTimers.clear()
 }
 
 function cancelQueuedGroupMessage(group, messageId) {
@@ -16107,7 +16186,7 @@ export default {
           scheduleGroupChatServerSync($groupChats.get())
           for (const [roomName, room] of Object.entries($groupChats.get())) {
             if (!room.running && Array.isArray(room.pending) && room.pending.length) {
-              void drainQueuedGroupMessageWhenIdle(roomName, room.members)
+              scheduleQueuedGroupRecovery(roomName, room.members)
             }
           }
         })
@@ -16152,6 +16231,7 @@ export default {
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
         stopGroupChatServerSync()
+        stopQueuedGroupRecovery()
         if (typeof unbindProfileListener === 'function') {
           unbindProfileListener()
         }
