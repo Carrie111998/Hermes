@@ -9,6 +9,10 @@ from pathlib import Path
 import pytest
 
 from tui_gateway.compute_host import ComputeHost, HostSession
+from tui_gateway.server import (
+    _open_profile_session_db,
+    _require_existing_profile_home,
+)
 
 
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
@@ -126,3 +130,66 @@ def test_compute_host_interrupt_uses_explicit_stop_compatibility(kind):
 
     assert calls == ["hard" if kind == "hard-only" else "legacy"]
     assert emitted[-1]["applied"] is True
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_compute_host_rejects_deleted_profile_home_before_agent_build(
+    tmp_path, cached
+):
+    profile_home = tmp_path / "profiles" / "deleted"
+    sid = "stale-profile"
+
+    class _Server:
+        _sessions = (
+            {
+                sid: {
+                    "session_key": sid,
+                    "profile_home": str(profile_home),
+                }
+            }
+            if cached
+            else {}
+        )
+        _require_existing_profile_home = staticmethod(_require_existing_profile_home)
+
+        @staticmethod
+        def _make_agent(*_args, **_kwargs):
+            raise AssertionError("agent construction must not run")
+
+    host = ComputeHost(heartbeat_secs=0)
+    try:
+        with pytest.raises(RuntimeError, match="profile home no longer exists"):
+            host._ensure_server_session(
+                _Server,
+                {
+                    "sid": sid,
+                    "session_key": sid,
+                    "profile_home": str(profile_home),
+                },
+            )
+    finally:
+        host.close()
+
+    assert not profile_home.exists()
+
+
+def test_profile_home_guard_accepts_existing_directory(tmp_path):
+    profile_home = tmp_path / "profiles" / "live"
+    profile_home.mkdir(parents=True)
+
+    assert _require_existing_profile_home(profile_home) == profile_home
+
+
+def test_profile_db_open_does_not_create_missing_profile_home(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profiles" / "deleted"
+    monkeypatch.setattr(
+        "hermes_state.SessionDB",
+        lambda **_kwargs: pytest.fail("SessionDB construction must not run"),
+    )
+
+    with pytest.raises(RuntimeError, match="profile home no longer exists"):
+        _open_profile_session_db(profile_home)
+
+    assert not profile_home.exists()
