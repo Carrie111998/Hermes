@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, drainQueuedGroupMessage, cancelQueuedGroupMessage, keepWaitingForQueuedGroupMessage, interruptForQueuedGroupMessage, stopGroupThread, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, drainQueuedGroupMessage, drainQueuedGroupMessageWhenIdle, cancelQueuedGroupMessage, keepWaitingForQueuedGroupMessage, interruptForQueuedGroupMessage, stopGroupThread, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -536,6 +536,69 @@ test('interrupt fencing survives sticky-hold restoration until the old poll exit
   const room = gc.$groupChats.get().Fence
   assert.equal(room.cancelledThroughEpoch, 8, 'the stopped drive remains fenced after promotion')
   assert.equal(room.holds.research.byMessageId, 'sticky', 'the user hold is restored without erasing the fence')
+})
+
+test('a restored queue waits for durable member sessions to become idle before draining', async () => {
+  const gc = load(() => '(pass)')
+  await new Promise(resolve => setImmediate(resolve))
+  const roster = [{ name: 'research', title: '' }]
+  let busy = true
+  const request = gc.host.request
+  gc.host.request = (method, params) => {
+    if (method === 'session.resume' && params.session_id === 'surviving-session') {
+      return Promise.resolve({ messages: [], inflight: busy, running: busy })
+    }
+    return request(method, params)
+  }
+  gc.host.requestProfile = (_route, method, params) => gc.host.request(method, params)
+  gc.updateGroupChat('Restored', room => {
+    room.running = true
+    room.members = roster
+    room.sessions = { research: 'surviving-session' }
+    return room
+  })
+  gc.sendToGroupChat('Restored', roster, 'wait for the old backend turn')
+  gc.updateGroupChat('Restored', room => {
+    room.running = false
+    return room
+  })
+
+  assert.equal(await gc.drainQueuedGroupMessageWhenIdle('Restored', roster), false)
+  assert.equal(gc.$groupChats.get().Restored.pending.length, 1)
+  assert.equal(roomLog(gc, 'Restored').some(entry => entry.text === 'wait for the old backend turn'), false)
+
+  busy = false
+  assert.equal(await gc.drainQueuedGroupMessageWhenIdle('Restored', roster), true)
+  assert.equal(roomLog(gc, 'Restored').some(entry => entry.text === 'wait for the old backend turn'), true)
+})
+
+test('send-now promotes the selected non-head item only after session-idle verification', async () => {
+  const gc = load(() => '(pass)')
+  const roster = [{ name: 'research', title: '' }]
+  gc.host.request = async (method, params) => {
+    if (method === 'session.resume' && params.session_id === 'idle-session') {
+      return { messages: [], inflight: false, running: false }
+    }
+    return {}
+  }
+  gc.host.requestProfile = (_route, method, params) => gc.host.request(method, params)
+  gc.updateGroupChat('Select', room => {
+    room.running = true
+    room.members = roster
+    room.sessions = { research: 'idle-session' }
+    return room
+  })
+  gc.sendToGroupChat('Select', roster, 'stay at the head')
+  gc.sendToGroupChat('Select', roster, 'send the selected item')
+  const selected = gc.$groupChats.get().Select.pending[1]
+  gc.updateGroupChat('Select', room => {
+    room.running = false
+    return room
+  })
+
+  assert.equal(await gc.interruptForQueuedGroupMessage('Select', selected.id, roster), true)
+  assert.equal(roomLog(gc, 'Select').some(entry => entry.text === 'send the selected item'), true)
+  assert.equal(gc.$groupChats.get().Select.pending[0].text, 'stay at the head')
 })
 
 test('concurrent groups sharing one member keep sessions, deltas, and context isolated', async () => {

@@ -8642,6 +8642,55 @@ function drainQueuedGroupMessage(group, members = null) {
   return runQueuedGroupMessage(group, members, next)
 }
 
+/** A restored room has no trustworthy renderer-side `running` flag. Check the
+ * durable member sessions before replaying its oldest queued send so a window
+ * reload cannot submit into backend work that survived the renderer. Unknown
+ * session state fails closed and leaves the durable queue untouched. */
+async function drainQueuedGroupMessageWhenIdle(group, members = null, messageId = null) {
+  const before = $groupChats.get()[group] || {}
+  const roster = Array.isArray(members) && members.length ? members : before.members || []
+  const queued = messageId
+    ? before.pending?.find(item => item.id === messageId)
+    : before.pending?.[0]
+
+  if (before.running || before.interruptingQueue || !queued) {
+    return false
+  }
+
+  for (const member of roster) {
+    const sessionId = (before.sessions || {})[groupMemberKey(member)]
+
+    if (!sessionId) {
+      continue
+    }
+
+    let state
+    try {
+      state = await requestForBot(member, 'session.resume', {
+        session_id: sessionId,
+        profile: member.name
+      })
+    } catch {
+      return false
+    }
+
+    if (state?.inflight || state?.running || state?.pending_clarify || state?.pending_approval) {
+      return false
+    }
+  }
+
+  const current = $groupChats.get()[group] || {}
+  if (
+    current.running ||
+    current.interruptingQueue ||
+    !(current.pending || []).some(item => item.id === queued.id)
+  ) {
+    return false
+  }
+
+  return runQueuedGroupMessage(group, roster, queued)
+}
+
 function cancelQueuedGroupMessage(group, messageId) {
   const room = $groupChats.get()[group]
 
@@ -8695,7 +8744,7 @@ async function interruptForQueuedGroupMessage(group, messageId, members = null) 
   const roster = Array.isArray(members) && members.length ? members : room.members || []
 
   if (!room.running) {
-    return runQueuedGroupMessage(group, roster, queued)
+    return drainQueuedGroupMessageWhenIdle(group, roster, messageId)
   }
 
   updateGroupChat(group, current => {
@@ -13649,7 +13698,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // epoch bump + holds the loop marched on to the next member. Thread scope:
   // the run being stopped is the one the latest activity belongs to.
   const stopRoomRun = async () => {
-    const queuedCount = (room.pending || []).length + (room.interruptingQueue ? 1 : 0)
+    const queuedCount = (room.pending || []).length
     await stopGroupThread(group, latestActivity?.thread || null, memberDescriptors())
     host.notify({
       kind: 'success',
@@ -16058,7 +16107,7 @@ export default {
           scheduleGroupChatServerSync($groupChats.get())
           for (const [roomName, room] of Object.entries($groupChats.get())) {
             if (!room.running && Array.isArray(room.pending) && room.pending.length) {
-              void drainQueuedGroupMessage(roomName, room.members)
+              void drainQueuedGroupMessageWhenIdle(roomName, room.members)
             }
           }
         })
