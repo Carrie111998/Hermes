@@ -43,17 +43,33 @@ _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
 
 # ─── UI Helpers ───────────────────────────────────────────────────────────────
 
+def _safe_mcp_diagnostic(
+    value: object,
+    *,
+    configured_url: Optional[str] = None,
+) -> str:
+    """Project untrusted MCP diagnostic text through the shared redactor."""
+    from agent.redact import redact_diagnostic_text
+
+    configured_urls = (configured_url,) if configured_url else ()
+    return redact_diagnostic_text(
+        str(value),
+        force=True,
+        configured_urls=configured_urls,
+    )
+
+
 def _info(text: str):
-    print(color(f"  {text}", Colors.DIM))
+    print(color(f"  {_safe_mcp_diagnostic(text)}", Colors.DIM))
 
 def _success(text: str):
-    print(color(f"  ✓ {text}", Colors.GREEN))
+    print(color(f"  ✓ {_safe_mcp_diagnostic(text)}", Colors.GREEN))
 
 def _warning(text: str):
-    print(color(f"  ⚠ {text}", Colors.YELLOW))
+    print(color(f"  ⚠ {_safe_mcp_diagnostic(text)}", Colors.YELLOW))
 
 def _error(text: str):
-    print(color(f"  ✗ {text}", Colors.RED))
+    print(color(f"  ✗ {_safe_mcp_diagnostic(text)}", Colors.RED))
 
 
 def _confirm(question: str, default: bool = True) -> bool:
@@ -537,7 +553,7 @@ def cmd_mcp_add(args):
     elif url:
         # Prompt for API key / Bearer token for HTTP servers
         print()
-        _info(f"Connecting to {url}")
+        _info("Connecting to HTTP server")
         needs_auth = _confirm("Does this server require authentication?", default=True)
         if needs_auth:
             if auth_type == "header" or not auth_type:
@@ -586,8 +602,10 @@ def cmd_mcp_add(args):
     _success(f"Connected! Found {len(tools)} tool(s) from '{name}':")
     print()
     for tool_name, desc in tools:
-        short = desc[:60] + "..." if len(desc) > 60 else desc
-        print(f"    {color(tool_name, Colors.GREEN):40s} {short}")
+        safe_name = _safe_mcp_diagnostic(tool_name)
+        safe_desc = _safe_mcp_diagnostic(desc)
+        short = safe_desc[:60] + "..." if len(safe_desc) > 60 else safe_desc
+        print(f"    {color(safe_name, Colors.GREEN):40s} {short}")
     print()
 
     # Ask: enable all, select, or cancel
@@ -608,7 +626,10 @@ def cmd_mcp_add(args):
         # Interactive tool selection
         from hermes_cli.curses_ui import curses_checklist
 
-        labels = [f"{t[0]}  —  {t[1]}" for t in tools]
+        labels = [
+            f"{_safe_mcp_diagnostic(t[0])}  —  {_safe_mcp_diagnostic(t[1])}"
+            for t in tools
+        ]
         pre_selected = set(range(len(tools)))
 
         chosen = curses_checklist(
@@ -699,11 +720,7 @@ def cmd_mcp_list(args=None):
     for name, cfg in servers.items():
         # Transport info
         if "url" in cfg:
-            url = cfg["url"]
-            # Truncate long URLs
-            if len(url) > 28:
-                url = url[:25] + "..."
-            transport = url
+            transport = "HTTP"
         elif "command" in cfg:
             cmd = cfg["command"]
             cmd_args = cfg.get("args", [])
@@ -736,7 +753,9 @@ def cmd_mcp_list(args=None):
             enabled = enabled.lower() in {"true", "1", "yes"}
         status = color("✓ enabled", Colors.GREEN) if enabled else color("✗ disabled", Colors.DIM)
 
-        print(f"  {name:<16} {transport:<30} {tools_str:<12} {status}")
+        safe_name = _safe_mcp_diagnostic(name)
+        safe_transport = _safe_mcp_diagnostic(transport)
+        print(f"  {safe_name:<16} {safe_transport:<30} {tools_str:<12} {status}")
 
     print()
 
@@ -745,6 +764,8 @@ def cmd_mcp_list(args=None):
 
 def cmd_mcp_test(args):
     """Test connection to an MCP server."""
+    from agent.redact import project_diagnostic_url_component
+
     name = args.name
     servers = _get_mcp_servers()
 
@@ -761,7 +782,17 @@ def cmd_mcp_test(args):
 
     # Show transport info
     if "url" in cfg:
-        _info(f"Transport: HTTP → {cfg['url']}")
+        _info("Transport: HTTP")
+        env_refs = []
+        for ref in _ENV_VAR_PATTERN.findall(str(cfg["url"])):
+            name = _env_ref_name(ref)
+            if not _ENV_VAR_NAME_RE.fullmatch(name):
+                name = "<redacted>"
+            else:
+                name = project_diagnostic_url_component(name)
+            env_refs.append(name)
+        if env_refs:
+            _info(f"URL environment: {', '.join(env_refs)}")
     else:
         cmd = cfg.get("command", "?")
         _info(f"Transport: stdio → {cmd}")
@@ -791,7 +822,14 @@ def cmd_mcp_test(args):
         elapsed_ms = (time.monotonic() - start) * 1000
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
-        _error(f"Connection failed ({elapsed_ms:.0f}ms): {exc}")
+        configured_url = None
+        if "url" in cfg:
+            try:
+                configured_url = str(_resolve_mcp_server_config(cfg).get("url") or "")
+            except Exception:
+                configured_url = str(cfg.get("url") or "")
+        diagnostic = _safe_mcp_diagnostic(exc, configured_url=configured_url)
+        _error(f"Connection failed ({elapsed_ms:.0f}ms): {diagnostic}")
         return
 
     _success(f"Connected ({elapsed_ms:.0f}ms)")
@@ -800,8 +838,10 @@ def cmd_mcp_test(args):
     if tools:
         print()
         for tool_name, desc in tools:
-            short = desc[:55] + "..." if len(desc) > 55 else desc
-            print(f"    {color(tool_name, Colors.GREEN):36s} {short}")
+            safe_name = _safe_mcp_diagnostic(tool_name)
+            safe_desc = _safe_mcp_diagnostic(desc)
+            short = safe_desc[:55] + "..." if len(safe_desc) > 55 else safe_desc
+            print(f"    {color(safe_name, Colors.GREEN):36s} {short}")
     print()
 
 
@@ -881,7 +921,7 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             print()
             print(color("    mcp_servers:", Colors.DIM))
             print(color(f"      {name}:", Colors.DIM))
-            print(color(f"        url: {url}", Colors.DIM))
+            print(color("        url: <configured MCP URL>", Colors.DIM))
             print(color("        auth: oauth", Colors.DIM))
             print(color("        oauth:", Colors.DIM))
             print(color("          client_id: \"<your-oauth-client-id>\"", Colors.DIM))
@@ -1058,7 +1098,10 @@ def cmd_mcp_configure(args):
     # Interactive checklist
     from hermes_cli.curses_ui import curses_checklist
 
-    labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
+    labels = [
+        f"{_safe_mcp_diagnostic(t[0])}  —  {_safe_mcp_diagnostic(t[1])}"
+        for t in all_tools
+    ]
 
     chosen = curses_checklist(
         f"Select tools for '{name}'",
