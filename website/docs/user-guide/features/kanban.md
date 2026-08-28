@@ -402,9 +402,11 @@ Every profile that works kanban tasks automatically gets the worker lifecycle �
 4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
 
 That final `kanban_complete` / `kanban_block` call is part of the worker
-protocol. If the worker process exits with status 0 while the task is still
-`running`, the dispatcher treats that as a protocol violation and emits a
-`protocol_violation` event.
+protocol. The dispatcher pins each attempt to a stable Hermes session derived
+from its run id. If the process exits with status 0 while the task is still
+`running`, the dispatcher closes the run with outcome `handoff_missing`, puts
+the task in `blocked`, and attaches that exact worker session. It does not call
+the work complete, count a crash, or immediately rerun the task.
 
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
 synthetic nudges when it detects the model is about to stop without a terminal
@@ -414,15 +416,11 @@ reminds the model to call `kanban_complete` or `kanban_block` immediately. This
 guard is active only for dispatcher-spawned workers (`HERMES_KANBAN_TASK` is
 set) and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
 
-**Dispatcher-side recovery:** If the nudges are exhausted or the worker crashes
-before reaching the nudge, the dispatcher gives the violation a **bounded retry**
-(up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` consecutive violations, default 3)
-before auto-blocking the task instead of respawning it into the same loop. The
-budget counts only *consecutive* clean-exit protocol violations — interleaved
-rate-limited requeues are neutral, and any other failure kind resets the
-streak — and a per-task `max_retries` overrides the bound. This usually means
-the model wrote a plain-text answer and exited without using the Kanban tool
-surface.
+**Dispatcher-side recovery:** If the nudges are exhausted, the task stops in
+`blocked` instead of entering the crash retry loop. An operator can inspect the
+attached worker session and workspace, then explicitly unblock it for
+continuation, move it to review, or close it. Non-zero exits, timeouts, and
+killed workers keep their existing crash and circuit-breaker behavior.
 
 The lifecycle plus the load-bearing reference details (workspace kinds, deliverable `artifacts`, claiming created cards) ship in that system-prompt block, so every worker has them regardless of which profile it runs under — no per-profile skill setup required.
 
@@ -1157,7 +1155,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
-| `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
+| `blocked` | `{pid, claimer, exit_code, kind, outcome, worker_session_id}` | A worker exited with status 0 while the task was still `running`. The run closes as `handoff_missing`; the task parks in `blocked` without incrementing the failure counter or retrying. Inspect the exact worker session, then explicitly continue, review, or close the task. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.

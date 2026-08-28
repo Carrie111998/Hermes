@@ -293,7 +293,7 @@ kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dep
 3. 在长时间操作期间每隔几分钟调用一次 `kanban_heartbeat(note="...")`。**如果你的工作可能运行超过 1 小时，请至少每小时调用一次 `kanban_heartbeat`** —— 调度器会回收运行时间超过 `kanban.dispatch_stale_timeout_seconds`（默认 4 小时）且最近一小时内没有心跳的任务，认为 worker 在没有清理的情况下崩溃了。回收是无害的（任务返回 `ready` 重新调度，不增加失败计数器），但你会失去当前运行的进度。
 4. 以 `kanban_complete(summary="...", metadata={...})` 完成，或在卡住时以 `kanban_block(reason="...")` 完成。
 
-最终的 `kanban_complete` / `kanban_block` 调用是 worker 协议的一部分。如果 worker 进程以状态 0 退出而任务仍处于 `running` 状态，调度器将其视为协议违规，发出 `protocol_violation` 事件，并在下一个 tick 自动阻塞任务而不是重新启动它进入同一循环。这通常意味着模型写了一个纯文本答案并退出，而没有使用 Kanban 工具界面。
+最终的 `kanban_complete` / `kanban_block` 调用是 worker 协议的一部分。调度器会为每次尝试固定一个由运行 ID 派生的 Hermes 会话。如果 worker 进程以状态 0 退出而任务仍处于 `running` 状态，调度器会以 `handoff_missing` 结果关闭该运行，将任务置于 `blocked`，并附上对应的 worker 会话。它不会把工作标记为完成、计为崩溃或立即重试。操作员可以检查该会话和工作区，然后明确选择继续、审查或关闭任务。
 
 ### 为特定任务固定额外 skill
 
@@ -855,7 +855,7 @@ hermes kanban runs t_abcd
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | 任务运行时间超过 `kanban.dispatch_stale_timeout_seconds`（默认 4 小时）**且**最近一小时内没有 `kanban_heartbeat`。调度器向本地 worker（如有）发送 SIGTERM，将任务重置为 `ready` 重新调度。**不**增加失败计数器（stale 是调度器端的缺席检测，不是 worker 故障）。运行长时间操作的 Worker 应至少每小时调用一次 `kanban_heartbeat` 以避免此情况。 |
 | `respawn_guarded` | `{reason}` | 调度器拒绝在本 tick 重新启动此就绪任务。原因：`blocker_auth`（上次失败是配额/认证/429 错误 —— 等待速率窗口重置）、`recent_success`（最近一小时内有完成的运行 —— 在重新运行前等待审查）、`active_pr`（最近的评论中出现 GitHub PR URL —— 先前的 worker 已经打开了 PR）。任务保持在 `ready`；下一个 tick 有另一次启动机会。如果底层条件持续存在，正常的 `consecutive_failures` 熔断器将在 `failure_limit` 次失败后通过 `gave_up` 自动阻塞。 |
 | `spawn_failed` | `{error, failures}` | 一次启动尝试失败（PATH 缺失、工作区无法挂载等）。计数器递增；任务返回 `ready` 重试。 |
-| `protocol_violation` | `{pid, claimer, exit_code}` | Worker 在任务仍处于 `running` 状态时成功退出，通常是因为它回答了问题而没有调用 `kanban_complete` 或 `kanban_block`。调度器还会立即发出 `gave_up` 并自动阻塞，而不是重试。 |
+| `blocked` | `{pid, claimer, exit_code, kind, outcome, worker_session_id}` | Worker 以状态 0 退出时任务仍处于 `running`。该运行以 `handoff_missing` 结束，任务停在 `blocked`；失败计数器不会增加，也不会自动重试。检查对应的 worker 会话后，再明确选择继续、审查或关闭任务。 |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | N 次连续不成功尝试后熔断器触发。任务以最后一个错误自动阻塞。有效限制解析为任务 `max_retries`，然后是调度器 `failure_limit` / `kanban.failure_limit`，然后是内置默认值。 |
 
 `hermes kanban tail <id>` 显示单个任务的这些事件。`hermes kanban watch` 在整个看板范围内流式传输它们。

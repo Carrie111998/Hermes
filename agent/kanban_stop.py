@@ -4,7 +4,7 @@ Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
 (especially GLM / Qwen families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
-``protocol_violation``.
+``handoff_missing``.
 
 This module is policy-only: when a kanban worker tries to finish without a
 terminal board tool, return a bounded synthetic nudge so the conversation
