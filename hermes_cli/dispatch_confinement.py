@@ -529,7 +529,13 @@ def terminate_worker_tree(owned: Optional[OwnedProcess], *,
             continue
         if use_group:
             try:
-                os.killpg(int(owned.pgid), sig)
+                # POSIX-only branch. ``pgid`` is populated in exactly one
+                # place — ``own_process()`` — by ``os.getpgid()``, which does
+                # not exist on Windows and fails closed to ``None`` there. A
+                # ``None`` pgid makes ``has_tree_handle`` False, which makes
+                # ``use_group`` False, so this call cannot be reached on
+                # Windows and the ``else`` branch below handles that platform.
+                os.killpg(int(owned.pgid), sig)  # windows-footgun: ok — unreachable on Windows (pgid is always None there)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         else:
