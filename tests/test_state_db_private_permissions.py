@@ -20,8 +20,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @contextmanager
-def _permissive_umask():
-    previous = os.umask(0o002)
+def _permissive_umask(mask: int = 0o002):
+    previous = os.umask(mask)
     try:
         yield
     finally:
@@ -40,6 +40,38 @@ def _force_wal(monkeypatch):
         lambda version_info=None: False,
     )
     monkeypatch.setattr(hermes_state, "resolve_journal_mode", lambda: "wal")
+
+
+def test_session_db_first_creation_is_private_with_permissive_umask(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "state.db"
+    assert not db_path.exists()
+
+    real_connect = hermes_state._connect_tracked_db
+
+    def connect_after_private_creation(path, *args, **kwargs):
+        assert db_path.exists()
+        assert _mode(db_path) == 0o600
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_tracked_db", connect_after_private_creation
+    )
+
+    with _permissive_umask(0o000):
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._wal_active is True
+            paths = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")]
+            assert all(path.exists() for path in paths)
+            assert {path.name: _mode(path) for path in paths} == {
+                "state.db": 0o600,
+                "state.db-wal": 0o600,
+                "state.db-shm": 0o600,
+            }
+        finally:
+            db.close()
 
 
 def test_session_db_tightens_database_and_created_wal_sidecars(tmp_path):
