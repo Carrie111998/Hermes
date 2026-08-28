@@ -725,8 +725,11 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
+    # Validate grep's shell grammar before normalization strips escapes such
+    # as the \" in a valid double-quoted regex (`grep "[^\"]*"`). Parsing
+    # the normalized spelling would turn that escaped data quote into a shell
+    # delimiter and falsely report an unterminated executable payload.
+    _, malformed_grep = _grep_safe_detection_variant(command)
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
     for command_variant in _command_detection_variants(command):
@@ -2380,7 +2383,8 @@ def _command_detection_variants(command: str):
     # unterminated quote), so masking the normalized text could swallow a
     # REAL unquoted newline separator that follows. The raw command carries
     # faithful shell quote state.
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+    quote_faithful = _mask_quoted_newlines(command)
+    normalized = _normalize_command_for_detection(quote_faithful)
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -2431,8 +2435,12 @@ def _command_detection_variants(command: str):
     # untouched, while `(reboot)` / `{ shutdown -h now; }` now anchor. This
     # covers every `_CMDPOS` rule (shutdown/reboot/init/systemctl/telinit and
     # the rm root/home/system floor) in one place.
-    marked = _mark_command_starts(grep_safe)
-    if marked != grep_safe and marked not in seen:
+    # Find command boundaries while the original escape/quote structure is
+    # still intact, then normalize the already-marked spelling. Otherwise a
+    # valid data escape such as grep's `[^\"]` can become a quote delimiter
+    # before this pass and hide a real command that follows the grep segment.
+    marked = _normalize_command_for_detection(_mark_command_starts(quote_faithful))
+    if marked != normalized and marked not in seen:
         seen.add(marked)
         yield marked
     # Shell quoting/escaping can spell a dangerous executable name in pieces

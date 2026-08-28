@@ -656,6 +656,49 @@ def test_quoted_paren_brace_prose_not_blocked_under_yolo(clean_session, monkeypa
         )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'''grep -o "[^\"]*" f''',
+        r'''grep -o "C:\Users\UPC\Desktop[^\"]*" file.py''',
+        r'''grep -Po "(?<=href=\")[^\"]*" index.html''',
+    ],
+)
+def test_escaped_quotes_in_grep_bracket_classes_are_not_malformed(command):
+    """Normalization must not corrupt valid shell quoting before parsing grep."""
+    assert detect_hardline_command(command) == (False, None)
+
+
+def test_unescaped_quote_in_grep_bracket_class_remains_malformed():
+    malformed = '''grep -o "[^"]*" f'''
+    assert detect_hardline_command(malformed) == (
+        True,
+        "command parser limit or malformed executable payload",
+    )
+
+
+def test_destructive_command_after_valid_quoted_grep_remains_blocked():
+    destructive = r'''grep -o "[^\"]*" f; rm -rf /'''
+    assert detect_hardline_command(destructive) == (
+        True,
+        "recursive delete of root filesystem",
+    )
+
+
+def test_valid_quoted_grep_passes_yolo_and_approvals_off_guards(
+    clean_session, monkeypatch
+):
+    import tools.approval as approval_mod
+
+    command = r'''grep -o "[^\"]*" f'''
+    enable_session_yolo("hardline_test")
+    assert check_all_command_guards(command, "local")["approved"] is True
+
+    disable_session_yolo("hardline_test")
+    monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "off")
+    assert check_all_command_guards(command, "local")["approved"] is True
+
+
 def test_line_continuation_root_wipe_cannot_bypass_hardline(clean_session, monkeypatch):
     """A line-continuation root wipe must stay blocked even under yolo.
 
