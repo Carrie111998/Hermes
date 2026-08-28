@@ -105,4 +105,18 @@ describe('the catalog owns model curation', () => {
 
     expect($modelVisibilityOpen.get()).toBe(true)
   })
+
+  it('shows a retry control when the model owner cannot load', async () => {
+    getGlobalModelOptions.mockRejectedValueOnce(new Error('Model owner unavailable')).mockResolvedValueOnce({
+      providers: [{ models: ['gemini-3.1-pro'], name: 'Google', slug: 'google' }]
+    })
+
+    renderMenu()
+
+    await screen.findByText('Model owner unavailable')
+    fireEvent.click(screen.getByText('Retry'))
+
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+    expect(getGlobalModelOptions).toHaveBeenCalledTimes(2)
+  })
 })

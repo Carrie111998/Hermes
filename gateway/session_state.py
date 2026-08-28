@@ -93,6 +93,10 @@ class ConversationState:
 
     # /model per-session override (model/provider/api_key/base_url/api_mode).
     model_override: Optional[Dict[str, Any]] = None
+    # A model switch accepted while this conversation is mid-turn. The live
+    # turn keeps its captured client; its cached agent is rebuilt only after
+    # the running slot is released.
+    model_cache_evict_pending: bool = False
     # /model --once restore snapshot.
     one_turn_restore: Optional[Dict[str, Any]] = None
     # /reasoning per-session override.
@@ -118,6 +122,7 @@ class ConversationState:
         automatically.
         """
         self.model_override = None
+        self.model_cache_evict_pending = False
         self.one_turn_restore = None
         self.reasoning_override = None
         self.service_tier_override = _UNSET_TIER

@@ -88,14 +88,18 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 def test_named_pipe_identify_status_and_fleet_consumer(live_server, monkeypatch):
     proc, home, server_pid = live_server
-    from gateway.control_socket import identify_gateway, query_gateway_control
+    from gateway.control_socket import (
+        CONTROL_PROTOCOL_VERSION,
+        identify_gateway,
+        query_gateway_control,
+    )
 
     ident = identify_gateway(home, timeout=5.0)
     assert ident is not None, "identify returned None against a live pipe server"
     # Compare against the server's SELF-reported pid, not Popen.pid — uv's
     # Windows trampoline makes the spawner's view wrong (see _CHILD_CODE).
     assert ident["pid"] == server_pid
-    assert ident["protocol"] == 1
+    assert ident["protocol"] == CONTROL_PROTOCOL_VERSION
     assert ident["kind"] == "hermes-gateway"
     assert ident["supervisor"] in {"systemd", "launchd", "desktop", "external", "manual"}
 

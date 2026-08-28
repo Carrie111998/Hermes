@@ -145,10 +145,11 @@ export function ModelCatalogMenu({
     // Gateway-first even with no session: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers the local
     // REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, profile, request, sessionId })
+    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, profile, request, sessionId }),
+    retry: false
   })
 
-  const loading = modelOptions.isPending && !modelOptions.data
+  const loading = modelOptions.isFetching && !modelOptions.data
 
   const error = modelOptions.error
     ? modelOptions.error instanceof Error
@@ -360,9 +361,20 @@ export function ModelCatalogMenu({
           ))}
         </DropdownMenuGroup>
       ) : error ? (
-        <DropdownMenuItem className={dropdownMenuRow} disabled>
-          {error}
-        </DropdownMenuItem>
+        <DropdownMenuGroup className="py-1">
+          <DropdownMenuItem className={dropdownMenuRow} disabled>
+            {error}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className={dropdownMenuRow}
+            onSelect={event => {
+              event.preventDefault()
+              void modelOptions.refetch()
+            }}
+          >
+            {t.common.retry}
+          </DropdownMenuItem>
+        </DropdownMenuGroup>
       ) : groups.length === 0 && moaPresets.length === 0 ? (
         <DropdownMenuItem className={dropdownMenuRow} disabled>
           {copy.noModels}

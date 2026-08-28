@@ -74,7 +74,7 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
     entry = store.get_or_create_session(_make_source())
     session_key = entry.session_key
 
-    store.set_model_override(session_key, OVERRIDE)
+    assert store.set_model_override(session_key, OVERRIDE) is True
 
     # Simulated restart: a brand-new store instance reads the same dir.
     store2 = store_factory()
@@ -84,6 +84,12 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+
+
+def test_override_refuses_a_routing_key_the_store_no_longer_owns(store_factory):
+    store = store_factory()
+
+    assert store.set_model_override("missing-routing-key", OVERRIDE) is False
 
 
 def _make_runner(store):

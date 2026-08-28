@@ -4,17 +4,20 @@ import asyncio
 import json
 import socket
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from gateway.control_socket import (
     CONTROL_PROTOCOL_VERSION,
+    GatewayControlTimeoutError,
     GatewayControlServer,
     identify_gateway,
     query_gateway_control,
     resolve_client_socket_path,
     resolve_server_socket_path,
+    set_gateway_session_model_override,
     windows_pipe_name,
 )
 
@@ -161,6 +164,56 @@ def test_unknown_verb_and_malformed_request(home: Path):
     assert payload["protocol"] == CONTROL_PROTOCOL_VERSION
 
 
+def test_parameterized_handler_receives_bounded_json_payload(home: Path):
+    seen = []
+
+    def handler(params):
+        seen.append(params)
+        return {"applied": True, "session_key": params["session_key"]}
+
+    server = GatewayControlServer(home, verb_handlers={"set-session-model": handler})
+    response = json.loads(
+        server.handle_request_line(
+            json.dumps(
+                {
+                    "verb": "set-session-model",
+                    "params": {
+                        "session_key": "agent:main:telegram:dm:42",
+                        "model": "gpt-5.6-sol",
+                    },
+                }
+            ).encode()
+        ).decode()
+    )
+
+    assert response["ok"] is True
+    assert response["result"] == {
+        "applied": True,
+        "session_key": "agent:main:telegram:dm:42",
+    }
+    assert seen == [
+        {
+            "session_key": "agent:main:telegram:dm:42",
+            "model": "gpt-5.6-sol",
+        }
+    ]
+
+
+@pytest.mark.parametrize("params", [[], "", 0, False])
+def test_control_socket_rejects_non_object_params(home: Path, params):
+    server = GatewayControlServer(
+        home, verb_handlers={"set-session-model": lambda received: received}
+    )
+    response = json.loads(
+        server.handle_request_line(
+            json.dumps({"verb": "set-session-model", "params": params}).encode()
+        ).decode()
+    )
+
+    assert response["ok"] is False
+    assert "params must be a JSON object" in response["error"]
+
+
 def test_stop_removes_socket_and_pointer(home: Path):
     async def scenario():
         server = GatewayControlServer(
@@ -223,6 +276,42 @@ def test_long_home_end_to_end_via_pointer(tmp_path: Path):
 def test_no_socket_returns_none_fast(home: Path):
     assert identify_gateway(home) is None
     assert query_gateway_control(home, "status") is None
+
+
+def test_mutating_timeout_is_not_reported_as_an_unavailable_socket(home: Path):
+    def slow_handler(_params):
+        time.sleep(0.1)
+        return {"applied": True}
+
+    async def scenario():
+        server = GatewayControlServer(
+            home, verb_handlers={"set-session-model": slow_handler}
+        )
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            observer_result = await loop.run_in_executor(
+                None,
+                lambda: query_gateway_control(
+                    home, "set-session-model", params={"probe": True}, timeout=0.01
+                ),
+            )
+
+            def mutate():
+                return set_gateway_session_model_override(
+                    home,
+                    session_key="agent:main:telegram:dm:42",
+                    model="gpt-5.6-sol",
+                    timeout=0.01,
+                )
+
+            with pytest.raises(GatewayControlTimeoutError):
+                await loop.run_in_executor(None, mutate)
+            return observer_result
+        finally:
+            await server.stop()
+
+    assert _run(scenario()) is None
 
 
 def test_default_identify_payload_shape(home: Path, monkeypatch):

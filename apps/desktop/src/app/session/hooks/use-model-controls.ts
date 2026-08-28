@@ -7,20 +7,23 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
+import { handoffOriginSource, isMessagingSource } from '@/lib/session-source'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $selectedStoredSessionId,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
+  ownerLookupSessionRows,
   setCurrentModel,
   setCurrentModelSource,
   setCurrentProvider
 } from '@/store/session'
-import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
+import { $sessionStates, sessionTileDelegate, storedSessionIdForRuntimeId } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelControlsOptions {
@@ -32,6 +35,31 @@ interface ModelSwitchResponse {
   confirm_message?: string
   confirm_required?: boolean
   deferred?: boolean
+}
+
+/**
+ * Model scope follows the conversation's durable origin, not the pane that is
+ * currently rendering it. A Telegram/Discord/etc. conversation opened in the
+ * primary pane is still an external messaging session: changing its model must
+ * not rewrite the profile default used by unrelated local chats.
+ */
+export function liveSessionHasMessagingOrigin(liveSessionId: string, touchesPrimary: boolean): boolean {
+  const storedId =
+    storedSessionIdForRuntimeId(liveSessionId) ?? (touchesPrimary ? $selectedStoredSessionId.get() : null)
+
+  if (!storedId) {
+    return false
+  }
+
+  const row = ownerLookupSessionRows().find(candidate => {
+    const lineageRoot = candidate._lineage_root_id?.trim()
+
+    return candidate.id === storedId || lineageRoot === storedId
+  })
+
+  return Boolean(
+    row && (isMessagingSource(row.source) || Boolean(handoffOriginSource(row.handoff_state, row.handoff_platform)))
+  )
 }
 
 export function useModelControls({ queryClient, requestGateway }: ModelControlsOptions) {
@@ -247,21 +275,21 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         return true
       }
 
-      // The PRIMARY profile's main agent is the profile's default — its
-      // model/provider choice IS the default, so persist it to config.yaml
-      // (model.default + model.provider) via --global. This is what makes
-      // the selection "stick": a set model.provider outranks a leftover
-      // OPENAI_API_KEY env var in resolve_provider(), so the main agent
-      // keeps the chosen (e.g. subscription) provider across restarts
-      // instead of silently falling back to an env key.
+      // The PRIMARY *local* profile session owns the profile default, so its
+      // pick persists to config.yaml. Pane placement is not authority though:
+      // a Telegram/Discord/etc. conversation remains session-scoped even when
+      // it is opened in the primary pane.
       //
       // Two things stay --session, deliberately:
       //  - a SECONDARY chat tile: picking a model there must not rewrite the
       //    profile default (the cross-session-contamination guard).
+      //  - an EXTERNAL messaging conversation in any pane: its durable routing
+      //    peer owns the choice, not the profile default.
       //  - MoA (mixture-of-agents) presets: a transient orchestration choice
       //    that must never become the persisted global gateway default.
       const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
-      const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
+      const messagingOrigin = liveSessionHasMessagingOrigin(liveSessionId, touchesPrimary)
+      const persistsAsDefault = touchesPrimary && !messagingOrigin && !isSessionOnlyPreset
       const scope = persistsAsDefault ? '--global' : '--session'
 
       const requestSwitch = (confirmExpensiveModel = false) =>

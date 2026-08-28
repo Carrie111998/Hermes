@@ -60,7 +60,11 @@ export function ModelPickerDialog({
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(profile, sessionId),
     queryFn: () => requestModelOptions({ gateway: gw, sessionId }),
-    enabled: open
+    enabled: open,
+    // The request itself is bounded. Leave retries under the user's control so
+    // an unreachable session owner does not turn one timeout into a long,
+    // unexplained spinner.
+    retry: false
   })
 
   const providers = modelOptions.data?.providers ?? []
@@ -70,7 +74,7 @@ export function ModelPickerDialog({
     modelOptions.data
   )
 
-  const loading = modelOptions.isPending && !modelOptions.data
+  const loading = modelOptions.isFetching && !modelOptions.data
 
   const error = modelOptions.error
     ? modelOptions.error instanceof Error
@@ -115,6 +119,7 @@ export function ModelPickerDialog({
               currentProvider={optionsProvider || currentProvider}
               error={error}
               loading={loading}
+              onRetry={() => void modelOptions.refetch()}
               onSelectModel={selectModel}
               providers={providers}
               search={search}
@@ -142,6 +147,7 @@ function ModelResults({
   currentModel,
   currentProvider,
   onSelectModel,
+  onRetry,
   search
 }: {
   loading: boolean
@@ -150,6 +156,7 @@ function ModelResults({
   currentModel: string
   currentProvider: string
   onSelectModel: (provider: ModelOptionProvider, model: string) => void
+  onRetry: () => void
   search: string
 }) {
   const { t } = useI18n()
@@ -161,10 +168,13 @@ function ModelResults({
 
   if (error) {
     return (
-      <div className="px-3 py-3">
+      <div className="space-y-2 px-3 py-3">
         <InlineNotice kind="error" title={copy.loadFailed}>
           {error}
         </InlineNotice>
+        <Button className="w-full" onClick={onRetry} size="sm" variant="outline">
+          {t.common.retry}
+        </Button>
       </div>
     )
   }

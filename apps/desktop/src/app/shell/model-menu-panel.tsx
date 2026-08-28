@@ -74,7 +74,8 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(profile, activeSessionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
-      requestModelOptions({ gateway, profile, request: requestGateway, sessionId: activeSessionId })
+      requestModelOptions({ gateway, profile, request: requestGateway, sessionId: activeSessionId }),
+    retry: false
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(

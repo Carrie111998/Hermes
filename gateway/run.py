@@ -6952,6 +6952,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state = self._peek_session_state(session_key)
         return state is not None and state.turn.agent is not None
 
+    def _defer_or_evict_session_model_cache(self, session_key: str) -> bool:
+        """Evict an idle session now, or defer until its active turn ends.
+
+        A running agent has captured its model client for the current turn.
+        Removing it from the cache mid-turn would let cleanup race the worker,
+        so a control-socket model switch records one conversation-scoped bit
+        that the authoritative turn-release funnel consumes.
+
+        Returns True when eviction was deferred.
+        """
+        state = self._session_state(session_key)
+        if self._is_session_running(session_key):
+            state.conversation.model_cache_evict_pending = True
+            return True
+        state.conversation.model_cache_evict_pending = False
+        self._evict_cached_agent(session_key)
+        return False
+
     def _running_agent_items(self) -> List[tuple]:
         """(session_key, agent) pairs for sessions with a running turn
         (including pending sentinels), matching the old ``_running_agents``
@@ -27136,6 +27154,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # are deliberately NOT cleared here — _release_turn_lease owns
             # them (#64934).
             state.turn.clear()
+            if state.conversation.model_cache_evict_pending:
+                state.conversation.model_cache_evict_pending = False
+                self._evict_cached_agent(session_key)
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
@@ -31172,7 +31193,107 @@ def _looks_like_profile_conflict_from_cmdline(command: str, our_home) -> bool:
     if home_value is not None and os.path.normcase(os.path.normpath(home_value)) != os.path.normcase(os.path.normpath(str(our_home))):
         return True
     return False
+_SESSION_MODEL_APPLY_TIMEOUT = 4.0
+_SESSION_MODEL_DB_WRITE_TIMEOUT = 1.5
 
+
+def _build_set_session_model_handler(runner, main_loop):
+    """Build the control-thread bridge for one gateway-owned conversation.
+
+    The coroutine owns the only mutation deadline. A request that sits on a
+    stalled loop until that deadline expires is rejected before touching
+    session state; once mutation starts, the only awaited step (SQLite) is
+    bounded by the remaining budget and degrades to a visible durability
+    warning rather than contradicting the already-applied live override.
+    """
+
+    def _set_session_model_handler(params: dict) -> dict:
+        session_key = str(params.get("session_key") or "").strip()
+        model = str(params.get("model") or "").strip()
+        provider = str(params.get("provider") or "").strip()
+        requested_base_url = str(params.get("base_url") or "").strip()
+        if not session_key or not model:
+            raise ValueError("session_key and model are required")
+        if not runner.session_store.has_session(session_key):
+            raise ValueError("session not found")
+
+        runtime: dict = {}
+        if provider:
+            runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+        resolved_provider = str(runtime.get("provider") or provider or "").strip()
+        full_override: Dict[str, Any] = {
+            "model": model,
+            "provider": resolved_provider,
+            "base_url": requested_base_url or runtime.get("base_url"),
+            "api_key": runtime.get("api_key"),
+            "api_mode": runtime.get("api_mode"),
+            "credential_pool": runtime.get("credential_pool"),
+        }
+        apply_deadline = time.monotonic() + _SESSION_MODEL_APPLY_TIMEOUT
+
+        async def _apply() -> tuple[str, bool]:
+            if time.monotonic() >= apply_deadline:
+                raise TimeoutError(
+                    "gateway did not begin the session model change in time"
+                )
+            # Recheck on the gateway loop so a session removed after the
+            # control request was accepted cannot be resurrected.
+            if not runner.session_store.has_session(session_key):
+                raise ValueError("session not found")
+            session_id = runner.session_store.get_session_id(session_key)
+            if not runner.session_store.set_model_override(
+                session_key, full_override
+            ):
+                raise ValueError("session not found")
+            runner._session_state(
+                session_key
+            ).conversation.model_override = full_override
+            eviction_deferred = runner._defer_or_evict_session_model_cache(
+                session_key
+            )
+
+            durability_warning = ""
+            session_db = getattr(runner, "_session_db", None)
+            if session_db is not None and session_id:
+                remaining = apply_deadline - time.monotonic()
+                if remaining <= 0:
+                    durability_warning = (
+                        "The live model changed, but its transcript record could "
+                        "not be confirmed before the gateway deadline. Refresh "
+                        "before retrying."
+                    )
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            session_db.update_session_model(
+                                session_id, model, provider=resolved_provider
+                            ),
+                            timeout=min(_SESSION_MODEL_DB_WRITE_TIMEOUT, remaining),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Live session model changed but the transcript row "
+                            "could not be updated",
+                            exc_info=True,
+                        )
+                        durability_warning = (
+                            "The live model changed, but the saved transcript "
+                            "record could not be confirmed. Refresh before retrying."
+                        )
+            return durability_warning, eviction_deferred
+
+        future = asyncio.run_coroutine_threadsafe(_apply(), main_loop)
+        durability_warning, eviction_deferred = future.result()
+        return {
+            "applied": True,
+            "session_key": session_key,
+            "model": model,
+            "provider": resolved_provider,
+            "eviction_deferred": eviction_deferred,
+            "durability_warning": durability_warning,
+        }
+
+    return _set_session_model_handler
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
@@ -31642,7 +31763,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # drain budget so the caller knows how long to wait for exit.
         _main_loop = asyncio.get_running_loop()
 
-        def _pause_for_update_handler() -> dict:
+        def _pause_for_update_handler(_params: Optional[dict] = None) -> dict:
             try:
                 from hermes_cli.gateway import _get_restart_drain_timeout
 
@@ -31670,8 +31791,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 "drain_timeout": _drain,
             }
 
+        _set_session_model_handler = _build_set_session_model_handler(
+            runner, _main_loop
+        )
+
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler}
+            verb_handlers={
+                "pause-for-update": _pause_for_update_handler,
+                "set-session-model": _set_session_model_handler,
+            }
         )
         if not await _control_server.start():
             _control_server = None

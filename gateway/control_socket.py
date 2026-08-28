@@ -10,13 +10,16 @@ gateway process creates at startup and removes on clean shutdown, answering
 versioned JSON verbs. A connectable socket with a well-formed ``identify``
 answer IS liveness — no PID-reuse heuristics.
 
-v1 verbs (observation only — no behavior change for the gateway):
+v2 verbs:
 
 - ``identify`` → pid, profile label, hermes_home, code_sha/code_version
   (the #91283 stamps, now queryable live), supervisor kind, served profiles,
   start_time, protocol version.
 - ``status``   → the live runtime-status payload (what ``gateway_state.json``
   holds today, but answered by the process itself, race-free).
+- ``pause-for-update`` → drain and stop this exact gateway for an update.
+- ``set-session-model`` → replace one gateway-owned conversation's model
+  override and evict only that conversation's cached agent.
 
 Transport:
 
@@ -31,7 +34,11 @@ Transport:
 Never a TCP port. Filesystem/pipe ACLs are the auth boundary — the same
 trust model as ``gateway_state.json`` today.
 
-v1 wire contract: ONE request per connection — a single JSON line in, a
+This is an internal Hermes coordination protocol, not a public extension API.
+Protocol v2 adds object-valued ``params`` for mutating verbs; the original
+zero-argument observer verbs remain accepted for mixed-version local fleets.
+
+v2 wire contract: ONE request per connection — a single JSON line in, a
 single JSON line out, then the server closes. Clients must not rely on
 keep-alive or pipelining. Verb handlers may touch disk (they run in an
 executor server-side) but must stay fast; the client budget is small.
@@ -48,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -60,7 +68,7 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-CONTROL_PROTOCOL_VERSION = 1
+CONTROL_PROTOCOL_VERSION = 2
 
 _SOCKET_FILENAME = "gateway.sock"
 _POINTER_FILENAME = "gateway.sock.path"
@@ -76,11 +84,17 @@ _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 
 _DEFAULT_CLIENT_TIMEOUT = 2.0
+_SESSION_MODEL_CLIENT_TIMEOUT = 5.0
+
+
+class GatewayControlTimeoutError(TimeoutError):
+    """A control request whose final mutation outcome cannot be confirmed."""
 
 
 # ---------------------------------------------------------------------------
 # Path resolution (shared by server and client)
 # ---------------------------------------------------------------------------
+
 
 def _home_hash(home: Path) -> str:
     canonical = os.path.normcase(str(Path(home).expanduser().resolve(strict=False)))
@@ -153,6 +167,7 @@ def resolve_client_socket_path(home: Path) -> Optional[Path]:
 # Default payload builders (import-light; overridable at wiring time)
 # ---------------------------------------------------------------------------
 
+
 def _detect_supervisor() -> str:
     """Best-effort supervisor kind for THIS process, from its own environment.
 
@@ -223,8 +238,9 @@ def build_status_payload() -> dict[str, Any]:
 # Server
 # ---------------------------------------------------------------------------
 
+
 class GatewayControlServer:
-    """Gateway-owned control socket server (identify/status, v1).
+    """Gateway-owned control socket server (versioned observation + mutation).
 
     Lifecycle is owned by the gateway process: ``start()`` after the PID-file
     claim (the point where this process becomes the authoritative gateway for
@@ -237,7 +253,7 @@ class GatewayControlServer:
         self,
         home: Optional[Path] = None,
         *,
-        verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+        verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None,
     ) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
@@ -248,12 +264,33 @@ class GatewayControlServer:
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
         self._pointer_file: Optional[Path] = None
-        self._handlers: dict[str, Callable[[], dict[str, Any]]] = {
-            "identify": build_identify_payload,
-            "status": build_status_payload,
+        self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+            "identify": lambda _params: build_identify_payload(),
+            "status": lambda _params: build_status_payload(),
         }
         if verb_handlers:
-            self._handlers.update(verb_handlers)
+            for verb, handler in verb_handlers.items():
+                self._handlers[verb] = self._normalize_handler(handler)
+
+    @staticmethod
+    def _normalize_handler(
+        handler: Callable[..., dict[str, Any]],
+    ) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        """Accept old zero-argument observers and new parameterized handlers.
+
+        Normalizing once at registration keeps failures raised *inside* a
+        handler distinguishable from an arity mismatch; the request path never
+        retries a mutating handler after catching a broad ``TypeError``.
+        """
+        try:
+            accepts_params = bool(inspect.signature(handler).parameters)
+        except (TypeError, ValueError):
+            accepts_params = False
+
+        if accepts_params:
+            return handler
+
+        return lambda _params: handler()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -264,7 +301,9 @@ class GatewayControlServer:
                 return await self._start_windows()
             return await self._start_posix()
         except Exception as exc:
-            logger.warning("Gateway control socket failed to start (non-fatal): %s", exc)
+            logger.warning(
+                "Gateway control socket failed to start (non-fatal): %s", exc
+            )
             return False
 
     async def _start_posix(self) -> bool:
@@ -352,6 +391,10 @@ class GatewayControlServer:
                 raise ValueError("request must be a JSON object")
             request_id = request.get("id")
             verb = request.get("verb")
+            raw_params = request.get("params", {})
+            params = {} if raw_params is None else raw_params
+            if not isinstance(params, dict):
+                raise ValueError("params must be a JSON object")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
             if handler is None:
                 response: dict[str, Any] = {
@@ -364,7 +407,7 @@ class GatewayControlServer:
                 response = {
                     "ok": True,
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "result": handler(),
+                    "result": handler(params),
                 }
         except Exception as exc:
             response = {
@@ -437,29 +480,42 @@ class _PipeControlProtocol(asyncio.Protocol):
 # Client (synchronous — used by CLI/updater consumers)
 # ---------------------------------------------------------------------------
 
+
 def query_gateway_control(
     home: Path,
     verb: str,
     *,
+    params: Optional[dict[str, Any]] = None,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+    propagate_timeout: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; None when unanswered.
 
-    Returns the verb's ``result`` payload on success. Any failure — no
-    socket, stale socket nobody accepts on, timeout, malformed answer,
-    ``ok: false`` — returns None so callers fall back to the scan layer.
-    Never raises.
+    Returns the verb's ``result`` payload on success. Observer callers keep
+    the historical never-raises behavior: no socket, a stale socket, timeout,
+    malformed response, and ``ok: false`` all collapse to None so they can
+    fall back to the scan layer. Mutating callers may set
+    ``propagate_timeout`` so a response timeout is not misreported as an
+    unavailable socket: the gateway may have accepted the mutation and the
+    caller must treat its outcome as unknown.
     """
-    request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
-        .encode("utf-8")
-        + b"\n"
-    )
+    request_payload: dict[str, Any] = {
+        "verb": verb,
+        "id": 1,
+        "protocol": CONTROL_PROTOCOL_VERSION,
+    }
+    if params:
+        request_payload["params"] = params
+    request = json.dumps(request_payload).encode("utf-8") + b"\n"
     try:
         if _IS_WINDOWS:
             raw = _query_windows_pipe(Path(home), request, timeout)
         else:
             raw = _query_unix_socket(Path(home), request, timeout)
+    except GatewayControlTimeoutError:
+        if propagate_timeout:
+            raise
+        return None
     except Exception:
         return None
     if not raw:
@@ -482,6 +538,10 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
         sock.settimeout(timeout)
         try:
             sock.connect(str(path))
+        except socket.timeout as exc:
+            raise GatewayControlTimeoutError(
+                "gateway control request timed out while connecting"
+            ) from exc
         except (ConnectionRefusedError, FileNotFoundError, OSError):
             return None
         sock.sendall(request)
@@ -490,8 +550,10 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
         while time.monotonic() < deadline:
             try:
                 chunk = sock.recv(65536)
-            except socket.timeout:
-                return None
+            except socket.timeout as exc:
+                raise GatewayControlTimeoutError(
+                    "gateway control request timed out awaiting a response"
+                ) from exc
             if not chunk:
                 break
             chunks.append(chunk)
@@ -540,7 +602,9 @@ def _query_windows_pipe(
             handle.close()
 
 
-def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
+def identify_gateway(
+    home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT
+) -> Optional[dict[str, Any]]:
     """Convenience wrapper: ``identify`` the gateway serving ``home``."""
     return query_gateway_control(home, "identify", timeout=timeout)
 
@@ -558,3 +622,33 @@ def pause_gateway_for_update(
     exactly as before this verb existed.
     """
     return query_gateway_control(home, "pause-for-update", timeout=timeout)
+
+
+def set_gateway_session_model_override(
+    home: Path,
+    *,
+    session_key: str,
+    model: str,
+    provider: str = "",
+    base_url: str = "",
+    timeout: float = _SESSION_MODEL_CLIENT_TIMEOUT,
+) -> Optional[dict[str, Any]]:
+    """Set one live gateway conversation's model through its owned socket.
+
+    This is the local bridge used when Desktop opens a Telegram/Discord/etc.
+    session and changes its model. The filesystem-owned socket is the authority
+    boundary; callers never edit ``sessions.json`` or another process's SQLite
+    state behind its back.
+    """
+    return query_gateway_control(
+        home,
+        "set-session-model",
+        params={
+            "session_key": session_key,
+            "model": model,
+            "provider": provider,
+            "base_url": base_url,
+        },
+        timeout=timeout,
+        propagate_timeout=True,
+    )
