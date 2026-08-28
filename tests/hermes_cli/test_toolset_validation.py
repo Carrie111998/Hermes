@@ -7,6 +7,7 @@ tool registry nor a running Hermes.
 import pytest
 
 from hermes_cli.toolset_validation import (
+    effective_toolset_validator,
     validate_disabled_toolset_declarations,
     validate_platform_toolsets,
 )
@@ -84,6 +85,34 @@ def test_disabled_toolset_validation_parses_list_shaped_strings():
 
     assert len(warnings) == 1
     assert "unknown toolset 'execute_code'" in warnings[0]
+
+
+def test_dynamic_extension_toolsets_are_valid_before_registry_discovery(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_toolset_keys_nowait",
+        lambda: {"plugin_bundle"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_portable_mcp_server_names_nowait",
+        lambda: {"portable_server"},
+    )
+    config = {
+        "mcp_servers": {"native_server": {"enabled": True}},
+        "agent": {
+            "disabled_toolsets": [
+                "plugin_bundle",
+                "portable_server",
+                "native_server",
+                "bogus",
+            ]
+        },
+    }
+
+    is_valid = effective_toolset_validator(config, _is_valid)
+    warnings = validate_disabled_toolset_declarations(config, is_valid)
+
+    assert len(warnings) == 1
+    assert "unknown toolset 'bogus'" in warnings[0]
 
 
 

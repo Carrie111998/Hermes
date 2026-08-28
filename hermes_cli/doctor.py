@@ -1784,14 +1784,18 @@ def run_doctor(args):
         # are deliberately excluded from diagnostics.
         try:
             from hermes_cli.config import load_env, read_user_config_raw
-            from hermes_cli.toolset_validation import validate_disabled_toolset_declarations
+            from hermes_cli.toolset_validation import (
+                effective_toolset_validator,
+                validate_disabled_toolset_declarations,
+            )
             from toolsets import validate_toolset
 
             raw_config = read_user_config_raw(config_path)
             env_names = set(os.environ) | set(load_env())
+            is_valid_toolset = effective_toolset_validator(raw_config, validate_toolset)
             deny_warnings = validate_disabled_toolset_declarations(
                 raw_config,
-                validate_toolset,
+                is_valid_toolset,
                 environ={name: "" for name in env_names},
             )
             for warning in deny_warnings:

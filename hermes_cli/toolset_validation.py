@@ -31,6 +31,41 @@ LEGACY_TOOLSET_NAMES = frozenset({
 })
 
 
+def effective_toolset_validator(
+    config: object,
+    is_valid_toolset: Callable[[str], bool],
+) -> Callable[[str], bool]:
+    """Include configured extension toolsets in a validity predicate.
+
+    Plugin and MCP aliases are registered dynamically, after some config
+    diagnostics run.  Discover their declared names through the same cached
+    APIs used by the toolset picker so an early doctor or migration pass does
+    not mislabel a valid extension deny as inert.
+    """
+    dynamic_names = set()
+    if isinstance(config, dict):
+        mcp_servers = config.get("mcp_servers")
+        if isinstance(mcp_servers, Mapping):
+            dynamic_names.update(
+                name for name in mcp_servers if isinstance(name, str) and name
+            )
+
+    try:
+        from hermes_cli.plugins import (
+            get_plugin_toolset_keys_nowait,
+            get_portable_mcp_server_names_nowait,
+        )
+
+        dynamic_names.update(get_plugin_toolset_keys_nowait())
+        dynamic_names.update(get_portable_mcp_server_names_nowait())
+    except Exception:
+        # Diagnostics remain best-effort. Runtime validation after discovery is
+        # authoritative and will still warn about genuinely unknown names.
+        pass
+
+    return lambda name: is_valid_toolset(name) or name in dynamic_names
+
+
 def validate_platform_toolsets(
     platform_toolsets: object,
     is_valid_toolset: Callable[[str], bool],
