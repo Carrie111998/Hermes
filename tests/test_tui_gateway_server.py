@@ -5014,6 +5014,161 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         server._sessions.pop("inline-sid", None)
 
 
+def test_ws_orphan_reap_preserves_opted_in_running_turn_until_it_settles(monkeypatch):
+    callbacks = []
+    interrupted = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            interrupt=lambda: interrupted.append("interrupted")
+        ),
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+        preserve_running_on_disconnect=True,
+    )
+    server._sessions["bot-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS", 1)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap("bot-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == []
+        assert "bot-sid" in server._sessions
+        assert session.get("_turn_cancel_requested") is not True
+        assert len(callbacks) == 1
+
+        # A long-running Bot turn remains protected across multiple orphan
+        # polls rather than receiving one delayed interrupt.
+        callbacks.pop(0)()
+        assert interrupted == []
+        assert "bot-sid" in server._sessions
+        assert len(callbacks) == 1
+
+        # The ordinary-session interrupt budget is intentionally not a hidden
+        # lifetime cap for Bot work. Only an explicit Stop (or the turn's own
+        # model/tool limits) may end a protected turn.
+        callbacks.pop(0)()
+        assert interrupted == []
+        assert "bot-sid" in server._sessions
+        assert len(callbacks) == 1
+
+        # Once the turn settles, the detached runtime is still reclaimed.
+        session["running"] = False
+        callbacks.pop(0)()
+        assert "bot-sid" not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
+    finally:
+        server._sessions.pop("bot-sid", None)
+
+
+def test_canonical_bot_turn_adopts_disconnect_policy_for_older_desktops(monkeypatch):
+    session = _session(
+        agent=types.SimpleNamespace(_session_title_hint="Bot Chat"),
+        preserve_running_on_disconnect=False,
+    )
+    monkeypatch.setattr(
+        "tools.bot_mode_probe.capability_fingerprint",
+        lambda _home=None: "unavailable",
+    )
+
+    server._sync_bot_capabilities("bot-sid", session)
+
+    assert session["preserve_running_on_disconnect"] is True
+
+
+def test_prompt_submit_adopts_bot_disconnect_policy_before_turn_slot(monkeypatch):
+    session = _session(preserve_running_on_disconnect=False)
+    server._sessions["bot-submit"] = session
+    monkeypatch.setattr(
+        server,
+        "_ensure_active_session_slot",
+        lambda *_args, **_kwargs: "test stop before turn",
+    )
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "bot-submit",
+                    "text": "continue working",
+                    "preserve_running_on_disconnect": True,
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("bot-submit", None)
+
+    assert response["error"]["code"] == 4090
+    assert session["preserve_running_on_disconnect"] is True
+
+
+def test_compressed_bot_tip_inherits_root_disconnect_policy(monkeypatch):
+    root_reads = []
+
+    class _DB:
+        def get_conversation_root(self, session_id):
+            assert session_id == "tip-sid"
+            root_reads.append(session_id)
+            return "root-sid"
+
+        def get_session_title(self, session_id):
+            assert session_id == "root-sid"
+            return "Bot Chat"
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            _session_db=_DB(),
+            _session_title_hint="UAT continuity test",
+        ),
+        session_key="tip-sid",
+        preserve_running_on_disconnect=False,
+    )
+    monkeypatch.setattr(
+        "tools.bot_mode_probe.capability_fingerprint",
+        lambda _home=None: "unavailable",
+    )
+
+    server._sync_bot_capabilities("bot-tip", session)
+    server._sync_bot_capabilities("bot-tip", session)
+
+    assert session["preserve_running_on_disconnect"] is True
+    assert session["_canonical_bot_chat"] is True
+    assert root_reads == ["tip-sid"]
+
+
+def test_non_bot_turn_keeps_default_disconnect_policy():
+    session = _session(
+        agent=types.SimpleNamespace(_session_title_hint="Research notes"),
+        preserve_running_on_disconnect=False,
+    )
+
+    server._sync_bot_capabilities("ordinary-sid", session)
+
+    assert session["preserve_running_on_disconnect"] is False
+
+
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
     closed = []
     scheduled = []
@@ -5022,6 +5177,7 @@ def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeyp
         transport=transport,
         running=True,
         close_on_disconnect=True,
+        preserve_running_on_disconnect=True,
     )
     monkeypatch.setattr(
         server,
@@ -16241,6 +16397,31 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
         server._sessions.pop("sid-b", None)
 
 
+def test_session_activate_can_adopt_bot_disconnect_policy(monkeypatch):
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        preserve_running_on_disconnect=False,
+    )
+    server._sessions["sid-bot"] = session
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.activate",
+                "params": {
+                    "session_id": "sid-bot",
+                    "preserve_running_on_disconnect": True,
+                },
+            }
+        )
+
+        assert "error" not in response
+        assert session["preserve_running_on_disconnect"] is True
+    finally:
+        server._sessions.pop("sid-bot", None)
+
+
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
     server._sessions["sid-large"] = _session(
@@ -18340,6 +18521,26 @@ def test_session_create_records_close_on_disconnect_flag(monkeypatch):
         )["result"]["session_id"]
         assert server._sessions[on]["close_on_disconnect"]
         assert not server._sessions[off]["close_on_disconnect"]
+    finally:
+        server._sessions.clear()
+
+
+def test_session_create_records_preserve_running_on_disconnect_flag(monkeypatch):
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+    server._sessions.clear()
+    try:
+        on = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.create",
+                "params": {"preserve_running_on_disconnect": True},
+            }
+        )["result"]["session_id"]
+        off = server.handle_request(
+            {"id": "2", "method": "session.create", "params": {}}
+        )["result"]["session_id"]
+        assert server._sessions[on]["preserve_running_on_disconnect"]
+        assert not server._sessions[off]["preserve_running_on_disconnect"]
     finally:
         server._sessions.clear()
 

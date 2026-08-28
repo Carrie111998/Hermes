@@ -1429,30 +1429,43 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif current.get("running"):
-                # Mid-turn detached sessions must never drop the single
-                # Timer (#85578): after the reconnect grace the turn is
-                # interrupted once, then the reap keeps polling until the
-                # normal turn-finalization path settles.
-                polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
-                current["_client_gone_interrupt_polls"] = polls
-                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
-                    # The interrupted turn never settled inside the budget —
-                    # force-reap rather than parking the session + a timer
-                    # chain forever. Loud by design: this only fires when a
-                    # turn is genuinely stuck past interrupt.
-                    logger.error(
-                        "client_gone sid=%s: turn did not settle after %d "
-                        "interrupt polls (%.0fs) — force-reaping detached "
-                        "session",
-                        sid, polls - 1,
-                        (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
-                    )
-                    session = _pop_session_by_id(sid)
+                if current.get("preserve_running_on_disconnect"):
+                    # Bot Mode owns long-lived, backend-resident work. Losing
+                    # its viewing socket (switching bots/gateways, navigating,
+                    # or quitting Desktop) is not a stop request: let the turn
+                    # finish, then reap the detached idle runtime normally.
+                    # Explicit session.interrupt/close remains authoritative.
+                    if not current.get("_client_gone_preserve_logged"):
+                        current["_client_gone_preserve_logged"] = True
+                        logger.info(
+                            "client_gone sid=%s action=preserve_running", sid
+                        )
+                    reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
                 else:
-                    if not current.get("_client_gone_interrupt_requested"):
-                        current["_client_gone_interrupt_requested"] = True
-                        interrupt_session = current
-                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                    # Mid-turn detached sessions must never drop the single
+                    # Timer (#85578): after the reconnect grace the turn is
+                    # interrupted once, then the reap keeps polling until the
+                    # normal turn-finalization path settles.
+                    polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
+                    current["_client_gone_interrupt_polls"] = polls
+                    if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
+                        # The interrupted turn never settled inside the budget —
+                        # force-reap rather than parking the session + a timer
+                        # chain forever. Loud by design: this only fires when a
+                        # turn is genuinely stuck past interrupt.
+                        logger.error(
+                            "client_gone sid=%s: turn did not settle after %d "
+                            "interrupt polls (%.0fs) — force-reaping detached "
+                            "session",
+                            sid, polls - 1,
+                            (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
+                        )
+                        session = _pop_session_by_id(sid)
+                    else:
+                        if not current.get("_client_gone_interrupt_requested"):
+                            current["_client_gone_interrupt_requested"] = True
+                            interrupt_session = current
+                        reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
             else:
                 session = _pop_session_by_id(sid)
 
@@ -1567,6 +1580,7 @@ def _close_sessions_for_transport(
                     else:
                         current["transport"] = _detached_ws_transport
                         current.pop("_client_gone_interrupt_requested", None)
+                        current.pop("_client_gone_preserve_logged", None)
                         should_schedule_reap = True
         if claimed_for_teardown is not None:
             if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
@@ -6581,13 +6595,29 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     if agent is None:
         return
     try:
-        title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-        if not title:
+        if not session.get("_canonical_bot_chat"):
+            title = str(getattr(agent, "_session_title_hint", "") or "").strip()
             db = getattr(agent, "_session_db", None)
             key = session.get("session_key") or ""
-            title = str((db.get_session_title(key) if (db and key) else None) or "").strip()
-        if title != "Bot Chat":
-            return
+            if title != "Bot Chat" and db and key:
+                # Compression retitles the live continuation tip. Bot identity
+                # belongs to the lineage root, which keeps the canonical title;
+                # checking only the tip makes an old/compressed Bot Chat lose its
+                # background-work policy exactly when long work needs it most.
+                root = db.get_conversation_root(key)
+                title = str(db.get_session_title(root) or "").strip()
+            if title != "Bot Chat":
+                return
+            # Canonical identity cannot change during one live runtime. Cache
+            # the positive proof so compressed tips do not repeat two SQLite
+            # lookups at every turn boundary. Do not cache a negative result:
+            # legacy callers may still attach the canonical title later.
+            session["_canonical_bot_chat"] = True
+        # Canonical Bot work is backend-resident by definition. Mark it here,
+        # at every turn boundary, so older Desktop clients that do not know the
+        # optional create/resume flag still cannot turn navigation or app exit
+        # into an implicit Stop. Group member sessions use the explicit flag.
+        session["preserve_running_on_disconnect"] = True
         from tools.bot_mode_probe import capability_fingerprint
 
         home = session.get("profile_home") or None
@@ -9176,6 +9206,7 @@ def _init_session(
     source: str | None = None,
     profile_home: str | None = None,
     explicit_cwd: bool = False,
+    preserve_running_on_disconnect: bool = False,
 ):
     now = time.time()
     with _sessions_lock:
@@ -9197,6 +9228,7 @@ def _init_session(
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
             "source": _resolve_session_source(source),
+            "preserve_running_on_disconnect": preserve_running_on_disconnect,
             "tool_progress_mode": _load_tool_progress_mode(),
             "edit_snapshots": {},
             "tool_started_at": {},
@@ -10609,6 +10641,7 @@ def _deferred_session_record(
     lease,
     source: str = "tui",
     close_on_disconnect: bool = False,
+    preserve_running_on_disconnect: bool = False,
     display_history_prefix: list | None = None,
     profile_home: Path | None = None,
     lazy: bool = False,
@@ -10626,6 +10659,7 @@ def _deferred_session_record(
         "agent_ready": threading.Event(),
         "attached_images": [],
         "close_on_disconnect": close_on_disconnect,
+        "preserve_running_on_disconnect": preserve_running_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
         "created_at": now,

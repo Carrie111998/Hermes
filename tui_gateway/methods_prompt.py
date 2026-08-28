@@ -423,6 +423,12 @@ def _(rid, params: dict) -> dict:
                             )
                             + "Update Hermes Desktop to continue it.",
                         )
+    if is_truthy_value(params.get("preserve_running_on_disconnect", False)):
+        # The prompt is the final authority for a Bot turn. Session routing can
+        # rebuild/rebind a runtime between open and send, so adopting the
+        # policy here closes every warm-cache and recovery path before the
+        # orphan reaper can interpret a viewer detach as Stop.
+        session["preserve_running_on_disconnect"] = True
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         # The refusal reason travels as machine-readable data, not as prose.
         #
