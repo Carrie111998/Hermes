@@ -53,18 +53,13 @@ _PARENT_HANDOFF_METADATA_STRING_MAX_BYTES = 2048
 _PARENT_HANDOFF_METADATA_MAX_ITEMS = 32
 _PARENT_HANDOFF_METADATA_MAX_DEPTH = 4
 
-# A decomposer creates leaf cards only after it has committed the scope and
-# ownership decision into the child body.  Letting such a leaf re-open that
-# decision as ``needs_input`` is a common local-model failure mode: the worker
-# asks a human which analysis to perform instead of performing the bounded
-# analysis it was assigned.  Real external access failures remain
-# ``capability`` blocks.  Keep this list aligned with dispatcher handling of
-# generated tasks in ``kanban_db.dispatch_once``.
-_GENERATED_LEAF_CREATORS = frozenset({
-    "auto-decomposer",
-    "decomposer",
-    "specialist-routing",
-})
+# A direct user/dashboard root can legitimately need a follow-up choice.  A
+# worker-, decomposer-, or cron-created card cannot: it was created only after
+# a producer had chosen its scope and owner.  Letting those cards reopen their
+# assignment as ``needs_input`` produces unblock loops from local models (and
+# lets a scheduled audit claim a prior timeout is a human prerequisite).
+# Real external access failures remain evidence-backed ``capability`` blocks.
+_NEEDS_INPUT_ROOT_CREATORS = frozenset({"user", "dashboard"})
 
 _PRIVATE_PATH_IN_TEXT = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
@@ -1135,19 +1130,16 @@ def _handle_block(args: dict, **kw) -> str:
                 f"{reason}\n\nReproduced command: {command}\n"
                 f"stderr: {stderr}"
             )
-        generated_leaf = bool(
-            task
-            and (task.created_by or "").strip().lower()
-            in _GENERATED_LEAF_CREATORS
-        )
-        if kind == "needs_input" and generated_leaf:
+        creator = (task.created_by or "").strip().lower() if task else ""
+        worker_or_cron_created = bool(creator) and creator not in _NEEDS_INPUT_ROOT_CREATORS
+        if kind == "needs_input" and worker_or_cron_created:
             conn.close()
             return tool_error(
-                "auto-decomposed leaf tasks cannot block with needs_input: "
-                "their bounded scope and decision owner were fixed by the "
-                "decomposer. Make the role-owned decision and complete with "
-                "factual evidence; use kind='capability' only for a newly "
-                "reproduced external access or credential failure."
+                "worker- and cron-created tasks cannot block with needs_input: "
+                "their producer already fixed the scope and decision owner. "
+                "Make the role-owned decision and complete with factual "
+                "evidence; use kind='capability' only for a newly reproduced "
+                "external access or credential failure."
             )
         try:
             ok = kb.block_task(
