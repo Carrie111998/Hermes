@@ -9084,7 +9084,12 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
     .join(' · ')
 
   const warm = () => {
-    // Multi-source row: pre-dial the agent's OWN source (feature-detected).
+    // SSH sources are connect-on-demand: hover must not dial or spawn a bot.
+    if (bot.sourceScoped && bot.connectionKind === 'ssh') {
+      return
+    }
+
+    // Multi-source row: pre-dial the agent's OWN HTTP source (feature-detected).
     if (bot.sourceScoped && typeof host.warmAgent === 'function') {
       try {
         host.warmAgent(bot.connectionId, bot.name)
