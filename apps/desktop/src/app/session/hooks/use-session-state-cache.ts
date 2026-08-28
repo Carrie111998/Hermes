@@ -7,6 +7,7 @@ import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { normalizeProfileKey } from '@/store/profile'
 import {
   $activeSessionId,
   $messages,
@@ -20,10 +21,16 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
-import { $sessionStates, $sessionTiles, publishSessionState, releaseSessionTranscript } from '@/store/session-states'
+import { $sessionTiles, getSessionState, publishSessionState, releaseSessionTranscript } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../types'
-import { SessionStateCache } from '../session-state-cache'
+import {
+  SessionRuntimeIndex,
+  sessionRuntimeStateMatchesOwner,
+  SessionStateCache,
+  sessionStateMatchesOwner,
+  type SessionStateOwner
+} from '../session-state-cache'
 
 import { chatMessageArraysEquivalent } from './use-session-actions/utils'
 
@@ -58,6 +65,9 @@ export function useSessionStateCache({
   const sessionTiles = useStore($sessionTiles)
   const activeSessionIdRef = useRef<string | null>(activeSessionId)
   const selectedStoredSessionIdRef = useRef<string | null>(selectedStoredSessionId)
+  // Stored ids are profile-local. Keep the owner beside the imperative
+  // selection ref so same-id profile switches cannot inherit transcript state.
+  const selectedStoredSessionProfileRef = useRef<string | null>(null)
 
   // Mirror the latest prop into its ref synchronously during render — not via
   // a passive useEffect, which only fires a frame after paint and left the
@@ -83,7 +93,7 @@ export function useSessionStateCache({
     selectedStoredSessionIdRef.current = selectedStoredSessionId
   }
 
-  const runtimeIdByStoredSessionIdRef = useRef(new Map<string, string>())
+  const runtimeIdByStoredSessionIdRef = useRef(new SessionRuntimeIndex())
   const sessionStateByRuntimeIdRef = useRef<SessionStateCache>(null!)
 
   if (sessionStateByRuntimeIdRef.current === null) {
@@ -103,8 +113,8 @@ export function useSessionStateCache({
       // pinned megabytes of warm transcript per reconnect cycle behind
       // #isWarmSettled (#95189). Trust the cached in-flight flags only while
       // the authoritative store still claims work for the same runtime id.
-      isAuthoritativelyActive: runtimeId => {
-        const live = $sessionStates.get()[runtimeId]
+      isAuthoritativelyActive: (runtimeId, state) => {
+        const live = getSessionState(runtimeId, state)
 
         return Boolean(live && (live.busy || live.awaitingResponse))
       },
@@ -134,15 +144,36 @@ export function useSessionStateCache({
   }, [busy, busyRef])
 
   const ensureSessionState = useCallback(
-    (sessionId: string, storedSessionId?: string | null) => {
-      const existing = sessionStateCache.get(sessionId)
+    (sessionId: string, storedSessionId?: string | null, ownerProfile?: string, ownerConnectionId?: null | string) => {
+      const normalizedOwnerProfile = ownerProfile === undefined ? undefined : normalizeProfileKey(ownerProfile)
+
+      const normalizedOwnerConnectionId =
+        ownerConnectionId === undefined ? undefined : ownerConnectionId?.trim() || null
+
+      const existing =
+        normalizedOwnerProfile !== undefined && normalizedOwnerConnectionId
+          ? sessionStateCache.getOwned(sessionId, {
+              connectionId: normalizedOwnerConnectionId,
+              profile: normalizedOwnerProfile
+            })
+          : sessionStateCache.get(sessionId)
 
       if (existing) {
-        if (storedSessionId !== undefined && storedSessionId !== existing.storedSessionId) {
+        const nextProfile = normalizedOwnerProfile ?? existing.profile
+        const nextConnectionId = normalizedOwnerConnectionId ?? existing.connectionId
+        const storedIdChanged = storedSessionId !== undefined && storedSessionId !== existing.storedSessionId
+        const ownerClaimed = nextProfile !== existing.profile || nextConnectionId !== existing.connectionId
+
+        if (storedIdChanged || ownerClaimed) {
           // Stored id changed (e.g. auto-compression rotated it). Create a NEW
           // state object rather than mutating in place — updateSessionState needs
           // the PREVIOUS state to detect transitions (busy→idle, id rotation).
-          const updated = { ...existing, storedSessionId }
+          const updated = {
+            ...existing,
+            connectionId: nextConnectionId,
+            profile: nextProfile,
+            ...(storedIdChanged ? { storedSessionId: storedSessionId ?? null } : {})
+          }
 
           // Drop the obsolete stored→runtime reverse mapping as soon as the id
           // rotates (e.g. auto-compression forks a continuation). Leaving the
@@ -153,34 +184,60 @@ export function useSessionStateCache({
           // now skips publishSessionState (and thus handleTransition) when the
           // updater is a no-op — fire it here so the route-follow effect still
           // tracks compression without needing a dummy state write.
-          if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
+          if (storedIdChanged && existing.storedSessionId) {
             runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
 
             // A rotation event needs a real next id — a null/cleared stored id
             // is a detach, not a rotation the route-follow effect should chase.
             if (storedSessionId && sessionId === $activeSessionId.get()) {
               setActiveSessionStoredIdRotation({
+                connectionId: updated.connectionId,
                 nextStoredSessionId: storedSessionId,
                 previousStoredSessionId: existing.storedSessionId,
+                profile: normalizeProfileKey(updated.profile),
                 runtimeSessionId: sessionId
               })
             }
           }
 
           if (storedSessionId) {
-            runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+            if (updated.connectionId && updated.profile) {
+              runtimeIdByStoredSessionIdRef.current.setOwned(storedSessionId, sessionId, {
+                connectionId: updated.connectionId,
+                profile: updated.profile
+              })
+            } else {
+              runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+            }
+          }
+
+          if (ownerClaimed && updated.connectionId) {
+            sessionStateCache.delete(sessionId)
           }
 
           sessionStateCache.set(sessionId, updated)
+
+          return updated
         }
 
-        return sessionStateCache.get(sessionId)!
+        return existing
       }
 
-      const created = createClientSessionState(storedSessionId ?? null)
+      const created = {
+        ...createClientSessionState(storedSessionId ?? null),
+        connectionId: normalizedOwnerConnectionId ?? null,
+        profile: normalizedOwnerProfile ?? null
+      }
 
       if (storedSessionId) {
-        runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+        if (created.connectionId && created.profile) {
+          runtimeIdByStoredSessionIdRef.current.setOwned(storedSessionId, sessionId, {
+            connectionId: created.connectionId,
+            profile: created.profile
+          })
+        } else {
+          runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+        }
       }
 
       sessionStateCache.set(sessionId, created)
@@ -319,27 +376,22 @@ export function useSessionStateCache({
     []
   )
 
-  const updateSessionState = useCallback(
-    (
-      sessionId: string,
-      updater: (state: ClientSessionState) => ClientSessionState,
-      storedSessionId?: string | null
-    ) => {
-      const previous = ensureSessionState(sessionId, storedSessionId)
-      // Give the updater the raw previous state so it can return the same
-      // reference when nothing changed (the caller sees a no-op). Previously
-      // the param was always a fresh spread, so every call looked like a
-      // change — including periodic ~1/s session.info heartbeats that churn
-      // $sessionStates and its computed atoms on every tick.
-      const next = updater(previous)
-
+  const commitSessionState = useCallback(
+    (sessionId: string, previous: ClientSessionState, next: ClientSessionState) => {
       // If the updater returned the same reference, nothing changed for this
       // session — skip the store write, publishSessionState, and view sync.
       // The cache entry was already updated by ensureSessionState (if
       // storedSessionId rotated); the caller gets its return value from the
       // cache, so stale reads don't regress.
       if (next === previous) {
-        return previous
+        return
+      }
+
+      if (
+        previous.connectionId !== next.connectionId ||
+        normalizeProfileKey(previous.profile) !== normalizeProfileKey(next.profile)
+      ) {
+        sessionStateCache.delete(sessionId)
       }
 
       sessionStateCache.set(sessionId, next)
@@ -353,10 +405,121 @@ export function useSessionStateCache({
       publishSessionState(sessionId, next)
       sessionStateCache.prune()
       syncSessionStateToView(sessionId, next)
-
-      return next
     },
-    [ensureSessionState, sessionStateCache, syncSessionStateToView]
+    [sessionStateCache, syncSessionStateToView]
+  )
+
+  const updateSessionState = useCallback(
+    (
+      sessionId: string,
+      updater: (state: ClientSessionState) => ClientSessionState,
+      storedSessionId?: string | null,
+      ownerProfile?: string,
+      ownerConnectionId?: null | string
+    ) => {
+      const normalizedOwnerProfile = ownerProfile === undefined ? undefined : normalizeProfileKey(ownerProfile)
+
+      const normalizedOwnerConnectionId =
+        ownerConnectionId === undefined ? undefined : ownerConnectionId?.trim() || null
+
+      const installed =
+        normalizedOwnerProfile !== undefined && normalizedOwnerConnectionId
+          ? (sessionStateCache.getOwned(sessionId, {
+              connectionId: normalizedOwnerConnectionId,
+              profile: normalizedOwnerProfile
+            }) ?? sessionStateCache.get(sessionId))
+          : sessionStateCache.get(sessionId)
+
+      // Gateway runtime ids are transport-local and can collide across profile
+      // sockets. A session.info publisher may claim an unowned state, but it may
+      // never rotate or mutate a runtime already installed for another profile.
+      // Check before ensureSessionState: ensure can rotate the stored id and emit
+      // the route-follow edge even when the updater itself is a no-op.
+      if (
+        normalizedOwnerProfile !== undefined &&
+        installed?.profile !== null &&
+        installed?.profile !== undefined &&
+        !sessionRuntimeStateMatchesOwner(installed, {
+          connectionId: normalizedOwnerConnectionId,
+          profile: normalizedOwnerProfile
+        })
+      ) {
+        return installed
+      }
+
+      const previous = ensureSessionState(
+        sessionId,
+        storedSessionId,
+        normalizedOwnerProfile,
+        normalizedOwnerConnectionId
+      )
+      // Give the updater the raw previous state so it can return the same
+      // reference when nothing changed (the caller sees a no-op). Previously
+      // the param was always a fresh spread, so every call looked like a
+      // change — including periodic ~1/s session.info heartbeats that churn
+      // $sessionStates and its computed atoms on every tick.
+
+      const next = updater(previous)
+
+      commitSessionState(sessionId, previous, next)
+
+      return next === previous ? previous : next
+    },
+    [commitSessionState, ensureSessionState, sessionStateCache]
+  )
+
+  const sessionStateHasOwner = useCallback(
+    (sessionId: string, owner: SessionStateOwner): boolean =>
+      sessionStateMatchesOwner(sessionStateCache.getOwned(sessionId, owner), owner),
+    [sessionStateCache]
+  )
+
+  const getSessionStateOwner = useCallback(
+    (sessionId: string): SessionStateOwner | null => {
+      const state = sessionStateCache.get(sessionId)
+
+      return state?.profile && state.storedSessionId
+        ? {
+            connectionId: state.connectionId,
+            profile: normalizeProfileKey(state.profile),
+            storedSessionId: state.storedSessionId
+          }
+        : null
+    },
+    [sessionStateCache]
+  )
+
+  const updateOwnedSessionState = useCallback(
+    (
+      sessionId: string,
+      owner: SessionStateOwner,
+      updater: (state: ClientSessionState) => ClientSessionState
+    ): boolean => {
+      // Do not call ensureSessionState here: a stale async completion must not
+      // create a cache entry or rotate/graft a stored id before ownership is
+      // proven against the currently installed runtime state.
+      const previous = sessionStateCache.getOwned(sessionId, owner)
+
+      if (!sessionStateMatchesOwner(previous, owner)) {
+        return false
+      }
+
+      const next = updater(previous)
+
+      // Ownership is immutable for this publication primitive. A caller that
+      // needs to transfer ownership must use the explicit resume/setup path.
+      if (!sessionStateMatchesOwner(next, owner)) {
+        return false
+      }
+
+      commitSessionState(sessionId, previous, next)
+
+      // publishSessionState notifies synchronously. A subscriber may reclaim
+      // the same runtime id before this call returns, so report success only if
+      // the exact composite owner is still installed.
+      return sessionStateHasOwner(sessionId, owner)
+    },
+    [commitSessionState, sessionStateCache, sessionStateHasOwner]
   )
 
   useEffect(() => {
@@ -381,12 +544,16 @@ export function useSessionStateCache({
   return {
     activeSessionIdRef,
     ensureSessionState,
+    getSessionStateOwner,
     getRuntimeIdForStoredSession,
     resetViewSync,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
+    selectedStoredSessionProfileRef,
+    sessionStateHasOwner,
     sessionStateByRuntimeIdRef: sessionStateByRuntimeIdRef as MutableRefObject<Map<string, ClientSessionState>>,
     syncSessionStateToView,
+    updateOwnedSessionState,
     updateSessionState
   }
 }

@@ -564,7 +564,7 @@ describe('refreshSessions batches slices into one request', () => {
       await scoped.result.current.refreshCronJobs()
     })
 
-    expect(getCronJobs).toHaveBeenLastCalledWith('work')
+    expect(getCronJobs).toHaveBeenLastCalledWith({ connectionId: null, profile: 'work' })
   })
 
   it('requests cron jobs for the unified scope', async () => {
@@ -574,7 +574,7 @@ describe('refreshSessions batches slices into one request', () => {
       await unified.result.current.refreshCronJobs()
     })
 
-    expect(getCronJobs).toHaveBeenLastCalledWith('all')
+    expect(getCronJobs).toHaveBeenLastCalledWith({ connectionId: null, profile: 'all' })
   })
 
   it('ignores an out-of-order cron-jobs response from the previous profile', async () => {
@@ -600,7 +600,10 @@ describe('refreshSessions batches slices into one request', () => {
       await workRefresh
     })
 
-    expect(getCronJobs.mock.calls.map(call => call[0])).toEqual(['work', 'personal'])
+    expect(getCronJobs.mock.calls.map(call => call[0])).toEqual([
+      { connectionId: null, profile: 'work' },
+      { connectionId: null, profile: 'personal' }
+    ])
     expect($cronJobs.get().map(job => job.id)).toEqual(['personal-job'])
   })
 })

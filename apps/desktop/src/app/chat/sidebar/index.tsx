@@ -296,15 +296,16 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onNavigate: (item: SidebarNavItem) => void
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
-  onResumeSession: (sessionId: string, session?: SessionInfo) => void
+  onResumeSession: (sessionId: string, owner?: SessionInfo | string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   /** Create a brand-new session and open it as a tile on `dir`. */
   onNewSessionSplit: (dir: SplitDir) => void
-  onManageCronJob: (jobId: string) => void
-  onTriggerCronJob: (jobId: string) => Promise<void>
+  onManageCronJob: (jobId: string, profile?: string, connectionId?: null | string) => void
+  onOpenCronRun: (jobId: string, outputId: string, profile?: string, connectionId?: null | string) => void
+  onTriggerCronJob: (jobId: string, profile?: string, connectionId?: null | string) => Promise<void>
 }
 
 export function ChatSidebar({
@@ -319,6 +320,7 @@ export function ChatSidebar({
   onNewSessionInWorkspace,
   onNewSessionSplit,
   onManageCronJob,
+  onOpenCronRun,
   onTriggerCronJob
 }: ChatSidebarProps) {
   const { t } = useI18n()
@@ -1891,7 +1893,8 @@ export function ChatSidebar({
                 jobs={cronJobs}
                 label={s.cronJobs}
                 onManageJob={onManageCronJob}
-                onOpenRun={onResumeSession}
+                onOpenOutput={onOpenCronRun}
+                onOpenSession={onResumeSession}
                 onToggle={() => setSidebarCronOpen(!cronOpen)}
                 onTriggerJob={onTriggerCronJob}
                 open={cronOpen}

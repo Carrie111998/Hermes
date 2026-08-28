@@ -5,7 +5,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $sessionStates, $sessionTiles, releaseSessionTranscript } from '@/store/session-states'
 
-import { SessionStateCache } from './session-state-cache'
+import { SessionRuntimeIndex, SessionStateCache } from './session-state-cache'
 
 function transcript(id: string, text = id): ChatMessage[] {
   return [
@@ -18,10 +18,105 @@ function settled(storedSessionId: string, text = storedSessionId): ClientSession
   return { ...createClientSessionState(storedSessionId), messages: transcript(storedSessionId, text) }
 }
 
+describe('SessionRuntimeIndex', () => {
+  const ownerA = { connectionId: 'connection-a', profile: 'default' }
+  const ownerB = { connectionId: 'connection-b', profile: 'default' }
+
+  it('exposes public stored ids through every Map iteration surface', () => {
+    const index = new SessionRuntimeIndex()
+    const visited: Array<[string, string, Map<string, string>]> = []
+
+    index.setOwned('stored-a', 'runtime-a', ownerA)
+    index.setOwned('stored-b', 'runtime-b', ownerB)
+    index.forEach((runtimeId, storedSessionId, map) => visited.push([storedSessionId, runtimeId, map]))
+
+    expect(index.size).toBe(2)
+    expect([...index.keys()]).toEqual(['stored-a', 'stored-b'])
+    expect([...index.values()]).toEqual(['runtime-a', 'runtime-b'])
+    expect([...index.entries()]).toEqual([
+      ['stored-a', 'runtime-a'],
+      ['stored-b', 'runtime-b']
+    ])
+    expect([...index]).toEqual([...index.entries()])
+    expect(visited).toEqual([
+      ['stored-a', 'runtime-a', index],
+      ['stored-b', 'runtime-b', index]
+    ])
+  })
+
+  it('keeps duplicate public ids ambiguous while owner-qualified lookup and deletion stay exact', () => {
+    const index = new SessionRuntimeIndex()
+
+    index.setOwned('stored-shared', 'runtime-a', ownerA)
+    index.setOwned('stored-shared', 'runtime-b', ownerB)
+
+    expect(index.size).toBe(2)
+    expect([...index.keys()]).toEqual(['stored-shared', 'stored-shared'])
+    expect(index.get('stored-shared')).toBeUndefined()
+    expect(index.delete('stored-shared')).toBe(false)
+    expect(index.getOwned('stored-shared', ownerA)).toBe('runtime-a')
+    expect(index.getOwned('stored-shared', ownerB)).toBe('runtime-b')
+
+    expect(index.deleteOwned('stored-shared', ownerA)).toBe(true)
+    expect(index.get('stored-shared')).toBe('runtime-b')
+    expect(index.delete('stored-shared')).toBe(true)
+    expect(index.size).toBe(0)
+
+    index.setOwned('stored-shared', 'runtime-a', ownerA)
+    index.setOwned('stored-shared', 'runtime-b', ownerB)
+    expect(index.deleteAll('stored-shared')).toBe(2)
+    expect(index.size).toBe(0)
+  })
+
+  it('counts direct and owner-qualified entries together for unqualified access', () => {
+    const index = new SessionRuntimeIndex()
+
+    index.set('stored-shared', 'runtime-primary')
+    index.setOwned('stored-shared', 'runtime-a', ownerA)
+
+    expect(index.size).toBe(2)
+    expect([...index.keys()]).toEqual(['stored-shared', 'stored-shared'])
+    expect(index.get('stored-shared')).toBeUndefined()
+    expect(index.delete('stored-shared')).toBe(false)
+    expect(index.size).toBe(2)
+    expect(index.getOwned('stored-shared', ownerA)).toBe('runtime-a')
+
+    expect(index.deleteAll('stored-shared')).toBe(2)
+    expect(index.size).toBe(0)
+  })
+
+  it('allows unqualified access when exactly one direct or owner-qualified entry exists', () => {
+    const index = new SessionRuntimeIndex()
+
+    index.set('stored-direct', 'runtime-direct')
+    expect(index.get('stored-direct')).toBe('runtime-direct')
+    expect(index.delete('stored-direct')).toBe(true)
+
+    index.setOwned('stored-owned', 'runtime-owned', ownerA)
+    expect(index.get('stored-owned')).toBe('runtime-owned')
+    expect(index.delete('stored-owned')).toBe(true)
+    expect(index.size).toBe(0)
+  })
+})
+
 describe('SessionStateCache', () => {
   beforeEach(() => {
     $sessionStates.set({})
     $sessionTiles.set([])
+  })
+
+  it('keeps identical runtime ids independent across connection owners', () => {
+    const cache = new SessionStateCache({ isReferenced: () => false, onEvict: () => undefined })
+    const ownerA = { ...settled('stored-a'), connectionId: 'connection-a', profile: 'default' }
+    const ownerB = { ...settled('stored-b'), connectionId: 'connection-b', profile: 'default' }
+
+    cache.set('runtime-shared', ownerA)
+    cache.set('runtime-shared', ownerB)
+
+    expect(cache.size).toBe(2)
+    expect(cache.getOwned('runtime-shared', ownerA)).toBe(ownerA)
+    expect(cache.getOwned('runtime-shared', ownerB)).toBe(ownerB)
+    expect(cache.get('runtime-shared')).toBeUndefined()
   })
 
   it('bounds warm settled transcripts by LRU count and cleans ownership atomically', () => {

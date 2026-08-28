@@ -70,9 +70,14 @@ import {
   setSessions,
   setTurnStartedAt
 } from '@/store/session'
-import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
+import {
+  requestForSessionProfile,
+  type SessionOwnerScope,
+  type SessionProfileRoute
+} from '@/store/session-request-router'
 import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
+import { clearTranscriptTails, saveTranscriptTail } from '@/store/transcript-tail-cache'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { deferred } from '../../../test/deferred'
@@ -234,16 +239,28 @@ describe('connection-qualified session deletion', () => {
 
 function StoredIdRotationHarness({
   activeSessionIdRef,
+  connectionId,
   getRoutedStoredSessionId,
   navigate,
+  selectedStoredSessionProfileRef,
   selectedStoredSessionIdRef
 }: {
   activeSessionIdRef: MutableRefObject<string | null>
+  connectionId?: string
   getRoutedStoredSessionId: () => null | string
   navigate: (to: string, options?: { replace?: boolean }) => void
+  selectedStoredSessionProfileRef?: MutableRefObject<string | null>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+  const installedState = createClientSessionState(selectedStoredSessionIdRef.current)
+  installedState.connectionId = connectionId ?? null
+  installedState.profile = selectedStoredSessionProfileRef?.current || 'default'
+  const stateMap = new Map<string, ClientSessionState>()
+
+  if (activeSessionIdRef.current) {
+    stateMap.set(activeSessionIdRef.current, installedState)
+  }
 
   useSessionActions({
     activeSessionId: activeSessionIdRef.current,
@@ -259,7 +276,8 @@ function StoredIdRotationHarness({
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
     selectedStoredSessionId: selectedStoredSessionIdRef.current,
     selectedStoredSessionIdRef,
-    sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
+    selectedStoredSessionProfileRef,
+    sessionStateByRuntimeIdRef: ref(stateMap),
     syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
   })
@@ -293,8 +311,10 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })
@@ -303,6 +323,107 @@ describe('active stored-session id rotation routing', () => {
     expect($selectedStoredSessionId.get()).toBe('stored-A-next')
     expect(navigate).toHaveBeenCalledWith(sessionRoute('stored-A-next'), { replace: true })
     expect($activeSessionStoredIdRotation.get()).toBeNull()
+  })
+
+  it('preserves the selected owner profile when a qualified cron run rotates beside a same-id sibling', async () => {
+    const sharedId = 'cron-shared-session'
+    const nextId = 'cron-shared-session-next'
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-meta' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: sharedId }
+    const selectedStoredSessionProfileRef: MutableRefObject<string | null> = { current: 'meta' }
+    const navigate = vi.fn()
+
+    setSessions([storedSession({ id: sharedId, profile: 'default' }), storedSession({ id: sharedId, profile: 'meta' })])
+    setSelectedStoredSessionId(sharedId)
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => sharedId}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        selectedStoredSessionProfileRef={selectedStoredSessionProfileRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        connectionId: null,
+        nextStoredSessionId: nextId,
+        previousStoredSessionId: sharedId,
+        profile: 'meta',
+        runtimeSessionId: 'runtime-meta'
+      })
+    })
+
+    await waitFor(() => expect(selectedStoredSessionIdRef.current).toBe(nextId))
+    expect(selectedStoredSessionProfileRef.current).toBe('meta')
+    expect(navigate).toHaveBeenCalledWith(sessionRoute(nextId, 'meta'), { replace: true })
+  })
+
+  it('rejects a stored-id rotation whose profile no longer owns the selected route', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-shared' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-shared' }
+    const selectedStoredSessionProfileRef: MutableRefObject<string | null> = { current: 'default' }
+    const navigate = vi.fn()
+
+    setSelectedStoredSessionId('stored-shared')
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => 'stored-shared'}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        selectedStoredSessionProfileRef={selectedStoredSessionProfileRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        connectionId: null,
+        nextStoredSessionId: 'meta-next',
+        previousStoredSessionId: 'stored-shared',
+        profile: 'meta',
+        runtimeSessionId: 'runtime-shared'
+      })
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect(selectedStoredSessionIdRef.current).toBe('stored-shared')
+    expect($selectedStoredSessionId.get()).toBe('stored-shared')
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a stored-id rotation whose connection no longer owns the runtime', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-shared' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-shared' }
+    const selectedStoredSessionProfileRef: MutableRefObject<string | null> = { current: 'default' }
+    const navigate = vi.fn()
+
+    setSelectedStoredSessionId('stored-shared')
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        connectionId="gateway-a"
+        getRoutedStoredSessionId={() => 'stored-shared'}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        selectedStoredSessionProfileRef={selectedStoredSessionProfileRef}
+      />
+    )
+
+    act(() => {
+      setActiveSessionStoredIdRotation({
+        connectionId: 'gateway-b',
+        nextStoredSessionId: 'foreign-next',
+        previousStoredSessionId: 'stored-shared',
+        profile: 'default',
+        runtimeSessionId: 'runtime-shared'
+      })
+    })
+
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect(selectedStoredSessionIdRef.current).toBe('stored-shared')
+    expect(navigate).not.toHaveBeenCalled()
   })
 
   it('keeps draft on the previous tip when the new tip row is not loaded yet', async () => {
@@ -329,8 +450,10 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
+        profile: 'default',
         runtimeSessionId
       })
     })
@@ -371,8 +494,10 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: tipAfter,
         previousStoredSessionId: tipBefore,
+        profile: 'default',
         runtimeSessionId
       })
     })
@@ -405,8 +530,10 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })
@@ -434,8 +561,10 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })
@@ -463,8 +592,10 @@ describe('active stored-session id rotation routing', () => {
 
     act(() => {
       setActiveSessionStoredIdRotation({
+        connectionId: null,
         nextStoredSessionId: 'stored-A-next',
         previousStoredSessionId: 'stored-A',
+        profile: 'default',
         runtimeSessionId: 'runtime-A'
       })
     })
@@ -733,15 +864,17 @@ function ResumeHarness({
   requestGateway,
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId = null,
+  selectedStoredSessionProfileRef,
   sessionStateByRuntimeIdRef
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
   onReady: (
-    resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
+    resume: (storedSessionId: string, replaceRoute?: boolean, owner?: SessionOwnerScope) => Promise<unknown>
   ) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: string | null
+  selectedStoredSessionProfileRef?: MutableRefObject<string | null>
   sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
@@ -762,6 +895,7 @@ function ResumeHarness({
     runtimeIdByStoredSessionIdRef: runtimeMapRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
+    selectedStoredSessionProfileRef,
     sessionStateByRuntimeIdRef: stateMapRef,
     syncSessionStateToView: vi.fn(),
     updateSessionState: (sessionId, updater, storedSessionId) => {
@@ -1364,6 +1498,7 @@ describe('resumeSession failure recovery', () => {
             awaitingResponse: false,
             branch: '',
             busy: false,
+            connectionId: null,
             cwd: '',
             fast: false,
             interimBoundaryPending: false,
@@ -1374,6 +1509,7 @@ describe('resumeSession failure recovery', () => {
             needsInput: false,
             pendingBranchGroup: null,
             personality: '',
+            profile: null,
             provider: '',
             reasoningEffort: '',
             sawAssistantPayload: false,
@@ -2024,6 +2160,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       .mockResolvedValue({ messages: [] } as never)
     vi.mocked(requestGatewayForAgent).mockReset()
     clearClarifyRequest()
+    clearTranscriptTails()
     vi.mocked(requestGatewayForProfile).mockReset()
     setConnection(null)
     vi.restoreAllMocks()
@@ -2275,6 +2412,226 @@ describe('resumeSession warm-cache mapping integrity', () => {
     // The corrupt mapping was purged so it can't mis-resolve again.
     expect(runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(sessionStateByRuntimeIdRef.current.has('rt-recycled')).toBe(false)
+  })
+
+  it('clears a foreign same-id selection and paints only the owner-qualified durable tail', async () => {
+    const sharedId = 'cron-shared-session'
+    const selectedProfileRef: MutableRefObject<string | null> = { current: 'default' }
+
+    const foreignMessage = {
+      id: 'default-live',
+      parts: [{ text: 'default transcript', type: 'text' }],
+      role: 'assistant'
+    } as never
+
+    const targetCachedMessage = {
+      id: 'meta-cached',
+      parts: [{ text: 'meta transcript', type: 'text' }],
+      role: 'assistant'
+    } as never
+
+    const prefetch = deferred<{ messages: never[]; session_id: string }>()
+    const resumed = deferred<SessionResumeResponse>()
+
+    setMessages([foreignMessage])
+    setSessions([
+      storedSession({ id: sharedId, message_count: 1, profile: 'default', title: 'Default duplicate' }),
+      storedSession({ id: sharedId, message_count: 1, profile: 'meta', title: 'Cron owner' })
+    ])
+    saveTranscriptTail(sharedId, [foreignMessage], 'default')
+    saveTranscriptTail(sharedId, [targetCachedMessage], 'meta')
+    vi.mocked(getLatestSessionMessages).mockReturnValue(prefetch.promise)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return resumed.promise as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(requestGatewayForProfile).mockImplementation(async (_profile, method) => requestGateway(method))
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean, ownerProfile?: string) => Promise<unknown>) | null =
+      null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId={sharedId}
+        selectedStoredSessionProfileRef={selectedProfileRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    const pendingResume = resume!(sharedId, true, 'meta')
+
+    await waitFor(() => expect($messages.get().map(message => message.id)).toEqual(['meta-cached']))
+    expect(selectedProfileRef.current).toBe('meta')
+    expect($messages.get()).not.toContain(foreignMessage)
+
+    prefetch.resolve({ messages: [], session_id: sharedId })
+    resumed.resolve({
+      info: {},
+      messages: [],
+      resumed: sharedId,
+      session_id: 'rt-meta',
+      session_key: sharedId
+    } as never)
+    await pendingResume
+  })
+
+  it('does not activate a same-id runtime cache owned by another profile', async () => {
+    const sharedId = 'cron-shared-session'
+    const foreignRuntimeId = 'rt-default'
+    const targetRuntimeId = 'rt-meta'
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([[sharedId, foreignRuntimeId]])
+    }
+
+    const foreignState = Object.assign(clientState(sharedId), { profile: 'default' })
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([[foreignRuntimeId, foreignState]])
+    }
+
+    $activeGatewayProfile.set('default')
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async profile => {
+      $activeGatewayProfile.set(profile || 'default')
+    })
+    setSessions([
+      storedSession({ id: sharedId, profile: 'default', title: 'Default duplicate' }),
+      storedSession({ id: sharedId, profile: 'meta', title: 'Cron owner' })
+    ])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: sharedId } as never)
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.activate') {
+        return {
+          session_id: params?.session_id,
+          session_key: sharedId,
+          resumed: sharedId,
+          messages: [],
+          info: {}
+        } as never
+      }
+
+      if (method === 'session.resume') {
+        return {
+          session_id: targetRuntimeId,
+          session_key: sharedId,
+          resumed: sharedId,
+          messages: [],
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(requestGatewayForProfile).mockImplementation(async (profile, method, params) =>
+      requestGateway(method, { ...(params ?? {}), profile })
+    )
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean, ownerProfile?: string) => Promise<unknown>) | null =
+      null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!(sharedId, true, 'meta')
+
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('meta')
+    expect(requestGateway).not.toHaveBeenCalledWith(
+      'session.activate',
+      expect.objectContaining({ session_id: foreignRuntimeId })
+    )
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ profile: 'meta', session_id: sharedId })
+    )
+    expect(sessionStateByRuntimeIdRef.current.has(foreignRuntimeId)).toBe(true)
+    expect(sessionStateByRuntimeIdRef.current.get(targetRuntimeId)?.profile).toBe('meta')
+
+    requestGateway.mockClear()
+    await resume!(sharedId, true, 'meta')
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.activate',
+      expect.objectContaining({ session_id: targetRuntimeId })
+    )
+    expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('session.resume')
+  })
+
+  it('activates only the profile-qualified warm runtime when same-id caches coexist', async () => {
+    const sharedId = 'cron-shared-session'
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([[sharedId, 'rt-default']])
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([
+        ['rt-default', Object.assign(clientState(sharedId), { profile: 'default' })],
+        ['rt-meta', Object.assign(clientState(sharedId), { profile: 'meta' })]
+      ])
+    }
+
+    setSessions([
+      storedSession({ id: sharedId, profile: 'default', title: 'Default duplicate' }),
+      storedSession({ id: sharedId, profile: 'meta', title: 'Cron owner' })
+    ])
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async profile => {
+      $activeGatewayProfile.set(profile || 'default')
+    })
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: sharedId } as never)
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.activate') {
+        return {
+          session_id: params?.session_id,
+          session_key: sharedId,
+          resumed: sharedId,
+          messages: [],
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(requestGatewayForProfile).mockImplementation(async (profile, method, params) =>
+      requestGateway(method, { ...(params ?? {}), profile })
+    )
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean, ownerProfile?: string) => Promise<unknown>) | null =
+      null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!(sharedId, true, 'meta')
+
+    expect(requestGateway).toHaveBeenCalledWith('session.activate', expect.objectContaining({ session_id: 'rt-meta' }))
+    expect(requestGateway).not.toHaveBeenCalledWith(
+      'session.activate',
+      expect.objectContaining({ session_id: 'rt-default' })
+    )
+    expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('session.resume')
   })
 
   it('paints the bounded latest transcript after the deferred resume acknowledgement', async () => {

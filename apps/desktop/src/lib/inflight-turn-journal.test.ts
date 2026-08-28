@@ -2,20 +2,42 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 import {
-  clearInFlightTurnJournal,
+  clearInFlightTurnJournal as clearJournal,
   type JournalableSessionState,
   mergeInFlightMessages,
   persistInFlightTurnState,
-  readInFlightTurnJournal,
-  recoverInFlightTurnJournal,
+  readInFlightTurnJournal as readJournal,
+  recoverInFlightTurnJournal as recoverJournal,
   resetInFlightTurnJournalStateForTests
 } from '@/lib/inflight-turn-journal'
 
 const STORAGE_KEY = 'hermes.desktop.inflightTurnJournal.v1'
-const STORAGE_PREFIX = 'hermes.desktop.inflightTurnJournal.v2:'
-const MIGRATION_KEY = 'hermes.desktop.inflightTurnJournal.v2.migrated'
+const LEGACY_STORAGE_PREFIX = 'hermes.desktop.inflightTurnJournal.v2:'
+const LEGACY_PROFILE_STORAGE_PREFIX = 'hermes.desktop.inflightTurnJournal.v3:'
+const STORAGE_PREFIX = 'hermes.desktop.inflightTurnJournal.v4:'
+const MIGRATION_KEY = 'hermes.desktop.inflightTurnJournal.v4.migrated'
 
-const sessionStorageKey = (storedSessionId: string) => `${STORAGE_PREFIX}${encodeURIComponent(storedSessionId)}`
+const sessionStorageKey = (storedSessionId: string, profile = 'default', connectionId: null | string = null) =>
+  `${STORAGE_PREFIX}${encodeURIComponent(connectionId ?? '')}:${encodeURIComponent(profile)}:${encodeURIComponent(storedSessionId)}`
+
+const legacyProfileSessionStorageKey = (storedSessionId: string, profile = 'default') =>
+  `${LEGACY_PROFILE_STORAGE_PREFIX}${encodeURIComponent(profile)}:${encodeURIComponent(storedSessionId)}`
+
+const legacySessionStorageKey = (storedSessionId: string) =>
+  `${LEGACY_STORAGE_PREFIX}${encodeURIComponent(storedSessionId)}`
+
+const clearInFlightTurnJournal = (storedSessionId: null | string, profile = 'default') =>
+  clearJournal(storedSessionId, profile, null)
+
+const readInFlightTurnJournal = (storedSessionId: null | string, profile = 'default') =>
+  readJournal(storedSessionId, profile, null)
+
+const recoverInFlightTurnJournal = (
+  storedSessionId: null | string,
+  baseMessages: ChatMessage[],
+  options: { keepPending?: boolean } = {},
+  profile = 'default'
+) => recoverJournal(storedSessionId, profile, null, baseMessages, options)
 
 function user(id: string, text: string): ChatMessage {
   return { id, role: 'user', parts: [{ type: 'text', text }] }
@@ -42,6 +64,8 @@ function journalState(overrides: Partial<JournalableSessionState> = {}): Journal
     awaitingResponse: false,
     busy: true,
     messages: [user('u1', 'do the thing'), assistant('assistant-stream-1', 'partial answer', { pending: true })],
+    connectionId: null,
+    profile: 'default',
     storedSessionId: 'stored-1',
     streamId: 'assistant-stream-1',
     turnStartedAt: 1000,
@@ -73,6 +97,8 @@ describe('persistInFlightTurnState', () => {
           user(`u-${index}`, `prompt-${index}`),
           assistant(`a-${index}`, `partial-${index}`, { pending: true })
         ],
+        connectionId: null,
+        profile: 'default',
         streamId: `a-${index}`,
         turnStartedAt: index,
         updatedAt: now - index * 1_000
@@ -85,6 +111,8 @@ describe('persistInFlightTurnState', () => {
       sessionStorageKey('expired'),
       JSON.stringify({
         messages: [user('expired-u', 'expired'), assistant('expired-a', 'expired', { pending: true })],
+        connectionId: null,
+        profile: 'default',
         streamId: 'expired-a',
         turnStartedAt: 0,
         updatedAt: now - 8 * 24 * 60 * 60 * 1_000
@@ -136,6 +164,74 @@ describe('persistInFlightTurnState', () => {
 
     expect(readInFlightTurnJournal('stored-1')).not.toBeNull()
     expect(readInFlightTurnJournal('stored-2')).toBeNull()
+  })
+
+  it('isolates snapshots and throttle state for the same stored id across profiles', () => {
+    persistInFlightTurnState(
+      journalState({
+        messages: [user('default-u', 'default prompt'), assistant('default-a', 'default partial', { pending: true })],
+        connectionId: null,
+        profile: 'default',
+        streamId: 'default-a'
+      })
+    )
+    persistInFlightTurnState(
+      journalState({
+        messages: [user('meta-u', 'meta prompt'), assistant('meta-a', 'meta partial', { pending: true })],
+        connectionId: null,
+        profile: ' meta ',
+        streamId: 'meta-a'
+      })
+    )
+    vi.advanceTimersByTime(400)
+
+    expect(readJournal('stored-1', 'default', null)?.messages.at(-1)?.id).toBe('default-a')
+    expect(readJournal('stored-1', 'meta', null)?.messages.at(-1)?.id).toBe('meta-a')
+    expect(window.localStorage.getItem(sessionStorageKey('stored-1', 'default'))).not.toBeNull()
+    expect(window.localStorage.getItem(sessionStorageKey('stored-1', 'meta'))).not.toBeNull()
+
+    clearJournal('stored-1', 'default', null)
+
+    expect(readJournal('stored-1', 'default', null)).toBeNull()
+    expect(readJournal('stored-1', 'meta', null)?.messages.at(-1)?.id).toBe('meta-a')
+  })
+
+  it('isolates overwrite, recovery, and clear for the same root across connections', () => {
+    persistInFlightTurnState(
+      journalState({
+        connectionId: 'connection-a',
+        messages: [user('a-u', 'A prompt'), assistant('a-stream', 'A partial', { pending: true })],
+        streamId: 'a-stream'
+      })
+    )
+    persistInFlightTurnState(
+      journalState({
+        connectionId: 'connection-b',
+        messages: [user('b-u', 'B prompt'), assistant('b-stream', 'B partial', { pending: true })],
+        streamId: 'b-stream'
+      })
+    )
+    vi.advanceTimersByTime(400)
+
+    expect(readJournal('stored-1', 'default', 'connection-a')?.streamId).toBe('a-stream')
+    expect(readJournal('stored-1', 'default', 'connection-b')?.streamId).toBe('b-stream')
+
+    const recoveredA = recoverJournal('stored-1', 'default', 'connection-a', [user('db-a', 'A prompt')])
+    expect(recoveredA.messages.at(-1)?.id).toBe('a-stream')
+    expect(recoverJournal('stored-1', 'default', 'connection-b', [user('db-a', 'A prompt')]).messages.at(-1)?.id).toBe(
+      'b-stream'
+    )
+
+    clearJournal('stored-1', 'default', 'connection-a')
+    expect(readJournal('stored-1', 'default', 'connection-a')).toBeNull()
+    expect(readJournal('stored-1', 'default', 'connection-b')?.streamId).toBe('b-stream')
+  })
+
+  it('fails closed when a journalable state has no proven profile owner', () => {
+    persistInFlightTurnState(journalState({ profile: null }))
+    vi.advanceTimersByTime(400)
+
+    expect(readJournal('stored-1', 'default', null)).toBeNull()
   })
 
   it('journals the running turn tail after the throttle window', () => {
@@ -260,6 +356,8 @@ describe('persistInFlightTurnState', () => {
   it('does not parse the legacy aggregate when a pathological write discards its session', () => {
     const legacy = {
       messages: [user('legacy-u1', 'old prompt'), assistant('legacy-a1', 'old partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
       streamId: 'legacy-a1',
       turnStartedAt: 1,
       updatedAt: Date.now()
@@ -283,6 +381,8 @@ describe('persistInFlightTurnState', () => {
   it('preserves a tombstone while sweeping before legacy migration', () => {
     const legacy = {
       messages: [user('legacy-u1', 'old prompt'), assistant('legacy-a1', 'old partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
       streamId: 'legacy-a1',
       turnStartedAt: 1,
       updatedAt: Date.now()
@@ -412,6 +512,8 @@ describe('persistInFlightTurnState', () => {
           { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'prompt' }], attachmentRefs: '@file:bad' },
           { id: 'a1', role: 'assistant', parts: [{ type: 'text', text: 'partial' }], pending: true }
         ],
+        connectionId: null,
+        profile: 'default',
         streamId: 'a1',
         turnStartedAt: 1,
         updatedAt: Date.now()
@@ -425,9 +527,64 @@ describe('persistInFlightTurnState', () => {
 })
 
 describe('legacy journal migration', () => {
+  it('keeps profile-only v3 records in the untagged-primary namespace', () => {
+    const legacy = {
+      connectionId: null,
+      messages: [user('u1', 'one'), assistant('a1', 'legacy partial', { pending: true })],
+      profile: 'default',
+      streamId: 'a1',
+      turnStartedAt: 1,
+      updatedAt: Date.now()
+    }
+
+    window.localStorage.setItem(legacyProfileSessionStorageKey('stored-1'), JSON.stringify(legacy))
+
+    expect(readJournal('stored-1', 'default', 'connection-a')).toBeNull()
+    expect(readJournal('stored-1', 'default', null)?.streamId).toBe('a1')
+    expect(window.localStorage.getItem(legacyProfileSessionStorageKey('stored-1'))).toBeNull()
+  })
+
+  it('discards an unowned bare-id v2 snapshot instead of guessing the active profile', () => {
+    const unowned = {
+      messages: [user('u1', 'one'), assistant('a1', 'partial one', { pending: true })],
+      streamId: 'a1',
+      turnStartedAt: 1,
+      updatedAt: Date.now()
+    }
+
+    window.localStorage.setItem(legacySessionStorageKey('stored-1'), JSON.stringify(unowned))
+    const base = [user('db-u0', 'earlier')]
+    const recovered = recoverJournal('stored-1', 'default', null, base)
+
+    expect(recovered.applied).toBe(false)
+    expect(recovered.messages).toBe(base)
+    expect(window.localStorage.getItem(legacySessionStorageKey('stored-1'))).toBeNull()
+    expect(window.localStorage.getItem(sessionStorageKey('stored-1'))).toBeNull()
+  })
+
+  it('migrates a bare-id v2 snapshot only when embedded profile provenance proves its owner', () => {
+    const owned = {
+      messages: [user('u1', 'one'), assistant('a1', 'meta partial', { pending: true })],
+      connectionId: null,
+      profile: 'meta',
+      streamId: 'a1',
+      turnStartedAt: 1,
+      updatedAt: Date.now()
+    }
+
+    window.localStorage.setItem(legacySessionStorageKey('stored-1'), JSON.stringify(owned))
+
+    expect(readJournal('stored-1', 'default', null)).toBeNull()
+    expect(readJournal('stored-1', 'meta', null)).toEqual(owned)
+    expect(window.localStorage.getItem(legacySessionStorageKey('stored-1'))).toBeNull()
+    expect(window.localStorage.getItem(sessionStorageKey('stored-1', 'meta'))).not.toBeNull()
+  })
+
   it('migrates the bounded v1 aggregate once and recovers its sessions', () => {
     const first = {
       messages: [user('u1', 'one'), assistant('a1', 'partial one', { pending: true })],
+      connectionId: null,
+      profile: 'default',
       streamId: 'a1',
       turnStartedAt: 1,
       updatedAt: Date.now()
@@ -452,6 +609,8 @@ describe('legacy journal migration', () => {
           pending: true
         }
       ],
+      connectionId: null,
+      profile: 'default',
       streamId: 'a2',
       turnStartedAt: 2,
       updatedAt: Date.now()
@@ -476,6 +635,56 @@ describe('legacy journal migration', () => {
     expect(window.localStorage.getItem(STORAGE_KEY)).not.toBeNull()
   })
 
+  it('keeps legacy records retryable when a replacement write fails', () => {
+    const legacy = {
+      messages: [user('u1', 'one'), assistant('a1', 'partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
+      streamId: 'a1',
+      turnStartedAt: 1,
+      updatedAt: Date.now()
+    }
+
+    const legacyKey = legacyProfileSessionStorageKey('stored-1')
+    const replacementKey = sessionStorageKey('stored-1')
+    window.localStorage.setItem(legacyKey, JSON.stringify(legacy))
+
+    // Node 26 defines its own global Storage. Spy on the jsdom realm that owns
+    // window.localStorage so the quota failure remains deterministic there too.
+    let storagePrototype: null | object = window.localStorage
+
+    while (storagePrototype && !Object.prototype.hasOwnProperty.call(storagePrototype, 'setItem')) {
+      storagePrototype = Object.getPrototypeOf(storagePrototype) as null | object
+    }
+
+    if (!storagePrototype) {
+      throw new Error('localStorage setItem implementation not found')
+    }
+
+    const localStorageMethods = storagePrototype as Storage
+    const originalSetItem = localStorageMethods.setItem
+
+    const setItem = vi.spyOn(localStorageMethods, 'setItem').mockImplementation(function (this: Storage, key, value) {
+      if (key === replacementKey) {
+        throw new DOMException('quota exceeded', 'QuotaExceededError')
+      }
+
+      return originalSetItem.call(this, key, value)
+    })
+
+    expect(readInFlightTurnJournal('stored-1')).toBeNull()
+    expect(window.localStorage.getItem(legacyKey)).not.toBeNull()
+    expect(window.localStorage.getItem(replacementKey)).toBeNull()
+    expect(window.localStorage.getItem(MIGRATION_KEY)).toBeNull()
+
+    setItem.mockRestore()
+
+    expect(readInFlightTurnJournal('stored-1')).toEqual(legacy)
+    expect(window.localStorage.getItem(legacyKey)).toBeNull()
+    expect(window.localStorage.getItem(replacementKey)).not.toBeNull()
+    expect(window.localStorage.getItem(MIGRATION_KEY)).toBe('1')
+  })
+
   it('drops an oversized legacy aggregate without parsing it', () => {
     window.localStorage.setItem(STORAGE_KEY, 'x'.repeat(2 * 1024 * 1024 + 1))
 
@@ -490,6 +699,8 @@ describe('legacy journal migration', () => {
 
     const legacyCurrent = {
       messages: [user('legacy-u1', 'old prompt'), assistant('legacy-a1', 'old partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
       streamId: 'legacy-a1',
       turnStartedAt: 1,
       updatedAt: Date.now() - 1_000
@@ -497,6 +708,8 @@ describe('legacy journal migration', () => {
 
     const legacyOther = {
       messages: [user('u2', 'other prompt'), assistant('a2', 'other partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
       streamId: 'a2',
       turnStartedAt: 2,
       updatedAt: Date.now()
@@ -514,6 +727,8 @@ describe('legacy journal migration', () => {
   it('does not resurrect a legacy entry after that session settles before migration', () => {
     const legacyCurrent = {
       messages: [user('legacy-u1', 'old prompt'), assistant('legacy-a1', 'old partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
       streamId: 'legacy-a1',
       turnStartedAt: 1,
       updatedAt: Date.now()
@@ -521,6 +736,8 @@ describe('legacy journal migration', () => {
 
     const legacyOther = {
       messages: [user('u2', 'other prompt'), assistant('a2', 'other partial', { pending: true })],
+      connectionId: null,
+      profile: 'default',
       streamId: 'a2',
       turnStartedAt: 2,
       updatedAt: Date.now()
@@ -774,6 +991,8 @@ describe('mid-turn redirect corrections', () => {
         user('user-2', 'hurry up'),
         assistant('assistant-stream-1', 'Moving.', { pending: true })
       ],
+      connectionId: null,
+      profile: 'default',
       storedSessionId: 'stored-redirect',
       streamId: 'assistant-stream-1',
       turnStartedAt: Date.now()
@@ -799,6 +1018,8 @@ describe('mid-turn redirect corrections', () => {
         user('user-1', 'the live prompt'),
         assistant('assistant-stream-1', 'Moving.', { pending: true })
       ],
+      connectionId: null,
+      profile: 'default',
       storedSessionId: 'stored-boundary',
       streamId: 'assistant-stream-1',
       turnStartedAt: Date.now()

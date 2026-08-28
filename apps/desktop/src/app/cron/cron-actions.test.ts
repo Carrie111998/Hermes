@@ -31,8 +31,8 @@ describe('triggerAndRefreshCronJobs', () => {
 
     const result = await triggerAndRefreshCronJobs('deleted-one-shot', 'work')
 
-    expect(triggerCronJob).toHaveBeenCalledWith('deleted-one-shot')
-    expect(getCronJobs).toHaveBeenCalledWith('work')
+    expect(triggerCronJob).toHaveBeenCalledWith('deleted-one-shot', { connectionId: null, profile: 'work' })
+    expect(getCronJobs).toHaveBeenCalledWith({ connectionId: null, profile: 'work' })
     expect(result).toEqual({ jobs: authoritative, refreshError: null, stale: false })
   })
 
@@ -44,6 +44,16 @@ describe('triggerAndRefreshCronJobs', () => {
     const result = await triggerAndRefreshCronJobs('job-1', 'all')
 
     expect(result).toEqual({ jobs: null, refreshError, stale: false })
+  })
+
+  it('routes an aggregated duplicate-id trigger to the row owner profile', async () => {
+    triggerCronJob.mockResolvedValue({ id: 'shared-job', state: 'scheduled' })
+    getCronJobs.mockResolvedValue([])
+
+    await triggerAndRefreshCronJobs('shared-job', 'all', 'worker_alpha')
+
+    expect(triggerCronJob).toHaveBeenCalledWith('shared-job', 'worker_alpha')
+    expect(getCronJobs).toHaveBeenCalledWith({ connectionId: null, profile: 'all' })
   })
 
   it('still rejects when the trigger itself fails', async () => {

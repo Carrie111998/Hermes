@@ -25,6 +25,7 @@ import { makeSessionInfo } from '@/test/session-info'
 describe('storedSessionIdForRuntimeId', () => {
   afterEach(() => {
     $sessionTiles.set([])
+    clearAllSessionStates()
   })
 
   it('maps a runtime id to the stored id of the tile bound to it', () => {
@@ -73,6 +74,31 @@ describe('storedSessionIdForRuntimeId', () => {
     clearAllSessionStates()
   })
 
+  it('maps a unique connection-owned MAIN-PANE runtime through its composite state key', () => {
+    publishSessionState('rt-owned', {
+      ...createClientSessionState('stored-owned'),
+      connectionId: 'source-a',
+      profile: 'default'
+    })
+
+    expect(storedSessionIdForRuntimeId('rt-owned')).toBe('stored-owned')
+  })
+
+  it('fails closed when two connection owners expose the same MAIN-PANE runtime id', () => {
+    publishSessionState('rt-shared', {
+      ...createClientSessionState('stored-a'),
+      connectionId: 'source-a',
+      profile: 'default'
+    })
+    publishSessionState('rt-shared', {
+      ...createClientSessionState('stored-b'),
+      connectionId: 'source-b',
+      profile: 'default'
+    })
+
+    expect(storedSessionIdForRuntimeId('rt-shared')).toBeNull()
+  })
+
   it('prefers the stored-id identity when one tile is stored-matched and another is runtime-matched', () => {
     // Pathological but possible after a stale rebind: some other tile's dead
     // runtimeId equals a live tile's storedSessionId. The stored-id claim is
@@ -108,6 +134,43 @@ describe('knownOwnerForSession / requestForOwnedSession', () => {
     setSessions([makeSessionInfo({ id: 'stored-main', profile: 'coder' })])
     expect(knownOwnerForSession('rt-main')).toBe('coder')
   })
+
+  it('resolves a unique connection-owned runtime to its stored owner', () => {
+    publishSessionState('rt-owned', {
+      ...createClientSessionState('stored-owned'),
+      connectionId: 'source-a',
+      profile: 'default'
+    })
+    setSessionOwnerHint('stored-owned', { connectionId: 'source-a', profile: 'default' })
+
+    expect(knownOwnerForSession('rt-owned')).toEqual({ connectionId: 'source-a', profile: 'default' })
+  })
+
+  it.each(['approval.respond', 'clarify.respond'])(
+    'fails %s closed for an ambiguous A/B runtime owner',
+    async method => {
+      $profiles.set([{ name: 'default' }, { name: 'other' }] as never)
+      publishSessionState('rt-shared', {
+        ...createClientSessionState('stored-a'),
+        connectionId: 'source-a',
+        profile: 'default'
+      })
+      publishSessionState('rt-shared', {
+        ...createClientSessionState('stored-b'),
+        connectionId: 'source-b',
+        profile: 'default'
+      })
+      setSessionOwnerHint('stored-a', { connectionId: 'source-a', profile: 'default' })
+      setSessionOwnerHint('stored-b', { connectionId: 'source-b', profile: 'default' })
+      const ambient = vi.fn(async () => ({ ok: true }))
+
+      expect(knownOwnerForSession('rt-shared')).toBeUndefined()
+      await expect(
+        requestForOwnedSession('rt-shared', ambient as never, method, { session_id: 'rt-shared' })
+      ).rejects.toSatisfy(isSessionOwnerResolutionError)
+      expect(ambient).not.toHaveBeenCalled()
+    }
+  )
 
   it('fails closed with an explicit owner-resolution error instead of the ambient socket', async () => {
     // Somewhere to misroute to: two profiles exist.

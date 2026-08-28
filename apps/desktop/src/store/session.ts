@@ -699,8 +699,10 @@ export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
 export interface ActiveSessionStoredIdRotation {
+  connectionId: string | null
   nextStoredSessionId: string
   previousStoredSessionId: string
+  profile: string
   runtimeSessionId: string
 }
 

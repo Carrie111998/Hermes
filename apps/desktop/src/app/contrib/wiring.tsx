@@ -13,7 +13,6 @@ import { useQueryClient } from '@tanstack/react-query'
 import { type CSSProperties, lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
-import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
 import { ConfirmHost } from '@/components/confirm-host'
@@ -34,17 +33,15 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { TipHost } from '@/components/tips'
 import { emitGatewayEvent } from '@/contrib/events'
-import { getLatestSessionMessages } from '@/hermes'
-import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
 import { isMessagingSource } from '@/lib/session-source'
-import { latestSessionTodos } from '@/lib/todos'
 import { activateWakeIndicator } from '@/lib/wake-indicator'
 import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
 import { $desktopBoot } from '@/store/boot'
 import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
-import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
+import { $cronReviewRequest, setCronFocusJobId, setCronFocusOutput } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
@@ -79,7 +76,6 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
-import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
@@ -106,6 +102,7 @@ import {
   CRON_ROUTE,
   navigateToWorkspacePage,
   routeSessionId,
+  routeSessionProfile,
   sessionRoute,
   SETTINGS_ROUTE,
   syncWorkspaceRoute
@@ -147,6 +144,7 @@ import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
+import { useStoredSessionHydration } from './hooks/use-stored-session-hydration'
 import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
@@ -230,7 +228,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const profileScope = useStore($profileScope)
   const boot = useStore($desktopBoot)
 
-  const routedSessionId = routeSessionId(location.pathname)
+  const routeTarget = `${location.pathname}${location.search}`
+  const routedSessionId = routeSessionId(routeTarget)
+  const routedSessionProfile = routeSessionProfile(routeTarget)
   const routedSessionIdRef = useRef(routedSessionId)
 
   routedSessionIdRef.current = routedSessionId
@@ -276,11 +276,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionIdRef,
     ensureSessionState,
     getRuntimeIdForStoredSession,
+    getSessionStateOwner,
     resetViewSync,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
+    selectedStoredSessionProfileRef,
+    sessionStateHasOwner,
     sessionStateByRuntimeIdRef,
     syncSessionStateToView,
+    updateOwnedSessionState,
     updateSessionState
   } = useSessionStateCache({
     activeSessionId,
@@ -370,58 +374,16 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     return () => dispose?.()
   }, [])
 
-  // Post-turn rehydrate from stored history (same behavior as DesktopController,
-  // including finished-todos restoration).
-  const hydrateFromStoredSession = useCallback(
-    async (
-      attempts = 1,
-      storedSessionId = selectedStoredSessionIdRef.current,
-      runtimeSessionId = activeSessionIdRef.current
-    ) => {
-      if (!storedSessionId || !runtimeSessionId) {
-        return
-      }
-
-      const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
-
-      for (let index = 0; index < Math.max(1, attempts); index += 1) {
-        try {
-          const latest = await getLatestSessionMessages(storedSessionId, storedProfile)
-          const messages = toChatMessages(latest.messages)
-          updateSessionState(
-            runtimeSessionId,
-            state => ({
-              ...state,
-              // Post-turn rehydrate reads only the newest tail page — graft it
-              // onto any backfilled older pages instead of dropping them.
-              messages: preserveLocalAssistantErrors(
-                graftRefreshedTailOntoBackfill(messages, state.messages),
-                state.messages
-              )
-            }),
-            storedSessionId
-          )
-
-          const restored = todosForHydration(latestSessionTodos(messages))
-
-          if (restored) {
-            setSessionTodos(runtimeSessionId, restored)
-          } else {
-            clearSessionTodos(runtimeSessionId)
-          }
-
-          return
-        } catch {
-          // Best-effort fallback when live stream payloads are empty.
-        }
-
-        if (index < attempts - 1) {
-          await new Promise(resolve => window.setTimeout(resolve, 250))
-        }
-      }
-    },
-    [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
-  )
+  // Post-turn/recovery history belongs to the selected profile + stored id,
+  // not whichever duplicate row happens to appear first in the all-profile list.
+  const hydrateFromStoredSession = useStoredSessionHydration({
+    activeSessionIdRef,
+    getSessionStateOwner,
+    selectedStoredSessionIdRef,
+    selectedStoredSessionProfileRef,
+    sessionStateHasOwner,
+    updateOwnedSessionState
+  })
 
   // Refresh any active transcript changed by another process. Signature-gated
   // so a no-change event does not churn the thread.
@@ -431,12 +393,27 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         activeSessionIdRef,
         busyRef,
         requestSequenceRef: activeTranscriptRequestSequenceRef,
-        resolveSession: resolveActiveTranscriptSession,
+        resolveSession: (storedSessionId, ownerProfile) =>
+          resolveActiveTranscriptSession(
+            storedSessionId,
+            ownerProfile,
+            activeSessionIdRef.current ? getSessionStateOwner(activeSessionIdRef.current)?.connectionId : undefined
+          ),
         selectedStoredSessionIdRef,
+        selectedStoredSessionProfileRef,
+        sessionStateHasOwner,
         signatureRef: activeTranscriptSignatureRef,
-        updateSessionState
+        updateOwnedSessionState
       }),
-    [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState]
+    [
+      activeSessionIdRef,
+      busyRef,
+      getSessionStateOwner,
+      selectedStoredSessionIdRef,
+      selectedStoredSessionProfileRef,
+      sessionStateHasOwner,
+      updateOwnedSessionState
+    ]
   )
 
   const { handleGatewayEvent } = useMessageStream({
@@ -501,6 +478,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
+    selectedStoredSessionProfileRef,
     sessionStateByRuntimeIdRef,
     syncSessionStateToView,
     updateSessionState
@@ -719,15 +697,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     currentView,
     freshDraftReady,
     gatewayState,
-    locationPathname: location.pathname,
+    locationPathname: routeTarget,
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,
     sessionResumeRequest,
     routedSessionId,
+    routedSessionProfile,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
+    selectedStoredSessionProfileRef,
     startFreshSessionDraft
   })
 
@@ -828,7 +808,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshMessagingSessions,
     refreshSessions,
     requestGateway,
-    updateSessionState
+    sessionStateHasOwner,
+    updateOwnedSessionState
   })
 
   // Electron-main / OS / cross-window integrations: update polling, ⌘W close,
@@ -840,12 +821,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeProfile: normalizeProfileKey(activeGatewayProfile),
     chatOpen,
     hasPreview: Boolean(previewTarget),
-    locationPathname: location.pathname,
+    locationPathname: routeTarget,
     navigate,
     profileReady: boot.phase === 'renderer.ready',
     refreshSessions,
     resumeExhaustedSessionId,
     routedSessionId,
+    routedSessionProfile,
     runtimeIdByStoredSessionId: runtimeIdByStoredSessionIdRef,
     sessions
   })
@@ -976,13 +958,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
     onLoadMoreSessions: loadMoreSessions,
-    onManageCronJob: jobId => {
-      setCronFocusJobId(jobId)
+    onManageCronJob: (jobId, profile, connectionId) => {
+      setCronFocusJobId(jobId, profile, connectionId)
       navigate(CRON_ROUTE)
     },
     onNavigate: selectSidebarItem,
     onNewSessionInWorkspace: path => startSessionInWorkspace(path, { openTab: true }),
     onNewSessionSplit: dir => void openNewSessionTile(dir),
+    onOpenCronRun: (jobId, outputId, profile, connectionId) => {
+      setCronFocusOutput(jobId, outputId, profile, connectionId)
+      navigate(CRON_ROUTE)
+    },
     onPasteClipboardImage: opts => composer.pasteClipboardImage(opts),
     onPickFiles: () => void composer.pickContextPaths('file'),
     onPickFolders: () => void composer.pickContextPaths('folder'),
@@ -998,13 +984,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     // previewing profile A and the resume dials profile B. Pin the row's own
     // (connection, profile) as the resume owner before navigating; untagged
     // rows (single-profile installs, legacy pages) keep the id-only path.
-    onResumeSession: (sessionId, session) => {
-      const rowProfile = session?.profile?.trim()
+    onResumeSession: (sessionId, owner) => {
+      const rowProfile = (typeof owner === 'string' ? owner : owner?.profile)?.trim()
 
       if (rowProfile) {
         requestSessionResume(sessionId, {
-          connectionId: session?.connection_id?.trim() || 'local',
-          ...(session?.connection_id?.trim() ? {} : { mode: 'local' as const }),
+          connectionId: (typeof owner === 'object' ? owner.connection_id?.trim() : '') || 'local',
+          ...(typeof owner === 'object' && owner.connection_id?.trim() ? {} : { mode: 'local' as const }),
           profile: rowProfile,
           targetProfile: rowProfile
         })
@@ -1012,14 +998,22 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       openSession(sessionId, navigate)
     },
-    onRetryResume: sessionId => void resumeSession(sessionId, true),
+    onRetryResume: sessionId =>
+      void resumeSession(
+        sessionId,
+        true,
+        routedSessionId === sessionId ? (routedSessionProfile ?? undefined) : undefined
+      ),
     onSteer: steerPrompt,
     onSubmit: submitText,
     onThreadMessagesChange: handleThreadMessagesChange,
     onToggleSelectedPin: toggleSelectedPin,
     onTranscribeAudio: transcribeVoiceAudio,
-    onTriggerCronJob: jobId =>
-      triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope)
+    onTriggerCronJob: (jobId, profile, connectionId) =>
+      triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope, {
+        connectionId,
+        profile
+      })
         .then(() => undefined)
         .catch(() => undefined),
     getGateway: () => gatewayRef.current,
@@ -1215,10 +1209,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       {cronOpen && (
         <Suspense fallback={null}>
-          <CronView
-            onClose={closeOverlayToPreviousRoute}
-            onOpenSession={sessionId => openSession(sessionId, navigate)}
-          />
+          <CronView onClose={closeOverlayToPreviousRoute} />
         </Suspense>
       )}
 

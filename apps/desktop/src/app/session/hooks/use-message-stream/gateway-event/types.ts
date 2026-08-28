@@ -27,7 +27,8 @@ export interface GatewayEventDeps {
   hydrateFromStoredSession: (
     attempts?: number,
     storedSessionId?: string | null,
-    runtimeSessionId?: string | null
+    runtimeSessionId?: string | null,
+    storedSessionProfile?: string | null
   ) => Promise<void>
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
@@ -37,7 +38,9 @@ export interface GatewayEventDeps {
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    ownerProfile?: string,
+    ownerConnectionId?: null | string
   ) => ClientSessionState
   upsertToolCall: (
     sessionId: string,
