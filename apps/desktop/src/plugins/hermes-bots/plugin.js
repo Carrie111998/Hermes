@@ -2369,12 +2369,12 @@ async function stageHostedAttachments(route, roomId, eventId, attachments) {
 
 async function sendHostedGroupChat(group, members, sent, thread, attachments) {
   const room = $groupChats.get()[group]
-  const connectionId = String(room?.hostedConnectionId || '')
-  if (!connectionId) {
+  const route = await hostedRouteForRoom(room)
+  if (!route?.connectionId) {
     throw new Error('This group is offline. Try again when its gateway reconnects.')
   }
   const manifests = await stageHostedAttachments(
-    { connectionId },
+    route,
     room.roomId,
     sent.id,
     attachments
@@ -2384,7 +2384,7 @@ async function sendHostedGroupChat(group, members, sent, thread, attachments) {
     kind: 'send',
     roomId: room.roomId,
     authorityId: groupChatHostedGateway(room),
-    connectionId,
+    connectionId: String(route.connectionId),
     payload: {
       text: sent.text || (manifests.length ? 'Shared an attachment.' : ''),
       thread_id: thread,

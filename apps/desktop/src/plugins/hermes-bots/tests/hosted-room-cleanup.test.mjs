@@ -23,6 +23,11 @@ test('hosted rooms stage files only after every gateway advertises support', () 
   assert.match(pluginSource, /function hostedGroupAttachmentAvailability/)
   assert.match(pluginSource, /catalog\?\.attachments !== true/)
   assert.match(pluginSource, /await stageHostedAttachments/)
+  assert.match(
+    pluginSource,
+    /const route = await hostedRouteForRoom\(room\)[\s\S]{0,300}stageHostedAttachments\(\s*route,/
+  )
+  assert.doesNotMatch(pluginSource, /stageHostedAttachments\(\s*\{\s*connectionId\s*\}/)
   assert.match(pluginSource, /Update \$\{label\} to share files in this Group Chat\./)
 })
 
