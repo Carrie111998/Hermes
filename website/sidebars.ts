@@ -842,8 +842,8 @@ const sidebars: SidebarsConfig = {
           items: [
             'reference/tools-reference',
             'reference/toolsets-reference',
-            'reference/skills-catalog',
-            'reference/optional-skills-catalog',
+            { type: 'ref', id: 'reference/skills-catalog' },
+            { type: 'ref', id: 'reference/optional-skills-catalog' },
           ],
         },
         'reference/cli-symbols',
