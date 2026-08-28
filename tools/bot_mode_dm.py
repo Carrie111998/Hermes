@@ -131,10 +131,10 @@ def ensure_message_agent_tool(agent: Any) -> bool:
 
     Called once per turn from the conversation loop. Idempotent and
     deterministic for the life of a session: the gate (canonical Bot Chat
-    title on a Bot-Mode-managed install) is stable from the session's first
-    turn, so the tool list is byte-identical across turns — prompt-cache
-    safe. Every non-Bot-Chat session fails the gate on every turn and never
-    sees the schema. Never raises.
+    compression-root title on a Bot-Mode-managed install) is stable from the
+    session's first turn, so the tool list is byte-identical across turns —
+    prompt-cache safe. Every non-Bot-Chat session fails the gate on every turn
+    and never sees the schema. Never raises.
     """
     try:
         if not getattr(agent, "_bot_mode_protocol", True):
@@ -147,9 +147,9 @@ def ensure_message_agent_tool(agent: Any) -> bool:
                     and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
                 ):
                     return True
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import is_bot_chat_session, is_bot_mode_managed
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
+        if not is_bot_chat_session(agent):
             return False
         # Managed-install check, NOT section non-emptiness: a profile whose
         # SOUL.md carries the legacy plugin-appended protocol text gets an
@@ -253,10 +253,9 @@ def message_agent_tool(
     # ── defense-in-depth gate: only a canonical Bot Chat may deliver ──
     home = _agent_home(agent)
     try:
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.bot_mode_probe import is_bot_chat_session, is_bot_mode_managed
 
-        title = _session_title(agent)
-        if title != BOT_CHAT_TITLE:
+        if not is_bot_chat_session(agent):
             return _err(
                 "message_agent is only available in a Bot Mode 'Bot Chat' session. "
                 "This session is not one; do not retry."
@@ -745,20 +744,6 @@ def _agent_home(agent: Any) -> str:
     except Exception:
         pass
     return os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
-
-
-def _session_title(agent: Any) -> str:
-    title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-    if title:
-        return title
-    try:
-        sdb = getattr(agent, "_session_db", None)
-        sid = getattr(agent, "session_id", None)
-        if sdb and sid:
-            return str(sdb.get_session_title(sid) or "").strip()
-    except Exception:
-        pass
-    return ""
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a background process

@@ -632,16 +632,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_bot_mode_protocol", True):
         try:
             from tools.bot_mode_probe import (
-                BOT_CHAT_TITLE,
                 epoch_line,
                 get_bot_mode_protocol_section,
+                is_bot_chat_session,
             )
-            _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-            if not _title:
-                _sdb = getattr(agent, "_session_db", None)
-                _sid = getattr(agent, "session_id", None)
-                _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
-            if _title == BOT_CHAT_TITLE:
+            if is_bot_chat_session(agent):
                 _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
                 if _bot_section:
                     post_workspace_parts.append(_bot_section)

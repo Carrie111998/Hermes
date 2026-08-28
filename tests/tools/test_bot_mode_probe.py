@@ -4,6 +4,7 @@ import textwrap
 
 import pytest
 
+from hermes_state import SessionDB
 from tools import bot_mode_probe
 
 
@@ -12,6 +13,13 @@ def _fresh_cache():
     bot_mode_probe._reset_cache_for_tests()
     yield
     bot_mode_probe._reset_cache_for_tests()
+
+
+@pytest.fixture
+def session_db(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    yield db
+    db.close()
 
 
 def _make_bot_profile(root, name, *, managed=True, soul=None):
@@ -32,6 +40,40 @@ def _make_bot_profile(root, name, *, managed=True, soul=None):
     if soul is not None:
         (d / "SOUL.md").write_text(soul, encoding="utf-8")
     return d
+
+
+class _Agent:
+    def __init__(self, db, session_id, hint=None):
+        self._session_db = db
+        self.session_id = session_id
+        self._session_title_hint = hint
+
+
+def test_bot_chat_identity_follows_compression_lineage_root(session_db):
+    session_db.create_session("root", source="webui")
+    session_db.set_session_title("root", "Bot Chat")
+    session_db.end_session("root", "compression")
+    session_db.create_session("tip", source="webui", parent_session_id="root")
+    session_db.set_session_title("tip", "Friendly greeting")
+
+    assert bot_mode_probe.is_bot_chat_session(_Agent(session_db, "tip")) is True
+
+
+def test_bot_chat_identity_does_not_follow_delegate_parent(session_db):
+    session_db.create_session("root", source="webui")
+    session_db.set_session_title("root", "Bot Chat")
+    session_db.create_session(
+        "delegate",
+        source="delegate",
+        parent_session_id="root",
+        model_config={"_delegate_from": "root"},
+    )
+    session_db.set_session_title("delegate", "Research task")
+
+    assert (
+        bot_mode_probe.is_bot_chat_session(_Agent(session_db, "delegate"))
+        is False
+    )
 
 
 def test_silent_when_no_profile_is_bot_managed(tmp_path):

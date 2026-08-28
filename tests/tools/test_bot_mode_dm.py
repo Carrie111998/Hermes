@@ -52,17 +52,28 @@ def _managed_home(tmp_path, *, teammates=("researcher",), peers=()) -> Path:
 
 
 class _FakeDB:
-    def __init__(self, home: Path, title: str):
+    def __init__(self, home: Path, title: str, root_title: str | None = None):
         self.db_path = str(home / "state.db")
         self._title = title
+        self._root_title = root_title
 
-    def get_session_title(self, _sid):
+    def get_session_title(self, sid):
+        if sid == "root":
+            return self._root_title
         return self._title
+
+    def get_compression_lineage(self, sid):
+        return ["root", sid] if self._root_title is not None else [sid]
 
 
 class _FakeAgent:
-    def __init__(self, home: Path, title: str = "Bot Chat"):
-        self._session_db = _FakeDB(home, title)
+    def __init__(
+        self,
+        home: Path,
+        title: str = "Bot Chat",
+        root_title: str | None = None,
+    ):
+        self._session_db = _FakeDB(home, title, root_title)
         self.session_id = "sess-1"
         self._session_title_hint = None
         self._bot_mode_protocol = True
@@ -84,6 +95,21 @@ def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
     # idempotent: second call adds nothing (byte-stable tool list per turn)
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
     assert len(agent.tools) == 1
+
+
+def test_injects_into_compressed_tip_of_canonical_bot_chat(tmp_path):
+    """A renamed live tip keeps the canonical root's Bot Mode capabilities."""
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(
+        home,
+        title="Friendly greeting",
+        root_title="Bot Chat",
+    )
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    assert [tool["function"]["name"] for tool in agent.tools] == [
+        bot_mode_dm.MESSAGE_AGENT_TOOL_NAME
+    ]
 
 
 @pytest.mark.parametrize(

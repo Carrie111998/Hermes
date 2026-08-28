@@ -6419,12 +6419,9 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     if agent is None:
         return
     try:
-        title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-        if not title:
-            db = getattr(agent, "_session_db", None)
-            key = session.get("session_key") or ""
-            title = str((db.get_session_title(key) if (db and key) else None) or "").strip()
-        if title != "Bot Chat":
+        from tools.bot_mode_probe import is_bot_chat_session
+
+        if not is_bot_chat_session(agent):
             return
         from tools.bot_mode_probe import capability_fingerprint
 

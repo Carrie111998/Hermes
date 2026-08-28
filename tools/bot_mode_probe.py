@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
 _PROTOCOL_HEADING = "## Messaging other agents"
 
@@ -42,6 +43,41 @@ BOT_CHAT_TITLE = "Bot Chat"
 
 _lock = threading.Lock()
 _cached: dict[str, str] = {}
+
+
+def bot_chat_session_title(agent: Any) -> str:
+    """Return the title that owns *agent*'s Bot Mode identity.
+
+    Compression rotates a conversation onto a new session row whose display
+    title can differ from the canonical root's ``Bot Chat`` title. Resolve
+    only the compression lineage back to its root so the protocol and
+    ``message_agent`` survive compaction without leaking into explicit
+    branches, delegate agents, or tool sessions. The title hint remains the
+    fallback for a newly created Bot Chat whose DB row does not exist yet.
+    Never raises.
+    """
+    hint = str(getattr(agent, "_session_title_hint", "") or "").strip()
+    try:
+        session_db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None)
+        if session_db and session_id:
+            title_session_id = session_id
+            get_lineage = getattr(session_db, "get_compression_lineage", None)
+            if callable(get_lineage):
+                lineage = get_lineage(session_id)
+                if lineage:
+                    title_session_id = lineage[0]
+            title = session_db.get_session_title(title_session_id)
+            if title is not None:
+                return str(title).strip()
+    except Exception:
+        pass
+    return hint
+
+
+def is_bot_chat_session(agent: Any) -> bool:
+    """Return whether *agent* belongs to the canonical Bot Chat lineage."""
+    return bot_chat_session_title(agent) == BOT_CHAT_TITLE
 
 
 def _hermes_root(home: Path) -> Path:

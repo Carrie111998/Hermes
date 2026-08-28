@@ -929,6 +929,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         try:
             from tools.bot_mode_probe import (
                 BOT_CHAT_TITLE,
+                is_bot_chat_session,
                 stored_bot_chat_prompt_needs_upgrade,
                 stored_prompt_capability_stale,
             )
@@ -948,14 +949,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 # the messaging protocol. Title-gated so ordinary unstamped
                 # sessions (i.e. all of them) never take this path; the
                 # rebuilt prompt carries the stamp, so it cannot re-fire.
-                _t = str(getattr(agent, "_session_title_hint", "") or "").strip()
-                if not _t and agent._session_db and agent.session_id:
-                    try:
-                        _t = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
-                    except Exception:
-                        _t = ""
-                if _t == BOT_CHAT_TITLE:
-                    _bot_stale = stored_bot_chat_prompt_needs_upgrade(stored_prompt, _home_for_epoch)
+                if is_bot_chat_session(agent):
+                    _bot_stale = stored_bot_chat_prompt_needs_upgrade(
+                        stored_prompt, _home_for_epoch
+                    )
         except Exception:
             _bot_stale = False
         if _bot_stale:
@@ -965,7 +962,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "prefix-cache break).",
                 agent.session_id,
             )
-            agent._session_title_hint = "Bot Chat"
+            agent._session_title_hint = BOT_CHAT_TITLE
             # The skills index inside the prompt comes from a two-layer cache
             # (in-process LRU + disk snapshot) that doesn't watch the skills
             # dir; a capability refresh must rebuild THROUGH it or a freshly
