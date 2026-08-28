@@ -16,6 +16,7 @@ import {
   overlayHopYAtProgress,
   overlayIdleAction,
   overlayLandingAlongPath,
+  overlayLowerPosition,
   overlayMotionLandingLedges,
   overlayMotionProbeIsCurrent,
   overlayPlannedAction,
@@ -77,6 +78,21 @@ describe('overlay roam geometry', () => {
     expect(overlayIdleAction(false, () => 0.49)).toBe('hop')
     expect(overlayIdleAction(false, () => 0.5)).toBe('walk')
     expect(overlayIdleAction(false, () => 0.9)).toBe('walk')
+  })
+
+  it('keeps walking at 50% while preferring hops on lower supports', () => {
+    expect(overlayIdleAction(true, () => 0.24, 0)).toBe('hop')
+    expect(overlayIdleAction(true, () => 0.25, 0)).toBe('drop')
+    expect(overlayIdleAction(true, () => 0.47, 0.9)).toBe('hop')
+    expect(overlayIdleAction(true, () => 0.48, 0.9)).toBe('drop')
+    expect(overlayIdleAction(true, () => 0.5, 0.9)).toBe('walk')
+  })
+
+  it('normalizes support height within positive and negative-coordinate work areas', () => {
+    expect(overlayLowerPosition(100, { height: 800, width: 1200, x: 0, y: 100 })).toBe(0)
+    expect(overlayLowerPosition(500, { height: 800, width: 1200, x: 0, y: 100 })).toBe(0.5)
+    expect(overlayLowerPosition(900, { height: 800, width: 1200, x: 0, y: 100 })).toBe(1)
+    expect(overlayLowerPosition(-500, { height: 800, width: 1200, x: -1200, y: -900 })).toBe(0.5)
   })
 
   it('targets only an upper support directly above, or hops in place', () => {

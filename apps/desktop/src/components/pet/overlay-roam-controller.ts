@@ -36,8 +36,8 @@ const PET_FOOT_INSET_PX = 24
 const MIN_TRAVEL_PX = 48
 const GRAVITY_PX_S2 = 1500
 const MAX_DT_S = 0.05
-const HOP_CHANCE = 0.35
-const DROP_CHANCE = 0.15
+const VERTICAL_ACTION_CHANCE = 0.5
+const MIN_HOP_CHANCE = 0.25
 const BASE_HOP_DURATION_MS = 800
 const LANDING_ANALYSIS_DELAY_MS = 250
 const PAUSE_POLL_MS = 250
@@ -372,16 +372,31 @@ export function advanceOverlayVisualCandidate(
     : { hits: 1, ledge: visual }
 }
 
-/** Reassign the unavailable drop band to hops while standing on the desktop floor. */
-export function overlayIdleAction(canDrop: boolean, rng: () => number = Math.random): OverlayIdleAction {
+/** Relative surface height: 0 at the work-area top and 1 at its bottom. */
+export function overlayLowerPosition(surfaceY: number, workArea: OverlayBounds): number {
+  const height = Math.max(1, workArea.height)
+
+  return Math.max(0, Math.min(1, (surfaceY - workArea.y) / height))
+}
+
+/** Keep walking at 50%; shift the vertical half from drops to hops near the bottom. */
+export function overlayIdleAction(
+  canDrop: boolean,
+  rng: () => number = Math.random,
+  lowerPosition = 0.4
+): OverlayIdleAction {
   const sample = Math.max(0, Math.min(1, rng()))
-  const hopChance = canDrop ? HOP_CHANCE : HOP_CHANCE + DROP_CHANCE
+  const heightBias = Math.max(0, Math.min(1, lowerPosition))
+
+  const hopChance = canDrop
+    ? MIN_HOP_CHANCE + (VERTICAL_ACTION_CHANCE - MIN_HOP_CHANCE) * heightBias
+    : VERTICAL_ACTION_CHANCE
 
   if (sample < hopChance) {
     return 'hop'
   }
 
-  return canDrop && sample < hopChance + DROP_CHANCE ? 'drop' : 'walk'
+  return canDrop && sample < VERTICAL_ACTION_CHANCE ? 'drop' : 'walk'
 }
 
 /** Never intentionally drop without a pre-scanned landing destination below. */
@@ -392,9 +407,10 @@ export function overlayPlannedAction(
   canDrop: boolean,
   supportMisses: number,
   forceWalk: boolean,
-  rng: () => number = Math.random
+  rng: () => number = Math.random,
+  lowerPosition = 0.4
 ): OverlayIdleAction {
-  return supportMisses > 0 || forceWalk ? 'walk' : overlayIdleAction(canDrop, rng)
+  return supportMisses > 0 || forceWalk ? 'walk' : overlayIdleAction(canDrop, rng, lowerPosition)
 }
 
 export function overlaySupportMissOutcome(previousFailures: number): {
@@ -614,7 +630,7 @@ export function startPetOverlayRoam({
     signal('jump')
   }
 
-  const beginMotion = (now: number, settleAfterDrag = false): boolean => {
+  const beginMotion = (now: number, workArea: OverlayBounds, settleAfterDrag = false): boolean => {
     if (!current || ledges.length === 0) {
       return false
     }
@@ -651,11 +667,14 @@ export function startPetOverlayRoam({
     const fromX = current.x
     const reachable = overlayHopDestinations(ledges, fromLedge, fromX, petH)
     const dropDestinations = overlayDropDestinations(ledges, fromLedge, fromX)
+    const lowerPosition = overlayLowerPosition(fromLedge.y, workArea)
 
     const idleAction = overlayPlannedAction(
       overlayDropAllowed(currentLedge !== ledges[0], dropDestinations.length > 0),
       supportMisses,
-      settleAfterDrag || forceWalkNext
+      settleAfterDrag || forceWalkNext,
+      Math.random,
+      lowerPosition
     )
 
     if (idleAction === 'drop') {
@@ -913,7 +932,7 @@ export function startPetOverlayRoam({
       ignoredDropSurfaceY = support.lostSupport.y
     }
 
-    if (!beginMotion(now, Boolean(draggedSupport))) {
+    if (!beginMotion(now, environment.workArea, Boolean(draggedSupport))) {
       schedulePlan()
 
       return
