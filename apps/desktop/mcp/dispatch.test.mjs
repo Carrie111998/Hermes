@@ -88,3 +88,23 @@ test('boundary intact: ui_inspect under the same dead-CDP deps still refuses', a
 
   await assert.rejects(() => dispatchTool('ui_inspect', { selector: 'div' }, deps), /No CDP target/)
 })
+
+// --- P1: dispatch → handleAct ctx contract (real handler, not a mock) ---
+
+test('P1 (RED): dispatch → real handleAct reaches CDP input — no ensureCdp hole', async () => {
+  const sends = []
+  const live = {
+    send: async (m, p) => { sends.push({ m, p }); return { ok: true } },
+    eval: async () => true,
+    on: () => {}
+  }
+  const realHandleAct = (await import('./tools/act.mjs')).handleAct
+  const deps = baseDeps({
+    handleAct: realHandleAct,
+    CFG: { allowAct: true }
+  })
+  deps.connect = async () => live // dispatch's connect() result IS the ctx.cdp
+
+  const out = await dispatchTool('ui_click', { selector: '.btn' }, deps)
+  assert.ok(sends.length > 0, 'real handleAct must produce CDP input from the dispatch ctx; got: ' + JSON.stringify(out).slice(0, 120))
+})

@@ -26,8 +26,7 @@ function mockCdp() {
 const ctx = (cdp) => ({
   cdp,
   resolveSelector: (s) => s,
-  evalBounded: async (expr) => 'eval-result',
-  ensureCdp: async () => cdp
+  evalBounded: async (expr) => 'eval-result'
 })
 
 test('ui_type uses Input.insertText (not dispatchKeyEvent char) — P0 regression fix', async () => {

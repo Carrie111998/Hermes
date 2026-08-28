@@ -114,8 +114,11 @@ export const actTools = [
 ]
 
 export async function handleAct(name, args, ctx) {
-  // One shared connection with friendly errors — same instance read tools use.
-  const cdp = await ctx.ensureCdp()
+  // Dispatch connects AND attests first, then hands us the live handle —
+  // same contract as handleFlow (ctx.cdp). Bugbot P1: this used to call
+  // ctx.ensureCdp(), which dispatch never provided, so every act tool
+  // threw before any CDP input was sent.
+  const cdp = ctx.cdp
 
   switch (name) {
     case 'ui_click':
