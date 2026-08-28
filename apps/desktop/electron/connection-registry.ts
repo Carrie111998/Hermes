@@ -449,6 +449,43 @@ export function registrySourceOwnsPrimaryBackend(
   return Boolean(id) && id === registry.primary && resolvedConnectionId(registry, descriptor) === id
 }
 
+/**
+ * Reuse the already-running v1 primary for the registry's matching shared
+ * remote. The returned descriptor must retain the shared-host routing marker:
+ * registry REST dispatch relies on it to append the requested profile rather
+ * than reading the dashboard process's launch home.
+ */
+export async function reuseMatchingPrimarySharedBackend(opts: {
+  connectionId: string
+  ensurePrimary: () => Promise<ResolvedConnectionDescriptor>
+  profile: null | string | undefined
+  registry: ConnectionRegistry
+  source: RegistryConnection
+}) {
+  const { connectionId, ensurePrimary, profile, registry, source } = opts
+
+  if (
+    connectionId !== registry.primary ||
+    source.kind === 'local' ||
+    source.kind === 'ssh'
+  ) {
+    return null
+  }
+
+  const descriptor = await ensurePrimary()
+
+  if (!registrySourceOwnsPrimaryBackend(registry, connectionId, descriptor)) {
+    return null
+  }
+
+  return {
+    ...descriptor,
+    profile: String(profile ?? '').trim() || 'default',
+    connectionId,
+    sharedRemote: true as const
+  }
+}
+
 function normalizedSshTarget(route: { host?: unknown; port?: unknown; user?: unknown }): null | string {
   const ssh = normalizeSshConfig({ ...route, mode: 'ssh' })
 

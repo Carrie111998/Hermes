@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
+import { pathForRegistryBackendRequest } from './connection-config'
 import type { ConnectionRegistry } from './connection-registry'
 import {
   agentHandle,
@@ -33,6 +34,7 @@ import {
   removeConnection,
   resolvedConnectionId,
   resolveRegistryLocalRoute,
+  reuseMatchingPrimarySharedBackend,
   reuseMatchingPrimarySshBackend,
   setConnectionLaunchMode,
   setLastUsedConnection,
@@ -260,6 +262,38 @@ test('registry primary reuses a matching primary backend descriptor', () => {
 
   assert.equal(registrySourceOwnsPrimaryBackend(registry, 'hermes-vps', descriptor), true)
   assert.equal(registrySourceOwnsPrimaryBackend(registry, LOCAL_CONNECTION_ID, descriptor), false)
+})
+
+test('reused shared primary scopes registry REST requests to the requested profile', async () => {
+  const registry = normalizeRegistry({
+    version: REGISTRY_VERSION,
+    primary: 'shared-remote',
+    launchMode: 'primary',
+    lastUsed: 'shared-remote',
+    connections: [
+      { id: LOCAL_CONNECTION_ID, kind: 'local', label: 'This device' },
+      { id: 'shared-remote', kind: 'remote', label: 'Shared remote', url: 'https://remote.example' }
+    ]
+  })
+  const source = registry.connections.find(connection => connection.id === registry.primary)!
+  const descriptor = await reuseMatchingPrimarySharedBackend({
+    connectionId: source.id,
+    ensurePrimary: async () => ({
+      connectionId: source.id,
+      mode: 'remote',
+      remoteKind: 'url'
+    }),
+    profile: 'beta',
+    registry,
+    source
+  })
+
+  assert.ok(descriptor)
+  assert.equal(descriptor.sharedRemote, true)
+  assert.equal(
+    pathForRegistryBackendRequest('/api/model/info', 'beta', descriptor),
+    '/api/model/info?profile=beta'
+  )
 })
 
 test('resolvedConnectionId identifies local and migrated remote descriptors', () => {
