@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextvars
 import importlib
 import json
 import logging
@@ -310,6 +311,33 @@ _loop: asyncio.AbstractEventLoop | None = None
 _loop_thread: threading.Thread | None = None
 _loop_lock = threading.Lock()
 
+
+def _scoped_thread(target, *, name: str) -> threading.Thread:
+    """Build a daemon thread that inherits the caller's contextvars.
+
+    A bare ``threading.Thread`` does NOT inherit ContextVars, and the active
+    profile's credentials live in one: ``agent.secret_scope`` installs them
+    per-turn via ``set_secret_scope``. Any ``get_secret`` call on a bare thread
+    therefore sees no scope and silently falls through to ``os.environ`` --
+    which under the gateway does not carry profile keys -- resolving to "".
+
+    That is not hypothetical: it blanked HINDSIGHT_API_LLM_API_KEY on disk
+    (the profile env is rebuilt with O_TRUNC on daemon start) and, because
+    ``_get_client`` caches, could pin an empty-key client for a whole session.
+
+    Threads built here run inside a snapshot of the spawning context, so the
+    profile scope propagates exactly as it does into the agent's worker thread.
+    The thread is returned UNSTARTED so callers keep their existing
+    assign-then-start ordering (``_ensure_writer`` publishes ``_writer_thread``
+    before starting, so a concurrent caller can't race in a second writer).
+
+    NOTE: for per-provider (single-profile) threads only. The shared
+    process-global loop thread must NOT use it -- see ``_get_loop``.
+    """
+    ctx = contextvars.copy_context()
+    return threading.Thread(target=lambda: ctx.run(target), daemon=True, name=name)
+
+
 # Sentinel pushed to the per-provider retain queue to wake the writer for a
 # clean exit. A unique object so it can never collide with a real job.
 _WRITER_SENTINEL = object()
@@ -327,6 +355,13 @@ def _get_loop() -> asyncio.AbstractEventLoop:
             asyncio.set_event_loop(_loop)
             _loop.run_forever()
 
+        # Deliberately NOT run under a copied context: this loop is a
+        # process-global singleton shared by every profile. Copying the first
+        # caller's context into it would pin that profile's secret scope for
+        # the lifetime of the process and leak it to every later profile's
+        # coroutines. Work is submitted here via run_coroutine_threadsafe from
+        # an already-scoped caller, so the loop thread itself stays
+        # context-free. See _scoped_thread for the per-provider case.
         _loop_thread = threading.Thread(target=_run, daemon=True, name="hindsight-loop")
         _loop_thread.start()
         return _loop
@@ -1323,11 +1358,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # If the previous writer exited (e.g. after a prior shutdown), reset
         # the flag so this fresh writer is allowed to drain new jobs.
         self._shutting_down.clear()
-        thread = threading.Thread(
-            target=self._writer_loop,
-            daemon=True,
-            name="hindsight-writer",
-        )
+        thread = _scoped_thread(self._writer_loop, name="hindsight-writer")
         self._writer_thread = thread
         # Keep the legacy _sync_thread alias pointing at the writer so any
         # external code that joins _sync_thread keeps working.
@@ -1853,7 +1884,7 @@ class HindsightMemoryProvider(MemoryProvider):
                         f.write(f"\n=== Daemon startup failed: {e} ===\n")
                         traceback.print_exc(file=f)
 
-            t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
+            t = _scoped_thread(_start_daemon, name="hindsight-daemon-start")
             t.start()
 
     def system_prompt_block(self) -> str:
@@ -2010,7 +2041,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._prefetch_result = recalled.text
                     self._prefetch_count = recalled.count
 
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
+        self._prefetch_thread = _scoped_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:

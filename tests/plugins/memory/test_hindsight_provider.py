@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from agent.secret_scope import get_secret, reset_secret_scope, set_secret_scope
+import plugins.memory.hindsight as hindsight_mod
 from hermes_cli.memory_setup import _CANCELLED
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
@@ -29,6 +32,7 @@ from plugins.memory.hindsight import (
     _load_simple_env,
     _build_embedded_profile_env,
     _materialize_embedded_profile_env,
+    _scoped_thread,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -1763,6 +1767,148 @@ class TestEmbeddedProfileEnvKeyPreservation:
         env = _build_embedded_profile_env(dict(self._CONFIG))
 
         assert env["HINDSIGHT_API_LLM_API_KEY"] == ""
+
+
+class TestSecretScopePropagationIntoThreads:
+    """Regression tests: background threads must inherit the profile secret scope.
+
+    Root cause of the live key wipe. ``agent.secret_scope`` keeps the active
+    profile's credentials in a ContextVar, but a bare ``threading.Thread`` does
+    not inherit ContextVars. Every ``get_secret`` on such a thread saw no scope
+    and fell through to ``os.environ``, which under the gateway does not carry
+    profile keys -- so it resolved to "". The daemon-start thread then rebuilt
+    the profile env (O_TRUNC) and wrote that empty value over the good key.
+
+    This was deterministic, not a transient: it reproduced on every start under
+    gateway conditions (scope installed, key absent from os.environ).
+    """
+
+    def test_bare_thread_loses_scope_this_is_the_bug(self, monkeypatch):
+        """Pins the underlying stdlib behavior the fix compensates for."""
+        monkeypatch.delenv("HINDSIGHT_LLM_API_KEY", raising=False)
+        token = set_secret_scope({"HINDSIGHT_LLM_API_KEY": "sk-scoped"})
+        try:
+            seen = {}
+
+            def work():
+                seen["key"] = get_secret("HINDSIGHT_LLM_API_KEY", "")
+
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            t.join(timeout=5)
+
+            assert get_secret("HINDSIGHT_LLM_API_KEY", "") == "sk-scoped"
+            assert seen["key"] == "", "bare thread unexpectedly saw the scope"
+        finally:
+            reset_secret_scope(token)
+
+    def test_scoped_thread_inherits_the_secret_scope(self, monkeypatch):
+        """The fix: _scoped_thread carries the profile scope across the boundary."""
+        monkeypatch.delenv("HINDSIGHT_LLM_API_KEY", raising=False)
+        token = set_secret_scope({"HINDSIGHT_LLM_API_KEY": "sk-scoped"})
+        try:
+            seen = {}
+
+            def work():
+                seen["key"] = get_secret("HINDSIGHT_LLM_API_KEY", "")
+
+            t = _scoped_thread(work, name="test-scoped")
+            t.start()
+            t.join(timeout=5)
+
+            assert seen["key"] == "sk-scoped", (
+                "scoped thread did not inherit the profile secret scope"
+            )
+        finally:
+            reset_secret_scope(token)
+
+    def test_scoped_thread_is_returned_unstarted(self):
+        """Callers assign before starting; returning a live thread would widen
+        the duplicate-writer race in _ensure_writer."""
+        t = _scoped_thread(lambda: None, name="test-unstarted")
+        assert not t.is_alive()
+        assert t.daemon
+        assert t.name == "test-unstarted"
+        t.start()
+        t.join(timeout=5)
+
+    def test_profile_env_rebuild_keeps_key_on_scoped_thread(self, tmp_path, monkeypatch):
+        """End-to-end: the exact wipe path, now on a scope-carrying thread."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("HINDSIGHT_LLM_API_KEY", raising=False)
+        config = {
+            "profile": "scoped",
+            "llm_provider": "openai_compatible",
+            "llm_model": "gpt-4o-mini",
+        }
+        env_path = tmp_path / ".hindsight" / "profiles" / "scoped.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+
+        token = set_secret_scope({"HINDSIGHT_LLM_API_KEY": "sk-live-profile-key"})
+        try:
+            built = {}
+
+            def work():
+                _materialize_embedded_profile_env(dict(config))
+                built["key"] = _load_simple_env(env_path).get("HINDSIGHT_API_LLM_API_KEY")
+
+            t = _scoped_thread(work, name="test-materialize")
+            t.start()
+            t.join(timeout=10)
+        finally:
+            reset_secret_scope(token)
+
+        assert built["key"] == "sk-live-profile-key", (
+            "the profile env rebuild lost the key on a background thread"
+        )
+
+    def test_shared_loop_thread_does_not_leak_scope_between_profiles(self, monkeypatch):
+        """The process-global loop is shared by every profile, so the profile
+        that happens to start it must not pin its scope onto later work.
+
+        Note asyncio copies the *submitting* context into each Handle, so work
+        submitted from a scoped caller correctly sees that caller's scope. The
+        property under test is the leak direction: profile A starting the loop
+        must not bleed A's credentials into profile B's later submissions.
+        """
+        monkeypatch.setattr(hindsight_mod, "_loop", None)
+        monkeypatch.setattr(hindsight_mod, "_loop_thread", None)
+        monkeypatch.delenv("HINDSIGHT_LLM_API_KEY", raising=False)
+
+        loop = None
+        seen = {}
+        try:
+            # Profile A starts the shared loop.
+            token_a = set_secret_scope({"HINDSIGHT_LLM_API_KEY": "sk-profile-A"})
+            try:
+                loop = hindsight_mod._get_loop()
+            finally:
+                reset_secret_scope(token_a)
+
+            # Profile B later submits work onto that same loop.
+            token_b = set_secret_scope({"HINDSIGHT_LLM_API_KEY": "sk-profile-B"})
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: seen.setdefault(
+                        "key", get_secret("HINDSIGHT_LLM_API_KEY", "")
+                    )
+                )
+                for _ in range(100):
+                    if "key" in seen:
+                        break
+                    time.sleep(0.02)
+            finally:
+                reset_secret_scope(token_b)
+        finally:
+            if loop is not None:
+                loop.call_soon_threadsafe(loop.stop)
+
+        assert "key" in seen, "loop callback never ran"
+        assert seen["key"] != "sk-profile-A", (
+            "the shared loop thread leaked the starting profile's secret scope "
+            "into another profile's work"
+        )
+        assert seen["key"] == "sk-profile-B"
 
 
 class TestPostSetupEnvEncoding:
