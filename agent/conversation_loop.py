@@ -2966,6 +2966,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        model_policy_stop = None
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -3264,6 +3265,32 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    # Final provider-attempt authority boundary: execution
+                    # middleware and provider preflight have already produced
+                    # the exact request this callback would send.
+                    from hermes_cli.model_call_policy import (
+                        enforce_pre_model_call_policy,
+                    )
+
+                    enforce_pre_model_call_policy(
+                        next_api_kwargs,
+                        call_kind="conversation",
+                        task_id=effective_task_id,
+                        mission_id=os.environ.get("HERMES_KANBAN_MISSION", ""),
+                        profile=os.environ.get("HERMES_PROFILE", ""),
+                        session_id=agent.session_id or "",
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        call_seq=api_call_count,
+                        request_attempt=retry_count,
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        approx_input_tokens=request_pressure_tokens,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -3292,6 +3319,7 @@ def run_conversation(
                     )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
+                from hermes_cli.model_call_policy import ModelCallPolicyHalt
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -3319,6 +3347,11 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
+                except ModelCallPolicyHalt as policy_halt:
+                    model_policy_stop = {
+                        "action": policy_halt.action,
+                        "message": policy_halt.message,
+                    }
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3331,6 +3364,8 @@ def run_conversation(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
+                if model_policy_stop is not None:
+                    break
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -6780,6 +6815,31 @@ def run_conversation(
                     # stale request.
                     break
         
+        if model_policy_stop is not None:
+            # The request never reached the provider, so it must not consume a
+            # model-call iteration. The policy decision itself is the terminal
+            # result for this turn and is persisted by finalize_turn.
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            if thinking_spinner:
+                thinking_spinner.stop("")
+                thinking_spinner = None
+            if agent.thinking_callback:
+                agent.thinking_callback("")
+            action = str(model_policy_stop.get("action") or "deny")
+            final_response = str(
+                model_policy_stop.get("message")
+                or "Model request denied by policy."
+            )
+            failed = True
+            _turn_exit_reason = f"model_policy_{action}"
+            agent._emit_status(f"⛔ {final_response}")
+            break
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed

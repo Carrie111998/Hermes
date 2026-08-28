@@ -1219,6 +1219,36 @@ class TestForceReloadSymmetry:
         assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
         hold.set()
 
+    def test_pre_tool_call_dispatch_exception_does_not_reach_tool_handler(
+        self, monkeypatch
+    ):
+        """A policy-dispatch defect must block instead of running the tool."""
+        import json
+
+        from hermes_cli.model_call_policy import (
+            PRE_TOOL_CALL_POLICY_FAILURE_MESSAGE,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        mock_registry = MagicMock()
+        mock_registry.dispatch.return_value = json.dumps({"ok": True})
+
+        with patch("model_tools.registry", mock_registry):
+            from model_tools import handle_function_call
+
+            result = handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                session_id="s1",
+            )
+
+        mock_registry.dispatch.assert_not_called()
+        assert PRE_TOOL_CALL_POLICY_FAILURE_MESSAGE in result
+
 
 class TestPreToolCallBlocking:
     """Tests for the pre_tool_call block directive helper."""

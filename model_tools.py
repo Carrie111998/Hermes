@@ -1430,23 +1430,22 @@ def handle_function_call(
         # the hook on that same pass. When skip=True, the caller already
         # fired it — do nothing here.
         if not skip_pre_tool_call_hook:
-            block_message: Optional[str] = None
-            try:
-                from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-                block_message, modified_args = _dispatch_pre_tool_call_hooks(
-                    function_name,
-                    function_args,
-                    task_id=task_id or "",
-                    session_id=session_id or "",
-                    tool_call_id=tool_call_id or "",
-                    turn_id=turn_id or "",
-                    api_request_id=api_request_id or "",
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-                if modified_args is not None:
-                    function_args = modified_args
-            except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
+            from hermes_cli.model_call_policy import (
+                dispatch_pre_tool_call_fail_closed,
+            )
+
+            block_message, modified_args = dispatch_pre_tool_call_fail_closed(
+                function_name,
+                function_args,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            if modified_args is not None:
+                function_args = modified_args
 
             if block_message is not None:
                 result = tool_error(block_message)

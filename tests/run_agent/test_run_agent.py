@@ -2370,6 +2370,35 @@ class TestConcurrentToolExecution:
         assert json.loads(result) == {"error": "Blocked"}
         assert agent._turns_since_memory == 5
 
+    def test_agent_tool_dispatch_exception_fails_closed(
+        self, agent, monkeypatch
+    ):
+        from agent import tool_executor
+        from hermes_cli.model_call_policy import (
+            PRE_TOOL_CALL_POLICY_FAILURE_MESSAGE,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("broken dispatcher")
+            ),
+        )
+        dispatched = []
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="terminal",
+            function_args={"command": "true"},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda args: dispatched.append(args) or "ok",
+        )
+
+        assert dispatched == []
+        assert outcome.blocked is True
+        assert PRE_TOOL_CALL_POLICY_FAILURE_MESSAGE in outcome.result
+
 
 
 
@@ -3087,6 +3116,53 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_pre_model_call_policy_denies_before_provider(self, agent, monkeypatch):
+        self._setup_agent(agent)
+        policy_payload = {}
+        policy_payloads = []
+
+        def _has_hook(name):
+            return name == "pre_model_call_policy"
+
+        def _deny(_name, **payload):
+            if _name != "pre_model_call_policy":
+                return []
+            policy_payload.update(payload)
+            policy_payloads.append(dict(payload))
+            return [{"action": "deny", "message": "mission budget exhausted"}]
+
+        def _rewrite_then_call(request, next_call, **_context):
+            realized_request = dict(request)
+            realized_request["model"] = "middleware-selected-model"
+            return next_call(realized_request)
+
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", _has_hook)
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _deny)
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_llm_execution_middleware",
+            _rewrite_then_call,
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", task_id="slice-1")
+
+        agent.client.chat.completions.create.assert_not_called()
+        assert result["final_response"] == "mission budget exhausted"
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert result["turn_exit_reason"] == "model_policy_deny"
+        assert policy_payload["policy_schema_version"] == 1
+        assert policy_payload["task_id"] == "slice-1"
+        assert policy_payload["call_seq"] == 1
+        assert policy_payload["request_attempt"] == 0
+        assert policy_payload["message_utf8_bytes"] > 0
+        assert policy_payload["model"] == "middleware-selected-model", policy_payloads
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
