@@ -103,6 +103,31 @@ def _assert_refused_for_the_right_reason(output):
         )
 
 
+def _assert_process_gone(pid, timeout=15.0):
+    """The orphan was reparented to init, so it cannot be waited on — poll it.
+
+    Uses psutil rather than ``os.kill(pid, 0)`` so the check carries no
+    platform-specific signal semantics of its own.
+    """
+    import psutil
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            proc = psutil.Process(pid)
+            # A zombie is finished work waiting to be reaped by init; the
+            # attacking process is no longer running either way.
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                return
+        except psutil.NoSuchProcess:
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        f"the orphaned grandchild (pid {pid}) was still running {timeout}s "
+        f"after publishing its result"
+    )
+
+
 def _run_in_tool_pty(board, command, timeout=60):
     """Run *command* through the real terminal-tool PTY, inside a real tool call.
 
@@ -184,9 +209,21 @@ def test_an_orphaned_process_cannot_approve(board):
     escape. Here it changes nothing, because ancestry is never consulted.
 
     (``setsid`` is not a binary on macOS, hence ``os.setsid`` in Python.)
+
+    The grandchild publishes its result ATOMICALLY. It writes the CLI's whole
+    output to a scratch file, closes that file only after ``subprocess.run``
+    has returned, and only then renames it onto ``marker`` — a rename within
+    one directory is atomic on POSIX, so ``marker`` never exists half-written.
+    Waiting on "the marker is non-empty" instead races the CLI's own writes: it
+    prints the plan header before the refusal, so a poll landing between the
+    two reads a header with no refusal and fails on a partial read rather than
+    on behaviour. The rename also makes an unfinished CLI *fail* this test
+    rather than silently weaken it — no marker is ever published.
     """
     tid = _seed(board)
     marker = board / "orphan.out"
+    scratch = board / "orphan.out.partial"
+    pidfile = board / "orphan.pid"
     script = board / "orphan.py"
     script.write_text(
         "import os, sys, subprocess\n"
@@ -195,23 +232,41 @@ def test_an_orphaned_process_cannot_approve(board):
         "os.setsid()\n"
         "if os.fork():\n"
         "    os._exit(0)\n"
+        # The orphan cannot be waited on, so it names itself for the cleanup
+        # assertion at the end of the test.
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
         f"env = dict(os.environ, HERMES_HOME={str(board)!r},\n"
         f"           HERMES_KANBAN_DB={str(board / 'kanban.db')!r})\n"
-        f"with open({str(marker)!r}, 'w') as fh:\n"
-        f"    subprocess.run([{HERMES_BIN!r}, 'project', 'approve-plan', {tid!r}],\n"
-        "                   stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,\n"
-        "                   env=env)\n"
+        f"fh = open({str(scratch)!r}, 'w')\n"
+        f"subprocess.run([{HERMES_BIN!r}, 'project', 'approve-plan', {tid!r}],\n"
+        "               stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,\n"
+        "               env=env)\n"
+        # Publish only a COMPLETE result: flush, fsync, close, then rename.
+        # Every line above must have finished for the rename to happen at all.
+        "fh.flush()\n"
+        "os.fsync(fh.fileno())\n"
+        "fh.close()\n"
+        f"os.rename({str(scratch)!r}, {str(marker)!r})\n"
         "os._exit(0)\n"
     )
     _run_in_tool_pty(board, f"{sys.executable} {script}", timeout=45)
 
     deadline = time.time() + 90
-    while time.time() < deadline and not (marker.exists() and marker.stat().st_size):
-        time.sleep(0.5)
-    output = marker.read_text(errors="replace") if marker.exists() else ""
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.1)
+    assert marker.exists(), (
+        "the orphaned grandchild never published a complete result within 90s "
+        "— the CLI did not return, so this test proved nothing about the gate"
+    )
+    output = marker.read_text(errors="replace")
     assert output, "orphaned child produced no output; test is not meaningful"
     _assert_refused_for_the_right_reason(output)
     _assert_gate_intact(board, tid)
+
+    # Nothing the attack created outlives the test: the scratch file was
+    # renamed away, and the orphan itself has actually exited.
+    assert not scratch.exists(), "a partial result file was left behind"
+    _assert_process_gone(int(pidfile.read_text()))
 
 
 @requires_cli
