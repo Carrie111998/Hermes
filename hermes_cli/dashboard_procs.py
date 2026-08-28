@@ -1082,4 +1082,3 @@ def _reap_orphaned_desktop_local_serves(
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
-
