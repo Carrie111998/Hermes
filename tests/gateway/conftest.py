@@ -361,37 +361,74 @@ def _scan_for_plugin_adapter_antipattern(source: str) -> list[str]:
     return offenses
 
 
-def _fingerprint_gateway_tests() -> str:
-    """Return a short fingerprint that changes when any gateway test file changes.
+def _read_gateway_test_sources(
+    gateway_dir: Path | None = None,
+) -> dict[Path, bytes | None]:
+    """Read every gateway test file's bytes ONCE, for fingerprint AND scan.
 
-    Uses (mtime, size) pairs instead of content hashing — fast to compute
-    (stat-only, no reads) and sufficient for cache invalidation across
-    per-file subprocess runs.
+    A single read is load-bearing, not a micro-optimisation: concurrent agent
+    sessions rewrite files in this SHARED checkout while suites run. When the
+    fingerprint stat()ed the files and the scan then read them separately
+    (the pre-2026-08-28 shape), a rewrite landing between the two produced a
+    verdict cached under a key describing DIFFERENT bytes than were judged —
+    and, because the verdict is persisted and shared, that one racy read
+    could suppress the guard for every concurrent pytest subprocess. Reading
+    once and hashing the same bytes that are scanned makes the cached verdict
+    true of its key by construction (see ``_fingerprint_gateway_tests``).
+    """
+    gateway_dir = gateway_dir if gateway_dir is not None else _GATEWAY_DIR
+    sources: dict[Path, bytes | None] = {}
+    for path in sorted(gateway_dir.rglob("test_*.py")):
+        try:
+            sources[path] = path.read_bytes()
+        except OSError:
+            sources[path] = None  # vanished mid-walk; keyed as missing
+    return sources
+
+
+def _fingerprint_gateway_tests(sources: dict[Path, bytes | None]) -> str:
+    """A short fingerprint of the EXACT bytes handed to the scan.
+
+    CONTENT hashes, deliberately not (mtime, size): a stat-based key admits
+    two suppressions a content key cannot — (a) the stat-then-read TOCTOU
+    above, where the key describes bytes the scan never saw, and (b) a
+    same-size rewrite with a restored mtime (editors and git checkouts
+    preserve sizes routinely; ``os.utime`` restores mtimes), which reuses a
+    stale "clean" verdict for content that was never scanned. With the key
+    derived from the scanned bytes themselves, a concurrent process whose
+    files differ computes a different key and rescans — a stale shared
+    verdict can no longer suppress the guard. Cost: hashing ~520 files'
+    bytes, already in memory; the expensive part this cache exists to
+    amortise is the AST walk, not the read.
     """
     import hashlib
 
     h = hashlib.sha256()
-    for path in sorted(_GATEWAY_DIR.rglob("test_*.py")):
-        try:
-            st = path.stat()
-            h.update(f"{path.name}:{st.st_mtime_ns}:{st.st_size}".encode())
-        except OSError:
+    for path in sorted(sources):
+        data = sources[path]
+        if data is None:
             h.update(f"{path.name}:missing".encode())
+        else:
+            h.update(f"{path.name}:{len(data)}:".encode())
+            h.update(hashlib.sha256(data).digest())
     return h.hexdigest()[:16]
 
 
-def _run_adapter_antipattern_scan() -> list[str]:
-    """Scan gateway test files for the plugin-adapter anti-pattern.
+def _run_adapter_antipattern_scan(sources: dict[Path, bytes | None]) -> list[str]:
+    """Scan the pre-read gateway test sources for the anti-pattern.
 
-    Returns a list of violation strings (empty if clean).
+    Returns a list of violation strings (empty if clean). Operates on the
+    same bytes the fingerprint hashed — never re-reads the disk.
     """
     violations: list[str] = []
-    for path in _GATEWAY_DIR.rglob("test_*.py"):
+    for path, data in sources.items():
         if path.name in {"_plugin_adapter_loader.py", "conftest.py"}:
             continue
+        if data is None:
+            continue
         try:
-            source = path.read_text(encoding="utf-8")
-        except OSError:
+            source = data.decode("utf-8")
+        except UnicodeDecodeError:
             continue
         # Fast string pre-filter: skip files that can't possibly violate.
         # A violating file MUST contain both (a) an adapter/plugins/platforms
@@ -406,43 +443,23 @@ def _run_adapter_antipattern_scan() -> list[str]:
             continue
         offenses = _scan_for_plugin_adapter_antipattern(source)
         if offenses:
-            violations.append(
-                f"  {path.relative_to(_GATEWAY_DIR.parent.parent)}:\n    "
-                + "\n    ".join(offenses)
-            )
+            try:
+                shown = path.relative_to(_GATEWAY_DIR.parent.parent)
+            except ValueError:  # scratch dirs in tests of this guard
+                shown = path
+            violations.append(f"  {shown}:\n    " + "\n    ".join(offenses))
     return violations
 
 
-def pytest_configure(config):
-    """Reject plugin-adapter tests that use the sys.path anti-pattern.
+def _adapter_guard_check(gateway_dir: Path, cache_dir: Path) -> None:
+    """Run the anti-pattern guard over ``gateway_dir``, with a shared cache.
 
-    Runs once per pytest session on the controller, BEFORE any xdist
-    worker is spawned. If any file under ``tests/gateway/`` matches the
-    anti-pattern, we fail the whole session with a clear message —
-    before a polluted ``sys.path`` can cascade across workers.
-
-    **Performance**: in the per-file subprocess isolation model (no xdist),
-    every subprocess is a "controller" — so the naive scan would run 257
-    times, each costing ~1s of AST walking.  We avoid this with two
-    strategies:
-
-    1. **Tight string pre-filter**: a file can only violate if it contains
-       *both* an adapter/plugins/platforms reference *and* a sys.path
-       manipulation or bare ``import adapter``.  This drops ~95% of files
-       from needing AST parsing.
-    2. **File-locked cache**: the scan result is cached in
-       ``.pytest-cache/gw-adapter-guard-<fingerprint>`` keyed on a
-       fingerprint of the gateway test file mtimes/sizes.  Concurrent
-       subprocesses acquire a lock; only the first performs the scan;
-       the rest wait and read the cached result.
+    Raises ``pytest.UsageError`` on a violation; returns silently when clean.
+    Factored out of ``pytest_configure`` so the cache-keying semantics are
+    testable end to end (tests/gateway/test_adapter_guard_fingerprint.py).
     """
-    # Only run on the xdist controller (or in non-xdist runs). Skip on
-    # worker subprocesses so we don't scan the filesystem N times.
-    if hasattr(config, "workerinput"):
-        return
-
-    fp = _fingerprint_gateway_tests()
-    cache_dir = Path.cwd() / ".pytest-cache"
+    sources = _read_gateway_test_sources(gateway_dir)
+    fp = _fingerprint_gateway_tests(sources)
     cache_file = cache_dir / f"gw-adapter-guard-{fp}"
     lock_file = cache_dir / f".gw-adapter-guard-{fp}.lock"
 
@@ -483,7 +500,7 @@ def pytest_configure(config):
             raise pytest.UsageError(cached)
 
         # Slow path: this process is the first to acquire the lock.
-        violations = _run_adapter_antipattern_scan()
+        violations = _run_adapter_antipattern_scan(sources)
 
         if violations:
             msg = (
@@ -496,4 +513,38 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
+
+
+def pytest_configure(config):
+    """Reject plugin-adapter tests that use the sys.path anti-pattern.
+
+    Runs once per pytest session on the controller, BEFORE any xdist
+    worker is spawned. If any file under ``tests/gateway/`` matches the
+    anti-pattern, we fail the whole session with a clear message —
+    before a polluted ``sys.path`` can cascade across workers.
+
+    **Performance**: in the per-file subprocess isolation model (no xdist),
+    every subprocess is a "controller" — so the naive scan would run 257
+    times, each costing ~1s of AST walking.  We avoid this with two
+    strategies:
+
+    1. **Tight string pre-filter**: a file can only violate if it contains
+       *both* an adapter/plugins/platforms reference *and* a sys.path
+       manipulation or bare ``import adapter``.  This drops ~95% of files
+       from needing AST parsing.
+    2. **File-locked cache**: the scan result is cached in
+       ``.pytest-cache/gw-adapter-guard-<fingerprint>`` keyed on a
+       fingerprint of the gateway test files' CONTENT — sha256 of the same
+       bytes the scan judged, read once (see ``_read_gateway_test_sources``
+       / ``_fingerprint_gateway_tests`` for why stat-based keying was a
+       race that could suppress the guard for every concurrent subprocess).
+       Concurrent subprocesses acquire a lock; only the first performs the
+       scan; the rest wait and read the cached result.
+    """
+    # Only run on the xdist controller (or in non-xdist runs). Skip on
+    # worker subprocesses so we don't scan the filesystem N times.
+    if hasattr(config, "workerinput"):
+        return
+
+    _adapter_guard_check(_GATEWAY_DIR, Path.cwd() / ".pytest-cache")
 

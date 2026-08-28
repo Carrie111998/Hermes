@@ -21,12 +21,15 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import gc
+import inspect
+import linecache
 import logging
 import os
 import re
 import shutil
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -322,6 +325,112 @@ def _install_sqlite_open_tripwire() -> None:
 
 
 _install_sqlite_open_tripwire()
+
+
+# ── inspect-source snapshot: first read wins for the whole session ──────────
+# Multiple concurrent agent sessions rewrite files in this SHARED checkout
+# while suites run, so a run-time read of a source file can observe a
+# half-written file, or a NEWER file than the code this process imported.
+# Six spellings of run-time source reads exist across ~119 test files
+# (censused 2026-08-27, loops record tier4-hygiene-batch-20260827):
+#
+#   1. ``inspect.getsource`` / ``inspect.getsourcelines``   (the ~88% majority)
+#   2. ``inspect.getsourcefile`` / ``inspect.getfile`` + an explicit read
+#   3. ``Path(mod.__file__).read_text()``
+#   4. bare ``open("pkg/mod.py")``
+#   5. reads via ``<fn>.__code__.co_filename``
+#   6. tree globs (``rglob``/``glob``, then read every hit)
+#
+# Only spelling 1 is intercepted here, because it has ONE choke point that can
+# be pinned with zero call-site edits and zero behavior change when nothing
+# rewrites files: ``inspect`` resolves source through ``linecache``, whose
+# cache entries are ``(size, mtime, lines, fullname)`` 4-tuples — and
+# ``linecache.checkcache`` (called by ``inspect.findsource`` on every
+# getsource, and by traceback formatting) deliberately SKIPS entries whose
+# ``mtime`` is ``None`` (the marker for loader-sourced files). So after the
+# first successful getsource of a file, its linecache entry is rewritten with
+# ``mtime=None``: the first-read snapshot then survives any on-disk rewrite
+# for the rest of the process, and every later getsource sees the same bytes
+# the first one saw — one consistent snapshot per file per session.
+#
+# Spellings 2–6 are deliberately NOT intercepted: hooking ``io.open`` /
+# ``Path.read_text`` / glob machinery globally is far riskier than the
+# disease, and ~88% of the reader files use spelling 1 against one pinned
+# sibling module each. The two whole-tree readers are hardened separately:
+# ``tests/test_test_path_anchoring.py`` judges committed blobs via git, and
+# ``tests/gateway/conftest.py`` keys its cached verdict on content hashes.
+#
+# Concurrency: tests run one file per interpreter
+# (scripts/run_tests_parallel.py) and pytest-xdist is not installed
+# (pyproject dev deps), so this cache is per-process by construction; the
+# RLock only covers tests that call getsource from their own threads, and
+# re-entrancy (inspect.getsource calls inspect.getsourcelines, which is also
+# wrapped).
+#
+# No test legitimately depends on a re-read: the only file mixing getsource
+# with importlib.reload (tests/hermes_cli/test_ignore_user_config_flags.py)
+# never rewrites the source it inspects (verified 2026-08-28).
+#
+# Pinned by tests/test_source_snapshot_cache.py, including a mutation arm of
+# the flag below.
+
+_SOURCE_SNAPSHOT_ENABLED = True  # flipped only by the arm-test mutation script
+_source_snapshot_lock = threading.RLock()
+
+
+def _pin_source_snapshot(filename) -> None:
+    """Make ``filename``'s current linecache entry immune to checkcache.
+
+    Only complete 4-tuple entries with a real mtime are rewritten; lazy
+    1-tuples and loader-sourced entries (mtime already None) are left alone.
+    """
+    if not _SOURCE_SNAPSHOT_ENABLED or not filename:
+        return
+    entry = linecache.cache.get(filename)
+    if entry is None or len(entry) != 4:
+        return
+    size, mtime, lines, fullname = entry
+    if mtime is None:
+        return
+    linecache.cache[filename] = (size, None, lines, fullname)
+
+
+def _install_inspect_source_snapshot() -> None:
+    if getattr(inspect.getsourcelines, "_hermes_source_snapshot", False):
+        return
+
+    _real_getsourcelines = inspect.getsourcelines
+    _real_getsource = inspect.getsource
+
+    def _pin_for(obj) -> None:
+        try:
+            _pin_source_snapshot(inspect.getsourcefile(obj) or inspect.getfile(obj))
+        except (TypeError, OSError):
+            pass
+
+    def _snapshot_getsourcelines(object):
+        with _source_snapshot_lock:
+            result = _real_getsourcelines(object)
+            _pin_for(object)
+            return result
+
+    def _snapshot_getsource(object):
+        with _source_snapshot_lock:
+            result = _real_getsource(object)
+            _pin_for(object)
+            return result
+
+    # Deliberately NOT functools.wraps — same rationale as the PID-scan guard
+    # below: the attribute is the supported way to recognise the wrapper.
+    _snapshot_getsourcelines._hermes_source_snapshot = True
+    _snapshot_getsource._hermes_source_snapshot = True
+    _snapshot_getsourcelines._hermes_source_snapshot_real = _real_getsourcelines
+    _snapshot_getsource._hermes_source_snapshot_real = _real_getsource
+    inspect.getsourcelines = _snapshot_getsourcelines
+    inspect.getsource = _snapshot_getsource
+
+
+_install_inspect_source_snapshot()
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────

@@ -94,6 +94,32 @@ or a regex that stops matching cannot masquerade as a clean tree. The
 widening was itself falsified by planting a violating module under
 ``gateway/`` and confirming this file goes red — not merely by observing that
 it stays green.
+
+THE SCAN JUDGES THE COMMITTED TREE, NOT THE WORKING FILES (2026-08-28).
+This test reads ~3,700 files over a ~2–4s window, and on this box multiple
+concurrent agent sessions rewrite files in the SHARED checkout while suites
+run. A working-tree read can therefore observe a half-written file — an
+undecodable or vanished file turns ``test_every_test_file_was_readable`` red,
+and any transient state is judged as if it were the tree. So the scan now
+pins ``HEAD`` once (``git rev-parse``), lists ``*.py`` blobs with ``git
+ls-tree -r`` and reads them all through ONE ``git cat-file --batch`` process:
+an immutable, internally consistent snapshot that no concurrent rewrite can
+perturb. Measured 2026-08-28 on this box: per-file ``git show`` costs
+108.5 ms/file (~407s for the tree — prohibitive, per-spawn cost on Windows);
+one ``cat-file --batch`` pass reads all 3,750 blobs (73 MB) in ~3.5s,
+comparable to the old 16-thread disk read.
+
+DELIBERATE TRADE-OFF: an uncommitted (new or modified, unstaged or staged)
+violation is invisible to a local run until it is committed. The guard's
+history is violations that LANDED (see above — every incident was caught in
+committed code), and the cron gates (``hermes_repo_test_gate.py``,
+``nightly_gate.py``) judge committed trees, where HEAD content is exactly
+what is under test. Nothing in the prior implementation deliberately targeted
+uncommitted files — it read the working tree only because that is the
+default spelling. When git is unavailable (not a repo, no git binary) the
+scan falls back to the old working-tree walk; ``_Scan.source`` records which
+path ran, and the fallback is pinned by
+``TestScanJudgesTheCommittedTree::test_non_git_root_falls_back_to_the_working_tree``.
 """
 
 from __future__ import annotations
@@ -101,6 +127,8 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -149,6 +177,10 @@ _ONE_PARENT_HOP = re.compile(r"\.\s*parent\b")
 # string literals, and a self-scan would flag them. Nothing is lost — this
 # file's own anchoring is checked directly, see the test named above.
 _SELF = pathlib.Path(__file__).resolve()
+# The same exclusion for the committed-tree snapshot, keyed the way git
+# names blobs (posix-relative). The HEAD blob of this file embeds the same
+# violating literals as the working copy, so both read paths must skip it.
+_SELF_REL = _SELF.relative_to(_REPO_ROOT).as_posix()
 
 # Read the tree on threads. Serial reads of ~2.5k files cost 15-30s on this
 # box (Defender, not decode); 16 threads bring the same bytes back in ~1.7s.
@@ -205,8 +237,11 @@ def _read(path: pathlib.Path) -> tuple[pathlib.Path, str | None]:
 
 
 class _Scan:
-    def __init__(self, scope: str) -> None:
+    def __init__(self, scope: str, source: str = "working-tree") -> None:
         self.scope = scope
+        # Which bytes were judged: "HEAD <sha12>" for the committed-tree
+        # snapshot, "working-tree" for the git-unavailable fallback.
+        self.source = source
         self.files_read = 0
         self.subscript_occurrences = 0
         self.chain_occurrences = 0
@@ -216,6 +251,102 @@ class _Scan:
     @property
     def occurrences(self) -> int:
         return self.subscript_occurrences + self.chain_occurrences
+
+
+# ── committed-tree snapshot ────────────────────────────────────────────────
+# See "THE SCAN JUDGES THE COMMITTED TREE" in the module docstring. HEAD is
+# pinned once; every blob is read from the object store through a single
+# ``git cat-file --batch`` process, so the whole scan sees one immutable
+# commit no matter what concurrent sessions do to the working files — even a
+# ``git commit`` landing mid-scan cannot shift the pinned sha.
+
+
+class _TreeSnapshot:
+    __slots__ = ("commit", "blobs")
+
+    def __init__(self, commit: str, blobs: dict[str, bytes | None]) -> None:
+        self.commit = commit
+        self.blobs = blobs  # posix rel path -> bytes (None: unreadable blob)
+
+
+def _read_committed_tree(repo_root: pathlib.Path) -> _TreeSnapshot | None:
+    """All ``*.py`` blobs at ``repo_root``'s HEAD, or None if git can't say.
+
+    One ``cat-file --batch`` process fed by a writer thread — measured
+    2026-08-28: 3,750 blobs / 73 MB in ~3.5s, versus 108.5 ms per ``git
+    show`` spawn (~407s for the tree).
+    """
+
+    def _git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            check=True,
+            timeout=120,
+        ).stdout
+
+    try:
+        commit = _git("rev-parse", "HEAD").decode("ascii").strip()
+        listing = _git("ls-tree", "-r", "-z", "--name-only", commit)
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+
+    paths = [
+        p.decode("utf-8", "surrogateescape")
+        for p in listing.split(b"\0")
+        if p.endswith(b".py")
+    ]
+    paths = [p for p in paths if "\n" not in p]  # batch protocol is line-based
+
+    blobs: dict[str, bytes | None] = {}
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", str(repo_root), "cat-file", "--batch"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+    except OSError:
+        return None
+    try:
+        def _feed() -> None:
+            try:
+                for p in paths:
+                    proc.stdin.write(f"{commit}:{p}\n".encode())
+                proc.stdin.close()
+            except OSError:
+                pass  # reader sees EOF and stops
+
+        threading.Thread(target=_feed, daemon=True).start()
+        out = proc.stdout
+        for p in paths:
+            header = out.readline().split()
+            if len(header) == 3 and header[1] == b"blob":
+                size = int(header[2])
+                data = out.read(size)
+                out.read(1)  # trailing LF
+                blobs[p] = data if len(data) == size else None
+            else:
+                blobs[p] = None  # "missing" or truncated stream
+                if not header:
+                    break
+    finally:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+    return _TreeSnapshot(commit, blobs)
+
+
+# One snapshot per repo root per process: both module-scoped scans (tests /
+# non-tests) judge the SAME commit and pay the read once.
+_TREE_SNAPSHOTS: dict[pathlib.Path, _TreeSnapshot | None] = {}
+
+
+def _tree_snapshot(repo_root: pathlib.Path) -> _TreeSnapshot | None:
+    if repo_root not in _TREE_SNAPSHOTS:
+        _TREE_SNAPSHOTS[repo_root] = _read_committed_tree(repo_root)
+    return _TREE_SNAPSHOTS[repo_root]
 
 
 # Never descend into these. ``.claude`` is the load-bearing one — see the
@@ -238,7 +369,10 @@ _PRUNED_DIRS = frozenset({
 
 
 def _walk_py(
-    start: pathlib.Path, *, skip_top_level: frozenset[str]
+    start: pathlib.Path,
+    *,
+    skip_top_level: frozenset[str],
+    root: pathlib.Path | None = None,
 ) -> list[pathlib.Path]:
     """Collect ``*.py`` under ``start``, pruning as we go.
 
@@ -246,10 +380,11 @@ def _walk_py(
     micro-optimisation: ``rglob`` would enumerate every sibling worktree in
     full before anything got a chance to reject it.
     """
+    root = root if root is not None else _REPO_ROOT
     found: list[pathlib.Path] = []
     for dirpath, dirnames, filenames in os.walk(start):
         here = pathlib.Path(dirpath)
-        rel_dir = here.relative_to(_REPO_ROOT)
+        rel_dir = here.relative_to(root)
         dirnames[:] = [d for d in dirnames if d not in _PRUNED_DIRS]
         if rel_dir == pathlib.Path("."):
             dirnames[:] = [d for d in dirnames if d not in skip_top_level]
@@ -257,28 +392,74 @@ def _walk_py(
     return sorted(found)
 
 
-def _scan(scope: str) -> _Scan:
-    scan = _Scan(scope)
+def _tally(scan: _Scan, rel: pathlib.PurePath, source: str) -> None:
+    """Count one file's occurrences/violations into ``scan``."""
+    scan.files_read += 1
+    subscript, chain = _hop_counts(source)
+    scan.subscript_occurrences += len(subscript)
+    scan.chain_occurrences += len(chain)
+    limit = _root_hop_count(rel)
+    scan.violations.extend(
+        (rel.as_posix(), n, limit) for n in subscript + chain if n > limit
+    )
+
+
+def _scan_snapshot(scope: str, snap: _TreeSnapshot) -> _Scan:
+    """Judge the committed blobs of one pinned HEAD."""
+    scan = _Scan(scope, source=f"HEAD {snap.commit[:12]}")
+    self_rel = _SELF_REL
+    for rel_str in sorted(snap.blobs):
+        if rel_str == self_rel:
+            continue
+        rel = pathlib.PurePosixPath(rel_str)
+        if _PRUNED_DIRS.intersection(rel.parts):
+            continue
+        if (scope == "tests") != (rel.parts[0] == "tests"):
+            continue
+        data = snap.blobs[rel_str]
+        if data is None:
+            scan.unreadable.append(rel_str)
+            continue
+        try:
+            source = data.decode("utf-8")
+        except UnicodeDecodeError:
+            scan.unreadable.append(rel_str)
+            continue
+        _tally(scan, rel, source)
+    return scan
+
+
+def _scan_working_tree(scope: str, repo_root: pathlib.Path) -> _Scan:
+    """Fallback for a checkout git cannot describe: judge the working files.
+
+    This is the pre-2026-08-28 behavior, kept only for non-git checkouts —
+    it is exposed to mid-scan rewrites by concurrent sessions.
+    """
+    scan = _Scan(scope, source="working-tree")
     if scope == "tests":
-        paths = _walk_py(_TESTS_DIR, skip_top_level=frozenset())
+        paths = _walk_py(
+            repo_root / "tests", skip_top_level=frozenset(), root=repo_root
+        )
     else:
-        paths = _walk_py(_REPO_ROOT, skip_top_level=frozenset({"tests"}))
+        paths = _walk_py(
+            repo_root, skip_top_level=frozenset({"tests"}), root=repo_root
+        )
     paths = [p for p in paths if p.resolve() != _SELF]
     with ThreadPoolExecutor(max_workers=_READ_WORKERS) as pool:
         for path, source in pool.map(_read, paths):
-            rel = path.relative_to(_REPO_ROOT)
+            rel = path.relative_to(repo_root)
             if source is None:
                 scan.unreadable.append(rel.as_posix())
                 continue
-            scan.files_read += 1
-            subscript, chain = _hop_counts(source)
-            scan.subscript_occurrences += len(subscript)
-            scan.chain_occurrences += len(chain)
-            limit = _root_hop_count(rel)
-            scan.violations.extend(
-                (rel.as_posix(), n, limit) for n in subscript + chain if n > limit
-            )
+            _tally(scan, rel, source)
     return scan
+
+
+def _scan(scope: str, repo_root: pathlib.Path = _REPO_ROOT) -> _Scan:
+    snap = _tree_snapshot(repo_root)
+    if snap is not None:
+        return _scan_snapshot(scope, snap)
+    return _scan_working_tree(scope, repo_root)
 
 
 def _scan_tests_tree() -> _Scan:
@@ -626,6 +807,111 @@ class TestScanScoping:
             if _PRUNED_DIRS.intersection(p.relative_to(_REPO_ROOT).parts)
         ]
         assert not offenders, f"walk entered a pruned dir: {offenders[:5]}"
+
+
+class TestScanJudgesTheCommittedTree:
+    """The scan must judge HEAD blobs, not whatever is on disk mid-write.
+
+    Concurrent sessions rewrite files in the shared checkout while suites
+    run; a working-tree read can see a half-written file. These tests pin
+    the semantics with a scratch git repo: the working file and HEAD are
+    made to DISAGREE, and the scan must side with HEAD in both directions.
+    """
+
+    _VIOLATION = (
+        "import pathlib\n"
+        "ROOT = pathlib.Path(__file__).resolve().parents[3]\n"
+    )
+    _CLEAN = (
+        "import pathlib\n"
+        "ROOT = pathlib.Path(__file__).resolve().parents[1]\n"
+    )
+
+    @staticmethod
+    def _git(repo: pathlib.Path, *args: str) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-c", "user.email=anchoring-test@local",
+                "-c", "user.name=anchoring-test",
+                "-c", "commit.gpgsign=false",
+                "-c", "core.hooksPath=",
+                "-C", str(repo),
+                *args,
+            ],
+            capture_output=True,
+            check=True,
+            timeout=60,
+        )
+
+    def _scratch_repo(self, tmp_path: pathlib.Path, committed: str) -> pathlib.Path:
+        repo = tmp_path / "scratch"
+        target = repo / "tests" / "cron" / "test_scratch.py"
+        target.parent.mkdir(parents=True)
+        target.write_text(committed, encoding="utf-8")
+        self._git(repo, "init", "-q")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "scratch")
+        return repo
+
+    def test_dirty_working_file_is_judged_by_head_content(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """A mid-run rewrite (here: a planted violation) must be invisible."""
+        repo = self._scratch_repo(tmp_path, committed=self._CLEAN)
+        working = repo / "tests" / "cron" / "test_scratch.py"
+        working.write_text(self._VIOLATION, encoding="utf-8")
+
+        scan = _scan("tests", repo_root=repo)
+        assert scan.source.startswith("HEAD ")
+        assert scan.files_read == 1
+        assert scan.violations == []
+
+    def test_committed_violation_is_reported_even_if_working_file_is_fixed(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """The inverse direction — proves HEAD is read, not merely that
+        violations vanish."""
+        repo = self._scratch_repo(tmp_path, committed=self._VIOLATION)
+        working = repo / "tests" / "cron" / "test_scratch.py"
+        working.write_text(self._CLEAN, encoding="utf-8")
+
+        scan = _scan("tests", repo_root=repo)
+        assert scan.source.startswith("HEAD ")
+        assert scan.violations == [("tests/cron/test_scratch.py", 3, 2)]
+
+    def test_deleted_working_file_is_still_judged(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """A file vanishing mid-scan (rewrite via delete+recreate) cannot
+        drop it from the scan or turn it 'unreadable'."""
+        repo = self._scratch_repo(tmp_path, committed=self._CLEAN)
+        (repo / "tests" / "cron" / "test_scratch.py").unlink()
+
+        scan = _scan("tests", repo_root=repo)
+        assert scan.files_read == 1
+        assert scan.unreadable == []
+
+    def test_non_git_root_falls_back_to_the_working_tree(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """No git — the pre-2026-08-28 disk walk still guards the tree."""
+        root = tmp_path / "plain"
+        target = root / "tests" / "cron" / "test_scratch.py"
+        target.parent.mkdir(parents=True)
+        target.write_text(self._VIOLATION, encoding="utf-8")
+
+        scan = _scan("tests", repo_root=root)
+        assert scan.source == "working-tree"
+        assert scan.violations == [("tests/cron/test_scratch.py", 3, 2)]
+
+    def test_the_real_scans_judged_a_pinned_commit(self, scan: _Scan) -> None:
+        """The module-scoped scan of THIS checkout must be on the snapshot
+        path — the fallback is for non-git checkouts only."""
+        assert scan.source.startswith("HEAD "), (
+            f"scan judged {scan.source!r}; expected a pinned HEAD snapshot — "
+            "did _read_committed_tree start failing on this checkout?"
+        )
 
 
 class TestGuardSelfConsistency:
