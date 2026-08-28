@@ -9,6 +9,7 @@ import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { resolveSessionRpcOwner } from '@/app/contrib/wiring-routing'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
+import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import {
   deleteSession,
   getAllSessionMessages,
@@ -2347,6 +2348,37 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(sessionStateByRuntimeIdRef.current.has('rt-recycled')).toBe(false)
   })
 
+  it('marks Bot Mode resumes to keep running after the viewer detaches', async () => {
+    setWorkspaceScope('bots', 'source-a::bot-a')
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        return { session_id: 'rt-bot', resumed: params?.session_id, messages: [], info: {} } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    try {
+      render(<ResumeHarness onReady={value => (resume = value)} requestGateway={requestGateway} />)
+      await waitFor(() => expect(resume).not.toBeNull())
+      await resume!('stored-bot', true)
+
+      expect(requestGateway).toHaveBeenCalledWith(
+        'session.resume',
+        expect.objectContaining({
+          preserve_running_on_disconnect: true,
+          session_id: 'stored-bot'
+        })
+      )
+    } finally {
+      setWorkspaceScope('sessions')
+    }
+  })
+
   it('paints the bounded latest transcript after the deferred resume acknowledgement', async () => {
     const latestPage = Array.from({ length: 500 }, (_, index) => ({
       content: `message-${index}`,
@@ -2457,6 +2489,56 @@ describe('resumeSession warm-cache mapping integrity', () => {
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
     )
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+  })
+
+  it('marks a warm Bot Mode activation to keep its running turn after detach', async () => {
+    setWorkspaceScope('bots', 'source-a::bot-a')
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-bot', 'rt-bot']])
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-bot', clientState('stored-bot')]])
+    }
+
+    const requestGateway = vi.fn(async (method: string) =>
+      method === 'session.activate'
+        ? ({
+            session_id: 'rt-bot',
+            session_key: 'stored-bot',
+            messages: [],
+            running: true,
+            info: {}
+          } as never)
+        : ({} as never)
+    )
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-bot' } as never)
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    try {
+      render(
+        <ResumeHarness
+          onReady={value => (resume = value)}
+          requestGateway={requestGateway}
+          runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+          sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+        />
+      )
+      await waitFor(() => expect(resume).not.toBeNull())
+      await resume!('stored-bot', true)
+
+      expect(requestGateway).toHaveBeenCalledWith(
+        'session.activate',
+        expect.objectContaining({
+          preserve_running_on_disconnect: true,
+          session_id: 'rt-bot'
+        })
+      )
+    } finally {
+      setWorkspaceScope('sessions')
+    }
   })
 
   it('re-arms a pending clarify in place on the warm session.activate path', async () => {

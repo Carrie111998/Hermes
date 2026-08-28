@@ -5,7 +5,7 @@ import type { NavigateFunction } from 'react-router'
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
+import { $workspaceMode, setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import {
   deleteSession,
   fetchStoredTranscriptAcrossBackends,
@@ -714,7 +714,7 @@ export function useSessionActions({
 
         const params = {
           ...(await desktopSessionCreateParams(cwd, capturedRoute)),
-          ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
+          ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true, preserve_running_on_disconnect: true } : {})
         }
 
         // Same lease chain as createBackendSessionForSend: owner socket held
@@ -822,6 +822,10 @@ export function useSessionActions({
       resumeRequestRef.current = requestId
       const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
+
+      const preserveRunningOnDisconnect =
+        $workspaceMode.get() === 'bots' ||
+        $sessionTiles.get().some(tile => tile.storedSessionId === storedSessionId && tile.workspaceMode === 'bots')
 
       const isCurrentResume = () =>
         resumeRequestRef.current === requestId && selectedStoredSessionIdRef.current === storedSessionId
@@ -1096,6 +1100,7 @@ export function useSessionActions({
               activated = await requestForSession<SessionResumeResponse>('session.activate', {
                 session_id: cachedRuntimeId,
                 cols: 96,
+                ...(preserveRunningOnDisconnect ? { preserve_running_on_disconnect: true } : {}),
                 omit_messages: true
               })
             } catch (error) {
@@ -1485,6 +1490,7 @@ export function useSessionActions({
             session_id: storedSessionId,
             cols: 96,
             source: 'desktop',
+            ...(preserveRunningOnDisconnect ? { preserve_running_on_disconnect: true } : {}),
             defer_history: !watchWindow,
             // REST is the transcript authority for Desktop. Avoid duplicating a
             // potentially huge compression lineage in the WebSocket response.

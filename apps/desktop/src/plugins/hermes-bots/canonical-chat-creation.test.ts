@@ -155,6 +155,7 @@ describe('the lazy row is materialized before anything else touches it', () => {
     expect(created).toMatchObject({
       hidden: true,
       title: 'Bot Chat',
+      preserve_running_on_disconnect: true,
       // The PR #97008 contract: the canonical Bot Chat's runtime always
       // follows the profile's CURRENT config on resume — never the stored
       // model/provider pin. Dropping this param silently regresses bots to
@@ -173,6 +174,7 @@ describe('the lazy row is materialized before anything else touches it', () => {
 
       if (method === 'prompt.submit') {
         expect(params.session_id).toBe('runtime-1')
+        expect(params.preserve_running_on_disconnect).toBe(true)
       }
 
       return {}

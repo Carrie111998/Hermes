@@ -336,6 +336,7 @@ export function createCanonicalChat(
       // (deferred as pending_hidden until the row exists); older gateways
       // ignore the unknown param and it stays visible.
       hidden: true,
+      preserve_running_on_disconnect: true,
       // Explicit contract (PR #97008): this session's runtime always follows
       // the member profile's CURRENT config. Resume must NOT restore the
       // stored model/provider pin from an old row — that left bot DMs stuck
@@ -423,7 +424,8 @@ export function createCanonicalChat(
         try {
           await requestForBot(bot, 'prompt.submit', {
             session_id: runtime,
-            text: kickoffText()
+            text: kickoffText(),
+            preserve_running_on_disconnect: true
           })
 
           if (!opened && sid && typeof host.openSession === 'function' && canNavigate()) {

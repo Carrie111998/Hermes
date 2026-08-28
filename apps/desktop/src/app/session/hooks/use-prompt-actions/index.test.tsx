@@ -4,6 +4,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -462,6 +463,41 @@ describe('usePromptActions HUD surface', () => {
 
   it('says nothing about the surface from the app window', async () => {
     expect(await submitFrom('app')).not.toHaveProperty('surface')
+  })
+})
+
+describe('usePromptActions Bot Mode lifecycle', () => {
+  afterEach(() => {
+    cleanup()
+    setWorkspaceScope('sessions')
+    vi.restoreAllMocks()
+  })
+
+  it('marks prompt.submit so Bot work survives a viewer detach', async () => {
+    setWorkspaceScope('bots', 'remote::worker')
+
+    const submitted: (Record<string, unknown> | undefined)[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'prompt.submit') {
+        submitted.push(params)
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+    await handle!.submitText('keep working')
+
+    expect(submitted[0]).toMatchObject({ preserve_running_on_disconnect: true })
   })
 })
 

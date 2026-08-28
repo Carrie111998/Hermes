@@ -101,6 +101,25 @@ describe('session resolution', () => {
     })
   })
 
+  it('preserves member turns across every create, resume and submit boundary', async () => {
+    const room = await loadRoom({ turn: () => 'done' })
+
+    room.chat.updateGroupChat('Detach', current => {
+      current.roomId = 'r-detach'
+
+      return current
+    })
+
+    await room.turns.runGroupChatMemberTurn('Detach', ROUTED_MEMBER, 'keep working', 't1', [])
+
+    const lifecycleCalls = room.gateway.rpc.filter(call =>
+      ['prompt.submit', 'session.create', 'session.resume'].includes(call.method)
+    )
+
+    expect(lifecycleCalls.length).toBeGreaterThan(0)
+    expect(lifecycleCalls.every(call => call.params.preserve_running_on_disconnect === true)).toBe(true)
+  })
+
   it('mints fresh member sessions when a same-name group is recreated after disband', async () => {
     const room = await loadRoom()
     const member: GroupMember = { name: 'research', title: '' }

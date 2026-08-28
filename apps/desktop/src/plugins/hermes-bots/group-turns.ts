@@ -152,7 +152,8 @@ export async function ensureGroupChatSession(group: string, member: GroupMember)
       const res = (await requestForBot(member, 'session.resume', {
         session_id: target,
         profile: member.name,
-        omit_messages: true
+        omit_messages: true,
+        preserve_running_on_disconnect: true
       })) as GroupSessionSnapshot
 
       if (res?.session_id) {
@@ -199,6 +200,7 @@ export async function ensureGroupChatSession(group: string, member: GroupMember)
     title,
     // Room member sessions are plumbing — always hidden from the sidebar.
     hidden: true,
+    preserve_running_on_disconnect: true,
     // Explicit contracts (PR #97008): room plumbing sessions always rebuild
     // from the member profile's CURRENT config on resume, never a stale
     // stored model/provider pin. Older gateways ignore the unknown params;
@@ -309,7 +311,8 @@ async function submitGroupTurnPrompt(
   try {
     await requestForBot(member, 'prompt.submit', {
       session_id: runtime,
-      text
+      text,
+      preserve_running_on_disconnect: true
     })
 
     return runtime
@@ -321,7 +324,8 @@ async function submitGroupTurnPrompt(
     const res = (await requestForBot(member, 'session.resume', {
       session_id: stored,
       profile: member.name,
-      omit_messages: true
+      omit_messages: true,
+      preserve_running_on_disconnect: true
     })) as GroupSessionSnapshot
 
     const fresh = res?.session_id
@@ -332,7 +336,8 @@ async function submitGroupTurnPrompt(
 
     await requestForBot(member, 'prompt.submit', {
       session_id: fresh,
-      text
+      text,
+      preserve_running_on_disconnect: true
     })
 
     return fresh
@@ -564,7 +569,8 @@ async function runGroupChatMemberTurnLeased(
   try {
     const pre = (await requestForBot(member, 'session.resume', {
       session_id: stored || runtime,
-      profile: member.name
+      profile: member.name,
+      preserve_running_on_disconnect: true
     })) as GroupSessionSnapshot
 
     before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
@@ -648,7 +654,8 @@ async function runGroupChatMemberTurnLeased(
     try {
       state = (await requestForBot(member, 'session.resume', {
         session_id: stored || liveRuntime,
-        profile: member.name
+        profile: member.name,
+        preserve_running_on_disconnect: true
       })) as GroupSessionSnapshot
     } catch {
       continue
@@ -738,7 +745,8 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
     const stored = room.sessions?.[memberKey]
     state = (await requestForBot(member, 'session.resume', {
       session_id: stored || `Group: ${room.roomId || group}`,
-      profile: member.name
+      profile: member.name,
+      preserve_running_on_disconnect: true
     })) as GroupSessionSnapshot
   } catch {
     return // source unreachable — leave the marker for the next boundary
