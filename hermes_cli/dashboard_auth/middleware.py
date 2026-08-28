@@ -335,7 +335,20 @@ def _attach_public_path_session(request: Request) -> None:
     """
     if getattr(request.state, "session", None) is not None:
         return
+    # The desktop authenticates REST with ``Authorization: Bearer`` and holds
+    # no cookies at all (RFC 8252 native flow), so the bearer has to be read
+    # here too: otherwise a signed-in desktop reads as anonymous on every
+    # public path.
     try:
+        bearer = _extract_bearer(request)
+        if bearer:
+            try:
+                bearer_session = _verify_bearer(request, access_token=bearer)
+            except Exception:
+                bearer_session = None
+            if bearer_session is not None:
+                request.state.session = bearer_session
+                return
         access_token, _refresh_token = read_session_cookies(request)
         if not access_token:
             return

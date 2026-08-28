@@ -3758,6 +3758,13 @@ def _public_status_detail() -> str:
             "public_status_detail", "full"
         )
     except Exception:
+        # Fail open: an unreadable config must not turn a liveness probe into
+        # an error. Logged because it silently drops an operator's hardening
+        # choice back to the public default.
+        _log.warning(
+            "Could not read dashboard.public_status_detail; "
+            "serving the full public /api/status payload"
+        )
         return "full"
     if isinstance(configured, str) and configured.strip().lower() == "minimal":
         return "minimal"

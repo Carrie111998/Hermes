@@ -172,3 +172,80 @@ def test_status_probe_survives_a_broken_session_cookie(gated_client, monkeypatch
     r = gated_client.get("/api/status")
     assert r.status_code == 200
     assert _OPERATOR_DETAIL_FIELDS.isdisjoint(r.json().keys())
+
+
+def _session_token(client) -> str:
+    """Return the access token of a logged-in client's session cookie.
+
+    The cookie name carries a ``__Host-`` prefix over HTTPS, so match on the
+    bare suffix rather than hardcoding the prefixed name.
+    """
+    for name, value in client.cookies.items():
+        if name.endswith("hermes_session_at"):
+            return value
+    raise AssertionError(f"no session cookie among {list(client.cookies.keys())}")
+
+
+def test_status_keeps_operator_detail_for_bearer_caller(gated_client, monkeypatch):
+    """The desktop authenticates REST with ``Authorization: Bearer`` and holds
+    no cookie (RFC 8252 native flow). It must not read as anonymous, or
+    ``minimal`` would blind the very cockpit that manages the gateway."""
+    monkeypatch.setattr(
+        web_server, "load_config",
+        lambda: {"dashboard": {"public_status_detail": "minimal"}},
+    )
+    _login(gated_client)
+    token = _session_token(gated_client)
+    gated_client.cookies.clear()
+    body = gated_client.get(
+        "/api/status", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert "profiles" in body, "bearer caller lost the profile list"
+    assert "memory" in body, "bearer caller lost the memory rollup"
+
+
+def test_status_minimal_is_a_no_op_on_a_loopback_bind(loopback_client, monkeypatch):
+    """``minimal`` describes what an anonymous NETWORK caller sees. A loopback
+    dashboard has no gate and no anonymous reader, so the payload is whole."""
+    monkeypatch.setattr(
+        web_server, "load_config",
+        lambda: {"dashboard": {"public_status_detail": "minimal"}},
+    )
+    body = loopback_client.get("/api/status").json()
+    assert "profiles" in body
+    assert "memory" in body
+
+
+def test_status_detail_env_override_wins(gated_client, monkeypatch):
+    """Hosting platforms inject settings as env, matching the precedence the
+    other dashboard keys already follow."""
+    monkeypatch.setattr(
+        web_server, "load_config",
+        lambda: {"dashboard": {"public_status_detail": "full"}},
+    )
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_STATUS_DETAIL", "minimal")
+    body = gated_client.get("/api/status").json()
+    assert _OPERATOR_DETAIL_FIELDS.isdisjoint(body.keys())
+
+
+def test_status_detail_unknown_value_falls_back_to_full(gated_client, monkeypatch):
+    """An unrecognised value must not silently mean ``minimal``: the payload
+    Hermes Cloud reads stays whole unless the operator asked otherwise."""
+    monkeypatch.setattr(
+        web_server, "load_config",
+        lambda: {"dashboard": {"public_status_detail": "moderate"}},
+    )
+    body = gated_client.get("/api/status").json()
+    assert "profiles" in body
+
+
+def test_status_survives_an_unreadable_config(gated_client, monkeypatch):
+    """A config read that raises must degrade to the public default rather
+    than failing the liveness probe."""
+    def _boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(web_server, "load_config", _boom)
+    r = gated_client.get("/api/status")
+    assert r.status_code == 200
+    assert "version" in r.json()
