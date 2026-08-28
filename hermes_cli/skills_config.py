@@ -205,6 +205,10 @@ def skills_command(args=None):
         # Anything NOT chosen is disabled
         new_disabled = {skills[i]["name"] for i in range(len(skills)) if i not in chosen}
 
+    if new_disabled == disabled:
+        print(color("  No changes.", Colors.DIM))
+        return
+
     # Whitelist-blocked skills must NOT be persisted into skills.disabled:
     # they appear disabled in the UI but the user didn't explicitly toggle
     # them off. Toggling whitelist off later would otherwise leave stale
