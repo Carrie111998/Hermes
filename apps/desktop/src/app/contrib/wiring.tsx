@@ -1163,6 +1163,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         onSelect={selectModel}
         ownerConnectionId={activeConnectionId || undefined}
         profile={activeGatewayProfile}
+        requestGateway={requestGateway}
       />
       <SessionPickerOverlay onResume={sessionId => openSession(sessionId, navigate)} />
       <ModelVisibilityOverlay
