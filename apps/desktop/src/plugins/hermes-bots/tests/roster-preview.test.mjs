@@ -14,6 +14,7 @@ function runtime() {
     jsxs: jsx,
     useQuery: () => ({}),
     useValue: value => (value?.get ? value.get() : value),
+    useRef: initial => ({ current: initial }),
     useState: value => [value, () => undefined],
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
     host: { state: { profile: { get: () => 'ops', listen: () => undefined } }, request: () => undefined }
@@ -122,6 +123,7 @@ function renderRuntime() {
     relativeTime: () => 'now',
     useQuery: () => ({}),
     useValue: value => (value?.get ? value.get() : value),
+    useRef: initial => ({ current: initial }),
     useState: value => [value, () => undefined],
     useEffect: () => undefined,
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } }
