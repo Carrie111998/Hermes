@@ -812,8 +812,14 @@ class GatewayKanbanWatchersMixin:
                         # ApiServerAdapter refuses by design, so twelve doomed
                         # attempts would trip MAX_SEND_FAILURES and DELETE a
                         # live subscription. Do not silently consume it either.
-                        # Record the fact on the task instead — an auditable,
-                        # operator-visible row — and move on. (G11.)
+                        #
+                        # What happens instead is explicit audited
+                        # NON-DELIVERY, and the distinction matters: the row
+                        # written below records that nobody was told through
+                        # this channel. It is not a notification and must never
+                        # be counted as one. The gate event itself stays in
+                        # ``task_events``, so the board remains the record a
+                        # human actually reads. (G11.)
                         _undeliverable = ""
                         if kind in PLAN_GATE_NOTIFY_KINDS:
                             if not _push_ok:
@@ -827,17 +833,51 @@ class GatewayKanbanWatchersMixin:
                                     "delivery and a gate event never wakes"
                                 )
                         if _undeliverable:
+                            # Recording the non-delivery is the ONLY thing that
+                            # happens for this event, so it is not best-effort:
+                            # if the row cannot be written, the claimed cursor
+                            # must not advance, or the event is consumed with
+                            # nothing to show for it — the exact absence this
+                            # disposition exists to prevent. Raising here lands
+                            # in the shared failure handler below, which rewinds
+                            # the claim and retries on the next tick.
+                            _recorded = await _to_thread_process_service(
+                                self._kanban_record_undeliverable,
+                                sub, int(getattr(ev, "id", 0) or 0), kind,
+                                platform_str, _undeliverable, board_slug,
+                            )
+                            if not _recorded:
+                                # Fail CLOSED. The row is the only outcome this
+                                # event gets, so if it cannot be written the
+                                # claim must be given back. Unlike a failed
+                                # send this is never a dead chat — the board's
+                                # own database is what failed — so the
+                                # subscription is rewound and retried, never
+                                # dropped.
+                                logger.warning(
+                                    "kanban notifier: could not record %s for "
+                                    "%s as undeliverable; rewinding the claim "
+                                    "rather than consuming it",
+                                    kind, sub["task_id"],
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                                break
                             logger.info(
-                                "kanban notifier: gate event %s for %s is not "
-                                "deliverable on %s (%s); recorded on the task",
+                                "kanban notifier: gate event %s for %s could "
+                                "NOT be notified on %s (%s); recorded the "
+                                "non-delivery on the task",
                                 kind, sub["task_id"], platform_str,
                                 _undeliverable,
                             )
-                            await _to_thread_process_service(
-                                self._kanban_record_undeliverable,
-                                sub, kind, platform_str, _undeliverable,
-                                board_slug,
-                            )
+                            # A recorded disposition is a resolved outcome for
+                            # this event, so the dead-chat counter resets.
+                            sub_fail_counts.pop(sub_key, None)
                             continue
 
                         if (not _push_ok and wake_agent
@@ -1235,32 +1275,78 @@ class GatewayKanbanWatchersMixin:
             conn.close()
 
     def _kanban_record_undeliverable(
-        self, sub: dict, kind: str, platform: str, reason: str,
-        board: Optional[str] = None,
-    ) -> None:
+        self, sub: dict, source_event_id: int, kind: str, platform: str,
+        reason: str, board: Optional[str] = None,
+    ) -> bool:
         """Sync helper: record that a gate notification could not be delivered.
 
-        Best-effort and audit-only. The kind is deliberately NOT in
-        ``TERMINAL_KINDS``, so no notifier ever claims it and this cannot
-        recurse. It exists so "nobody was told" is a fact on the task rather
-        than an absence, without waking anyone or deleting a subscription.
+        Returns True only when a row for this (source event, subscription) pair
+        is durably present — either written here or already there. The caller
+        treats False as a refusal to consume the event.
+
+        NOT best-effort. This row is the entire outcome of the event on this
+        subscription, so a swallowed write would recreate exactly the silent
+        consumption it exists to prevent.
+
+        Idempotent per (source event id, subscription). The existence check and
+        the insert share one ``write_txn`` (BEGIN IMMEDIATE), so a concurrent
+        gateway cannot double-insert, and a cursor rewind — which reprocesses
+        the whole claimed batch after an unrelated failure later in it — cannot
+        append a second row on the next tick, nor can a fresh runner after a
+        restart. The subscription is identified by a short digest rather than
+        its raw ``chat_id``: enough to key on, and it puts no new addressable
+        identifier into a user-facing event.
+
+        The kind is deliberately absent from ``TERMINAL_KINDS``, so no notifier
+        claims it and this cannot recurse.
         """
+        import hashlib
+
         from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_gate_events import GATE_UNDELIVERABLE_KIND
+
+        sub_digest = hashlib.sha256(
+            "\x1f".join((
+                str(sub.get("platform") or ""),
+                str(sub.get("chat_id") or ""),
+                str(sub.get("thread_id") or ""),
+            )).encode("utf-8")
+        ).hexdigest()[:16]
         try:
             conn = _kb.connect(board=board)
-        except Exception:
-            return
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: cannot open board %s to record a "
+                "non-delivery for %s: %s", board, sub.get("task_id"), exc,
+            )
+            return False
         try:
             with _kb.write_txn(conn):
+                existing = conn.execute(
+                    "SELECT 1 FROM task_events "
+                    "WHERE task_id = ? AND kind = ? "
+                    "AND json_extract(payload, '$.source_event_id') = ? "
+                    "AND json_extract(payload, '$.subscription') = ? LIMIT 1",
+                    (sub["task_id"], GATE_UNDELIVERABLE_KIND,
+                     int(source_event_id), sub_digest),
+                ).fetchone()
+                if existing is not None:
+                    return True
                 _kb._append_event(
-                    conn, sub["task_id"], "gate_notification_undeliverable",
+                    conn, sub["task_id"], GATE_UNDELIVERABLE_KIND,
                     {"event_kind": kind, "platform": platform,
                      "reason": reason,
-                     "delivery_mode": sub.get("delivery_mode") or "notify"},
+                     "delivery_mode": sub.get("delivery_mode") or "notify",
+                     "source_event_id": int(source_event_id),
+                     "subscription": sub_digest},
                 )
-        except Exception:
-            # Auditing a non-delivery must never become an outage.
-            pass
+            return True
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: could not record a non-delivery for %s: %s",
+                sub.get("task_id"), exc,
+            )
+            return False
         finally:
             conn.close()
 

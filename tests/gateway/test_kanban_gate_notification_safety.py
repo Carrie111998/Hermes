@@ -12,6 +12,7 @@ Synthetic markers only. No real credential appears in this file.
 
 import asyncio
 import json
+import time
 import unicodedata
 
 import pytest
@@ -730,3 +731,201 @@ def test_attacks_are_neutralised_through_the_shared_renderer(value):
     for ch in out:
         assert unicodedata.category(ch) not in ("Cf", "Cs")
     out.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The disposition is durable and idempotent (third-round review)
+# ---------------------------------------------------------------------------
+
+def _break_audit_writes(monkeypatch):
+    """Fail ONLY the disposition write; every other event still records."""
+    real_append = kb._append_event
+
+    def _boom(conn, task_id, kind, payload=None, run_id=None):
+        if kind == ge.GATE_UNDELIVERABLE_KIND:
+            raise RuntimeError("simulated storage failure")
+        return real_append(conn, task_id, kind, payload, run_id=run_id)
+
+    monkeypatch.setattr(kb, "_append_event", _boom)
+
+
+@pytest.mark.parametrize("mode", ["notify+wake", "wake"])
+def test_an_audit_write_failure_does_not_consume_the_gate_event(
+    tmp_path, monkeypatch, mode
+):
+    """Fail closed: no row written means the claim is given back."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / f"audit-fail-{mode}.db"))
+    kb.init_db()
+    tid = _subscribed_task(mode)
+    _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
+
+    _break_audit_writes(monkeypatch)
+    adapter = NonPushAdapter() if mode == "notify+wake" else PushAdapter()
+    _tick(monkeypatch, adapter)
+
+    assert _undeliverable_rows(tid) == [], "the write was supposed to fail"
+    assert _unseen(tid, GATE_KINDS), "the event must NOT have been consumed"
+    assert _subs(tid), "a failing database is not a dead chat"
+    assert adapter.handled == []
+
+    # With storage healthy again the next tick records it and moves on.
+    monkeypatch.undo()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / f"audit-fail-{mode}.db"))
+    _tick(monkeypatch, NonPushAdapter() if mode == "notify+wake" else PushAdapter())
+    assert len(_undeliverable_rows(tid)) == 1
+    assert _unseen(tid, GATE_KINDS) == []
+
+
+def test_a_repeatedly_failing_audit_write_never_unsubscribes(tmp_path, monkeypatch):
+    """A broken board database must not be treated as a dead chat."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "audit-fail-many.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify+wake")
+    _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
+    _break_audit_writes(monkeypatch)
+    runner = _runner(NonPushAdapter())
+    for _ in range(15):
+        runner._running = True
+        runner.adapters = {Platform.TELEGRAM: NonPushAdapter()}
+        asyncio.run(_one_tick(monkeypatch, runner))
+    assert _subs(tid), "the subscription must survive a failing database"
+    assert _unseen(tid, GATE_KINDS), "and the event must still be unconsumed"
+
+
+def test_a_rewound_mixed_batch_does_not_duplicate_the_disposition(
+    tmp_path, monkeypatch
+):
+    """A later self-post failure rewinds the whole batch — the row must not
+    be appended again when the gate event is reprocessed."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "rewind-dup.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify+wake")
+    _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
+    _emit(tid, "completed", {"summary": "done"})
+
+    import gateway.wake as wake_mod
+    attempts = []
+
+    async def _failing(adapter, *, text, session_id="", source=None):
+        attempts.append(text)
+        raise RuntimeError("self-post failed")
+
+    monkeypatch.setattr(wake_mod, "deliver_wake", _failing)
+
+    runner = _runner(NonPushAdapter())
+    for _ in range(3):
+        runner._running = True
+        runner.adapters = {Platform.TELEGRAM: NonPushAdapter()}
+        asyncio.run(_one_tick(monkeypatch, runner))
+
+    assert len(attempts) == 3, "the actionable half really did retry"
+    assert len(_undeliverable_rows(tid)) == 1, "one row per source event"
+
+
+def test_gateway_restarts_cannot_grow_the_audit_log(tmp_path, monkeypatch):
+    """A fresh runner resets the in-memory counter; the row must not repeat."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "restart-dup.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify+wake")
+    _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
+    _emit(tid, "completed", {"summary": "done"})
+
+    import gateway.wake as wake_mod
+
+    async def _failing(adapter, *, text, session_id="", source=None):
+        raise RuntimeError("self-post failed")
+
+    monkeypatch.setattr(wake_mod, "deliver_wake", _failing)
+
+    for _ in range(8):                      # eight separate "gateway restarts"
+        _tick(monkeypatch, NonPushAdapter())
+
+    assert len(_undeliverable_rows(tid)) == 1
+    rows = _undeliverable_rows(tid)
+    assert rows[0]["event_kind"] == "plan_awaiting_approval"
+    assert "source_event_id" in rows[0] and "subscription" in rows[0]
+    # The digest keys the row without publishing a new addressable identifier.
+    assert "chat-1" not in json.dumps(rows[0])
+
+
+def test_two_subscriptions_each_get_their_own_disposition(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "two-subs.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify+wake", chat_id="chat-1")
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-2",
+            thread_id="topic-7", chat_type="thread",
+            delivery_mode="notify+wake",
+        )
+    finally:
+        conn.close()
+    _emit(tid, "plan_awaiting_approval", {"project_id": "p", "revision": 1})
+    _tick(monkeypatch, NonPushAdapter())
+    rows = _undeliverable_rows(tid)
+    assert len(rows) == 2, "one per subscription"
+    assert len({r["subscription"] for r in rows}) == 2
+
+
+# ---------------------------------------------------------------------------
+# Multi-word and Windows paths (third-round review)
+# ---------------------------------------------------------------------------
+
+MULTIWORD_PATHS = [
+    "/Users/rick/My Very Secret/config.yaml",
+    "file:///Users/rick/My Very Secret/config.yaml",
+    r"C:\Users\Rick Swindell\Secret Folder\key.txt",
+    "/Volumes/My Big Drive/Client Files/keys.txt",
+    "/home/rick/Two Word Dir/Another One/creds.json",
+    r"D:\Program Files\Hermes Data\token.txt",
+]
+
+MULTIWORD_LEAKS = (
+    "Very Secret", "Secret Folder", "Client Files", "Another One",
+    "Hermes Data", "config.yaml", "key.txt", "keys.txt", "creds.json",
+    "token.txt", "Swindell",
+)
+
+
+@pytest.mark.parametrize("value", MULTIWORD_PATHS)
+def test_multiword_and_windows_paths_are_fully_redacted(value):
+    out = ge.safe_display_value(value, limit=200)
+    for fragment in MULTIWORD_LEAKS:
+        assert fragment not in out, f"{value!r} leaked {fragment!r} as {out!r}"
+
+
+@pytest.mark.parametrize("value", MULTIWORD_PATHS)
+def test_multiword_paths_are_redacted_through_the_real_notifier(
+    tmp_path, monkeypatch, value
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB",
+                       str(tmp_path / f"mw-{abs(hash(value))}.db"))
+    kb.init_db()
+    tid = _subscribed_task("notify")
+    _emit(tid, "plan_rejected", {"operator": value, "project_id": value,
+                                 "revision": 1, "reason": value})
+    adapter = PushAdapter()
+    _tick(monkeypatch, adapter)
+    assert len(adapter.sent) == 1
+    for fragment in MULTIWORD_LEAKS:
+        assert fragment not in adapter.sent[0]["text"]
+
+
+def test_prose_after_a_path_still_survives_redaction():
+    out = ge.safe_display_value(
+        "/Users/me/x and then the plan was approved by the operator", limit=200)
+    assert "and then the plan was approved by the operator" in out
+    assert "/Users/me/x" not in out
+
+
+@pytest.mark.parametrize("value", [
+    " " * 20000 + "/Users/x",
+    "/Users/" + "a " * 5000,
+    "C:\\" + "a " * 5000,
+])
+def test_pathological_inputs_stay_bounded(value):
+    start = time.monotonic()
+    out = ge.safe_display_value(value, limit=160)
+    assert time.monotonic() - start < 2.0
+    assert len(out) <= 160

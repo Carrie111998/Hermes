@@ -10,9 +10,19 @@ Everything about a *gate* event that both surfaces need lives here, so neither
 can drift:
 
 * :data:`PLAN_GATE_NOTIFY_KINDS` — the kinds ``kanban_db`` emits for a human
-  plan/deploy gate. A human gate exists to STOP an agent, so these are passive
-  notifications on every surface: displayed and auditable, never a wake, never
-  an agent turn, never a dispatch.
+  plan/deploy gate. A human gate exists to STOP an agent, so a gate event is
+  **never** a wake, an agent turn, or a dispatch on any surface.
+
+  Whether it is *notified* depends on the subscription, and the two are not the
+  same claim. A surface with a passive channel — a push-capable messaging
+  adapter, the Desktop/TUI poller — displays it to a person. A subscription
+  with no passive channel (a non-push adapter, whose only channel is the wake
+  self-post that deliberately carries no gate wording) or one that declined it
+  (``delivery_mode="wake"``) **cannot notify anyone at all**. There the outcome
+  is explicit audited non-delivery: a :data:`GATE_UNDELIVERABLE_KIND` row
+  saying nobody was told through that channel. That row is a *record*, not a
+  delivery, and must never be described as one. The gate event itself always
+  survives in ``task_events``, so the board remains the durable record.
 * :func:`safe_display_value` — the outbound safety boundary for **every**
   event-derived value, not just free-text reasons.
 * :func:`render_gate_event` — the one rendering of a gate event.
@@ -42,6 +52,13 @@ PLAN_GATE_NOTIFY_KINDS: tuple[str, ...] = (
     "gate_release_refused",
 )
 
+# Written on a task when a gate event could NOT be passively delivered to a
+# subscription: a non-push adapter has no passive channel, and a ``wake``-only
+# subscriber declined the only one there is. Deliberately NOT a member of the
+# notifier's TERMINAL_KINDS or WAKE_KINDS — it is an audit disposition, never
+# itself a notification, so nothing claims it and it cannot recurse.
+GATE_UNDELIVERABLE_KIND = "gate_notification_undeliverable"
+
 GATE_EMOJI: dict[str, str] = {
     "plan_awaiting_approval": "⏳",
     "plan_approved": "✅",
@@ -58,18 +75,32 @@ GATE_EMOJI: dict[str, str] = {
 #   * only seven roots were covered, so /Volumes, /opt, /root, /Applications
 #     and a "file://" URL survived intact.
 #
-# A space is consumed ONLY when a "/" follows before the next delimiter — that
-# continues a path through "My Secret/config" without swallowing the ordinary
-# prose after "/Users/me/x and then ...".
+# A space is consumed ONLY when a separator still follows it before the next
+# delimiter. That continues a path through any number of spaced segments
+# ("My Very Secret/config.yaml", "Rick Swindell\\Secret Folder\\key.txt") while
+# still stopping at ordinary prose ("/Users/me/x and then the plan was
+# approved"), which has no separator left to find.
+#
+# The first version allowed exactly ONE space, so a two-word directory leaked
+# its tail — usually the sensitive half — and the Windows branch stopped dead
+# at the first space.
 _PATH_ROOTS = (
     "Users|home|root|Volumes|Applications|Library|System|opt|srv|mnt|media|"
     "private|tmp|var|etc|usr|workspace|data"
 )
-_PATH_TAIL = r"(?:[^/\s,;'\"]| (?=[^\s,;'\"]*/))*"
+# POSIX: ordinary path characters, or a space that still has a "/" ahead.
+_PATH_TAIL = r"(?:[^/\s,;'\"]|[ ](?=[^,;'\"\n]*?/))*"
+# Windows: the same shape with a backslash as the separator.
+_WIN_TAIL = r"(?:[^\\\s,;'\"]|[ ](?=[^,;'\"\n]*?\\))*"
 _LOCAL_PATH_RE = re.compile(
     rf"(?:file://)?(?<![\w:])/(?:{_PATH_ROOTS})\b(?:/{_PATH_TAIL})*"
-    r"|[A-Za-z]:\\[^\s,;]+"
+    rf"|[A-Za-z]:(?:\\{_WIN_TAIL})+"
 )
+
+# Redaction runs a lookahead per space, so a pathological value is quadratic
+# in principle. Values here come from bounded event payloads, but the
+# boundary must not depend on that: clamp before any scanning.
+_MAX_SCAN_CHARS = 4096
 
 # Everything outside printable text. C0 (minus the whitespace that
 # ``str.split`` already folds), DEL, and C1 — the range that carries ANSI
@@ -112,6 +143,8 @@ def safe_display_value(value: Any, *, limit: int = IDENT_LIMIT) -> str:
         # without echoing anything derived from it.
         return "[unrenderable]"
 
+    if len(text) > _MAX_SCAN_CHARS:
+        text = text[:_MAX_SCAN_CHARS]
     try:
         from agent.redact import redact_sensitive_text
 
