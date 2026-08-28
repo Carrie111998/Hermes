@@ -13,7 +13,7 @@ const EMPTY: ProviderUsageState = { loading: false, providers: [] }
 
 /**
  * Subscription usage for every provider this machine is authenticated with —
- * Claude, Codex, Kimi, OpenRouter, Copilot, and anything a provider plugin
+ * Claude, Codex, Kimi, OpenRouter, and anything a provider plugin
  * adds. One store for the whole window: the gauge is account-scoped, not
  * session-scoped, so every surface shows the same numbers.
  */

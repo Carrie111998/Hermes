@@ -63,7 +63,9 @@ _DEFAULT_TIMEOUT = 8.0
 # token`, so on a machine that has never persisted it there is no auth.json
 # key and no env var to find. `gh`'s hosts file exists once `gh auth login` has
 # run — including the keyring-backed form, which stores no token in the file —
-# so its presence, not its contents, is the signal.
+# so its presence, not its contents, is the signal. Detection stays honest
+# about it even though no bundled plugin reports Copilot usage: detection and
+# reporting are separate sets, and `usage_providers()` is what the panel reads.
 _CREDENTIAL_FILES = {
     "anthropic": ("~/.claude/.credentials.json", "~/.hermes/.anthropic_oauth.json"),
     "openai-codex": ("~/.codex/auth.json",),

@@ -132,7 +132,7 @@ function ProviderCard({ snapshot }: { snapshot: ProviderUsageSnapshot }) {
 
 /**
  * Every connected subscription's plan state in one place — Claude, Codex,
- * Kimi, OpenRouter, Copilot, and whatever a provider plugin adds.
+ * Kimi, OpenRouter, and whatever a provider plugin adds.
  *
  * Fetches on mount, which is when the popover opens. The backend caches per
  * provider and serves stale-while-revalidate, so reopening is nearly free and

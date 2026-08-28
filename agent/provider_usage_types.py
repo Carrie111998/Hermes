@@ -2,8 +2,8 @@
 
 One shape for "how much of my plan is left", across providers that measure in
 completely different units: Anthropic and Codex report **percent** of a rolling
-window, OpenRouter reports **dollars**, Copilot reports **counts** of premium
-interactions, MiniMax reports **tokens**.
+window, OpenRouter reports **dollars**, a seat-metered plan reports **counts**
+of interactions, MiniMax reports **tokens**.
 
 Two rules make that work:
 
