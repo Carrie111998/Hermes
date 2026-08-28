@@ -44,6 +44,10 @@ from tui_gateway.hosted_room_peer_transport import (
 )
 
 
+class _ArtifactRetirementBlocked(RuntimeError):
+    """Private peer bytes need a repaired scoped route before retirement."""
+
+
 class HostedRoomService:
     """Own the hosted Discussion policy and its transport-free worker."""
 
@@ -206,6 +210,7 @@ class HostedRoomService:
             self.peer_routes[(room_id, member_id)] = route
             self.peer_clients[(room_id, member_id)] = client
             self._peer_route_status[(room_id, member_id)] = "ready"
+        self._clear_blocked_artifact_retries(room_id, member_id)
         self.runtime.wakeup()
 
     def revoke_room_routes(self, room_id: str) -> int:
@@ -265,20 +270,10 @@ class HostedRoomService:
                 task_id=identity.task_id,
                 execution_generation=execution_generation,
             )
-        tracked_client = _RouteStatusPeerClient(
+        tracked_client = self._tracked_peer_client(
+            binding.room_id,
+            member_id,
             client,
-            on_ready=lambda: self._set_route_status(
-                binding.room_id, member_id, "ready"
-            ),
-            on_reauthorization=lambda: self._set_route_status(
-                binding.room_id, member_id, "needs_reauthorization"
-            ),
-            on_unavailable=lambda: self._set_route_status(
-                binding.room_id, member_id, "unavailable"
-            ),
-            on_refreshed=lambda grant: self._rotate_route_grant(
-                binding.room_id, member_id, grant
-            ),
         )
         if task.get("payload", {}).get("attachments"):
             route = self._refresh_peer_attachment_catalog(
@@ -299,6 +294,28 @@ class HostedRoomService:
             source_event_seq=int(payload.get("source_event_seq") or 0),
             task_id=getattr(task.get("identity"), "task_id", None),
             execution_generation=int(task.get("execution_generation") or 0),
+        )
+
+    def _tracked_peer_client(
+        self,
+        room_id: str,
+        member_id: str,
+        client: HostedRoomPeerClient,
+    ) -> "_RouteStatusPeerClient":
+        return _RouteStatusPeerClient(
+            client,
+            on_ready=lambda: self._set_route_status(
+                room_id, member_id, "ready"
+            ),
+            on_reauthorization=lambda: self._set_route_status(
+                room_id, member_id, "needs_reauthorization"
+            ),
+            on_unavailable=lambda: self._set_route_status(
+                room_id, member_id, "unavailable"
+            ),
+            on_refreshed=lambda grant: self._rotate_route_grant(
+                room_id, member_id, grant
+            ),
         )
 
     def _recover_peer_admission(
@@ -619,6 +636,7 @@ class HostedRoomService:
                 if not self._artifact_retry_due(task):
                     continue
                 publication_status = status
+                keep_artifact_retry = False
                 plan = discussion.reconstruct_task_plan(
                     room,
                     events,
@@ -638,6 +656,9 @@ class HostedRoomService:
                     ):
                         self._defer_artifact_retry(task, exc)
                         continue
+                    if isinstance(exc, _ArtifactRetirementBlocked):
+                        self._defer_artifact_retry(task, exc, permanent=True)
+                        keep_artifact_retry = True
                     result = {
                         "error": "A Group Chat file could not be verified.",
                         "reason_code": "artifact_verification_failed",
@@ -670,7 +691,8 @@ class HostedRoomService:
                             continue
                         self._defer_artifact_retry(task, exc, permanent=True)
                         continue
-                self._clear_artifact_retry(task)
+                if not keep_artifact_retry:
+                    self._clear_artifact_retry(task)
                 events = self._events(str(room["room_id"]))
                 changed = changed or len(events) > before
         return changed
@@ -861,6 +883,12 @@ class HostedRoomService:
             home_install = local_install
         else:
             raise RuntimeError("room output artifact target is invalid")
+        if peer_client is not None:
+            peer_client = self._tracked_peer_client(
+                str(room["room_id"]),
+                plan.member.member_id,
+                peer_client,
+            )
         scope = RoomArtifactScope.from_mapping({
             "room_id": room["room_id"],
             "task_id": plan.identity.task_id,
@@ -882,6 +910,43 @@ class HostedRoomService:
             outbox = RoomArtifactOutbox(profile_root / "state.db")
         artifact_ids = tuple(item["artifact_id"] for item in items)
         message_event_id = f"dmessage:{plan.identity.task_id.removeprefix('dtask:')}"
+        recipient_ids = tuple(plan.payload.get("recipient_member_ids") or ())
+        if not recipient_ids:
+            # Pre-file-handoff tasks have no admission-time recipient snapshot.
+            # Their text replies remain replayable after upgrade, but publishing
+            # a file would otherwise grant bytes using today's room membership.
+            # Retire the exact private outbox first, then fail the visible turn.
+            if outbox is not None:
+                outbox.discard(scope)
+            else:
+                run_id = str(result.get("run_id") or "")
+                if not run_id:
+                    raise RuntimeError("peer room output artifact run is missing")
+                try:
+                    peer_client.acknowledge_artifacts(
+                        run_id=run_id,
+                        artifact_ids=artifact_ids,
+                        manifest_digest=result["artifacts"]["manifest_digest"],
+                        message_event_id=message_event_id,
+                        grant=peer_route.grant,
+                    )
+                except Exception as exc:
+                    # Do not publish a terminal failure while private bytes are
+                    # still live on the peer. Keep the bounded retry active so
+                    # route refresh or reconnection can finish retirement.
+                    if bool(getattr(exc, "retryable", False)) or isinstance(
+                        exc, (ConnectionError, OSError, TimeoutError)
+                    ):
+                        raise
+                    self._set_route_status(
+                        str(room["room_id"]),
+                        plan.member.member_id,
+                        "needs_reauthorization",
+                    )
+                    raise _ArtifactRetirementBlocked(
+                        "peer room output artifact retirement needs a repaired route"
+                    ) from exc
+            raise RuntimeError("room output artifact recipient roster is missing")
         existing_message = next(
             (
                 event
@@ -953,9 +1018,6 @@ class HostedRoomService:
 
         digest = plan.identity.task_id.removeprefix("dtask:")
         event_id = f"dmessage:{digest}"
-        recipient_ids = tuple(plan.payload.get("recipient_member_ids") or ())
-        if not recipient_ids:
-            raise RuntimeError("room output artifact recipient roster is missing")
         normalized = dict(result)
         normalized["attachments"] = self.attachments.commit_message(
             room_id=str(room["room_id"]),
@@ -1010,12 +1072,39 @@ class HostedRoomService:
                 local_profiles=self.local_profiles(),
             )
             if decision.status == "task" and decision.task is not None:
-                driver.admit_task(
-                    self.db_path,
-                    decision.task.identity,
-                    payload=decision.task.payload,
-                    clock=time.time,
+                existing = next(
+                    (
+                        task
+                        for task in driver.list_tasks(
+                            self.db_path,
+                            room_id=binding.room_id,
+                        )
+                        if task["status"] not in driver.TERMINAL_STATUSES
+                        and task["identity"].thread_id
+                        == decision.task.identity.thread_id
+                        and task["identity"].turn_id == decision.task.identity.turn_id
+                    ),
+                    None,
                 )
+                if existing is not None:
+                    # A roster edit can change the prompt and task hash while
+                    # the immutable room/thread/turn coordinate stays the same.
+                    # Resume the admitted task after strict reconstruction;
+                    # admitting the rehashed candidate would collide with the
+                    # driver's unique turn fence and brick the room.
+                    discussion.reconstruct_task_plan(
+                        room,
+                        events,
+                        existing,
+                        local_profiles=self.local_profiles(),
+                    )
+                else:
+                    driver.admit_task(
+                        self.db_path,
+                        decision.task.identity,
+                        payload=decision.task.payload,
+                        clock=time.time,
+                    )
                 # A stop can race the policy read from another process. Re-read
                 # after admission and cancel before the runtime can execute a
                 # task whose source event is now behind the room stop fence.
@@ -1398,7 +1487,9 @@ class _RouteStatusPeerClient:
 
         def tracked(*args, **kwargs):
             if name in {
+                "acknowledge_artifacts",
                 "dispatch",
+                "read_artifact",
                 "recover_dispatch",
                 "stage_attachments",
             } and "grant" in kwargs:

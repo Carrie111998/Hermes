@@ -278,6 +278,60 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
     )
 
 
+def test_reconstructs_pre_file_handoff_task_without_recipient_snapshot(room_db):
+    db, room = room_db
+    _append_user(db, event_id="legacy-user", text="Check the release.")
+    planned = _next_task(room, db)
+    legacy_payload = dict(planned.payload)
+    legacy_payload.pop("recipient_member_ids")
+    driver.admit_task(
+        db,
+        planned.identity,
+        payload=legacy_payload,
+        clock=time.time,
+    )
+
+    reconstructed = discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        driver.get_task(db, planned.identity),
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    assert reconstructed.identity == planned.identity
+    assert reconstructed.payload == legacy_payload
+
+
+def test_reconstruction_keeps_admission_time_recipients(room_db):
+    db, room = room_db
+    _append_user(db, event_id="user-frozen-roster", text="Prepare the file.")
+    planned = _next_task(room, db)
+    driver.admit_task(db, planned.identity, payload=planned.payload, clock=time.time)
+    expanded_room = {
+        **room,
+        "members": [
+            *room["members"],
+            {
+                "member_id": "member-late",
+                "profile": "late",
+                "handle": "late",
+                "display_name": "Late",
+            },
+        ],
+    }
+
+    reconstructed = discussion.reconstruct_task_plan(
+        expanded_room,
+        _events(db),
+        driver.get_task(db, planned.identity),
+        local_profiles=(*LOCAL_PROFILES, "late"),
+    )
+
+    assert reconstructed.payload["recipient_member_ids"] == planned.payload[
+        "recipient_member_ids"
+    ]
+
+
 @pytest.mark.parametrize(
     ("text", "expected_profile"),
     [

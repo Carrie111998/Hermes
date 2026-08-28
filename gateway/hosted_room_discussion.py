@@ -1435,10 +1435,9 @@ def reconstruct_task_plan(
         member = None
     if member is None or _member_digest(member) != match.group("member"):
         raise DiscussionReconstructionError("task target member does not match turn_id")
-    if payload.get("recipient_member_ids") != [
-        candidate.member_id for candidate in room.members
-    ]:
-        raise DiscussionReconstructionError("task recipient roster changed")
+    frozen_recipient_ids = payload.get("recipient_member_ids")
+    if frozen_recipient_ids is not None and member.member_id not in frozen_recipient_ids:
+        raise DiscussionReconstructionError("task target is missing from recipient roster")
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise DiscussionReconstructionError("task prompt is missing")
@@ -1484,6 +1483,27 @@ def reconstruct_task_plan(
         seen_through_seq=seen_through_seq,
         prompt=prompt,
         attachments=attachments,
+    )
+    reconstructed_payload = dict(reconstructed.payload)
+    if frozen_recipient_ids is None:
+        # Tasks admitted before Bot file handoff had no recipient snapshot.
+        # They cannot publish output files without one (the service fails that
+        # path closed), but their text terminal rows must remain replayable or
+        # a single pre-upgrade turn bricks the entire room after restart.
+        reconstructed_payload.pop("recipient_member_ids", None)
+    else:
+        # Preserve the admission-time roster. A Bot added later must not gain
+        # access to an earlier file, while a removed Bot keeps the same history
+        # boundary it had when the turn was accepted.
+        reconstructed_payload["recipient_member_ids"] = list(frozen_recipient_ids)
+    reconstructed = DiscussionTaskPlan(
+        identity=reconstructed.identity,
+        payload=reconstructed_payload,
+        discussion_event_id=reconstructed.discussion_event_id,
+        member=reconstructed.member,
+        member_index=reconstructed.member_index,
+        round_index=reconstructed.round_index,
+        seen_through_seq=reconstructed.seen_through_seq,
     )
     if reconstructed.identity != identity or dict(reconstructed.payload) != dict(
         payload

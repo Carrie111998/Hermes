@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway import hosted_room_discussion as discussion
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
 from gateway.hosted_room_peer import (
@@ -276,6 +277,16 @@ class _LostAckArtifactPeerClient(_ArtifactPeerClient):
                 ambiguous=True,
             )
         return {"acknowledged": True, "changed": 0}
+
+
+class _ReauthAckArtifactPeerClient(_ArtifactPeerClient):
+    def acknowledge_artifacts(self, **kwargs):
+        self.acks.append(dict(kwargs))
+        raise PeerRunsHTTPError(
+            "room grant expired",
+            status_code=401,
+            error_code="invalid_room_grant",
+        )
 
 
 class _UnavailableAttachmentPeerClient(_FakePeerClient):
@@ -704,6 +715,325 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
     service.prepare_room(binding)
     replayed = service._events("room-1")
     assert replayed == events
+
+
+def test_upgrade_replays_legacy_terminal_task_then_admits_new_work(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="legacy-user",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops inspect", "thread_id": "legacy-thread"},
+    )
+    room = hosted_rooms.room_state(db, room_id="room-1")
+    events = service._events("room-1")
+    planned = discussion.plan_next_task(
+        room,
+        events,
+        local_profiles=("default", "ops"),
+    ).task
+    assert planned is not None
+    legacy_payload = dict(planned.payload)
+    legacy_payload.pop("recipient_member_ids")
+    admitted = driver.admit_task(
+        db,
+        planned.identity,
+        payload=legacy_payload,
+        clock=time.time,
+    )
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="pre-upgrade",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    attempt = driver.start_task(
+        db,
+        admitted["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    driver.settle_task(
+        db,
+        attempt,
+        settlement_id="legacy-reply",
+        status="settled",
+        result={"text": "legacy done"},
+        clock=time.time,
+    )
+
+    service.prepare_room(binding)
+    assert any(
+        row["kind"] == "message.member"
+        and row["payload"].get("text") == "legacy done"
+        for row in service._events("room-1")
+    )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="post-upgrade-user",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops continue", "thread_id": "post-upgrade-thread"},
+    )
+    service.prepare_room(binding)
+
+    queued = driver.list_tasks(db, room_id="room-1", status="queued")
+    assert len(queued) == 1
+    assert queued[0]["payload"]["recipient_member_ids"] == ["default", "ops"]
+
+
+def test_upgrade_fails_legacy_file_output_closed_then_continues(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _ArtifactRPC(db)
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Handoff room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="legacy-file-user",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "Prepare the file", "thread_id": "legacy-thread"},
+    )
+    room = hosted_rooms.room_state(db, room_id="room-1")
+    planned = discussion.plan_next_task(
+        room,
+        service._events("room-1"),
+        local_profiles=("default", "ops"),
+    ).task
+    assert planned is not None
+    legacy_payload = dict(planned.payload)
+    legacy_payload.pop("recipient_member_ids")
+    driver.admit_task(
+        db,
+        planned.identity,
+        payload=legacy_payload,
+        clock=time.time,
+    )
+
+    service.start()
+    _wait_for(
+        lambda: any(
+            row["kind"] == "turn.failed"
+            and row["payload"].get("task_id") == planned.identity.task_id
+            for row in service._events("room-1")
+        )
+    )
+    assert not any(
+        row["kind"] == "message.member"
+        and row["payload"].get("attachments")
+        and row["payload"].get("thread_id") == "legacy-thread"
+        for row in service._events("room-1")
+    )
+    assert RoomArtifactOutbox(db).list(rpc.scope) == []
+
+    service.send(
+        room_id="room-1",
+        event_id="post-upgrade-file-user",
+        payload={"text": "Prepare another file", "thread_id": "new-thread"},
+    )
+    _wait_for(
+        lambda: any(
+            row["kind"] == "message.member"
+            and row["payload"].get("attachments")
+            and row["payload"].get("thread_id") == "new-thread"
+            for row in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+
+def test_upgrade_resumes_queued_legacy_turn_after_roster_expands(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops", "audit")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="legacy-user",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    original_room = hosted_rooms.room_state(db, room_id="room-1")
+    planned = discussion.plan_next_task(
+        original_room,
+        service._events("room-1"),
+        local_profiles=("default", "ops"),
+    ).task
+    assert planned is not None
+    legacy_payload = dict(planned.payload)
+    legacy_payload.pop("recipient_member_ids")
+    driver.admit_task(db, planned.identity, payload=legacy_payload, clock=time.time)
+    expanded_members = [
+        *original_room["members"],
+        {
+            "member_id": "audit",
+            "profile": "audit",
+            "handle": "audit",
+            "display_name": "Audit",
+            "target": {"kind": "local", "profile": "audit"},
+        },
+    ]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE hosted_rooms SET members_json=?, revision=revision+1 WHERE room_id=?",
+            (
+                __import__("json").dumps(
+                    expanded_members,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "room-1",
+            ),
+        )
+
+    expanded_room = hosted_rooms.room_state(db, room_id="room-1")
+    rehashed = discussion.plan_next_task(
+        expanded_room,
+        service._events("room-1"),
+        local_profiles=("default", "ops", "audit"),
+    ).task
+    assert rehashed is not None
+    assert rehashed.identity.turn_id == planned.identity.turn_id
+    assert rehashed.identity.task_id != planned.identity.task_id
+
+    service.prepare_room(service.bindings()[0])
+
+    queued = driver.list_tasks(db, room_id="room-1", status="queued")
+    assert [task["identity"] for task in queued] == [planned.identity]
+
+
+def test_upgrade_retires_legacy_peer_file_before_failing_closed(tmp_path: Path):
+    db = tmp_path / "state.db"
+    peer = _ReauthAckArtifactPeerClient()
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-reviewer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest="a" * 64,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed-room-grant",
+        attachments=True,
+    )
+    service = HostedRoomService(
+        _server(),
+        db_path=db,
+        peer_routes={("room-1", "member-reviewer"): route},
+        peer_clients={"install-peer": peer},
+    )
+    service.local_profiles = lambda: ("ops",)
+    service.create_room(
+        room_id="room-1",
+        name="Cross-gateway handoff",
+        members=[
+            {
+                "member_id": "member-reviewer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": "a" * 64,
+                },
+            },
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="legacy-peer-user",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@reviewer prepare the file", "thread_id": "thread-1"},
+    )
+    room = hosted_rooms.room_state(db, room_id="room-1")
+    planned = discussion.plan_next_task(
+        room,
+        service._events("room-1"),
+        local_profiles=("ops",),
+    ).task
+    assert planned is not None
+    legacy_payload = dict(planned.payload)
+    legacy_payload.pop("recipient_member_ids")
+    driver.admit_task(db, planned.identity, payload=legacy_payload, clock=time.time)
+
+    service.start()
+    _wait_for(lambda: bool(peer.acks))
+    _wait_for(
+        lambda: any(
+            row["kind"] == "turn.failed"
+            and row["payload"].get("task_id") == planned.identity.task_id
+            for row in service._events("room-1")
+        )
+    )
+    assert service.status("room-1")["peer_routes"][0]["status"] == (
+        "needs_reauthorization"
+    )
+    with service._artifact_retry_connection() as conn:
+        assert conn.execute(
+            "SELECT blocked FROM hosted_room_artifact_retries"
+        ).fetchone()["blocked"] == 1
+
+    replacement = _ArtifactPeerClient()
+    service.register_peer_route(
+        room_id="room-1",
+        member_id="member-reviewer",
+        route=route,
+        client=replacement,
+    )
+    _wait_for(lambda: bool(replacement.acks))
+    with service._artifact_retry_connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hosted_room_artifact_retries"
+        ).fetchone()[0] == 0
+    assert service.stop(timeout=1.0)
+    assert replacement.acks[0]["artifact_ids"] == (peer.item["artifact_id"],)
+    assert not any(
+        row["kind"] == "message.member" and row["payload"].get("attachments")
+        for row in service._events("room-1")
+    )
 
 
 def test_headless_room_publishes_peer_member_reply_without_desktop_transport(
