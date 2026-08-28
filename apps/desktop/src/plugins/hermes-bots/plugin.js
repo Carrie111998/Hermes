@@ -76,6 +76,7 @@ const SkillsView = typeof sdk === 'undefined' ? undefined : sdk.SkillsView
 // ACTIVE gateway's skills under the remote bot's name (the wrong machine),
 // so those builds keep the staged checklists for remote targets.
 const skillsViewRoutesConnections = Boolean(SkillsView && SkillsView.supportsFixedConnection)
+const MessageTextContent = typeof sdk === 'undefined' ? undefined : sdk.MessageTextContent
 const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
 // Deterministic blob avatars (name → face). Feature-detected: older SDKs
 // without the export fall back to the legacy math-face shapes below.
@@ -13872,7 +13873,11 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                             // The app shell sets user-select: none globally; message bodies opt
                             // back in so drag-select and ⌘C work in group chat logs.
                             'data-selectable-text': 'true',
-                            children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
+                            children: MessageTextContent
+                              ? jsx(MessageTextContent, { text: entry.text })
+                              : Streamdown
+                                ? jsx(Streamdown, { children: entry.text })
+                                : entry.text
                           }),
                           // User attachments: what every responding bot was
                           // shown — image previews, or a named chip for
