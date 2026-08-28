@@ -18,11 +18,12 @@ test('hosted rooms never advertise a file drop target they will reject', () => {
   assert.doesNotMatch(pluginSource, /if \(hosted\) setDragOver\(true\)/)
 })
 
-test('same-gateway hosted rooms keep file staging while distributed rooms fail early', () => {
+test('hosted rooms stage files only after every gateway advertises support', () => {
   assert.match(pluginSource, /async function stageHostedAttachments/)
-  assert.match(pluginSource, /room\?\.continuityMode === 'distributed'/)
-  assert.match(pluginSource, /await stageHostedAttachments\(\{ connectionId \}, room\.roomId, sent\.id, attachments\)/)
-  assert.match(pluginSource, /Files are not available across gateways yet\. The draft was kept\./)
+  assert.match(pluginSource, /function hostedGroupAttachmentAvailability/)
+  assert.match(pluginSource, /catalog\?\.attachments !== true/)
+  assert.match(pluginSource, /await stageHostedAttachments/)
+  assert.match(pluginSource, /Update \$\{label\} to share files in this Group Chat\./)
 })
 
 test('hosted sends distinguish sending, queued offline, and working', () => {

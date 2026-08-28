@@ -2373,9 +2373,12 @@ async function sendHostedGroupChat(group, members, sent, thread, attachments) {
   if (!connectionId) {
     throw new Error('This group is offline. Try again when its gateway reconnects.')
   }
-  const manifests = room?.continuityMode === 'distributed'
-    ? []
-    : await stageHostedAttachments({ connectionId }, room.roomId, sent.id, attachments)
+  const manifests = await stageHostedAttachments(
+    { connectionId },
+    room.roomId,
+    sent.id,
+    attachments
+  )
   return enqueueHostedRoomCommand({
     commandId: sent.id,
     kind: 'send',
@@ -9875,17 +9878,21 @@ function sendToGroupChat(group, members, text, thread, images) {
   const attached = Array.isArray(images) ? images.filter(img => img && img.data) : []
   const room = $groupChats.get()[group]
   const hosted = groupChatHostedGateway(room)
-  const distributedHosted = Boolean(hosted && room?.continuityMode === 'distributed')
+  const attachmentAvailability = hostedGroupAttachmentAvailability(
+    room,
+    members,
+    $hostedRoomCapabilities.get()
+  )
 
   if ((!trimmed && !attached.length) || !members.length) {
     return null
   }
 
   if (hosted) {
-    if (distributedHosted && attached.length) {
+    if (attached.length && attachmentAvailability.kind !== 'ready') {
       host.notify?.({
         kind: 'info',
-        message: 'Files are not available across gateways yet. The draft was kept.'
+        message: attachmentAvailability.message
       })
       return null
     }
@@ -14990,12 +14997,70 @@ function migrateGroupComposerDraft(oldKey, newKey) {
   groupComposerDrafts.delete(oldKey)
 }
 
+function hostedGroupAttachmentAvailability(room, members, capabilities) {
+  if (!groupChatHostedGateway(room)) {
+    return { kind: 'ready', message: '' }
+  }
+  const connectionIds = new Set()
+  const home = String(room?.hostedConnectionId || '')
+  if (home) connectionIds.add(home)
+  for (const member of members || []) {
+    let connectionId = String(
+      member?.route?.connectionId || member?.connectionId || ''
+    )
+    if (!connectionId && !member?.sourceMissing && !member?.sourceScoped && !member?.remoteSource && member?.target?.kind !== 'peer') {
+      connectionId = home
+    }
+    if (!connectionId) {
+      const label = String(
+        member?.connectionLabel || member?.display_name || member?.title || member?.name || 'this Bot'
+      )
+      return {
+        kind: 'unavailable',
+        message: `Reconnect ${label} before sharing files in this Group Chat.`
+      }
+    }
+    if (connectionId) connectionIds.add(connectionId)
+  }
+  if (!connectionIds.size) {
+    return {
+      kind: 'checking',
+      message: 'Checking file sharing for this Group Chat…'
+    }
+  }
+  for (const connectionId of connectionIds) {
+    if (!Object.prototype.hasOwnProperty.call(capabilities || {}, connectionId)) {
+      return {
+        kind: 'checking',
+        message: 'Checking file sharing for this Group Chat…'
+      }
+    }
+    if (capabilities?.[connectionId]?.roomLink?.catalog?.attachments !== true) {
+      const member = (members || []).find(candidate =>
+        String(candidate?.route?.connectionId || candidate?.connectionId || '') === connectionId
+      )
+      const label = String(member?.connectionLabel || 'One gateway')
+      return {
+        kind: 'needs-update',
+        message: `Update ${label} to share files in this Group Chat.`
+      }
+    }
+  }
+  return { kind: 'ready', message: '' }
+}
+
 function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
   const hosted = Boolean(groupChatHostedGateway(room))
-  const hostedAttachmentsUnavailable = hosted && room.continuityMode === 'distributed'
+  const hostedCapabilities = useValue($hostedRoomCapabilities)
+  const attachmentAvailability = hostedGroupAttachmentAvailability(
+    room,
+    members,
+    hostedCapabilities
+  )
+  const hostedAttachmentsUnavailable = attachmentAvailability.kind !== 'ready'
   const retryAction = Array.isArray(room.hostedPendingActions)
     ? room.hostedPendingActions.find(action => action?.kind === 'retry')
     : null
@@ -15136,7 +15201,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     if (hostedAttachmentsUnavailable) {
       host.notify({
         kind: 'info',
-        message: 'Files are not available across gateways yet.'
+        message: attachmentAvailability.message
       })
       return
     }
@@ -15161,7 +15226,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     if (hostedAttachmentsUnavailable) {
       host.notify({
         kind: 'info',
-        message: 'Files are not available across gateways yet.'
+        message: attachmentAvailability.message
       })
       return
     }
@@ -15525,7 +15590,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const attachButton = thread =>
     jsx(Tip, {
       label: hostedAttachmentsUnavailable
-        ? 'Files are not available across gateways yet'
+        ? attachmentAvailability.message
         : 'Attach files — every responding bot sees them',
       children: jsx(Button, {
         type: 'button',
@@ -15533,7 +15598,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         size: 'sm',
         disabled: hostedAttachmentsUnavailable,
         className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
-        'aria-label': hostedAttachmentsUnavailable ? 'File sharing unavailable across gateways' : 'Attach files',
+        'aria-label': hostedAttachmentsUnavailable ? attachmentAvailability.message : 'Attach files',
         onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
         children: jsx(Codicon, { name: 'attach' })
       })

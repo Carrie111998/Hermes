@@ -207,7 +207,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, stageHostedAttachments, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, hostedMemberDescriptors, transitionHostedRoomOutbox, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $hostedRoomOutbox, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, stageHostedAttachments, hostedGroupAttachmentAvailability, appendGroupChatEntry, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatHostedGateway, applyHostedRoomAuthority, hostedMemberDescriptors, transitionHostedRoomOutbox, groupChatSyncSequence, compareGroupChatSyncEntries, mergeGroupChatSyncEntries, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, hydratePersistedGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $hostedRoomOutbox, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -1034,6 +1034,56 @@ test('hosted attachments upload once to the room home and return metadata-only m
     }
   ])
   assert.doesNotMatch(JSON.stringify(manifest), /base64|data:|iVBOR/)
+})
+
+test('hosted file sharing waits for every gateway and names the one needing an update', () => {
+  const gc = load(() => '(pass)')
+  const room = { hosted: 'home', hostedConnectionId: 'home' }
+  const members = [
+    { name: 'home-bot', connectionId: 'home', connectionLabel: 'Home' },
+    { name: 'work-bot', connectionId: 'work', connectionLabel: 'Work gateway' }
+  ]
+  const ready = connectionId => ({
+    roomLink: { catalog: { attachments: true, installationId: connectionId } }
+  })
+
+  assert.equal(
+    JSON.stringify(gc.hostedGroupAttachmentAvailability(room, members, {})),
+    JSON.stringify({ kind: 'checking', message: 'Checking file sharing for this Group Chat…' })
+  )
+  assert.equal(
+    JSON.stringify(gc.hostedGroupAttachmentAvailability(
+      room,
+      [...members, {
+        name: 'offline-reviewer',
+        connectionLabel: 'Review gateway',
+        sourceMissing: true,
+        target: { kind: 'peer' }
+      }],
+      { home: ready('home'), work: ready('work') }
+    )),
+    JSON.stringify({
+      kind: 'unavailable',
+      message: 'Reconnect Review gateway before sharing files in this Group Chat.'
+    })
+  )
+  assert.equal(
+    JSON.stringify(gc.hostedGroupAttachmentAvailability(room, members, {
+      home: ready('home'),
+      work: { roomLink: { catalog: { attachments: false } } }
+    })),
+    JSON.stringify({
+      kind: 'needs-update',
+      message: 'Update Work gateway to share files in this Group Chat.'
+    })
+  )
+  assert.equal(
+    JSON.stringify(gc.hostedGroupAttachmentAvailability(room, members, {
+      home: ready('home'),
+      work: ready('work')
+    })),
+    JSON.stringify({ kind: 'ready', message: '' })
+  )
 })
 
 test('late renderer callbacks cannot mutate a hosted room mirror', () => {
