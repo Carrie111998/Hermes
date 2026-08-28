@@ -66,6 +66,25 @@ class TestFallbackChainIdentity:
             len(get_fallback_chain({"fallback_providers": [entry, dict(entry)]})) == 1
         )
 
+    def test_distinct_unresolved_key_env_entries_stay_distinct(self, monkeypatch):
+        """Credential-source identity must survive when env values are absent."""
+        monkeypatch.delenv("FB_KEY_A", raising=False)
+        monkeypatch.delenv("FB_KEY_B", raising=False)
+        common = {
+            "provider": "custom",
+            "model": "m",
+            "base_url": "https://gw/v1",
+        }
+        entries = [
+            {**common, "key_env": "FB_KEY_A"},
+            {**common, "key_env": "FB_KEY_B"},
+            {**common, "api_key": "inline-key"},
+            {**common, "credential_pool": "pool-a"},
+        ]
+        # Even without resolving either env var, all four credential surfaces
+        # remain selectable; collapsing the two key_env rows strands one.
+        assert len(get_fallback_chain({"fallback_providers": entries})) == 4
+
     def test_path_case_is_preserved_for_deduplication(self):
         config = {
             "fallback_providers": [

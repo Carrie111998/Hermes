@@ -4488,7 +4488,12 @@ def _is_endpoint_unreachable_error(exc: Exception) -> bool:
             "addressnotavailable",
         }:
             return True
-        if error_type in {"connecterror", "connecttimeouterror"} and (
+        if error_type in {"connecttimeout", "connecttimeouterror"}:
+            # A connect timeout means no response connection was established;
+            # it invalidates this endpoint, unlike ReadTimeout/PoolTimeout
+            # after the request has reached the provider.
+            return True
+        if error_type == "connecterror" and (
             "all connection attempts failed" in text
             or "failed to establish a new connection" in text
             or "cannot connect" in text
@@ -6303,6 +6308,28 @@ def _fallback_entry_has_isolated_credentials(entry: Dict[str, Any]) -> bool:
     )
 
 
+def _fallback_entry_credential_id(
+    entry: Dict[str, Any],
+    *,
+    api_key: Optional[str],
+) -> Optional[str]:
+    """Return a non-secret identity for an entry's credential source.
+
+    Resolved key material is fingerprinted by ``BackendIdentity``. When a
+    ``key_env`` value is unavailable in the current secret scope, retain the
+    env-var name as a source identity rather than falling back to the provider
+    label (or collapsing the entry during selection). Environment variable
+    names are not credential values and are safe to compare.
+    """
+    if api_key:
+        return None
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        return f"key-env:{key_env.casefold()}"
+    pool = str(entry.get("credential_pool") or "").strip()
+    return pool or None
+
+
 def _backend_identity_for_entry(
     entry: Dict[str, Any],
     *,
@@ -6317,7 +6344,7 @@ def _backend_identity_for_entry(
         model=resolved_model or str(entry.get("model") or ""),
         base_url=str(entry.get("base_url") or ""),
         api_key=api_key,
-        credential_id=str(entry.get("credential_pool") or "") or None,
+        credential_id=_fallback_entry_credential_id(entry, api_key=api_key),
     )
 
 
@@ -10827,10 +10854,10 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
-            elif _is_timeout_error(first_err):
-                reason = "timeout"
             elif _is_endpoint_unreachable_error(first_err):
                 reason = "endpoint unreachable"
+            elif _is_timeout_error(first_err):
+                reason = "timeout"
             elif _is_connection_error(first_err):
                 reason = "connection blip"
             else:
@@ -11576,10 +11603,10 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
-            elif _is_timeout_error(first_err):
-                reason = "timeout"
             elif _is_endpoint_unreachable_error(first_err):
                 reason = "endpoint unreachable"
+            elif _is_timeout_error(first_err):
+                reason = "timeout"
             elif _is_connection_error(first_err):
                 reason = "connection blip"
             else:

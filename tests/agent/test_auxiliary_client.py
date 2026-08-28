@@ -2193,6 +2193,48 @@ class TestTransientTransportRetry:
         assert mock_chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
         assert mock_chain.call_args.kwargs["failed_model"] is None
 
+    def test_httpx_connect_timeout_is_endpoint_scoped(self, monkeypatch):
+        """A timeout before connection is endpoint failure, not model failure."""
+        import httpx
+        from agent.backend_identity import FailureScope
+
+        primary = MagicMock()
+        primary.base_url = "https://blackhole.example/v1"
+        primary.chat.completions.create.side_effect = httpx.ConnectTimeout("timed out")
+        fallback = MagicMock()
+        fallback.base_url = "https://healthy.example/v1"
+        fallback.chat.completions.create.return_value = {"fallback": True}
+        monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 0)
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1,
+            p2,
+            p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+            ) as mock_chain,
+        ):
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert result == {"fallback": True}
+        assert mock_chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+        assert mock_chain.call_args.kwargs["failed_model"] is None
+
+    def test_httpx_read_timeout_remains_model_scoped(self):
+        """A connected endpoint that reads too slowly only loses one model."""
+        import httpx
+        from agent.auxiliary_client import (
+            _is_endpoint_unreachable_error,
+            _is_timeout_error,
+        )
+
+        err = httpx.ReadTimeout("timed out")
+        assert _is_timeout_error(err) is True
+        assert _is_endpoint_unreachable_error(err) is False
+
     def test_exhausted_5xx_reaches_fallback(self, monkeypatch):
         """A bounded 5xx retry must transition to provider fallback."""
         class _ServerError(Exception):
@@ -2266,6 +2308,50 @@ class TestAsyncTransportFallbackResiduals:
             )
         assert result == {"fallback": True}
         assert mock_chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+
+    @pytest.mark.asyncio
+    async def test_async_connect_timeout_is_endpoint_scoped(self, monkeypatch):
+        import httpx
+        from agent.backend_identity import FailureScope
+
+        primary = MagicMock()
+        primary.base_url = "https://blackhole.example/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=httpx.ConnectTimeout("timed out")
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://healthy.example/v1"
+        fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+        monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 0)
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openrouter", "some-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "some-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda response, _task, **_kw: response,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+            ) as mock_chain,
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback, "fallback-model"),
+            ),
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert result == {"fallback": True}
+        assert mock_chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+        assert mock_chain.call_args.kwargs["failed_model"] is None
 
     @pytest.mark.asyncio
     async def test_async_exhausted_408_reaches_fallback(self, monkeypatch):
@@ -2363,6 +2449,42 @@ class TestTopLevelFallbackIdentity:
         assert second[2] == "fallback_providers[1](custom)"
         assert resolver.call_args_list[0].args[0] == entries[0]
         assert resolver.call_args_list[1].args[0] == entries[1]
+
+    def test_top_level_key_env_identity_preserves_credential_sibling(self, monkeypatch):
+        """An unresolved key_env must not inherit provider-wide identity."""
+        from agent.auxiliary_client import _try_main_fallback_chain
+        from agent.backend_identity import FailureScope
+
+        monkeypatch.delenv("R3_FALLBACK_KEY", raising=False)
+        entry = {
+            "provider": "custom",
+            "model": "model-b",
+            "base_url": "https://tenant-b.example/v1",
+            "key_env": "R3_FALLBACK_KEY",
+        }
+        client = MagicMock(base_url=entry["base_url"])
+        config = {"fallback_providers": [entry]}
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.auxiliary_client._read_main_provider", return_value="main"),
+            patch("agent.auxiliary_client._read_main_model", return_value="main-model"),
+            patch("agent.auxiliary_client._read_main_base_url", return_value="https://main.example/v1"),
+            patch("agent.auxiliary_client._read_main_api_key", return_value="main-key"),
+            patch(
+                "agent.auxiliary_client._resolve_fallback_entry",
+                return_value=(client, entry["model"]),
+            ) as resolver,
+        ):
+            result = _try_main_fallback_chain(
+                task="session_search",
+                failed_provider="custom",
+                failed_model="model-a",
+                failed_base_url="https://tenant-a.example/v1",
+                failed_api_key="failed-key",
+                failure_scope=FailureScope.CREDENTIAL,
+            )
+        assert result[2] == "fallback_providers[0](custom)"
+        assert resolver.call_args.args[0] == entry
 
 
 class TestFailureScopeFallbackEligibility:

@@ -100,7 +100,14 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str, str]:
         hashlib.sha256(credential.encode("utf-8")).hexdigest() if credential else ""
     )
     if not credential_fingerprint:
-        credential_fingerprint = str(entry.get("credential_pool") or "").strip()
+        key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+        if key_env:
+            # An unavailable env value is still an explicit credential
+            # surface. Keep its non-secret source identity so two entries
+            # cannot collapse before the active secret scope can resolve them.
+            credential_fingerprint = f"key-env:{key_env.casefold()}"
+        else:
+            credential_fingerprint = str(entry.get("credential_pool") or "").strip()
     return (
         str(entry.get("provider") or "").strip().lower(),
         str(entry.get("model") or "").strip().lower(),
