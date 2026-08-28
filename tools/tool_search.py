@@ -871,6 +871,7 @@ def bridge_tool_schemas(
                         "arguments": {
                             "type": "object",
                             "description": "Arguments for the tool, matching its schema.",
+                            "additionalProperties": True,
                         },
                     },
                     "required": ["name", "arguments"],
