@@ -1,3 +1,4 @@
+import { QueryClient } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelOptions } from '@/hermes'
@@ -201,16 +202,22 @@ describe('modelOptionsQueryKey', () => {
   })
 
   it('isolates identical profile and session names across registry connections', () => {
-    expect(modelOptionsQueryKey('default', 'session-1', 'source-a')).toEqual([
+    const sourceAKey = modelOptionsQueryKey('default', 'session-1', 'source-a')
+    const sourceBKey = modelOptionsQueryKey('default', 'session-1', 'source-b')
+    const queryClient = new QueryClient()
+
+    expect(sourceAKey).toEqual([
       'model-options',
       'default',
       'session-1',
       'owner',
       'source-a'
     ])
-    expect(modelOptionsQueryKey('default', 'session-1', 'source-a')).not.toEqual(
-      modelOptionsQueryKey('default', 'session-1', 'source-b')
-    )
+    queryClient.setQueryData(sourceAKey, { providers: [{ models: ['a/model'], slug: 'a' }] })
+    queryClient.setQueryData(sourceBKey, { providers: [{ models: ['b/model'], slug: 'b' }] })
+
+    expect(queryClient.getQueryData(sourceAKey)).toMatchObject({ providers: [{ models: ['a/model'] }] })
+    expect(queryClient.getQueryData(sourceBKey)).toMatchObject({ providers: [{ models: ['b/model'] }] })
   })
 })
 

@@ -97,6 +97,27 @@ describe('useModelControls', () => {
     setCurrentProvider('')
   })
 
+  it('writes optimistic selections only to the owning connection cache', async () => {
+    const queryClient = new QueryClient()
+    const { result } = renderHook(() =>
+      useModelControls({
+        cacheOwnerConnectionId: 'source-a',
+        cacheProfile: 'beta',
+        queryClient,
+        requestGateway: vi.fn()
+      })
+    )
+
+    await act(() => result.current.selectModel({ model: 'a/model', provider: 'a' }))
+
+    expect(queryClient.getQueryData(modelOptionsQueryKey('beta', null, 'source-a'))).toMatchObject({
+      model: 'a/model',
+      provider: 'a'
+    })
+    expect(queryClient.getQueryData(modelOptionsQueryKey('beta'))).toBeUndefined()
+    expect(queryClient.getQueryData(modelOptionsQueryKey('beta', null, 'source-b'))).toBeUndefined()
+  })
+
   it('applies the global model when there is no active runtime session', async () => {
     vi.mocked(getGlobalModelInfo).mockResolvedValue({
       model: 'openai/gpt-5.5',

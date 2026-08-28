@@ -165,7 +165,12 @@ function TileChat({
     [ownerRoute, requestGateway]
   )
 
-  const { selectModel } = useModelControls({ queryClient, requestGateway: requestTileGateway })
+  const { selectModel } = useModelControls({
+    cacheOwnerConnectionId: ownerRoute?.connectionId || undefined,
+    cacheProfile: ownerRoute?.targetProfile || ownerRoute?.profile || undefined,
+    queryClient,
+    requestGateway: requestTileGateway
+  })
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const cwd = useStore(view.$cwd)
   const gatewayOpen = useStore($gatewayState) === 'open'

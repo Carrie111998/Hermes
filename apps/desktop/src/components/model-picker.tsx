@@ -27,6 +27,7 @@ interface ModelPickerDialogProps {
   currentModel: string
   currentProvider: string
   onSelect: (selection: { provider: string; model: string }) => void
+  ownerConnectionId?: string
   profile?: string
   /**
    * Optional class for DialogContent. Use it to lift the picker onto a higher
@@ -45,6 +46,7 @@ export function ModelPickerDialog({
   currentModel,
   currentProvider,
   onSelect,
+  ownerConnectionId,
   profile = 'default',
   contentClassName
 }: ModelPickerDialogProps) {
@@ -58,7 +60,7 @@ export function ModelPickerDialog({
   const [search, setSearch] = useState('')
 
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
+    queryKey: modelOptionsQueryKey(profile, sessionId, ownerConnectionId),
     queryFn: () => requestModelOptions({ gateway: gw, profile, sessionId }),
     enabled: open
   })
