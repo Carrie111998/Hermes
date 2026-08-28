@@ -104,6 +104,15 @@ _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 # size to ~16 KB.  Keep a conservative cap that matches BlueBubbles.
 _MAX_MESSAGE_LENGTH = 8000
 
+
+def _normalize_space_chat_type(value: Any) -> str:
+    """Return a trusted Photon destination class without guessing privacy."""
+    if value == "dm":
+        return "dm"
+    if value == "group":
+        return "group"
+    return "unknown"
+
 # ---------------------------------------------------------------------------
 # Sidecar runtime record
 #
@@ -1236,7 +1245,9 @@ class PhotonAdapter(BasePlatformAdapter):
             return
 
         # iMessage spaces carry their type directly — no id string-sniffing.
-        chat_type = "group" if space.get("type") == "group" else "dm"
+        # Unknown future or malformed values must not be promoted to a trusted
+        # private destination.
+        chat_type = _normalize_space_chat_type(space.get("type"))
         sender_id = sender.get("id") or space.get("phone") or space_id
 
         ts_str = event.get("timestamp") or ""

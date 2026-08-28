@@ -927,7 +927,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 |------|-----------|-------------------|---------|
 | [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes | `tool_name: str, args: dict, task_id: str` | optional directive: `{"action": "block", "message": ...}` vetoes the call; `{"action": "approve", "message": ...}` escalates to the human-approval gate |
 | [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str, duration_ms: int` | ignored |
-| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
+| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str, sender_id: str, destination_chat_id: str, destination_chat_type: str` | [context injection](#pre_llm_call-context-injection) |
 | [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
 | `pre_api_request` | Before each raw provider API request (several per turn when the model calls tools) | `session_id: str, model: str, provider: str, base_url: str, api_mode: str, api_call_count: int, message_count: int, tool_count: int, approx_input_tokens: int, max_tokens: int, request: dict` | ignored |
 | `post_api_request` | After each raw provider API request returns | `pre_api_request` fields plus `api_duration: float, finish_reason: str, response_model: str \| None, usage: dict, response: dict, assistant_content_chars: int, assistant_tool_call_count: int` | ignored |
@@ -952,6 +952,15 @@ The **API request hooks** are observers for the raw provider request, one level 
 ### `pre_llm_call` context injection
 
 This is the only hook whose return value matters. When a `pre_llm_call` callback returns a dict with a `"context"` key (or a plain string), Hermes injects that text into the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context.
+
+Gateway turns also provide source-bound `sender_id`, `destination_chat_id`, and
+`destination_chat_type` fields. Plugins may use all three together for
+destination-aware policy. Treat missing or unrecognized destination types as
+unknown; do not infer that a destination is private from an empty value.
+Hermes binds each gateway agent and model conversation to its original
+provider route. If that destination identity changes in place, the next turn
+fails before hooks, memory retrieval, persistence, or a provider request.
+Start a fresh destination-bound agent instead of reusing the conversation.
 
 #### Return format
 

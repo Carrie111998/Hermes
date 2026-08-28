@@ -719,6 +719,23 @@ class TestWhatsAppSessionKeyConsistency:
         assert build_session_key(second) == "agent:main:telegram:dm:100"
         assert build_session_key(first) != build_session_key(second)
 
+    def test_photon_destination_boundaries_get_distinct_session_keys(self):
+        """Photon DM, group, and different-chat routes cannot share an agent."""
+        photon = Platform("photon")
+        private = SessionSource(
+            platform=photon,
+            chat_id="space-1",
+            chat_type="dm",
+            user_id="provider-sender",
+        )
+        group = replace(private, chat_type="group")
+        different_private = replace(private, chat_id="space-2")
+
+        assert build_session_key(private) == "agent:main:photon:dm:space-1"
+        assert build_session_key(group).startswith("agent:main:photon:group:space-1")
+        assert build_session_key(private) != build_session_key(group)
+        assert build_session_key(private) != build_session_key(different_private)
+
 
     def test_dm_without_chat_id_distinct_users_do_not_collide(self):
         """Two different DM senders without chat_id must not share one
@@ -1642,5 +1659,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

@@ -51,6 +51,33 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+def assert_destination_binding(agent) -> None:
+    """Refuse to reuse a gateway model conversation for another destination.
+
+    Gateway agents are cached and their transcript can contain destination-
+    specific plugin context.  The provider route captured at construction is
+    therefore a security boundary, not mutable per-turn metadata.  CLI and
+    legacy test agents without a gateway session key have no binding.
+    """
+    expected = getattr(agent, "_destination_binding", None)
+    if expected is None:
+        return
+    current = (
+        getattr(agent, "platform", None) or "",
+        getattr(agent, "_user_id", None) or "",
+        getattr(agent, "_user_id_alt", None) or "",
+        getattr(agent, "_chat_id", None) or "",
+        getattr(agent, "_chat_type", None) or "",
+        getattr(agent, "_thread_id", None) or "",
+        getattr(agent, "_gateway_session_key", None) or "",
+    )
+    if current != expected:
+        raise RuntimeError(
+            "Agent destination binding changed during the conversation; "
+            "start a fresh destination-bound agent instead"
+        )
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -481,6 +508,12 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    # This must precede hooks, memory prefetch, persistence, compaction, and
+    # every provider call.  A drifted agent may already contain private or
+    # private-derived prior turns, so merely disabling fresh hydration is not
+    # sufficient.
+    assert_destination_binding(agent)
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1287,6 +1320,8 @@ def build_turn_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            destination_chat_id=getattr(agent, "_chat_id", None) or "",
+            destination_chat_type=getattr(agent, "_chat_type", None) or "",
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

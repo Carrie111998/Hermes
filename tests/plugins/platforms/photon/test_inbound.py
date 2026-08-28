@@ -67,6 +67,26 @@ async def test_dispatch_text_dm(monkeypatch: pytest.MonkeyPatch) -> None:
     assert src.user_id == "+15551234567"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("space_type", [None, "", "private", "future-type"])
+async def test_unknown_space_type_never_becomes_dm(
+    monkeypatch: pytest.MonkeyPatch, space_type: str | None
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    event = _dm_event("hello")
+    if space_type is None:
+        event["space"].pop("type")
+    else:
+        event["space"]["type"] = space_type
+
+    await adapter._dispatch_inbound(event)
+
+    assert len(captured) == 1
+    assert captured[0].source is not None
+    assert captured[0].source.chat_type == "unknown"
+
+
 # A real 1x1 transparent PNG (passes base.py's _looks_like_image magic check).
 _PNG_1X1_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhf"
