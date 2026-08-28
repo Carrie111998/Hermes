@@ -4,7 +4,7 @@ manifest_version: 1
 
 name: orgo
 description: 'Orgo cloud computers: full Linux VMs with a desktop — lifecycle, files, screens, and computer use.'
-source: https://docs.orgo.ai
+source: https://docs.orgo.ai/guides/mcp
 
 # Vendor-hosted remote MCP (URL-only — Hermes never spawns a local process for
 # this entry). The server is generated from Orgo's published OpenAPI spec, so
@@ -29,14 +29,24 @@ auth:
       required: true
       secret: true
 
-# Excluded: the template registry — publish/build/delete/version surface (14
-# tools) that belongs to a release pipeline, not to a chat session, and which
-# would otherwise be a third of the tool list for every user. `orgo_wait` is
-# excluded too: the agent already has its own sleep, and a remote round trip to
-# do nothing is strictly worse. Everything not listed stays enabled, including
+# Excluded, in three groups. Everything not listed stays enabled, including
 # tools Orgo adds later.
+#
+#  1. The template registry (15 tools) — publish/build/version/delete. A release
+#     pipeline, not something a chat session reaches for, and otherwise nearly a
+#     third of the tool list for every user.
+#  2. `orgo_wait` — the agent already has its own sleep, and a remote round trip
+#     to do nothing is strictly worse than a local one.
+#  3. `orgo_upload_file` — on the HOSTED transport this one does not do what its
+#     description says. Its `file` argument is an OpenAPI `format: binary` field,
+#     so the server reads that path off the filesystem of whichever process runs
+#     the handler; over https://www.orgo.ai/mcp that is Orgo's own container, not
+#     the caller's machine. Excluding it keeps Hermes users away from a tool that
+#     can only confuse or misfire for them. (Use the stdio server if you want
+#     working uploads — there `readFile` runs on your own box.)
 tools:
   default_excluded:
+    - orgo_upload_file
     - orgo_get_template_schema
     - orgo_list_templates
     - orgo_publish_template
@@ -54,21 +64,32 @@ tools:
     - orgo_stop_template_run
     - orgo_wait
 
-# Composer-suggestion triggers (desktop brand pills).
-suggest:
-  keywords:
-    - orgo
-  hosts:
-    - orgo.ai
+# No `suggest:` block, deliberately. The desktop composer's brand pill routes
+# through a connect path that calls addMcpServer({name, url}) and then
+# completeMcpDesktopOAuth() unconditionally
+# (apps/desktop/src/store/suggestion-providers/mcp.ts), never consulting
+# auth_type and never carrying headers or env. For an api_key entry the only
+# reachable outcomes are an error toast and a rolled-back server, so advertising
+# the pill would be worse than having none.
 
 post_install: |
-  Every tool takes an optional `id` (a computer UUID). Pin a default with the
-  X-Orgo-Default-Computer-Id header if you work on one computer:
+  Restart the session (or run /reload-mcp) so the tools load.
+
+  Finding a computer id: every tool takes an optional `id`. Get one from
+  orgo_list_workspaces — each workspace comes back with its computers embedded.
+  There is no list-computers tool; the workspace listing is the documented way.
+
+  If you work on one computer, pin it as a default so you never pass an id:
 
       hermes config set mcp_servers.orgo.headers.X-Orgo-Default-Computer-Id <uuid>
 
   Note orgo_list_files takes `projectId`, not `workspace_id`.
 
+  This server can run shell commands and delete computers, workspaces, and
+  files. If you would rather approve each write, mark it untrusted — Orgo's
+  server emits readOnlyHint, so reads stay unprompted:
+
+      hermes config set mcp_servers.orgo.trust untrusted
+
   To run Hermes' own shell inside an Orgo computer rather than just managing
-  them, the terminal backend is a separate plugin:
-  https://github.com/OrgoAI/hermes-orgo
+  them over MCP, the terminal backend is a separate plugin (see docs.orgo.ai).
