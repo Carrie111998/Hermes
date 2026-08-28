@@ -366,6 +366,36 @@ def test_concurrent_process_watchers_coalesce_one_session_completion_turn(monkey
         assert f"proc_batch_{index}" in delivered.text
 
 
+def test_lost_process_watchers_coalesce_without_claiming_completion():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    events = [
+        _completion_event(started_at=float(index), session_id=f"proc_lost_{index}")
+        for index in range(2)
+    ]
+    for event in events:
+        event["exit_code"] = None
+        event["completion_reason"] = "lost"
+        event["output"] = "last captured output\n"
+
+    async def _exercise():
+        return await asyncio.gather(*(
+            runner._enqueue_process_completion_notification(
+                "supervision lost", event
+            )
+            for event in events
+        ))
+
+    assert asyncio.run(_exercise()) == [True, True]
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert "background process status updates" in delivered.text
+    assert "supervision lost; no exit status was collected" in delivered.text
+    assert "last captured output" in delivered.text
+    assert "processes completed" not in delivered.text
+    assert "exit_code=None" not in delivered.text
+
+
 def test_completion_arriving_during_batch_delivery_schedules_next_flush():
     """A new event cannot be stranded behind an in-flight batch for its route."""
     first_delivery_entered = asyncio.Event()

@@ -26156,9 +26156,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
+        has_supervision_loss = any(
+            evt.get("completion_reason") == "lost" for _text, evt, _future in entries
+        )
+        if has_supervision_loss:
+            header = (
+                f"[IMPORTANT: {len(entries)} background process status updates "
+                "for this session."
+            )
+            batch_description = "status-update"
+        else:
+            header = (
+                f"[IMPORTANT: {len(entries)} background processes completed "
+                "for this session."
+            )
+            batch_description = "completion"
         lines = [
-            f"[IMPORTANT: {len(entries)} background processes completed for this session.",
-            "Treat these results as one completion batch and send at most one "
+            header,
+            f"Treat these results as one {batch_description} batch and send at most one "
             "consolidated user-facing response.",
         ]
         shown = entries[:10]
@@ -26177,9 +26192,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ).strip()
             if len(output) > 800:
                 output = f"[… truncated …]\n{output[-800:]}"
-            lines.append(
-                f"\n- {session_id}: exit_code={exit_code}, reason={reason}"
-            )
+            if reason == "lost":
+                lines.append(
+                    f"\n- {session_id}: supervision lost; no exit status was collected"
+                )
+            else:
+                lines.append(
+                    f"\n- {session_id}: exit_code={exit_code}, reason={reason}"
+                )
             if output:
                 lines.append(output)
         omitted = len(entries) - len(shown)
