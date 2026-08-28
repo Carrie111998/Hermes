@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_constants import mark_named_profile_deleted
 from tui_gateway.compute_host import ComputeHost, HostSession
 from tui_gateway.server import (
     _open_profile_session_db,
@@ -171,6 +172,53 @@ def test_compute_host_rejects_deleted_profile_home_before_agent_build(
         host.close()
 
     assert not profile_home.exists()
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_compute_host_rejects_tombstoned_profile_before_agent_build(
+    tmp_path, cached
+):
+    profile_home = tmp_path / ".hermes" / "profiles" / "deleted"
+    profile_home.mkdir(parents=True)
+    mark_named_profile_deleted(profile_home)
+    sid = "stale-profile"
+
+    class _Server:
+        _sessions = (
+            {
+                sid: {
+                    "session_key": sid,
+                    "profile_home": str(profile_home),
+                }
+            }
+            if cached
+            else {}
+        )
+        _require_existing_profile_home = staticmethod(_require_existing_profile_home)
+
+        @staticmethod
+        def _open_profile_session_db(*_args, **_kwargs):
+            raise AssertionError("SessionDB construction must not run")
+
+        @staticmethod
+        def _make_agent(*_args, **_kwargs):
+            raise AssertionError("agent construction must not run")
+
+    host = ComputeHost(heartbeat_secs=0)
+    try:
+        with pytest.raises(RuntimeError, match="profile home no longer exists"):
+            host._ensure_server_session(
+                _Server,
+                {
+                    "sid": sid,
+                    "session_key": sid,
+                    "profile_home": str(profile_home),
+                },
+            )
+    finally:
+        host.close()
+
+    assert list(profile_home.iterdir()) == []
 
 
 def test_profile_home_guard_accepts_existing_directory(tmp_path):
