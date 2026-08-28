@@ -8504,7 +8504,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         from model_tools import get_toolset_for_tool
                         tools = get_tool_definitions(
                             enabled_toolsets=self.enabled_toolsets,
-                            disabled_toolsets=self.disabled_toolsets,
+                            disabled_toolsets=getattr(self, "disabled_toolsets", None),
                             quiet_mode=True,
                         )
                         availability = compute_toolset_availability(self.enabled_toolsets)
@@ -8534,7 +8534,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 from model_tools import get_toolset_for_tool
                 tools = get_tool_definitions(
                     enabled_toolsets=self.enabled_toolsets,
-                    disabled_toolsets=self.disabled_toolsets,
+                    disabled_toolsets=getattr(self, "disabled_toolsets", None),
                     quiet_mode=True,
                 )
                 availability = compute_toolset_availability(self.enabled_toolsets)
@@ -9196,7 +9196,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             tools = get_tool_definitions(
                 enabled_toolsets=self.enabled_toolsets,
-                disabled_toolsets=self.disabled_toolsets,
+                disabled_toolsets=getattr(self, "disabled_toolsets", None),
                 quiet_mode=True,
             )
             tool_count = len(tools) if tools else 0
@@ -9499,7 +9499,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # tool_search bridge (users check this to verify an MCP installed).
         tools = get_tool_definitions(
             enabled_toolsets=self.enabled_toolsets,
-            disabled_toolsets=self.disabled_toolsets,
+            disabled_toolsets=getattr(self, "disabled_toolsets", None),
             quiet_mode=True,
             skip_tool_search_assembly=True,
         )
@@ -12140,7 +12140,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 else:
                     tools = get_tool_definitions(
                         enabled_toolsets=self.enabled_toolsets,
-                        disabled_toolsets=self.disabled_toolsets,
+                        disabled_toolsets=getattr(self, "disabled_toolsets", None),
                         quiet_mode=True,
                     )
                     cwd = os.getenv("TERMINAL_CWD", os.getcwd())
