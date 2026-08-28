@@ -29,6 +29,24 @@ class TestBuildReplayEntry:
         )
         assert entry == {"role": "user", "content": "hello"}
 
+    def test_user_platform_identity_is_internalized_for_retry_recovery(self):
+        entry = _build_replay_entry(
+            "user",
+            "hello",
+            {
+                "role": "user",
+                "content": "hello",
+                "message_id": "provider-delivery-id",
+            },
+        )
+
+        assert entry == {
+            "role": "user",
+            "content": "hello",
+            "_platform_message_id": "provider-delivery-id",
+        }
+        assert "message_id" not in entry
+
     def test_tool_message_has_only_role_and_content(self):
         # Tool messages aren't routed through this helper in production
         # (they take the rich-passthrough branch), but the helper itself
@@ -143,3 +161,35 @@ class TestGatewayHistoryBuildForwardsSidecar:
         agent_history, _obs = _build_gateway_agent_history(history)
         assert agent_history[0]["api_content"] == "hi\n\nCTX"
 
+    def test_durable_input_replay_keeps_exact_persisted_provider_payload(self):
+        from gateway.run import _build_gateway_agent_history
+
+        history = [
+            {
+                "role": "user",
+                "content": "clean transcript text",
+                "api_content": "[Sat 2026-08-22 12:00:00 PDT] clean transcript text\n\nCTX",
+                "message_id": "durable-delivery-marker",
+                "timestamp": 1_777_000_000.0,
+                "mirror": True,
+                "mirror_source": "another session",
+            },
+        ]
+
+        agent_history, _obs = _build_gateway_agent_history(
+            history,
+            inject_timestamps=True,
+            durable_input_marker="durable-delivery-marker",
+        )
+
+        assert agent_history == [
+            {
+                "role": "user",
+                "content": "clean transcript text",
+                "api_content": (
+                    "[Sat 2026-08-22 12:00:00 PDT] clean transcript text\n\nCTX"
+                ),
+                "_platform_message_id": "durable-delivery-marker",
+                "timestamp": 1_777_000_000.0,
+            }
+        ]

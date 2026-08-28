@@ -2900,6 +2900,35 @@ class TestStateMeta:
         db.set_meta("foo", "bar")
         assert db.get_meta("foo") == "bar"
 
+    def test_set_meta_if_absent_has_one_cross_connection_winner(self, db):
+        peer = SessionDB(db_path=db.db_path)
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def _claim(session_db, value):
+            try:
+                barrier.wait(timeout=5)
+                results.append(session_db.set_meta_if_absent("claim", value))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_claim, args=(db, "owner-a")),
+            threading.Thread(target=_claim, args=(peer, "owner-b")),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert errors == []
+            assert sorted(results) == [False, True]
+            assert db.get_meta("claim") in {"owner-a", "owner-b"}
+        finally:
+            peer.close()
 
 
 class TestVacuum:

@@ -2,12 +2,14 @@ import asyncio
 import sys
 import threading
 import types
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import gateway.run as gateway_run
-from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
+from gateway.session import SessionEntry, SessionSource
 
 
 SESSION_KEY = "agent:main:telegram:dm:12345"
@@ -25,6 +27,17 @@ class _SessionStore:
 
     def _save(self):
         self.save_calls += 1
+
+    def advance_compression_session(
+        self, session_key, expected_session_id, target_session_id
+    ):
+        if session_key != SESSION_KEY:
+            return None
+        if self.entry.session_id != expected_session_id:
+            return None
+        self.entry.session_id = target_session_id
+        self._save()
+        return self.entry
 
     def _record_gateway_session_peer(self, session_id, session_key, source):
         # #55300 records the child's gateway peer metadata after a compression
@@ -181,6 +194,70 @@ def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
     )
 
 
+def test_mock_non_webhook_adapter_does_not_opt_into_durable_admission(
+    monkeypatch,
+):
+    _install_compression_failure_agent(monkeypatch)
+
+    now = datetime.now()
+    session_store = MagicMock()
+    session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=SESSION_KEY,
+        session_id="session-before-compression",
+        created_at=now - timedelta(seconds=1),
+        updated_at=now,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    session_store.load_transcript.return_value = []
+    session_store.has_any_sessions.return_value = True
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="fake-token",
+            )
+        }
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = session_store
+    runner._session_db = None
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._mark_durable_active_turn = AsyncMock(return_value=False)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    event = MessageEvent(
+        text="continue",
+        message_id="message-1",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+
+    result = asyncio.run(runner._handle_message(event))
+
+    assert result == "ok"
+    runner._mark_durable_active_turn.assert_awaited_once()
+
+
 class _RateLimitFailureAgent(_CompressionThenFailureAgent):
     def run_conversation(self, user_message, conversation_history=None, task_id=None, **_kwargs):
         return {
@@ -281,5 +358,3 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
             ],
             "api_calls": 1,
         }
-
-

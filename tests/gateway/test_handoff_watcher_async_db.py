@@ -51,15 +51,16 @@ class _RecordingSessionDB:
         self._record("list_pending_handoffs")
         return [{"id": "sess-1"}]
 
+    def list_claimed_webhook_handoffs(self):
+        self._record("list_claimed_webhook_handoffs")
+        return []
+
     def claim_handoff(self, session_id):
         self._record("claim_handoff")
         return True
 
     def complete_handoff(self, session_id):
         self._record("complete_handoff")
-
-    def fail_handoff(self, session_id, error):
-        self._record("fail_handoff")
 
 
 def _make_fake_runner(session_db, *, fail_process=False):
@@ -68,10 +69,21 @@ def _make_fake_runner(session_db, *, fail_process=False):
     The watcher now talks to the SessionDB through the AsyncSessionDB facade,
     so wrap the recording stand-in the same way the gateway does.
     """
+    from gateway.session import AsyncSessionStore
     from hermes_state import AsyncSessionDB
+
+    class _RecordingSessionStore:
+        def _routing_scope(self):
+            session_db._record("_routing_scope")
+            return "test-scope"
 
     fake = types.SimpleNamespace()
     fake._session_db = AsyncSessionDB(session_db)
+    fake.session_store = _RecordingSessionStore()
+    fake.async_session_store = AsyncSessionStore(fake.session_store)
+    fake._recover_dead_webhook_handoffs = types.MethodType(
+        run.GatewayRunner._recover_dead_webhook_handoffs, fake
+    )
     # _running yields True for the first loop check, then False so the loop
     # exits after a single tick.
     states = iter([True, False])
@@ -90,6 +102,7 @@ def _make_fake_runner(session_db, *, fail_process=False):
             raise RuntimeError("boom")
 
     fake._process_handoff = _process_handoff
+    fake._is_webhook_handoff_row = lambda _row: False
     return fake
 
 
@@ -130,5 +143,7 @@ async def test_watcher_wraps_calls_via_asyncio_to_thread(monkeypatch):
     await _run_one_tick(fake, monkeypatch)
 
     assert "list_pending_handoffs" in wrapped
+    assert "list_claimed_webhook_handoffs" in wrapped
+    assert "_routing_scope" in wrapped
     assert "claim_handoff" in wrapped
     assert "complete_handoff" in wrapped

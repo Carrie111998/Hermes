@@ -118,3 +118,34 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rewrite_preserves_event_identity_for_lifecycle_callbacks(
+    monkeypatch,
+):
+    """The adapter-owned event receives the rewritten run's outcome stamp."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    def _fake_hook(name, **_kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "rewrite", "text": "rewritten by plugin"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    event = _make_event("original")
+
+    async def _capture(current_event, source, _quick_key, _run_generation):
+        assert current_event is event
+        assert source is event.source
+        current_event.agent_run_failed = False
+        return "ok"
+
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    assert await runner._handle_message(event) == "ok"
+    assert event.text == "rewritten by plugin"
+    assert event.agent_run_failed is False

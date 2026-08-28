@@ -157,6 +157,20 @@ class TestCachedAgentCleanupOnShutdown:
 
         assert len(gw._agent_cache) == 0
 
+    @pytest.mark.asyncio
+    async def test_legacy_fake_cancels_background_task_without_storage_helpers(
+        self,
+    ):
+        gw = _FakeGateway()
+        gw._restart_task = None
+        gw._adapter_disconnect_timeout_secs = lambda: 0.1
+        background = asyncio.create_task(asyncio.Event().wait())
+        gw._background_tasks.add(background)
+
+        await gw_mod.GatewayRunner.stop(gw)
+
+        assert background.cancelled()
+
 
 class TestRunningAgentsNotDoubleCleaned:
     """Verify behavior when agents appear in both _running_agents and _agent_cache."""

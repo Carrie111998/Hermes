@@ -543,6 +543,2033 @@ class TestSessionStoreSwitchSession:
         db.close()
 
 
+class TestSessionStoreRouteMove:
+    @pytest.fixture()
+    def store(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        session_store = SessionStore(
+            sessions_dir=tmp_path / "sessions",
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        yield session_store
+        session_store._db.close()
+
+    @staticmethod
+    def _webhook_source():
+        return SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:alerts:delivery-1",
+            chat_name="webhook/alerts",
+            chat_type="webhook",
+            user_id="webhook:alerts",
+        )
+
+    @staticmethod
+    def _discord_destination():
+        return SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-123",
+            chat_name="Hermes handoff",
+            chat_type="thread",
+            user_id="system:handoff",
+            user_name="Handoff",
+            thread_id="thread-123",
+        )
+
+    def _claimed_webhook_move(self, store, token):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": source_entry.session_key,
+            "active_session_key": source_entry.session_key,
+        }
+        assert store._db.request_handoff_once(
+            source_entry.session_id, "discord"
+        )
+        assert store._db.claim_webhook_handoff(
+            source_entry.session_id,
+            json.dumps(owner),
+        )
+        moved = store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination_source,
+            handoff_claim_token=token,
+        )
+        assert moved is not None
+        return source_entry, moved, destination_source, destination_key
+
+    def test_move_preserves_exact_session_transcript_and_source_bookkeeping(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        source_key = source_entry.session_key
+        session_id = source_entry.session_id
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+
+        with store._lock:
+            source_entry.input_tokens = 17
+            source_entry.model_override = {"model": "test-model"}
+        assert store.set_session_metadata(
+            source_key,
+            "webhook_handoff_delivery",
+            "alerts:delivery-1",
+        )
+        store.append_to_transcript(
+            session_id, {"role": "user", "content": "investigate alert"}
+        )
+        store.append_to_transcript(
+            session_id, {"role": "assistant", "content": "alert investigated"}
+        )
+        store._db.end_session(session_id, "webhook_complete")
+
+        moved = store.move_session_route(
+            source_key,
+            destination_key,
+            session_id,
+            destination_source,
+        )
+
+        assert moved is not None
+        assert moved.session_id == session_id
+        assert moved.origin == destination_source
+        assert moved.display_name == "Hermes handoff"
+        assert moved.platform == Platform.DISCORD
+        assert moved.chat_type == "thread"
+        assert moved.input_tokens == 17
+        assert moved.model_override == {"model": "test-model"}
+        assert moved.metadata["webhook_handoff_delivery"] == "alerts:delivery-1"
+        assert store.peek_session_id(source_key) is None
+        assert store.peek_session_id(destination_key) == session_id
+        transcript = store.load_transcript(session_id)
+        assert [message["role"] for message in transcript] == ["user", "assistant"]
+        assert [message["content"] for message in transcript] == [
+            "investigate alert",
+            "alert investigated",
+        ]
+        row = store._db.get_session(session_id)
+        assert row["ended_at"] is None
+        assert row["session_key"] == destination_key
+        assert row["source"] == "discord"
+        assert row["chat_id"] == "thread-123"
+        assert row["thread_id"] == "thread-123"
+
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert source_key not in persisted
+        assert json.loads(persisted[destination_key])["session_id"] == session_id
+
+        restarted = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        recovered = restarted.lookup_by_session_key(destination_key)
+        assert recovered is not None
+        assert recovered.session_key == destination_key
+        assert recovered.session_id == session_id
+        assert recovered.metadata["webhook_handoff_delivery"] == (
+            "alerts:delivery-1"
+        )
+        restarted._db.close()
+
+    def test_unclaimed_move_supports_legacy_database_signature(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        original_mover = store._db.move_gateway_routing_entry_if_owned
+
+        def legacy_mover(
+            source_session_key,
+            destination_session_key,
+            expected_session_id,
+            destination_entry_json,
+            *,
+            scope="",
+        ):
+            return bool(
+                original_mover(
+                    source_session_key,
+                    destination_session_key,
+                    expected_session_id,
+                    destination_entry_json,
+                    scope=scope,
+                )
+            )
+
+        with patch.object(
+            store._db,
+            "move_gateway_routing_entry_if_owned",
+            side_effect=legacy_mover,
+        ):
+            moved = store.move_session_route(
+                source_entry.session_key,
+                destination_key,
+                source_entry.session_id,
+                destination_source,
+            )
+
+        assert moved is not None
+        assert store.peek_session_id(source_entry.session_key) is None
+        assert store.peek_session_id(destination_key) == source_entry.session_id
+
+    def test_cleanup_legacy_true_removes_only_requested_route(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+        sibling = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="legacy-sibling-alias",
+                chat_type="dm",
+                user_id="legacy-sibling-alias",
+            )
+        )
+        sibling_key = sibling.session_key
+        assert store.switch_session(sibling_key, entry.session_id) is not None
+
+        def legacy_finalizer(
+            session_key,
+            expected_session_id,
+            end_reason,
+            *,
+            scope="",
+            handoff_error=None,
+        ):
+            assert handoff_error is None
+            removed = store._db.delete_gateway_routing_entry_if_owned(
+                session_key,
+                expected_session_id,
+                scope=scope,
+            )
+            if removed:
+                store._db.end_session(expected_session_id, end_reason)
+            return removed
+
+        with patch.object(
+            store._db,
+            "delete_gateway_routing_entry_and_end_session_if_owned",
+            side_effect=legacy_finalizer,
+        ):
+            cleaned = store.remove_session_route_and_end(
+                entry.session_key,
+                entry.session_id,
+                "webhook_handoff_failed",
+            )
+
+        assert cleaned is True
+        assert store.peek_session_id(entry.session_key) is None
+        assert store.peek_session_id(sibling_key) == entry.session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert sibling_key in persisted
+
+    def test_cleanup_supports_legacy_false_database_result(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+        old_session_id = entry.session_id
+        newer = store.reset_session(entry.session_key)
+        assert newer is not None
+        original_finalizer = (
+            store._db.delete_gateway_routing_entry_and_end_session_if_owned
+        )
+
+        def legacy_finalizer(
+            session_key,
+            expected_session_id,
+            end_reason,
+            *,
+            scope="",
+            handoff_error=None,
+        ):
+            result = original_finalizer(
+                session_key,
+                expected_session_id,
+                end_reason,
+                scope=scope,
+                handoff_error=handoff_error,
+            )
+            if result is None:
+                return None
+            removed_keys, _removable_session_ids = result
+            return session_key in removed_keys
+
+        with patch.object(
+            store._db,
+            "delete_gateway_routing_entry_and_end_session_if_owned",
+            side_effect=legacy_finalizer,
+        ):
+            cleaned = store.remove_session_route_and_end(
+                entry.session_key,
+                old_session_id,
+                "webhook_handoff_failed",
+            )
+
+        assert cleaned is True
+        assert store.peek_session_id(entry.session_key) == newer.session_id
+        assert store._db.get_session(old_session_id)["ended_at"] is not None
+
+    def test_successful_claimed_move_fences_stale_route_writers(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        stale_fast = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        stale_full = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale_fast.peek_session_id(source_entry.session_key) == (
+                source_entry.session_id
+            )
+            assert stale_full.peek_session_id(source_entry.session_key) == (
+                source_entry.session_id
+            )
+            source_entry, _moved, _destination, destination_key = (
+                self._claimed_webhook_move(store, "successful-stale-writer")
+            )
+            assert store._db.complete_claimed_webhook_handoff(
+                source_entry.session_id,
+                "successful-stale-writer",
+            )
+
+            stale_fast.update_session(
+                source_entry.session_key,
+                last_prompt_tokens=7,
+            )
+            with stale_full._lock:
+                stale_full._save()
+
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert source_entry.session_key not in persisted
+            assert set(persisted) == {destination_key}
+            assert json.loads(persisted[destination_key])["session_id"] == (
+                source_entry.session_id
+            )
+            assert stale_fast.peek_session_id(source_entry.session_key) is None
+            assert stale_full.peek_session_id(source_entry.session_key) is None
+            assert stale_full.peek_session_id(destination_key) == (
+                source_entry.session_id
+            )
+        finally:
+            stale_fast.close_all_db_handles()
+            stale_full.close_all_db_handles()
+
+    def test_restart_reconciles_stale_source_mirror_after_claimed_move(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        store._write_sessions_json = True
+        with store._lock:
+            store._save()
+
+        with patch.object(
+            store,
+            "_save_sessions_json",
+            side_effect=OSError("simulated crash before mirror update"),
+        ):
+            source_entry, _moved, _destination, destination_key = (
+                self._claimed_webhook_move(store, "mirror-gap-token")
+            )
+        assert store._db.complete_claimed_webhook_handoff(
+            source_entry.session_id,
+            "mirror-gap-token",
+        )
+
+        restarted = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=True),
+        )
+        try:
+            assert restarted.peek_session_id(source_entry.session_key) is None
+            assert restarted.peek_session_id(destination_key) == (
+                source_entry.session_id
+            )
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert set(persisted) == {destination_key}
+        finally:
+            restarted.close_all_db_handles()
+
+    def test_preclaim_terminal_cleanup_fences_stale_route_writers(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        stale_fast = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        stale_full = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale_fast.peek_session_id(source_entry.session_key) == (
+                source_entry.session_id
+            )
+            assert stale_full.peek_session_id(source_entry.session_key) == (
+                source_entry.session_id
+            )
+            assert store.remove_session_route_and_end(
+                source_entry.session_key,
+                source_entry.session_id,
+                "webhook_handoff_cancelled",
+            )
+
+            stale_fast.update_session(
+                source_entry.session_key,
+                last_prompt_tokens=3,
+            )
+            with stale_full._lock:
+                stale_full._save()
+
+            assert store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            ) == {}
+            assert stale_fast.peek_session_id(source_entry.session_key) is None
+            assert stale_full.peek_session_id(source_entry.session_key) is None
+        finally:
+            stale_fast.close_all_db_handles()
+            stale_full.close_all_db_handles()
+
+    def test_protected_route_survives_reset_compression_and_stale_saves(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        ) is not None
+        stale_root = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale_root.peek_session_id(destination_key) == (
+                source_entry.session_id
+            )
+            reset = store.reset_session(destination_key)
+            assert reset is not None
+            with stale_root._lock:
+                stale_root._save()
+            assert store.peek_session_id(destination_key) == reset.session_id
+
+            stale_reset = SessionStore(
+                sessions_dir=store.sessions_dir,
+                config=GatewayConfig(write_sessions_json=False),
+            )
+            try:
+                assert stale_reset.peek_session_id(destination_key) == (
+                    reset.session_id
+                )
+                child_session_id = "protected-compression-child"
+                store._db.end_session(reset.session_id, "compression")
+                store._db.create_session(
+                    child_session_id,
+                    "discord",
+                    parent_session_id=reset.session_id,
+                    session_key=destination_key,
+                )
+                assert store.advance_compression_session(
+                    destination_key,
+                    reset.session_id,
+                    child_session_id,
+                ) is not None
+                with stale_reset._lock:
+                    stale_reset._save()
+
+                persisted = store._db.load_gateway_routing_entries(
+                    scope=store._routing_scope()
+                )
+                assert json.loads(persisted[destination_key])["session_id"] == (
+                    child_session_id
+                )
+            finally:
+                stale_reset.close_all_db_handles()
+        finally:
+            stale_root.close_all_db_handles()
+
+    def test_force_new_rotates_protected_route_without_retry_loop(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        ) is not None
+
+        replacement = store.get_or_create_session(destination, force_new=True)
+
+        assert replacement.session_id != source_entry.session_id
+        assert store.peek_session_id(destination_key) == replacement.session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert json.loads(persisted[destination_key])["session_id"] == (
+            replacement.session_id
+        )
+
+    def test_stale_structural_cas_adopts_concurrent_route_winner(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        ) is not None
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(destination_key) == source_entry.session_id
+
+            winner = store.get_or_create_session(destination, force_new=True)
+            adopted = stale.get_or_create_session(destination)
+
+            assert adopted.session_id == winner.session_id
+            assert store.peek_session_id(destination_key) == winner.session_id
+            assert stale.peek_session_id(destination_key) == winner.session_id
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[destination_key])["session_id"] == (
+                winner.session_id
+            )
+            assert store._db.get_session(winner.session_id)["ended_at"] is None
+        finally:
+            stale.close_all_db_handles()
+
+    def test_stale_metadata_save_adopts_concurrent_route_winner(
+        self, store, monkeypatch
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        ) is not None
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(destination_key) == source_entry.session_id
+            original_liveness_check = stale._is_session_ended_in_db
+            concurrent_winner = None
+
+            def _rotate_then_report_live(session_id):
+                nonlocal concurrent_winner
+                if concurrent_winner is None:
+                    concurrent_winner = store.get_or_create_session(
+                        destination, force_new=True
+                    )
+                    return False
+                return original_liveness_check(session_id)
+
+            monkeypatch.setattr(
+                stale, "_is_session_ended_in_db", _rotate_then_report_live
+            )
+            adopted = stale.get_or_create_session(destination)
+
+            assert concurrent_winner is not None
+            assert adopted.session_id == concurrent_winner.session_id
+            assert stale.peek_session_id(destination_key) == (
+                concurrent_winner.session_id
+            )
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[destination_key])["session_id"] == (
+                concurrent_winner.session_id
+            )
+            assert store._db.get_session(concurrent_winner.session_id)[
+                "ended_at"
+            ] is None
+        finally:
+            stale.close_all_db_handles()
+
+    def test_prune_reactivates_binding_for_fresh_owner_against_stale_source(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(source_entry.session_key) == (
+                source_entry.session_id
+            )
+            destination = self._discord_destination()
+            destination_key = build_session_key(destination)
+            moved = store.move_session_route(
+                source_entry.session_key,
+                destination_key,
+                source_entry.session_id,
+                destination,
+            )
+            assert moved is not None
+            with store._lock:
+                store._entries[destination_key].updated_at = (
+                    datetime.now() - timedelta(days=2)
+                )
+                store._save()
+            assert store.prune_old_entries(1) == 1
+            assert store.peek_session_id(destination_key) is None
+
+            fresh = store.get_or_create_session(destination)
+            assert fresh.session_id != source_entry.session_id
+            with stale._lock:
+                stale._save()
+
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert source_entry.session_key not in persisted
+            assert json.loads(persisted[destination_key])["session_id"] == (
+                fresh.session_id
+            )
+        finally:
+            stale.close_all_db_handles()
+
+    def test_restart_filters_retired_alias_when_primary_routing_is_empty(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        store._write_sessions_json = True
+        with store._lock:
+            store._save()
+        with patch.object(
+            store,
+            "_save_sessions_json",
+            side_effect=OSError("simulated stale legacy mirror"),
+        ):
+            source_entry, _moved, _destination, destination_key = (
+                self._claimed_webhook_move(store, "empty-routing-restart")
+            )
+        assert store._db.complete_claimed_webhook_handoff(
+            source_entry.session_id,
+            "empty-routing-restart",
+        )
+        with patch.object(
+            store,
+            "_save_sessions_json",
+            side_effect=OSError("simulated prune mirror gap"),
+        ):
+            assert store.remove_session_route(
+                destination_key,
+                source_entry.session_id,
+            )
+        assert store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        ) == {}
+
+        restarted = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=True),
+        )
+        try:
+            assert restarted.peek_session_id(source_entry.session_key) is None
+            assert restarted.peek_session_id(destination_key) is None
+            assert store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            ) == {}
+        finally:
+            restarted.close_all_db_handles()
+
+    def test_successful_completion_accepts_bound_compression_child(self, store):
+        source_entry, _moved, _destination, destination_key = (
+            self._claimed_webhook_move(store, "completion-after-compression")
+        )
+        child_session_id = "successful-handoff-compression-child"
+        store._db.end_session(source_entry.session_id, "compression")
+        store._db.create_session(
+            child_session_id,
+            "discord",
+            parent_session_id=source_entry.session_id,
+            session_key=destination_key,
+        )
+        assert store.advance_compression_session(
+            destination_key,
+            source_entry.session_id,
+            child_session_id,
+        ) is not None
+
+        assert store._db.complete_claimed_webhook_handoff(
+            source_entry.session_id,
+            "completion-after-compression",
+        )
+        assert store._db.get_handoff_state(source_entry.session_id)["state"] == (
+            "completed"
+        )
+        assert store.peek_session_id(destination_key) == child_session_id
+        assert store._db.get_session(child_session_id)["ended_at"] is None
+
+    def test_completion_rejects_noncompression_route_replacement(self, store):
+        source_entry, _moved, _destination, destination_key = (
+            self._claimed_webhook_move(store, "completion-after-reset")
+        )
+        replacement = store.reset_session(destination_key)
+        assert replacement is not None
+
+        assert not store._db.complete_claimed_webhook_handoff(
+            source_entry.session_id,
+            "completion-after-reset",
+        )
+        assert store._db.get_handoff_state(source_entry.session_id)["state"] == (
+            "running"
+        )
+        assert store.peek_session_id(destination_key) == replacement.session_id
+
+    def test_explicit_resume_transfers_protected_route_to_selected_key(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        ) is not None
+        other = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="resume-chat",
+                chat_type="dm",
+                user_id="resume-user",
+            )
+        )
+
+        resumed = store.switch_session(
+            other.session_key,
+            source_entry.session_id,
+        )
+
+        assert resumed is not None
+        assert store.peek_session_id(destination_key) is None
+        assert store.peek_session_id(other.session_key) == source_entry.session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert destination_key not in persisted
+        assert json.loads(persisted[other.session_key])["session_id"] == (
+            source_entry.session_id
+        )
+
+    def test_second_move_transfers_binding_and_allows_old_key_reuse(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        first_destination = self._discord_destination()
+        first_key = build_session_key(first_destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            first_key,
+            source_entry.session_id,
+            first_destination,
+        ) is not None
+        second_destination = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="second-destination",
+            chat_type="dm",
+            user_id="second-destination",
+        )
+        second_key = build_session_key(second_destination)
+
+        assert store.move_session_route(
+            first_key,
+            second_key,
+            source_entry.session_id,
+            second_destination,
+        ) is not None
+
+        assert store.peek_session_id(first_key) is None
+        assert store.peek_session_id(second_key) == source_entry.session_id
+        replacement = store.get_or_create_session(first_destination)
+        assert replacement.session_id != source_entry.session_id
+        assert store.peek_session_id(first_key) == replacement.session_id
+
+    def test_resume_reactivates_retired_binding_against_stale_writer(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        ) is not None
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(destination_key) == source_entry.session_id
+            assert store.remove_session_route(
+                destination_key,
+                source_entry.session_id,
+            )
+            selected = store.get_or_create_session(
+                SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="retired-resume",
+                    chat_type="dm",
+                    user_id="retired-resume",
+                )
+            )
+            assert store.switch_session(
+                selected.session_key,
+                source_entry.session_id,
+            ) is not None
+            with store._lock:
+                store._entries[selected.session_key].last_prompt_tokens = 42
+                assert store._save_entry(
+                    selected.session_key,
+                    lock_held=True,
+                )
+
+            with stale._lock:
+                stale._save()
+
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert destination_key not in persisted
+            assert json.loads(persisted[selected.session_key])["session_id"] == (
+                source_entry.session_id
+            )
+            assert json.loads(persisted[selected.session_key])[
+                "last_prompt_tokens"
+            ] == 42
+        finally:
+            stale.close_all_db_handles()
+
+    def test_resume_uses_forbidden_history_after_old_key_reuse(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        ) is not None
+        assert store.remove_session_route(
+            destination_key,
+            source_entry.session_id,
+        )
+        fresh = store.get_or_create_session(destination)
+        assert fresh.session_id != source_entry.session_id
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(destination_key) == fresh.session_id
+            selected = store.get_or_create_session(
+                SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="history-resume",
+                    chat_type="dm",
+                    user_id="history-resume",
+                )
+            )
+            assert store.switch_session(
+                selected.session_key,
+                source_entry.session_id,
+            ) is not None
+
+            with stale._lock:
+                stale._save()
+
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[destination_key])["session_id"] == (
+                fresh.session_id
+            )
+            assert json.loads(persisted[selected.session_key])["session_id"] == (
+                source_entry.session_id
+            )
+        finally:
+            stale.close_all_db_handles()
+
+    def test_protected_resume_retains_unrelated_old_key_owner(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+        moved = store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        )
+        assert moved is not None
+        unrelated = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="unrelated-owner",
+                chat_type="dm",
+                user_id="unrelated-owner",
+            )
+        )
+        unrelated_at_destination = replace(
+            unrelated,
+            session_key=destination_key,
+        )
+        selected = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="selected-route",
+                chat_type="dm",
+                user_id="selected-route",
+            )
+        )
+
+        def _replace_destination_owner(conn):
+            conn.execute(
+                "UPDATE gateway_routing SET entry_json = ? "
+                "WHERE scope = ? AND session_key = ?",
+                (
+                    json.dumps(unrelated_at_destination.to_dict()),
+                    store._routing_scope(),
+                    destination_key,
+                ),
+            )
+
+        store._db._execute_write(_replace_destination_owner)
+
+        resumed = store.switch_session(
+            selected.session_key,
+            source_entry.session_id,
+        )
+
+        assert resumed is not None
+        assert store.peek_session_id(destination_key) == unrelated.session_id
+        assert store.peek_session_id(selected.session_key) == source_entry.session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert json.loads(persisted[destination_key])["session_id"] == (
+            unrelated.session_id
+        )
+
+    def test_move_rejects_stale_source_and_occupied_destination(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_entry = store.get_or_create_session(destination_source)
+
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_entry.session_key,
+            "stale-owner",
+            destination_source,
+        ) is None
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_entry.session_key,
+            source_entry.session_id,
+            destination_source,
+        ) is None
+        assert store.peek_session_id(source_entry.session_key) == source_entry.session_id
+        assert (
+            store.peek_session_id(destination_entry.session_key)
+            == destination_entry.session_id
+        )
+
+    def test_move_exact_alias_removes_source_and_retains_both_metadata_sets(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        source_key = source_entry.session_key
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        assert store.set_session_metadata(source_key, "source-marker", "source")
+
+        with store._lock:
+            destination_alias = replace(
+                source_entry,
+                session_key=destination_key,
+                origin=SessionSource(
+                    platform=Platform.DISCORD,
+                    chat_id="old-thread",
+                    chat_type="thread",
+                    thread_id="old-thread",
+                ),
+                display_name="old destination",
+                platform=Platform.DISCORD,
+                chat_type="thread",
+                metadata={"destination-marker": "destination"},
+            )
+            store._entries[destination_key] = destination_alias
+            store._save()
+
+        moved = store.move_session_route(
+            source_key,
+            destination_key,
+            source_entry.session_id,
+            destination_source,
+        )
+
+        assert moved is not None
+        assert store.peek_session_id(source_key) is None
+        assert moved.origin == destination_source
+        assert moved.metadata == {
+            "source-marker": "source",
+            "destination-marker": "destination",
+        }
+
+    def test_move_removes_every_preexisting_exact_session_alias(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        alias = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="preexisting-alias",
+                chat_type="dm",
+                user_id="preexisting-alias",
+            )
+        )
+        assert store.switch_session(
+            alias.session_key,
+            source_entry.session_id,
+        ) is not None
+        assert store.peek_session_id(source_entry.session_key) == (
+            source_entry.session_id
+        )
+        assert store.peek_session_id(alias.session_key) == source_entry.session_id
+        destination = self._discord_destination()
+        destination_key = build_session_key(destination)
+
+        moved = store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination,
+        )
+
+        assert moved is not None
+        assert store.peek_session_id(source_entry.session_key) is None
+        assert store.peek_session_id(alias.session_key) is None
+        assert store.peek_session_id(destination_key) == source_entry.session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert set(
+            key
+            for key, entry_json in persisted.items()
+            if json.loads(entry_json)["session_id"] == source_entry.session_id
+        ) == {destination_key}
+
+    def test_already_moved_is_only_no_write_idempotent_success(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        moved = store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination_source,
+        )
+        assert moved is not None
+
+        with patch.object(
+            store._db,
+            "replace_gateway_routing_entries",
+            side_effect=AssertionError("idempotent move rewrote routing"),
+        ):
+            repeated = store.move_session_route(
+                source_entry.session_key,
+                destination_key,
+                source_entry.session_id,
+                destination_source,
+            )
+
+        assert repeated is moved
+        assert store.move_session_route(
+            "missing-source",
+            "missing-destination",
+            source_entry.session_id,
+            destination_source,
+        ) is None
+
+    def test_move_primary_failure_leaves_live_routes_unchanged(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+
+        with patch.object(
+            store._db,
+            "move_gateway_routing_entry_if_owned",
+            side_effect=OSError("database unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="routing transition failed"):
+                store.move_session_route(
+                    source_entry.session_key,
+                    destination_key,
+                    source_entry.session_id,
+                    destination_source,
+                )
+
+        assert store.peek_session_id(source_entry.session_key) == source_entry.session_id
+        assert store.peek_session_id(destination_key) is None
+
+    def test_post_commit_reopen_failure_still_reports_destination_owner(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+
+        with patch.object(
+            store._db,
+            "reopen_session",
+            side_effect=OSError("database temporarily unavailable"),
+        ):
+            moved = store.move_session_route(
+                source_entry.session_key,
+                destination_key,
+                source_entry.session_id,
+                destination_source,
+            )
+
+        assert moved is not None
+        assert store.peek_session_id(source_entry.session_key) is None
+        assert store.peek_session_id(destination_key) == source_entry.session_id
+
+    def test_claim_binding_preserves_source_through_stale_omitting_full_save(
+        self, store
+    ):
+        source_key = build_session_key(self._webhook_source())
+        stale_store = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            # Load an empty routing snapshot before the webhook route exists.
+            assert stale_store.peek_session_id(source_key) is None
+            source_entry = store.get_or_create_session(self._webhook_source())
+            destination_source = self._discord_destination()
+            destination_key = build_session_key(destination_source)
+            token = "claim-source-binding-token"
+            owner = {
+                "token": token,
+                "pid": 12345,
+                "process_start_time": 67890,
+                "host": "test-host",
+                "instantiation_epoch": "test-epoch",
+                "routing_scope": store._routing_scope(),
+                "source_session_key": source_key,
+                "active_session_key": source_key,
+            }
+            assert store._db.request_handoff_once(
+                source_entry.session_id, "discord"
+            ) is True
+            assert store._db.claim_webhook_handoff(
+                source_entry.session_id,
+                json.dumps(owner),
+            ) is True
+
+            # A pre-route stale store omits the source from its whole-index save.
+            # The claim transaction's binding must retain and reconcile that route.
+            with stale_store._lock:
+                stale_store._save()
+            assert stale_store.peek_session_id(source_key) == source_entry.session_id
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[source_key])["session_id"] == (
+                source_entry.session_id
+            )
+
+            moved = store.move_session_route(
+                source_key,
+                destination_key,
+                source_entry.session_id,
+                destination_source,
+                handoff_claim_token=token,
+            )
+            assert moved is not None
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert source_key not in persisted
+            assert set(persisted) == {destination_key}
+            assert json.loads(persisted[destination_key])["session_id"] == (
+                source_entry.session_id
+            )
+        finally:
+            stale_store.close_all_db_handles()
+
+    def test_request_binding_preserves_source_before_webhook_claim(self, store):
+        source_key = build_session_key(self._webhook_source())
+        stale_store = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            # Load an empty routing snapshot before the webhook route exists.
+            assert stale_store.peek_session_id(source_key) is None
+            source_entry = store.get_or_create_session(self._webhook_source())
+            assert store._db.request_handoff_once(
+                source_entry.session_id,
+                "discord",
+                source_session_key=source_key,
+            ) is True
+
+            # The request transaction must protect the source before the watcher
+            # has a chance to claim it. Otherwise this stale omission deletes the
+            # only durable route and leaves an unclaimable pending handoff.
+            with stale_store._lock:
+                stale_store._save()
+
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[source_key])["session_id"] == (
+                source_entry.session_id
+            )
+            assert stale_store.peek_session_id(source_key) == source_entry.session_id
+
+            token = "request-source-binding-token"
+            owner = {
+                "token": token,
+                "pid": 12345,
+                "process_start_time": 67890,
+                "host": "test-host",
+                "instantiation_epoch": "test-epoch",
+                "routing_scope": store._routing_scope(),
+                "source_session_key": source_key,
+                "active_session_key": source_key,
+            }
+            assert store._db.claim_webhook_handoff(
+                source_entry.session_id,
+                json.dumps(owner),
+            ) is True
+            assert store._db.get_handoff_state(source_entry.session_id)["state"] == (
+                "running"
+            )
+        finally:
+            stale_store.close_all_db_handles()
+
+    @pytest.mark.parametrize("route_state", ["absent", "wrong_owner"])
+    def test_webhook_claim_refuses_absent_or_wrong_source_route(
+        self, store, route_state
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        source_key = source_entry.session_key
+        token = f"claim-refusal-{route_state}"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": source_key,
+            "active_session_key": source_key,
+        }
+        assert store._db.request_handoff_once(
+            source_entry.session_id, "discord"
+        ) is True
+
+        expected_route_owner = None
+        if route_state == "absent":
+            store._db.delete_gateway_routing_entries(
+                [source_key],
+                scope=store._routing_scope(),
+            )
+        else:
+            wrong_entry = store.get_or_create_session(
+                SessionSource(
+                    platform=Platform.WEBHOOK,
+                    chat_id="webhook:alerts:other-delivery",
+                    chat_name="webhook/alerts",
+                    chat_type="webhook",
+                    user_id="webhook:alerts",
+                )
+            )
+            expected_route_owner = wrong_entry.session_id
+            assert store._db.save_gateway_routing_entry(
+                source_key,
+                json.dumps(replace(wrong_entry, session_key=source_key).to_dict()),
+                scope=store._routing_scope(),
+            ) is True
+
+        assert store._db.claim_webhook_handoff(
+            source_entry.session_id,
+            json.dumps(owner),
+        ) is False
+        assert store._db.get_handoff_state(source_entry.session_id) == {
+            "state": "pending",
+            "platform": "discord",
+            "error": None,
+        }
+        assert store._db.get_meta(
+            f"webhook_handoff_owner:{source_entry.session_id}"
+        ) is None
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        if expected_route_owner is None:
+            assert source_key not in persisted
+        else:
+            assert json.loads(persisted[source_key])["session_id"] == (
+                expected_route_owner
+            )
+
+    def test_claimed_webhook_move_advances_owner_key_atomically(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        token = "claimed-move-token"
+        owner_key = f"webhook_handoff_owner:{source_entry.session_id}"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": source_entry.session_key,
+            "active_session_key": source_entry.session_key,
+        }
+        assert store._db.request_handoff_once(
+            source_entry.session_id, "discord"
+        ) is True
+        assert store._db.claim_webhook_handoff(
+            source_entry.session_id,
+            json.dumps(owner),
+        ) is True
+
+        moved = store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination_source,
+            handoff_claim_token=token,
+        )
+
+        assert moved is not None
+        assert store.peek_session_id(source_entry.session_key) is None
+        assert store.peek_session_id(destination_key) == source_entry.session_id
+        durable_owner = json.loads(store._db.get_meta(owner_key))
+        assert durable_owner["token"] == token
+        assert durable_owner["active_session_key"] == destination_key
+
+    def test_claimed_webhook_move_rejects_stale_token_without_changes(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        token = "current-claim-token"
+        owner_key = f"webhook_handoff_owner:{source_entry.session_id}"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": source_entry.session_key,
+            "active_session_key": source_entry.session_key,
+        }
+        assert store._db.request_handoff_once(
+            source_entry.session_id, "discord"
+        ) is True
+        assert store._db.claim_webhook_handoff(
+            source_entry.session_id,
+            json.dumps(owner),
+        ) is True
+
+        assert store.move_session_route(
+            source_entry.session_key,
+            destination_key,
+            source_entry.session_id,
+            destination_source,
+            handoff_claim_token="stale-token",
+        ) is None
+
+        assert store.peek_session_id(source_entry.session_key) == (
+            source_entry.session_id
+        )
+        assert store.peek_session_id(destination_key) is None
+        durable_owner = json.loads(store._db.get_meta(owner_key))
+        assert durable_owner["token"] == token
+        assert durable_owner["active_session_key"] == source_entry.session_key
+
+    def test_claimed_webhook_owner_write_failure_rolls_back_route_move(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        token = "atomic-owner-update-token"
+        owner_key = f"webhook_handoff_owner:{source_entry.session_id}"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": source_entry.session_key,
+            "active_session_key": source_entry.session_key,
+        }
+        assert store._db.request_handoff_once(
+            source_entry.session_id, "discord"
+        ) is True
+        assert store._db.claim_webhook_handoff(
+            source_entry.session_id,
+            json.dumps(owner),
+        ) is True
+
+        def _install_failure_trigger(conn):
+            conn.execute(
+                "CREATE TRIGGER fail_handoff_owner_update "
+                "BEFORE UPDATE ON state_meta "
+                "WHEN OLD.key LIKE 'webhook_handoff_owner:%' "
+                "BEGIN SELECT RAISE(ABORT, 'owner write failed'); END"
+            )
+
+        store._db._execute_write(_install_failure_trigger)
+        with pytest.raises(RuntimeError, match="routing transition failed"):
+            store.move_session_route(
+                source_entry.session_key,
+                destination_key,
+                source_entry.session_id,
+                destination_source,
+                handoff_claim_token=token,
+            )
+
+        assert store.peek_session_id(source_entry.session_key) == (
+            source_entry.session_id
+        )
+        assert store.peek_session_id(destination_key) is None
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert source_entry.session_key in persisted
+        assert destination_key not in persisted
+        durable_owner = json.loads(store._db.get_meta(owner_key))
+        assert durable_owner["active_session_key"] == source_entry.session_key
+
+    def test_claimed_cleanup_fences_and_removes_all_exact_session_aliases(
+        self, store
+    ):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        source_key = source_entry.session_key
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        extra_key = "agent:main:discord:thread:extra-alias"
+        token = "all-alias-cleanup-token"
+        owner_key = f"webhook_handoff_owner:{source_entry.session_id}"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": source_key,
+            "active_session_key": source_key,
+        }
+        assert store._db.request_handoff_once(
+            source_entry.session_id, "discord"
+        ) is True
+        assert store._db.claim_webhook_handoff(
+            source_entry.session_id,
+            json.dumps(owner),
+        ) is True
+        moved = store.move_session_route(
+            source_key,
+            destination_key,
+            source_entry.session_id,
+            destination_source,
+            handoff_claim_token=token,
+        )
+        assert moved is not None
+
+        # Model a crash-stale source mirror plus another exact-session alias.
+        # The token-fenced finalizer must discover both from the authoritative
+        # scope, not merely delete the currently active destination key.
+        with store._lock:
+            store._entries[source_key] = replace(moved, session_key=source_key)
+            store._entries[extra_key] = replace(moved, session_key=extra_key)
+            store._save()
+
+        assert store.remove_session_route_and_end(
+            destination_key,
+            source_entry.session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+            handoff_claim_token="stale-token",
+            handoff_source_session_key=source_key,
+        ) is False
+        assert store.peek_session_id(source_key) is None
+        for key in (destination_key, extra_key):
+            assert store.peek_session_id(key) == source_entry.session_id
+        assert store._db.get_handoff_state(source_entry.session_id)["state"] == (
+            "running"
+        )
+        assert json.loads(store._db.get_meta(owner_key))["token"] == token
+
+        assert store.remove_session_route_and_end(
+            destination_key,
+            source_entry.session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+            handoff_claim_token=token,
+            handoff_source_session_key=source_key,
+        ) is True
+
+        for key in (source_key, destination_key, extra_key):
+            assert store.peek_session_id(key) is None
+        assert store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        ) == {}
+        assert store._db.get_meta(owner_key) is None
+        assert store._db.get_handoff_state(source_entry.session_id) == {
+            "state": "failed",
+            "platform": "discord",
+            "error": "destination delivery failed",
+        }
+
+    def test_terminal_cleanup_fences_stale_store_route_resurrection(self, store):
+        source_entry = store.get_or_create_session(self._webhook_source())
+        source_key = source_entry.session_key
+        destination_source = self._discord_destination()
+        destination_key = build_session_key(destination_source)
+        unrelated = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="unrelated-thread",
+                chat_type="thread",
+                user_id="unrelated-user",
+                thread_id="unrelated-thread",
+            )
+        )
+        token = "stale-store-terminal-repair-token"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": source_key,
+            "active_session_key": source_key,
+        }
+
+        stale_stores = [
+            SessionStore(
+                sessions_dir=store.sessions_dir,
+                config=GatewayConfig(write_sessions_json=False),
+            )
+            for _ in range(3)
+        ]
+        try:
+            for stale in stale_stores:
+                assert stale.peek_session_id(source_key) == source_entry.session_id
+                assert stale.peek_session_id(unrelated.session_key) == (
+                    unrelated.session_id
+                )
+
+            assert store._db.request_handoff_once(
+                source_entry.session_id, "discord"
+            ) is True
+            assert store._db.claim_webhook_handoff(
+                source_entry.session_id,
+                json.dumps(owner),
+            ) is True
+            assert store.move_session_route(
+                source_key,
+                destination_key,
+                source_entry.session_id,
+                destination_source,
+                handoff_claim_token=token,
+            ) is not None
+            assert store.remove_session_route_and_end(
+                destination_key,
+                source_entry.session_id,
+                "webhook_handoff_failed",
+                handoff_error="destination delivery failed",
+                handoff_claim_token=token,
+                handoff_source_session_key=source_key,
+            ) is True
+
+            # Both blind stale-writer paths are durably fenced after the
+            # token-owned terminal commit. Each losing store also evicts only
+            # the rejected exact owner from its local routing map.
+            stale_fast, stale_full, stale_after_reuse = stale_stores
+            stale_fast.update_session(source_key, last_prompt_tokens=9)
+            assert stale_fast.peek_session_id(source_key) is None
+            with stale_full._lock:
+                stale_full._save()
+            assert stale_full.peek_session_id(source_key) is None
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert source_key not in persisted
+            assert destination_key not in persisted
+            assert json.loads(persisted[unrelated.session_key])["session_id"] == (
+                unrelated.session_id
+            )
+
+            # A fresh session may legitimately reuse the same route key. A
+            # third pre-cleanup snapshot still carrying the rejected old owner
+            # cannot erase or overwrite that newer unrelated owner.
+            replacement_store = SessionStore(
+                sessions_dir=store.sessions_dir,
+                config=GatewayConfig(write_sessions_json=False),
+            )
+            replacement = replacement_store.get_or_create_session(
+                self._webhook_source()
+            )
+            assert replacement.session_id != source_entry.session_id
+            with stale_after_reuse._lock:
+                stale_after_reuse._save()
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[source_key])["session_id"] == (
+                replacement.session_id
+            )
+
+            # The owner token is gone, but an idempotent cleanup retry remains
+            # safe and retains the explicitly new route owner.
+            assert stale_after_reuse.remove_session_route_and_end(
+                destination_key,
+                source_entry.session_id,
+                "webhook_handoff_failed",
+                handoff_error="destination delivery failed",
+                handoff_claim_token=token,
+                handoff_source_session_key=source_key,
+            ) is True
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[source_key])["session_id"] == (
+                replacement.session_id
+            )
+            assert destination_key not in persisted
+            assert json.loads(persisted[unrelated.session_key])["session_id"] == (
+                unrelated.session_id
+            )
+            replacement_store.close_all_db_handles()
+        finally:
+            for stale in stale_stores:
+                stale.close_all_db_handles()
+
+    def test_expected_owner_removal_is_durable_idempotent_and_fail_closed(
+        self, store
+    ):
+        entry = store.get_or_create_session(self._webhook_source())
+
+        assert store.remove_session_route(entry.session_key, "newer-owner") is False
+        assert store.peek_session_id(entry.session_key) == entry.session_id
+        assert store.remove_session_route(entry.session_key, entry.session_id) is True
+        assert store.peek_session_id(entry.session_key) is None
+        assert store.remove_session_route(entry.session_key, entry.session_id) is True
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert entry.session_key not in persisted
+
+    def test_remove_primary_failure_keeps_expected_route(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+
+        with patch.object(
+            store._db,
+            "delete_gateway_routing_entry_if_owned",
+            side_effect=OSError("database unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="routing transition failed"):
+                store.remove_session_route(entry.session_key, entry.session_id)
+
+        assert store.peek_session_id(entry.session_key) == entry.session_id
+
+    def test_stale_store_move_cannot_replace_newer_source_owner(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(entry.session_key) == entry.session_id
+            newer = store.reset_session(entry.session_key)
+            assert newer is not None
+
+            destination_source = self._discord_destination()
+            destination_key = build_session_key(destination_source)
+            assert stale.move_session_route(
+                entry.session_key,
+                destination_key,
+                entry.session_id,
+                destination_source,
+            ) is None
+
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[entry.session_key])["session_id"] == (
+                newer.session_id
+            )
+            assert destination_key not in persisted
+        finally:
+            stale.close_all_db_handles()
+
+    def test_stale_store_move_cannot_replace_newer_destination_owner(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(entry.session_key) == entry.session_id
+            destination_source = self._discord_destination()
+            destination_entry = store.get_or_create_session(destination_source)
+
+            assert stale.move_session_route(
+                entry.session_key,
+                destination_entry.session_key,
+                entry.session_id,
+                destination_source,
+            ) is None
+
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[entry.session_key])["session_id"] == (
+                entry.session_id
+            )
+            assert json.loads(
+                persisted[destination_entry.session_key]
+            )["session_id"] == destination_entry.session_id
+        finally:
+            stale.close_all_db_handles()
+
+    def test_stale_store_remove_cannot_delete_newer_owner(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+        stale = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        try:
+            assert stale.peek_session_id(entry.session_key) == entry.session_id
+            newer = store.reset_session(entry.session_key)
+            assert newer is not None
+
+            assert stale.remove_session_route(
+                entry.session_key, entry.session_id
+            ) is False
+            persisted = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert json.loads(persisted[entry.session_key])["session_id"] == (
+                newer.session_id
+            )
+        finally:
+            stale.close_all_db_handles()
+
+    def test_atomic_cleanup_removes_and_ends_compression_descendant(
+        self, store
+    ):
+        entry = store.get_or_create_session(self._webhook_source())
+        expected_session_id = entry.session_id
+        assert store._db.request_handoff_once(
+            expected_session_id, "discord"
+        ) is True
+        assert store._db.claim_handoff(expected_session_id) is True
+
+        child_session_id = "webhook-compression-tip"
+        store._db.end_session(expected_session_id, "compression")
+        store._db.create_session(
+            child_session_id,
+            "webhook",
+            parent_session_id=expected_session_id,
+            session_key=entry.session_key,
+        )
+        assert store.advance_compression_session(
+            entry.session_key,
+            expected_session_id,
+            child_session_id,
+        ) is not None
+
+        assert store.remove_session_route_and_end(
+            entry.session_key,
+            expected_session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+        ) is True
+
+        assert store.peek_session_id(entry.session_key) is None
+        assert store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        ).get(entry.session_key) is None
+        assert store._db.get_session(expected_session_id)["end_reason"] == (
+            "compression"
+        )
+        child = store._db.get_session(child_session_id)
+        assert child["end_reason"] == "webhook_handoff_failed"
+        assert store._db.get_handoff_state(expected_session_id) == {
+            "state": "failed",
+            "platform": "discord",
+            "error": "destination delivery failed",
+        }
+
+    def test_atomic_cleanup_ends_published_child_before_route_advances(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+        expected_session_id = entry.session_id
+        assert store._db.request_handoff_once(
+            expected_session_id, "discord"
+        ) is True
+        assert store._db.claim_handoff(expected_session_id) is True
+
+        child_session_id = "published-before-route-advance"
+        store._db.end_session(expected_session_id, "compression")
+        store._db.create_session(
+            child_session_id,
+            "webhook",
+            parent_session_id=expected_session_id,
+            session_key=entry.session_key,
+        )
+        # Child publication precedes the SessionStore route advance. Recovery
+        # must terminate this live canonical child even while the durable key
+        # still points at its compression-ended root.
+        assert store.peek_session_id(entry.session_key) == expected_session_id
+
+        assert store.remove_session_route_and_end(
+            entry.session_key,
+            expected_session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+        ) is True
+
+        assert store.peek_session_id(entry.session_key) is None
+        child = store._db.get_session(child_session_id)
+        assert child["ended_at"] is not None
+        assert child["end_reason"] == "webhook_handoff_failed"
+        assert store._db.get_session(expected_session_id)["end_reason"] == (
+            "compression"
+        )
+        # A detached executor that finishes after cleanup must not recreate
+        # the removed route when it publishes its compression child.
+        assert store.advance_compression_session(
+            entry.session_key,
+            expected_session_id,
+            child_session_id,
+        ) is None
+        assert store.peek_session_id(entry.session_key) is None
+        assert entry.session_key not in store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+
+    def test_terminal_cleanup_retry_retains_explicitly_resumed_compression_child(
+        self, store
+    ):
+        source = self._webhook_source()
+        entry = store.get_or_create_session(source)
+        root_session_id = entry.session_id
+        child_session_id = "explicitly-resumed-compression-child"
+        assert store._db.request_handoff_once(root_session_id, "discord") is True
+        assert store._db.claim_handoff(root_session_id) is True
+        store._db.end_session(root_session_id, "compression")
+        store._db.create_session(
+            child_session_id,
+            "webhook",
+            parent_session_id=root_session_id,
+            session_key=entry.session_key,
+        )
+
+        assert store.remove_session_route_and_end(
+            entry.session_key,
+            root_session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+        ) is True
+
+        replacement = store.get_or_create_session(source)
+        assert replacement.session_id not in {
+            root_session_id,
+            child_session_id,
+        }
+        resumed = store.switch_session(entry.session_key, child_session_id)
+        assert resumed is not None
+        assert resumed.session_id == child_session_id
+        assert store._db.get_session(child_session_id)["ended_at"] is None
+
+        # The failed root remains a valid idempotency marker, but its late
+        # cleanup retry must not reap a canonical child explicitly reopened by
+        # the user after the terminal handoff failure.
+        assert store.remove_session_route_and_end(
+            entry.session_key,
+            root_session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+        ) is True
+        assert store.peek_session_id(entry.session_key) == child_session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert json.loads(persisted[entry.session_key])["session_id"] == (
+            child_session_id
+        )
+        assert store._db.get_session(child_session_id)["ended_at"] is None
+
+    @pytest.mark.parametrize(
+        ("child_source", "noncontinuation_marker", "foreign_marker"),
+        [
+            ("webhook", "_branched_from", False),
+            ("webhook", "_delegate_from", False),
+            ("webhook", "_delegate_from", True),
+            ("tool", None, False),
+        ],
+        ids=["branch", "delegate", "foreign-delegate-marker", "tool"],
+    )
+    def test_atomic_cleanup_retains_noncanonical_parent_linked_route(
+        self,
+        store,
+        child_source,
+        noncontinuation_marker,
+        foreign_marker,
+    ):
+        entry = store.get_or_create_session(self._webhook_source())
+        expected_session_id = entry.session_id
+        assert store._db.request_handoff_once(
+            expected_session_id, "discord"
+        ) is True
+        assert store._db.claim_handoff(expected_session_id) is True
+
+        child_session_id = (
+            f"noncanonical-{child_source}-{noncontinuation_marker or 'source'}"
+        )
+        model_config = (
+            {
+                noncontinuation_marker: (
+                    "foreign-parent" if foreign_marker else expected_session_id
+                )
+            }
+            if noncontinuation_marker
+            else None
+        )
+        store._db.end_session(expected_session_id, "compression")
+        store._db.create_session(
+            child_session_id,
+            child_source,
+            parent_session_id=expected_session_id,
+            session_key=entry.session_key,
+            model_config=model_config,
+        )
+        with store._lock:
+            child_entry = replace(entry, session_id=child_session_id)
+            store._entries[entry.session_key] = child_entry
+            store._save()
+
+        assert store.remove_session_route_and_end(
+            entry.session_key,
+            expected_session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+        ) is True
+
+        assert store.peek_session_id(entry.session_key) == child_session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert json.loads(persisted[entry.session_key])["session_id"] == (
+            child_session_id
+        )
+        assert store._db.get_session(child_session_id)["ended_at"] is None
+        assert store._db.get_session(expected_session_id)["end_reason"] == (
+            "compression"
+        )
+        assert store._db.get_handoff_state(expected_session_id) == {
+            "state": "failed",
+            "platform": "discord",
+            "error": "destination delivery failed",
+        }
+
+    def test_atomic_cleanup_keeps_unrelated_route_but_finalizes_old_owner(
+        self, store
+    ):
+        entry = store.get_or_create_session(self._webhook_source())
+        assert store._db.request_handoff_once(entry.session_id, "discord") is True
+        assert store._db.claim_handoff(entry.session_id) is True
+
+        newer_session_id = "unrelated-new-owner"
+        store._db.create_session(
+            newer_session_id,
+            "webhook",
+            session_key=entry.session_key,
+        )
+        with store._lock:
+            newer_entry = replace(entry, session_id=newer_session_id)
+            store._entries[entry.session_key] = newer_entry
+            store._save()
+
+        assert store.remove_session_route_and_end(
+            entry.session_key,
+            entry.session_id,
+            "webhook_handoff_failed",
+            handoff_error="destination delivery failed",
+        ) is True
+
+        assert store.peek_session_id(entry.session_key) == newer_session_id
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert json.loads(persisted[entry.session_key])["session_id"] == (
+            newer_session_id
+        )
+        assert store._db.get_session(newer_session_id)["ended_at"] is None
+        expected = store._db.get_session(entry.session_id)
+        assert expected["end_reason"] == "webhook_handoff_failed"
+        assert store._db.get_handoff_state(entry.session_id) == {
+            "state": "failed",
+            "platform": "discord",
+            "error": "destination delivery failed",
+        }
+
+    def test_atomic_cleanup_rejects_late_write_after_handoff_completed(self, store):
+        entry = store.get_or_create_session(self._webhook_source())
+        assert store._db.request_handoff_once(entry.session_id, "discord") is True
+        assert store._db.claim_handoff(entry.session_id) is True
+        store._db.complete_handoff(entry.session_id)
+
+        assert store.remove_session_route_and_end(
+            entry.session_key,
+            entry.session_id,
+            "webhook_handoff_failed",
+            handoff_error="late failure",
+        ) is False
+
+        assert store.peek_session_id(entry.session_key) == entry.session_id
+        assert store._db.get_session(entry.session_id)["ended_at"] is None
+        assert store._db.get_handoff_state(entry.session_id) == {
+            "state": "completed",
+            "platform": "discord",
+            "error": None,
+        }
+
+
 class TestSessionStoreLookup:
     @pytest.fixture()
     def store(self, tmp_path):
@@ -1644,3 +3671,155 @@ class TestGatewayRoutingTable:
         restarted._db.close()
 
 
+class TestPruneRecheckUnderLock:
+    def test_session_becoming_active_between_scan_and_removal_survives(
+        self, tmp_path
+    ):
+        """Prune eligibility must be re-verified under the store lock.
+
+        The scan collects candidates and releases ``_lock`` before removing
+        them; a session that receives activity in that window still passes
+        the session-id CAS (activity never changes the id), so the removal
+        itself must re-check eligibility or a live session is pruned
+        mid-turn.
+        """
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        store._loaded = True
+        entry = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="42",
+                chat_type="dm",
+                user_id="42",
+            )
+        )
+        with store._lock:
+            entry.updated_at = datetime.now() - timedelta(days=2)
+
+        calls = {"count": 0}
+
+        def _active_after_scan(session_key, context=None):
+            calls["count"] += 1
+            # Inactive during the scan pass, active by removal time.
+            return calls["count"] > 1
+
+        store._has_active_processes_safe = _active_after_scan
+
+        assert store.prune_old_entries(1) == 0
+        assert store.peek_session_id(entry.session_key) == entry.session_id
+
+        # Once genuinely inactive again, the same entry prunes normally.
+        store._has_active_processes_safe = lambda session_key, context=None: False
+        assert store.prune_old_entries(1) == 1
+        assert store.peek_session_id(entry.session_key) is None
+
+
+class TestRouteMoveDestinationBindingGuard:
+    @pytest.fixture()
+    def store(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        session_store = SessionStore(
+            sessions_dir=tmp_path / "sessions",
+            config=GatewayConfig(write_sessions_json=False),
+        )
+        yield session_store
+        session_store._db.close()
+
+    def test_move_refuses_foreign_non_retired_destination_binding(self, store):
+        """A move cannot silently adopt another session's protection fence.
+
+        A non-retired binding at the destination key carries its session's
+        protection and forbidden-route history even when the route row is
+        gone. Every sibling routing writer refuses to rebind that fence to a
+        different session; the move transaction must reject it too instead
+        of transferring the orphaned protection.
+        """
+        source_a = SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:alerts:delivery-a",
+            chat_name="webhook/alerts",
+            chat_type="webhook",
+            user_id="webhook:alerts",
+        )
+        destination = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-guard",
+            chat_name="Hermes handoff",
+            chat_type="thread",
+            user_id="system:handoff",
+            user_name="Handoff",
+            thread_id="thread-guard",
+        )
+        destination_key = build_session_key(destination)
+
+        entry_a = store.get_or_create_session(source_a)
+        token = "binding-guard-token"
+        owner = {
+            "token": token,
+            "pid": 12345,
+            "process_start_time": 67890,
+            "host": "test-host",
+            "instantiation_epoch": "test-epoch",
+            "routing_scope": store._routing_scope(),
+            "source_session_key": entry_a.session_key,
+            "active_session_key": entry_a.session_key,
+        }
+        assert store._db.request_handoff_once(entry_a.session_id, "discord")
+        assert store._db.claim_webhook_handoff(
+            entry_a.session_id, json.dumps(owner)
+        )
+        moved = store.move_session_route(
+            entry_a.session_key,
+            destination_key,
+            entry_a.session_id,
+            destination,
+            handoff_claim_token=token,
+        )
+        assert moved is not None
+
+        # Drop the route row without retiring the binding — the orphaned
+        # non-retired fence still names session A.
+        store._db.delete_gateway_routing_entries(
+            [destination_key], scope=store._routing_scope()
+        )
+        with store._lock:
+            store._entries.pop(destination_key, None)
+
+        source_b = SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:alerts:delivery-b",
+            chat_name="webhook/alerts",
+            chat_type="webhook",
+            user_id="webhook:alerts",
+        )
+        entry_b = store.get_or_create_session(source_b)
+        assert store.move_session_route(
+            entry_b.session_key,
+            destination_key,
+            entry_b.session_id,
+            destination,
+        ) is None
+        assert store.peek_session_id(entry_b.session_key) == entry_b.session_id
+        assert store.peek_session_id(destination_key) is None
+
+        # An unfenced destination still accepts the same move.
+        clean_destination = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-clean",
+            chat_name="Hermes handoff",
+            chat_type="thread",
+            user_id="system:handoff",
+            user_name="Handoff",
+            thread_id="thread-clean",
+        )
+        assert store.move_session_route(
+            entry_b.session_key,
+            build_session_key(clean_destination),
+            entry_b.session_id,
+            clean_destination,
+        ) is not None

@@ -1,11 +1,9 @@
-"""Regression test: cancel_background_tasks must drain late-arrival tasks.
+"""Regression tests for adapter background-task shutdown.
 
 During gateway shutdown, a message arriving while
-cancel_background_tasks is mid-await can spawn a fresh
-_process_message_background task via handle_message, which is added
-to self._background_tasks.  Without the re-drain loop, the subsequent
-_background_tasks.clear() drops the reference; the task runs
-untracked against a disconnecting adapter.
+cancel_background_tasks is mid-await must be spooled for restart rather than
+spawning fresh work behind the runner's teardown boundary. Tasks that were
+admitted before shutdown are still cancelled and drained with a bounded loop.
 """
 
 import asyncio
@@ -47,9 +45,8 @@ def _event(text, cid="42"):
 
 
 @pytest.mark.asyncio
-async def test_cancel_background_tasks_drains_late_arrivals():
-    """A message that arrives during the gather window must be picked
-    up by the re-drain loop, not leaked as an untracked task."""
+async def test_cancel_background_tasks_spools_late_arrivals(monkeypatch):
+    """A message arriving during shutdown is spooled, never dispatched."""
     adapter = _make_adapter()
     sk = build_session_key(
         SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm")
@@ -58,7 +55,17 @@ async def test_cancel_background_tasks_drains_late_arrivals():
     m1_started = asyncio.Event()
     m1_cleanup_running = asyncio.Event()
     m2_started = asyncio.Event()
-    m2_cancelled = asyncio.Event()
+    spooled = {}
+
+    def capture_spool(pending, *, reason):
+        assert reason == "adapter_shutdown"
+        spooled.update(pending)
+        return len(pending)
+
+    monkeypatch.setattr(
+        "gateway.shutdown_flush.flush_pending_to_file",
+        capture_spool,
+    )
 
     async def handler(event):
         if event.text == "M1":
@@ -73,11 +80,7 @@ async def test_cancel_background_tasks_drains_late_arrivals():
                 raise
         else:  # M2 — the late arrival
             m2_started.set()
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                m2_cancelled.set()
-                raise
+            await asyncio.sleep(10)
 
     adapter._message_handler = handler
 
@@ -100,21 +103,17 @@ async def test_cancel_background_tasks_drains_late_arrivals():
     # repro, make it deterministic.
     adapter._active_sessions.pop(sk, None)
 
-    # Inject late arrival — spawns a fresh _process_message_background
-    # task and adds it to _background_tasks while cancel_task is still
-    # in gather.
-    await adapter.handle_message(_event("M2"))
-    await asyncio.wait_for(m2_started.wait(), timeout=1.0)
+    # Inject a late arrival after shutdown has started. It must be persisted
+    # for replay instead of starting new work behind the runner's teardown.
+    late_event = _event("M2")
+    await adapter.handle_message(late_event)
+    assert not m2_started.is_set()
 
     # Let cancel_task finish.  Round 1's gather completes when M1's
     # shielded cleanup finishes.  Round 2 should pick up M2.
     await asyncio.wait_for(cancel_task, timeout=5.0)
 
-    # Assert M2 was drained, not leaked.
-    assert m2_cancelled.is_set(), (
-        "Late-arrival M2 was NOT cancelled by cancel_background_tasks — "
-        "the re-drain loop is missing and the task leaked"
-    )
+    assert spooled == {sk: late_event}
     assert adapter._background_tasks == set()
 
 

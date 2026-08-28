@@ -96,6 +96,12 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications
     # (#82888). DB-only presentation metadata; never sent to the provider.
     persist_user_display_kind: Optional[str] = None
+    # Opaque, globally unique inbound identity persisted on the current user
+    # row. A retry can reuse that row rather than append the input twice.
+    persist_user_message_id: Optional[str] = None
+    # Sync bridge invoked by the agent worker only after the current user row
+    # has committed. Exceptions abort the turn before its primary model call.
+    input_persisted_callback: Optional[Callable[[], None]] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

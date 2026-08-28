@@ -983,6 +983,22 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
+        # has_webhook_handoff_input looks a delivery marker up WITHOUT a
+        # session id; the (session_id, platform_message_id) index above
+        # cannot serve that (SQLite has no skip-scan), so without this the
+        # lookup scans every platform-keyed message under the DB lock on
+        # each webhook delivery admission.
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id_global "
+                "ON messages(platform_message_id) "
+                "WHERE platform_message_id IS NOT NULL"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "idx_messages_platform_msg_id_global create skipped: %s", exc
+            )
+
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
         cursor.executescript(DEFERRED_INDEX_SQL)

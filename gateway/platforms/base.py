@@ -2463,10 +2463,23 @@ class MessageEvent:
     timestamp: datetime = field(default_factory=datetime.now)
 
     # Whether this event may resolve gateway commands or pending control
-    # prompts. Kept last to preserve positional construction compatibility.
+    # prompts. Kept after all older fields to preserve positional construction
+    # compatibility.
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # Authoritative runner result for this event. False means the agent
+    # completed successfully, True includes failed/partial/interrupted runs,
+    # and None means no authoritative agent result was produced. Kept last to
+    # preserve positional construction compatibility.
+    agent_run_failed: Optional[bool] = None
+
+    # True when the runner could not persist ownership of this exact active
+    # turn. Autonomous adapters use this to preserve a competing durable owner
+    # instead of finalizing its session from a losing event. Kept last to
+    # preserve positional construction compatibility.
+    active_turn_admission_failed: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -3154,6 +3167,10 @@ class BasePlatformAdapter(ABC):
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
+        # Set synchronously when shutdown starts. A cancelled owner can finish
+        # unwinding after the runner's bounded adapter-teardown deadline; it
+        # must not turn an already-queued follow-up into fresh agent work then.
+        self._background_shutdown_started = False
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
         # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
@@ -4141,8 +4158,8 @@ class BasePlatformAdapter(ABC):
     ) -> Optional[str]:
         """Create a fresh thread under ``parent_chat_id`` for a session handoff.
 
-        Used by the gateway's handoff watcher when transferring a CLI
-        session to a thread-capable platform — the new thread isolates the
+        Used by the gateway's handoff watcher when transferring a session
+        to a thread-capable platform — the new thread isolates the
         handed-off conversation from any pre-existing chat in the home
         channel and gives users a clean per-handoff scrollback.
 
@@ -5540,6 +5557,43 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
+    async def on_agent_run_started(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> Optional[str]:
+        """Hook called after the exact agent session route is persisted.
+
+        An adapter may return an opaque current-input persistence identity.
+        The runner then requires that adapter's explicit durable-input hook
+        before it can enter the primary conversation call.
+        """
+
+    async def on_agent_input_persisted(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> None:
+        """Hook called after this turn's user row durably commits.
+
+        The runner invokes it only when :meth:`on_agent_run_started`
+        returned an input-persistence marker; an exception here aborts the
+        turn before its primary conversation call.
+        """
+
+    async def on_agent_run_persisted(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> None:
+        """Hook called after a successful agent turn is fully persisted."""
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes.
 
@@ -6174,6 +6228,20 @@ class BasePlatformAdapter(ABC):
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
         """
+        if getattr(self, "_background_shutdown_started", False):
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile=self._session_key_profile(event.source),
+            )
+            self._flush_shutdown_pending({session_key: event})
+            return
+
         if not self._message_handler:
             return
 
@@ -6984,6 +7052,9 @@ class BasePlatformAdapter(ABC):
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
+                if getattr(self, "_background_shutdown_started", False):
+                    self._flush_shutdown_pending({session_key: pending_event})
+                    return
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -7115,7 +7186,9 @@ class BasePlatformAdapter(ABC):
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
             late_pending = self._pending_messages.pop(session_key, None)
-            if late_pending is not None:
+            if late_pending is not None and not getattr(
+                self, "_background_shutdown_started", False
+            ):
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
                 if (
@@ -7154,6 +7227,8 @@ class BasePlatformAdapter(ABC):
                 # Leave _active_sessions[session_key] populated — the drain
                 # task's own lifecycle will clean it up.
             else:
+                if late_pending is not None:
+                    self._flush_shutdown_pending({session_key: late_pending})
                 # Clean up session tracking.  Guard-match both deletes so a
                 # reset-like command that already swapped in its own
                 # command_guard (and cancelled us) can't be accidentally
@@ -7206,6 +7281,8 @@ class BasePlatformAdapter(ABC):
         whole shutdown path.  Stragglers are released from our tracking and
         allowed to finish unwinding on their own.
         """
+        self._background_shutdown_started = True
+
         # Loop until no new tasks appear.  Without this, a message
         # arriving during the `await asyncio.gather` below would spawn
         # a fresh _process_message_background task (added to
@@ -7216,45 +7293,55 @@ class BasePlatformAdapter(ABC):
         # until it completes on its own.  Retrying the drain until the
         # task set stabilizes closes the window.
         MAX_DRAIN_ROUNDS = 5
-        for _ in range(MAX_DRAIN_ROUNDS):
-            tasks = [task for task in self._background_tasks if not task.done()]
-            if not tasks:
-                break
-            for task in tasks:
-                self._expected_cancelled_tasks.add(task)
-                task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        *(asyncio.shield(t) for t in tasks),
-                        return_exceptions=True,
-                    ),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[%s] %d background task(s) did not exit within 5s; "
-                    "releasing tracking and letting them unwind in the background",
-                    self.name, len([t for t in tasks if not t.done()]),
-                )
-                break
-            # Loop: late-arrival tasks spawned during the gather above
-            # will be in self._background_tasks now.  Re-check.
-        self._background_tasks.clear()
-        self._expected_cancelled_tasks.clear()
-        self._session_tasks.clear()
-        # Flush pending messages to disk before clearing (#72680).
+        try:
+            for _ in range(MAX_DRAIN_ROUNDS):
+                tasks = [task for task in self._background_tasks if not task.done()]
+                if not tasks:
+                    break
+                for task in tasks:
+                    self._expected_cancelled_tasks.add(task)
+                    task.add_done_callback(self._expected_cancelled_tasks.discard)
+                    task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(asyncio.shield(t) for t in tasks),
+                            return_exceptions=True,
+                        ),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] %d background task(s) did not exit within 5s; "
+                        "releasing tracking and letting them unwind in the background",
+                        self.name, len([t for t in tasks if not t.done()]),
+                    )
+                    break
+                # Loop: late-arrival tasks spawned during the gather above
+                # will be in self._background_tasks now.  Re-check.
+        finally:
+            # The runner may cancel this coroutine at its shorter adapter
+            # teardown deadline. Keep the synchronous cleanup in ``finally``
+            # so queued messages and session guards cannot outlive that bound.
+            self._background_tasks.clear()
+            self._session_tasks.clear()
+            self._flush_shutdown_pending(self._pending_messages)
+            self._pending_messages.clear()
+            self._active_sessions.clear()
+            for state in list(self._text_debounce_store().values()):
+                if state.task is not None and not state.task.done():
+                    state.task.cancel()
+            self._text_debounce_store().clear()
+
+    @staticmethod
+    def _flush_shutdown_pending(pending_messages: Dict[str, MessageEvent]) -> None:
+        """Persist queued input that shutdown will not dispatch."""
         try:
             from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+
+            flush_pending_to_file(pending_messages, reason="adapter_shutdown")
         except Exception:
             pass
-        self._pending_messages.clear()
-        self._active_sessions.clear()
-        for state in list(self._text_debounce_store().values()):
-            if state.task is not None and not state.task.done():
-                state.task.cancel()
-        self._text_debounce_store().clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
