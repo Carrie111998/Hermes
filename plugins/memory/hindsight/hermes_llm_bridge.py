@@ -231,12 +231,19 @@ class HermesLlmBridge:
         self,
         llm: Any,
         *,
+        main_runtime: dict[str, Any] | None = None,
         host: str = "127.0.0.1",
         max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
     ) -> None:
         if llm is None:
             raise ValueError("HermesLlmBridge requires the host-owned LLM facade")
         self._llm = llm
+        # The bridge serves requests from its own HTTP worker threads.  Those
+        # threads do not inherit the agent turn's auxiliary ContextVar, so keep
+        # the parent runtime snapshot supplied by the owner and bind it around
+        # each host-facade call.  It contains routing/auth metadata only in
+        # memory; it is never written to the Hindsight daemon env.
+        self._main_runtime = dict(main_runtime or {})
         self._host = host
         self._api_key = secrets.token_urlsafe(32)
         self._max_concurrent = max(1, int(max_concurrent))
@@ -285,6 +292,25 @@ class HermesLlmBridge:
         if thread is not None:
             thread.join(timeout=5.0)
 
+    def _run_with_parent_runtime(self, callback):
+        """Run a host-facade callback with the owner's runtime bound.
+
+        ``PluginLlm`` normally reads the active runtime from a ContextVar set
+        by the agent turn.  Hindsight calls this bridge from a separate worker
+        thread, so without this scope ``call_llm`` falls back to the persisted
+        root config (which may belong to another profile/model).
+        """
+        if not self._main_runtime:
+            # Unit/test doubles and non-Hermes callers can still use the bridge
+            # without a runtime snapshot. In production, the owner supplies
+            # the active Hermes snapshot so worker threads do not fall back to
+            # unrelated persisted configuration.
+            return callback()
+        from agent.auxiliary_client import scoped_runtime_main
+
+        with scoped_runtime_main(self._main_runtime):
+            return callback()
+
     def complete(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise HermesLlmBridgeError("request body must be a JSON object")
@@ -304,15 +330,17 @@ class HermesLlmBridge:
             self._semaphore.release()
 
     def _complete_text(self, messages: list[dict[str, str]], payload: dict[str, Any]) -> Any:
-        return self._llm.complete(
-            messages,
-            temperature=_coerce_optional_number(payload.get("temperature")),
-            max_tokens=_coerce_optional_number(
-                payload.get("max_completion_tokens", payload.get("max_tokens")), integer=True
-            ),
-            tools=payload.get("tools") if isinstance(payload.get("tools"), list) else None,
-            tool_choice=payload.get("tool_choice"),
-            purpose="hindsight",
+        return self._run_with_parent_runtime(
+            lambda: self._llm.complete(
+                messages,
+                temperature=_coerce_optional_number(payload.get("temperature")),
+                max_tokens=_coerce_optional_number(
+                    payload.get("max_completion_tokens", payload.get("max_tokens")), integer=True
+                ),
+                tools=payload.get("tools") if isinstance(payload.get("tools"), list) else None,
+                tool_choice=payload.get("tool_choice"),
+                purpose="hindsight",
+            )
         )
 
     def _complete_structured(
@@ -336,18 +364,20 @@ class HermesLlmBridge:
             input_text = "Return the requested structured response."
         from agent.plugin_llm import PluginLlmTextInput
 
-        return self._llm.complete_structured(
-            instructions="Follow the system instructions and return the requested response.",
-            input=[PluginLlmTextInput(text=input_text)],
-            json_schema=schema,
-            json_mode=response_format.get("type") in {"json_schema", "json_object"},
-            schema_name=schema_name,
-            system_prompt=system_prompt or None,
-            temperature=_coerce_optional_number(payload.get("temperature")),
-            max_tokens=_coerce_optional_number(
-                payload.get("max_completion_tokens", payload.get("max_tokens")), integer=True
-            ),
-            purpose="hindsight",
+        return self._run_with_parent_runtime(
+            lambda: self._llm.complete_structured(
+                instructions="Follow the system instructions and return the requested response.",
+                input=[PluginLlmTextInput(text=input_text)],
+                json_schema=schema,
+                json_mode=response_format.get("type") in {"json_schema", "json_object"},
+                schema_name=schema_name,
+                system_prompt=system_prompt or None,
+                temperature=_coerce_optional_number(payload.get("temperature")),
+                max_tokens=_coerce_optional_number(
+                    payload.get("max_completion_tokens", payload.get("max_tokens")), integer=True
+                ),
+                purpose="hindsight",
+            )
         )
 
     @staticmethod

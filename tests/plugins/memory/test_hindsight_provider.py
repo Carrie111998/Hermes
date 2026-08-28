@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+from plugins.memory import hindsight as hindsight_module
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -395,6 +396,11 @@ class TestConfig:
             "bank_id": "jarpis",
             "idle_timeout": 0,
         }
+        p._main_runtime = {
+            "provider": "openai-codex",
+            "model": "parent-model-a",
+            "api_mode": "codex_responses",
+        }
         p._bank_id = "jarpis"
         results = []
         errors = []
@@ -418,6 +424,175 @@ class TestConfig:
             assert len(created) == 1
         finally:
             p.shutdown()
+
+    def test_inherited_providers_share_one_process_runtime(self, monkeypatch):
+        created = []
+        bridges = []
+
+        class FakeBridge:
+            def __init__(self, llm, *, main_runtime=None):
+                self.llm = llm
+                self.main_runtime = main_runtime
+                self.closed = False
+                bridges.append(self)
+
+            @property
+            def api_key(self):
+                return "bridge-key"
+
+            @property
+            def base_url(self):
+                return "http://127.0.0.1:12345/v1"
+
+            def start(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        class FakeHindsightEmbedded:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.close_calls = 0
+                created.append(self)
+
+            def close(self, stop_daemon=False):
+                self.close_calls += 1
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight",
+            SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded),
+        )
+        monkeypatch.setattr("plugins.memory.hindsight.HermesLlmBridge", FakeBridge)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+
+        config = {
+            "profile": "jarpis",
+            "llm_provider": "hermes",
+            "llm_model": "ignored",
+            "bank_id": "jarpis",
+            "idle_timeout": 0,
+        }
+        parent_runtime_a = {
+            "provider": "parent-provider-a",
+            "model": "parent-model-a",
+            "api_mode": "parent-wire-a",
+        }
+        parent_runtime_b = {
+            "provider": "parent-provider-b",
+            "model": "parent-model-b",
+            "api_mode": "parent-wire-b",
+        }
+
+        def make_provider(parent_runtime):
+            provider = HindsightMemoryProvider(SimpleNamespace(llm=SimpleNamespace()))
+            provider._mode = "local_embedded"
+            provider._config = dict(config)
+            provider._main_runtime = dict(parent_runtime)
+            return provider
+
+        first = make_provider(parent_runtime_a)
+        second = make_provider(parent_runtime_b)
+        try:
+            first_client = first._get_client()
+            second_client = second._get_client()
+
+            assert first_client is second_client
+            assert len(created) == 1
+            assert len(bridges) == 1
+            expected_profile = hindsight_module._shared_embedded_profile_name(config)
+            assert first._embedded_profile_override == expected_profile
+            assert second._embedded_profile_override == expected_profile
+            assert first._main_runtime != second._main_runtime
+            assert first._embedded_runtime_key == second._embedded_runtime_key
+            assert first._embedded_runtime_key is not None
+            assert bridges[0].main_runtime == parent_runtime_a
+            runtime = hindsight_module._EMBEDDED_RUNTIME_REGISTRY[first._embedded_runtime_key]
+            assert runtime.refs == 2
+
+            first.shutdown()
+            assert created[0].close_calls == 0
+            assert bridges[0].closed is False
+            assert runtime.refs == 1
+
+            second.shutdown()
+            assert created[0].close_calls == 1
+            assert bridges[0].closed is True
+            assert first._embedded_runtime_key is None
+            assert not hindsight_module._EMBEDDED_RUNTIME_REGISTRY
+        finally:
+            # Keep the test idempotent if an assertion fails before either
+            # provider reaches its normal teardown path.
+            first.shutdown()
+            second.shutdown()
+
+    def test_inherited_runtime_identity_is_stable(self):
+        config = {"profile": "jarpis", "llm_provider": "hermes"}
+
+        first_key = hindsight_module._shared_embedded_runtime_key(config)
+        second_key = hindsight_module._shared_embedded_runtime_key(dict(config))
+
+        assert first_key == second_key
+        assert hindsight_module._shared_embedded_profile_name(config) == "jarpis-hermes-shared"
+        assert "model" not in hindsight_module._shared_embedded_profile_name(config)
+
+    def test_hermes_runtime_does_not_require_parent_model_snapshot(self, monkeypatch):
+        created = []
+
+        class FakeBridge:
+            def __init__(self, llm, *, main_runtime=None):
+                self.main_runtime = main_runtime
+                self.closed = False
+
+            @property
+            def api_key(self):
+                return "bridge-key"
+
+            @property
+            def base_url(self):
+                return "http://127.0.0.1:12345/v1"
+
+            def start(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        class FakeEmbedded:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                created.append(self)
+
+            def close(self, stop_daemon=False):
+                return None
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight",
+            SimpleNamespace(HindsightEmbedded=FakeEmbedded),
+        )
+        monkeypatch.setattr("plugins.memory.hindsight.HermesLlmBridge", FakeBridge)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+
+        provider = HindsightMemoryProvider(SimpleNamespace(llm=SimpleNamespace()))
+        provider._mode = "local_embedded"
+        provider._config = {
+            "profile": "jarpis",
+            "llm_provider": "hermes",
+            "llm_model": "ignored",
+            "idle_timeout": 0,
+        }
+        provider._main_runtime = {}
+
+        try:
+            client = provider._get_client()
+            assert isinstance(client, FakeEmbedded)
+            assert client is created[0]
+            assert client.kwargs["llm_model"] == "hermes-inherited"
+        finally:
+            provider.shutdown()
 
     def test_get_client_waits_for_background_daemon_start(self):
         import threading

@@ -29,7 +29,7 @@ class _FakeLlm:
         return SimpleNamespace(
             text="plain response",
             provider="openai-codex",
-            model="gpt-5.6-luna",
+            model="parent-model-a",
             usage=SimpleNamespace(input_tokens=7, output_tokens=3, total_tokens=10),
         )
 
@@ -39,7 +39,7 @@ class _FakeLlm:
             text=json.dumps({"facts": []}),
             parsed={"facts": []},
             provider="openai-codex",
-            model="gpt-5.6-luna",
+            model="parent-model-a",
             usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
         )
 
@@ -93,7 +93,7 @@ def test_bridge_routes_plain_completion_to_host_facade():
 
     assert status == 200
     assert response["choices"][0]["message"]["content"] == "plain response"
-    assert response["model"] == "gpt-5.6-luna"
+    assert response["model"] == "parent-model-a"
     assert response["usage"] == {
         "prompt_tokens": 7,
         "completion_tokens": 3,
@@ -101,6 +101,56 @@ def test_bridge_routes_plain_completion_to_host_facade():
     }
     assert llm.complete_calls[0][1]["purpose"] == "hindsight"
     assert llm.complete_calls[0][0][1]["content"] == "Remember this"
+
+
+def test_bridge_binds_parent_runtime_inside_worker_thread():
+    """The bridge must not fall back to the persisted root model."""
+    from agent.auxiliary_client import _runtime_main_value
+
+    class RuntimeAwareLlm(_FakeLlm):
+        def complete(self, messages, **kwargs):
+            self.seen_runtime = {
+                "provider": _runtime_main_value("provider"),
+                "model": _runtime_main_value("model"),
+                "api_mode": _runtime_main_value("api_mode"),
+            }
+            return SimpleNamespace(
+                text="bound response",
+                provider=self.seen_runtime["provider"],
+                model=self.seen_runtime["model"],
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+    llm = RuntimeAwareLlm()
+    bridge = HermesLlmBridge(
+        llm,
+        main_runtime={
+            "provider": "openai-codex",
+            "model": "parent-model-a",
+            "api_mode": "codex_responses",
+        },
+    )
+    bridge.start()
+    try:
+        status, response = _post(
+            f"{bridge.base_url}/chat/completions",
+            bridge.api_key,
+            {
+                "model": "hermes-inherited",
+                "messages": [{"role": "user", "content": "Use the parent runtime"}],
+            },
+        )
+    finally:
+        bridge.close()
+
+    assert status == 200
+    assert response["choices"][0]["message"]["content"] == "bound response"
+    assert response["model"] == "parent-model-a"
+    assert llm.seen_runtime == {
+        "provider": "openai-codex",
+        "model": "parent-model-a",
+        "api_mode": "codex_responses",
+    }
 
 
 def test_bridge_forwards_native_tools_and_returns_openai_tool_calls():
@@ -120,7 +170,7 @@ def test_bridge_forwards_native_tools_and_returns_openai_tool_calls():
                     }
                 ],
                 provider="openai-codex",
-                model="gpt-5.6-sol",
+                model="parent-model-tool",
                 usage=SimpleNamespace(input_tokens=9, output_tokens=2, total_tokens=11),
             )
 
@@ -343,6 +393,11 @@ def test_hindsight_provider_wires_hermes_mode_to_loopback_bridge(monkeypatch):
         "profile": "hermes",
         "idle_timeout": 0,
     }
+    provider._main_runtime = {
+        "provider": "openai-codex",
+        "model": "parent-model-a",
+        "api_mode": "codex_responses",
+    }
 
     client = provider._get_client()
     try:
@@ -366,7 +421,7 @@ def test_hindsight_provider_wires_hermes_mode_to_loopback_bridge(monkeypatch):
         provider.shutdown()
 
 
-def test_hermes_provider_instances_use_isolated_embedded_profiles(monkeypatch):
+def test_hermes_provider_instances_share_one_embedded_runtime(monkeypatch):
     class FakeEmbedded:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -380,18 +435,29 @@ def test_hermes_provider_instances_use_isolated_embedded_profiles(monkeypatch):
         "llm_provider": "hermes",
         "profile": "hermes",
     }
+    parent_runtime = {
+        "provider": "openai-codex",
+        "model": "parent-model-a",
+        "api_mode": "codex_responses",
+    }
     first = HindsightMemoryProvider(SimpleNamespace(llm=_FakeLlm()))
     second = HindsightMemoryProvider(SimpleNamespace(llm=_FakeLlm()))
     first._mode = second._mode = "local_embedded"
     first._config = dict(config)
     second._config = dict(config)
+    first._main_runtime = dict(parent_runtime)
+    second._main_runtime = dict(parent_runtime)
 
     try:
         first_client = first._get_client()
         second_client = second._get_client()
-        assert first_client.kwargs["profile"] != second_client.kwargs["profile"]
-        assert first_client.kwargs["profile"].startswith("hermes-hermes-")
-        assert first_client.kwargs["llm_base_url"] != second_client.kwargs["llm_base_url"]
+        assert isinstance(first_client, FakeEmbedded)
+        assert isinstance(second_client, FakeEmbedded)
+        assert first_client is second_client
+        assert first_client.kwargs["profile"] == hindsight._shared_embedded_profile_name(config)
+        assert first_client.kwargs["llm_base_url"] == second_client.kwargs["llm_base_url"]
+        assert first._embedded_runtime_key is not None
+        assert hindsight._EMBEDDED_RUNTIME_REGISTRY[first._embedded_runtime_key].refs == 2
     finally:
         first.shutdown()
         second.shutdown()

@@ -75,6 +75,24 @@ class _RecallResult:
     text: str
     count: int
 
+
+@dataclass
+class _SharedEmbeddedRuntime:
+    """One process-owned embedded daemon/bridge runtime.
+
+    Provider instances are short-lived relative to the Hermes server process.
+    Keeping the runtime here, rather than on each provider, prevents every
+    session from minting a profile and a loopback bridge of its own.
+    """
+
+    key: tuple[Any, ...]
+    profile: str
+    client: Any
+    bridge: HermesLlmBridge
+    refs: int = 0
+    start_thread: threading.Thread | None = None
+    start_attempted: bool = False
+
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
@@ -91,6 +109,9 @@ _DEFAULT_RETAIN_SOURCE = ""
 # the deterministic recall/retain indicators (overrides the generic core default).
 _HINDSIGHT_GLYPH = "👁️"
 _PROFILE_ENV_LOCK = threading.RLock()
+_EMBEDDED_RUNTIME_LOCK = threading.RLock()
+_EMBEDDED_RUNTIME_REGISTRY: dict[tuple[Any, ...], _SharedEmbeddedRuntime] = {}
+_EMBEDDED_RUNTIME_ATEXIT_REGISTERED = False
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -815,6 +836,138 @@ def _sanitize_bank_segment(value: str) -> str:
     return "".join(out).strip("-_")
 
 
+def _shared_embedded_runtime_key(config: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the process-local identity for the inherited Hindsight runtime.
+
+    Inherit mode is intentionally model/provider agnostic.  The parent LLM is
+    selected by Hermes at request time; it is not part of the daemon identity.
+    The PID deliberately keeps the registry process-scoped.  Hermes home,
+    logical profile, and database URL keep unrelated local configurations from
+    sharing a bridge inside one process.  The URL is retained only in memory
+    and is never logged.
+    """
+    logical_profile = _sanitize_bank_segment(_embedded_profile_name(config)) or "hermes"
+    configured_database = config.get("database_url") or config.get("hindsight_database_url")
+    database_url = str(configured_database or f"pg0://hindsight-embed-{logical_profile}")
+    try:
+        hermes_home = str(get_hermes_home().resolve())
+    except Exception:
+        hermes_home = str(get_hermes_home())
+    return (
+        os.getpid(),
+        hermes_home,
+        logical_profile,
+        database_url,
+    )
+
+
+def _shared_embedded_profile_name(config: dict[str, Any]) -> str:
+    """Return the stable, model-agnostic daemon profile name."""
+    logical_profile = _sanitize_bank_segment(_embedded_profile_name(config)) or "hermes"
+    return f"{logical_profile}-hermes-shared"
+
+
+def _stop_shared_embedded_daemon(runtime: _SharedEmbeddedRuntime) -> None:
+    """Stop the runtime's daemon and reap a matching detached process."""
+    client = runtime.client
+    manager = getattr(client, "_manager", None)
+    if manager is None:
+        return
+    try:
+        if manager.is_running(runtime.profile):
+            manager.stop(runtime.profile)
+    except Exception:
+        logger.debug("Shared Hindsight daemon stop failed", exc_info=True)
+
+    # Hindsight daemons detach from the parent.  If the manager's health check
+    # already went down, perform the same narrow profile+port ownership check
+    # used by the provider fallback, without touching unrelated processes.
+    if os.name == "nt":
+        return
+    try:
+        paths = manager._profile_manager.resolve_profile_paths(runtime.profile)
+        port = int(paths.port)
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        port_needle = f"--port {port}"
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) != 2:
+                continue
+            command = fields[1]
+            if "hindsight-api --daemon --idle-timeout" not in command or port_needle not in command:
+                continue
+            try:
+                pid = int(fields[0])
+            except ValueError:
+                continue
+            try:
+                if not manager._kill_process(pid):
+                    os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
+                pass
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        logger.debug("Shared Hindsight daemon reap fallback failed", exc_info=True)
+
+
+def _close_shared_embedded_runtime(runtime: _SharedEmbeddedRuntime) -> None:
+    """Close the shared client, daemon, bridge, and generated env file."""
+    client = runtime.client
+    try:
+        inner_client = getattr(client, "_client", None)
+        if inner_client is not None and hasattr(inner_client, "aclose"):
+            try:
+                _run_sync(inner_client.aclose())
+            except Exception:
+                logger.debug("Shared Hindsight async client close failed", exc_info=True)
+            try:
+                client._client = None
+            except Exception:
+                pass
+        close_embedded = getattr(client, "close", None)
+        if close_embedded is not None:
+            try:
+                close_embedded(stop_daemon=True)
+            except TypeError:
+                close_embedded()
+    except Exception:
+        logger.debug("Shared Hindsight client close failed", exc_info=True)
+    _stop_shared_embedded_daemon(runtime)
+    try:
+        runtime.bridge.close()
+    except Exception:
+        logger.debug("Shared Hindsight bridge close failed", exc_info=True)
+
+    profile_env = _embedded_profile_env_path({}, runtime.profile)
+    with _PROFILE_ENV_LOCK:
+        try:
+            profile_env.unlink()
+        except OSError:
+            pass
+
+
+def _shutdown_all_shared_embedded_runtimes() -> None:
+    """Release all process-owned runtimes during interpreter shutdown."""
+    with _EMBEDDED_RUNTIME_LOCK:
+        runtimes = list(_EMBEDDED_RUNTIME_REGISTRY.values())
+        _EMBEDDED_RUNTIME_REGISTRY.clear()
+    for runtime in runtimes:
+        _close_shared_embedded_runtime(runtime)
+
+
+def _register_shared_runtime_atexit() -> None:
+    global _EMBEDDED_RUNTIME_ATEXIT_REGISTERED
+    with _EMBEDDED_RUNTIME_LOCK:
+        if not _EMBEDDED_RUNTIME_ATEXIT_REGISTERED:
+            atexit.register(_shutdown_all_shared_embedded_runtimes)
+            _EMBEDDED_RUNTIME_ATEXIT_REGISTERED = True
+
+
 def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str) -> str:
     """Resolve a bank_id template string with the given placeholders.
 
@@ -872,6 +1025,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._llm_bridge: HermesLlmBridge | None = None
         self._embedded_profile_override: str | None = None
         self._embedded_profile_env_path = None
+        self._main_runtime: dict[str, Any] = {}
         self._config = None
         self._api_key = None
         self._api_url = _DEFAULT_API_URL
@@ -898,6 +1052,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._client = None
         self._client_lock = threading.RLock()
         self._daemon_thread: threading.Thread | None = None
+        self._embedded_runtime_key: tuple[int, str, str, str] | None = None
+        self._embedded_runtime_lease = False
         self._timeout = _DEFAULT_TIMEOUT
         self._prefetch_timeout = _DEFAULT_PREFETCH_TIMEOUT
         self._retain_shutdown_timeout = _DEFAULT_PREFETCH_TIMEOUT
@@ -1369,18 +1525,17 @@ class HindsightMemoryProvider(MemoryProvider):
         *,
         inherit_hermes_llm: bool,
     ) -> str:
-        """Resolve the daemon profile without sharing Hermes bridge state.
+        """Resolve the daemon profile used by the embedded client.
 
         Direct-provider mode keeps the configured profile for compatibility.
-        Hermes inheritance gets a per-provider profile because each provider
-        owns a distinct loopback bridge credential and endpoint.
+        Hermes inheritance uses one stable process-owned profile.  The bridge
+        and client for that profile are leased through the module registry.
         """
         configured = _embedded_profile_name(config)
         if not inherit_hermes_llm:
             return configured
         if self._embedded_profile_override is None:
-            base = _sanitize_bank_segment(configured) or "hermes"
-            self._embedded_profile_override = f"{base}-hermes-{uuid.uuid4().hex[:12]}"
+            self._embedded_profile_override = _shared_embedded_profile_name(config)
         return self._embedded_profile_override
 
     def _effective_embedded_database_url(
@@ -1391,12 +1546,10 @@ class HindsightMemoryProvider(MemoryProvider):
     ) -> str | None:
         """Resolve the persistent database independently from daemon profile.
 
-        Hermes inheritance uses a per-instance daemon profile so its loopback
-        bridge credentials and port cannot race with another provider instance.
-        Hindsight also uses that profile as the default pg0 database name,
-        though, so using it directly would make memories disappear after a
-        provider restart. Keep the daemon/profile identity ephemeral while
-        deriving a stable database name from the configured logical profile.
+        Hermes inheritance uses a stable process-owned daemon profile while
+        Hindsight uses a stable database name derived from the logical profile.
+        Keeping those identities separate prevents memory loss across provider
+        restarts without creating one daemon per provider instance.
         An explicit ``database_url`` remains an escape hatch for deployments
         that manage their own Hindsight database.
         """
@@ -1407,6 +1560,93 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         logical_profile = _sanitize_bank_segment(_embedded_profile_name(config)) or "hermes"
         return f"pg0://hindsight-embed-{logical_profile}"
+
+    def _acquire_shared_embedded_runtime(
+        self,
+        config: dict[str, Any],
+    ) -> _SharedEmbeddedRuntime:
+        """Acquire the process-owned runtime for Hermes LLM inheritance."""
+        key = _shared_embedded_runtime_key(config)
+        with _EMBEDDED_RUNTIME_LOCK:
+            if self._embedded_runtime_lease and self._embedded_runtime_key == key:
+                runtime = _EMBEDDED_RUNTIME_REGISTRY.get(key)
+                if runtime is not None:
+                    return runtime
+                self._embedded_runtime_lease = False
+                self._embedded_runtime_key = None
+
+            runtime = _EMBEDDED_RUNTIME_REGISTRY.get(key)
+            if runtime is None:
+                host_llm = getattr(self._host_context, "llm", None)
+                if host_llm is None:
+                    raise RuntimeError(
+                        "Hindsight llm_provider=hermes requires ctx.llm"
+                    )
+                try:
+                    from tools.lazy_deps import ensure as _lazy_ensure
+                    _lazy_ensure("memory.hindsight", prompt=False)
+                except ImportError:
+                    pass
+                except Exception as exc:
+                    raise ImportError(str(exc)) from exc
+                from hindsight import HindsightEmbedded
+
+                HindsightEmbedded.__del__ = lambda self: None
+                bridge = HermesLlmBridge(
+                    host_llm,
+                    main_runtime=self._main_runtime,
+                )
+                try:
+                    bridge.start()
+                    idle_timeout = _parse_int_setting(
+                        config.get("idle_timeout")
+                        if config.get("idle_timeout") is not None
+                        else os.environ.get("HINDSIGHT_IDLE_TIMEOUT", self._idle_timeout),
+                        _DEFAULT_IDLE_TIMEOUT,
+                    )
+                    profile = _shared_embedded_profile_name(config)
+                    kwargs = {
+                        "profile": profile,
+                        "llm_provider": "openai",
+                        "llm_api_key": bridge.api_key,
+                        "llm_model": "hermes-inherited",
+                        "llm_base_url": bridge.base_url,
+                        "idle_timeout": idle_timeout,
+                    }
+                    database_url = self._effective_embedded_database_url(
+                        config,
+                        inherit_hermes_llm=True,
+                    )
+                    if database_url:
+                        kwargs["database_url"] = database_url
+                    runtime = _SharedEmbeddedRuntime(
+                        key=key,
+                        profile=profile,
+                        client=HindsightEmbedded(**kwargs),
+                        bridge=bridge,
+                    )
+                    _EMBEDDED_RUNTIME_REGISTRY[key] = runtime
+                    _register_shared_runtime_atexit()
+                except Exception:
+                    bridge.close()
+                    raise
+
+            runtime.refs += 1
+            self._embedded_runtime_key = key
+            self._embedded_runtime_lease = True
+            self._embedded_profile_override = runtime.profile
+            self._llm_bridge = runtime.bridge
+            self._embedded_profile_env_path = _embedded_profile_env_path(
+                config,
+                runtime.profile,
+            )
+            self._idle_timeout = _parse_int_setting(
+                config.get("idle_timeout")
+                if config.get("idle_timeout") is not None
+                else os.environ.get("HINDSIGHT_IDLE_TIMEOUT", self._idle_timeout),
+                _DEFAULT_IDLE_TIMEOUT,
+            )
+            return runtime
 
     def _get_client(self):
         with self._client_lock:
@@ -1441,67 +1681,51 @@ class HindsightMemoryProvider(MemoryProvider):
                     raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
-                llm_provider = self._config.get("llm_provider", "")
+                llm_provider = config.get("llm_provider", "")
                 inherit_hermes_llm = str(llm_provider).strip().lower() == "hermes"
-                if llm_provider in {"openai_compatible", "openrouter"}:
-                    llm_provider = "openai"
                 if inherit_hermes_llm:
-                    if self._host_context is None:
-                        raise RuntimeError(
-                            "Hindsight llm_provider=hermes requires the Hermes PluginContext"
-                        )
-                    host_llm = getattr(self._host_context, "llm", None)
-                    if host_llm is None:
-                        raise RuntimeError(
-                            "Hindsight llm_provider=hermes requires ctx.llm"
-                        )
-                    if self._llm_bridge is None:
-                        self._llm_bridge = HermesLlmBridge(host_llm)
-                        self._llm_bridge.start()
-                    llm_provider = "openai"
-                configured_llm_api_key = ""
-                if not inherit_hermes_llm:
+                    runtime = self._acquire_shared_embedded_runtime(config)
+                    self._client = runtime.client
+                else:
+                    if llm_provider in {"openai_compatible", "openrouter"}:
+                        llm_provider = "openai"
                     configured_llm_api_key = (
                         config.get("llmApiKey")
                         or config.get("llm_api_key")
                         or get_secret("HINDSIGHT_LLM_API_KEY", "")
                     )
-                effective_profile = self._effective_embedded_profile_name(
-                    config,
-                    inherit_hermes_llm=inherit_hermes_llm,
-                )
-                logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
-                             effective_profile, llm_provider)
-                kwargs = dict(
-                    profile=effective_profile,
-                    llm_provider=llm_provider,
-                    llm_api_key=configured_llm_api_key,
-                    llm_model=self._config.get("llm_model", ""),
-                )
-                if inherit_hermes_llm:
-                    bridge = self._llm_bridge
-                    if bridge is None:  # pragma: no cover - defensive narrowing
-                        raise RuntimeError("Failed to initialize the Hermes LLM bridge")
-                    kwargs["llm_api_key"] = bridge.api_key
-                    kwargs["llm_base_url"] = bridge.base_url
-                    kwargs["llm_model"] = "hermes-inherited"
-                elif self._llm_base_url:
-                    kwargs["llm_base_url"] = self._llm_base_url
-                database_url = self._effective_embedded_database_url(
-                    config,
-                    inherit_hermes_llm=inherit_hermes_llm,
-                )
-                if database_url:
-                    kwargs["database_url"] = database_url
-                idle_timeout = _parse_int_setting(
-                    self._config.get("idle_timeout")
-                    if self._config.get("idle_timeout") is not None
-                    else os.environ.get("HINDSIGHT_IDLE_TIMEOUT", self._idle_timeout),
-                    _DEFAULT_IDLE_TIMEOUT,
-                )
-                self._idle_timeout = idle_timeout
-                kwargs["idle_timeout"] = idle_timeout
-                self._client = HindsightEmbedded(**kwargs)
+                    effective_profile = self._effective_embedded_profile_name(
+                        config,
+                        inherit_hermes_llm=False,
+                    )
+                    logger.debug(
+                        "Creating HindsightEmbedded client (profile=%s, provider=%s)",
+                        effective_profile,
+                        llm_provider,
+                    )
+                    kwargs: dict[str, Any] = dict(
+                        profile=effective_profile,
+                        llm_provider=llm_provider,
+                        llm_api_key=configured_llm_api_key,
+                        llm_model=config.get("llm_model", ""),
+                    )
+                    if self._llm_base_url:
+                        kwargs["llm_base_url"] = self._llm_base_url
+                    database_url = self._effective_embedded_database_url(
+                        config,
+                        inherit_hermes_llm=False,
+                    )
+                    if database_url:
+                        kwargs["database_url"] = database_url
+                    idle_timeout = _parse_int_setting(
+                        config.get("idle_timeout")
+                        if config.get("idle_timeout") is not None
+                        else os.environ.get("HINDSIGHT_IDLE_TIMEOUT", self._idle_timeout),
+                        _DEFAULT_IDLE_TIMEOUT,
+                    )
+                    self._idle_timeout = idle_timeout
+                    kwargs["idle_timeout"] = idle_timeout
+                    self._client = HindsightEmbedded(**kwargs)
             else:
                 _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight
@@ -1916,6 +2140,16 @@ class HindsightMemoryProvider(MemoryProvider):
             pass  # packaging not available or other issue — proceed anyway
 
         self._config = _load_config()
+        raw_main_runtime = kwargs.get("main_runtime")
+        if isinstance(raw_main_runtime, dict):
+            try:
+                from agent.auxiliary_client import _normalize_main_runtime
+
+                self._main_runtime = _normalize_main_runtime(raw_main_runtime)
+            except Exception:
+                self._main_runtime = {}
+        else:
+            self._main_runtime = {}
         self._platform = str(kwargs.get("platform") or "").strip()
         self._user_id = str(kwargs.get("user_id") or "").strip()
         self._user_name = str(kwargs.get("user_name") or "").strip()
@@ -2150,9 +2384,40 @@ class HindsightMemoryProvider(MemoryProvider):
                         f.write(f"\n=== Daemon startup failed: {e} ===\n")
                         traceback.print_exc(file=f)
 
-            t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
-            self._daemon_thread = t
-            t.start()
+            inherit_hermes_llm = str(
+                (self._config or {}).get("llm_provider", "")
+            ).strip().lower() == "hermes"
+            if inherit_hermes_llm:
+                # Acquire before launching the starter so all providers in
+                # this Hermes process attach to one bridge/client and only the
+                # first lease starts the daemon.
+                try:
+                    runtime = self._acquire_shared_embedded_runtime(self._config or {})
+                except Exception as exc:
+                    logger.warning(
+                        "Hindsight shared embedded runtime setup failed: %s",
+                        type(exc).__name__,
+                    )
+                    return
+                with _EMBEDDED_RUNTIME_LOCK:
+                    if not runtime.start_attempted:
+                        t = threading.Thread(
+                            target=_start_daemon,
+                            daemon=True,
+                            name="hindsight-daemon-start",
+                        )
+                        runtime.start_thread = t
+                        runtime.start_attempted = True
+                        t.start()
+                    self._daemon_thread = runtime.start_thread
+            else:
+                t = threading.Thread(
+                    target=_start_daemon,
+                    daemon=True,
+                    name="hindsight-daemon-start",
+                )
+                self._daemon_thread = t
+                t.start()
 
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
@@ -2770,6 +3035,27 @@ class HindsightMemoryProvider(MemoryProvider):
         except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
             return []
 
+    def _release_shared_embedded_runtime(self) -> None:
+        """Release this provider's lease and close the last shared owner."""
+        key = self._embedded_runtime_key
+        if not self._embedded_runtime_lease or key is None:
+            return
+
+        with _EMBEDDED_RUNTIME_LOCK:
+            runtime = _EMBEDDED_RUNTIME_REGISTRY.get(key)
+            self._embedded_runtime_lease = False
+            self._embedded_runtime_key = None
+            if runtime is None:
+                return
+            runtime.refs = max(0, runtime.refs - 1)
+            if runtime.refs:
+                return
+            _EMBEDDED_RUNTIME_REGISTRY.pop(key, None)
+            # Keep the registry lock while closing the last owner.  That
+            # prevents a new provider from recreating the same stable profile
+            # while its previous daemon/bridge is still being torn down.
+            _close_shared_embedded_runtime(runtime)
+
     def _force_stop_embedded_daemon(self) -> None:
         """Stop an owned embedded daemon if the wrapper close left it alive."""
         client = self._client
@@ -2835,7 +3121,13 @@ class HindsightMemoryProvider(MemoryProvider):
         ):
             daemon_thread.join(timeout=5.0)
         self._daemon_thread = None
-        if self._client is not None:
+        if self._embedded_runtime_lease:
+            self._release_shared_embedded_runtime()
+            self._client = None
+            self._llm_bridge = None
+            self._embedded_profile_override = None
+            self._embedded_profile_env_path = None
+        elif self._client is not None:
             try:
                 if self._mode == "local_embedded":
                     # HindsightEmbedded.close() delegates to its sync client.close().
