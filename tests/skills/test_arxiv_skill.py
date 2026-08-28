@@ -1,19 +1,22 @@
 """Tests for the bundled arXiv research skill and its search script."""
 
-import io
+import json
 import re
+import runpy
+import subprocess
 import sys
 from pathlib import Path
-from unittest import mock
 import urllib.parse
 import urllib.request
 import pytest
-import yaml
+
+from tests.skills._skill_test_utils import parse_frontmatter_and_body, resolve_related_skills_in_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_DIR = REPO_ROOT / "skills" / "research" / "arxiv"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 SCRIPTS_DIR = SKILL_DIR / "scripts"
+SCRIPT_PATH = SCRIPTS_DIR / "search_arxiv.py"
 
 # Add script directory to sys.path for direct import
 if str(SCRIPTS_DIR) not in sys.path:
@@ -82,16 +85,6 @@ class DummyResponse:
         pass
 
 
-def _frontmatter_and_body():
-    content = SKILL_MD.read_text(encoding="utf-8")
-    assert content.startswith("---")
-    m = re.search(r"\n---\s*\n", content[3:])
-    assert m, "frontmatter must close with ---"
-    fm = yaml.safe_load(content[3 : m.start() + 3])
-    body = content[m.end() + 3 :]
-    return fm, body
-
-
 class TestArxivSkillContract:
     """Test that SKILL.md adheres to the project hardline standards."""
 
@@ -99,7 +92,7 @@ class TestArxivSkillContract:
         assert SKILL_MD.is_file()
 
     def test_frontmatter_required_fields(self):
-        fm, _ = _frontmatter_and_body()
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
         for field in ("name", "description", "version", "author", "license", "platforms"):
             assert field in fm, f"missing frontmatter field: {field}"
         assert fm["name"] == "arxiv"
@@ -108,7 +101,7 @@ class TestArxivSkillContract:
         assert "related_skills" in hermes
 
     def test_description_hardline(self):
-        fm, _ = _frontmatter_and_body()
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
         desc = fm["description"]
         assert len(desc) <= 60, f"description is {len(desc)} chars; max allowed is 60"
         assert desc.endswith("."), "description must end with a period"
@@ -119,12 +112,9 @@ class TestArxivSkillContract:
         )
 
     def test_related_skills_resolve_in_repo(self):
-        fm, _ = _frontmatter_and_body()
-        for name in fm["metadata"]["hermes"]["related_skills"]:
-            hits = list(REPO_ROOT.glob(f"skills/**/{name}/SKILL.md")) + list(
-                REPO_ROOT.glob(f"optional-skills/**/{name}/SKILL.md")
-            )
-            assert hits, f"related_skills entry does not resolve in repo: {name}"
+        fm, _ = parse_frontmatter_and_body(SKILL_MD)
+        missing = resolve_related_skills_in_repo(fm["metadata"]["hermes"]["related_skills"])
+        assert not missing, f"related_skills entries do not resolve in repo: {missing}"
 
     def test_no_machine_local_paths(self):
         content = SKILL_MD.read_text(encoding="utf-8")
@@ -132,7 +122,7 @@ class TestArxivSkillContract:
         assert not re.search(r"[A-Z]:\\\\Users", content)
 
     def test_body_structure(self):
-        _, body = _frontmatter_and_body()
+        _, body = parse_frontmatter_and_body(SKILL_MD)
         for section in ("## Quick Reference", "## Helper Script"):
             assert section in body, f"missing section: {section}"
 
@@ -162,6 +152,7 @@ class TestSearchArxivScript:
         assert len(recorded_url) == 1
         url = recorded_url[0]
         assert "export.arxiv.org/api/query?" in url
+        assert "search_query=all%3AGRPO%2520reinforcement%2520learning" in url or "all:GRPO" in urllib.parse.unquote(url)
         assert "max_results=2" in url
         assert "sortBy=relevance" in url
         assert "sortOrder=descending" in url
@@ -221,69 +212,54 @@ class TestSearchArxivScript:
         captured = capsys.readouterr()
         assert "No results found." in captured.out
 
-    def test_cli_help(self, monkeypatch, capsys):
-        monkeypatch.setattr(sys, "argv", ["search_arxiv.py", "--help"])
-        with pytest.raises(SystemExit) as excinfo:
-            if not sys.argv[1:] or sys.argv[1] in {"-h", "--help"}:
-                print(search_arxiv.__doc__)
-                sys.exit(0)
-        assert excinfo.value.code == 0
-        captured = capsys.readouterr()
-        assert "Search arXiv and display results" in captured.out
+    def test_cli_help(self):
+        """Verify real CLI help execution via subprocess."""
+        res = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res.returncode == 0
+        assert "Search arXiv and display results in a clean format." in res.stdout
 
     def test_cli_argument_parsing(self, monkeypatch, capsys):
-        calls = []
+        """Verify real __main__ CLI argument parsing and execution hermetically."""
+        recorded_url = []
 
-        def fake_search(**kwargs):
-            calls.append(kwargs)
+        def mock_urlopen(req, timeout=15):
+            recorded_url.append(req.full_url)
+            return DummyResponse(SAMPLE_ARXIV_ATOM_XML)
 
-        monkeypatch.setattr(search_arxiv, "search", fake_search)
+        monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                str(SCRIPT_PATH),
+                "reinforcement",
+                "learning",
+                "--author",
+                "Sutton",
+                "--category",
+                "cs.AI",
+                "--max",
+                "10",
+                "--sort",
+                "date",
+            ],
+        )
 
-        test_args = [
-            "search_arxiv.py",
-            "reinforcement",
-            "learning",
-            "--author",
-            "Sutton",
-            "--category",
-            "cs.AI",
-            "--max",
-            "10",
-            "--sort",
-            "date",
-        ]
-        monkeypatch.setattr(sys, "argv", test_args)
+        runpy.run_path(str(SCRIPT_PATH), run_name="__main__")
 
-        args = sys.argv[1:]
-        query = None
-        author = None
-        category = None
-        ids = None
-        max_results = 5
-        sort = "relevance"
-        i = 0
-        positional = []
-        while i < len(args):
-            if args[i] == "--max" and i + 1 < len(args):
-                max_results = int(args[i + 1]); i += 2
-            elif args[i] == "--sort" and i + 1 < len(args):
-                sort = args[i + 1]; i += 2
-            elif args[i] == "--author" and i + 1 < len(args):
-                author = args[i + 1]; i += 2
-            elif args[i] == "--category" and i + 1 < len(args):
-                category = args[i + 1]; i += 2
-            elif args[i] == "--id" and i + 1 < len(args):
-                ids = args[i + 1]; i += 2
-            else:
-                positional.append(args[i]); i += 1
-        if positional:
-            query = " ".join(positional)
+        assert len(recorded_url) == 1
+        url = recorded_url[0]
+        assert "max_results=10" in url
+        assert "sortBy=submittedDate" in url
+        unquoted = urllib.parse.unquote(url)
+        assert "all:reinforcement learning" in unquoted or "all%3Areinforcement" in url
+        assert "au:Sutton" in unquoted
+        assert "cat:cs.AI" in unquoted
 
-        search_arxiv.search(query=query, author=author, category=category, ids=ids, max_results=max_results, sort=sort)
-
-        assert len(calls) == 1
-        assert calls[0]["query"] == "reinforcement learning"
-        assert calls[0]["author"] == "Sutton"
-        assert calls[0]["category"] == "cs.AI"
-        assert calls[0]["max_results"] == 10
-        assert calls[0]["sort"] == "date"
+        captured = capsys.readouterr()
+        assert "Found 2 results" in captured.out
