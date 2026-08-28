@@ -1272,6 +1272,22 @@ def run_compress_context_with_progress_timeout(
         # telemetry stream as every other failed attempt, or a wedged pool
         # looks like compression simply stopped being attempted.
         if telemetry_agent is not None:
+            # No compress_context ran for this refusal, so open a minimal
+            # attribution scope of its own: without it, a host thread that
+            # previously ran a direct-path attempt would emit this line under
+            # that stale attempt's identity.
+            try:
+                from agent.context_compressor import (
+                    begin_compression_attempt_attribution,
+                )
+
+                begin_compression_attempt_attribution({
+                    "attempt_id": uuid.uuid4().hex,
+                    "session_id": getattr(telemetry_agent, "session_id", "")
+                    or "",
+                })
+            except Exception:
+                pass
             _emit_compression_attempt_telemetry(
                 telemetry_agent,
                 started_at=time.monotonic(),
@@ -1562,7 +1578,29 @@ def _emit_compression_attempt_telemetry(
 ) -> None:
     """Emit one content-free JSON log line for a compression attempt."""
     try:
-        telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
+        # Attribution order: this attempt's context-local telemetry, then its
+        # context-local identity seed (an abort that never began summary
+        # telemetry), then — only for legacy callers with no attribution
+        # scope — the compressor's shared last-attempt mirror. The mirror is
+        # last-writer-wins across OVERLAPPING attempts, so reading it for a
+        # scoped attempt could stamp this payload with another attempt's
+        # attempt_id/aux fields (the 2026-08-28 fence-cancel churn logs).
+        telemetry = None
+        try:
+            from agent.context_compressor import (
+                current_compression_attempt_seed,
+                current_compression_attempt_telemetry,
+            )
+
+            telemetry = current_compression_attempt_telemetry()
+            if telemetry is None:
+                telemetry = current_compression_attempt_seed()
+        except Exception:
+            telemetry = None
+        if telemetry is None:
+            telemetry = getattr(
+                agent.context_compressor, "_last_compression_telemetry", None
+            )
         if not isinstance(telemetry, dict):
             telemetry = {}
         payload = dict(telemetry)
@@ -2775,15 +2813,36 @@ def compress_context(
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
     _trigger_source = "manual" if force else "auto"
+    _attempt_seed = {
+        "attempt_id": _attempt_id,
+        "session_id": agent.session_id or "",
+        "trigger_source": _trigger_source,
+    }
     try:
         agent._compression_attempt_id = _attempt_id
-        setattr(agent.context_compressor, "_compression_telemetry_seed", {
-            "attempt_id": _attempt_id,
-            "session_id": agent.session_id or "",
-            "trigger_source": _trigger_source,
-        })
+        setattr(
+            agent.context_compressor,
+            "_compression_telemetry_seed",
+            dict(_attempt_seed),
+        )
     except Exception:
         pass
+    # Attribution scope for THIS attempt (context-local): overlapping workers
+    # share the compressor object, so the instance seed/telemetry slots above
+    # are last-writer-wins mirrors only. The context-local scope is what
+    # _begin_compression_telemetry and _emit_compression_attempt_telemetry
+    # read, keeping an aborted attempt's payload from carrying an overlapping
+    # attempt's attempt_id/aux fields.
+    try:
+        from agent.context_compressor import (
+            begin_compression_attempt_attribution,
+        )
+
+        begin_compression_attempt_attribution(_attempt_seed)
+    except Exception:
+        logger.debug(
+            "compression attempt attribution scope open failed", exc_info=True
+        )
 
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking

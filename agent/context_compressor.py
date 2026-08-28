@@ -94,6 +94,54 @@ _SUMMARY_ROUTE_CONSUMED: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_consumed", default=None)
 )
 
+# ── Per-attempt telemetry attribution ────────────────────────────────────
+# The compressor object is SHARED between overlapping compression attempts
+# (a fence-cancelled worker stays alive on the pool while the host launches
+# the next attempt), so instance slots like ``_last_compression_telemetry``
+# are last-writer-wins: an aborted attempt that emitted its payload from the
+# instance slot could carry an OVERLAPPING attempt's attempt_id/aux fields.
+# Attribution therefore lives in ContextVars: each pooled worker runs under
+# its own copied context (``propagate_context_to_thread``), and
+# ``compress_context`` opens a fresh scope at entry
+# (``begin_compression_attempt_attribution``) so executor-thread reuse
+# cannot leak the previous attempt's payload either. The instance slots
+# remain as last-attempt mirrors for external readers and tests.
+_COMPRESSION_ATTEMPT_SEED: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("hermes_compression_attempt_seed", default=None)
+)
+_COMPRESSION_ATTEMPT_TELEMETRY: contextvars.ContextVar[
+    Optional[Dict[str, Any]]
+] = contextvars.ContextVar(
+    "hermes_compression_attempt_telemetry", default=None
+)
+
+
+def begin_compression_attempt_attribution(
+    seed: Optional[Dict[str, Any]],
+) -> None:
+    """Open a fresh attribution scope for ONE compression attempt.
+
+    ``seed`` carries the attempt's identity (``attempt_id`` / ``session_id``
+    / ``trigger_source``). Resets the attempt-telemetry slot so a reused
+    executor thread cannot leak the previous attempt's payload into an
+    abort that never reached ``_begin_compression_telemetry``.
+    """
+    _COMPRESSION_ATTEMPT_SEED.set(dict(seed) if isinstance(seed, dict) else None)
+    _COMPRESSION_ATTEMPT_TELEMETRY.set(None)
+
+
+def current_compression_attempt_seed() -> Optional[Dict[str, Any]]:
+    """This attempt's identity seed (context-local), or ``None``."""
+    seed = _COMPRESSION_ATTEMPT_SEED.get()
+    return dict(seed) if isinstance(seed, dict) else None
+
+
+def current_compression_attempt_telemetry() -> Optional[Dict[str, Any]]:
+    """This attempt's live telemetry dict (context-local), or ``None``."""
+    telemetry = _COMPRESSION_ATTEMPT_TELEMETRY.get()
+    return telemetry if isinstance(telemetry, dict) else None
+
+
 # call_llm kwargs a pinned route may set. ``timeout`` lets a fallback entry
 # keep its own deadline instead of inheriting one the primary already burned
 # (same per-entry semantics the aux client applies to chain candidates).
@@ -2338,7 +2386,12 @@ class ContextCompressor(ContextEngine):
         trigger_source: str | None = None,
     ) -> Dict[str, Any]:
         """Initialize content-free per-attempt compression telemetry."""
-        seed = getattr(self, "_compression_telemetry_seed", None)
+        # Context-local seed first (set by compress_context for THIS attempt);
+        # the instance slot is a shared last-writer-wins mirror kept only for
+        # legacy callers and can name an overlapping attempt.
+        seed = _COMPRESSION_ATTEMPT_SEED.get()
+        if not isinstance(seed, dict):
+            seed = getattr(self, "_compression_telemetry_seed", None)
         if isinstance(seed, dict):
             attempt_id = attempt_id or seed.get("attempt_id")
             session_id = session_id or seed.get("session_id")
@@ -2377,9 +2430,26 @@ class ContextCompressor(ContextEngine):
             "split_status": "unknown",
             "failure_class": None,
         }
+        # Attempt-scoped slot is authoritative; the instance slots stay as
+        # last-attempt mirrors for external readers (tests, /usage-style
+        # introspection) and are the fallback for unscoped legacy callers.
+        _COMPRESSION_ATTEMPT_TELEMETRY.set(telemetry)
         self._active_compression_telemetry = telemetry
         self._last_compression_telemetry = telemetry
         return telemetry
+
+    def _current_attempt_telemetry(self) -> Optional[Dict[str, Any]]:
+        """The telemetry dict owned by THIS attempt's context, if any.
+
+        Falls back to the shared instance slot only when no context-local
+        attempt telemetry exists (legacy callers that never opened an
+        attribution scope).
+        """
+        telemetry = _COMPRESSION_ATTEMPT_TELEMETRY.get()
+        if isinstance(telemetry, dict):
+            return telemetry
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        return telemetry if isinstance(telemetry, dict) else None
 
     def _record_compression_regions(
         self,
@@ -2388,7 +2458,7 @@ class ContextCompressor(ContextEngine):
         middle_messages: List[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
     ) -> None:
-        telemetry = getattr(self, "_active_compression_telemetry", None)
+        telemetry = self._current_attempt_telemetry()
         if not isinstance(telemetry, dict):
             return
         telemetry["protected_head_tokens"] = estimate_messages_tokens_rough(head_messages)
@@ -2406,7 +2476,7 @@ class ContextCompressor(ContextEngine):
         effective_aux_context: int | None = None,
         phase_timings: Dict[str, Any] | None = None,
     ) -> None:
-        telemetry = getattr(self, "_active_compression_telemetry", None)
+        telemetry = self._current_attempt_telemetry()
         if not isinstance(telemetry, dict):
             return
         telemetry["aux_prompt_tokens"] = estimate_messages_tokens_rough(prompt_messages)
@@ -4879,7 +4949,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _err_text = _err_text[:217].rstrip() + "..."
         self._last_aux_model_failure_error = _err_text
         self._last_aux_model_failure_model = self.summary_model
-        telemetry = getattr(self, "_active_compression_telemetry", None)
+        telemetry = self._current_attempt_telemetry()
         if isinstance(telemetry, dict):
             telemetry["fallback_used"] = True
             telemetry["failure_class"] = telemetry.get("failure_class") or "aux_model_fallback"
