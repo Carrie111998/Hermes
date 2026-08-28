@@ -155,7 +155,13 @@ export async function desktopDefaultCwd(): Promise<{ branch: string; cwd: string
     return null
   }
 
-  return remoteFsApi<{ branch: string; cwd: string }>('/api/fs/default-cwd')
+  // Ask for the ACTIVE profile's default: in app-global remote mode one
+  // backend serves every profile, so the launch profile's terminal.cwd would
+  // otherwise seed a new chat with the wrong workspace (the backend falls
+  // back to its own default when the profile sets none or is unknown).
+  const profile = desktopFsProfile()
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+  return remoteFsApi<{ branch: string; cwd: string }>(`/api/fs/default-cwd${query}`)
 }
 
 // Reveal a path in the OS file manager (Finder / Explorer / Files). Local only.
