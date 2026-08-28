@@ -200,7 +200,8 @@ class TestQueryOllamaApiShowBlackhole:
         from agent.model_metadata import _endpoint_blackholed, _query_ollama_api_show_uncached
 
         client = _client_mock(httpx.ConnectTimeout("timed out"))
-        with patch("httpx.Client", return_value=client):
+        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"), \
+             patch("httpx.Client", return_value=client):
             assert _query_ollama_api_show_uncached("some-model", self.URL) is None
 
         assert client.post.call_count == 1
@@ -219,7 +220,8 @@ class TestQueryOllamaApiShowBlackhole:
         from agent.model_metadata import _endpoint_blackholed, _query_ollama_api_show_uncached
 
         client = _client_mock(httpx.ReadTimeout("slow"))
-        with patch("httpx.Client", return_value=client):
+        with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"), \
+             patch("httpx.Client", return_value=client):
             assert _query_ollama_api_show_uncached("some-model", self.URL) is None
 
         assert _endpoint_blackholed(self.URL) is False
