@@ -1209,12 +1209,24 @@ def _cron_next_run_matches_expr(
     if not expr or not _ensure_croniter() or croniter is None:
         return True
     try:
+        # A stamped cron expression describes wall-clock time in its own
+        # schedule zone, even when the scanner process is running in another
+        # zone.  ``next_run_dt`` has already been normalized to the scanner's
+        # timezone by the due-scan; convert it back before validating the
+        # expression or every non-UTC stamped schedule looks stale and is
+        # silently re-anchored instead of firing.
+        schedule_zone = _schedule_zone(schedule)
+        scheduled_dt = (
+            next_run_dt.astimezone(schedule_zone)
+            if schedule_zone is not None
+            else next_run_dt
+        )
         # The last occurrence at-or-before the stored instant: base croniter
         # a second past it so an exact occurrence is included, then compare
         # at second granularity (croniter returns second-precision datetimes).
-        base = next_run_dt + timedelta(seconds=1)
+        base = scheduled_dt + timedelta(seconds=1)
         prev = croniter(str(expr), base).get_prev(datetime)
-        return abs((prev - next_run_dt).total_seconds()) < 1.0
+        return abs((prev - scheduled_dt).total_seconds()) < 1.0
     except Exception:
         return True
 
