@@ -1,0 +1,79 @@
+{
+  "schema": "hermes-redteam-remediation-repair-final/v1",
+  "finding_id": "R3-CAND-018",
+  "status": "REPAIRED_LOCAL_NOT_PUSHED",
+  "repository": "NousResearch/hermes-agent",
+  "worktree": "C:/TEMP/hermes-redteam-f751a8c5/impl/r3-cand-018",
+  "branch": "redteam/r3-cand-018",
+  "base": "306db2776c6b6f1acc85c31c4dabba3263f0e9fd",
+  "previous_head": "d26a219ab783f0b04c8f0712adc4b31e3c754212",
+  "implementation_head": "8596e02f7b4d6302c14987636e610f7578e6a2b1",
+  "implementation_tree": "519eca344fea28807fdfede56bd2b1b3c449e6d7",
+  "implementation_parent": "d26a219ab783f0b04c8f0712adc4b31e3c754212",
+  "commits": [
+    {
+      "sha": "8596e02f7b4d6302c14987636e610f7578e6a2b1",
+      "subject": "fix(auth): close final publication and recovery races"
+    }
+  ],
+  "push": "not performed",
+  "findings_repaired": {
+    "R3-CAND-018-F1": [
+      "Ordinary loads require providers or credential_pool and preserve invalid primary bytes as read-only corruption with SHA-256 evidence.",
+      "Persisted top-level fields, including suppressed_sources, are schema-validated; explicitly scoped legacy empty/suppression readers normalize only their documented compatibility forms."
+    ],
+    "R3-CAND-018-F2": [
+      "Recovery carries the reviewed corrupt-source digest through the locked save path and rechecks it immediately before publication and inside the publication primitive.",
+      "Stale ordinary snapshots fail with explicit AuthStoreWriteConflictError and cannot erase a recovered store."
+    ],
+    "R3-CAND-018-F3": [
+      "Windows publication uses a native SetFileInformationByHandle rename from a DELETE-capable validated source handle, retains and revalidates the no-reparse parent identity, and rejects source/parent identity mismatch before publication."
+    ],
+    "R3-CAND-018-F4": [
+      "Windows sidecars use exclusive temporary creation and no-replace hard-link publication while a retained parent handle denies delete sharing; collisions and reparse destinations fail closed without overwriting incumbent evidence or leaking redirected copies.",
+      "Sidecar publication verifies final link identity and bytes before reporting preservation success."
+    ]
+  },
+  "changed_paths": [
+    "hermes_cli/auth_store.py",
+    "hermes_cli/auth.py",
+    "agent/credential_pool.py",
+    "tests/hermes_cli/test_auth_store_r3_cand_018_adversarial.py",
+    "artifacts/remediation/r3-cand-018/review-final-correctness.md",
+    "artifacts/remediation/r3-cand-018/review-final-d26a219a-correctness.md",
+    "artifacts/remediation/r3-cand-018/repair-final.json"
+  ],
+  "verification": {
+    "focused_security_matrix": {
+      "command": "python -m pytest -q tests/hermes_cli/test_auth_store_r3_cand_018.py tests/hermes_cli/test_auth_store_r3_cand_018_adversarial.py tests/hermes_cli/test_auth_store_read_failure.py tests/hermes_cli/test_auth_store_windows_encoding.py",
+      "passed": 46,
+      "failed": 0,
+      "exit_code": 0,
+      "interpreter": "C:/Users/andre/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe",
+      "platform": "win32"
+    },
+    "related_auth_provider_selection": {
+      "command": "python -m pytest -q tests/hermes_cli/test_auth_*.py tests/agent/test_credential_pool_oauth_writethrough.py",
+      "passed": 189,
+      "failed": 1,
+      "skipped": 7,
+      "exit_code": 1,
+      "known_baseline_failure": "tests/hermes_cli/test_auth_nous_provider.py::test_shared_store_write_and_read_roundtrip (Windows st_mode reports 0o666; same failure at declared base and prior candidate)"
+    },
+    "compile": "passed: hermes_cli/auth.py hermes_cli/auth_store.py hermes_cli/auth_commands.py agent/credential_pool.py",
+    "windows_footguns": "passed: scripts/check-windows-footguns.py --diff HEAD^",
+    "diff_check": "passed: git diff --check HEAD^ HEAD",
+    "new_deterministic_regressions": [
+      "recovery target mutation after preflight/publication callback",
+      "Windows publication ancestor swap before source open",
+      "Windows sidecar ancestor swap with no redirected publication"
+    ],
+    "focused_seam": "passed: persistence shard ownership and integration tests included in focused matrix",
+    "canonical_full_suite": "not run"
+  },
+  "cleanup": {
+    "verification_scratch": "isolated under C:/TEMP/hermes-redteam-f751a8c5/verify/r3-cand-018-repair3-focused",
+    "harness_only_failed_run_cleaned": true,
+    "product_worktree_after_artifact_commit": "clean"
+  }
+}
