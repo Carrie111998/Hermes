@@ -8484,11 +8484,10 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
 }
 
 // ---------------------------------------------------------------------------
-// Opt-in keychain encryption (secret-storage-policy.ts owns the decision).
-// Default OFF: no safeStorage call is ever made, so a broken/locked macOS
-// login keychain can never throw its password dialog on launch. Settings →
-// Gateway exposes the toggle; flipping it re-encrypts (or decrypts) the
-// stored secrets in place.
+// Keychain-backed secret storage (secret-storage-policy.ts owns the decision).
+// Default ON: new persisted secrets use safeStorage. Settings → Gateway
+// exposes an explicit plaintext escape hatch; flipping it re-encodes stored
+// secrets in place.
 // ---------------------------------------------------------------------------
 const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_POLICY_FILE)
 
@@ -8614,10 +8613,10 @@ function rewriteAllStoredSecrets(shouldRewrite: (secret: any) => boolean, reenco
 }
 
 /**
- * One-shot legacy migration: builds before the opt-in policy wrote every
- * secret as a safeStorage blob. With encryption now defaulting OFF, decrypt
- * each stored blob once and rewrite it as plain so no future launch touches
- * the keychain. Marked `migrated` whether or not every blob decrypts — a
+ * One-shot legacy migration: builds before the policy wrote every secret as a
+ * safeStorage blob. When a user explicitly turns encryption OFF, decrypt each
+ * stored blob once and rewrite it as plain so no future launch touches the
+ * keychain. Marked `migrated` whether or not every blob decrypts — a
  * broken keychain costs at most ONE prompt (this pass), never one per
  * launch; blobs that would not decrypt are left in place and simply read as
  * absent from then on (classifyStoredSecret → 'drop'), so opting encryption
@@ -8713,8 +8712,8 @@ function applySecretStorageEncryption(on: boolean) {
     return { on: true }
   }
 
-  // Turning OFF: decrypt everything back to plain while the keychain is
-  // still readable, then flip the policy.
+  // Turning OFF is an explicit user action: decrypt everything back to plain
+  // while the keychain is still readable, then flip the policy.
   const needsDecrypt = (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
 
   rewriteAllStoredSecrets(needsDecrypt, (secret: any) => {
@@ -14596,7 +14595,7 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
 })
 ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
 
-// ── Opt-in keychain encryption for stored secrets ───────────────────────────
+// ── Keychain-backed encryption for stored secrets ───────────────────────────
 // get returns the current policy without touching safeStorage; set flips it
 // and re-encodes every stored secret (see applySecretStorageEncryption).
 ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePolicy().on }))
@@ -17261,11 +17260,10 @@ app.whenReady().then(() => {
     safeStorageApi: safeStorage
   })
 
-  // Keychain encryption is opt-in (default OFF). One-shot: rewrite any
-  // legacy safeStorage-encrypted secrets as plain so no later launch ever
-  // touches the OS keychain unless the user turns encryption on in
-  // Settings → Gateway. Must run before createWindow() and the first
-  // connection resolution.
+  // Keychain encryption defaults ON. Explicit opt-out migration converts
+  // legacy safeStorage-encrypted secrets to plain once after the user turns
+  // encryption off. Must run before createWindow() and the first connection
+  // resolution.
   migrateLegacyEncryptedSecretsOnce()
 
   if (IS_MAC) {

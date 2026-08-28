@@ -10,20 +10,18 @@
  * or corrupted default keychain, ANY safeStorage touch — including
  * isEncryptionAvailable() — makes macOS throw a blocking "Keychain Not
  * Found" / password dialog on every launch. That is an unacceptable default
- * for a chat app, so keychain-backed encryption is OPT-IN:
+ * for a chat app, so keychain-backed encryption is the safe default:
  *
- *   - Setting OFF (default): secrets are written with encoding 'plain' and
- *     NO safeStorage API is ever called. decryptDesktopSecret already
- *     returns non-safeStorage encodings verbatim, so reads need no change.
- *   - Setting ON: the previous behavior — strict safeStorage encryption,
- *     loud failure when the keychain is unavailable, per-save plain-text
- *     confirm dialog as the escape hatch.
+ *   - Setting ON (default): secrets use strict safeStorage encryption, with
+ *     loud failure when the keychain is unavailable.
+ *   - Setting OFF: plaintext is an explicit, user-confirmed escape hatch;
+ *     safeStorage is not touched while the setting is off.
  *
  * Legacy blobs written before the flag existed are safeStorage-encoded on
- * disk. With the setting OFF we attempt ONE migration pass (decrypt →
- * rewrite as plain). The pass is recorded in the same settings file whether
- * or not it succeeds, so a broken keychain costs at most one prompt on the
- * first post-update launch — never one per launch.
+ * disk. If a user explicitly turns encryption OFF we attempt ONE migration
+ * pass (decrypt → rewrite as plain). The pass is recorded in the same settings
+ * file whether or not it succeeds, so a broken keychain costs at most one
+ * prompt on the first post-update launch — never one per launch.
  *
  * Kept standalone (no `import 'electron'`) so it unit-tests under the
  * electron vitest project, same pattern as native-token-store.ts. main.ts
@@ -46,10 +44,11 @@ export interface SecretStoragePolicyIo {
 
 /**
  * Normalize whatever is on disk into a policy. Anything unreadable,
- * unparseable, or hand-mangled is the default: encryption OFF, migration
- * not yet attempted. `on` uses strict `=== true` — a truthy-but-not-true
- * value must not silently enable keychain prompts (mirrors the
- * allowPlainText coercion rule in hardening.ts).
+ * unparseable, or hand-mangled is the secure default: encryption ON,
+ * migration not yet attempted. A persisted `on: false` is honored only after
+ * the user has explicitly selected the plaintext escape hatch. `on` uses
+ * strict `=== true` — a truthy-but-not-true value must not silently enable
+ * keychain prompts (mirrors the allowPlainText coercion rule in hardening.ts).
  */
 export function readSecretStoragePolicy(io: SecretStoragePolicyIo): SecretStoragePolicy {
   try {
@@ -62,7 +61,7 @@ export function readSecretStoragePolicy(io: SecretStoragePolicyIo): SecretStorag
     // fall through to default
   }
 
-  return { on: false, migrated: false }
+  return { on: true, migrated: false }
 }
 
 export function writeSecretStoragePolicy(policy: SecretStoragePolicy, io: SecretStoragePolicyIo): void {
