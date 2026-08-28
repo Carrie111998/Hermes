@@ -1124,7 +1124,7 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
     """Render the live background-process list for the judge prompt.
 
     Each entry is a ``process_registry.list_sessions()`` dict. Only RUNNING
-    processes are worth showing (an exited one is nothing to wait on). Returns
+    processes are worth showing (a terminal one is nothing to wait on). Returns
     an empty string when there's nothing running, so the judge prompt is
     byte-identical to the no-background case (no behavior change for the
     common path).
@@ -1135,7 +1135,7 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
     for p in background_processes:
         if not isinstance(p, dict):
             continue
-        if p.get("status") == "exited":
+        if p.get("status") != "running":
             continue
         pid = p.get("pid")
         if not pid:
@@ -1306,7 +1306,7 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     """Return the live background-process snapshot for the goal judge.
 
     Thin, fail-safe wrapper over ``process_registry.list_sessions(task_id)``.
-    Returns only RUNNING processes (an exited one is nothing to wait on) and
+    Returns only RUNNING processes (a terminal one is nothing to wait on) and
     never raises — any import/registry failure yields ``[]`` so the goal loop
     degrades to its pre-wait-barrier behavior (judge just won't see processes).
     The drivers (CLI + gateway) call this and pass the result into
@@ -1319,7 +1319,7 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     except Exception as exc:
         logger.debug("gather_background_processes failed: %s", exc)
         return []
-    return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
+    return [s for s in sessions if isinstance(s, dict) and s.get("status") == "running"]
 
 
 def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Optional[GoalContract]:
