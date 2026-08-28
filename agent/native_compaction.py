@@ -291,6 +291,12 @@ def _cache_ownership_document(agent: Any, document: Dict[str, Any]) -> None:
 def _load_ownership_document(agent: Any) -> Dict[str, Any]:
     session_id = str(getattr(agent, "session_id", None) or "")
     document = _ownership_default_document()
+    cached = getattr(agent, "_native_compaction_ownership_cache", None)
+    cached_document = None
+    if isinstance(cached, dict) and cached.get("session_id") == session_id:
+        candidate = cached.get("document")
+        if isinstance(candidate, dict) and isinstance(candidate.get("routes"), dict):
+            cached_document = candidate
     session_db = getattr(agent, "_session_db", None)
     getter = getattr(session_db, "get_session_model_config_value", None)
     if session_id and callable(getter) and not getattr(agent, "_persist_disabled", False):
@@ -300,12 +306,25 @@ def _load_ownership_document(agent: Any) -> Dict[str, Any]:
                 document = persisted
         except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError):
             logger.warning("native ownership metadata read failed", exc_info=True)
-    else:
-        cached = getattr(agent, "_native_compaction_ownership_cache", None)
-        if isinstance(cached, dict) and cached.get("session_id") == session_id:
-            candidate = cached.get("document")
-            if isinstance(candidate, dict) and isinstance(candidate.get("routes"), dict):
-                document = candidate
+    elif cached_document is not None:
+        document = cached_document
+
+    # A failed atomic write leaves the database at an older revision. Local
+    # ownership is one-way, so that older native row must never weaken a
+    # fail-closed transition already observed by this agent.
+    if cached_document is not None:
+        cached_local = {
+            key: dict(state)
+            for key, state in cached_document["routes"].items()
+            if isinstance(state, dict) and state.get("owner") == OWNER_LOCAL
+        }
+        if cached_local:
+            routes = dict(document.get("routes", {}))
+            for key, state in cached_local.items():
+                persisted = routes.get(key)
+                if not isinstance(persisted, dict) or persisted.get("owner") != OWNER_LOCAL:
+                    routes[key] = state
+            document = {**document, "routes": routes}
     _cache_ownership_document(agent, document)
     return document
 
@@ -603,7 +622,17 @@ def suppress_automatic_local_compaction(
         current_tokens = 0
 
     at_boundary = current_tokens >= boundary
-    if state.get("phase") == PHASE_CHECKPOINT_ACCEPTED:
+    compatible_checkpoint_present = bool(
+        _compatible_checkpoint_items(
+            agent,
+            messages,
+            known_digests=state.get("checkpoint_digests", []),
+        )
+    )
+    if (
+        state.get("phase") == PHASE_CHECKPOINT_ACCEPTED
+        and compatible_checkpoint_present
+    ):
         episode_start = state.get("episode_start_tokens")
         checkpoint_generation = state.get("checkpoint_generation")
         if (

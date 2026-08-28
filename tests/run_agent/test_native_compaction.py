@@ -7,17 +7,24 @@ structured rejection — hence the hard model-family gate these tests pin.
 """
 
 import hashlib
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
 from agent.native_compaction import (
     DEFAULT_COMPACT_THRESHOLD,
+    OWNER_LOCAL,
+    begin_native_compaction_request,
     is_direct_openai_route,
     is_native_compaction_model,
     is_native_compaction_rejection,
     native_compaction_context_management,
+    native_compaction_ownership,
+    observe_native_compaction_response,
     resolve_compact_threshold,
+    suppress_automatic_local_compaction,
+    transition_native_compaction_to_local,
 )
 
 
@@ -41,6 +48,25 @@ def _agent(
 
 def _known_checkpoint_digest(encrypted: str) -> list[str]:
     return [hashlib.sha256(encrypted.encode("utf-8")).hexdigest()]
+
+
+def _ownership_agent(session_db, *, session_id="native-ownership-test"):
+    return SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-api",
+        model="gpt-5.6",
+        base_url="https://api.openai.com/v1",
+        codex_responses_native_compaction=True,
+        compression_enabled=True,
+        compression_checkpoint_required=False,
+        context_compressor=SimpleNamespace(
+            context_length=100_000,
+            threshold_tokens=20_000,
+        ),
+        session_id=session_id,
+        _session_db=session_db,
+        _persist_disabled=False,
+    )
 
 
 class TestModelGate:
@@ -390,6 +416,67 @@ class TestResponseCapture:
 
 
 class TestNativePrimaryOwnershipRegression:
+    def test_failed_local_transition_cannot_resurrect_native_ownership(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        session_id = "locked-local-transition"
+        session_db = SessionDB(tmp_path / "state.db")
+        session_db.create_session(session_id, "test")
+        agent = _ownership_agent(session_db, session_id=session_id)
+
+        def locked_mutation(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(
+            session_db,
+            "mutate_session_model_config_value",
+            locked_mutation,
+        )
+
+        transitioned = transition_native_compaction_to_local(
+            agent, "structured_rejection"
+        )
+        observed_next_request = native_compaction_ownership(agent, [])
+
+        assert transitioned["owner"] == OWNER_LOCAL
+        assert observed_next_request["owner"] == OWNER_LOCAL
+
+    def test_hard_boundary_without_compatible_checkpoint_transfers_local(
+        self, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        session_id = "checkpoint-missing-at-hard-boundary"
+        session_db = SessionDB(tmp_path / "state.db")
+        session_db.create_session(session_id, "test")
+        agent = _ownership_agent(session_db, session_id=session_id)
+        generation = begin_native_compaction_request(agent, request_tokens=90_000)
+        observe_native_compaction_response(
+            agent,
+            {
+                "output": [
+                    {
+                        "type": "compaction",
+                        "encrypted_content": "checkpoint-no-longer-in-history",
+                    }
+                ]
+            },
+            request_generation=generation,
+        )
+
+        suppressed = suppress_automatic_local_compaction(
+            agent,
+            messages=[],
+            approx_tokens=100_000,
+        )
+        observed_next_request = native_compaction_ownership(agent, [])
+
+        assert suppressed is False
+        assert observed_next_request["owner"] == OWNER_LOCAL
+        assert observed_next_request["reason"] == "hard_emergency_no_checkpoint"
+
     def test_accepted_checkpoint_keeps_local_automatic_compression_out_of_episode(
         self, monkeypatch, tmp_path
     ):
