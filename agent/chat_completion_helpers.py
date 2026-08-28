@@ -3281,6 +3281,48 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             logger.warning("Failed to cleanup browser for task %s: %s", task_id, e)
 
 
+def _append_streamed_reasoning_detail(details_acc: list, detail) -> None:
+    """Accumulate one streamed ``reasoning_details`` delta entry.
+
+    OpenRouter streams ``reasoning_details`` as deltas: consecutive
+    ``reasoning.text`` / ``reasoning.summary`` entries are fragments of ONE
+    logical block and must be merged, while encrypted/opaque entries stay
+    discrete. Without merging, a long thought becomes hundreds of one-word
+    entries — bloating the replayed signature payload and breaking providers
+    that validate the reasoning_details sequence shape on the next turn.
+    (Ported from earendil-works/pi#8605 / commit c5ad7c1b0.)
+
+    ``detail`` may be a dict or an SDK object; it is normalized to a dict.
+    """
+    if not isinstance(detail, dict):
+        if hasattr(detail, "model_dump"):
+            try:
+                detail = detail.model_dump(warnings=False)
+            except TypeError:
+                detail = detail.model_dump()
+        elif hasattr(detail, "__dict__"):
+            detail = dict(detail.__dict__)
+        else:
+            return
+    dtype = detail.get("type")
+    last = details_acc[-1] if details_acc else None
+    if last is not None and dtype and dtype == last.get("type"):
+        merge_key = None
+        if dtype == "reasoning.text":
+            merge_key = "text"
+        elif dtype == "reasoning.summary":
+            merge_key = "summary"
+        if merge_key is not None and isinstance(detail.get(merge_key), str):
+            last[merge_key] = (last.get(merge_key) or "") + detail[merge_key]
+            # Later fragments may carry fields the first one omitted
+            # (signature arrives on the final fragment for some providers).
+            for k in ("signature", "id", "format", "index"):
+                if last.get(k) in (None, "") and detail.get(k) not in (None, ""):
+                    last[k] = detail[k]
+            return
+    details_acc.append(dict(detail))
+
+
 def _build_partial_stream_stub(
     role, full_content, full_reasoning, model_name, usage_obj, *,
     dropped_tool_names=None,
@@ -3938,6 +3980,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         model_name = None
         role = "assistant"
         reasoning_parts: list = []
+        # Streamed reasoning_details delta entries (OpenRouter unified
+        # format), merged per logical block by
+        # _append_streamed_reasoning_detail. Previously the streaming path
+        # dropped these entirely — only non-streaming responses preserved
+        # reasoning_details for replay continuity (pi#8605 class).
+        reasoning_details_acc: list = []
         usage_obj = None
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -4183,6 +4231,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
+
+            # Accumulate structured reasoning_details deltas (OpenRouter
+            # unified format). These carry provider replay data (signatures,
+            # encrypted blocks) that must survive streaming for multi-turn
+            # reasoning continuity; consecutive text/summary fragments merge
+            # into logical entries (pi#8605).
+            _rd_delta = getattr(delta, "reasoning_details", None)
+            if _rd_delta is None and hasattr(delta, "model_extra"):
+                _me = getattr(delta, "model_extra", None) or {}
+                if isinstance(_me, dict):
+                    _rd_delta = _me.get("reasoning_details")
+            if _rd_delta and isinstance(_rd_delta, (list, tuple)):
+                for _rd in _rd_delta:
+                    try:
+                        _append_streamed_reasoning_detail(reasoning_details_acc, _rd)
+                    except Exception:
+                        logger.debug(
+                            "Failed to accumulate streamed reasoning_details entry",
+                            exc_info=True,
+                        )
 
             # Accumulate text content — fire callback only when no tool calls
             delta_content = getattr(delta, "content", None)
@@ -4494,6 +4562,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             tool_calls=mock_tool_calls,
             reasoning_content=full_reasoning,
         )
+        if reasoning_details_acc:
+            # Preserved for _build_assistant_message's reasoning_details
+            # passthrough — replay continuity for OpenRouter/Anthropic signed
+            # or encrypted reasoning blocks (pi#8605). Only set when present
+            # so non-reasoning providers keep the attribute absent.
+            mock_message.reasoning_details = reasoning_details_acc
         mock_choice = SimpleNamespace(
             index=0,
             message=mock_message,
