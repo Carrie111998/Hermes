@@ -1178,6 +1178,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    global_policy_block: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -1197,13 +1198,14 @@ def _build_child_system_prompt(
     # Focused children deliberately skip profile memory and identity, but the
     # machine-wide operating policy must still apply. Use the same canonical
     # loader as main-agent prompt assembly; never copy policy text here.
-    try:
-        from tools.memory_tool import load_global_policy_block
+    if global_policy_block is None:
+        try:
+            from tools.memory_tool import load_global_policy_block
 
-        global_policy_block = load_global_policy_block()
-    except Exception:
-        logger.debug("subagent: global policy load failed", exc_info=True)
-        global_policy_block = ""
+            global_policy_block = load_global_policy_block()
+        except Exception:
+            logger.debug("subagent: global policy load failed", exc_info=True)
+            global_policy_block = ""
     if global_policy_block.strip():
         parts.append("\n" + global_policy_block.strip())
     if workspace_path and str(workspace_path).strip():
@@ -1740,6 +1742,9 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    parent_global_policy = getattr(parent_agent, "_global_policy_snapshot", None)
+    if not isinstance(parent_global_policy, str):
+        parent_global_policy = None
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1747,6 +1752,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        global_policy_block=parent_global_policy,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1995,6 +2001,7 @@ def _build_child_agent(
                 platform="subagent",
                 skip_context_files=True,
                 skip_memory=True,
+                global_policy_snapshot=parent_global_policy,
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,

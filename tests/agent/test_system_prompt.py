@@ -18,6 +18,7 @@ def _make_agent(**overrides):
         _environment_probe=False,
         _kanban_worker_guidance="",
         _memory_store=None,
+        _global_policy_snapshot="",
         _memory_enabled=True,
         _user_profile_enabled=True,
         _memory_manager=None,
@@ -96,6 +97,25 @@ def _init_code_repo(path):
 
 
 class TestGlobalPolicyPrompt:
+    def test_global_policy_is_injected_without_personal_memory_store(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        with patch(
+            "tools.memory_tool.load_global_policy_block",
+            return_value="GLOBAL POLICY (shared across all Hermes profiles)\nShared rule",
+        ):
+            parts = _prompt_parts(
+                _make_agent(
+                    _memory_store=None,
+                    _global_policy_snapshot=(
+                        "GLOBAL POLICY (shared across all Hermes profiles)\nShared rule"
+                    ),
+                    _memory_enabled=False,
+                    _user_profile_enabled=False,
+                )
+            )
+        assert "GLOBAL POLICY (shared across all Hermes profiles)" in parts["volatile"]
+        assert "Shared rule" in parts["volatile"]
+
     def test_global_policy_block_is_injected(self, monkeypatch):
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
@@ -105,7 +125,14 @@ class TestGlobalPolicyPrompt:
                     return "GLOBAL POLICY (shared across all Hermes profiles)\nShared rule"
                 return None
 
-        parts = _prompt_parts(_make_agent(_memory_store=Store()))
+        parts = _prompt_parts(
+            _make_agent(
+                _memory_store=Store(),
+                _global_policy_snapshot=(
+                    "GLOBAL POLICY (shared across all Hermes profiles)\nShared rule"
+                ),
+            )
+        )
         assert "GLOBAL POLICY (shared across all Hermes profiles)" in parts["volatile"]
         assert "Shared rule" in parts["volatile"]
 
