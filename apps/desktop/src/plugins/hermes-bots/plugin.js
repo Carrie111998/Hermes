@@ -998,8 +998,12 @@ function mergeGroupChatSyncSnapshots(
       identity = remoteRoom
       members = [...(remoteRoom?.members || [])]
       image = remoteRoom?.image
-      failedMembers = boundedGroupMemberFlags(remoteRoom?.failedMembers)
-      unackedFailures = boundedGroupMemberFlags(remoteRoom?.unackedFailures)
+      failedMembers = Object.prototype.hasOwnProperty.call(remoteRoom || {}, 'failedMembers')
+        ? boundedGroupMemberFlags(remoteRoom?.failedMembers)
+        : boundedGroupMemberFlags(localRoom?.failedMembers)
+      unackedFailures = Object.prototype.hasOwnProperty.call(remoteRoom || {}, 'unackedFailures')
+        ? boundedGroupMemberFlags(remoteRoom?.unackedFailures)
+        : boundedGroupMemberFlags(localRoom?.unackedFailures)
     } else {
       identity = localRoom || remoteRoom
       const byId = new Map()
@@ -1184,8 +1188,16 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
       sessions: existing.sessions && typeof existing.sessions === 'object' ? existing.sessions : {},
       stranded: existing.stranded && typeof existing.stranded === 'object' ? existing.stranded : {},
       members: [...members.values()],
-      failedMembers: boundedGroupMemberFlags(stateSource?.failedMembers),
-      unackedFailures: boundedGroupMemberFlags(stateSource?.unackedFailures),
+      failedMembers: boundedGroupMemberFlags(
+        !isPreserved && remoteRevision >= localRevision && !Object.prototype.hasOwnProperty.call(projected, 'failedMembers')
+          ? existing.failedMembers
+          : stateSource?.failedMembers
+      ),
+      unackedFailures: boundedGroupMemberFlags(
+        !isPreserved && remoteRevision >= localRevision && !Object.prototype.hasOwnProperty.call(projected, 'unackedFailures')
+          ? existing.unackedFailures
+          : stateSource?.unackedFailures
+      ),
       ...(projectedRoomId || existing.roomId ? { roomId: existing.roomId || projectedRoomId } : {}),
       image: isPreserved
         ? existing.image || null
@@ -7115,7 +7127,7 @@ function resolveGroupResponders(log, members) {
   let everyone = false
 
   for (const entry of sinceLastUser) {
-    if (entry?.from?.kind === 'system' || entry?.routing === 'none') {
+    if (entry?.from?.kind === 'system' || entry?.routing === 'none' || entry?.code === 'member_turn_failed') {
       continue
     }
 
@@ -8395,8 +8407,8 @@ function unaddressedGroupMentions(group, members, thread) {
     const parsed = parseGroupChatMentions(entry.text || '', members)
 
     // A user send re-drives everyone anyway; only member-to-member handoffs
-    // can strand here.
-    if (entry.from.kind !== 'member') {
+    // can strand here. Failure notices are not citations.
+    if (entry.from.kind !== 'member' || entry?.routing === 'none' || entry?.code === 'member_turn_failed') {
       continue
     }
 

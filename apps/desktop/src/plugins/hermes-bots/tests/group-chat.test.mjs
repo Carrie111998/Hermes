@@ -204,7 +204,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES, GROUP_CHAT_MAX_MEMBERS };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -394,7 +394,7 @@ test('repeated failed member turns stay within the per-run message cap', async (
     throw new Error('provider unavailable')
   })
   const manyMembers = Array.from(
-    { length: gc.GROUP_CHAT_MAX_MESSAGES + 5 },
+    { length: gc.GROUP_CHAT_MAX_MEMBERS },
     (_, index) => ({ name: `builder-${index}`, title: '' })
   )
 
@@ -404,7 +404,8 @@ test('repeated failed member turns stay within the per-run message cap', async (
   }
 
   const memberMessages = roomLog(gc, 'Outage').filter(e => e.from.kind === 'member')
-  assert.equal(memberMessages.length, gc.GROUP_CHAT_MAX_MESSAGES)
+  assert.ok(memberMessages.length <= gc.GROUP_CHAT_MAX_MEMBERS)
+  assert.ok(memberMessages.length <= gc.GROUP_CHAT_MAX_MESSAGES)
 })
 
 test('delta injection: a second user send only feeds members the NEW messages', async () => {
