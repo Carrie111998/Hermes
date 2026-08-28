@@ -19,3 +19,10 @@ def test_skips_terminal_cwd_if_workspace_missing():
     out = pin_worker_cwd_env(env, ws)
     assert out["HERMES_KANBAN_WORKSPACE"] == ws
     assert out["TERMINAL_CWD"] == "/old"
+
+
+def test_kanban_db_imports_pin_helper():
+    import inspect
+    from hermes_cli import kanban_db
+    src = inspect.getsource(kanban_db)
+    assert "pin_worker_cwd_env" in src

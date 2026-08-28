@@ -11154,6 +11154,7 @@ def _default_spawn(
     
     # Build the spawn packet using the full prompt builder (not the four-word stub).
     from hermes_cli.kanban_worker_prompt import build_worker_spawn_prompt
+    from hermes_cli.kanban_worker_env import pin_worker_cwd_env
     prompt = build_worker_spawn_prompt(
         task.id,
         body=task.body,
@@ -11165,7 +11166,6 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
-    env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -11186,8 +11186,7 @@ def _default_spawn(
     # Only pin a real, absolute directory — file_tools rejects relative /
     # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
     # here (leave the inherited value rather than write a meaningless one).
-    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
-        env["TERMINAL_CWD"] = workspace
+    pin_worker_cwd_env(env, workspace)
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
@@ -11368,6 +11367,51 @@ def _default_spawn(
         except Exception as e:
             # Never let shadow-capture failures block dispatch
             _log.debug(f"shadow_capture write failed for task {task.id}: {e}")
+    # Record route economics for cactus routing signal (record-only, does not affect model pick)
+    if True:  # Always attempt to record, even if needle is down
+        try:
+            # NOTE: do NOT `import sys` here. `sys` is imported at module level
+            # (line ~83) and used earlier in this same function (sys.executable
+            # in the free-model wrapper cmd). A function-local import would make
+            # `sys` a local name for the WHOLE function body, turning that
+            # earlier use into UnboundLocalError and breaking every dispatch.
+            sys.path.insert(0, str(Path.home() / ".hermes" / "workspace" / "infra"))
+            import pick_lane
+            # Open connection to the board's kanban.db for recording
+            db_path = kanban_db_path(board=board)
+            conn = sqlite3.connect(db_path.resolve().as_uri(), uri=True)
+            try:
+                cactus_verdict = "skip"  # Default: no route economics if engine is down
+                if pick_lane.needle_engine_up():
+                    # Call engine for verdict (record-only, does not change _resolved_model)
+                    try:
+                        verdict_result = pick_lane.call_engine(
+                            card_id=task.id,
+                            card_title=task.title,
+                            card_body=task.body,
+                            expected_route="free" if _is_free_routed else "default",
+                        )
+                        if verdict_result and "verdict" in verdict_result:
+                            cactus_verdict = verdict_result["verdict"]
+                    except Exception as e:
+                        _log.debug(f"pick_lane.call_engine failed for task {task.id}: {e}")
+                        cactus_verdict = "skip"
+                # Record route_economics to task_events
+                record_route_economics(
+                    conn,
+                    task.id,
+                    expected_route="free" if _is_free_routed else "default",
+                    actual_route=_resolved_model or task.model_override or "default",
+                    free_attempted=_is_free_routed,
+                    fallback_used=False,
+                    paid_seat_consumed=(not _is_free_routed) or False,
+                    cactus_verdict=cactus_verdict,
+                )
+            finally:
+                conn.close()
+        except Exception as e:
+            # Never let route_economics recording block dispatch
+            _log.debug(f"route_economics write failed for task {task.id}: {e}")
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
