@@ -1,17 +1,34 @@
 """The desktop can render more than the model is told — this makes that fail.
 
 Mermaid diagrams rendered in the transcript for as long as
-``embeds/registry.tsx`` has existed. The desktop platform hint never mentioned
-them, so the model never emitted one: asked for a flow it wrote prose steps, or
-built an HTML file and a ``::preview`` directive, because those were the only
-rendering paths it had been told about. The capability was not missing. The
-sentence describing it was.
+``embeds/registry.tsx`` has existed, and the desktop platform hint never
+mentioned them. The capability was not missing. The sentence describing it
+was — and without that sentence the model had no way to know a diagram would
+survive the trip, so on anything short of an explicit "draw me X" it answered
+in prose.
 
 That gap is invisible to every other test in the repo: the renderer has its own
 tests and passes, the prompt has its own tests and passes, and nothing compares
 them. So these tests read the renderer's own source and assert the hint names
 what it can do. A new fence language, or a new artifact kind, fails here until
 someone writes the sentence.
+
+Measured, 2026-08-28 (claude-sonnet-4, temperature 0, same question per arm,
+the hint as the only variable):
+
+  asked EXPLICITLY to draw ("show me the flow of ..."):
+      without the hint 2/2 drew, with it 2/2 drew — no effect. The model
+      already reaches for mermaid when the request names a diagram, so the
+      original claim that it "never emitted one" was too strong.
+
+  asked to EXPLAIN, where drawing is a judgement call
+  ("explain how our OAuth login works", "what states does a job move
+  through"), in English and Arabic:
+      without the hint 0/4 drew.  With it, 4/4.
+
+That second row is what this guard protects: the hint does not teach the model
+mermaid syntax, it tells it the surface will render one — which is the fact it
+needs to choose a diagram over a paragraph.
 """
 
 import re
