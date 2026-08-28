@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -70,6 +72,70 @@ def test_store_is_private_atomic_deduplicated_and_upload_idempotent(tmp_path):
         assert store.blob_root.stat().st_mode & 0o777 == 0o700
         blob = next(path for path in store.blob_root.iterdir() if path.name.startswith("blob_"))
         assert blob.stat().st_mode & 0o777 == 0o600
+    assert not list(store.blob_root.glob(".tmp-*"))
+
+
+def test_concurrent_upload_retries_are_idempotent_and_physically_deduplicated(tmp_path):
+    store = HostedRoomAttachmentStore(tmp_path / "state.db")
+    workers = 16
+    gate = threading.Barrier(workers)
+
+    def put(index):
+        gate.wait()
+        return _put(store, upload_id=f"upload-{index}")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(put, range(workers)))
+
+    assert len({item["attachment_id"] for item in results}) == workers
+    assert store.stats() == {
+        "attachments": workers,
+        "logical_bytes": len(PNG) * workers,
+        "blobs": 1,
+        "physical_bytes": len(PNG),
+    }
+    assert not list(store.blob_root.glob(".tmp-*"))
+
+    retry_gate = threading.Barrier(workers)
+
+    def retry(_index):
+        retry_gate.wait()
+        return _put(store, upload_id="shared-retry")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        retried = list(pool.map(retry, range(workers)))
+
+    assert len({item["attachment_id"] for item in retried}) == 1
+    assert sum(item["idempotent"] is False for item in retried) == 1
+    assert sum(item["idempotent"] is True for item in retried) == workers - 1
+
+
+def test_concurrent_conflicting_retry_has_one_winner_and_no_partial_blob(tmp_path):
+    store = HostedRoomAttachmentStore(tmp_path / "state.db")
+    workers = 12
+    gate = threading.Barrier(workers)
+    payloads = [PNG, PNG + b"other"] * (workers // 2)
+
+    def put(data):
+        gate.wait()
+        try:
+            return ("ok", _put(store, upload_id="shared-conflict", data=data), data)
+        except AttachmentConflictError:
+            return ("conflict", None, data)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(put, payloads))
+
+    accepted = [item for item in results if item[0] == "ok"]
+    rejected = [item for item in results if item[0] == "conflict"]
+    winning_payloads = {item[2] for item in accepted}
+
+    assert len(winning_payloads) == 1
+    assert len(accepted) == workers // 2
+    assert len(rejected) == workers // 2
+    assert len({item[1]["attachment_id"] for item in accepted}) == 1
+    assert store.stats()["attachments"] == 1
+    assert store.stats()["blobs"] == 1
     assert not list(store.blob_root.glob(".tmp-*"))
 
 
