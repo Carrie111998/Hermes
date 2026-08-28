@@ -14,7 +14,7 @@
  * path, matching how run-tour.ts treats the driver bundle.
  */
 
-import { pinEngineSource, type PinCommand } from '@/lib/preview-pins/pin-in-page'
+import { type PinCommand, pinEngineSource } from '@/lib/preview-pins/pin-in-page'
 import type { PinEngineReport, PreviewPin } from '@/lib/preview-pins/types'
 
 import { activePreviewScriptRunner } from './preview-script-runner'
@@ -54,6 +54,7 @@ function buildScript(command: PinCommand, seed: PreviewPin[] | null): string {
 
 async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
+
   try {
     return await Promise.race([
       work,
@@ -62,7 +63,7 @@ async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
       })
     ])
   } finally {
-    if (timer) clearTimeout(timer)
+    if (timer) {clearTimeout(timer)}
   }
 }
 
@@ -75,7 +76,8 @@ async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
  */
 export async function pinVerb(command: PinCommand, seed: PreviewPin[] | null = null): Promise<PinEngineReport | null> {
   const run = activePreviewScriptRunner()
-  if (!run) return null
+
+  if (!run) {return null}
 
   try {
     const report = (await withTimeout(
@@ -83,7 +85,8 @@ export async function pinVerb(command: PinCommand, seed: PreviewPin[] | null = n
       command.verb
     )) as PinEngineReport | undefined
 
-    if (!report || !Array.isArray(report.pins)) return null
+    if (!report || !Array.isArray(report.pins)) {return null}
+
     return report
   } catch {
     // A verb that failed is not worth tearing the panel down over: the page may

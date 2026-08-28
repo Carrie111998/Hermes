@@ -15,6 +15,7 @@ import { ANCHOR_MIN_CONFIDENCE, anchorKit } from './anchor'
 /** Replace the document body, the way a reload or a re-render does. */
 function render(html: string) {
   document.body.innerHTML = html
+
   return anchorKit(document)
 }
 
@@ -106,6 +107,7 @@ describe('resolve — the page came back', () => {
     const grown = render(
       '<ul id="l"><li><button>Edit</button></li><li><button>Edit</button></li><li><button>Edit</button></li></ul>'
     )
+
     const match = grown.resolve(anchor)
 
     // Ambiguous by label, so the ordinal decides — the same rung the user's
@@ -194,6 +196,7 @@ describe('self-containment', () => {
     // execute" — so assert the shape that prevents it.
     const source = anchorKit.toString()
     expect(source.startsWith('function anchorKit')).toBe(true)
+
     for (const external of ['ANCHOR_MIN_CONFIDENCE', 'import(', 'require(']) {
       expect(source.includes(external)).toBe(false)
     }
@@ -201,7 +204,7 @@ describe('self-containment', () => {
 
   it('is a live function once round-tripped through a string', () => {
     render('<button id="save">Save</button>')
-    // eslint-disable-next-line no-eval
+     
     const rebuilt = eval(`(${anchorKit.toString()})`)(document)
     const anchor = rebuilt.capture(document.querySelector('#save'))
     expect(rebuilt.resolve(anchor).confidence).toBe(1)

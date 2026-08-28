@@ -25,13 +25,16 @@ function describeTarget(pin: PreviewPin): string {
   if (pin.kind === 'region' && pin.region) {
     return `region at ${percent(pin.region.x)},${percent(pin.region.y)} sized ${percent(pin.region.w)}×${percent(pin.region.h)}`
   }
+
   const anchor = pin.anchor
-  if (!anchor) return pin.target || 'unknown target'
+
+  if (!anchor) {return pin.target || 'unknown target'}
   const name = anchor.label ? `${anchor.role} "${anchor.label}"` : anchor.role
   // The selector is what the agent will actually grep for, so it goes in when
   // the page offered one. The path is the fallback and is noisier, so it only
   // appears when there is no selector.
   const where = anchor.selector || anchor.path
+
   return where ? `${name} — ${where}` : name
 }
 
@@ -48,18 +51,22 @@ function describeTarget(pin: PreviewPin): string {
  */
 export function pinCommentBlock(detail: string): null | string {
   let pins: PreviewPin[]
+
   try {
     const parsed = JSON.parse(detail)
     pins = Array.isArray(parsed) ? parsed : parsed?.pins
-    if (!Array.isArray(pins)) return null
+
+    if (!Array.isArray(pins)) {return null}
   } catch {
     return null
   }
 
   const open = pins.filter(pin => pin && !pin.resolved)
-  if (!open.length) return null
+
+  if (!open.length) {return null}
 
   const url = open.find(pin => pin.pageUrl)?.pageUrl ?? ''
+
   const lines = open
     .slice()
     .sort((a, b) => a.createdAt - b.createdAt)
@@ -70,6 +77,7 @@ export function pinCommentBlock(detail: string): null | string {
       // resolves.
       const stale = pin.orphaned ? '\n   (this element is no longer on the page — locate it by description)' : ''
       const comment = (pin.comment || '').trim()
+
       return `${head}${stale}\n   ${comment || '(no comment)'}`
     })
 
@@ -79,5 +87,6 @@ export function pinCommentBlock(detail: string): null | string {
 /** Chip label: "3 comments" reads better than a truncated first comment. */
 export function pinAttachmentLabel(pins: PreviewPin[]): string {
   const open = pins.filter(pin => pin && !pin.resolved).length
+
   return open === 1 ? '1 comment' : `${open} comments`
 }

@@ -53,6 +53,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     pins: [],
     seq: 0
   }
+
   holder[STATE_KEY] = state
 
   const pins = state.pins as Record<string, unknown>[]
@@ -63,7 +64,8 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
   const host = () => {
     let node = doc.getElementById(HOST_ID) as HTMLElement | null
-    if (node && node.shadowRoot) return node
+
+    if (node && node.shadowRoot) {return node}
     node = doc.createElement('div')
     node.id = HOST_ID
     // Fixed and non-interactive by default: the overlay must not eat clicks
@@ -96,19 +98,21 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     ].join('')
     root.append(style)
     doc.body.append(node)
+
     return node
   }
 
   const shadow = () => host().shadowRoot as ShadowRoot
 
   const clearLayer = (selector: string) => {
-    for (const node of Array.from(shadow().querySelectorAll(selector))) node.remove()
+    for (const node of Array.from(shadow().querySelectorAll(selector))) {node.remove()}
   }
 
   const fractionToBox = (rect: { h: number; w: number; x: number; y: number }) => {
     const view = doc.defaultView
     const width = Math.max(1, doc.documentElement.scrollWidth)
     const height = Math.max(1, doc.documentElement.scrollHeight)
+
     return {
       height: rect.h * height,
       left: rect.x * width - (view ? view.scrollX : 0),
@@ -128,8 +132,10 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       marker.dataset.pin = String(pin.id)
 
       let box: { height: number; left: number; top: number; width: number } | null = null
+
       if (pin.kind === 'element' && pin.anchor) {
         const match = kit.resolve(pin.anchor as never)
+
         if (match.element) {
           const live = match.element.getBoundingClientRect()
           box = { height: live.height, left: live.left, top: live.top, width: live.width }
@@ -137,11 +143,13 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       } else if (pin.region) {
         box = fractionToBox(pin.region as never)
       }
+
       if (!box) {
         // An orphan has nowhere to sit. Keeping it off-screen rather than at
         // 0,0 avoids a pile of grey markers in the corner that look like a bug.
         return
       }
+
       marker.style.left = box.left + 'px'
       marker.style.top = box.top + 'px'
       root.append(marker)
@@ -153,7 +161,8 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   const openBubble = (pinId: string, left: number, top: number) => {
     closeBubble()
     const pin = pins.find(entry => entry.id === pinId)
-    if (!pin) return
+
+    if (!pin) {return}
     const view = doc.defaultView
     const bubble = doc.createElement('div')
     bubble.className = 'bubble'
@@ -183,10 +192,12 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     drop.addEventListener('click', event => {
       event.stopPropagation()
       const index = pins.findIndex(entry => entry.id === pinId)
-      if (index !== -1) pins.splice(index, 1)
+
+      if (index !== -1) {pins.splice(index, 1)}
       closeBubble()
       paint()
     })
+
     // Typing in the page must not reach the page. A review comment containing
     // "d" should not trigger the app's own keyboard shortcut for it.
     for (const type of ['keydown', 'keyup', 'keypress']) {
@@ -205,12 +216,15 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     // The host is pointer-events:none at the root, but a marker inside it is
     // not, so ask the page what is under the cursor with the host discounted.
     const found = doc.elementFromPoint(x, y)
-    if (!found || found.id === HOST_ID) return null
+
+    if (!found || found.id === HOST_ID) {return null}
+
     return found
   }
 
   const onMove = (event: MouseEvent) => {
-    if (!state.armed) return
+    if (!state.armed) {return}
+
     if (state.drag) {
       const drag = state.drag as { x0: number; y0: number }
       clearLayer('.box')
@@ -221,11 +235,14 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       box.style.width = Math.abs(event.clientX - drag.x0) + 'px'
       box.style.height = Math.abs(event.clientY - drag.y0) + 'px'
       shadow().append(box)
+
       return
     }
+
     clearLayer('.hl')
     const el = targetAt(event.clientX, event.clientY)
-    if (!el) return
+
+    if (!el) {return}
     const rect = el.getBoundingClientRect()
     const highlight = doc.createElement('div')
     highlight.className = 'hl'
@@ -237,7 +254,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   }
 
   const onDown = (event: MouseEvent) => {
-    if (!state.armed) return
+    if (!state.armed) {return}
     state.drag = { x0: event.clientX, y0: event.clientY }
   }
 
@@ -248,15 +265,17 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     entry.resolved = false
     entry.pageUrl = doc.location ? doc.location.href : ''
     pins.push(entry)
+
     return entry.id as string
   }
 
   const onUp = (event: MouseEvent) => {
-    if (!state.armed) return
+    if (!state.armed) {return}
     const drag = state.drag as { x0: number; y0: number } | null
     state.drag = null
     clearLayer('.box')
-    if (!drag) return
+
+    if (!drag) {return}
 
     // Suppress the page's own click. Annotation mode is a review overlay, not a
     // way to accidentally submit the form you are commenting on.
@@ -270,6 +289,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     const height = Math.max(1, doc.documentElement.scrollHeight)
 
     let id: string
+
     if (dx > 6 || dy > 6) {
       // A drag: a region, for images, charts and canvases where no node means
       // what the user is pointing at.
@@ -283,7 +303,8 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       })
     } else {
       const el = targetAt(event.clientX, event.clientY)
-      if (!el) return
+
+      if (!el) {return}
       const anchor = kit.capture(el)
       id = addPin({
         anchor,
@@ -301,15 +322,16 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
   const onKey = (event: KeyboardEvent) => {
     if (event.key === 'Escape' && state.armed) {
-      if (shadow().querySelector('.bubble')) closeBubble()
-      else disarm()
+      if (shadow().querySelector('.bubble')) {closeBubble()}
+      else {disarm()}
     }
   }
 
   const onPinClick = (event: MouseEvent) => {
     const target = event.target as HTMLElement | null
     const id = target && target.dataset ? target.dataset.pin : null
-    if (!id) return
+
+    if (!id) {return}
     event.preventDefault()
     event.stopPropagation()
     openBubble(id, event.clientX + 14, event.clientY + 14)
@@ -318,7 +340,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   const onScroll = () => paint()
 
   const arm = () => {
-    if (state.armed) return
+    if (state.armed) {return}
     state.armed = true
     host().setAttribute(
       'style',
@@ -331,31 +353,36 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     doc.addEventListener('mouseup', onUp, true)
     doc.addEventListener('keydown', onKey, true)
     const view = doc.defaultView
+
     if (view) {
       view.addEventListener('scroll', onScroll, true)
       view.addEventListener('resize', onScroll, true)
     }
+
     state.handlers = { onDown, onKey, onMove, onScroll, onUp }
     paint()
   }
 
   const disarm = () => {
-    if (!state.armed) return
+    if (!state.armed) {return}
     state.armed = false
     state.drag = null
     doc.documentElement.style.cursor = ''
     const handlers = state.handlers as Record<string, EventListener> | undefined
+
     if (handlers) {
       doc.removeEventListener('mousemove', handlers.onMove, true)
       doc.removeEventListener('mousedown', handlers.onDown, true)
       doc.removeEventListener('mouseup', handlers.onUp, true)
       doc.removeEventListener('keydown', handlers.onKey, true)
       const view = doc.defaultView
+
       if (view) {
         view.removeEventListener('scroll', handlers.onScroll, true)
         view.removeEventListener('resize', handlers.onScroll, true)
       }
     }
+
     clearLayer('.hl')
     clearLayer('.box')
     closeBubble()
@@ -371,16 +398,18 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
    */
   const reattach = () => {
     for (const pin of pins) {
-      if (pin.kind !== 'element' || !pin.anchor) continue
+      if (pin.kind !== 'element' || !pin.anchor) {continue}
       const match = kit.resolve(pin.anchor as never)
       pin.orphaned = !match.element
       pin.matchedBy = match.how
+
       if (match.element) {
         // Re-capture from the element we just found, so the anchor tracks the
         // page forward instead of decaying against the version it was placed on.
         pin.anchor = kit.capture(match.element)
       }
     }
+
     paint()
   }
 
@@ -394,36 +423,53 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   switch (command.verb) {
     case 'arm':
       arm()
+
       break
+
     case 'disarm':
       disarm()
+
       break
+
     case 'reattach':
       reattach()
+
       break
     case 'comment': {
       const pin = pins.find(entry => entry.id === command.id)
-      if (pin) pin.comment = String(command.comment ?? '')
+
+      if (pin) {pin.comment = String(command.comment ?? '')}
+
       break
     }
+
     case 'resolve': {
       const pin = pins.find(entry => entry.id === command.id)
-      if (pin) pin.resolved = !pin.resolved
+
+      if (pin) {pin.resolved = !pin.resolved}
       paint()
+
       break
     }
+
     case 'remove': {
       const index = pins.findIndex(entry => entry.id === command.id)
-      if (index !== -1) pins.splice(index, 1)
+
+      if (index !== -1) {pins.splice(index, 1)}
       paint()
+
       break
     }
+
     case 'clear':
       pins.splice(0, pins.length)
       closeBubble()
       paint()
+
       break
+
     case 'state':
+
     default:
       break
   }

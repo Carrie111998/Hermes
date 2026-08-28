@@ -7,7 +7,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { anchorKit } from './anchor'
-import { pinEngineCore, pinEngineSource, type PinCommand } from './pin-in-page'
+import { type PinCommand, pinEngineCore, pinEngineSource } from './pin-in-page'
 
 let holder: Record<string, unknown>
 
@@ -28,7 +28,9 @@ function placePin(selector: string, comment = '') {
   document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: x, clientY: y }))
   const state = run({ verb: 'state' })
   const pin = state.pins[state.pins.length - 1]
-  if (comment) run({ comment, id: pin.id as string, verb: 'comment' })
+
+  if (comment) {run({ comment, id: pin.id as string, verb: 'comment' })}
+
   return run({ verb: 'state' }).pins[state.pins.length - 1]
 }
 
@@ -210,7 +212,7 @@ describe('injectable source', () => {
   it('assembles into one evaluable expression', () => {
     const source = pinEngineSource()
     expect(source.startsWith('(function (doc, holder, command)')).toBe(true)
-    // eslint-disable-next-line no-eval
+     
     const engine = eval(source)
     const state = engine(document, {}, { verb: 'state' })
     expect(state.armed).toBe(false)
@@ -218,7 +220,7 @@ describe('injectable source', () => {
   })
 
   it('works end to end once round-tripped through a string', () => {
-    // eslint-disable-next-line no-eval
+     
     const engine = eval(pinEngineSource())
     const box: Record<string, unknown> = {}
     document.elementFromPoint = () => document.querySelector('#save')

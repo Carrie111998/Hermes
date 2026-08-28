@@ -45,8 +45,10 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
   const sync = useCallback(async (report: Awaited<ReturnType<typeof readPins>>) => {
     if (!report) {
       setLive(false)
+
       return
     }
+
     setLive(true)
     setArmed(report.armed === true)
     setPins(report.pins)
@@ -57,19 +59,20 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
   // page the user is not annotating is a round trip into the guest document
   // every beat for nothing.
   useEffect(() => {
-    if (!open || !armed) return
+    if (!open || !armed) {return}
     const timer = setInterval(() => void readPins().then(sync), POLL_MS)
+
     return () => clearInterval(timer)
   }, [armed, open, sync])
 
   useEffect(() => {
-    if (open) void readPins().then(sync)
+    if (open) {void readPins().then(sync)}
   }, [open, sync])
 
   // A navigation destroys the engine and every pin with it. Seed the new one
   // from what the panel is holding, then re-run the ladder over it.
   useEffect(() => {
-    if (!open || !held.current.length) return
+    if (!open || !held.current.length) {return}
     void reattachPins(held.current).then(sync)
   }, [open, sync, url])
 
@@ -80,7 +83,8 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
 
   const attach = () => {
     const openPins = pins.filter(pin => !pin.resolved)
-    if (!openPins.length) return
+
+    if (!openPins.length) {return}
     addComposerAttachment({
       detail: JSON.stringify(openPins),
       id: `pins:${url}:${openPins.map(pin => pin.id).join(',')}`,
@@ -90,7 +94,7 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
     })
   }
 
-  if (!open) return null
+  if (!open) {return null}
 
   const openCount = pins.filter(pin => !pin.resolved).length
 

@@ -38,6 +38,7 @@ describe('pinCommentBlock', () => {
     const withoutSelector = pin({
       anchor: { ...pin().anchor!, selector: '' }
     })
+
     expect(pinCommentBlock(JSON.stringify([withoutSelector]))).toContain('#panel>button')
   })
 
@@ -46,6 +47,7 @@ describe('pinCommentBlock', () => {
       pin({ comment: 'still open' }),
       pin({ comment: 'already done', id: 'pin-2', resolved: true })
     ]))
+
     expect(block).toContain('still open')
     expect(block).not.toContain('already done')
   })
@@ -59,6 +61,7 @@ describe('pinCommentBlock', () => {
       pin({ comment: 'second', createdAt: 20, id: 'b' }),
       pin({ comment: 'first', createdAt: 10, id: 'a' })
     ]))
+
     expect(block!.indexOf('first')).toBeLessThan(block!.indexOf('second'))
   })
 
@@ -77,6 +80,7 @@ describe('pinCommentBlock', () => {
         region: { h: 0.2, w: 0.4, x: 0.1, y: 0.5 }
       })
     ]))
+
     expect(block).toContain('region at 10%,50% sized 40%×20%')
     expect(block).toContain('this chart axis is unreadable')
   })
