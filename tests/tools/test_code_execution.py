@@ -529,8 +529,13 @@ class TestEnvVarFiltering(unittest.TestCase):
             with patch("model_tools.handle_function_call", return_value='{}'), \
                  patch("tools.code_execution_tool._load_config",
                        return_value={"timeout": 10, "max_tool_calls": 50}):
+                # reset=True: a session kernel's env is frozen at spawn, so
+                # env-building rules are only observable on a FRESH kernel —
+                # a reused one would (correctly) show the env from whenever
+                # it was first spawned, not this test's os.environ tweaks.
                 raw = execute_code(code, task_id="test-env",
-                                   enabled_tools=list(SANDBOX_ALLOWED_TOOLS))
+                                   enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                                   reset=True)
         finally:
             os.environ.clear()
             os.environ.update(env_backup)
