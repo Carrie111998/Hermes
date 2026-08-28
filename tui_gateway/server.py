@@ -5888,7 +5888,45 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     cfg = None
     fallback_notice = None
 
-    # Coding posture (base Hermes): with no explicit pin, collapse to the
+    # A profile-level exact pin outranks every contextual source, including the
+    # HERMES_TUI_TOOLSETS process override. Resolve it before interpreting that
+    # override so a broad host environment cannot widen a least-privilege
+    # profile. Explicit MCP entries in this same profile remain part of its
+    # exact configuration via _get_platform_tools.
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            has_exact_profile_toolset_pin,
+        )
+
+        cfg = load_config() or {}
+        if has_exact_profile_toolset_pin(cfg):
+            try:
+                profile_toolsets = _get_platform_tools(
+                        cfg,
+                        "cli",
+                        include_default_mcp_servers=True,
+                    )
+                # Profile pins constrain configurable capabilities, but GUI
+                # tools are properties of this session's client surface and
+                # cannot be disabled or enabled by profile config.
+                return sorted(
+                    {*profile_toolsets, *_gui_surface_toolsets(session_platform)}
+                )
+            except Exception:
+                surface_toolsets = sorted(_gui_surface_toolsets(session_platform))
+                print(
+                    "[tui] exact profile toolset pin could not be resolved; "
+                    "enabling only session-scoped GUI toolsets",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return surface_toolsets
+    except Exception:
+        cfg = None
+
+    # Coding posture (base Hermes): with no environment or profile pin, collapse to the
     # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
     # The desktop app and `hermes --tui` both land here. See
     # agent/coding_context.py. No config is loaded yet at this point, so we let
