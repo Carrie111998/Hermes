@@ -10,8 +10,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
@@ -21,6 +22,93 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+_DESCENDANT_SNAPSHOT_BUDGET_S = 0.25
+_DESCENDANT_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
+    """SIGKILL identity-checked descendants outside ``pgid``."""
+    for child in descendants:
+        try:
+            if not child.is_running():
+                continue
+            try:
+                if os.getpgid(child.pid) == pgid:
+                    continue
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            child.kill()
+        except Exception:
+            continue
+
+
+def _bounded_descendant_snapshot(
+    pid: int,
+    *,
+    timeout_s: float,
+    on_late_result: Callable[[list], None] | None = None,
+) -> list:
+    """Best-effort psutil descendant snapshot with a hard caller deadline.
+
+    Process-table enumeration can take minutes under PRoot and similarly slow
+    ``/proc`` implementations. Keep at most one abandoned scan in flight and
+    let timeout cleanup continue with its process-group boundary when the scan
+    misses its independent budget. A late result is handed to the optional
+    callback so escaped descendants are still reaped eventually.
+    """
+    if not _DESCENDANT_SNAPSHOT_LOCK.acquire(blocking=False):
+        return []
+
+    done = threading.Event()
+    state_lock = threading.Lock()
+    state = {"timed_out": False}
+    result: list = []
+
+    def _scan() -> None:
+        try:
+            try:
+                import psutil
+
+                descendants = psutil.Process(pid).children(recursive=True)
+            except Exception:
+                descendants = []
+            with state_lock:
+                late = state["timed_out"]
+                if not late:
+                    result.extend(descendants)
+                done.set()
+            if late and on_late_result is not None:
+                try:
+                    on_late_result(descendants)
+                except Exception:
+                    pass
+        finally:
+            _DESCENDANT_SNAPSHOT_LOCK.release()
+
+    try:
+        threading.Thread(
+            target=_scan,
+            daemon=True,
+            name=f"descendant-snapshot-{pid}",
+        ).start()
+    except Exception:
+        _DESCENDANT_SNAPSHOT_LOCK.release()
+        return []
+
+    if not done.wait(max(0.0, timeout_s)):
+        with state_lock:
+            if done.is_set():
+                return result
+            state["timed_out"] = True
+        logger.warning(
+            "Process-tree snapshot for pid %s exceeded %.2fs; "
+            "continuing with process-group cleanup",
+            pid,
+            timeout_s,
+        )
+        return []
+    return result
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1943,63 +2031,40 @@ class LocalEnvironment(BaseEnvironment):
                 # (issue #84967's local sibling).  The snapshot must never
                 # break the kill path, so any failure just yields an empty
                 # sweep set.
-                descendants: list = []
-                try:
-                    import psutil
-
-                    descendants = psutil.Process(proc.pid).children(recursive=True)
-                except Exception:
-                    descendants = []
-
-                def _sweep_escaped_descendants() -> None:
-                    """SIGKILL snapshotted survivors outside the (dead) group.
-
-                    Runs after the TERM→KILL group escalation so in-group
-                    members keep their SIGTERM grace window; only escapees
-                    (own setsid sessions) are force-killed.  psutil's
-                    identity-aware Process means recycled PIDs are skipped.
-
-                    POSIX-only: reached solely from the non-_IS_WINDOWS
-                    branch above (the win32 path returns earlier).
-                    """
-                    for child in descendants:
-                        try:
-                            if not child.is_running():
-                                continue
-                            try:
-                                if os.getpgid(child.pid) == pgid:
-                                    continue  # group-kill already covers it
-                            except (ProcessLookupError, PermissionError, OSError):
-                                pass
-                            child.kill()
-                        except Exception:
-                            continue
+                descendants = _bounded_descendant_snapshot(
+                    proc.pid,
+                    timeout_s=_DESCENDANT_SNAPSHOT_BUDGET_S,
+                    on_late_result=lambda late: _sweep_escaped_descendants(
+                        late,
+                        pgid,
+                    ),
+                )
 
                 try:
                     os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)
                 except ProcessLookupError:
-                    _sweep_escaped_descendants()
+                    _sweep_escaped_descendants(descendants, pgid)
                     return
 
                 # Wait on the process group, not just the shell wrapper. Under
                 # load the wrapper can exit before grandchildren do; returning
                 # at that point leaves orphaned process-group members behind.
                 if _wait_for_group_exit(pgid, 1.0):
-                    _sweep_escaped_descendants()
+                    _sweep_escaped_descendants(descendants, pgid)
                     return
 
                 try:
                     # POSIX-only: _IS_WINDOWS is handled by the outer branch.
                     os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX process-group SIGKILL
                 except ProcessLookupError:
-                    _sweep_escaped_descendants()
+                    _sweep_escaped_descendants(descendants, pgid)
                     return
                 _wait_for_group_exit(pgid, 2.0)
                 try:
                     proc.wait(timeout=0.2)
                 except (subprocess.TimeoutExpired, OSError):
                     pass
-                _sweep_escaped_descendants()
+                _sweep_escaped_descendants(descendants, pgid)
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()

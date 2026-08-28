@@ -1,23 +1,27 @@
 """Regression tests for #85125 Phase 4b (terminal flavor of the #71148 class).
 
 LocalEnvironment._kill_process kills the process GROUP (SIGTERM -> wait ->
-SIGKILL).  A descendant that called ``setsid`` escapes the group and survives
-the group-kill — the local sibling of issue #84967.  The fix snapshots the
-descendant set via psutil BEFORE the first signal (children reparent to init
-after the parent dies, so a later parent walk finds nothing — same rationale
-as agent/deadline.py kill_process_tree) and sweeps any snapshotted survivor
-outside the (now-dead) group with SIGKILL afterwards.
+SIGKILL). A descendant that called ``setsid`` escapes the group and survives
+the group-kill — the local sibling of issue #84967. Descendants are therefore
+snapshotted before the first signal, but that process-table walk is independently
+bounded and single-flight so slow ``/proc`` implementations cannot wedge every
+concurrent timeout-cleanup worker.
 """
 
 import os
 import signal
 import textwrap
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from tools.environments.local import LocalEnvironment
+from tools.environments.local import (
+    LocalEnvironment,
+    _DESCENDANT_SNAPSHOT_LOCK,
+    _bounded_descendant_snapshot,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +50,7 @@ def _wait_for_pid_exit(pid: int, timeout: float = 10.0) -> bool:
 
 
 @pytest.mark.live_system_guard_bypass
+@pytest.mark.linux_only
 def test_timeout_kill_reaps_setsid_grandchild(tmp_path):
     """A grandchild that setsid's out of the group must not survive the
     timeout kill path."""
@@ -110,6 +115,7 @@ def _sh_quote(s: str) -> str:
     return shlex.quote(s)
 
 
+@pytest.mark.linux_only
 def test_kill_process_survives_psutil_snapshot_failure(monkeypatch):
     """A broken psutil snapshot must never break the kill path — the
     group-kill escalation still runs to completion."""
@@ -146,3 +152,72 @@ def test_kill_process_survives_psutil_snapshot_failure(monkeypatch):
     # escalation path completed despite the snapshot failure.
     assert killpg_calls[0] == (67890, signal.SIGTERM)
     assert (67890, 0) in killpg_calls
+
+
+def test_descendant_snapshot_has_independent_deadline_and_single_flight(monkeypatch):
+    """A slow process-table walk must not multiply across timeout cleanup."""
+    psutil = pytest.importorskip("psutil")
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    late_result = threading.Event()
+    late_children = []
+    calls = []
+
+    class SlowProcess:
+        def __init__(self, pid):
+            calls.append(pid)
+
+        def children(self, *, recursive):
+            assert recursive is True
+            entered.set()
+            release.wait(timeout=2)
+            finished.set()
+            return ["late-child"]
+
+    monkeypatch.setattr(psutil, "Process", SlowProcess)
+
+    def capture_late(children):
+        late_children.extend(children)
+        late_result.set()
+
+    started = time.monotonic()
+    first = _bounded_descendant_snapshot(
+        111,
+        timeout_s=0.02,
+        on_late_result=capture_late,
+    )
+    elapsed = time.monotonic() - started
+    assert entered.is_set()
+    assert first == []
+    assert elapsed < 0.2
+
+    # While the abandoned scan is still alive, another cleanup must skip the
+    # process-table walk rather than starting a second expensive enumeration.
+    second = _bounded_descendant_snapshot(222, timeout_s=0.02)
+    assert second == []
+    assert calls == [111]
+
+    release.set()
+    assert finished.wait(timeout=1)
+    assert late_result.wait(timeout=1)
+    assert late_children == ["late-child"]
+    assert _DESCENDANT_SNAPSHOT_LOCK.acquire(timeout=1)
+    _DESCENDANT_SNAPSHOT_LOCK.release()
+
+
+def test_fast_descendant_snapshot_preserves_setsid_sweep(monkeypatch):
+    psutil = pytest.importorskip("psutil")
+    children = [object(), object()]
+
+    class FastProcess:
+        def __init__(self, pid):
+            assert pid == 333
+
+        def children(self, *, recursive):
+            assert recursive is True
+            return children
+
+    monkeypatch.setattr(psutil, "Process", FastProcess)
+
+    assert _bounded_descendant_snapshot(333, timeout_s=0.2) == children
