@@ -74,6 +74,47 @@ def test_format_footer_skips_missing_context_length():
     assert "/tmp/wd" in out
 
 
+def test_build_footer_line_bot_uses_explicit_profile():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["bot"],
+                }
+            }
+        },
+        platform_key="telegram",
+        profile="finance",
+        model="deepseek-v4-flash",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+    )
+    assert out == "finance"
+
+
+def test_build_footer_line_bot_name_config_overrides_profile():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["bot"],
+                    "bot_name": "Jimmy_Fin_bot",
+                }
+            }
+        },
+        platform_key="telegram",
+        profile="finance",
+        model="deepseek-v4-flash",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+    )
+    assert out == "Jimmy_Fin_bot"
+
+
 # ---------------------------------------------------------------------------
 # resolve_footer_config
 # ---------------------------------------------------------------------------
