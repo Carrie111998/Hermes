@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -149,6 +150,88 @@ def _is_reparse_or_link(path: Path) -> bool:
     return bool(getattr(info, "st_file_attributes", 0) & 0x400)
 
 
+def _windows_final_path(path: Path, handle: Any, win32file: Any) -> None:
+    """Require a Windows handle to resolve to the exact requested path.
+
+    ``FILE_FLAG_OPEN_REPARSE_POINT`` protects the final component, while the
+    handle-derived final path catches a junction/reparse in any ancestor.  A
+    path check performed before ``CreateFile`` is intentionally not treated as
+    a security boundary: the handle and its metadata are the boundary.
+    """
+    actual = win32file.GetFinalPathNameByHandle(handle, 0)
+    if actual.startswith("\\\\?\\UNC\\"):
+        actual = "\\\\" + actual[8:]
+    elif actual.startswith("\\\\?\\"):
+        actual = actual[4:]
+    expected = os.path.abspath(os.fspath(path))
+    if os.path.normcase(os.path.normpath(actual)) != os.path.normcase(os.path.normpath(expected)):
+        raise OSError(f"Auth-store path escaped its expected location: {path}")
+
+
+def _windows_open_no_reparse(path: Path, *, directory: bool = False) -> Any:
+    """Open *path* with a handle-level no-reparse check on native Windows."""
+    try:
+        import pywintypes
+        import win32con
+        import win32file
+    except Exception as exc:  # pragma: no cover - dependency is Windows-only
+        raise OSError("native Windows no-reparse support is unavailable") from exc
+
+    flags = win32con.FILE_ATTRIBUTE_NORMAL | 0x00200000
+    if directory:
+        flags |= win32con.FILE_FLAG_BACKUP_SEMANTICS
+    handle = win32file.CreateFile(
+        str(path),
+        win32con.GENERIC_READ,
+        win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
+        None,
+        win32con.OPEN_EXISTING,
+        flags,
+        None,
+    )
+    try:
+        _windows_final_path(path, handle, win32file)
+        attributes = win32file.GetFileInformationByHandle(handle)[0]
+        if attributes & 0x400:
+            raise OSError(f"Refusing to follow auth-store reparse point: {path}")
+        if directory:
+            if not (attributes & win32con.FILE_ATTRIBUTE_DIRECTORY):
+                raise OSError(f"Auth-store parent is not a directory: {path}")
+        elif attributes & win32con.FILE_ATTRIBUTE_DIRECTORY:
+            raise OSError(f"Auth-store path is a directory: {path}")
+        return handle
+    except BaseException:
+        win32file.CloseHandle(handle)
+        raise
+
+
+def _read_auth_bytes_windows(auth_file: Path) -> bytes:
+    """Read from a validated native handle, never from a path after checking."""
+    try:
+        import pywintypes
+        import win32file
+    except Exception as exc:  # pragma: no cover - dependency is Windows-only
+        raise OSError("native Windows no-reparse support is unavailable") from exc
+    try:
+        handle = _windows_open_no_reparse(auth_file)
+    except pywintypes.error as exc:
+        if exc.winerror == 2:
+            raise FileNotFoundError(os.fspath(auth_file)) from exc
+        raise
+    try:
+        chunks = []
+        while True:
+            error, data = win32file.ReadFile(handle, 1024 * 1024)
+            if error:
+                raise OSError(error, f"Could not read auth store: {auth_file}")
+            if not data:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
+    finally:
+        win32file.CloseHandle(handle)
+
+
 def _read_auth_bytes(auth_file: Path) -> bytes:
     """Read a regular auth file without following a final link/reparse."""
     if _is_reparse_or_link(auth_file):
@@ -158,6 +241,8 @@ def _read_auth_bytes(auth_file: Path) -> bytes:
     # descriptor below, which provides the no-follow guarantee.
     if Path.read_text is not _ORIGINAL_PATH_READ_TEXT:
         auth_file.read_text(encoding="utf-8-sig")
+    if sys.platform == "win32":
+        return _read_auth_bytes_windows(auth_file)
     flags = os.O_RDONLY
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow:
@@ -189,25 +274,132 @@ def _digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _validate_recovery_store(auth_store: Any) -> None:
-    """Reject malformed replacement shapes before any primary write."""
+def _validate_auth_store_schema(auth_store: Any, *, require_section: bool = False) -> None:
+    """Validate the canonical auth-store document without touching the disk."""
     if not isinstance(auth_store, dict):
-        raise ValueError("Recovery replacement must be a JSON object")
+        raise ValueError("Auth store must be a JSON object")
+    version = auth_store.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != AUTH_STORE_VERSION:
+        raise ValueError("Auth store has an unsupported or missing version")
     providers = auth_store.get("providers")
-    pool = auth_store.get("credential_pool")
     if providers is not None:
         if not isinstance(providers, dict):
-            raise ValueError("Recovery replacement providers must be an object")
-        if any(not isinstance(value, dict) for value in providers.values()):
-            raise ValueError("Recovery replacement provider entries must be objects")
+            raise ValueError("Auth store providers must be an object")
+        if any(not isinstance(key, str) or not isinstance(value, dict) for key, value in providers.items()):
+            raise ValueError("Auth store provider entries must be objects")
+    pool = auth_store.get("credential_pool")
     if pool is not None:
         if not isinstance(pool, dict):
-            raise ValueError("Recovery replacement credential_pool must be an object")
-        for entries in pool.values():
+            raise ValueError("Auth store credential_pool must be an object")
+        for key, entries in pool.items():
+            if not isinstance(key, str):
+                raise ValueError("Auth store credential_pool keys must be strings")
             if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
-                raise ValueError("Recovery replacement credential_pool entries must be arrays of objects")
-    if providers is None and pool is None:
-        raise ValueError("Recovery replacement must contain providers or credential_pool")
+                raise ValueError("Auth store credential_pool entries must be arrays of objects")
+    active_provider = auth_store.get("active_provider")
+    if active_provider is not None and not isinstance(active_provider, str):
+        raise ValueError("Auth store active_provider must be a string or null")
+    updated_at = auth_store.get("updated_at")
+    if updated_at is not None and not isinstance(updated_at, str):
+        raise ValueError("Auth store updated_at must be a string")
+    if require_section and providers is None and pool is None:
+        raise ValueError("Auth store must contain providers or credential_pool")
+
+
+def _validate_recovery_store(auth_store: Any) -> None:
+    """Reject incomplete or malformed replacement shapes before any write."""
+    _validate_auth_store_schema(auth_store, require_section=True)
+
+
+def _raise_preserved_corruption(auth_file: Path, raw_bytes: bytes, reason: Any) -> None:
+    """Raise the read-only corruption error after best-effort preservation."""
+    corrupt_digest = _digest(raw_bytes)
+    try:
+        corrupt_path = _write_corrupt_sidecar(auth_file, raw_bytes)
+    except Exception:
+        corrupt_path = None
+    if corrupt_path is not None:
+        logger.warning(
+            "auth: invalid store %s (%s); store is read-only. "
+            "Corrupt file preserved at %s",
+            auth_file,
+            reason,
+            corrupt_path,
+        )
+        raise AuthStoreCorruptionError(
+            auth_file,
+            corrupt_path,
+            preserved=True,
+            corrupt_sha256=corrupt_digest,
+        )
+    logger.warning(
+        "auth: invalid store %s (%s); store is read-only. "
+        "A copy could NOT be preserved",
+        auth_file,
+        reason,
+    )
+    raise AuthStoreCorruptionError(
+        auth_file,
+        None,
+        preserved=False,
+        corrupt_sha256=corrupt_digest,
+    )
+
+
+def _atomic_publish_auth_store(tmp_path: Path, auth_file: Path) -> None:
+    """Atomically publish without ``utils.atomic_replace``'s link resolution."""
+    if sys.platform == "win32":
+        # Validate the parent and existing destination through handles. The
+        # actual move then replaces the directory entry; it never resolves a
+        # destination symlink (unlike utils.atomic_replace), and the native
+        # handle checks reject final or ancestor reparses before the move.
+        parent_handle = _windows_open_no_reparse(auth_file.parent, directory=True)
+        try:
+            if auth_file.exists() or auth_file.is_symlink():
+                target_handle = _windows_open_no_reparse(auth_file)
+                try:
+                    pass
+                finally:
+                    import win32file
+                    win32file.CloseHandle(target_handle)
+        finally:
+            import win32file
+            win32file.CloseHandle(parent_handle)
+        try:
+            import win32con
+            import win32file
+            win32file.MoveFileEx(
+                str(tmp_path),
+                str(auth_file),
+                0x00000001 | 0x00000008,
+            )
+        except Exception as exc:
+            raise OSError(f"Could not atomically publish auth store: {auth_file}") from exc
+        return
+
+    if os.path.lexists(os.fspath(auth_file)) and _is_reparse_or_link(auth_file):
+        raise OSError(f"Refusing to publish through auth-store link or reparse: {auth_file}")
+    # POSIX rename replaces the directory entry and does not follow a final
+    # symlink. The lexical check above is a policy guard; rename itself is the
+    # atomic no-follow publication primitive.
+    os.replace(os.fspath(tmp_path), os.fspath(auth_file))
+
+
+def _validate_auth_store_parent(auth_file: Path) -> None:
+    """Validate the destination parent before creating a credential temp file."""
+    parent = auth_file.parent
+    if sys.platform == "win32":
+        handle = _windows_open_no_reparse(parent, directory=True)
+        try:
+            return
+        finally:
+            import win32file
+            win32file.CloseHandle(handle)
+    current = parent
+    while current != current.parent:
+        if os.path.lexists(os.fspath(current)) and _is_reparse_or_link(current):
+            raise OSError(f"Refusing to write beneath auth-store link or reparse: {current}")
+        current = current.parent
 
 # =============================================================================
 # Auth Store — persistence layer for ~/.hermes/auth.json
@@ -530,41 +722,31 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         except OSError:
             raise
         except Exception as exc:
-            corrupt_digest = _digest(raw_bytes)
             try:
-                corrupt_path = _write_corrupt_sidecar(auth_file, raw_bytes)
-            except Exception:
-                corrupt_path = None
-            preserved = corrupt_path is not None
-            if preserved:
-                logger.warning(
-                    "auth: failed to parse %s (%s); store is read-only. "
-                    "Corrupt file preserved at %s",
-                    auth_file, exc, corrupt_path,
-                )
-                raise AuthStoreCorruptionError(
-                    auth_file,
-                    corrupt_path,
-                    preserved=True,
-                    corrupt_sha256=corrupt_digest,
-                ) from exc
-            logger.warning(
-                "auth: failed to parse %s (%s); store is read-only. "
-                "A copy could NOT be preserved",
-                auth_file, exc,
-            )
-            raise AuthStoreCorruptionError(
-                auth_file, None, preserved=False, corrupt_sha256=corrupt_digest
-            ) from exc
+                _raise_preserved_corruption(auth_file, raw_bytes, exc)
+            except AuthStoreCorruptionError as corruption:
+                raise corruption from exc
 
-        _remember_snapshot(raw if isinstance(raw, dict) else {}, auth_file, raw_bytes)
-        if isinstance(raw, dict) and (
-            isinstance(raw.get("providers"), dict)
-            or isinstance(raw.get("credential_pool"), dict)
-        ):
+        # ``systems`` is the one legacy document accepted for migration. Every
+        # current document must be a complete canonical object; in particular,
+        # valid JSON such as [] or {"providers": []} is still corruption.
+        if isinstance(raw, dict) and "systems" in raw and "providers" not in raw:
+            systems = raw.get("systems")
+            if not isinstance(systems, dict) or any(
+                not isinstance(key, str) or not isinstance(value, dict)
+                for key, value in systems.items()
+            ):
+                _raise_preserved_corruption(auth_file, raw_bytes, "invalid legacy systems shape")
+        else:
+            try:
+                _validate_auth_store_schema(raw)
+            except ValueError as exc:
+                _raise_preserved_corruption(auth_file, raw_bytes, exc)
+
+        if isinstance(raw, dict) and "systems" not in raw:
             raw.setdefault("providers", {})
-            if isinstance(raw.get("providers"), dict):
-                _migrate_stale_nous_portal_url(raw["providers"])
+            _remember_snapshot(raw, auth_file, raw_bytes)
+            _migrate_stale_nous_portal_url(raw["providers"])
             return raw
 
         # Migrate from PR's "systems" format if present
@@ -585,11 +767,13 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
 def _save_auth_store_locked(auth_store: Dict[str, Any], auth_file: Path, *, recovery: bool) -> Path:
     """Write while the caller owns the target lock and final digest check."""
+    _validate_recovery_store(auth_store) if recovery else _validate_auth_store_schema(auth_store)
     expected_digest = None if recovery else _snapshot_for(auth_store, auth_file)
     if auth_file.exists() and not recovery:
         try:
             current_bytes = _read_auth_bytes(auth_file)
-            json.loads(current_bytes.decode("utf-8-sig"))
+            current_store = json.loads(current_bytes.decode("utf-8-sig"))
+            _validate_auth_store_schema(current_store)
         except OSError:
             raise
         except Exception as exc:
@@ -597,6 +781,7 @@ def _save_auth_store_locked(auth_store: Dict[str, Any], auth_file: Path, *, reco
         if expected_digest is not None and expected_digest != _digest(current_bytes):
             raise AuthStoreWriteConflictError(auth_file)
     auth_file.parent.mkdir(parents=True, exist_ok=True)
+    _validate_auth_store_parent(auth_file)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
     secure_parent_dir(auth_file)
@@ -622,7 +807,7 @@ def _save_auth_store_locked(auth_store: Dict[str, Any], auth_file: Path, *, reco
             current_bytes = _read_auth_bytes(auth_file)
             if expected_digest is not None and expected_digest != _digest(current_bytes):
                 raise AuthStoreWriteConflictError(auth_file)
-        atomic_replace(tmp_path, auth_file)
+        _atomic_publish_auth_store(tmp_path, auth_file)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
         except OSError:
@@ -638,10 +823,6 @@ def _save_auth_store_locked(auth_store: Dict[str, Any], auth_file: Path, *, reco
                 tmp_path.unlink()
         except OSError:
             pass
-    try:
-        auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
     _remember_snapshot(auth_store, auth_file, payload_bytes)
     return auth_file
 
@@ -668,12 +849,12 @@ def recover_auth_store(
 ) -> Path:
     """Import a validated replacement fenced to reviewed corrupt bytes.
 
-    ``expected_corrupt_sha256`` is the recovery CAS token. The optional
-    omission preserves the historical callable API by taking an atomic digest
-    snapshot under the target lock immediately before the write; CLI/operator
-    flows always pass the digest captured from the corruption exception.
+    ``expected_corrupt_sha256`` is a mandatory recovery CAS token captured from
+    the corruption exception. Recovery without a reviewed digest is refused.
     """
     _validate_recovery_store(auth_store)
+    if not isinstance(expected_corrupt_sha256, str) or not expected_corrupt_sha256:
+        raise ValueError("Explicit recovery requires the reviewed corrupt-store SHA-256")
     auth_file = target_path if target_path is not None else _auth_file_path()
     with _auth_store_lock(target_path=auth_file):
         try:

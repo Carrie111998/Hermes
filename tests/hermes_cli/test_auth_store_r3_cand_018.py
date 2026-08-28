@@ -65,7 +65,15 @@ def test_explicit_recovery_import_is_the_only_replacement_path(tmp_path):
         "providers": {"openai-codex": {"source": "explicit-recovery"}},
     }
 
-    auth.recover_auth_store(replacement, primary)
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(primary)
+
+    auth.recover_auth_store(
+        replacement,
+        primary,
+        expected_corrupt_sha256=caught.value.corrupt_sha256,
+        expected_corrupt_path=primary,
+    )
 
     assert json.loads(primary.read_text(encoding="utf-8")) == {
         **replacement,
