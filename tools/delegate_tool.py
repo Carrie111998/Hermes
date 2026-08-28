@@ -1644,16 +1644,34 @@ def _resolve_child_fallback_chain(parent_agent, delegation_cfg, pinned):
     )
     if declared is None:
         return default
+
+    entries = [declared] if isinstance(declared, dict) else declared
+    malformed = not isinstance(entries, list) or any(
+        not isinstance(entry, dict)
+        or not str(entry.get("provider") or "").strip()
+        or not str(entry.get("model") or "").strip()
+        for entry in (entries if isinstance(entries, list) else [])
+    )
+    if malformed:
+        logger.warning(
+            "Ignoring malformed delegation.fallback_providers; using %s.",
+            "no chain (delegation pinned)" if pinned else "parent chain",
+        )
+        return default
+
     try:
         from hermes_cli.fallback_config import get_fallback_chain
 
-        return get_fallback_chain({"fallback_providers": declared}) or None
+        chain = get_fallback_chain({"fallback_providers": declared})
+        if entries and not chain:
+            raise ValueError("no valid provider/model entries")
+        return chain or None
     except Exception as exc:
         logger.warning(
             "Ignoring malformed delegation.fallback_providers (%s); "
             "using %s.",
             exc,
-            "no chain (provider pinned)" if pinned else "parent chain",
+            "no chain (delegation pinned)" if pinned else "parent chain",
         )
         return default
 
