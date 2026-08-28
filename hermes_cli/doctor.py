@@ -299,15 +299,20 @@ def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
     """Return doctor rows for web search/extract provider readiness (#78412).
 
     Each row is ``(status, label, detail)`` where *status* is ``ok`` or ``warn``.
-    Uses the same active-provider resolvers as the tools, but reports readiness
-    from ``is_available()`` so an explicitly selected but unconfigured backend
-    does not look healthy.
+    Explicit selections are validated before provider resolution so an unknown
+    or capability-incompatible backend cannot silently look healthy via an
+    unrelated fallback. Auto selection still uses the same active-provider
+    resolvers as the tools. Readiness comes from ``is_available()``.
     """
     rows: list[tuple[str, str, str]] = []
     try:
         from agent.web_search_registry import (
             get_active_extract_provider,
             get_active_search_provider,
+        )
+        from hermes_cli.config import (
+            load_config,
+            validate_web_backend_config_value,
         )
         from tools.web_tools import _ensure_web_plugins_loaded, _provider_is_ready
 
@@ -316,13 +321,25 @@ def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
         # Without this the registry is empty and every row reads
         # "no provider selected or registered" (idempotent, cheap on rerun).
         _ensure_web_plugins_loaded()
+        web_config = load_config().get("web") or {}
+        if not isinstance(web_config, dict):
+            web_config = {}
     except Exception:
         return rows
 
-    for capability, getter in (
-        ("web search", get_active_search_provider),
-        ("web extract", get_active_extract_provider),
+    for capability, label, getter in (
+        ("search", "web search", get_active_search_provider),
+        ("extract", "web extract", get_active_extract_provider),
     ):
+        key = f"web.{capability}_backend"
+        explicit = (
+            web_config.get(f"{capability}_backend") or web_config.get("backend")
+        )
+        if explicit:
+            issue = validate_web_backend_config_value(key, explicit)
+            if issue is not None:
+                rows.append(("warn", label, f"({issue.message})"))
+                continue
         try:
             provider = getter()
         except Exception:
@@ -331,19 +348,19 @@ def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
             rows.append(
                 (
                     "warn",
-                    capability,
+                    label,
                     "(no provider selected or registered)",
                 )
             )
             continue
         name = getattr(provider, "name", None) or type(provider).__name__
         if _provider_is_ready(provider):
-            rows.append(("ok", capability, f"({name})"))
+            rows.append(("ok", label, f"({name})"))
         else:
             rows.append(
                 (
                     "warn",
-                    capability,
+                    label,
                     f"({name} selected; provider not configured)",
                 )
             )

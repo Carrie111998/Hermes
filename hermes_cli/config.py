@@ -2169,7 +2169,7 @@ def _known_web_backend_providers() -> Tuple[Dict[str, Any], Set[str]]:
     return registered, catalog_ids
 
 
-def _validate_web_backend_config_value(
+def validate_web_backend_config_value(
     key: str, value: Any
 ) -> Optional["ConfigIssue"]:
     """Validate a web backend ID and its per-key capability contract."""
@@ -2242,7 +2242,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
         for leaf in ("backend", "search_backend", "extract_backend"):
             if leaf not in web_cfg:
                 continue
-            issue = _validate_web_backend_config_value(
+            issue = validate_web_backend_config_value(
                 f"web.{leaf}", web_cfg.get(leaf)
             )
             if issue is not None:
@@ -5732,7 +5732,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         return
 
     if not force:
-        web_backend_issue = _validate_web_backend_config_value(key, value)
+        web_backend_issue = validate_web_backend_config_value(key, value)
         if web_backend_issue is not None:
             print(f"✗ {web_backend_issue.message}", file=sys.stderr)
             print(f"  {web_backend_issue.hint}", file=sys.stderr)
