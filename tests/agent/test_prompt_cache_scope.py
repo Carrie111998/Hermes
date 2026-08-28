@@ -384,3 +384,147 @@ class TestAuxiliaryRuntimeThreading:
             assert aux._runtime_main_value("cache_scope") == ""
         finally:
             aux.reset_runtime_main(token)
+
+
+class TestPerResponseRunNonce:
+    """Issue #96570 — hosts that mint one physical session per RESPONSE.
+
+    Hermes Studio group chat builds ``gc_run_<room>_<profile>_<name>_<uuid4hex>``
+    for every reply and destroys it when the reply completes
+    (``groupRuntimeSessionId``). Every conversation-affinity hint Hermes sends
+    is derived from that id, so each reply of one room landed in a different
+    cache bucket and was billed as a full prefix-cache miss.
+    """
+
+    RUN = "gc_run_room42_default_Worker"
+    RESPONSE_1 = f"{RUN}_5f2c1ab9d4e34f7a8b0c6d1e2f3a4b5c"
+    RESPONSE_2 = f"{RUN}_9a7e3b1c05d24e6fb83a1c7d9e0f2a4b"
+
+    SYS = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+
+    def test_consecutive_responses_share_one_scope(self):
+        assert (
+            _cache_scope_from_session_id(self.RESPONSE_1)
+            == _cache_scope_from_session_id(self.RESPONSE_2)
+            == self.RUN
+        )
+
+    def test_distinct_rooms_and_members_stay_isolated(self):
+        """Normalizing the nonce must not merge unrelated conversations."""
+        other_room = f"gc_run_room7_default_Worker_{'0' * 32}"
+        other_member = f"gc_run_room42_default_Reviewer_{'0' * 32}"
+
+        scope = _cache_scope_from_session_id(self.RESPONSE_1)
+        assert scope != _cache_scope_from_session_id(other_room)
+        assert scope != _cache_scope_from_session_id(other_member)
+
+    @pytest.mark.parametrize(
+        "session_id",
+        [
+            "20260827_140233_a1b2c3d4",  # CLI / gateway: <ts>_<8 hex>
+            "api_1756300000_a1b2c3d4",  # API server
+            "bg_140233_a1b2c3",  # background task: <hhmmss>_<6 hex>
+            "550e8400-e29b-41d4-a716-446655440000",  # bare str(uuid4())
+            "chat_0123456789abcdef",  # 16-hex slice
+            "root-sess",
+            "",
+        ],
+    )
+    def test_hermes_native_ids_are_untouched(self, session_id):
+        """Only a WHOLE uuid4 hex is stripped — no native id shape has one."""
+        assert _cache_scope_from_session_id(session_id) == session_id
+
+    def test_cron_normalization_takes_precedence(self):
+        assert (
+            _cache_scope_from_session_id("cron_backup_20260814_120000")
+            == "cron_backup"
+        )
+
+    def test_a_bare_nonce_keeps_its_own_scope(self):
+        """No logical base left to key on — the id must stay as-is."""
+        nonce = "5f2c1ab9d4e34f7a8b0c6d1e2f3a4b5c"
+        assert _cache_scope_from_session_id(nonce) == nonce
+        assert _cache_scope_from_session_id(f"_{nonce}") == f"_{nonce}"
+
+    def test_lineage_walk_cannot_fix_this_alone(self, db):
+        """The rows carry no lineage, so the normalizer is the only lever.
+
+        The Studio bridge creates the row with ``create_session(id, source,
+        model)`` — no ``parent_session_id``, no ``session_key`` — so
+        ``resolve_prompt_cache_scope`` correctly returns the physical id and
+        the per-response nonce survives to the wire without this fix.
+        """
+        db.create_session(self.RESPONSE_1, source="studio")
+        db.create_session(self.RESPONSE_2, source="studio")
+
+        assert resolve_prompt_cache_scope(_agent(self.RESPONSE_1, db)) == self.RESPONSE_1
+        assert resolve_prompt_cache_scope(_agent(self.RESPONSE_2, db)) == self.RESPONSE_2
+
+    def test_prompt_cache_key_stable_across_responses(self):
+        """OpenAI/Codex Responses: same room, same routing key."""
+        from agent.transports.codex import ResponsesApiTransport
+
+        transport = ResponsesApiTransport()
+        base = dict(model="gpt-5.5", messages=self.SYS, tools=[])
+        k1 = transport.build_kwargs(**base, session_id=self.RESPONSE_1)
+        k2 = transport.build_kwargs(**base, session_id=self.RESPONSE_2)
+
+        assert k1["prompt_cache_key"] == k2["prompt_cache_key"]
+
+    def test_xai_conv_id_stable_across_responses(self):
+        """xAI pins its prompt cache to a backend via this header."""
+        from agent.transports.codex import ResponsesApiTransport
+
+        transport = ResponsesApiTransport()
+        base = dict(
+            model="grok-4", messages=self.SYS, tools=[], is_xai_responses=True
+        )
+        k1 = transport.build_kwargs(**base, session_id=self.RESPONSE_1)
+        k2 = transport.build_kwargs(**base, session_id=self.RESPONSE_2)
+
+        assert (
+            k1["extra_headers"]["x-grok-conv-id"]
+            == k2["extra_headers"]["x-grok-conv-id"]
+            == self.RUN
+        )
+
+    def test_chat_completions_key_stable_across_responses(self):
+        from agent.transports.chat_completions import _add_prompt_cache_key
+
+        def key(session_id):
+            kwargs: dict = {}
+            _add_prompt_cache_key(
+                kwargs,
+                messages=[{"role": "system", "content": "sys"}],
+                tools=None,
+                supports_prompt_cache_key=True,
+                session_id=session_id,
+            )
+            return kwargs.get("prompt_cache_key")
+
+        assert key(self.RESPONSE_1) == key(self.RESPONSE_2)
+
+    @pytest.mark.parametrize("profile_name", ["openrouter", "nous"])
+    def test_provider_sticky_key_stable_across_responses(self, profile_name):
+        """OpenRouter/Nous route by this key — it must not change per reply."""
+        from agent.portal_tags import (
+            reset_conversation_context,
+            set_conversation_context,
+        )
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(profile_name)
+        keys = []
+        for session_id in (self.RESPONSE_1, self.RESPONSE_2):
+            token = set_conversation_context(session_id)
+            try:
+                keys.append(
+                    profile.build_extra_body(session_id=session_id)["session_id"]
+                )
+            finally:
+                reset_conversation_context(token)
+
+        assert keys[0] == keys[1] == self.RUN

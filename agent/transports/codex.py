@@ -15,16 +15,38 @@ from typing import Any, Dict, List, Optional
 # repeat fires of the same job share a cache scope (see #51395/#52295).
 _CRON_SESSION_ID_RE = re.compile(r"^(cron_.+)_\d{8}_\d{6}$")
 
+# Embedding hosts (Hermes Studio group chat, bridge-style runners) mint a
+# throwaway physical session per RESPONSE and stamp it with a whole UUID4 hex
+# — ``<logical_run>_<32 hex>`` — then destroy it once the response completes.
+# That token is per-run noise of exactly the same kind as cron's per-fire
+# timestamp: it identifies the RUN, never the conversation. Left in the scope
+# it re-keys every conversation-affinity hint Hermes sends (OpenRouter/Nous
+# sticky ``session_id``, xAI ``x-grok-conv-id``, OpenAI ``prompt_cache_key``)
+# on every response, so the conversation never lands back on a warm prefix and
+# each turn is billed as a cache miss (#96570).
+#
+# Deliberately narrow: a bare 32-char UUID4 hex, a shape no Hermes-native
+# session id uses (its own ids carry 6-, 8-, 10- or 16-char slices, or a
+# dashed ``str(uuid4())``), so this can only reach ids a host stamped with a
+# whole UUID. Collapsing those runs is safe by construction — the scope is a
+# routing hint, never a correctness boundary (see ``_content_cache_key``) —
+# and the runs it merges are the same logical conversation.
+_RUN_NONCE_SESSION_ID_RE = re.compile(r"^(.+?)_[0-9a-f]{32}$")
+
 
 def _cache_scope_from_session_id(session_id: Optional[str]) -> str:
     """Normalize a physical session_id into a stable logical cache scope.
 
-    Every non-cron session_id already identifies one conversation/agent
-    instance (main run, a specific child/subagent, a sibling child, ...),
-    so it is used unchanged. Only cron's per-fire timestamp needs stripping.
+    A session_id identifies one conversation/agent instance (main run, a
+    specific child/subagent, a sibling child, ...) and is used unchanged —
+    except for the two trailing tokens that carry no conversation identity:
+    cron's per-fire timestamp and an embedding host's per-response UUID4 hex.
     """
     sid = str(session_id or "")
     match = _CRON_SESSION_ID_RE.match(sid)
+    if match:
+        return match.group(1)
+    match = _RUN_NONCE_SESSION_ID_RE.match(sid)
     return match.group(1) if match else sid
 
 from agent.reasoning_effort import (
