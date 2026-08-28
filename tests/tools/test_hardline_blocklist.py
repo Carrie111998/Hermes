@@ -685,6 +685,46 @@ def test_destructive_command_after_valid_quoted_grep_remains_blocked():
     )
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        r"(rm${IFS}-rf${IFS}/)",
+        r"{ rm${IFS}-rf${IFS}/; }",
+        r"${missing:-$(rm -rf /)}",
+        r"${missing:-`rm -rf /`}",
+        r"${outer:-${inner:-$(rm -rf /)}}",
+    ],
+)
+def test_valid_quoted_grep_cannot_hide_expanded_root_delete(
+    suffix, clean_session, monkeypatch
+):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    command = rf'''grep -o "[^\"]*" f; {suffix}'''
+    assert detect_hardline_command(command) == (
+        True,
+        "recursive delete of root filesystem",
+    )
+    result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert result.get("hardline") is True
+
+
+def test_faithful_command_marker_survives_backslash_line_normalization():
+    command = r'''grep -o "[^\"]*" f; printf \\''' + "\nreboot"
+    assert detect_hardline_command(command) == (True, "system shutdown/reboot")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'''grep -o "[^\"]*" f; printf '%s' '${missing:-$(printf safe)}' ''',
+        r'''grep -o "[^\"]*" f; echo "${missing:-literal}"''',
+    ],
+)
+def test_parameter_expansion_text_after_valid_grep_stays_safe(command):
+    assert detect_hardline_command(command) == (False, None)
+
+
 def test_valid_quoted_grep_passes_yolo_and_approvals_off_guards(
     clean_session, monkeypatch
 ):
