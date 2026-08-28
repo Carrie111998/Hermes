@@ -1,4 +1,3 @@
-import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 import { atom, batch, computed } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
@@ -268,8 +267,7 @@ export const $newChatRoute = atom<AgentProfileRoute | null>(null)
 // string "omar", and every follow-up RPC dialed requestGatewayForProfile
 // ("omar") — a DIFFERENT socket than the one that created the session —
 // and 4001'd "session not found" (#94071). null = the intent dials the legacy
-// profile-only path (a v1 primary with no registry identity, or a profile
-// pick on the explicit `local` source — see profilePickConnectionId).
+// profile-only path for a v1 primary with no registry identity.
 export const $newChatConnectionId = atom<null | string>(null)
 
 /** Capture the registry source a new-chat profile intent lands on — by
@@ -281,17 +279,13 @@ export function captureNewChatSource(connectionId: null | string = activeGateway
 
 /**
  * The registry source a PROFILE PICK dials, mirroring activateOnCurrentSource:
- * a live remote registry source keeps its connection id, while the primary and
- * the explicit `local` source take the legacy profile-only path (null) so the
- * main process can resolve a per-profile remote override before falling back
- * to a local backend. The draft's owner must name the socket that activation
- * dials — capturing `local` for a pick would mint the session on the registry
- * entry local::x while the window shows the override's socket.
+ * every live registry source keeps its connection id. In particular, the
+ * explicit `local` source means This device and must not fall through the v1
+ * global route, which may point at a remote primary. Only a primary with no
+ * registry identity uses the legacy profile-only path.
  */
 function profilePickConnectionId(): null | string {
-  const connectionId = activeGatewayConnectionId()
-
-  return connectionId && connectionId !== LOCAL_CONNECTION_ID ? connectionId : null
+  return activeGatewayConnectionId()
 }
 
 /**

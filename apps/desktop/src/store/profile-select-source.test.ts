@@ -62,13 +62,13 @@ describe('selectProfile', () => {
     expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
 
-  it('keeps the legacy profile-only path when the explicit local source is live', async () => {
+  it('keeps the pick on the explicit local registry source', async () => {
     activeGatewayConnectionId.mockReturnValue('local')
 
     selectProfile('override-profile')
 
-    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('override-profile'))
-    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('local', 'override-profile'))
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
 })
 
@@ -82,13 +82,13 @@ describe('newSessionInProfile', () => {
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
 
-  it('keeps the legacy profile-only path for a new chat on the explicit local source', async () => {
+  it('keeps a new chat on the explicit local registry source', async () => {
     activeGatewayConnectionId.mockReturnValue('local')
 
     newSessionInProfile('override-profile')
 
-    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('override-profile'))
-    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('local', 'override-profile'))
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
 })
 

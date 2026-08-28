@@ -17,7 +17,12 @@ import {
 import { knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
-import { publishSessionState, sessionTileOwnerRoute, setSessionTileDelegate } from '@/store/session-states'
+import {
+  holdSessionOwnerUntilForeground,
+  publishSessionState,
+  sessionTileOwnerRoute,
+  setSessionTileDelegate
+} from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -235,6 +240,7 @@ export function useSessionTileDelegate({
         // launch-profile DB and fork the conversation into the wrong profile —
         // the same cross-profile bleed the recovery resumes had (#67603).
         const owner = await ownerForStoredSession(storedSessionId)
+        const releaseOwnerHold = holdSessionOwnerUntilForeground(storedSessionId, owner)
 
         const restScope =
           owner && typeof owner === 'object'
@@ -284,7 +290,10 @@ export function useSessionTileDelegate({
 
             return stored
           }
-        )
+        ).catch(error => {
+          releaseOwnerHold()
+          throw error
+        })
 
         const prefetch = await prefetchPromise
 
@@ -301,13 +310,13 @@ export function useSessionTileDelegate({
             }),
             storedSessionId
           )
-
           notify({
             kind: 'info',
             title: translateNow('desktop.readOnlyTranscriptTitle'),
             message: translateNow('desktop.readOnlyTranscriptBody')
           })
 
+          releaseOwnerHold()
           return readOnlyId
         }
 
@@ -316,6 +325,7 @@ export function useSessionTileDelegate({
         const runtimeId = resumed?.session_id
 
         if (!runtimeId) {
+          releaseOwnerHold()
           throw new Error('resume returned no session id')
         }
 

@@ -4,8 +4,10 @@ import {
   $selectedStoredSessionId,
   _resetSessionOwnerHintsForTests,
   setActiveSessionId,
-  setSessionOwnerHint
+  setSessionOwnerHint,
+  setSessions
 } from '@/store/session'
+import type { SessionInfo } from '@/types/hermes'
 
 import {
   $sessionOwnerHoldRevision,
@@ -30,6 +32,7 @@ afterEach(() => {
   $selectedStoredSessionId.set(null)
   _resetSessionOwnerHoldsForTests()
   _resetSessionOwnerHintsForTests({ storage: true })
+  setSessions([])
   vi.useRealTimers()
 })
 
@@ -84,6 +87,27 @@ describe('foregroundSessionScopes: owner hold across the create → foreground g
     holdSessionOwnerUntilForeground('stored-c', omar)
     vi.advanceTimersByTime(60_000 + 1)
     expect(foregroundSessionScopes()).toEqual(new Set())
+  })
+
+  it('keeps an ownerless session tile pinned after its transition hold expires', () => {
+    vi.useFakeTimers()
+    setSessions([{ id: 'stored-mali', profile: 'mali' } as SessionInfo])
+    $sessionTiles.set([{ storedSessionId: 'stored-mali' }])
+    holdSessionOwnerUntilForeground('stored-mali', 'mali')
+
+    vi.advanceTimersByTime(60_000 + 1)
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['mali']))
+  })
+
+  it.each([
+    [{ id: 'stored-mali', profile: 'mali' }, 'mali'],
+    [{ id: 'stored-upwork', connection_id: 'local', profile: 'default' }, 'conn:local::default']
+  ])('keeps a selected session owner pinned after restart (%s)', (session, expectedScope) => {
+    setSessions([session as SessionInfo])
+    $selectedStoredSessionId.set(session.id)
+
+    expect(foregroundSessionScopes()).toEqual(new Set([expectedScope]))
   })
 
   it('publishes hold release and TTL expiry so pending gateway redials can drain without unrelated UI state', () => {

@@ -3,7 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
 import { setSessionOwnerHint, setSessions } from '@/store/session'
-import { sessionTileDelegate } from '@/store/session-states'
+import {
+  $sessionTiles,
+  _resetSessionOwnerHoldsForTests,
+  foregroundSessionScopes,
+  sessionTileDelegate
+} from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import { useSessionTileDelegate } from './use-session-tile-delegate'
@@ -64,11 +69,15 @@ function renderTile(
 describe('useSessionTileDelegate resumeTile', () => {
   beforeEach(() => {
     setSessions([])
+    $sessionTiles.set([])
+    _resetSessionOwnerHoldsForTests()
     vi.mocked(getLatestSessionMessages).mockClear()
   })
 
   afterEach(() => {
     setSessions([])
+    $sessionTiles.set([])
+    _resetSessionOwnerHoldsForTests()
   })
 
   it('carries the owning profile into a cold tile resume so it cannot fork profiles', async () => {
@@ -149,6 +158,22 @@ describe('useSessionTileDelegate resumeTile', () => {
       profile: 'default'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  it('pins a resolved tile owner until the resumed runtime becomes foreground', async () => {
+    $sessionTiles.set([{ storedSessionId: 'stored-routed' }])
+    setSessions([row({ connection_id: 'source-b', id: 'stored-routed', profile: 'default' })])
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockImplementationOnce(async () => {
+      expect(foregroundSessionScopes()).toEqual(new Set(['conn:source-b::default']))
+
+      return { session_id: 'runtime-routed' } as never
+    })
+
+    renderTile(ambientRequest)
+
+    await expect(sessionTileDelegate()!.resumeTile('stored-routed')).resolves.toBe('runtime-routed')
   })
 
   it('routes a Bot tile prefetch and resume through its exact connection owner', async () => {
