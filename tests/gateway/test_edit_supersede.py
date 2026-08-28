@@ -391,3 +391,35 @@ class TestHandleEditSupersede:
         assert result is True
         assert adapter._pending_messages[sk].text == "edit that matches both"
         agent.redirect.assert_not_called()
+
+
+# ===================================================================
+# Tests: rapid consecutive edits (latest-wins race)
+# ===================================================================
+
+class TestRapidConsecutiveEdits:
+    """Verify that consecutive synchronous edits on the same message
+    leave the queued event at the latest text (no stale state, no crash)."""
+
+    def test_rapid_consecutive_edits_latest_wins(self):
+        """Two back-to-back edits on the same message_id: final text wins."""
+        runner = _make_runner()
+        sk = "rapid_session"
+        adapter = _make_adapter()
+        # Prime the primary pending slot with an original message
+        adapter._pending_messages[sk] = _make_event(
+            text="original", message_id="900"
+        )
+
+        # Call _handle_edit_supersede twice in a row (synchronously, no await
+        # between) with two edit events for message_id "900".
+        edit_a = _make_event(text="edit A", message_id="900", is_edit=True)
+        edit_b = _make_event(text="edit B", message_id="900", is_edit=True)
+
+        runner._handle_edit_supersede(edit_a, sk, adapter)
+        runner._handle_edit_supersede(edit_b, sk, adapter)
+
+        # The queued event's text should be "edit B" — latest wins, no stale
+        # state, no crash.
+        assert adapter._pending_messages[sk].text == "edit B"
+        assert adapter._pending_messages[sk].message_id == "900"

@@ -9320,14 +9320,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           * No match (uncorrelated edit) -> silently dropped.  An isolated
             out-of-context correction would confuse the model.
 
-        SYNCHRONOUS: no await between queued-replace, in-flight check, and
-        decision.  All operations are in-memory attribute writes.
+        SYNCHRONOUS: this method and ``_replace_queued_message`` are only
+        called from the gateway's single asyncio event loop with **no await
+        points** between the queue check, the in-flight check, and the
+        mutation — cooperative scheduling therefore cannot interleave a queue
+        promotion or turn completion inside the correlation block, and no lock
+        is required.  Cross-vendor review (Gemini/GPT-OSS) verified this
+        invariant.
         """
         _is_edit = bool(event.metadata.get("is_edit", False) if event.metadata else False)
         _msg_id = event.message_id
         if not _is_edit or not _msg_id:
             return False  # not an edit — continue normal dispatch
 
+        # SECURITY: correlation is scoped by session_key (derived from
+        # platform + chat_id, distinct for group vs DM sessions).  Platform
+        # message ids are unique per chat, so an edit from user A cannot
+        # supersede a queued message from user B in a shared group — each
+        # group session is separate.
         # 1. Try queued supersede
         if self._replace_queued_message(session_key, adapter, _msg_id, event.text or ""):
             logger.info(

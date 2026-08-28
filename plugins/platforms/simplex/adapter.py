@@ -446,6 +446,10 @@ class SimplexAdapter(BasePlatformAdapter):
         # consumers can react differently (e.g. re-summarize instead of
         # append).  Outgoing-direction guard inside _handle_chat_item
         # naturally drops edits of the bot's own messages.
+        # NOTE: edited media items carry only their caption text on the edit
+        # event — file/image payloads are not reconstructed on edits
+        # (intentional; matches newChatItems behavior for caption-only
+        # edits).
         if resp_type == "chatItemUpdated":
             try:
                 await self._handle_chat_item(
