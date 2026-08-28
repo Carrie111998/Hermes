@@ -1959,8 +1959,12 @@ def _build_child_agent(
             child_session_db = None
 
     from agent.delegation_context import delegated_child_context
+    from agent.skill_utils import suppress_skill_read_grants
 
-    with delegated_child_context():
+    # A parent may have a CLI/Kanban-scoped exception to read an otherwise
+    # disabled skill. That privilege belongs to the parent request only and
+    # must not become ambient authority during child construction.
+    with delegated_child_context(), suppress_skill_read_grants():
         try:
             child = AIAgent(
                 base_url=effective_base_url,
@@ -2814,8 +2818,11 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from agent.skill_utils import suppress_skill_read_grants
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or "")
+            ), suppress_skill_read_grants():
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -2981,11 +2988,17 @@ def _run_single_child(
                 _schema_retries = 1
                 _retry_result = None
                 try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
+                    from agent.delegation_context import delegated_child_context
+                    from agent.skill_utils import suppress_skill_read_grants
+
+                    with delegated_child_context(
+                        str(getattr(child, "session_id", "") or "")
+                    ), suppress_skill_read_grants():
+                        _retry_result = child.run_conversation(
+                            user_message=build_retry_message(_schema_errors),
+                            task_id=child_task_id,
+                            stream_callback=_relay_child_text,
+                        )
                 except Exception as _retry_exc:
                     logger.warning(
                         "Subagent %d schema-retry turn failed: %s",
