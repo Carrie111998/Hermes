@@ -58,11 +58,16 @@ function profileNavigationKey(base: string, profile: string): string {
 // events, which are the only way another window can recontaminate between
 // ticks.
 let legacyDiscardNeeded = true
+let legacyWorkspaceDiscardNeeded = true
 
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', e => {
     if (e.key === LAST_SESSION_KEY || e.key === LAST_ROUTE_KEY) {
       legacyDiscardNeeded = true
+    }
+
+    if (e.key === WORKSPACE_CWD_KEY) {
+      legacyWorkspaceDiscardNeeded = true
     }
   })
 }
@@ -86,9 +91,28 @@ function discardLegacyRememberedNavigation(): void {
   }
 }
 
-/** @internal Reset the legacy-discard flag for tests. */
+/** Drop the pre-#96834 global workspace-cwd key once per tick.
+ *
+ *  Same reasoning as the navigation keys above: the un-suffixed key was shared
+ *  by every local profile, so its value's owning profile is unknowable and
+ *  migrating it into any one profile would be exactly the cross-profile leak
+ *  the per-profile scoping exists to prevent. Users re-pick a project once. */
+function discardLegacyRememberedWorkspaceCwd(): void {
+  if (!legacyWorkspaceDiscardNeeded) {
+    return
+  }
+
+  legacyWorkspaceDiscardNeeded = false
+
+  if (storedString(WORKSPACE_CWD_KEY) !== null) {
+    persistString(WORKSPACE_CWD_KEY, null)
+  }
+}
+
+/** @internal Reset the legacy-discard flags for tests. */
 export function _resetLegacyDiscardForTests(): void {
   legacyDiscardNeeded = true
+  legacyWorkspaceDiscardNeeded = true
 }
 
 export function getRememberedSessionId(profile: string): null | string {
@@ -213,17 +237,26 @@ export function setRememberedRoute(path: null | string, profile: string): void {
 let configuredDefaultProjectDir = ''
 
 function workspaceCwdKey(connection: HermesConnection | null = $connection.get()): string {
+  const profile = encodeURIComponent(connection?.profile?.trim() || 'default')
+
   if (connection?.mode !== 'remote') {
-    return WORKSPACE_CWD_KEY
+    // Local connections are still per-profile: one desktop runs multiple
+    // local profiles, and a single global key let one profile's remembered
+    // project leak into another profile's new-session cwd seeding (#96834).
+    return `${WORKSPACE_CWD_KEY}.local.${profile}`
   }
 
   const base = encodeURIComponent(connection.baseUrl || 'remote')
-  const profile = encodeURIComponent(connection.profile || 'default')
 
   return `${WORKSPACE_CWD_KEY}.remote.${base}.${profile}`
 }
 
-export const getRememberedWorkspaceCwd = (): string => storedString(workspaceCwdKey())?.trim() || ''
+export const getRememberedWorkspaceCwd = (): string => {
+  discardLegacyRememberedWorkspaceCwd()
+
+  return storedString(workspaceCwdKey())?.trim() || ''
+}
+
 export type NewChatWorkspaceTarget = null | string | undefined
 
 export const getConfiguredDefaultProjectDir = (): string => configuredDefaultProjectDir

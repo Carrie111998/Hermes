@@ -34,6 +34,7 @@ import {
   getConfiguredDefaultProjectDir,
   getRememberedRoute,
   getRememberedSessionId,
+  getRememberedWorkspaceCwd,
   getSessionOwnerHint,
   hydrateSessionOwnerHints,
   knownSessionOwner,
@@ -606,6 +607,9 @@ describe('workspaceCwdForNewSession', () => {
     $currentCwd.set('')
     $activeSessionId.set(null)
     window.localStorage.removeItem('hermes.desktop.workspace-cwd')
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.local.default')
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.local.profile-a')
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.local.profile-b')
     window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-a.default')
     window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-b.default')
     delete (window as { hermesDesktop?: unknown }).hermesDesktop
@@ -730,6 +734,39 @@ describe('workspaceCwdForNewSession', () => {
 
     expect($currentCwd.get()).toBe('/backend/some-other-project')
     expect(workspaceCwdForNewSession()).toBe('/backend/picked')
+  })
+
+  it('scopes the local workspace memory per profile (#96834)', () => {
+    // One desktop runs multiple local profiles; the remembered workspace must
+    // not leak from one profile's backend into another's new-session cwd
+    // seeding ($currentCwd's initial value reads the remembered key).
+    $connection.set({ baseUrl: '', mode: 'local', profile: 'profile-a' } as never)
+    setCurrentCwd('/home/user/project-a')
+
+    expect(getRememberedWorkspaceCwd()).toBe('/home/user/project-a')
+
+    $connection.set({ baseUrl: '', mode: 'local', profile: 'profile-b' } as never)
+    expect(getRememberedWorkspaceCwd()).toBe('')
+    expect(window.localStorage.getItem('hermes.desktop.workspace-cwd.local.profile-b')).toBeNull()
+
+    setCurrentCwd('/home/user/project-b')
+    expect(getRememberedWorkspaceCwd()).toBe('/home/user/project-b')
+
+    // Back on profile A: A's own memory, never B's.
+    $connection.set({ baseUrl: '', mode: 'local', profile: 'profile-a' } as never)
+    expect(getRememberedWorkspaceCwd()).toBe('/home/user/project-a')
+  })
+
+  it('discards the pre-scoping global workspace key instead of migrating it', () => {
+    // The un-suffixed key was shared by every local profile, so its value's
+    // owning profile is unknowable — migrating it into any one profile would
+    // be exactly the cross-profile leak the scoping prevents.
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.local.default')
+    window.localStorage.setItem('hermes.desktop.workspace-cwd', '/unknown-owner/project')
+    _resetLegacyDiscardForTests()
+
+    expect(getRememberedWorkspaceCwd()).toBe('')
+    expect(window.localStorage.getItem('hermes.desktop.workspace-cwd')).toBeNull()
   })
 
   it('settling a resumed session does not move where the next new chat starts', () => {
