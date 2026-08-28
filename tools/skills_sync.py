@@ -184,16 +184,6 @@ def _read_manifest() -> Dict[str, str]:
         return {}
 
 
-def get_bundled_skill_names() -> Set[str]:
-    """Return the set of skill names recorded in the active profile's bundled-skills manifest.
-
-    Used at runtime to identify which installed skills are of bundled provenance
-    (as opposed to user/agent-created skills). Returns an empty set when the
-    manifest file is missing, unreadable, or the profile has no bundled skills.
-    """
-    return set(_read_manifest().keys())
-
-
 def _read_suppressed_names() -> set:
     """Built-in skills the curator pruned — must NOT be re-seeded on sync.
 

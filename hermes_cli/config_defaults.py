@@ -2265,7 +2265,10 @@ DEFAULT_CONFIG = {
         # skills. User-authored (non-bundled) skills are unaffected.
         # Bundled skills are those recorded in
         # ``~/.hermes/skills/.bundled_manifest`` (auto-seeded from the
-        # bundled catalog).
+        # bundled catalog). If the manifest is missing (e.g. bundled skills
+        # never synced), the whitelist filters nothing — fail-open — so
+        # enabling it on an installation without the manifest cannot hide
+        # every skill.
         "bundled_whitelist": False,
         "bundled_enabled": [],
     },

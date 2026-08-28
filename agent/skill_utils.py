@@ -469,11 +469,11 @@ def _read_bundled_manifest_names() -> Set[str]:
                 # v1 format: plain name
                 names.add(line)
         return names
-    except (OSError, IOError):
+    except (OSError, IOError, UnicodeDecodeError):
         return set()
 
 
-def _bundled_whitelist_blocked(skills_cfg: dict) -> Set[str]:
+def _bundled_whitelist_blocked(skills_cfg: dict | None) -> Set[str]:
     """Return skill names that the bundled-skills whitelist blocks.
 
     When ``bundled_whitelist`` is truthy in *skills_cfg*, any bundled-provenance
@@ -484,7 +484,7 @@ def _bundled_whitelist_blocked(skills_cfg: dict) -> Set[str]:
     Essential skills (``ESSENTIAL_SKILLS``) are never blocked even when they
     are bundled and not in the enabled list.
     """
-    if not skills_cfg.get("bundled_whitelist"):
+    if not isinstance(skills_cfg, dict) or not skills_cfg.get("bundled_whitelist"):
         return set()
 
     bundled_names = _read_bundled_manifest_names()

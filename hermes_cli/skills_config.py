@@ -205,18 +205,27 @@ def skills_command(args=None):
         # Anything NOT chosen is disabled
         new_disabled = {skills[i]["name"] for i in range(len(skills)) if i not in chosen}
 
-    if new_disabled == disabled:
-        print(color("  No changes.", Colors.DIM))
-        return
-
     # Whitelist-blocked skills must NOT be persisted into skills.disabled:
     # they appear disabled in the UI but the user didn't explicitly toggle
     # them off. Toggling whitelist off later would otherwise leave stale
-    # disabled entries.
+    # disabled entries. Enabling one from this UI cannot take effect while
+    # the whitelist is active — manage allowlisted names via
+    # skills.bundled_enabled in config.yaml.
     from agent.skill_utils import _bundled_whitelist_blocked
-    whitelist_blocked = _bundled_whitelist_blocked(config.get("skills", {}))
-    new_disabled = new_disabled - whitelist_blocked
+    whitelist_blocked = _bundled_whitelist_blocked(config.get("skills") or {})
+    persisted_disabled = new_disabled - whitelist_blocked
 
-    save_disabled_skills(config, new_disabled, platform)
-    enabled_count = len(skills) - len(new_disabled)
-    print(color(f"✓ Saved: {enabled_count} enabled, {len(new_disabled)} disabled ({platform_label}).", Colors.GREEN))
+    if persisted_disabled == disabled - whitelist_blocked:
+        print(color(
+            "  No changes saved (only whitelist-blocked skills toggled; "
+            "allow them via skills.bundled_enabled in config.yaml).",
+            Colors.YELLOW,
+        ))
+        return
+
+    save_disabled_skills(config, persisted_disabled, platform)
+    names = {s["name"] for s in skills}
+    masked = whitelist_blocked & names
+    enabled_count = len(skills) - len(persisted_disabled | masked)
+    masked_note = f" (+{len(masked)} whitelist-blocked)" if masked else ""
+    print(color(f"✓ Saved: {enabled_count} enabled, {len(persisted_disabled)} disabled{masked_note} ({platform_label}).", Colors.GREEN))
