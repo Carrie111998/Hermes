@@ -8530,7 +8530,7 @@ const {
  * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
  * itself a keychain touch that raises the macOS dialog this feature exists
  * to avoid. We report `true` so no plain-text warning banners fire: storing
- * plaintext is the user's chosen (default) mode, not a degraded state.
+ * plaintext is the user's explicit choice, not the default mode.
  */
 function probeSecureTokenStorage(): boolean {
   if (!secretStoragePolicy().on) {

@@ -29,7 +29,7 @@
  */
 
 export interface SecretStoragePolicy {
-  /** Keychain-backed encryption enabled (explicit user opt-in). */
+  /** Keychain-backed encryption enabled; defaults on, with explicit opt-out. */
   on: boolean
   /** One-shot legacy-blob migration already attempted. */
   migrated: boolean
