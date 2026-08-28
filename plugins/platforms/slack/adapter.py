@@ -466,11 +466,11 @@ _SLACK_REQUERY_PATTERNS = (
     ),
     re.compile(
         r"(?:다시|재조회|새로|최신).{0,16}(?:값|데이터|결과).{0,16}"
-        r"(?:가져|조회|확인|갱신|업데이트)"
+        r"(?:가져|가저|가지고\s*와|조회|확인|갱신|업데이트)"
     ),
     re.compile(
         r"(?:값|데이터|결과).{0,16}(?:다시|재조회|새로|최신).{0,16}"
-        r"(?:가져|조회|확인|갱신|업데이트)"
+        r"(?:가져|가저|가지고\s*와|조회|확인|갱신|업데이트)"
     ),
 )
 
@@ -8050,29 +8050,76 @@ class SlackAdapter(BasePlatformAdapter):
         team_id: str = "",
     ) -> str:
         """Recover a nearby self-authored root report for a fresh-data request."""
-        try:
-            result = await self._get_client(
-                channel_id, team_id=team_id
-            ).conversations_history(
-                channel=channel_id,
-                latest=current_ts,
-                inclusive=False,
-                limit=50,
+        session_store = getattr(self, "_session_store", None)
+        ensure_loaded = getattr(session_store, "_ensure_loaded", None)
+        if callable(ensure_loaded):
+            ensure_loaded()
+        canonical_threads = {
+            str(origin.thread_id)
+            for entry in getattr(session_store, "_entries", {}).values()
+            if (origin := getattr(entry, "origin", None))
+            and origin.platform == Platform.SLACK
+            and str(origin.chat_id) == str(channel_id)
+            and origin.user_id == "system:cron"
+            and origin.thread_id
+            and (
+                not team_id
+                or not getattr(origin, "scope_id", None)
+                or str(origin.scope_id) == str(team_id)
             )
+        }
+        if len(canonical_threads) > 1:
+            return (
+                "[Slack 재조회 컨텍스트] 가까운 보고서가 여러 개입니다. "
+                "어느 보고서인지 사용자에게 물어보고 원본 도구를 실행하지 마십시오.\n\n"
+            )
+
+        try:
+            client = self._get_client(channel_id, team_id=team_id)
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-            current = float(current_ts)
             candidates = []
-            for message in (result or {}).get("messages", []):
+            history_messages = []
+            if canonical_threads:
+                thread_ts = next(iter(canonical_threads))
+                result = await client.conversations_replies(
+                    channel=channel_id,
+                    ts=thread_ts,
+                    limit=1,
+                    inclusive=True,
+                )
+                messages = (result or {}).get("messages", [])
+                if messages:
+                    message = messages[0]
+                    if (
+                        message.get("user") == bot_uid
+                        and str(message.get("ts") or "") == thread_ts
+                    ):
+                        text = self._render_message_text(
+                            message, bot_uid=bot_uid or ""
+                        ).strip()
+                        if len(text) >= 40:
+                            candidates.append(text)
+
+            if not candidates:
+                result = await client.conversations_history(
+                    channel=channel_id,
+                    latest=current_ts,
+                    inclusive=False,
+                    limit=50,
+                )
+                history_messages = (result or {}).get("messages", [])
+            for message in history_messages:
                 message_ts = str(message.get("ts") or "")
                 thread_ts = str(message.get("thread_ts") or "")
                 if (
                     message.get("user") != bot_uid
                     or (thread_ts and thread_ts != message_ts)
                     or not message_ts
-                    or current - float(message_ts) > 900
                 ):
                     continue
-                text = self._render_message_text(message, bot_uid=bot_uid or "").strip()
+                text = self._render_message_text(
+                    message, bot_uid=bot_uid or ""
+                ).strip()
                 if len(text) >= 40:
                     candidates.append(text)
                 if len(candidates) == 3:

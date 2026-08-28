@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from plugins.platforms.slack.adapter import SlackAdapter, _slack_requery_intent
 
 
@@ -40,6 +40,10 @@ def routing_adapter():
 @pytest.mark.parametrize(
     "text",
     [
+        "다시 값을 가지고 와줘",
+        "값을 다시 가지고 와 주세요",
+        "다시 값 가지고와줘",
+        "다시 값을 가저와줘",
         "다시 값을 가져와줘",
         "방금 보고 데이터를 다시 조회해줘",
         "이전 결과를 최신 값으로 갱신해줘",
@@ -57,15 +61,19 @@ def test_requery_intent_rejects_unrelated_messages(text):
     assert not _slack_requery_intent(text)
 
 
-def _adapter(messages):
+def _adapter(messages, *, session_entries=None, thread_messages=None):
     adapter = object.__new__(SlackAdapter)
     adapter.config = PlatformConfig(enabled=True, extra={})
     adapter._bot_user_id = "U_BOT"
     adapter._team_bot_user_ids = {}
     client = SimpleNamespace(
-        conversations_history=AsyncMock(return_value={"messages": messages})
+        conversations_history=AsyncMock(return_value={"messages": messages}),
+        conversations_replies=AsyncMock(
+            return_value={"messages": thread_messages or []}
+        ),
     )
     adapter._get_client = lambda *_args, **_kwargs: client
+    adapter._session_store = SimpleNamespace(_entries=session_entries or {})
     return adapter, client
 
 
@@ -85,6 +93,69 @@ async def test_root_requery_recovers_single_nearest_self_report(channel_id):
     client.conversations_history.assert_awaited_once_with(
         channel=channel_id, latest="100.0", inclusive=False, limit=50
     )
+
+
+@pytest.mark.asyncio
+async def test_root_requery_history_fallback_accepts_hours_old_report():
+    adapter, _ = _adapter([
+        {"ts": "100.0", "user": "U_BOT", "text": "항공권 보고: " + "원본 값 " * 10},
+    ])
+
+    context = await adapter._fetch_requery_context("G_PRIVATE", "20000.0")
+
+    assert "항공권 보고" in context
+
+
+@pytest.mark.asyncio
+async def test_root_requery_prefers_canonical_cron_session_hours_later():
+    adapter, client = _adapter(
+        [
+            {"ts": "19999.0", "user": "U_BOT", "text": "unlinked report " * 10},
+        ],
+        session_entries={
+            "cron-report": SimpleNamespace(
+                origin=SimpleNamespace(
+                    platform=Platform.SLACK,
+                    chat_id="C1",
+                    thread_id="100.0",
+                    user_id="system:cron",
+                )
+            )
+        },
+        thread_messages=[
+            {"ts": "100.0", "user": "U_BOT", "text": "항공권 보고 " * 10},
+        ],
+    )
+
+    context = await adapter._fetch_requery_context("C1", "20000.0")
+
+    assert "항공권 보고" in context
+    client.conversations_replies.assert_awaited_once_with(
+        channel="C1", ts="100.0", limit=1, inclusive=True
+    )
+    client.conversations_history.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_root_requery_fails_closed_for_multiple_canonical_cron_sessions():
+    origins = {
+        name: SimpleNamespace(
+            origin=SimpleNamespace(
+                platform=Platform.SLACK,
+                chat_id="C1",
+                thread_id=ts,
+                user_id="system:cron",
+            )
+        )
+        for name, ts in (("first", "100.0"), ("second", "200.0"))
+    }
+    adapter, client = _adapter([], session_entries=origins)
+
+    context = await adapter._fetch_requery_context("C1", "20000.0")
+
+    assert "가까운 보고서가 여러 개" in context
+    client.conversations_replies.assert_not_awaited()
+    client.conversations_history.assert_not_awaited()
 
 
 @pytest.mark.asyncio
