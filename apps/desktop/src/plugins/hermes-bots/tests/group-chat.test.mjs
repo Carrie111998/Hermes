@@ -1435,6 +1435,13 @@ test('default profile speaks as Hermes in room transcripts, not @default', () =>
   assert.equal(plain, 'builder: yo')
 })
 
+test('human speaker is named G in member-facing group transcripts', () => {
+  const gc = load(() => '(pass)')
+  const line = gc.formatGroupChatLine({ from: { kind: 'user', name: 'You' }, text: 'hello room' }, 'builder')
+
+  assert.equal(line, 'G (user): hello room')
+})
+
 test('speaker labels honor friendly identity: Bot Mode title, then display_name, never a stale Hermes', () => {
   const gc = load(() => '(pass)')
 
@@ -1831,11 +1838,11 @@ test('source contract: group chat message bodies opt back into selectable text',
   assert.match(src, /'data-selectable-text':\s*'true'/)
 })
 
-test('group room preview renders the bot HANDLE, not the raw profile name', () => {
+test('group room preview renders the bot HANDLE and the human label, not raw identity fields', () => {
   // #89484: the room line read "@default: …" while the bot answers to
   // @hermes, so users concluded mention routing was broken.
   assert.match(pluginSource, /const lastHandle = botHandle\(lastFrom \|\| 'bot', members\.find\(/)
-  assert.match(pluginSource, /\? `\$\{last\.from\?\.kind === 'user' \? 'You' : `@\$\{lastHandle\}`\}/)
+  assert.match(pluginSource, /\? `\$\{last\.from\?\.kind === 'user' \? GROUP_HUMAN_LABEL : `@\$\{lastHandle\}`\}/)
   assert.doesNotMatch(pluginSource, /`@\$\{last\.from\?\.name \|\| 'bot'\}`/)
 })
 
