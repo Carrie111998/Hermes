@@ -351,6 +351,25 @@ def _durable_run_status(
             }
         )
         self._run_idempotency_store.update_status(run_id, status)
+        if status.get("room_artifact_scope"):
+            try:
+                from gateway.hosted_room_artifacts import (
+                    RoomArtifactOutbox,
+                    RoomArtifactScope,
+                )
+                from hermes_constants import get_hermes_home
+
+                RoomArtifactOutbox(
+                    Path(get_hermes_home()) / "state.db"
+                ).discard(
+                    RoomArtifactScope.from_mapping(status["room_artifact_scope"])
+                )
+            except Exception:
+                logger.warning(
+                    "failed to discard interrupted room artifacts for %s",
+                    run_id,
+                    exc_info=True,
+                )
 
     self._run_statuses[run_id] = status
     self._run_idempotency_ids.add(run_id)

@@ -1202,10 +1202,32 @@ class TestRunIdempotency:
 
     @pytest.mark.asyncio
     async def test_dead_owner_nonterminal_status_becomes_interrupted(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
+        from gateway.hosted_room_artifacts import (
+            RoomArtifactOutbox,
+            RoomArtifactScope,
+        )
         from gateway.platforms.api_server import RunIdempotencyStore
 
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        room_scope = RoomArtifactScope.from_mapping({
+            "room_id": "room-stale",
+            "task_id": "task-stale",
+            "execution_generation": 1,
+            "member_id": "member-stale",
+            "target_profile": "default",
+            "home_install_id": "install-home",
+            "target_install_id": "install-target",
+            "authority_gateway_id": "gateway-home",
+            "authority_epoch": 1,
+        })
+        output = tmp_path / "stale.md"
+        output.write_text("stale\n", encoding="utf-8")
+        outbox = RoomArtifactOutbox(home / "state.db")
+        outbox.put_path(scope=room_scope, path=output)
         path = tmp_path / "idem.db"
         scope = hashlib.sha256(
             "default\0unauthenticated-test-listener".encode()
@@ -1216,7 +1238,11 @@ class TestRunIdempotency:
             "stale-run",
             "fingerprint",
             "run_stale",
-            {"run_id": "run_stale", "status": "running"},
+            {
+                "run_id": "run_stale",
+                "status": "running",
+                "room_artifact_scope": room_scope.as_mapping(),
+            },
             owner_pid=999_999_999,
             owner_started=1,
         )
@@ -1231,6 +1257,7 @@ class TestRunIdempotency:
         assert response.status == 200
         assert body["status"] == "interrupted"
         assert body["last_event"] == "run.interrupted"
+        assert outbox.list(room_scope) == []
 
     def test_progress_event_does_not_fsync_unchanged_running_status(self, adapter):
         adapter._run_statuses["run_progress"] = {
