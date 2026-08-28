@@ -35,6 +35,7 @@ Design reference:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import threading
@@ -62,6 +63,31 @@ def _same_endpoint(a: str, b: str) -> bool:
         pa.scheme == pb.scheme
         and pa.netloc.lower() == pb.netloc.lower()
         and pa.path.rstrip("/") == pb.path.rstrip("/")
+    )
+
+
+def _equivalent_root_issuers(a: str, b: str) -> bool:
+    """Return whether issuer URLs differ only by the root path's slash.
+
+    RFC 8414 normally requires exact issuer string matching. This narrow
+    interoperability exception does not normalize scheme, authority, query,
+    fragment, or non-root paths, which can identify different issuers.
+    """
+    from urllib.parse import urlsplit
+
+    if not (a + "/" == b or b + "/" == a):
+        return False
+    try:
+        parsed = (urlsplit(a), urlsplit(b))
+    except ValueError:
+        return False
+    return all(
+        url.scheme
+        and url.netloc
+        and url.path in ("", "/")
+        and not url.query
+        and not url.fragment
+        for url in parsed
     )
 
 
@@ -110,7 +136,10 @@ def _make_hermes_provider_class() -> Optional[type]:
     MCP SDK's OAuth module is unavailable (e.g. older mcp versions).
     """
     try:
-        from mcp.client.auth.oauth2 import OAuthClientProvider
+        from mcp.client.auth.oauth2 import (
+            OAuthClientProvider,
+            build_oauth_authorization_server_metadata_discovery_urls,
+        )
     except ImportError:  # pragma: no cover — SDK required in CI
         return None
 
@@ -501,6 +530,48 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self._hermes_server_name, exc,
                 )
 
+        async def _align_equivalent_metadata_issuer(self, response: Any) -> None:
+            """Align the SDK's expected issuer for a root-slash-only mismatch."""
+            expected = self.context.auth_server_url
+            if expected is None or getattr(response, "status_code", None) != 200:
+                return
+            try:
+                payload = json.loads(await response.aread())
+            except (TypeError, ValueError):
+                return
+            actual = payload.get("issuer") if isinstance(payload, dict) else None
+            if isinstance(actual, str) and _equivalent_root_issuers(actual, expected):
+                self.context.auth_server_url = actual
+
+        async def _align_equivalent_bound_issuer(self, response: Any) -> None:
+            """Keep credentials bound across a root-slash-only PRM mismatch."""
+            client_info = self.context.client_info
+            bound = getattr(client_info, "issuer", None)
+            if not isinstance(bound, str) or getattr(response, "status_code", None) != 200:
+                return
+            try:
+                payload = json.loads(await response.aread())
+            except (TypeError, ValueError):
+                return
+            servers = payload.get("authorization_servers") if isinstance(payload, dict) else None
+            if not isinstance(servers, list):
+                return
+            for advertised in servers:
+                if isinstance(advertised, str) and _equivalent_root_issuers(bound, advertised):
+                    client_info.issuer = advertised
+                    return
+
+        def _is_auth_metadata_request(self, request: Any) -> bool:
+            """Return whether a yielded request is SDK authorization metadata discovery."""
+            try:
+                candidates = build_oauth_authorization_server_metadata_discovery_urls(
+                    self.context.auth_server_url,
+                    self.context.server_url,
+                )
+                return str(request.url) in candidates
+            except (AttributeError, TypeError, ValueError):
+                return False
+
         async def async_auth_flow(self, request):  # type: ignore[override]
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with
@@ -531,6 +602,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
             inner = super().async_auth_flow(request)
+            discovery_stage = None
             try:
                 outgoing = await inner.__anext__()
                 while True:
@@ -538,7 +610,22 @@ def _make_hermes_provider_class() -> Optional[type]:
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
+                    if discovery_stage == "protected-resource":
+                        await self._align_equivalent_bound_issuer(incoming)
+                    elif discovery_stage == "authorization-server":
+                        await self._align_equivalent_metadata_issuer(incoming)
+
+                    challenged_original_request = (
+                        outgoing is request
+                        and getattr(incoming, "status_code", None) == 401
+                    )
                     outgoing = await inner.asend(incoming)
+                    if challenged_original_request:
+                        discovery_stage = "protected-resource"
+                    elif self._is_auth_metadata_request(outgoing):
+                        discovery_stage = "authorization-server"
+                    elif discovery_stage == "authorization-server":
+                        discovery_stage = None
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.

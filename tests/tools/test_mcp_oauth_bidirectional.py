@@ -28,10 +28,30 @@ the bridge forwards responses correctly into the inner SDK generator.
 """
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 
 pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("https://secure.indeed.com", "https://secure.indeed.com/", True),
+        ("https://secure.indeed.com/", "https://secure.indeed.com", True),
+        ("https://secure.indeed.com/tenant", "https://secure.indeed.com/tenant/", False),
+        ("https://secure.indeed.com", "https://SECURE.indeed.com/", False),
+        ("https://secure.indeed.com", "http://secure.indeed.com/", False),
+        ("https://secure.indeed.com", "https://secure.indeed.com:443/", False),
+        ("https://secure.indeed.com?tenant=a", "https://secure.indeed.com?tenant=a/", False),
+    ],
+)
+def test_equivalent_root_issuers_is_narrow(left, right, expected):
+    from tools.mcp_oauth_manager import _equivalent_root_issuers
+
+    assert _equivalent_root_issuers(left, right) is expected
 
 
 @pytest.mark.asyncio
@@ -120,6 +140,62 @@ async def test_hermes_provider_forwards_asend_values(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hermes_provider_does_not_read_ordinary_success_response(
+    tmp_path, monkeypatch
+):
+    """Issuer compatibility must not consume successful MCP payloads."""
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            issuer="https://secure.indeed.com",
+        )
+    )
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+    provider.context.auth_server_url = "https://secure.indeed.com/"
+
+    flow = provider.async_auth_flow(
+        httpx.Request("POST", "https://example.com/mcp")
+    )
+    outbound = await flow.__anext__()
+    response = httpx.Response(200, request=outbound)
+    response.aread = AsyncMock(
+        side_effect=AssertionError("ordinary MCP response body was consumed")
+    )
+
+    with pytest.raises(StopAsyncIteration):
+        await flow.asend(response)
+    response.aread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypatch):
     """A 401 response MUST flow into the inner generator and trigger the
     SDK's 401 recovery branch.
@@ -203,6 +279,99 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     )
 
     # Clean up the generator — we don't need to complete the full dance.
+    await flow.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hermes_provider_accepts_root_issuer_trailing_slash_mismatch(
+    tmp_path, monkeypatch
+):
+    """A root ``/`` mismatch must not abort otherwise valid ASM discovery."""
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("indeed")
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            issuer="https://secure.indeed.com",
+        )
+    )
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="indeed",
+        server_url="https://mcp.indeed.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+    authorization_request = httpx.Request(
+        "GET", "https://secure.indeed.com/oauth/authorize"
+    )
+    provider._perform_authorization = AsyncMock(return_value=authorization_request)
+
+    flow = provider.async_auth_flow(
+        httpx.Request("POST", "https://mcp.indeed.com/mcp")
+    )
+    outbound = await flow.__anext__()
+    prm_request = await flow.asend(
+        httpx.Response(
+            401,
+            request=outbound,
+            headers={
+                "www-authenticate": (
+                    'Bearer resource_metadata="https://mcp.indeed.com/'
+                    '.well-known/oauth-protected-resource"'
+                )
+            },
+        )
+    )
+    asm_request = await flow.asend(
+        httpx.Response(
+            200,
+            request=prm_request,
+            json={
+                "resource": "https://mcp.indeed.com/mcp",
+                "authorization_servers": ["https://secure.indeed.com/"],
+            },
+        )
+    )
+
+    next_request = await flow.asend(
+        httpx.Response(
+            200,
+            request=asm_request,
+            json={
+                "issuer": "https://secure.indeed.com",
+                "authorization_endpoint": (
+                    "https://secure.indeed.com/oauth/authorize"
+                ),
+                "token_endpoint": "https://secure.indeed.com/oauth/token",
+                "response_types_supported": ["code"],
+            },
+        )
+    )
+
+    assert next_request is authorization_request
+    assert provider.context.client_info is not None
+    assert str(provider.context.oauth_metadata.issuer) == "https://secure.indeed.com"
     await flow.aclose()
 
 
