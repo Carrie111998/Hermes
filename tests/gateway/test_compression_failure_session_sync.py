@@ -20,7 +20,9 @@ class _SessionStore:
             session_id="session-before-compression",
         )
         self._entries = {SESSION_KEY: self.entry}
+        self._lock = threading.RLock()
         self.save_calls = 0
+        self.advance_calls = []
         self.peer_records = []
 
     def _save(self):
@@ -30,6 +32,30 @@ class _SessionStore:
         # #55300 records the child's gateway peer metadata after a compression
         # split; the fake tracks the call so tests can assert it fired.
         self.peer_records.append((session_id, session_key, source))
+
+    def advance_compression_session(
+        self, session_key, expected_session_id, target_session_id
+    ):
+        """Model SessionStore's atomic compression route compare-and-swap."""
+        self.advance_calls.append(
+            (session_key, expected_session_id, target_session_id)
+        )
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            if entry.session_id == target_session_id:
+                return entry
+            if entry.session_id != expected_session_id:
+                return None
+            entry.session_id = target_session_id
+            self._save()
+            return entry
+
+    def peek_session_id(self, session_key):
+        with self._lock:
+            entry = self._entries.get(session_key)
+            return entry.session_id if entry is not None else None
 
 
 class _CompressionThenFailureAgent:
@@ -172,6 +198,13 @@ def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
     assert result["history_offset"] == 0
     assert session_store.entry.session_id == "session-after-compression"
     assert session_store.save_calls == 1
+    assert session_store.advance_calls == [
+        (
+            SESSION_KEY,
+            "session-before-compression",
+            "session-after-compression",
+        )
+    ]
     # #55300: the child's gateway peer metadata is recorded on the persist path.
     assert session_store.peer_records == [
         ("session-after-compression", SESSION_KEY, source)
@@ -179,6 +212,36 @@ def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
     runner._sync_telegram_topic_binding.assert_called_once_with(
         source, session_store.entry, reason="agent-run-compression"
     )
+
+
+def test_failed_turn_does_not_overwrite_newer_session_binding(monkeypatch):
+    _install_compression_failure_agent(monkeypatch)
+
+    session_store = _SessionStore()
+    session_store.entry.session_id = "newer-session"
+    runner = _runner(session_store)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = _run_compression_failure_turn(runner, source)
+
+    assert result["failed"] is True
+    assert result["session_id"] == "session-after-compression"
+    assert session_store.entry.session_id == "newer-session"
+    assert session_store.save_calls == 0
+    assert session_store.advance_calls == [
+        (
+            SESSION_KEY,
+            "session-before-compression",
+            "session-after-compression",
+        )
+    ]
+    assert session_store.peer_records == []
+    runner._sync_telegram_topic_binding.assert_not_called()
 
 
 class _RateLimitFailureAgent(_CompressionThenFailureAgent):
@@ -281,5 +344,4 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
             ],
             "api_calls": 1,
         }
-
 
