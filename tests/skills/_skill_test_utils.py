@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def parse_frontmatter_and_body(skill_path: Path) -> tuple[dict[str, Any], str]:
     """Extract YAML frontmatter and body from a SKILL.md file."""
-    content = skill_path.read_text(encoding="utf-8")
+    content = skill_path.read_text(encoding="utf-8").lstrip("\ufeff\r\n\t ")
     assert content.startswith("---"), f"{skill_path}: SKILL.md must start with ---"
     m = re.search(r"\n---\s*\n", content[3:])
     assert m, f"{skill_path}: unclosed frontmatter"
