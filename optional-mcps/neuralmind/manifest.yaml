@@ -1,0 +1,56 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+#
+# Schema version 1.
+manifest_version: 1
+
+name: neuralmind
+description: >-
+  Persistent code-intelligence memory for AI agents: progressive-disclosure
+  semantic search (12-50x cheaper than raw file reads) plus a local Hebbian
+  synapse graph that learns which code moves together from real usage. Runs
+  entirely local; makes no network calls of its own.
+source: https://github.com/dfrostar/neuralmind
+
+# neuralmind-mcp is a PyPI console-script entry point, not a git-cloned
+# server — there is nothing to clone or bootstrap, so no `install:` block.
+# It differs from the npm/uvx case this field is normally omitted for: npx/uvx
+# auto-install on first run, pip does not. `pip install neuralmind` (or
+# pointing `command` at the right venv's binary) is a precondition, spelled
+# out below in `post_install` for the installing user.
+transport:
+  type: stdio
+  command: neuralmind-mcp
+  args: []
+
+auth:
+  type: none
+
+# All tools enabled by default: unlike n8n's mutating workflow actions,
+# nothing here reaches outside the local project directory or makes a
+# network call — `neuralmind_build` only rebuilds the local index.
+tools:
+  default_enabled:
+    - neuralmind_wakeup
+    - neuralmind_query
+    - neuralmind_search
+    - neuralmind_skeleton
+    - neuralmind_synaptic_neighbors
+    - neuralmind_synapse_stats
+    - neuralmind_synapse_decay
+    - neuralmind_export_synapse_memory
+    - neuralmind_build
+    - neuralmind_stats
+    - neuralmind_benchmark
+
+post_install: |
+  Requires `pip install neuralmind` first — the catalog does not install
+  it for you. If neuralmind lives in a virtualenv, point `transport.command`
+  at that venv's `neuralmind-mcp` binary instead of the bare command.
+
+  Every tool call takes its own `project_path` argument; there is no launch
+  argument to configure. Run `neuralmind build <project>` once per project
+  before querying — an unbuilt project returns `built: false` instead of
+  context.
+
+  Start a new Hermes session to load the neuralmind tools.
