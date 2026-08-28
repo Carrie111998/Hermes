@@ -117,6 +117,8 @@ interface ProjectTreeState {
   loaded: boolean
   openState: Record<string, boolean>
   requestId: number
+  /** Bumped only by an external tree reset so a mounted hook re-runs its root read. */
+  resetNonce: number
   /** Directory the displayed entries were read from ('' until first load). */
   resolvedCwd: string
   rootError: string | null
@@ -130,6 +132,7 @@ const initialState: ProjectTreeState = {
   loaded: false,
   openState: {},
   requestId: 0,
+  resetNonce: 0,
   resolvedCwd: '',
   rootError: null,
   rootLoading: false
@@ -138,6 +141,7 @@ const initialState: ProjectTreeState = {
 const inflight = new Set<string>()
 const $projectTree = atom<ProjectTreeState>(initialState)
 let nextRootRequestId = 0
+let nextResetNonce = 0
 let lastConnectionKey = ''
 
 // While the root is errored (ENOENT during a session's cwd race, a folder that
@@ -152,7 +156,7 @@ function setProjectTree(updater: (current: ProjectTreeState) => ProjectTreeState
 function clearProjectTree() {
   nextRootRequestId += 1
   inflight.clear()
-  $projectTree.set({ ...initialState, requestId: nextRootRequestId })
+  $projectTree.set({ ...initialState, requestId: nextRootRequestId, resetNonce: nextResetNonce })
 }
 
 /** Sessions record their launch cwd; deleted worktrees and remote-backend
@@ -211,6 +215,7 @@ async function loadRoot(
     loaded: false,
     openState: current.cwd === cwd ? current.openState : {},
     requestId,
+    resetNonce: current.resetNonce,
     resolvedCwd: '',
     rootError: null,
     rootLoading: true
@@ -259,6 +264,7 @@ async function loadRoot(
 
 export function resetProjectTreeState() {
   lastConnectionKey = ''
+  nextResetNonce += 1
   clearProjectTree()
   clearProjectDirCache()
 }
@@ -471,7 +477,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
     }
 
     void loadRoot(cwd, { connectionKey })
-  }, [connectionKey, cwd])
+  }, [connectionKey, cwd, state.resetNonce])
 
   // Self-heal: an errored root re-probes every few seconds while the tree is
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the
