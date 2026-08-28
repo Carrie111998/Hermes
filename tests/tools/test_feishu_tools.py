@@ -75,14 +75,14 @@ class TestFeishuToolClientFallback(unittest.TestCase):
         import tools.feishu_client_binding as binding
 
         shared = object()
-        binding.publish(shared, generation=1)
+        binding.publish(shared)
         self.assertIs(self._resolve_in_worker_thread(doc_tool), shared)
 
     def test_drive_tool_binding_resolves_in_worker_thread(self):
         import tools.feishu_client_binding as binding
 
         shared = object()
-        binding.publish(shared, generation=1)
+        binding.publish(shared)
         self.assertIs(self._resolve_in_worker_thread(drive_tool), shared)
 
     def test_thread_local_precedence_over_binding(self):
@@ -90,7 +90,7 @@ class TestFeishuToolClientFallback(unittest.TestCase):
 
         shared = object()
         local = object()
-        binding.publish(shared, generation=1)
+        binding.publish(shared)
         doc_tool.set_client(local)
         self.assertIs(doc_tool.get_client(), local)
 
