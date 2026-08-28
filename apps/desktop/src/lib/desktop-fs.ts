@@ -87,11 +87,8 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
   return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path))
 }
 
-/**
- * Read a composer text file local-shell first, even when the active agent is
- * remote. Picker, clipboard, and OS-drop paths belong to this machine; in-app
- * project-tree paths may belong only to the gateway and fall back there.
- */
+/** Read an explicitly local-origin attachment from the shell, falling back to
+ * the active gateway only when the local path cannot be read. */
 export async function readDesktopFileTextLocalFirst(path: string): Promise<HermesReadFileTextResult> {
   try {
     const local = await window.hermesDesktop?.readFileText?.(path)

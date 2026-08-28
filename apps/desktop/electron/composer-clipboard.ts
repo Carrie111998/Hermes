@@ -4,7 +4,8 @@
 const MAX_CLIPBOARD_TEXT_JSON_BYTES = 2 * 1024 * 1024
 const MAX_COMPOSER_CLIPBOARD_TEXT_BYTES = 10 * 1024 * 1024
 
-type ClipboardTextSaveResult = { status: 'saved'; path: string } | { status: 'empty' } | { status: 'too_large' }
+type ClipboardTextSaveResult =
+  { status: 'saved'; path: string } | { status: 'empty' } | { status: 'image' } | { status: 'too_large' }
 
 function clipboardTextByteLength(text: unknown) {
   return Buffer.byteLength(String(text || ''), 'utf8')

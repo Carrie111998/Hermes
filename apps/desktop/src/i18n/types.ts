@@ -2929,6 +2929,7 @@ export interface Translations {
     clipboard: string
     noClipboardImage: string
     noClipboardText: string
+    clipboardImageInstead: string
     clipboardTextTooLarge: string
     clipboardPasteFailed: string
     dropFiles: string

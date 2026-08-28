@@ -415,7 +415,8 @@ export function useComposerActions({
           label: pathLabel(path),
           detail: rel,
           refText: `@${kind}:${formatRefValue(rel)}`,
-          path
+          path,
+          localFile: true
         })
       }
     },
@@ -456,7 +457,8 @@ export function useComposerActions({
         label: pathLabel(filePath),
         detail: rel,
         refText: `@file:${formatRefValue(rel)}`,
-        path: filePath
+        path: filePath,
+        localFile: true
       })
 
       return true
@@ -602,6 +604,16 @@ export function useComposerActions({
         return false
       }
 
+      if (result.status === 'image') {
+        notify({
+          kind: 'warning',
+          title: copy.clipboard,
+          message: copy.clipboardImageInstead
+        })
+
+        return false
+      }
+
       if (result.status === 'too_large') {
         notify({
           kind: 'warning',
@@ -621,6 +633,7 @@ export function useComposerActions({
   }, [
     attachContextFilePath,
     copy.clipboard,
+    copy.clipboardImageInstead,
     copy.clipboardPasteFailed,
     copy.clipboardTextTooLarge,
     copy.noClipboardText

@@ -2930,6 +2930,7 @@ export const zhHant = defineLocale({
     clipboard: '剪貼簿',
     noClipboardImage: '剪貼簿中沒有圖片',
     noClipboardText: '剪貼簿中沒有文字',
+    clipboardImageInstead: '剪貼簿中有圖片。請改用「貼上圖片」。',
     clipboardTextTooLarge: '剪貼簿文字過大，無法附加（最大 10 MB）',
     clipboardPasteFailed: '剪貼簿貼上失敗',
     dropFiles: '拖曳檔案',
