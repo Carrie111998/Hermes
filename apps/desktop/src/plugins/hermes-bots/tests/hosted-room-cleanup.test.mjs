@@ -19,6 +19,11 @@ test('hosted rooms never advertise a file drop target they will reject', () => {
 })
 
 test('hosted rooms stage files only after every gateway advertises support', () => {
+  assert.match(
+    pluginSource,
+    /async function sendHostedGroupChat\(group, members, sent, thread, attachments\)/
+  )
+  assert.match(pluginSource, /sendHostedGroupChat\(group, members, sent, target, attached\)/)
   assert.match(pluginSource, /async function stageHostedAttachments/)
   assert.match(pluginSource, /function hostedGroupAttachmentAvailability/)
   assert.match(pluginSource, /catalog\?\.attachments !== true/)
