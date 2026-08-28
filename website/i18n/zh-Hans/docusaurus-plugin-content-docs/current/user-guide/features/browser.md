@@ -60,6 +60,34 @@ BROWSER_USE_API_KEY=***
 
 在 [browser-use.com](https://browser-use.com) 获取 API 密钥。Browser Use 通过 REST API 提供云端浏览器。若同时设置了 Browserbase 和 Browser Use 凭据，Browserbase 优先。
 
+### Browser Use 模式（默认）
+
+Browser Use 模式使用 [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) 替代内置浏览器工具。Agent 会在浏览器中编写并执行 Python 代码，以完成点击、输入、拖拽、抓取以及与网页的交互操作。
+
+**这是默认的浏览器模式**：当 `browser.backend` 未设置且 `browser-use` CLI 可运行时（已安装，或可通过 `uvx` 获取），Agent 获得单一的 `browser_exec` 工具。如果 CLI 无法运行，Hermes 会自动回退到内置浏览器工具。
+
+该模式是一个**驱动程序**，可与您配置的浏览器后端组合使用：驱动您的本地 Chrome、Nous 订阅云端浏览器、Browserbase、Firecrawl 或 Browser Use 云端浏览器 —— 取决于在 `hermes tools` → Browser Automation 中选择的浏览器来源。唯一的例外是 Camofox，它没有供 harness 连接的 CDP 端点；Camofox 配置会自动保留内置浏览器工具。
+
+**并发会话：** `browser_exec` 接受 `session=<name>` 参数，按名称在每个后端上隔离浏览器工作。每个名称获得自己的 harness 守护进程（独立的 IPC socket、日志和状态），在云端后端上还拥有独立的浏览器 —— 因此并行的子 Agent 或同时进行的对话不再相互覆盖单一的共享连接。省略 `session` 时使用共享的默认守护进程，适合一次一个的浏览任务。
+
+要退出此模式并强制使用内置浏览器工具，请使用 `/browser use off`，或：
+
+```yaml
+# Add to ~/.hermes/config.yaml
+browser:
+  backend: "off"
+```
+
+（`backend: "browser-use"` 仍可用于显式强制启用该模式。）
+
+Browser Use 自己的云端浏览器需要 `browser-use auth login` 或 `BROWSER_USE_API_KEY`；其他浏览器来源使用其现有凭据，无需更改。
+
+:::note
+由于 Browser Use 模式会在您的机器上执行模型编写的 Python 代码，因此
+`browser_exec` 工具仅向同时具有终端访问权限的会话开放。未配置终端
+工具集的平台（例如严格限制的消息界面）将保留默认的浏览器工具。
+:::
+
 ### Firecrawl 云端模式
 
 要使用 Firecrawl 作为云端浏览器提供商，请添加：
@@ -104,6 +132,38 @@ browser:
 禁用自动路由后，私有 URL 将被拒绝并返回 `"Blocked: URL targets a private or internal address"`，除非同时设置 `browser.allow_private_urls: true`（允许云端提供商尝试访问，但通常无法成功，因为 Browserbase 等无法访问您的 LAN）。
 
 要求：本地辅助进程使用与纯本地模式相同的 `agent-browser` CLI，因此需要先安装（`hermes setup tools → Browser Automation` 会自动安装）。从公网 URL 导航后重定向到私有地址的情况仍会被阻止（无法通过公网路径的重定向访问 LAN）。
+
+### 真实 Profile 浏览（使用您自己的登录）
+
+默认情况下，本地浏览运行在一个干净的、一次性的 profile 中 —— Agent 没有任何登录状态。开启**真实 profile 浏览**可以让 Agent 以*您的身份*浏览，携带您现有的登录和 Cookie：
+
+```yaml
+# ~/.hermes/config.yaml
+browser:
+  use_real_profile: true
+```
+
+开启后，Hermes 会复制您默认浏览器的**当前** profile —— 您实际使用的那个（`Local State → profile.last_used`），包括其 Cookie、已保存的登录信息和偏好设置 —— 到 `~/.hermes/browser-profile/<browser>/` 下的托管快照中，然后使用其打包的 Chromium 驱动该快照。您的实时浏览器 profile **永远不会被直接打开**：快照是一个单独的目录，因此不会与正在运行的浏览器争抢 profile 锁，也规避了 Chrome 136+ 对默认 profile 目录远程调试的限制。认证文件（Cookie/登录/偏好）在每次启动新会话时都会从您的真实 profile 重新同步，因此您在浏览器中的登录状态会出现在 Agent 的会话中。仅复制当前激活的 profile —— 其他 Chrome profile 永远不会被快照。
+
+当您关闭此开关后，Hermes 会在下次浏览器使用时删除快照目录（`~/.hermes/browser-profile/`），因此复制的凭据不会在您撤销同意后继续保留。
+
+:::note Windows：浏览器必须完全关闭
+在 Windows 上，正在运行的 Chrome/Edge/Brave 以独占（拒绝所有）锁持有其 Cookie 和登录数据库，因此 Hermes 在浏览器打开时无法复制它们 —— 它会以"请完全退出浏览器后重试"的提示快速失败，而不是挂起或生成一个已退出的会话。因此 Windows 上的真实 profile 浏览要求浏览器**完全退出**，包括任何后台/托盘实例（Chrome 的"关闭后继续运行后台应用"会在您关闭窗口后保留 `chrome.exe` 进程）。macOS 和 Linux 可以在浏览器运行时复制 profile。
+
+设置 `browser.real_profile_autoclose: true` 可让 Hermes 在浏览器持有 profile 时**主动询问是否关闭它**。即使开启此选项，Hermes 也绝不会自动关闭浏览器 —— 当 profile 被锁定时，它始终会停下并询问您；只有在您同意后才会运行 `hermes browser close-profile`（终止绑定到该 profile 的浏览器进程树，丢失未保存的标签页），然后重试。如果关闭后 profile 仍然被锁定（例如后台/托盘实例重新启动），Hermes 会保持阻塞状态并提示您完全退出浏览器 —— 它不会自行循环或再次终止。
+:::
+
+- **支持的浏览器：** Chrome、Edge、Brave、Chromium（无论哪个是您的操作系统
+  默认浏览器）。非 Chromium 默认浏览器（例如 Firefox）会以清晰的提示失败关闭，
+  而不是猜测。
+- **适用于任何后端。** 在本地后端上，开启开关后即自动生效。在**云端**浏览器
+  后端下，Agent 仍可通过 `browser_exec` 工具的 `local` 参数按需打开一个
+  真实 profile 的本地会话（仅当此开关开启时，该工具才会暴露该参数） ——
+  云端后端继续服务其他所有请求。
+- **安全定位：** 这是一个经同意启用的便利功能，而非隔离边界。Agent 访问的
+  页面将使用您的真实登录信息，因此仅在希望 Agent 以您的身份操作时启用。
+  默认关闭。
+- **桌面端：** 在 **Settings → Browser → Use My Real Browser Profile** 中切换。
 
 ### Camofox 本地模式
 
@@ -270,6 +330,28 @@ CAMOFOX_ADOPT_EXISTING_TAB=true
 
 当 Camofox 以有头模式运行（带可见浏览器窗口）时，其健康检查响应中会暴露 VNC 端口。Hermes 自动发现此信息，并在导航响应中包含 VNC URL，Agent 可分享链接供您实时查看浏览器。
 
+### Lightpanda 本地引擎
+
+[Lightpanda](https://lightpanda.io) 是一个从零开始编写的开源无头浏览器。它可以瞬间启动，运行速度比 Chrome 快 9 倍，内存占用少 16 倍 —— 这对于长时间运行在小虚拟机上的 Agent 尤为重要。
+
+Lightpanda 是一个**本地引擎**，在本地 `agent-browser` 路径下选择（而非云端提供商）。安装二进制文件并将其放入 `PATH`（参见 [Lightpanda 安装指南](https://lightpanda.io/docs)），然后设置：
+
+```yaml
+# Add to ~/.hermes/config.yaml
+browser:
+  engine: lightpanda
+```
+
+或通过环境变量：
+
+```bash
+AGENT_BROWSER_ENGINE=lightpanda
+```
+
+Hermes 通过 `agent-browser` 在 CDP 上驱动 Lightpanda，与驱动本地 Chrome 的方式相同。
+
+**自动 Chrome 回退。** Lightpanda 尚未覆盖 Chrome 的全部功能，因此该集成是非中断式的：Lightpanda 处理它支持的操作，对于不支持的操作，Hermes 会在 Chrome 上透明地重试。已支持的操作覆盖了核心 Agent 工作流 —— 导航、快照、点击、输入、滚动、后退、按键和 eval。截图也会回退到 Chrome，因为 Lightpanda 没有图形渲染器；出于相同原因，`browser_vision` 已预先直接路由到 Chrome。
+
 ### 通过 CDP 连接本地 Chromium 系浏览器（`/browser connect`）
 
 除云端提供商外，您还可以通过 Chrome DevTools Protocol（CDP）将 Hermes 浏览器工具连接到本地运行的 Chrome、Brave、Chromium 或 Edge 实例。当您希望实时查看 Agent 操作、与需要自身 Cookie/会话的页面交互，或避免云端浏览器费用时，此方式非常有用。
@@ -378,10 +460,10 @@ AGENT_BROWSER_ARGS=--no-sandbox
 
 ### 安装 agent-browser CLI
 
+无需安装任何东西 —— 首次使用浏览器工具时，`agent-browser` 会通过 `npx agent-browser` 自动获取。为避免一次性 npx 获取，您可以提前全局安装（可选）：
+
 ```bash
 npm install -g agent-browser
-# Or install locally in the repo:
-npm install
 ```
 
 :::info
