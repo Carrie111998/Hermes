@@ -1480,7 +1480,7 @@ def test_refresh_equal_names_publishes_same_owner_schema_update(monkeypatch):
         lambda **_kw: [new_schema],
     )
 
-    mcp_tool.refresh_agent_mcp_tools(agent)
+    mcp_tool.refresh_agent_mcp_tools(agent, content_aware=True)
 
     assert agent.tools == [new_schema]
     assert agent.valid_tool_names == {"shared_tool"}
