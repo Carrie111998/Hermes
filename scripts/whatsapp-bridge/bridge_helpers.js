@@ -296,6 +296,53 @@ export function appendMediaFailureNote(content, failures) {
   return content ? `${content}\n${note}` : note;
 }
 
+export function downloadMediaToBuffer(downloadMediaMessage, options = {}, onLateError) {
+  return async (mediaMsg) => {
+    const stream = await downloadMediaMessage(mediaMsg, 'stream', {}, options);
+    if (!stream || typeof stream.on !== 'function') {
+      throw new TypeError('media download did not return a readable stream');
+    }
+
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let settled = false;
+
+      const cleanup = () => {
+        stream.removeListener('data', onData);
+        stream.removeListener('end', onEnd);
+        stream.removeListener('close', onClose);
+      };
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+      const onData = (chunk) => chunks.push(Buffer.from(chunk));
+      const onEnd = () => finish(resolve, Buffer.concat(chunks));
+      const onClose = () => finish(reject, new Error('media stream closed before completing'));
+      const onError = (err) => {
+        if (!settled) {
+          finish(reject, err);
+          return;
+        }
+        try {
+          onLateError?.(err);
+        } catch {}
+      };
+
+      // Keep the error listener after settlement. Some HTTP/2-backed Baileys
+      // streams emit a transport error on a later tick after their consumer
+      // has completed; removing this listener would turn that into an
+      // uncaught exception and terminate the bridge.
+      stream.on('error', onError);
+      stream.on('data', onData);
+      stream.once('end', onEnd);
+      stream.once('close', onClose);
+    });
+  };
+}
+
 export async function extractBridgeEvent({
   msg,
   chatId,

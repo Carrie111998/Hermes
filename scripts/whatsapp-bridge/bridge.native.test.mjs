@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 
 import {
@@ -17,12 +18,67 @@ import {
   buildTextSendPayload,
   createBoundedMessageStore,
   appendMediaFailureNote,
+  downloadMediaToBuffer,
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- inbound media stream containment ------------------------------------
+{
+  const stream = new PassThrough();
+  const requestedTypes = [];
+  const download = downloadMediaToBuffer(async (_msg, type) => {
+    requestedTypes.push(type);
+    queueMicrotask(() => {
+      stream.write(Buffer.from('media'));
+      stream.end();
+    });
+    return stream;
+  });
+
+  assert.equal((await download({ key: { id: 'media-ok' } })).toString(), 'media');
+  assert.deepEqual(requestedTypes, ['stream']);
+  console.log('  ✓ inbound media is explicitly consumed as a stream');
+}
+
+{
+  const stream = new PassThrough();
+  const download = downloadMediaToBuffer(async () => {
+    queueMicrotask(() => stream.destroy(new Error('HTTP/2 stream reset')));
+    return stream;
+  });
+
+  await assert.rejects(() => download({ key: { id: 'media-fail' } }), /HTTP\/2 stream reset/);
+  console.log('  ✓ active media stream errors reject into the message boundary');
+}
+
+{
+  const stream = new PassThrough();
+  const lateErrors = [];
+  const download = downloadMediaToBuffer(
+    async () => {
+      queueMicrotask(() => stream.end(Buffer.from('complete')));
+      return stream;
+    },
+    {},
+    (err) => lateErrors.push(err.message),
+  );
+
+  assert.equal((await download({ key: { id: 'media-late' } })).toString(), 'complete');
+  stream.emit('error', new Error('late HTTP/2 reset'));
+  assert.deepEqual(lateErrors, ['late HTTP/2 reset']);
+
+  const next = new PassThrough();
+  const nextDownload = downloadMediaToBuffer(async () => {
+    queueMicrotask(() => next.end(Buffer.from('next')));
+    return next;
+  });
+  assert.equal((await nextDownload({ key: { id: 'media-next' } })).toString(), 'next');
+  console.log('  ✓ late media stream errors stay contained and later downloads continue');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

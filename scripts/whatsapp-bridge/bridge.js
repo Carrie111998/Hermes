@@ -40,6 +40,7 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  downloadMediaToBuffer,
   extractBridgeEvent,
   inboundReadReceiptKeys,
   inferMediaType,
@@ -419,6 +420,12 @@ async function startSocket() {
     },
   });
 
+  const downloadInboundMedia = downloadMediaToBuffer(
+    downloadMediaMessage,
+    { logger, reuploadRequest: sock.updateMediaMessage },
+    (err) => console.warn('[bridge] late inbound media stream error:', err?.message || err),
+  );
+
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
   sock.ev.on('connection.update', (update) => {
@@ -726,7 +733,7 @@ async function startSocket() {
         senderNumber,
         botIds,
         isGroup,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+        downloadMedia: downloadInboundMedia,
         cacheDirs: {
           image: IMAGE_CACHE_DIR,
           document: DOCUMENT_CACHE_DIR,
