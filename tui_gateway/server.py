@@ -2681,7 +2681,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 with _sessions_lock:
                     if _sessions.get(sid) is not current:
                         return
-            tokens = _set_session_context(key)
+            logical_cwd = _session_cwd(current)
+            tokens = _set_session_context(key, cwd=logical_cwd)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
             # agent that profile's db so turns persist to the right state.db.
@@ -2717,7 +2718,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw: dict[str, Any] = {"session_db": session_db}
+                kw: dict[str, Any] = {
+                    "session_db": session_db,
+                    "cwd_override": logical_cwd,
+                }
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)

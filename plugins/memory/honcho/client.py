@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from agent.secret_scope import get_secret
 from hermes_constants import get_hermes_home
 from hermes_cli.profiles import _get_default_hermes_home
+from hermes_state_common import TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM
 from plugins.plugin_utils import SingletonSlot
 from typing import Any, TYPE_CHECKING
 
@@ -54,7 +55,9 @@ def _sanitize_url(url: str | None) -> str | None:
 
 
 HOST = "hermes"
-_AUTOMATIC_SESSION_TITLE_SOURCES = frozenset({"derived", "llm"})
+_AUTOMATIC_SESSION_TITLE_SOURCES = frozenset(
+    {TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM}
+)
 
 
 def profile_host_key(profile: str | None) -> str:

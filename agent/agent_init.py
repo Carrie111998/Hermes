@@ -633,8 +633,8 @@ def init_agent(
         platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
             Used to inject platform-specific formatting hints into the system prompt.
         cwd (str): Logical working directory known by the constructing surface.
-            Passed to memory providers during initialization; otherwise they use
-            the runtime cwd resolver.
+            A non-empty value is passed to memory providers during initialization.
+            None or an empty value leaves the runtime cwd resolver unpinned.
         skip_context_files (bool): If True, skip auto-injection of project context files
             (SOUL.md, .hermes.md, AGENTS.md, CLAUDE.md, .cursorrules) from the cwd / HERMES_HOME
             into the system prompt. Use this for batch processing and data generation to avoid
@@ -656,8 +656,7 @@ def init_agent(
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
-    if cwd:
-        agent.session_cwd = cwd
+    agent.session_cwd = cwd or None
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     agent._user_name = user_name
