@@ -79,6 +79,7 @@ _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
 _resolve_profile_dir = late("_resolve_profile_dir")
 _spawn_hermes_action = late("_spawn_hermes_action")
+run_in_threadpool = late("run_in_threadpool")
 _strip_session_list_rows = late("_strip_session_list_rows")
 _write_profile_mcp_servers = late("_write_profile_mcp_servers")
 _write_profile_model = late("_write_profile_model")
@@ -778,8 +779,7 @@ async def list_profiles_endpoint():
     """List profiles and disclose whether reduced fallback data was used."""
     from hermes_cli import profiles as profiles_mod
     try:
-        loop = asyncio.get_running_loop()
-        profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
+        profiles = await run_in_threadpool(profiles_mod.list_profiles)
         return {
             "profiles": [_profile_to_dict(p) for p in profiles],
             "provenance": {"source": "canonical", "degraded": False},
@@ -1020,7 +1020,25 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
     except Exception as e:
         _log.exception("PATCH /api/profiles/%s failed", name)
         raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "name": body.new_name, "path": str(path)}
+    # For the default profile the rename lands as a presentation-only
+    # display_name; the canonical id ("default") is unchanged. Always
+    # return the canonical id so callers keying on `name` stay correct.
+    try:
+        is_default = profiles_mod.normalize_profile_name(name) == "default"
+    except ValueError:
+        is_default = False
+    if is_default:
+        return {
+            "ok": True,
+            "name": "default",
+            "display_name": body.new_name.strip(),
+            "path": str(path),
+        }
+    return {
+        "ok": True,
+        "name": profiles_mod.normalize_profile_name(body.new_name),
+        "path": str(path),
+    }
 
 
 @router.delete("/api/profiles/{name}")
