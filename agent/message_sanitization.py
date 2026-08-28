@@ -20,6 +20,8 @@ import logging
 import re
 from typing import Any
 
+from agent.context_compressor import _DB_PERSISTED_MARKER
+
 logger = logging.getLogger(__name__)
 
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
@@ -89,10 +91,12 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        msg_touched = False
         content = msg.get("content")
         if isinstance(content, str) and _SURROGATE_RE.search(content):
             msg["content"] = _SURROGATE_RE.sub('\ufffd', content)
             found = True
+            msg_touched = True
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict):
@@ -100,10 +104,12 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                     if isinstance(text, str) and _SURROGATE_RE.search(text):
                         part["text"] = _SURROGATE_RE.sub('\ufffd', text)
                         found = True
+                        msg_touched = True
         name = msg.get("name")
         if isinstance(name, str) and _SURROGATE_RE.search(name):
             msg["name"] = _SURROGATE_RE.sub('\ufffd', name)
             found = True
+            msg_touched = True
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
             for tc in tool_calls:
@@ -113,16 +119,19 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                 if isinstance(tc_id, str) and _SURROGATE_RE.search(tc_id):
                     tc["id"] = _SURROGATE_RE.sub('\ufffd', tc_id)
                     found = True
+                    msg_touched = True
                 fn = tc.get("function")
                 if isinstance(fn, dict):
                     fn_name = fn.get("name")
                     if isinstance(fn_name, str) and _SURROGATE_RE.search(fn_name):
                         fn["name"] = _SURROGATE_RE.sub('\ufffd', fn_name)
                         found = True
+                        msg_touched = True
                     fn_args = fn.get("arguments")
                     if isinstance(fn_args, str) and _SURROGATE_RE.search(fn_args):
                         fn["arguments"] = _SURROGATE_RE.sub('\ufffd', fn_args)
                         found = True
+                        msg_touched = True
         # Walk any additional string / nested fields (reasoning,
         # reasoning_content, reasoning_details, etc.) — surrogates from
         # byte-level reasoning models (xiaomi/mimo, kimi, glm) can lurk
@@ -135,9 +144,22 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                 if _SURROGATE_RE.search(value):
                     msg[key] = _SURROGATE_RE.sub('\ufffd', value)
                     found = True
+                    msg_touched = True
             elif isinstance(value, (dict, list)):
                 if _sanitize_structure_surrogates(value):
                     found = True
+                    msg_touched = True
+        if msg_touched:
+            # This dict may already carry _DB_PERSISTED_MARKER from an
+            # earlier incremental flush (hermes_state.py stamps resumed/
+            # flushed rows). Sanitizing in place without popping it leaves
+            # the marker True, so the flush logic (run_agent.py) treats the
+            # row as already persisted and never re-writes the sanitized
+            # content -- the same bad bytes come back on every future resume
+            # and re-trigger this exact sanitizer, forever. Mirrors
+            # turn_finalizer.py's pop of the same marker after an in-place
+            # content fix.
+            msg.pop(_DB_PERSISTED_MARKER, None)
     return found
 
 
@@ -347,6 +369,7 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        msg_touched = False
         # Sanitize content (string)
         content = msg.get("content")
         if isinstance(content, str):
@@ -354,6 +377,7 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
             if sanitized != content:
                 msg["content"] = sanitized
                 found = True
+                msg_touched = True
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict):
@@ -363,6 +387,7 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
                         if sanitized != text:
                             part["text"] = sanitized
                             found = True
+                            msg_touched = True
         # Sanitize name field (can contain non-ASCII in tool results)
         name = msg.get("name")
         if isinstance(name, str):
@@ -370,6 +395,7 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
             if sanitized != name:
                 msg["name"] = sanitized
                 found = True
+                msg_touched = True
         # Sanitize tool_calls
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -383,6 +409,7 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
                             if sanitized != fn_args:
                                 fn["arguments"] = sanitized
                                 found = True
+                                msg_touched = True
         # Sanitize any additional top-level string fields (e.g. reasoning_content)
         for key, value in msg.items():
             if key in {"content", "name", "tool_calls", "role"}:
@@ -392,6 +419,12 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
                 if sanitized != value:
                     msg[key] = sanitized
                     found = True
+                    msg_touched = True
+        if msg_touched:
+            # See _sanitize_messages_surrogates for why this pop is required:
+            # without it, an already-flushed row's marker stays True and the
+            # sanitized content is never re-persisted.
+            msg.pop(_DB_PERSISTED_MARKER, None)
     return found
 
 
@@ -435,13 +468,21 @@ def _strip_images_from_messages(messages: list) -> bool:
         if len(new_parts) < len(content):
             if new_parts:
                 msg["content"] = new_parts
+                # See _sanitize_messages_surrogates for why this pop is
+                # required: without it, an already-flushed row's marker
+                # stays True and the image-stripped content is never
+                # re-persisted, so the same rejected image comes back on
+                # every future resume.
+                msg.pop(_DB_PERSISTED_MARKER, None)
             elif msg.get("role") == "tool":
                 # Preserve tool_call_id linkage — providers require every
                 # assistant tool_call to have a matching tool response.
                 msg["content"] = "[image content removed — server does not support images]"
+                msg.pop(_DB_PERSISTED_MARKER, None)
             else:
                 # Synthetic image-only user/assistant message with no text;
-                # safe to drop.
+                # safe to drop. The dict is discarded below, so no marker
+                # pop is needed here.
                 to_delete.append(i)
     for i in reversed(to_delete):
         del messages[i]
