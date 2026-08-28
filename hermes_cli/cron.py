@@ -78,6 +78,18 @@ def _builtin_gateway_liveness() -> Optional[bool]:
     try:
         if _active_cron_provider_name() != "builtin":
             return True  # external provider fires jobs without the gateway
+        
+        # Self-check: if we're inside the gateway process, we're alive.
+        # This prevents false negatives when the cron tool runs in-process.
+        try:
+            import os
+            from gateway.status import get_running_pid
+            running_pid = get_running_pid()
+            if running_pid is not None and running_pid == os.getpid():
+                return True
+        except Exception:
+            pass
+        
         # The gateway runtime lock is held for exactly the gateway's lifetime, so it
         # is a more reliable "is the ticker's process alive" signal than PID scanning
         # — and inside the gateway process it short-circuits to True, so the in-gateway
