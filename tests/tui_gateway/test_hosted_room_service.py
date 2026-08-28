@@ -943,6 +943,116 @@ def test_lost_peer_artifact_ack_retries_without_duplicate_member_message(
     assert peer.dispatches[0]["target_profile"] == "reviewer"
 
 
+def test_artifact_retry_store_migrates_and_backfills_member_id(tmp_path: Path):
+    db = tmp_path / "state.db"
+    hosted_rooms.create_room(
+        db,
+        room_id="room-1",
+        name="Migration room",
+        members=[
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+            {"member_id": "qa", "profile": "qa", "handle": "qa"},
+        ],
+        authority_gateway_id="gateway-a",
+    )
+    identity = driver.TaskIdentity("room-1", "task-old", "thread-1", "turn-1")
+    driver.admit_task(
+        db,
+        identity,
+        payload={
+            "target_member_id": "ops",
+            "target_profile": "ops",
+            "prompt": "Review",
+            "source_event_seq": 1,
+        },
+        clock=time.time,
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """CREATE TABLE hosted_room_artifact_retries (
+                room_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                execution_generation INTEGER NOT NULL,
+                attempts INTEGER NOT NULL,
+                next_attempt_at REAL NOT NULL,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(room_id, task_id, execution_generation)
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO hosted_room_artifact_retries
+               VALUES ('room-1', 'task-old', 1, 1, 10, 1, 1)"""
+        )
+
+    HostedRoomService(_server(), db_path=db)
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            """SELECT member_id FROM hosted_room_artifact_retries
+               WHERE room_id='room-1' AND task_id='task-old'"""
+        ).fetchone()
+    assert row == ("ops",)
+
+
+def test_authoritative_stop_discards_crash_stranded_local_output(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Crash room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "default"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-crash",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "Prepare a file", "thread_id": "thread-1"},
+    )
+    binding = service.bindings()[0]
+    service.prepare_room(binding)
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='indeterminate', execution_generation=1
+               WHERE room_id='room-1' AND task_id=?""",
+            (task["identity"].task_id,),
+        )
+    scope = RoomArtifactScope.from_mapping({
+        "room_id": "room-1",
+        "task_id": task["identity"].task_id,
+        "execution_generation": 1,
+        "member_id": task["payload"]["target_member_id"],
+        "target_profile": task["payload"]["target_profile"],
+        "home_install_id": hosted_rooms.local_authority_gateway_id(),
+        "target_install_id": hosted_rooms.local_authority_gateway_id(),
+        "authority_gateway_id": room["authority_gateway_id"],
+        "authority_epoch": room["authority_epoch"],
+    })
+    output = tmp_path / "crash.md"
+    output.write_text("stranded\n", encoding="utf-8")
+    outbox = RoomArtifactOutbox(db)
+    outbox.put_path(scope=scope, path=output)
+
+    assert service.stop_room("room-1", cancel_id="stop-crash") == 1
+    stopping = driver.get_task(db, task["identity"])
+    driver.complete_task_cancel(
+        db,
+        task["identity"],
+        cancel_id="stop-crash",
+        expected_cancel_generation=stopping["cancel_generation"],
+        clock=time.time,
+    )
+    service.prepare_room(binding)
+    assert outbox.list(scope) == []
+
+
 def test_unadmitted_peer_failure_does_not_block_next_healthy_member(
     tmp_path: Path,
 ):

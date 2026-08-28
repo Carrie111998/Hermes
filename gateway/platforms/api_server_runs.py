@@ -1421,6 +1421,26 @@ async def _handle_stop_run(
         "cancelled",
         "interrupted",
     }:
+        if status.get("status") != "completed" and status.get("room_artifact_scope"):
+            try:
+                from gateway.hosted_room_artifacts import (
+                    RoomArtifactOutbox,
+                    RoomArtifactScope,
+                )
+                from hermes_constants import get_hermes_home
+
+                scope = RoomArtifactScope.from_mapping(
+                    status["room_artifact_scope"]
+                )
+                RoomArtifactOutbox(
+                    Path(get_hermes_home()) / "state.db"
+                ).discard(scope)
+            except Exception:
+                logger.warning(
+                    "failed to discard stopped room artifacts for %s",
+                    run_id,
+                    exc_info=True,
+                )
         return web.json_response(status)
 
     if agent is None and task is None:

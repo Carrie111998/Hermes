@@ -56,6 +56,10 @@ def artifact_api(tmp_path, monkeypatch):
         "/v1/runs/{run_id}/artifacts/ack",
         adapter._handle_room_run_artifact_ack,
     )
+    app.router.add_post(
+        "/v1/runs/{run_id}/stop",
+        adapter._handle_stop_run,
+    )
     grant = issue_room_grant(
         adapter._room_grant_secret(),
         grant_id="grant-artifact",
@@ -66,7 +70,7 @@ def artifact_api(tmp_path, monkeypatch):
         member_id=scope.member_id,
         target_install_id=scope.target_install_id,
         target_profile=scope.target_profile,
-        permissions=("artifact.ack", "artifact.read"),
+        permissions=("artifact.ack", "artifact.read", "stop"),
     )
     return adapter, app, scope, item, status, grant, outbox
 
@@ -145,3 +149,16 @@ def test_adapter_registers_output_artifact_routes(artifact_api):
     routes = {(method, path) for method, path, _handler in adapter._http_route_table()}
     assert ("GET", "/v1/runs/{run_id}/artifacts/{artifact_id}") in routes
     assert ("POST", "/v1/runs/{run_id}/artifacts/ack") in routes
+
+
+@pytest.mark.asyncio
+async def test_terminal_remote_stop_discards_crash_stranded_output(artifact_api):
+    _adapter, app, scope, _item, status, grant, outbox = artifact_api
+    status["status"] = "interrupted"
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/v1/runs/run-1/stop",
+            headers={"Authorization": f"HermesRoom {grant}"},
+        )
+        assert response.status == 200
+    assert outbox.list(scope) == []

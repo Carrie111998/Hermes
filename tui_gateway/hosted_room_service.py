@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -610,6 +611,11 @@ class HostedRoomService:
                 room_id=str(room["room_id"]),
                 status=status,
             ):
+                if status == "cancelled":
+                    self._discard_cancelled_task_artifacts(
+                        str(room["room_id"]),
+                        task,
+                    )
                 if not self._artifact_retry_due(task):
                     continue
                 publication_status = status
@@ -692,6 +698,55 @@ class HostedRoomService:
                     PRIMARY KEY(room_id, task_id, execution_generation)
                 )"""
             )
+            columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(hosted_room_artifact_retries)"
+                ).fetchall()
+            }
+            if "member_id" not in columns:
+                conn.execute(
+                    """ALTER TABLE hosted_room_artifact_retries
+                       ADD COLUMN member_id TEXT NOT NULL DEFAULT ''"""
+                )
+            empty = conn.execute(
+                """SELECT room_id, task_id, execution_generation
+                   FROM hosted_room_artifact_retries WHERE member_id=''"""
+            ).fetchall()
+            has_driver_tasks = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type='table' AND name='hosted_room_driver_tasks'"""
+            ).fetchone()
+            if has_driver_tasks is None:
+                return
+            for row in empty:
+                task = conn.execute(
+                    """SELECT payload_json FROM hosted_room_driver_tasks
+                       WHERE room_id=? AND task_id=?""",
+                    (row["room_id"], row["task_id"]),
+                ).fetchone()
+                if task is None:
+                    continue
+                try:
+                    payload = json.loads(task["payload_json"])
+                    member_id = str(
+                        payload.get("target_member_id")
+                        or payload.get("target_profile")
+                        or ""
+                    )
+                except Exception:
+                    continue
+                if member_id:
+                    conn.execute(
+                        """UPDATE hosted_room_artifact_retries SET member_id=?
+                           WHERE room_id=? AND task_id=? AND execution_generation=?""",
+                        (
+                            member_id,
+                            row["room_id"],
+                            row["task_id"],
+                            row["execution_generation"],
+                        ),
+                    )
 
     @staticmethod
     def _artifact_retry_key(task: Mapping[str, Any]) -> tuple[str, str, int]:
@@ -1155,12 +1210,49 @@ class HostedRoomService:
                 cancelled += 1
                 if result["status"] == "stopping":
                     pending += 1
+                else:
+                    self._discard_cancelled_task_artifacts(room_id, task)
         if require_acknowledged and pending:
             raise RuntimeError(
                 "room work is still stopping; retry deletion after Stop completes"
             )
         self.runtime.wakeup()
         return cancelled
+
+    def _discard_cancelled_task_artifacts(
+        self,
+        room_id: str,
+        task: Mapping[str, Any],
+    ) -> None:
+        generation = int(task.get("execution_generation") or 0)
+        if generation < 1:
+            return
+        payload = task.get("payload") or {}
+        member_id = str(
+            payload.get("target_member_id") or payload.get("target_profile") or ""
+        )
+        if not member_id or (room_id, member_id) in self.peer_routes:
+            return
+        room = hosted_rooms.room_state(self.db_path, room_id=room_id)
+        profile = str(payload.get("target_profile") or "default")
+        installation = hosted_rooms.local_authority_gateway_id()
+        scope = RoomArtifactScope.from_mapping({
+            "room_id": room_id,
+            "task_id": task["identity"].task_id,
+            "execution_generation": generation,
+            "member_id": member_id,
+            "target_profile": profile,
+            "home_install_id": installation,
+            "target_install_id": installation,
+            "authority_gateway_id": room["authority_gateway_id"],
+            "authority_epoch": int(room["authority_epoch"]),
+        })
+        profile_root = (
+            self.root
+            if profile == "default"
+            else self.root / "profiles" / profile
+        )
+        RoomArtifactOutbox(profile_root / "state.db").discard(scope)
 
     def retry_room_task(self, room_id: str, *, task_id: str) -> dict[str, Any]:
         """Retry one indeterminate task only after explicit user action."""

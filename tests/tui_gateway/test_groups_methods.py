@@ -663,6 +663,9 @@ def test_disband_stops_and_revokes_before_tombstoning(home, monkeypatch):
         def revoke_room_routes(self, room_id):
             calls.append(("revoke", room_id))
 
+        def discard_output_artifacts(self, room_id):
+            calls.append(("outputs", room_id))
+
     monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
     _result(srv._methods["groups.disband"](9, {"room_id": "room-1"}))
 
@@ -670,6 +673,7 @@ def test_disband_stops_and_revokes_before_tombstoning(home, monkeypatch):
         ("stop", "room-1"),
         ("revoke", "room-1"),
         ("attachments", "room-1"),
+        ("outputs", "room-1"),
     ]
     assert _result(srv._methods["groups.list"](10, {}))["rooms"] == []
 
