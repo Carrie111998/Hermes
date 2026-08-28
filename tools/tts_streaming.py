@@ -27,8 +27,16 @@ import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
 
-from tools.tool_backend_helpers import resolve_openai_audio_api_key
-from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
+from tools.tts_tool import (
+    DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_OPENAI_MODEL,
+    DEFAULT_OPENAI_VOICE,
+    MANAGED_OPENAI_TTS_MODELS,
+    _get_provider,
+    _has_openai_audio_backend,
+    _resolve_openai_audio_client_config,
+    get_env_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,15 +260,6 @@ class ElevenLabsStreamer(StreamingTTSProvider):
         )
 
 
-def _openai_config_api_key() -> str:
-    """Return ``tts.openai.api_key`` from config.yaml, or empty string."""
-    try:
-        openai_cfg = (_load_tts_config().get("openai") or {})
-    except Exception:
-        return ""
-    return openai_cfg.get("api_key") or ""
-
-
 @register("openai")
 class OpenAIStreamer(StreamingTTSProvider):
     """OpenAI speech with ``response_format=pcm`` (24 kHz mono int16)."""
@@ -269,21 +268,35 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     @staticmethod
     def available() -> bool:
-        return bool(_openai_config_api_key() or resolve_openai_audio_api_key())
+        return _has_openai_audio_backend()
 
     def stream(self, text: str) -> Iterator[bytes]:
         from openai import OpenAI
 
-        client = OpenAI(
-            api_key=(self.section.get("api_key") or resolve_openai_audio_api_key()),
-            base_url=(
-                self.section.get("base_url")
-                or get_env_value("OPENAI_BASE_URL")
-                or None
-            ),
-        )
-        model = self.section.get("model", "gpt-4o-mini-tts")
-        voice = self.section.get("voice", "alloy")
+        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
+        config_base_url = self.section.get("base_url")
+        base_url = config_base_url or fallback_base or DEFAULT_OPENAI_BASE_URL
+
+        model = self.section.get("model", DEFAULT_OPENAI_MODEL)
+        voice = self.section.get("voice", DEFAULT_OPENAI_VOICE)
+
+        # The managed OpenAI audio gateway only proxies MANAGED_OPENAI_TTS_MODELS.
+        # A model set for direct OpenAI (e.g. "tts-1-hd") 400s there, so coerce
+        # it unless the user redirected base_url to their own endpoint.
+        if (
+            is_managed
+            and not config_base_url
+            and model not in MANAGED_OPENAI_TTS_MODELS
+        ):
+            logger.warning(
+                "TTS: managed OpenAI audio gateway does not support model %r; "
+                "falling back to %s. Set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY "
+                "to use %r directly.",
+                model, DEFAULT_OPENAI_MODEL, model,
+            )
+            model = DEFAULT_OPENAI_MODEL
+
+        client = OpenAI(api_key=api_key, base_url=base_url)
         with client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice,
