@@ -175,3 +175,23 @@ def test_refusal_receipt_written_as_refused(tmp_path, monkeypatch):
     steps = {s["name"]: s for s in data["steps"]}
     assert "admission" in steps and steps["admission"]["ok"] is False
     assert "docker pull" in steps["admission"]["detail"]
+
+
+def test_pinned_refusal_receipt_uses_the_preflight_step(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.update_receipt as ur
+
+    monkeypatch.setattr(ur, "_receipt_dir", lambda: tmp_path / "receipts")
+    record_refusal_receipt(
+        UpdateRefusal(
+            code="docker",
+            message="msg",
+            update_command="docker compose pull",
+        ),
+        step_name="pinned_target_preflight",
+    )
+
+    payload = json.loads((tmp_path / "receipts" / "latest.json").read_text())
+    steps = {step["name"]: step for step in payload["steps"]}
+    assert steps["pinned_target_preflight"]["ok"] is False
+    assert "docker compose pull" in steps["pinned_target_preflight"]["detail"]

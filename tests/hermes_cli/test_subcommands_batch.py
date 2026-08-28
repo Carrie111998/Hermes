@@ -46,6 +46,23 @@ def _h(name):
     return handler
 
 
+def test_update_parser_accepts_an_exact_commit_cutoff():
+    """A fleet coordinator can supply one unambiguous full Git object ID."""
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def cmd_update(_args):
+        return None
+
+    build_update_parser(subparsers, cmd_update=cmd_update)
+    target = "a" * 40
+
+    args = parser.parse_args(["update", "--commit", target])
+
+    assert args.commit == target
+    assert args.func is cmd_update
+
+
 # (subcommand_name, builder, handler_kwargs, sample_argv)
 SINGLE_HANDLER_CASES = [
     ("model", build_model_parser, "cmd_model", ["model"]),

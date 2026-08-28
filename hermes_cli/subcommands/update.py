@@ -85,6 +85,17 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--commit",
+        default=None,
+        metavar="SHA",
+        help=(
+            "Update to this exact approved full Git object ID (40 or 64 hex "
+            "characters) instead of the branch tip. The ID must be reachable "
+            "from --branch (main by default); this refuses branch switching, "
+            "non-fast-forward updates, and ZIP fallback."
+        ),
+    )
+    update_parser.add_argument(
         "--switch-branch",
         action="store_true",
         default=False,

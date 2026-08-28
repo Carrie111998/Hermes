@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -53,6 +54,160 @@ def _m():
     from hermes_cli import main
 
     return main
+
+
+class ExactCommitTargetError(ValueError):
+    """The caller's requested immutable update target is unsafe or unavailable."""
+
+
+_EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+
+
+def _normalize_exact_commit_target(value: object) -> Optional[str]:
+    """Return a canonical full Git object ID, rejecting abbreviated refs.
+
+    Git accepts an object-ID prefix as a revision. That is useful interactively
+    but unsafe for a coordinated fleet: different object formats can expand a
+    40-character prefix differently. Accept only canonical SHA-1 or SHA-256
+    lengths and later require ``rev-parse`` to return the exact same ID.
+    """
+    if value is None:
+        return None
+    candidate = str(value).strip().lower()
+    if not _EXACT_COMMIT_RE.fullmatch(candidate):
+        raise ExactCommitTargetError(
+            "--commit must be a full 40- or 64-character Git object ID; "
+            "abbreviated IDs are not accepted."
+        )
+    return candidate
+
+
+def _resolve_exact_commit_target(
+    git_cmd: list[str], project_root: Path, branch: str, requested_commit: str
+) -> str:
+    """Resolve and authorize an immutable target from a freshly-fetched branch.
+
+    The exact-object comparison rejects Git's normal prefix expansion, and the
+    reachability check prevents a caller from applying an arbitrary dangling or
+    off-branch commit while presenting it as an approved release cutoff.
+    """
+    requested_commit = _normalize_exact_commit_target(requested_commit)
+    assert requested_commit is not None
+
+    resolved = subprocess.run(
+        git_cmd
+        + [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{requested_commit}^{{commit}}",
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if resolved.returncode != 0:
+        raise ExactCommitTargetError(
+            f"--commit {requested_commit} could not be resolved to a commit object."
+        )
+
+    resolved_commit = resolved.stdout.strip().lower()
+    if resolved_commit != requested_commit:
+        raise ExactCommitTargetError(
+            "--commit must equal the repository's full object ID; "
+            "abbreviated or prefix IDs are not accepted."
+        )
+
+    reachable = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", requested_commit, f"origin/{branch}"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if reachable.returncode != 0:
+        raise ExactCommitTargetError(
+            f"Requested commit {requested_commit} is not reachable from origin/{branch}."
+        )
+    return requested_commit
+
+
+def _preflight_exact_commit_update(
+    args, requested_commit: str, project_root: Path
+) -> tuple[list[str], str, str, str]:
+    """Authorize a pinned source target before any update lifecycle work.
+
+    A release coordinator needs refusal to be side-effect free: an invalid
+    cutoff must not first create a backup, pause a gateway, clear generated
+    checkout churn, or switch branches. Fetching the selected branch is the
+    one required prerequisite because branch reachability cannot otherwise be
+    proven against a fresh origin ref.
+    """
+    git_cmd = ["git"]
+    branch = _m()._resolve_update_branch(args)
+    print("→ Fetching pinned update target...")
+    # An explicit branch argument normally writes only FETCH_HEAD. Pin the
+    # destination ref too, so reachability is always checked against the exact
+    # remote branch state fetched for this admission—even if a local clone has
+    # a narrowed or stale remote.origin.fetch mapping.
+    tracking_refspec = f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
+    try:
+        fetch_result = subprocess.run(
+            git_cmd + ["fetch", "origin", tracking_refspec],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise ExactCommitTargetError(
+            f"Could not execute git for pinned --commit validation: {exc}"
+        ) from exc
+    if fetch_result.returncode != 0:
+        _print_fetch_failure(fetch_result.stderr)
+        raise ExactCommitTargetError(
+            f"Could not fetch origin/{branch} for pinned --commit validation."
+        )
+
+    current_branch_result = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if current_branch_result.returncode != 0:
+        raise ExactCommitTargetError("Could not determine the current checkout branch.")
+    current_branch = current_branch_result.stdout.strip()
+
+    update_target = _resolve_exact_commit_target(
+        git_cmd, project_root, branch, requested_commit
+    )
+    if current_branch != branch:
+        raise ExactCommitTargetError(
+            f"--commit requires the checkout to already be on '{branch}' "
+            f"(current: '{current_branch}'). No branch switch was performed."
+        )
+
+    forward_only = subprocess.run(
+        git_cmd + ["merge-base", "--is-ancestor", "HEAD", update_target],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if forward_only.returncode != 0:
+        raise ExactCommitTargetError(
+            f"--commit {requested_commit} is not a fast-forward from HEAD. "
+            "No reset or branch switch was performed."
+        )
+    return git_cmd, branch, current_branch, update_target
 
 
 _UPDATE_RUNTIME_RELOAD_MODULES = (
@@ -1829,6 +1984,16 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
 
     Returns ``False`` when a Desktop rebuild ran and failed; ``True`` otherwise.
     """
+    if getattr(args, "commit", None) is not None:
+        print(
+            "✗ --commit is not supported on the Windows ZIP-fallback update path."
+        )
+        print(
+            "  An immutable approved Git object ID cannot be verified from a "
+            "branch ZIP. Resolve the Git-side failure and retry the same command."
+        )
+        _m().sys.exit(1)
+
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
     import tempfile
@@ -2251,7 +2416,9 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
     return desktop_build_ok
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+def _stash_local_changes_if_needed(
+    git_cmd: list[str], cwd: Path, *, allow_reset: bool = True
+) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
@@ -2273,6 +2440,18 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         text=True, encoding="utf-8", errors="replace",
     )
     if unmerged.stdout.strip():
+        if not allow_reset:
+            print(
+                "✗ Pinned --commit update cannot clear unmerged index entries "
+                "with git reset."
+            )
+            print("  Resolve the index conflict manually, then re-run the update.")
+            raise subprocess.CalledProcessError(
+                1,
+                git_cmd + ["reset"],
+                output=unmerged.stdout,
+                stderr="Pinned update refuses automatic index reset.",
+            )
         print("→ Clearing unmerged index entries from a previous conflict...")
         subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
 
@@ -2328,7 +2507,22 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
             # A partially-failed stash push also aborts its working-tree
             # cleanup for TRACKED modifications — they are saved in the stash
             # but still dirty the tree, which would break the checkout/pull
-            # that follows. Safe to reset: everything is in the stash entry.
+            # that follows. Unpinned updates may reset because the stash is a
+            # recovery anchor; an exact-SHA request must instead stop before
+            # source mutation and leave both the stash and worktree intact.
+            if not allow_reset:
+                print(
+                    "✗ Pinned --commit update stopped after a partial autostash; "
+                    "no reset was performed."
+                )
+                print(f"  Saved stash ref: {stash_ref}")
+                print("  Resolve the remaining working-tree files manually, then re-run.")
+                raise subprocess.CalledProcessError(
+                    push.returncode,
+                    push.args,
+                    output=push.stdout,
+                    stderr=push.stderr,
+                )
             subprocess.run(
                 git_cmd + ["reset", "--hard", "HEAD"],
                 cwd=cwd,
@@ -2429,6 +2623,8 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    *,
+    allow_reset: bool = True,
 ) -> bool:
     if prompt_user:
         print()
@@ -2501,6 +2697,18 @@ def _restore_stashed_changes(
 
         print("\nYour stashed changes are preserved — nothing is lost.")
         print(f"  Stash ref: {stash_ref}")
+
+        if not allow_reset:
+            print(
+                "  Pinned target remains checked out; no reset was performed. "
+                "Resolve the conflict explicitly before continuing."
+            )
+            raise subprocess.CalledProcessError(
+                restore.returncode or 1,
+                restore.args,
+                output=restore.stdout,
+                stderr=restore.stderr,
+            )
 
         # Always reset to clean state — leaving conflict markers in source
         # files makes hermes completely unrunnable (SyntaxError on import).
@@ -7205,6 +7413,59 @@ def _rebuild_desktop_after_update(
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    # Start the receipt before *any* exact-target refusal. The command boundary
+    # owns finalization, so malformed IDs and fetch/admission failures remain
+    # observable to a fleet coordinator without starting backup, lifecycle, or
+    # source-update work.
+    _record_update_receipt_step = None
+    try:
+        from hermes_cli.update_receipt import (
+            begin_update_receipt,
+            record_step as _record_update_receipt_step,
+        )
+
+        begin_update_receipt()
+    except Exception as _receipt_exc:
+        logger.debug("Update receipt unavailable: %s", _receipt_exc)
+
+    try:
+        requested_commit = _normalize_exact_commit_target(
+            getattr(args, "commit", None)
+        )
+    except ExactCommitTargetError as exc:
+        if _record_update_receipt_step is not None:
+            _record_update_receipt_step("pinned_target_preflight", False, str(exc))
+        print(f"✗ {exc}")
+        sys.exit(2)
+
+    if requested_commit and not (_m().PROJECT_ROOT / ".git").exists():
+        detail = (
+            "--commit requires a working Git checkout; ZIP fallback cannot "
+            "prove an approved immutable source target."
+        )
+        if _record_update_receipt_step is not None:
+            _record_update_receipt_step("pinned_target_preflight", False, detail)
+        print(f"✗ {detail}")
+        sys.exit(1)
+
+    exact_commit_preflight = None
+    if requested_commit:
+        try:
+            exact_commit_preflight = _preflight_exact_commit_update(
+                args, requested_commit, _m().PROJECT_ROOT
+            )
+        except ExactCommitTargetError as exc:
+            if _record_update_receipt_step is not None:
+                _record_update_receipt_step("pinned_target_preflight", False, str(exc))
+            print(f"✗ {exc}")
+            sys.exit(1)
+        if _record_update_receipt_step is not None:
+            _record_update_receipt_step(
+                "pinned_target_preflight",
+                True,
+                f"approved_commit={requested_commit}",
+            )
+
     # A managed-runtime refresh can replace site-packages before the normal
     # ``.[all]`` install runs. Snapshot while the old environment can still
     # prove which optional backends the user had activated.
@@ -7259,15 +7520,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
     print("⚕ Updating Hermes Agent...")
     print()
 
-    # Phase 1 (#91277): structured update receipt — record what this run
-    # discovers, does, and skips, so silent-failure classes (#88848,
-    # #74973, #85753, #81193) become diagnosable from disk.
-    try:
-        from hermes_cli.update_receipt import begin_update_receipt
-
-        begin_update_receipt()
-    except Exception as _receipt_exc:
-        logger.debug("Update receipt unavailable: %s", _receipt_exc)
+    # The receipt began before exact-target validation so the command boundary
+    # can persist malformed-ID and admission failures as well as regular runs.
+    # All later phases append to that same receipt.
 
     # Plan phase (#91277 Phase 2): snapshot the pre-update fleet — every
     # running Hermes runtime, its supervisor, and its running code version —
@@ -7595,47 +7850,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # Fetch and pull
     try:
+        if requested_commit:
+            # This was fetched and fully authorized before any backup, gateway
+            # lifecycle, or managed-checkout cleanup. Do not re-fetch or
+            # re-resolve here: a later branch-tip movement must not turn an
+            # already-approved immutable target into a new admission decision.
+            assert exact_commit_preflight is not None
+            git_cmd, branch, current_branch, update_target = exact_commit_preflight
+        else:
+            # Resolve the target branch up front so the fetch can be scoped to it.
+            # A bare `git fetch origin` pulls every ref, and this repo carries
+            # thousands of auto-generated branches — an unscoped fetch can stall for
+            # minutes on a non-single-branch checkout. Fetch only what we update
+            # against.
+            branch = _m()._resolve_update_branch(args)
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
-        # A bare `git fetch origin` pulls every ref, and this repo carries
-        # thousands of auto-generated branches — an unscoped fetch can stall for
-        # minutes on a non-single-branch checkout. Fetch only what we update
-        # against.
-        branch = _m()._resolve_update_branch(args)
+            # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
+            # crashed fetch) before the fetch — otherwise the update fails with
+            # "Unable to create .../shallow.lock: File exists" and never reaches
+            # the network.
+            from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
 
-        # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
-        # crashed fetch) before the fetch — otherwise the update fails with
-        # "Unable to create .../shallow.lock: File exists" and never reaches
-        # the network.
-        from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
+            cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
+            if cleared:
+                print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
+            swept = clear_stale_tmp_packs(_m().PROJECT_ROOT)
+            if swept:
+                print("  (removed %d aborted-fetch pack temp file(s))" % len(swept))
 
-        cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
-        if cleared:
-            print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
-        swept = clear_stale_tmp_packs(_m().PROJECT_ROOT)
-        if swept:
-            print("  (removed %d aborted-fetch pack temp file(s))" % len(swept))
+            print("→ Fetching updates...")
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if fetch_result.returncode != 0:
+                _print_fetch_failure(fetch_result.stderr)
+                sys.exit(1)
 
-        print("→ Fetching updates...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if fetch_result.returncode != 0:
-            _print_fetch_failure(fetch_result.stderr)
-            sys.exit(1)
-
-        # Get current branch (returns literal "HEAD" when detached)
-        result = subprocess.run(
-            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=True,
-        )
-        current_branch = result.stdout.strip()
+            # Get current branch (returns literal "HEAD" when detached)
+            result = subprocess.run(
+                git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=True,
+            )
+            current_branch = result.stdout.strip()
+            update_target = f"origin/{branch}"
 
         # Parked-branch guard (2026-08-17 live incident): the checkout can be
         # left parked on a stale feature branch by earlier tooling. Blindly
@@ -7741,7 +8004,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "for update..."
                 )
             # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            auto_stash_ref = _m()._stash_local_changes_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                **({"allow_reset": False} if requested_commit else {}),
+            )
             checkout_result = subprocess.run(
                 git_cmd + ["checkout", branch],
                 cwd=_m().PROJECT_ROOT,
@@ -7769,13 +8036,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             auto_stash_ref,
                             prompt_user=False,
                             input_fn=gw_input_fn,
+                            **({"allow_reset": False} if requested_commit else {}),
                         )
                     print(f"✗ Branch '{branch}' does not exist locally or on origin.")
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            auto_stash_ref = _m()._stash_local_changes_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                **({"allow_reset": False} if requested_commit else {}),
+            )
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -7790,7 +8062,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # 0), so keep it, but treat the shallow NUMBER as unknown and recover
         # the real one via the GitHub compare API when possible.
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{update_target}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -7816,7 +8088,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             ).stdout.strip()
             target_sha = subprocess.run(
-                git_cmd + ["rev-parse", f"origin/{branch}"],
+                git_cmd + ["rev-parse", update_target],
                 cwd=_m().PROJECT_ROOT, capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             ).stdout.strip()
@@ -7833,7 +8105,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # commit_count == 0 branch, which returns immediately after: an update
         # that pulled hundreds of upstream commits printed "Already up to
         # date!" and verified nothing).
-        if commit_count == 0 and is_fork and branch == "main":
+        if commit_count == 0 and is_fork and branch == "main" and not requested_commit:
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
             post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
@@ -7862,6 +8134,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     auto_stash_ref,
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
+                    **({"allow_reset": False} if requested_commit else {}),
                 )
             if parked_branch_switched:
                 if switch_block_reason.startswith("unmerged:"):
@@ -8036,12 +8309,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", update_target],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
+                if requested_commit:
+                    print(
+                        f"✗ Could not fast-forward to approved --commit {requested_commit}."
+                    )
+                    print("  No reset or alternate-source fallback was performed.")
+                    if pull_result.stderr.strip():
+                        print(f"  {pull_result.stderr.strip().splitlines()[0]}")
+                    sys.exit(1)
                 # ff-only failed — local and remote have diverged. Before
                 # assuming an upstream force-push, check WHY: a checkout on a
                 # custom branch (local commits on top of origin/<branch>) also
@@ -8135,6 +8416,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # ~6 lines so the user sees the actual SyntaxError text.
                     for line in str(syntax_error).splitlines()[:6]:
                         print(f"    {line}")
+                if requested_commit:
+                    print()
+                    print(
+                        "  Pinned target remains checked out; no reset or alternate "
+                        "source fallback was performed."
+                    )
+                    sys.exit(1)
                 if pre_pull_sha:
                     print()
                     print(f"→ Rolling back to {pre_pull_sha[:10]}...")
@@ -8189,6 +8477,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         auto_stash_ref,
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
+                        **({"allow_reset": False} if requested_commit else {}),
                     )
 
         _invalidate_update_cache()
@@ -8269,8 +8558,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._record_bytecode_fingerprint()
         _m()._refresh_bootstrap_cache_scripts(branch)
 
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
+        # Fork upstream sync logic (only for an unpinned main-branch update on forks)
+        if is_fork and branch == "main" and not requested_commit:
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
@@ -9935,6 +10224,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _refuse_update_for_contended_shims(e)
     except subprocess.CalledProcessError as e:
         stage = _format_update_failure_stage(e)
+        if requested_commit:
+            print(f"✗ {stage} while applying pinned --commit {requested_commit}: {e}")
+            _print_called_process_error_tail(e)
+            print("  No ZIP, reset, or alternate-source fallback was performed.")
+            try:
+                from hermes_cli.update_receipt import finalize_update_receipt
+
+                finalize_update_receipt("failed")
+            except Exception:
+                pass
+            sys.exit(1)
         if _should_zip_fallback_on_update_error(e):
             print(f"⚠ {stage}: {e}")
             print("→ Falling back to ZIP download...")

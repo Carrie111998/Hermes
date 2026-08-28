@@ -637,6 +637,583 @@ class TestCmdUpdateProfileSkillSync:
         assert default_p.path in synced_paths
 
 
+class TestExactCommitTargetResolution:
+    """Exact-cutoff validation stays pure and never mutates a Hermes home."""
+
+    TARGET = "a" * 40
+
+    @staticmethod
+    def _git_side_effect(*, contained_by_branch: bool = True):
+        def side_effect(cmd, **_kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=f"{TestExactCommitTargetResolution.TARGET}\n",
+                    stderr="",
+                )
+            if "merge-base" in joined and TestExactCommitTargetResolution.TARGET in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0 if contained_by_branch else 1,
+                    stdout="",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        return side_effect
+
+    def test_exact_commit_must_be_contained_by_the_selected_branch(self):
+        from hermes_cli.update_cmd import _resolve_exact_commit_target
+
+        with patch(
+            "hermes_cli.update_cmd.subprocess.run",
+            side_effect=self._git_side_effect(),
+        ) as mock_run:
+            target = _resolve_exact_commit_target(
+                ["git"], PROJECT_ROOT, "main", self.TARGET
+            )
+
+        assert target == self.TARGET
+        commands = [" ".join(str(part) for part in call.args[0]) for call in mock_run.call_args_list]
+        assert any("rev-parse --verify" in command for command in commands), commands
+        assert any(
+            f"merge-base --is-ancestor {self.TARGET} origin/main" in command
+            for command in commands
+        ), commands
+
+    def test_exact_commit_outside_selected_branch_is_rejected(self):
+        from hermes_cli.update_cmd import (
+            ExactCommitTargetError,
+            _resolve_exact_commit_target,
+        )
+
+        with patch(
+            "hermes_cli.update_cmd.subprocess.run",
+            side_effect=self._git_side_effect(contained_by_branch=False),
+        ):
+            with pytest.raises(
+                ExactCommitTargetError,
+                match="not reachable from origin/main",
+            ):
+                _resolve_exact_commit_target(
+                    ["git"], PROJECT_ROOT, "main", self.TARGET
+                )
+
+    def test_short_commit_is_rejected_before_any_git_command(self):
+        from hermes_cli.update_cmd import (
+            ExactCommitTargetError,
+            _resolve_exact_commit_target,
+        )
+
+        with pytest.raises(ExactCommitTargetError, match="40- or 64-character"):
+            _resolve_exact_commit_target(["git"], PROJECT_ROOT, "main", "a" * 12)
+
+    def test_sha256_length_commit_id_is_accepted(self):
+        from hermes_cli.update_cmd import _normalize_exact_commit_target
+
+        assert _normalize_exact_commit_target("B" * 64) == "b" * 64
+
+    def test_resolved_object_must_equal_the_supplied_full_id(self):
+        from hermes_cli.update_cmd import (
+            ExactCommitTargetError,
+            _resolve_exact_commit_target,
+        )
+
+        def expanded_object_id(cmd, **_kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{'b' * 64}\n", stderr=""
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=expanded_object_id):
+            with pytest.raises(ExactCommitTargetError, match="full object ID"):
+                _resolve_exact_commit_target(
+                    ["git"], PROJECT_ROOT, "main", self.TARGET
+                )
+
+    def test_preflight_refreshes_tracking_ref_before_reachability_check(self, tmp_path):
+        """A force-pushed remote branch must not be checked against stale origin/main."""
+        from hermes_cli.update_cmd import (
+            ExactCommitTargetError,
+            _preflight_exact_commit_update,
+        )
+
+        def git(cwd, *args):
+            return subprocess.run(
+                ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+            )
+
+        remote = tmp_path / "remote.git"
+        seed = tmp_path / "seed"
+        worker = tmp_path / "worker"
+        replacement = tmp_path / "replacement"
+        git(tmp_path, "init", "--bare", str(remote))
+        git(tmp_path, "init", "-b", "main", str(seed))
+        git(seed, "config", "user.email", "test@example.invalid")
+        git(seed, "config", "user.name", "Test")
+        (seed / "tracked.txt").write_text("approved target\n", encoding="utf-8")
+        git(seed, "add", "tracked.txt")
+        git(seed, "commit", "-m", "approved target")
+        approved = git(seed, "rev-parse", "HEAD").stdout.strip()
+        git(seed, "remote", "add", "origin", str(remote))
+        git(seed, "push", "origin", "main")
+        git(tmp_path, "clone", "--branch", "main", str(remote), str(worker))
+        # An explicit `git fetch origin main` updates FETCH_HEAD but does not
+        # necessarily update origin/main when the remote's fetch mapping omits
+        # main. The updater must supply its own destination refspec.
+        git(
+            worker,
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/other:refs/remotes/origin/other",
+        )
+
+        git(tmp_path, "init", "-b", "main", str(replacement))
+        git(replacement, "config", "user.email", "test@example.invalid")
+        git(replacement, "config", "user.name", "Test")
+        (replacement / "replacement.txt").write_text("rewritten branch\n", encoding="utf-8")
+        git(replacement, "add", "replacement.txt")
+        git(replacement, "commit", "-m", "rewrite main")
+        rewritten = git(replacement, "rev-parse", "HEAD").stdout.strip()
+        git(replacement, "remote", "add", "origin", str(remote))
+        git(replacement, "push", "--force", "origin", "main")
+
+        assert git(worker, "rev-parse", "origin/main").stdout.strip() == approved
+        with pytest.raises(ExactCommitTargetError, match="not reachable from origin/main"):
+            _preflight_exact_commit_update(
+                SimpleNamespace(branch="main"), approved, worker
+            )
+        assert git(worker, "rev-parse", "origin/main").stdout.strip() == rewritten
+
+
+class TestCmdUpdateCheckCommitFlag:
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_rejects_an_apply_only_commit_flag(
+        self, mock_run, _mock_method, capsys
+    ):
+        args = SimpleNamespace(check=True, branch=None, commit="a" * 40)
+
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_update(args)
+
+        assert excinfo.value.code == 2
+        assert "--check cannot be combined with --commit" in capsys.readouterr().out
+        mock_run.assert_not_called()
+
+
+class TestCmdUpdateExactCommitFlag:
+    """Apply-path guarantees for a coordinated immutable host cutoff."""
+
+    TARGET = "a" * 40
+
+    @classmethod
+    def _git_side_effect(cls, *, current_branch="main", forward_only=True):
+        def side_effect(cmd, **_kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{current_branch}\n", stderr=""
+                )
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{cls.TARGET}\n", stderr=""
+                )
+            if "merge-base" in joined and "HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0 if forward_only else 1,
+                    stdout="",
+                    stderr="",
+                )
+            if "merge-base" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        return side_effect
+
+    @staticmethod
+    def _commands(mock_run):
+        return [
+            " ".join(str(part) for part in call.args[0])
+            for call in mock_run.call_args_list
+        ]
+
+    @staticmethod
+    def _assert_failed_pinned_preflight_receipt(detail_fragment):
+        """Assert the public cmd_update boundary finalized a failed receipt."""
+        from hermes_cli.update_receipt import read_latest_receipt
+
+        receipt = read_latest_receipt()
+        assert receipt is not None
+        assert receipt["outcome"] == "failed"
+        assert receipt["exit_code"] == 1
+        steps = {step["name"]: step for step in receipt["steps"]}
+        assert steps["pinned_target_preflight"]["ok"] is False
+        assert detail_fragment in steps["pinned_target_preflight"]["detail"]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_exact_commit_merges_the_approved_cutoff_not_the_branch_tip(
+        self, mock_run, _mock_which, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        mock_run.side_effect = self._git_side_effect()
+
+        # Stop immediately after the merge boundary: this test exercises the
+        # source-selection transaction without touching dependency or gateway
+        # lifecycle work that is separately covered by the update suite.
+        with patch(
+            "hermes_cli.update_cmd._validate_critical_files_syntax",
+            side_effect=RuntimeError("stop after source merge"),
+        ):
+            with pytest.raises(RuntimeError, match="stop after source merge"):
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        commands = self._commands(mock_run)
+        assert any(
+            f"merge --ff-only {self.TARGET}" in command for command in commands
+        ), commands
+        assert not any("reset --hard" in command for command in commands)
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_syntax_failure_keeps_the_pinned_target_without_reset(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        mock_run.side_effect = self._git_side_effect()
+
+        with patch(
+            "hermes_cli.update_cmd._validate_critical_files_syntax",
+            return_value=(False, "hermes_cli/main.py", "SyntaxError: bad source"),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "Pinned target remains checked out" in capsys.readouterr().out
+        commands = self._commands(mock_run)
+        assert any(
+            f"merge --ff-only {self.TARGET}" in command for command in commands
+        ), commands
+        assert not any("reset --hard" in command for command in commands)
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_partial_autostash_refuses_a_pinned_update_without_reset(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        """A partial stash must not clean a pinned checkout with reset --hard."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        old_stash = "b" * 40
+        new_stash = "c" * 40
+        stash_reads = iter([old_stash, new_stash])
+
+        def partial_stash(cmd, **_kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "status --porcelain" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=" M local-change.py\\n", stderr=""
+                )
+            if "ls-files --unmerged" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rev-parse" in joined and "refs/stash" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{next(stash_reads)}\\n", stderr=""
+                )
+            if "stash push" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    stdout="Saved working directory and index state\\n",
+                    stderr="warning: failed to remove generated/\\n",
+                )
+            return self._git_side_effect()(cmd, **_kwargs)
+
+        mock_run.side_effect = partial_stash
+
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "No ZIP, reset, or alternate-source fallback was performed" in capsys.readouterr().out
+        commands = self._commands(mock_run)
+        assert any("stash push --include-untracked" in command for command in commands)
+        assert not any("reset" in command for command in commands), commands
+        assert not any("merge --ff-only" in command for command in commands), commands
+
+    def test_pinned_update_refuses_to_clear_an_unmerged_index_with_reset(self, tmp_path):
+        from hermes_cli.update_cmd import _stash_local_changes_if_needed
+
+        def unmerged_index(cmd, **_kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "status --porcelain" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="UU local-change.py\\n", stderr="")
+            if "ls-files --unmerged" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="100644 deadbeef 1\\tlocal-change.py\\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=unmerged_index) as mock_run:
+            with pytest.raises(subprocess.CalledProcessError):
+                _stash_local_changes_if_needed(["git"], tmp_path, allow_reset=False)
+
+        assert not any(
+            " reset" in f" {' '.join(str(part) for part in call.args[0])}"
+            for call in mock_run.call_args_list
+        )
+
+    def test_pinned_stash_restore_conflict_does_not_hard_reset(self, tmp_path):
+        from hermes_cli.update_cmd import _restore_stashed_changes
+
+        def conflicted_restore(cmd, **_kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "stash apply" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="CONFLICT (content): Merge conflict"
+                )
+            if "diff --name-only --diff-filter=U" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="local-change.py\\n", stderr=""
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=conflicted_restore) as mock_run:
+            with pytest.raises(subprocess.CalledProcessError):
+                _restore_stashed_changes(
+                    ["git"], tmp_path, "d" * 40, allow_reset=False
+                )
+
+        assert not any(
+            "reset --hard" in " ".join(str(part) for part in call.args[0])
+            for call in mock_run.call_args_list
+        )
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_exact_commit_refuses_automatic_branch_switch(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        mock_run.side_effect = self._git_side_effect(current_branch="feature/local")
+        import hermes_cli.main as hm
+
+        with (
+            patch.object(
+                hm,
+                "_capture_active_lazy_features",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+            patch.object(
+                hm,
+                "_capture_active_tool_dependencies",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "No branch switch was performed" in capsys.readouterr().out
+        self._assert_failed_pinned_preflight_receipt("No branch switch was performed")
+        commands = self._commands(mock_run)
+        assert not any("checkout main" in command for command in commands)
+        assert not any("merge --ff-only" in command for command in commands)
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_exact_commit_refuses_non_fast_forward_without_reset(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        mock_run.side_effect = self._git_side_effect(forward_only=False)
+        import hermes_cli.main as hm
+
+        with (
+            patch.object(
+                hm,
+                "_capture_active_lazy_features",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+            patch.object(
+                hm,
+                "_capture_active_tool_dependencies",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "not a fast-forward" in capsys.readouterr().out
+        self._assert_failed_pinned_preflight_receipt("not a fast-forward")
+        commands = self._commands(mock_run)
+        assert not any("merge --ff-only" in command for command in commands)
+        assert not any("reset --hard" in command for command in commands)
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_unreachable_exact_commit_refuses_before_update_lifecycle(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        import hermes_cli.main as hm
+
+        def unreachable_target(cmd, **kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "merge-base" in joined and "HEAD" not in joined:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+            return self._git_side_effect()(cmd, **kwargs)
+
+        mock_run.side_effect = unreachable_target
+        with (
+            patch.object(
+                hm,
+                "_capture_active_lazy_features",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+            patch.object(
+                hm,
+                "_capture_active_tool_dependencies",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "not reachable" in capsys.readouterr().out
+        from hermes_cli.update_receipt import read_latest_receipt
+
+        receipt = read_latest_receipt()
+        assert receipt is not None
+        assert receipt["outcome"] == "failed"
+        assert receipt["exit_code"] == 1
+        assert receipt["steps"][-1]["name"] == "pinned_target_preflight"
+        assert receipt["steps"][-1]["ok"] is False
+        assert "not reachable" in receipt["steps"][-1]["detail"]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run", side_effect=FileNotFoundError("git executable unavailable"))
+    def test_missing_git_records_a_failed_pinned_preflight_step(
+        self, _mock_run, _mock_which, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from hermes_cli.update_receipt import read_latest_receipt
+
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        receipt = read_latest_receipt()
+        assert receipt is not None
+        assert receipt["outcome"] == "failed"
+        steps = {step["name"]: step for step in receipt["steps"]}
+        assert steps["pinned_target_preflight"]["ok"] is False
+        assert "Could not execute git" in steps["pinned_target_preflight"]["detail"]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_fetch_failure_records_a_failed_pinned_preflight_receipt(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        """A selected-branch fetch failure remains visible to fleet reducers."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        import hermes_cli.main as hm
+
+        def failed_fetch(cmd, **kwargs):
+            if "fetch origin" in " ".join(str(part) for part in cmd):
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="remote rejected selected branch"
+                )
+            return self._git_side_effect()(cmd, **kwargs)
+
+        mock_run.side_effect = failed_fetch
+        with (
+            patch.object(
+                hm,
+                "_capture_active_lazy_features",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+            patch.object(
+                hm,
+                "_capture_active_tool_dependencies",
+                side_effect=AssertionError("lifecycle must not start"),
+            ),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "Could not fetch origin/main" in capsys.readouterr().out
+        self._assert_failed_pinned_preflight_receipt("Could not fetch origin/main")
+        commands = self._commands(mock_run)
+        assert not any("merge --ff-only" in command for command in commands)
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_zip_eligible_git_failure_never_falls_back_when_pinned(
+        self, mock_run, _mock_which, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        def rev_list_failure(cmd, **kwargs):
+            if "rev-list" in " ".join(str(part) for part in cmd):
+                raise subprocess.CalledProcessError(1, cmd)
+            return self._git_side_effect()(cmd, **kwargs)
+
+        mock_run.side_effect = rev_list_failure
+        with (
+            patch(
+                "hermes_cli.update_cmd._should_zip_fallback_on_update_error",
+                return_value=True,
+            ),
+            patch("hermes_cli.update_cmd._update_via_zip") as zip_fallback,
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "pinned --commit" in capsys.readouterr().out
+        zip_fallback.assert_not_called()
+
+    def test_exact_commit_without_git_checkout_records_a_failed_preflight_receipt(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A non-Git pinned request is observable at the public cmd_update boundary."""
+        import hermes_cli.main as hm
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        non_git_root = tmp_path / "not-a-git-checkout"
+        non_git_root.mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", non_git_root)
+
+        with (
+            patch.object(
+                hm,
+                "_capture_active_lazy_features",
+                side_effect=AssertionError("update lifecycle must not start"),
+            ),
+            patch.object(
+                hm,
+                "_capture_active_tool_dependencies",
+                side_effect=AssertionError("update lifecycle must not start"),
+            ),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_update(SimpleNamespace(branch="main", commit=self.TARGET))
+
+        assert excinfo.value.code == 1
+        assert "requires a working Git checkout" in capsys.readouterr().out
+        self._assert_failed_pinned_preflight_receipt("requires a working Git checkout")
+
+
 class TestCmdUpdateBranchFlag:
     """``hermes update --branch <name>`` targets the requested branch.
 
@@ -872,6 +1449,22 @@ class TestCmdUpdateZipBranchRefusal:
         assert "bb/gui" in out
         assert "not supported" in out
         # No actual download attempted.
+        assert "Downloading latest version" not in out
+
+    def test_zip_fallback_refuses_an_exact_commit(self, capsys):
+        from hermes_cli.main import _update_via_zip
+
+        args = SimpleNamespace(branch=None, commit="a" * 40)
+        with patch(
+            "urllib.request.urlretrieve",
+            side_effect=AssertionError("ZIP download must not run"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _update_via_zip(args)
+        assert exc_info.value.code == 1
+
+        out = capsys.readouterr().out
+        assert "--commit" in out
         assert "Downloading latest version" not in out
 
 
