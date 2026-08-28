@@ -16,6 +16,9 @@ from tools.vision_tools import (
     _handle_vision_analyze,
     _determine_mime_type,
     _image_to_base64_data_url,
+    _normalize_to_supported_image,
+    _ANTHROPIC_SUPPORTED_MEDIA_TYPES,
+    _LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES,
     _resize_image_for_vision,
     _image_exceeds_dimension,
     _EMBED_MAX_DIMENSION,
@@ -1121,3 +1124,77 @@ class TestVisionCpuBurstCap:
             f"analyses were serialized to the cap (peak={calls_peak}); only the "
             "encode burst should be bounded, not the whole call"
         )
+
+
+# ---------------------------------------------------------------------------
+# _normalize_to_supported_image — webp handling differs by backend
+# ---------------------------------------------------------------------------
+
+
+class TestWebpNormalization:
+    """webp decodes on cloud providers but NOT on llama.cpp / stb_image, which
+    has no webp decoder — ``stbi_load_from_memory`` returns NULL and llama-server
+    silently drops the image (HTTP 200, text-only, model says "no image").
+
+    So the native/cloud path keeps webp as-is (re-encoding a photo to PNG there
+    would inflate every turn's baked-in history), and only the auxiliary call —
+    one-shot, backend often local — normalizes webp to PNG.
+    """
+
+    def test_cloud_set_keeps_webp_local_set_drops_it(self):
+        assert "image/webp" in _ANTHROPIC_SUPPORTED_MEDIA_TYPES
+        assert "image/webp" not in _LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES
+        # formats stb_image can decode stay in both
+        for m in ("image/jpeg", "image/png", "image/gif"):
+            assert m in _ANTHROPIC_SUPPORTED_MEDIA_TYPES
+            assert m in _LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES
+
+    def test_webp_passes_through_on_default_cloud_set(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        src = tmp_path / "photo.webp"
+        Image.new("RGB", (32, 24), (10, 120, 220)).save(src, "WEBP")
+
+        out_path, out_mime, err = _normalize_to_supported_image(src, "image/webp")
+
+        assert err is None
+        assert out_path == src
+        assert out_mime == "image/webp"
+
+    def test_webp_reencoded_to_png_for_local_backend(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        src = tmp_path / "photo.webp"
+        Image.new("RGB", (32, 24), (10, 120, 220)).save(src, "WEBP")
+
+        out_path, out_mime, err = _normalize_to_supported_image(
+            src, "image/webp", _LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES,
+        )
+
+        assert err is None
+        assert out_mime == "image/png"
+        assert out_path is not None and out_path != src
+        with Image.open(out_path) as reopened:
+            assert reopened.format == "PNG"
+            assert reopened.size == (32, 24)
+
+    def test_png_passes_through_untouched_on_both_sets(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        src = tmp_path / "photo.png"
+        Image.new("RGB", (8, 8), (0, 0, 0)).save(src, "PNG")
+
+        for supported in (_ANTHROPIC_SUPPORTED_MEDIA_TYPES,
+                          _LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES):
+            out_path, out_mime, err = _normalize_to_supported_image(
+                src, "image/png", supported,
+            )
+            assert err is None
+            assert out_path == src
+            assert out_mime == "image/png"

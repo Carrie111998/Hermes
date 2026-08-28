@@ -279,15 +279,27 @@ def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
     return None
 
 
-# Media types the major vision providers (Anthropic in particular) accept for
-# inline base64 images.  Anything outside this set — SVG, BMP, TIFF, etc. — is
-# rejected with a non-retryable 400.  Because a vision tool-result is baked into
-# immutable conversation history and re-sent every turn, embedding an
-# unsupported media_type permanently wedges the session (retries re-send the
-# same bad bytes).  We MUST normalize to one of these before embedding.
+# Media types the major cloud vision providers (Anthropic in particular, plus
+# OpenAI / Gemini / Bedrock) accept as-is for inline base64 images.  Anything
+# outside this set — SVG, BMP, TIFF, HEIC — is rejected with a non-retryable
+# 400.  Because a vision tool-result is baked into immutable conversation
+# history and re-sent every turn, embedding an unsupported media_type
+# permanently wedges the session (retries re-send the same bad bytes).  We MUST
+# normalize to one of these before embedding on the native path.
 _ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset(
     {"image/jpeg", "image/png", "image/gif", "image/webp"}
 )
+
+# Subset that a local llama.cpp / stb_image vision backend can actually decode.
+# stb_image has NO webp decoder: `stbi_load_from_memory` returns NULL for webp
+# and llama-server then silently drops the image part (HTTP 200, text-only
+# prompt, no image tokens, model says "there is no image" or hallucinates).
+# The auxiliary vision call — a one-shot request whose backend is often a local
+# model, and which is NOT baked into conversation history — normalizes against
+# this set instead, so webp gets re-encoded to PNG first.  The re-encode cost is
+# a single request; if the auxiliary backend is actually a cloud provider it's a
+# harmless no-op (PNG is universally accepted).
+_LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES = _ANTHROPIC_SUPPORTED_MEDIA_TYPES - {"image/webp"}
 
 
 def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
@@ -338,9 +350,15 @@ def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
 
 
 def _normalize_to_supported_image(
-    image_path: Path, detected_mime: str
+    image_path: Path, detected_mime: str,
+    supported: frozenset = _ANTHROPIC_SUPPORTED_MEDIA_TYPES,
 ) -> tuple[Optional[Path], Optional[str], Optional[str]]:
-    """Ensure an image is in a vision-provider-supported format.
+    """Ensure an image is in a format the target vision backend can read.
+
+    ``supported`` is the set of media types that need no conversion — defaults
+    to what the cloud providers accept; the auxiliary vision call passes
+    ``_LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES`` so webp is re-encoded for a local
+    stb_image backend that can't decode it.
 
     Returns a 3-tuple ``(path, mime, error)``:
       - If ``detected_mime`` is already supported: ``(image_path, detected_mime, None)``.
@@ -349,11 +367,11 @@ def _normalize_to_supported_image(
       - If conversion is impossible: ``(None, None, <error message>)``.
 
     SVG is rasterized to PNG (best-effort, soft deps).  Other raster formats
-    Pillow can read (BMP, TIFF, etc.) are re-encoded to PNG.  This runs BEFORE
-    the image is base64-embedded into conversation history, so an unsupported
-    media_type can never reach the provider and wedge the session.
+    Pillow can read (BMP, TIFF, webp, etc.) are re-encoded to PNG.  This runs
+    BEFORE the image is base64-embedded, so an undecodable media_type can never
+    reach the backend and wedge the session.
     """
-    if detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES:
+    if detected_mime in supported:
         return image_path, detected_mime, None
 
     out_dir = get_hermes_dir("cache/vision", "temp_vision_images")
@@ -1485,11 +1503,13 @@ async def vision_analyze_tool(
         image_size_bytes = len(resolved.data)
         image_size_kb = image_size_bytes / 1024
         logger.info("Image ready (%.1f KB)", image_size_kb)
-        # Normalize unsupported formats (SVG, BMP, ...) to PNG. Vision providers
-        # reject these media types; convert before encoding. Offloaded — the
-        # rasterizers/Pillow are blocking.
+        # Normalize unsupported formats (SVG, BMP, webp, ...) to PNG. This is the
+        # auxiliary vision call — the backend is often a local llama.cpp / ollama
+        # model, so normalize against what stb_image can decode (no webp), not
+        # just what the cloud providers accept. Offloaded — Pillow is blocking.
         normalized_path, detected_mime_type, _norm_err = await asyncio.to_thread(
             _normalize_to_supported_image, temp_image_path, detected_mime_type,
+            _LOCAL_BACKEND_SUPPORTED_MEDIA_TYPES,
         )
         if _norm_err or normalized_path is None:
             raise ValueError(_norm_err or "Image normalization failed.")
