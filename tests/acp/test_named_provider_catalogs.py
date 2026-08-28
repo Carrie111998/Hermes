@@ -331,7 +331,31 @@ class TestModelStateIncludesNamedProviders:
         (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-        model_state = acp_agent._build_model_state(state)
+        inventory_provider = "custom" if current_provider == "custom" else "9router"
+        inventory = {
+            "providers": [
+                {
+                    "slug": inventory_provider,
+                    "name": "9Router",
+                    "api_url": "https://router.example/v1",
+                    "models": [{"id": model}],
+                },
+                {
+                    "slug": colon_provider,
+                    "name": "Local Ollama",
+                    "api_url": "http://127.0.0.1:11434/v1",
+                    "models": [{"id": colon_model}],
+                },
+            ]
+        }
+
+        # The ACP suite intentionally stubs remote-backed shared inventory.
+        # Supply its exact row shape while exercising real config loading,
+        # canonical identity recovery, named catalogs, and model parsing.
+        with patch(
+            "hermes_cli.inventory.build_models_payload", return_value=inventory
+        ):
+            model_state = acp_agent._build_model_state(state)
         canonical_id = f"custom:9router:{model}"
         provider, parsed_model = parse_model_input(canonical_id, "custom")
         colon_id = f"custom:{colon_provider}:{colon_model}"
@@ -387,3 +411,28 @@ class TestModelStateIncludesNamedProviders:
             "anthropic:claude-sonnet-4.5"
         ]
         canonical_custom_identity.assert_not_called()
+
+    def test_auto_request_keeps_resolved_runtime_provider_identity(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="anthropic/claude-sonnet-4.5",
+                provider="openrouter",
+                requested_provider="auto",
+                base_url=None,
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+
+        with patch(
+            "acp_adapter.server._named_custom_provider_catalogs", return_value=[]
+        ):
+            model_state = acp_agent._build_model_state(state)
+
+        assert isinstance(model_state, SessionModelState)
+        assert model_state.current_model_id == (
+            "openrouter:anthropic/claude-sonnet-4.5"
+        )
+        assert [item.model_id for item in model_state.available_models] == [
+            "openrouter:anthropic/claude-sonnet-4.5"
+        ]

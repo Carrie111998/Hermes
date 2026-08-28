@@ -738,6 +738,13 @@ class HermesACPAgent(acp.Agent):
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
         requested_provider = getattr(state.agent, "requested_provider", None)
+        requested_provider_id = (
+            requested_provider.strip().lower()
+            if isinstance(requested_provider, str)
+            else ""
+        )
+        if not requested_provider_id.startswith("custom:"):
+            requested_provider_id = ""
 
         try:
             from hermes_cli.inventory import build_models_payload, load_picker_context
@@ -776,6 +783,8 @@ class HermesACPAgent(acp.Agent):
                 raw = str(provider_id or "").strip().lower()
                 if raw == "ollama":
                     return "custom:ollama"
+                if raw == "custom" and requested_provider_id:
+                    return requested_provider_id
                 if raw.startswith("custom:"):
                     return raw
                 normalized = normalize_provider(raw)
@@ -787,7 +796,7 @@ class HermesACPAgent(acp.Agent):
                 return normalized
 
             current_choice_provider = canonical_choice_provider(
-                requested_provider or provider
+                requested_provider_id or provider
             )
             current_base_url = str(
                 getattr(state.agent, "base_url", "") or ""
