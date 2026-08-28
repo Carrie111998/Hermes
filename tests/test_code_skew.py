@@ -88,6 +88,34 @@ class TestDashboardCodeSkewGuard:
         assert "def4567890" in msg
         assert "restart" in msg.lower()
 
+    def test_dashboard_guard_desktop_deployment_advises_reopening_app(self, monkeypatch):
+        # #97046: Desktop-owned backends (local or SSH) run with
+        # HERMES_DESKTOP=1 and are owned by the Electron client — there is no
+        # systemd on macOS and no dashboard process to restart via CLI.
+        from hermes_cli import web_server
+
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
+        msg = web_server._dashboard_code_skew_guard()
+        assert msg is not None
+        assert "abc1234567" in msg
+        assert "def4567890" in msg
+        assert "Hermes Desktop app" in msg
+        assert "reopen" in msg.lower()
+        assert "systemctl" not in msg
+
+    def test_dashboard_guard_browser_deployment_keeps_systemd_advice(self, monkeypatch):
+        # Without HERMES_DESKTOP the browser-dashboard remediation must stay
+        # exactly as before (#97046 must not change this behavior).
+        from hermes_cli import web_server
+
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("abc1234567", "def4567890"))
+        msg = web_server._dashboard_code_skew_guard()
+        assert msg is not None
+        assert "systemctl --user restart hermes-dashboard" in msg
+        assert "hermes dashboard --port <port>" in msg
+
 
 class TestModelOptionsSkewGuard:
     """/api/model/options must refuse with a clear 503 when the dashboard is stale.

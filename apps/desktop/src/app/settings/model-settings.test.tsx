@@ -593,3 +593,69 @@ describe('ModelSettings MoA preset editor', () => {
     }
   })
 })
+
+// #97046: a backend code-skew 503 arrives over Electron IPC double-wrapped —
+// the IPC prefix plus the FastAPI detail as a serialized JSON blob. The Models
+// page must surface the backend's human detail (with its deployment-aware
+// restart advice) instead of the raw blob.
+const IPC_SKEW_ERROR =
+  'Error invoking remote method \'hermes:api\': Error: 503: {"detail":"Restart required: This desktop backend was started before the update — quit and reopen Hermes Desktop to load the new code."}'
+
+describe('unwrapCodeSkewError', () => {
+  it('unwraps the IPC prefix and extracts the 503 detail text', async () => {
+    const { unwrapCodeSkewError } = await import('./model-settings')
+
+    expect(unwrapCodeSkewError(new Error(IPC_SKEW_ERROR))).toBe(
+      'Restart required: This desktop backend was started before the update — quit and reopen Hermes Desktop to load the new code.'
+    )
+  })
+
+  it('accepts plain string errors too', async () => {
+    const { unwrapCodeSkewError } = await import('./model-settings')
+
+    expect(unwrapCodeSkewError(IPC_SKEW_ERROR)).toBe(
+      'Restart required: This desktop backend was started before the update — quit and reopen Hermes Desktop to load the new code.'
+    )
+  })
+
+  it('leaves ordinary (non-skew) errors untouched', async () => {
+    const { unwrapCodeSkewError } = await import('./model-settings')
+
+    expect(unwrapCodeSkewError(new Error('boom'))).toBe('boom')
+  })
+
+  it('leaves non-503 IPC errors untouched (current raw behavior)', async () => {
+    const { unwrapCodeSkewError } = await import('./model-settings')
+
+    const raw = 'Error invoking remote method \'hermes:api\': Error: 500: {"detail":"boom"}'
+    expect(unwrapCodeSkewError(new Error(raw))).toBe(raw)
+  })
+
+  it('falls back to the raw remainder when the 503 payload is not JSON', async () => {
+    const { unwrapCodeSkewError } = await import('./model-settings')
+
+    // The IPC wrapper is still stripped; the unparseable remainder after
+    // "503: " is shown as-is.
+    expect(unwrapCodeSkewError(new Error('Error invoking remote method \'hermes:api\': Error: 503: oops not json'))).toBe(
+      '503: oops not json'
+    )
+  })
+})
+
+describe('ModelSettings code-skew 503 unwrapping', () => {
+  it('shows the backend restart detail instead of the raw IPC blob', async () => {
+    getGlobalModelOptions.mockRejectedValueOnce(new Error(IPC_SKEW_ERROR))
+
+    await renderModelSettings()
+
+    const banner = await screen.findByText(
+      /Restart required: This desktop backend was started before the update/
+    )
+
+    expect(banner.textContent).toContain(
+      'quit and reopen Hermes Desktop to load the new code.'
+    )
+    expect(banner.textContent).not.toContain('Error invoking remote method')
+    expect(screen.queryByText(/Error invoking remote method/)).toBeNull()
+  })
+})

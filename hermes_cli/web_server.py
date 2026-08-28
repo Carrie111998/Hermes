@@ -7381,7 +7381,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 
 
 def _dashboard_code_skew_guard() -> Optional[str]:
-    """Return a clear \"restart required\" message when the dashboard runs stale code.
+    """Return a clear "restart required" message when the dashboard runs stale code.
 
     The dashboard is a long-lived process; its ``sys.modules`` is frozen at
     boot.  When ``hermes update`` (or a manual ``git pull``) replaces the
@@ -7393,6 +7393,11 @@ def _dashboard_code_skew_guard() -> Optional[str]:
     ``_model_switch_skew_guard``: refuse the risky call with an actionable
     message instead of crashing with a cryptic import error.
 
+    The remediation text is deployment-aware (#97046): backends spawned by the
+    Desktop app (local or SSH) run with ``HERMES_DESKTOP=1`` and are owned by
+    the Electron client, so systemd/dashboard CLI advice would be wrong — the
+    user must quit and reopen the Desktop app instead.
+
     Returns None when no drift is detectable (fresh process, or a non-git
     install where the boot fingerprint could not be read — never a false
     positive).
@@ -7403,11 +7408,20 @@ def _dashboard_code_skew_guard() -> Optional[str]:
     if not skew:
         return None
     boot_rev, disk_rev = skew
+    if os.environ.get("HERMES_DESKTOP") == "1":
+        remediation = (
+            "quit and reopen the Hermes Desktop app — it owns this backend "
+            "and will load the new code on the next launch"
+        )
+    else:
+        remediation = (
+            "restart the dashboard to load the new code "
+            "(systemctl --user restart hermes-dashboard, or hermes dashboard --port <port>)"
+        )
     return (
         f"This dashboard is running code from {boot_rev} but the checkout on "
         f"disk is now {disk_rev}. The model picker would risk a stale-module "
-        f"crash — restart the dashboard to load the new code "
-        f"(systemctl --user restart hermes-dashboard, or hermes dashboard --port <port>)"
+        f"crash — {remediation}"
     )
 
 

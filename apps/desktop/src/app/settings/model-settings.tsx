@@ -39,6 +39,34 @@ import { getNested, setNested } from './helpers'
 import { ListRow, Pill, SectionHeading } from './primitives'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
 
+// A code-skew 503 from the backend arrives over Electron IPC double-wrapped:
+// the IPC layer prefixes it ("Error invoking remote method 'hermes:api':
+// Error: ") and the FastAPI detail rides inside as a serialized JSON blob
+// ("503: {\"detail\":\"Restart required: ...\"}"). Surface just the backend's
+// human detail text instead of the raw blob (#97046). Any other error shape
+// comes back unchanged, so non-skew behavior is untouched.
+export function unwrapCodeSkewError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error)
+  const inner = raw.match(/Error invoking remote method '[^']+': Error: (.+)$/)?.[1] ?? raw
+  const skew = /^503: (.+)$/.exec(inner)
+
+  if (!skew) {
+    return raw
+  }
+
+  try {
+    const detail = (JSON.parse(skew[1]) as { detail?: unknown }).detail
+
+    if (typeof detail === 'string' && detail.startsWith('Restart required:')) {
+      return detail
+    }
+  } catch {
+    // Not JSON — fall through to the raw remainder below.
+  }
+
+  return inner
+}
+
 // Skeleton mirror of the Model settings DOM so the page keeps its shape while
 // the provider/model catalog loads, instead of collapsing to a centered
 // spinner. Same containers/rhythm as the real render below.
@@ -270,7 +298,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         void invalidateHermesConfig(scopeProfile)
       } catch (err) {
         if (profileEpoch.current === epoch) {
-          setError(err instanceof Error ? err.message : String(err))
+          setError(unwrapCodeSkewError(err))
         }
       } finally {
         if (profileEpoch.current === epoch) {
@@ -408,7 +436,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           })
           .catch(err => {
             if (moaSaveGeneration.current === generation) {
-              setError(err instanceof Error ? err.message : String(err))
+              setError(unwrapCodeSkewError(err))
             }
           })
       }, 600)
@@ -477,7 +505,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
         setMoa(saved)
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setError(unwrapCodeSkewError(err))
       } finally {
         setApplying(false)
       }
@@ -592,7 +620,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       const fallbackModel = refreshedRow?.models?.[0] ?? ''
       setSelectedModel(nextModel || fallbackModel)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(unwrapCodeSkewError(err))
     } finally {
       setActivating(false)
     }
@@ -660,7 +688,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
       await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(unwrapCodeSkewError(err))
     } finally {
       setApplying(false)
     }
@@ -702,7 +730,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         )
         await refresh()
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setError(unwrapCodeSkewError(err))
       } finally {
         setApplying(false)
       }
@@ -733,7 +761,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         setEditingAuxTask(null)
         await refresh()
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setError(unwrapCodeSkewError(err))
       } finally {
         setApplying(false)
       }
@@ -776,7 +804,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setSwitchStaleAux([])
       await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(unwrapCodeSkewError(err))
     } finally {
       setApplying(false)
     }
