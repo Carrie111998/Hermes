@@ -26,10 +26,73 @@ piecemeal, the footer is sent as a separate trailing message via
 from __future__ import annotations
 
 import os
+import sqlite3
+import time
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+
+
+def _state_db_path() -> Optional[str]:
+    home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    db = home / "state.db"
+    return str(db) if db.exists() else None
+
+
+def _active_telegram_sessions_24h() -> int:
+    db_path = _state_db_path()
+    if not db_path:
+        return 0
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT s.id) as c
+            FROM sessions s
+            JOIN messages m ON m.session_id = s.id
+            WHERE s.source = 'telegram' AND s.archived = 0 AND m.timestamp > ?
+            """,
+            (time.time() - 24 * 3600,),
+        ).fetchone()
+        conn.close()
+        return row["c"] if row else 0
+    except Exception:
+        return 0
+
+
+def _session_started_at(session_id: str) -> Optional[float]:
+    db_path = _state_db_path()
+    if not db_path or not session_id:
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT started_at FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        return row["started_at"] if row else None
+    except Exception:
+        return None
+
+
+def _progress_bar(pct: float, width: int = 10) -> str:
+    filled = int(round(pct / 100 * width))
+    filled = max(0, min(width, filled))
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -95,6 +158,9 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    session_age_seconds: Optional[float] = None,
+    active_sessions: Optional[int] = None,
+    voice_on: bool = False,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
@@ -111,10 +177,25 @@ def format_runtime_footer(
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field == "context_bar":
+            if context_length and context_length > 0 and context_tokens >= 0:
+                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
+                parts.append(f"{_progress_bar(pct)} {pct}%")
+        elif field == "context_used_total":
+            if context_length and context_length > 0 and context_tokens >= 0:
+                parts.append(f"{context_tokens/1000:.1f}k/{context_length/1000:.1f}k")
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "age":
+            if session_age_seconds is not None and session_age_seconds >= 0:
+                parts.append(_fmt_duration(session_age_seconds))
+        elif field == "sessions":
+            if active_sessions is not None and active_sessions >= 0:
+                parts.append(f"{active_sessions} sessions")
+        elif field == "voice":
+            parts.append("voice on" if voice_on else "voice off")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -130,6 +211,9 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    session_id: Optional[str] = None,
+    session_age_seconds: Optional[float] = None,
+    voice_on: bool = False,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -140,10 +224,22 @@ def build_footer_line(
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
         return ""
+
+    # Compute derived metadata from state.db when not provided by caller.
+    active_sessions = _active_telegram_sessions_24h()
+    age = session_age_seconds
+    if age is None and session_id:
+        started = _session_started_at(session_id)
+        if started:
+            age = time.time() - started
+
     return format_runtime_footer(
         model=model,
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        session_age_seconds=age,
+        active_sessions=active_sessions,
+        voice_on=voice_on,
     )
