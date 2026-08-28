@@ -33,6 +33,7 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_skill_policy,
     iter_skill_index_files,
     org_id_of_path,
     parse_frontmatter,
@@ -397,6 +398,49 @@ KANBAN_GUIDANCE = (
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is "
     "for short reasoning subtasks inside your own run; board tasks are for "
     "cross-agent handoffs that outlive one API loop."
+)
+
+KANBAN_WORKER_GUIDANCE = (
+    "# Kanban worker\n"
+    "Own only the task in HERMES_KANBAN_TASK. Call kanban_show first and treat "
+    "its worker_context as the task contract. Use HERMES_KANBAN_WORKSPACE for "
+    "local file work. If the profile pins a remote terminal, use only its "
+    "authorized remote task workspace and never fall back to the host. Do not "
+    "modify another workspace unless the card explicitly authorizes it. Use "
+    "heartbeat during a genuinely long step and comment only when task evidence "
+    "would otherwise be lost. Block and stop on an exact external dependency; "
+    "do not call clarify in this headless run. If a pre-created review, QA, or "
+    "release child depends on this task, complete the task to release that child. "
+    "Otherwise request_review when this same card needs review. On a review task, "
+    "complete approval or request_changes with actionable rework. Put the verified "
+    "handoff in summary and metadata without secrets; pass existing user-facing "
+    "files through artifacts. Do not create, list, link, unblock, attach, delegate, "
+    "assign, or coordinate follow-up work. Return follow-up needs as proposals in "
+    "the handoff."
+)
+
+COMPACT_EXECUTION_GUIDANCE = (
+    "# Execution\n"
+    "Use an available tool when the answer depends on observation or action. If "
+    "an authorized tool can complete the current step, use it instead of "
+    "describing what you would do. Batch independent calls; serialize calls only "
+    "when one result determines the next. Preserve user-supplied identifiers and "
+    "values literally. Never invent tool output or substitute plausible data for "
+    "a blocked path. Use tools for material calculations, hashes, counts, live "
+    "state, files, and current facts. After an external write, read back the exact "
+    "target. Finish only when the requested outcome and material success conditions "
+    "are verified; otherwise report the exact blocker and smallest missing input or "
+    "dependency."
+)
+
+COMPACT_REPOSITORY_GUIDANCE = (
+    "# Repository work\n"
+    "Inspect the affected code and its callers before editing. Follow repository "
+    "instructions and conventions, preserve unrelated work, and change only what "
+    "the requested behavior needs. Apply edits with file tools. Validate the "
+    "changed behavior with the smallest relevant test, check, or build; if "
+    "validation cannot run, say why. Treat a patch acknowledgement as an edit "
+    "result, not proof of behavior. Re-read live Git state before a Git action."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
@@ -1836,6 +1880,7 @@ def _build_skills_system_prompt_inner(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    skill_policy = get_skill_policy()
     project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir),
@@ -1845,6 +1890,8 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        None if skill_policy.allowed is None else tuple(sorted(skill_policy.allowed)),
+        None if skill_policy.index_described is None else tuple(sorted(skill_policy.index_described)),
         tuple(sorted(compact_categories or ())),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
@@ -2058,6 +2105,15 @@ def _build_skills_system_prompt_inner(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
+    # Apply profile access policy after the policy-neutral inventory/snapshot
+    # scan. This same normalized policy also gates list/view/manage tools.
+    filtered_by_policy: dict[str, list[tuple[str, str]]] = {}
+    for category, entries in skills_by_category.items():
+        kept = [(name, desc) for name, desc in entries if skill_policy.permits(name)]
+        if kept:
+            filtered_by_policy[category] = kept
+    skills_by_category = filtered_by_policy
+
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
     # line — descriptions are dropped to cut noise, but every skill name
@@ -2092,8 +2148,17 @@ def _build_skills_system_prompt_inner(
         for category in sorted(skills_by_category.keys()):
             # Deduplicate and sort skills within each category
             seen = set()
-            if category in demoted:
-                names = sorted({name for name, _ in skills_by_category[category]})
+            entries = skills_by_category[category]
+            names_only = sorted({
+                name for name, _ in entries
+                if category in demoted or not skill_policy.describes(name)
+            })
+            described = [
+                (name, desc) for name, desc in entries
+                if category not in demoted and skill_policy.describes(name)
+            ]
+            if names_only and not described:
+                names = names_only
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
             cat_desc = category_descriptions.get(category, "")
@@ -2101,7 +2166,7 @@ def _build_skills_system_prompt_inner(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            for name, desc in sorted(described, key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
@@ -2109,24 +2174,39 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
+            if names_only:
+                index_lines.append(f"    [names only]: {', '.join(names_only)}")
 
+        _can_manage = available_tools is None or "skill_manage" in available_tools
+        if _can_manage:
+            _skills_intro = (
+                "## Skills\n"
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows. "
+                "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+                "and proven workflows that outperform general-purpose approaches. Load the skill "
+                f"even if you think you could handle the task with basic tools like {_basic_tools}. "
+                "Skills also encode the user's preferred approach, conventions, and quality standards "
+                "for tasks like code review, planning, and testing — load them even for tasks you "
+                "already know how to do, because the skill defines how it should be done here.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+            )
+        else:
+            _skills_intro = (
+                "## Skills\n"
+                "Scan the allowed skills below before acting. Load a relevant "
+                "procedure with skill_view(name) and follow it. Names-only skills "
+                "remain loadable; their descriptions are omitted to keep this "
+                "routing index focused.\n"
+            )
         result = (
-            "## Skills\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            f"even if you think you could handle the task with basic tools like {_basic_tools}. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
+            _skills_intro
+            + "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"

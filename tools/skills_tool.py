@@ -104,7 +104,7 @@ _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+def _skills_scan_signature(dirs_to_scan, disabled, allowed=None) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
     O(#dirs + #categories) stat calls, not a recursive walk. Includes the
@@ -134,7 +134,12 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    return (
+        tuple(sig),
+        frozenset(disabled),
+        None if allowed is None else frozenset(allowed),
+        platform,
+    )
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -702,6 +707,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     from agent.skill_utils import (
         get_external_skills_dirs,
         get_project_skills_dirs,
+        get_skill_policy,
         iter_project_skill_files,
         iter_skill_index_files,
     )
@@ -711,6 +717,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
+    policy = get_skill_policy()
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -724,7 +731,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, disabled, policy.allowed)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -772,6 +779,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
                 if name in disabled:
                     continue
+                if not policy.permits(name):
+                    continue
 
                 description = frontmatter.get("description", "")
                 if not description:
@@ -815,6 +824,89 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
+def validate_configured_skill_policy() -> Dict[str, Dict[str, str]]:
+    """Fail closed when configured policy names are missing or ambiguous.
+
+    Returns only source class/path metadata for canary evidence; skill content
+    is never copied into the result.
+    """
+    from agent.skill_utils import (
+        get_external_skills_dirs,
+        get_project_skills_dirs,
+        get_skill_policy,
+        iter_project_skill_files,
+        iter_skill_index_files,
+    )
+
+    policy = get_skill_policy()
+    targets = set(policy.allowed or ()) | set(policy.index_described or ())
+    if not targets:
+        return {}
+
+    disabled = _get_disabled_skill_names()
+    project_matches: Dict[str, List[Dict[str, str]]] = {}
+    other_matches: Dict[str, List[Dict[str, str]]] = {}
+
+    def _record(skill_md: Path, source_class: str, bucket) -> None:
+        try:
+            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+            frontmatter, _ = _parse_frontmatter(content)
+            if not skill_matches_platform(frontmatter):
+                return
+            if not skill_matches_environment(frontmatter):
+                return
+            name = str(frontmatter.get("name") or skill_md.parent.name).strip()
+            if name not in targets or name in disabled:
+                return
+            bucket.setdefault(name, []).append({
+                "source_class": source_class,
+                "path": str(skill_md),
+            })
+        except Exception:
+            logger.debug("Policy validation skipped unreadable skill %s", skill_md, exc_info=True)
+
+    for project_dir in get_project_skills_dirs():
+        for skill_md in iter_project_skill_files(project_dir):
+            _record(skill_md, "project", project_matches)
+
+    active_dir = _skills_dir()
+    if active_dir.exists():
+        for skill_md in iter_skill_index_files(active_dir, "SKILL.md"):
+            _record(skill_md, "profile", other_matches)
+    for external_dir in get_external_skills_dirs():
+        for skill_md in iter_skill_index_files(external_dir, "SKILL.md"):
+            _record(skill_md, "external", other_matches)
+
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        for item in get_plugin_manager().list_plugin_skill_metadata():
+            name = str(item.get("name") or "").strip()
+            if name in targets and name not in disabled:
+                other_matches.setdefault(name, []).append({
+                    "source_class": "plugin",
+                    "path": str(item.get("path") or item.get("source") or name),
+                })
+    except Exception:
+        logger.debug("Plugin skill policy validation failed", exc_info=True)
+
+    resolved: Dict[str, Dict[str, str]] = {}
+    errors: List[str] = []
+    for name in sorted(targets):
+        candidates = project_matches.get(name) or other_matches.get(name) or []
+        if not candidates:
+            errors.append(f"missing: {name}")
+        elif len(candidates) != 1:
+            paths = ", ".join(item["path"] for item in candidates)
+            errors.append(f"ambiguous: {name} ({paths})")
+        else:
+            resolved[name] = candidates[0]
+    if errors:
+        raise ValueError("Invalid skills policy: " + "; ".join(errors))
+    return resolved
+
+
 def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
@@ -845,6 +937,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 if not skill_matches_platform(frontmatter):
                     continue
                 if _is_skill_disabled(plugin_skill["name"]):
+                    continue
+                from agent.skill_utils import skill_allowed
+                if not skill_allowed(plugin_skill["name"]):
                     continue
                 all_skills.append(plugin_skill)
         except Exception:
@@ -1116,6 +1211,22 @@ def skill_view(
                     "success": False,
                     "error": lookup_error,
                     "hint": "Use a skill name or relative path within the skills directory.",
+                },
+                ensure_ascii=False,
+            )
+
+        from agent.skill_utils import get_skill_policy
+        _policy = get_skill_policy()
+        _lookup_leaf = Path(name).name
+        if (
+            _policy.allowed is not None
+            and name not in _policy.allowed
+            and _lookup_leaf not in _policy.allowed
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Skill '{name}' is outside skills.allowed for this profile.",
                 },
                 ensure_ascii=False,
             )
@@ -1502,6 +1613,16 @@ def skill_view(
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
+        if not _policy.permits(str(resolved_name)):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{resolved_name}' is outside skills.allowed for this profile."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         if _is_skill_disabled(resolved_name):
             return json.dumps(
                 {

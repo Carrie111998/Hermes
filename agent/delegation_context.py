@@ -106,6 +106,15 @@ def is_dispatcher_owned_worker_context() -> bool:
     return not _NON_DISPATCHER_OWNED_CONTEXT.get()
 
 
+def has_dispatcher_owned_worker_task() -> bool:
+    """Return True only for an execution that owns a concrete Kanban task."""
+    import os
+
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
+        is_dispatcher_owned_worker_context()
+    )
+
+
 def enter_non_dispatcher_owned_context() -> Token[bool]:
     """Token-based form of :func:`non_dispatcher_owned_context`.
 

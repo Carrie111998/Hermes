@@ -32,12 +32,15 @@ import re
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    COMPACT_EXECUTION_GUIDANCE,
+    COMPACT_REPOSITORY_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
     KANBAN_GUIDANCE,
+    KANBAN_WORKER_GUIDANCE,
     MEMORY_GUIDANCE,
     USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -432,6 +435,46 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def _active_profile_guidance(agent: Any) -> str:
+    """Describe cross-profile boundaries for sessions that can mutate them."""
+    agent_home = _agent_home(agent)
+    active_profile = "default"
+    try:
+        if agent_home is not None:
+            active_profile = _profile_name_for_home(agent_home)
+        else:
+            from agent.file_safety import _resolve_active_profile_name
+
+            active_profile = _resolve_active_profile_name()
+    except Exception:
+        active_profile = "default"
+
+    if agent_home is not None:
+        home_string = str(agent_home)
+        root_string = str(get_default_hermes_root())
+    else:
+        home_string = root_string = str(get_hermes_home())
+
+    if active_profile == "default":
+        return (
+            "Active Hermes profile: default. Other profiles (if any) live "
+            f"under {root_string}/profiles/<name>/. Each profile has its own "
+            "skills/, plugins/, cron/, and memories/ that affect a different "
+            "session than this one. Do not modify another profile's "
+            "skills/plugins/cron/memories unless the user explicitly directs you to."
+        )
+
+    default_root = get_default_hermes_root()
+    return (
+        f"Active Hermes profile: {active_profile}. This session reads and writes "
+        f"{home_string}/. The default profile's data lives at "
+        f"{default_root}/skills/, {default_root}/plugins/, {default_root}/cron/, "
+        f"{default_root}/memories/ — those belong to a different session run from "
+        "a different shell. Do NOT modify another profile's "
+        "skills/plugins/cron/memories unless the user explicitly directs you to."
+    )
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -493,9 +536,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # variant is chosen AFTER the skills index is built (see below) and
     # this slot holds its position. Toolset and skill set are fixed
     # per-session, so cache-safe either way.
-    _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
-    _help_guidance_slot = len(stable_parts)
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    _has_skill_view = False
+    _help_guidance_slot = None
+    if getattr(agent, "_hermes_help", True):
+        _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
+        _help_guidance_slot = len(stable_parts)
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+
+    _compact_mode = getattr(agent, "_execution_guidance_mode", "legacy") == "compact"
+    _compact_execution = _compact_mode and bool(agent.valid_tool_names)
+    if _compact_execution:
+        stable_parts.append(COMPACT_EXECUTION_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -503,7 +554,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # path is blocked) are not model-family specific.  Gated only by
     # config.yaml ``agent.task_completion_guidance`` (default True) so
     # users who want a leaner prompt can turn it off.
-    if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
+    if (not _compact_execution and
+            getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names):
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
@@ -514,7 +566,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # round-trips and the resent-context cost that compounds over a long
     # conversation.  Gated by config.yaml ``agent.parallel_tool_call_guidance``
     # (default True) and only injected when tools are actually loaded.
-    if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
+    if (not _compact_execution and
+            getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names):
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
@@ -546,8 +599,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
-        # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
+        # Fallback for code paths that bypass agent_init (rare). Worker status
+        # is a dispatcher-owned execution property, not a tool-name inference.
+        try:
+            from agent.delegation_context import has_dispatcher_owned_worker_task
+            _is_worker = has_dispatcher_owned_worker_task()
+        except Exception:
+            _is_worker = False
+        tool_guidance.append(
+            KANBAN_WORKER_GUIDANCE if _is_worker else KANBAN_GUIDANCE
+        )
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
@@ -563,7 +624,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     #   true  — always inject (all models)
     #   false — never inject
     #   list  — custom model-name substrings to match
-    if agent.valid_tool_names:
+    if agent.valid_tool_names and not _compact_execution:
         _enforce = agent._tool_use_enforcement
         _inject = False
         if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in {"true", "always", "yes", "on"}):
@@ -598,7 +659,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     #   list  — custom model-name substrings to match
     # Resolved once at session start keyed on the (fixed) model name, so
     # the system prompt stays byte-stable for the life of the conversation.
-    if agent.valid_tool_names:
+    if agent.valid_tool_names and not _compact_execution:
         _exec_guidance = getattr(agent, "_execution_guidance", "auto")
         _exec_inject = False
         if _exec_guidance is True or (isinstance(_exec_guidance, str) and _exec_guidance.lower() in {"true", "always", "yes", "on"}):
@@ -625,6 +686,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
             if toolset
         }
+        selected_toolsets = set(getattr(agent, "effective_toolsets", set()) or set())
+        avail_toolsets.update(selected_toolsets)
+        if "skills_read" in selected_toolsets:
+            avail_toolsets.discard("skills")
+        if "browser_exec_only" in selected_toolsets:
+            avail_toolsets.discard("browser")
+        if "kanban_worker" in selected_toolsets:
+            avail_toolsets.discard("kanban")
         # Focus mode (opt-in) demotes non-coding skill categories to
         # names-only in the index (never hidden — skill_view/skills_list
         # reach everything, and every name stays visible for recall). The
@@ -634,7 +703,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             from agent.coding_context import coding_compact_skill_categories
 
             _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
+                platform=agent.platform,
+                cwd=getattr(agent, "repository_context_root", None),
             )
         except Exception:
             _compact_cats = frozenset()
@@ -652,7 +722,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # the hermes-agent skill actually present in the index (gating on the
     # rendered index line keeps this a pure string check — no second
     # filesystem scan, and it inherits the index cache's stability).
-    if _has_skill_view and "- hermes-agent:" in skills_prompt:
+    if (_help_guidance_slot is not None and _has_skill_view
+            and "- hermes-agent:" in skills_prompt):
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
@@ -683,13 +754,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # stay in their historical position after the workspace snapshot.
     coding_workspace_parts: List[str] = []
     coding_trailing_parts: List[str] = []
-    if agent.valid_tool_names:
+    if agent.valid_tool_names and getattr(agent, "repository_context_active", True):
         try:
             from agent.coding_context import coding_system_prompt_parts
 
             coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = coding_system_prompt_parts(
                 platform=agent.platform,
-                cwd=resolve_context_cwd(),
+                cwd=getattr(agent, "repository_context_root", None),
                 model=agent.model,
                 valid_tool_names=agent.valid_tool_names,
             )
@@ -697,6 +768,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             # Coding-context probing must never block prompt build.
             pass
+
+    if _compact_execution and getattr(agent, "repository_context_active", False):
+        stable_parts.append(COMPACT_REPOSITORY_GUIDANCE)
 
     # Guidance assembled after the coding posture historically followed the
     # workspace snapshot. With no snapshot, the coding tail instead remains
@@ -761,68 +835,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
-    # Active-profile hint — names the Hermes profile the agent is running
-    # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
-    # ~/.hermes/profiles/<active>/skills/ (this profile's). Deterministic
-    # for the lifetime of the agent — profile name doesn't change
-    # mid-session, so this doesn't break the prompt cache.
-    # See file_safety._resolve_active_profile_name + classify_cross_profile_target
-    # for the matching tool-side guard.
-    #
-    # Resolve from the agent's OWN home first (its session_db path), not the
-    # ambient HERMES_HOME: on a build thread that lost the ContextVar this
-    # line would otherwise print "default" for a bot profile — the same
-    # thread-fallback bug that leaked default's skills index.
-    _agent_home_path = _agent_home(agent)
-    active_profile = "default"
-    try:
-        if _agent_home_path is not None:
-            active_profile = _profile_name_for_home(_agent_home_path)
-        else:
-            from agent.file_safety import _resolve_active_profile_name
-            active_profile = _resolve_active_profile_name()
-    except Exception:
-        active_profile = "default"
-    # Home string for the message text: prefer the agent's own home so the
-    # paths named match the profile just resolved. When we have an explicit
-    # agent home, the root (where the default profile's data lives) comes
-    # from get_default_hermes_root(): get_hermes_home() on a bound profile
-    # session is the PROFILE dir, which would misname the default profile's
-    # paths. Without an agent home, keep the ambient resolution byte-identical
-    # to the legacy behavior (and patchable via this module's get_hermes_home).
-    if _agent_home_path is not None:
-        _home_str = str(_agent_home_path)
-        _root_str = str(get_default_hermes_root())
-    else:
-        _home_str = _root_str = str(get_hermes_home())
-    if active_profile == "default":
-        post_workspace_parts.append(
-            "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + _root_str + "/profiles/<name>/. Each profile has its own "
-            "skills/, plugins/, cron/, and memories/ that affect a different "
-            "session than this one. Do not modify another profile's "
-            "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
-        )
-    else:
-        # A non-default name is only ever returned when the resolved home is
-        # ALREADY <root>/profiles/<name> — that is exactly how both
-        # _profile_name_for_home() and _resolve_active_profile_name() derive
-        # it. So the profile home is the session home itself; appending
-        # /profiles/<name> again doubled it (#72894). The default profile's
-        # data sits at the ROOT (get_default_hermes_root()), which in ambient
-        # profile mode is NOT get_hermes_home().
-        profile_home = _home_str
-        default_root = get_default_hermes_root()
-        post_workspace_parts.append(
-            f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {profile_home}/. The default "
-            f"profile's data lives at {default_root}/skills/, {default_root}/plugins/, "
-            f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
-            f"different session run from a different shell. Do NOT modify "
-            f"another profile's skills/plugins/cron/memories unless the user "
-            f"explicitly directs you to."
-        )
+    # The profile-path boundary is useful only when the model can mutate
+    # profile-owned state. In compact read-only/no-tool roles it is dead
+    # preload; authority remains in the profile and task contracts.
+    _profile_mutation_tools = {
+        "write_file", "patch", "skill_manage", "memory", "cronjob",
+    }
+    if not _compact_mode or _profile_mutation_tools.intersection(agent.valid_tool_names):
+        post_workspace_parts.append(_active_profile_guidance(agent))
 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply
@@ -892,8 +912,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
+        _context_root = (
+            agent.repository_context_root
+            if hasattr(agent, "repository_context_root")
+            else resolve_context_cwd()
+        )
         context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+            cwd=_context_root,
+            skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"),
             home_override=_agent_home(agent))

@@ -1596,6 +1596,8 @@ def _skill_manage_batch(
             task_id=task_id,
             session_id=session_id,
         )
+    from agent.skill_utils import skill_allowed
+
     names = []
     for i, op in enumerate(operations):
         if not isinstance(op, dict) or not op.get("action"):
@@ -1611,6 +1613,11 @@ def _skill_manage_batch(
         nm = op.get("name") or default_name
         if not nm:
             return tool_error(f"operations[{i}] needs a 'name' (the skill it targets).", success=False)
+        if not skill_allowed(nm):
+            return json.dumps({
+                "success": False,
+                "error": f"Skill '{nm}' is outside skills.allowed for this profile.",
+            }, ensure_ascii=False)
         names.append(nm)
         if act == "create" and nm in names[:-1]:
             return tool_error(
@@ -1889,6 +1896,14 @@ def skill_manage(
             operations, default_name=name or None,
             task_id=task_id, session_id=session_id,
         )
+
+    from agent.skill_utils import skill_allowed
+    if not skill_allowed(name):
+        return json.dumps({
+            "success": False,
+            "error": f"Skill '{name}' is outside skills.allowed for this profile.",
+        }, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
