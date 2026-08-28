@@ -9,7 +9,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from tools.url_safety import is_safe_url
+from tools.url_safety import async_is_safe_url
 
 from .outbound_image_fetch import (
     _DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES,
@@ -53,7 +53,7 @@ async def _read_url_image_with_redirect_guard(
         timeout=timeout,
         request_kwargs=request_kwargs,
         download_budget=download_budget,
-        is_safe_url_fn=_patchable_dependency("is_safe_url"),
+        async_is_safe_url_fn=_patchable_dependency("async_is_safe_url"),
         max_bytes=_patchable_dependency("_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES"),
         read_response_bytes_fn=_patchable_dependency("_read_response_bytes_bounded"),
         redirect_statuses=_patchable_dependency("_DISCORD_IMAGE_REDIRECT_STATUSES"),
@@ -88,7 +88,7 @@ class DiscordMediaSendMixin:
     ) -> SendResult:
         """Send an image natively as a Discord file attachment."""
         discord = _patchable_dependency("discord")
-        is_safe_url = _patchable_dependency("is_safe_url")
+        async_is_safe_url = _patchable_dependency("async_is_safe_url")
         create_image_http_client = _patchable_dependency(
             "_create_discord_image_http_client"
         )
@@ -102,7 +102,7 @@ class DiscordMediaSendMixin:
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        if not is_safe_url(image_url):
+        if not await async_is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL during Discord send_image", self.name)
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
@@ -177,7 +177,7 @@ class DiscordMediaSendMixin:
     ) -> SendResult:
         """Send an animated GIF natively as a Discord file attachment."""
         discord = _patchable_dependency("discord")
-        is_safe_url = _patchable_dependency("is_safe_url")
+        async_is_safe_url = _patchable_dependency("async_is_safe_url")
         create_image_http_client = _patchable_dependency(
             "_create_discord_image_http_client"
         )
@@ -191,7 +191,7 @@ class DiscordMediaSendMixin:
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        if not is_safe_url(animation_url):
+        if not await async_is_safe_url(animation_url):
             logger.warning("[%s] Blocked unsafe animation URL during Discord send_animation", self.name)
             return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
 
@@ -379,7 +379,7 @@ class DiscordMediaSendMixin:
             )
             return
 
-        is_safe_url = _patchable_dependency("is_safe_url")
+        async_is_safe_url = _patchable_dependency("async_is_safe_url")
         create_image_http_client = _patchable_dependency(
             "_create_discord_image_http_client"
         )
@@ -429,7 +429,7 @@ class DiscordMediaSendMixin:
                             continue
                         files.append(_discord_mod.File(local_path, filename=os.path.basename(local_path)))
                     else:
-                        if not is_safe_url(image_url):
+                        if not await async_is_safe_url(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
                             continue
                         # Download to BytesIO so it renders inline
@@ -501,7 +501,7 @@ class DiscordMediaSendMixin:
 def _snapshot_dependency_defaults(adapter: Any) -> Dict[str, Tuple[Any, Any]]:
     return {
         "discord": (discord, adapter.discord),
-        "is_safe_url": (is_safe_url, adapter.is_safe_url),
+        "async_is_safe_url": (async_is_safe_url, adapter.async_is_safe_url),
         "_create_discord_image_http_client": (
             _create_discord_image_http_client,
             adapter._create_discord_image_http_client,

@@ -1,6 +1,7 @@
 """Regression tests for the Discord outbound image fetch module seam."""
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -25,9 +26,11 @@ async def test_adapter_redirect_wrapper_uses_adapter_url_safety_patch(monkeypatc
     url = "https://cdn.example.test/image.png"
     safety_checks: list[str] = []
 
-    def patched_is_safe_url(candidate: str) -> bool:
+    async def record_safety_check(candidate: str) -> bool:
         safety_checks.append(candidate)
         return True
+
+    patched_async_is_safe_url = AsyncMock(side_effect=record_safety_check)
 
     class Response:
         status_code = 200
@@ -49,8 +52,13 @@ async def test_adapter_redirect_wrapper_uses_adapter_url_safety_patch(monkeypatc
             assert kwargs["follow_redirects"] is False
             return Response()
 
-    monkeypatch.setattr(discord_adapter, "is_safe_url", patched_is_safe_url)
-    monkeypatch.setattr(outbound_image_fetch, "is_safe_url", lambda _url: False)
+    monkeypatch.setattr(
+        discord_adapter, "async_is_safe_url", patched_async_is_safe_url
+    )
+    module_async_is_safe_url = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        outbound_image_fetch, "async_is_safe_url", module_async_is_safe_url
+    )
 
     status, body, _headers = await discord_adapter._read_url_image_with_redirect_guard(
         Client(),
@@ -61,6 +69,8 @@ async def test_adapter_redirect_wrapper_uses_adapter_url_safety_patch(monkeypatc
 
     assert (status, body) == (200, b"\x89PNG\r\n\x1a\n")
     assert safety_checks == [url]
+    patched_async_is_safe_url.assert_awaited_once_with(url)
+    module_async_is_safe_url.assert_not_awaited()
 
 
 def test_adapter_client_wrapper_uses_adapter_factory_patch(monkeypatch):

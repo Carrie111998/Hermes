@@ -131,6 +131,10 @@ class _FakeSession:
 _IMAGE_URL = "https://cdn.example.test/image.png"
 
 
+async def _allow_safe_url(_url: str) -> bool:
+    return True
+
+
 def _read_url_image(response: _FakeResponse) -> tuple[int, bytes, dict[str, str]]:
     session = _FakeSession(response)
     timeout = object()
@@ -218,7 +222,7 @@ async def test_send_image_uses_image_magic_bytes_for_filename(
     adapter, channel = _make_send_image_adapter(client)
     file_cls = MagicMock()
 
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(
         discord_adapter,
         "_create_discord_image_http_client",
@@ -243,7 +247,7 @@ async def test_send_image_does_not_upload_non_image_bytes_despite_image_content_
     adapter, channel = _make_send_image_adapter(client)
     file_cls = MagicMock()
 
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(
         discord_adapter,
         "_create_discord_image_http_client",
@@ -271,7 +275,7 @@ async def test_send_animation_requires_gif_magic(monkeypatch):
     adapter, channel = _make_send_image_adapter(client)
     file_cls = MagicMock()
 
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(
         discord_adapter,
         "_create_discord_image_http_client",
@@ -301,7 +305,7 @@ async def test_forum_starter_does_not_receive_invalid_image_body(monkeypatch):
     adapter._forum_post_file = AsyncMock()
     file_cls = MagicMock()
 
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(
         discord_adapter,
         "_create_discord_image_http_client",
@@ -436,7 +440,7 @@ class TestReadResponseBytesBounded:
 
 
 def test_content_length_over_limit_is_rejected_before_body_consumption(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(discord_adapter, "_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES", 4)
     response = _FakeResponse(
         (b"body must not be consumed",),
@@ -452,7 +456,7 @@ def test_content_length_over_limit_is_rejected_before_body_consumption(monkeypat
 
 
 def test_missing_content_length_rejects_aggregate_overflow(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(discord_adapter, "_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES", 4)
     response = _FakeResponse((b"AA", b"BBB"))
 
@@ -464,7 +468,7 @@ def test_missing_content_length_rejects_aggregate_overflow(monkeypatch):
 
 
 def test_underreported_content_length_rejects_later_chunk_overflow(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(discord_adapter, "_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES", 4)
     response = _FakeResponse(
         (b"AAA", b"BB"),
@@ -479,7 +483,7 @@ def test_underreported_content_length_rejects_later_chunk_overflow(monkeypatch):
 
 
 def test_multi_chunk_response_at_exact_limit_is_returned_intact(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     monkeypatch.setattr(discord_adapter, "_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES", 4)
     response = _FakeResponse(
         (b"AA", b"BB"),
@@ -497,7 +501,7 @@ def test_multi_chunk_response_at_exact_limit_is_returned_intact(monkeypatch):
 
 
 def test_redirect_guard_keeps_ten_redirect_limit_and_disables_auto_follow(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(discord_adapter, "async_is_safe_url", _allow_safe_url)
     response = _FakeResponse((b"must not be read",), {"Location": _IMAGE_URL})
     response.status = 302
     session = _FakeSession(response)

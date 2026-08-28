@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import inspect
 from contextvars import ContextVar
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from urllib.parse import urljoin
 
-from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+from tools.url_safety import async_is_safe_url, create_ssrf_safe_async_client
 
 
 _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024  # generous limit for images/animations
@@ -132,15 +132,15 @@ async def _read_url_image_with_redirect_guard(
     timeout: Any,
     request_kwargs: Dict[str, Any],
     download_budget: Any = None,
-    is_safe_url_fn: Optional[Callable[[str], bool]] = None,
+    async_is_safe_url_fn: Optional[Callable[[str], Awaitable[bool]]] = None,
     max_bytes: Optional[int] = None,
     read_response_bytes_fn: Optional[Callable[..., Any]] = None,
     redirect_statuses: Optional[set[int]] = None,
     max_redirects: Optional[int] = None,
 ) -> Tuple[int, bytes, Dict[str, str]]:
     """Read an image URL while re-checking every redirect target for SSRF."""
-    if is_safe_url_fn is None:
-        is_safe_url_fn = is_safe_url
+    if async_is_safe_url_fn is None:
+        async_is_safe_url_fn = async_is_safe_url
     if max_bytes is None:
         max_bytes = _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES
     if read_response_bytes_fn is None:
@@ -152,7 +152,7 @@ async def _read_url_image_with_redirect_guard(
 
     current_url = url
     for _ in range(max_redirects + 1):
-        if not is_safe_url_fn(current_url):
+        if not await async_is_safe_url_fn(current_url):
             raise ValueError("Blocked unsafe image URL redirect")
 
         async with client.stream(
@@ -170,7 +170,7 @@ async def _read_url_image_with_redirect_guard(
                 if not location:
                     return status, b"", headers
                 next_url = urljoin(current_url, str(location))
-                if not is_safe_url_fn(next_url):
+                if not await async_is_safe_url_fn(next_url):
                     raise ValueError("Blocked redirect to private/internal address")
                 current_url = next_url
                 continue

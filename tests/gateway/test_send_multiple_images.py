@@ -27,6 +27,10 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _allow_safe_url(_url):
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Base default loop
 # ---------------------------------------------------------------------------
@@ -206,7 +210,9 @@ class TestDiscordMultiImage:
             async def aclose(self):
                 return None
 
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",
@@ -261,10 +267,11 @@ class TestDiscordMultiImage:
                 assert kwargs.get("follow_redirects") is False
                 return FakeResponse()
 
+        async def allow_non_metadata_url(url):
+            return not str(url).startswith("http://169.254.169.254")
+
         monkeypatch.setitem(
-            send_image_globals,
-            "is_safe_url",
-            lambda url: not str(url).startswith("http://169.254.169.254"),
+            send_image_globals, "async_is_safe_url", allow_non_metadata_url
         )
         monkeypatch.setitem(
             send_image_globals,
@@ -330,7 +337,9 @@ class TestDiscordMultiImage:
         adapter._client.get_channel = MagicMock(return_value=channel)
         adapter._is_forum_parent = MagicMock(return_value=False)
 
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",
@@ -379,7 +388,9 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=True)
         adapter._forum_post_file = AsyncMock()
 
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",
@@ -453,7 +464,9 @@ class TestDiscordMultiImage:
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             len(body) * 10,
         )
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",
@@ -532,7 +545,9 @@ class TestDiscordMultiImage:
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             10,
         )
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",
@@ -613,7 +628,9 @@ class TestDiscordMultiImage:
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             16,
         )
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",
@@ -697,7 +714,9 @@ class TestDiscordMultiImage:
             "_DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES",
             10,
         )
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",
@@ -802,7 +821,9 @@ class TestDiscordMultiImage:
             "_DiscordImageDownloadBudget",
             make_budget,
         )
-        monkeypatch.setitem(send_multiple_images_globals, "is_safe_url", lambda _url: True)
+        monkeypatch.setitem(
+            send_multiple_images_globals, "async_is_safe_url", _allow_safe_url
+        )
         monkeypatch.setitem(
             send_multiple_images_globals,
             "_create_discord_image_http_client",

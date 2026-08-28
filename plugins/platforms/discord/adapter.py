@@ -170,7 +170,7 @@ from gateway.platforms.base import (
     utf16_len,
     validate_inbound_media_size,
 )
-from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+from tools.url_safety import async_is_safe_url, create_ssrf_safe_async_client
 
 from .outbound_image_fetch import (
     _DISCORD_IMAGE_BATCH_DOWNLOAD_MAX_BYTES,
@@ -200,7 +200,7 @@ async def _read_url_image_with_redirect_guard(
         timeout=timeout,
         request_kwargs=request_kwargs,
         download_budget=download_budget,
-        is_safe_url_fn=is_safe_url,
+        async_is_safe_url_fn=async_is_safe_url,
         max_bytes=_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES,
         read_response_bytes_fn=_read_response_bytes_bounded,
         redirect_statuses=_DISCORD_IMAGE_REDIRECT_STATUSES,
@@ -7614,7 +7614,7 @@ class DiscordAdapter(DiscordMediaSendMixin, BasePlatformAdapter):
     #      (issue #8242)
     #   2. Some user environments (VPNs, corporate DNS, tunnels) resolve
     #      ``cdn.discordapp.com`` to private-looking IPs that our
-    #      ``is_safe_url`` guard classifies as SSRF risks. Routing the
+    #      ``async_is_safe_url`` guard classifies as SSRF risks. Routing the
     #      fetch through discord.py's own HTTP client handles DNS
     #      internally so our guard isn't consulted for the attachment
     #      path. (issue #6587)
@@ -7716,7 +7716,7 @@ class DiscordAdapter(DiscordMediaSendMixin, BasePlatformAdapter):
             return raw_bytes
 
         # Fallback: SSRF-gated URL download.
-        if not is_safe_url(att.url):
+        if not await async_is_safe_url(att.url):
             raise ValueError(
                 f"Blocked unsafe attachment URL (SSRF protection): {att.url}"
             )

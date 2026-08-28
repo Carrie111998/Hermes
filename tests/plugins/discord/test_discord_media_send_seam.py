@@ -54,9 +54,11 @@ async def test_moved_send_image_observes_adapter_level_patch_seams(monkeypatch):
 
     http_client = FakeHttpClient()
 
-    def patched_is_safe_url(candidate):
+    async def record_safety_check(candidate):
         safety_checks.append(candidate)
         return True
+
+    patched_async_is_safe_url = AsyncMock(side_effect=record_safety_check)
 
     async def patched_fetch(client, candidate, *, timeout, request_kwargs, download_budget=None):
         guard_calls.append((client, candidate, timeout, request_kwargs, download_budget))
@@ -64,7 +66,9 @@ async def test_moved_send_image_observes_adapter_level_patch_seams(monkeypatch):
 
     fake_discord = SimpleNamespace(File=MagicMock())
     monkeypatch.setattr(adapter_mod, "discord", fake_discord)
-    monkeypatch.setattr(adapter_mod, "is_safe_url", patched_is_safe_url)
+    monkeypatch.setattr(
+        adapter_mod, "async_is_safe_url", patched_async_is_safe_url
+    )
     monkeypatch.setattr(
         adapter_mod,
         "_create_discord_image_http_client",
@@ -93,6 +97,7 @@ async def test_moved_send_image_observes_adapter_level_patch_seams(monkeypatch):
     assert result.success is True
     assert result.message_id == "message-1"
     assert safety_checks == [url]
+    patched_async_is_safe_url.assert_awaited_once_with(url)
     assert len(guard_calls) == 1
     assert guard_calls[0][0] is http_client
     assert guard_calls[0][1] == url
