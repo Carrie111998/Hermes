@@ -44,12 +44,15 @@ describe('spectator roster', () => {
           description: 'Primary',
           model: 'gpt',
           provider: 'openai',
-          gateway_running: true
+          gateway_running: true,
+          ui_meta: undefined,
+          has_avatar: false,
+          preferred_session: undefined
         }
       ],
       spectator: true
     })
-    expect(fetchMock).toHaveBeenCalledWith('/hermes/api/profiles', {
+    expect(fetchMock).toHaveBeenCalledWith('/hermes/api/profiles?bot_roster=true', {
       headers: { 'X-Hermes-Spectator-Token': 'read-only-token' }
     })
   })
@@ -62,11 +65,12 @@ describe('spectator roster', () => {
   it('opens only an existing persisted conversation without a profile mutation target', () => {
     expect(spectatorSessionOpenPlan(undefined)).toBeNull()
     expect(
-      spectatorSessionOpenPlan({ id: 'stored-1', message_count: 2 } as never)
+      spectatorSessionOpenPlan({ id: 'stored-1', message_count: 2 } as never, 'default')
     ).toEqual({
       sessionId: 'stored-1',
       options: {
         intent: 'main',
+        profile: 'default',
         awaitHydration: true,
         expectHistory: true,
         keepAllProfilesScope: false

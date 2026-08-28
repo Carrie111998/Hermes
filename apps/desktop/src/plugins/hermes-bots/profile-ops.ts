@@ -159,8 +159,26 @@ interface ProfilesGetAssetResult {
 
 /** Fetch server-side avatars for roster rows flagged has_avatar when the
  *  local cache doesn't already have an image for them. Fire-and-forget. */
-export function pullServerAvatars(roster: RosterRow[]) {
-  pushLocalAvatars(roster)
+async function spectatorAvatar(name: string): Promise<string> {
+  const token = window.__HERMES_SPECTATOR_TOKEN__ || ''
+  const base = String(window.__HERMES_BASE_PATH__ || '').replace(/\/$/, '')
+  const response = await fetch(`${base}/api/profiles/${encodeURIComponent(name)}/avatar`, {
+    headers: { 'X-Hermes-Spectator-Token': token }
+  })
+
+  if (!response.ok) throw new Error(`profile avatar request failed (${response.status})`)
+  const blob = await response.blob()
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('profile avatar decode failed'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+export function pullServerAvatars(roster: RosterRow[], { spectator = false }: { spectator?: boolean } = {}) {
+  if (!spectator) pushLocalAvatars(roster)
 
   for (const bot of roster) {
     const key = botMetaKey(bot)
@@ -175,15 +193,17 @@ export function pullServerAvatars(roster: RosterRow[]) {
 
     avatarFetchInflight.add(key)
 
-    const assetRequest = bot.sourceScoped
-      ? requestForBot(bot, 'profiles.get_asset', {
-          name: bot.name,
-          asset: 'avatar'
-        })
-      : host.request('profiles.get_asset', {
-          name: bot.name,
-          asset: 'avatar'
-        })
+    const assetRequest = spectator
+      ? spectatorAvatar(bot.name).then(data => ({ found: true, data }))
+      : bot.sourceScoped
+        ? requestForBot(bot, 'profiles.get_asset', {
+            name: bot.name,
+            asset: 'avatar'
+          })
+        : host.request('profiles.get_asset', {
+            name: bot.name,
+            asset: 'avatar'
+          })
 
     Promise.resolve(assetRequest as Promise<ProfilesGetAssetResult>)
       .then(res => {

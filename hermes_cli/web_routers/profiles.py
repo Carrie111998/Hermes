@@ -28,6 +28,7 @@ from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
+from fastapi.responses import FileResponse
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -774,15 +775,111 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
     return {"pull_requests": found, "scanned": wanted}
 
 
+def _spectator_session_summary(profile_path: Path, session_id: str) -> Optional[Dict[str, Any]]:
+    """Read one server-pinned Bot Chat without activating its profile."""
+    db_path = profile_path / "state.db"
+    if not session_id or not db_path.exists():
+        return None
+    try:
+        db = _open_session_db_at_path(db_path, read_only=True)
+        try:
+            row = db.get_session(session_id)
+            if not row or row.get("archived"):
+                return None
+            if str(row.get("source") or "").strip().lower() in {"kanban", "tool"}:
+                return None
+            try:
+                resolved_id = db.resolve_resume_session_id(session_id) or session_id
+            except Exception:
+                resolved_id = session_id
+            resolved = db.get_session(resolved_id) or row
+            preview = ""
+            try:
+                with db._lock:
+                    latest = db._conn.execute(
+                        "SELECT content FROM messages WHERE session_id = ?"
+                        " AND role IN ('user', 'assistant') AND active = 1"
+                        " AND content IS NOT NULL AND TRIM(content) != ''"
+                        " ORDER BY id DESC LIMIT 1",
+                        (resolved_id,),
+                    ).fetchone()
+                preview = " ".join(str(latest[0] or "").split())[:83] if latest else ""
+            except Exception:
+                pass
+            return {
+                "id": session_id,
+                "resolved_id": resolved_id,
+                "title": resolved.get("title") or "",
+                "preview": preview,
+                "started_at": resolved.get("started_at") or row.get("started_at") or 0,
+                "last_active": (
+                    resolved.get("last_activity_at")
+                    or resolved.get("started_at")
+                    or row.get("started_at")
+                    or 0
+                ),
+                "message_count": resolved.get("message_count") or 0,
+            }
+        finally:
+            db.close()
+    except Exception as exc:
+        _warn_profile_read_error(profile_path.name, exc)
+        return None
+
+
+def _enrich_bot_roster_profile(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach server-authoritative Bot Mode metadata for read-only clients."""
+    enriched = dict(row)
+    profile_path = Path(str(row.get("path") or ""))
+    try:
+        import yaml
+
+        raw = yaml.safe_load((profile_path / "profile.yaml").read_text(encoding="utf-8")) or {}
+        ui_meta = raw.get("ui_meta")
+        if isinstance(ui_meta, dict) and ui_meta:
+            enriched["ui_meta"] = ui_meta
+            bot_meta = ui_meta.get("hermes-bots")
+            chat = bot_meta.get("chat") if isinstance(bot_meta, dict) else None
+            if isinstance(chat, str) and chat.strip():
+                enriched["preferred_session"] = _spectator_session_summary(profile_path, chat.strip())
+    except (OSError, ValueError, TypeError):
+        pass
+
+    assets = profile_path / "assets"
+    enriched["has_avatar"] = any((assets / f"avatar.{ext}").is_file() for ext in ("png", "jpg", "webp"))
+    return enriched
+
+
 @router.get("/api/profiles")
-async def list_profiles_endpoint():
+async def list_profiles_endpoint(bot_roster: bool = False):
     from hermes_cli import profiles as profiles_mod
     try:
         profiles = await run_in_threadpool(profiles_mod.list_profiles)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        rows = [_profile_to_dict(p) for p in profiles]
+        if bot_roster:
+            rows = [_enrich_bot_roster_profile(row) for row in rows]
+        return {"profiles": rows}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        rows = _fallback_profile_dicts(profiles_mod)
+        if bot_roster:
+            rows = [_enrich_bot_roster_profile(row) for row in rows]
+        return {"profiles": rows}
+
+
+@router.get("/api/profiles/{name}/avatar")
+async def get_profile_avatar_endpoint(name: str):
+    """Return a profile avatar without exposing arbitrary profile files."""
+    try:
+        profile_path = Path(_resolve_profile_dir(name))
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Profile not found") from exc
+    assets = profile_path / "assets"
+    for ext, media_type in (("png", "image/png"), ("jpg", "image/jpeg"), ("webp", "image/webp")):
+        avatar = assets / f"avatar.{ext}"
+        if avatar.is_file():
+            return FileResponse(avatar, media_type=media_type, headers={"Cache-Control": "private, no-cache"})
+    raise HTTPException(status_code=404, detail="Profile avatar not found")
 
 
 @router.post("/api/profiles")

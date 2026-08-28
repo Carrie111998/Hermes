@@ -484,9 +484,9 @@ export function BotsPane() {
       $lastSources.set(data.sources)
     }
 
+    mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
+    pullServerAvatars(activeSourceRoster, { spectator })
     if (!spectator) {
-      mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
-      pullServerAvatars(activeSourceRoster)
       trackInboundActivity(roster)
       backfillMessagingProtocol(activeSourceRoster)
     }

@@ -624,7 +624,7 @@ export async function spectatorRoster(): Promise<RosterSnapshot> {
   if (!token) throw new Error('spectator credential unavailable')
 
   const base = String(window.__HERMES_BASE_PATH__ || '').replace(/\/$/, '')
-  const response = await fetch(`${base}/api/profiles`, {
+  const response = await fetch(`${base}/api/profiles?bot_roster=true`, {
     headers: { 'X-Hermes-Spectator-Token': token }
   })
 
@@ -638,7 +638,13 @@ export async function spectatorRoster(): Promise<RosterSnapshot> {
       description: String(profile?.description || '').trim(),
       model: String(profile?.model || '').trim(),
       provider: String(profile?.provider || '').trim(),
-      gateway_running: Boolean(profile?.gateway_running)
+      gateway_running: Boolean(profile?.gateway_running),
+      ui_meta: profile?.ui_meta && typeof profile.ui_meta === 'object' ? profile.ui_meta : undefined,
+      has_avatar: Boolean(profile?.has_avatar),
+      preferred_session:
+        profile?.preferred_session && typeof profile.preferred_session === 'object'
+          ? profile.preferred_session
+          : undefined
     }))
     .filter((profile: RosterRow) => profile.name)
 

@@ -5220,6 +5220,51 @@ class TestSpectatorServerScope:
     def test_scoped_credential_reads_sessions(self):
         assert self.client.get("/api/sessions", headers=self.headers).status_code == 200
 
+    def test_rich_bot_roster_returns_server_metadata_avatar_and_pinned_chat(self):
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        home = get_hermes_home()
+        (home / "profile.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "display_name": "Primary",
+                    "ui_meta": {
+                        "hermes-bots": {
+                            "chat": "bot-chat-1",
+                            "custom": True,
+                            "imageKind": "photo",
+                            "title": "Primary",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        assets = home / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        avatar = b"fake-jpeg-avatar"
+        (assets / "avatar.jpg").write_bytes(avatar)
+        db = SessionDB(db_path=home / "state.db")
+        try:
+            db.create_session(session_id="bot-chat-1", source="cli")
+            db.append_message("bot-chat-1", role="assistant", content="authoritative latest message")
+        finally:
+            db.close()
+
+        response = self.client.get("/api/profiles?bot_roster=true", headers=self.headers)
+        assert response.status_code == 200
+        row = next(item for item in response.json()["profiles"] if item["name"] == "default")
+        assert row["ui_meta"]["hermes-bots"]["title"] == "Primary"
+        assert row["has_avatar"] is True
+        assert row["preferred_session"]["id"] == "bot-chat-1"
+        assert row["preferred_session"]["preview"] == "authoritative latest message"
+
+        image = self.client.get("/api/profiles/default/avatar", headers=self.headers)
+        assert image.status_code == 200
+        assert image.headers["content-type"] == "image/jpeg"
+        assert image.content == avatar
+
     def test_scoped_credential_rejects_mutation_before_route_dispatch(self):
         response = self.client.post("/api/config", headers=self.headers, json={})
         assert response.status_code == 403
