@@ -159,10 +159,11 @@ class TestListSurfacesGatewayLiveness:
 
 
 from contextlib import ExitStack
+from types import SimpleNamespace
 
 
 class _LivenessPatches:
-    """Context manager patching the provider/gateway-pid probes."""
+    """Context manager patching the provider/canonical gateway probe."""
 
     def __init__(self, *, provider, pids):
         self._provider = provider
@@ -186,8 +187,13 @@ class _LivenessPatches:
         )
         self._stack.enter_context(
             patch(
-                "hermes_cli.gateway.find_gateway_pids",
-                return_value=list(self._pids),
+                "gateway.status.resolve_gateway_liveness",
+                return_value=SimpleNamespace(
+                    running=bool(self._pids),
+                    pid=self._pids[0] if self._pids else None,
+                    source="pid" if self._pids else "none",
+                    probe_error=False,
+                ),
             )
         )
         return self

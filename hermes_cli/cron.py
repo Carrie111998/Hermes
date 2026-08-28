@@ -78,9 +78,16 @@ def _builtin_gateway_liveness() -> Optional[bool]:
     try:
         if _active_cron_provider_name() != "builtin":
             return True  # external provider fires jobs without the gateway
-        from hermes_cli.gateway import find_gateway_pids
+        from gateway.status import resolve_gateway_liveness
+        from hermes_constants import get_hermes_home
 
-        return bool(find_gateway_pids())
+        result = resolve_gateway_liveness(profile_dir=get_hermes_home())
+        # ``False`` plus a probe error means "unknown", not "stopped". The
+        # cron warning is user-facing, so it must never turn an unreadable
+        # status source into a confident outage claim.
+        if result.probe_error and not result.running:
+            return None
+        return result.running
     except Exception:
         return None
 

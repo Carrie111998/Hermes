@@ -1349,6 +1349,22 @@ class TestResolveGatewayLiveness:
         assert result.probe_error is True
 
 
+    def test_gateway_process_is_authoritative_for_its_active_profile(self, tmp_path, monkeypatch):
+        """An in-gateway tool call cannot report its host process as down."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["python", "-m", "hermes_cli.main", "gateway", "run"])
+
+        result = status.resolve_gateway_liveness(
+            profile_dir=tmp_path,
+            use_cache=False,
+            pid_probe=lambda *a, **k: None,
+        )
+
+        assert result.running is True
+        assert result.pid == os.getpid()
+        assert result.source == "self"
+        assert result.probe_error is False
+
     def test_profile_dir_scopes_every_read_to_that_profile(self, tmp_path):
         """Gateway identity files live in the per-profile home.
 

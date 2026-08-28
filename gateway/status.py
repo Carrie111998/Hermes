@@ -1349,6 +1349,16 @@ def resolve_gateway_liveness(
     monkeypatch seam in the test-suite keeps working; production callers
     leave them ``None`` and get this module's implementations.
     """
+    # A model tool can execute in the gateway's own process. In that context
+    # process-table scans and the gateway's self-held runtime lock can both
+    # produce a false negative even though the caller is the gateway runtime.
+    # Treat the process identity as authoritative, but only for the active
+    # Hermes home so a multiplexed gateway cannot answer for another profile.
+    active_home = get_hermes_home().resolve()
+    requested_home = profile_dir.resolve() if profile_dir is not None else active_home
+    if requested_home == active_home and looks_like_gateway_command_line(" ".join(sys.argv)):
+        return GatewayLiveness(running=True, pid=os.getpid(), source="self")
+
     _pid_probe = pid_probe or (
         get_running_pid_cached if use_cache else get_running_pid
     )
