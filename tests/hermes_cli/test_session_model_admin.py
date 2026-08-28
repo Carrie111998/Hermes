@@ -196,6 +196,84 @@ def test_reset_backs_up_then_updates_only_session_route_fields_and_verifies(tmp_
         db.close()
 
 
+def test_reset_skips_route_changed_after_backup(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _seed_session(
+            db,
+            "stale",
+            model="old/model",
+            billing_provider="legacy",
+            model_config={"model": "old/model", "provider": "legacy"},
+        )
+        execute_write = db._execute_write
+
+        def interpose_route_change(callback):
+            db._conn.execute(
+                "UPDATE sessions SET model = ?, billing_provider = ?, model_config = ? "
+                "WHERE id = ?",
+                (
+                    "concurrent/model",
+                    "concurrent",
+                    json.dumps(
+                        {"model": "concurrent/model", "provider": "concurrent"}
+                    ),
+                    "stale",
+                ),
+            )
+            db._conn.commit()
+            return execute_write(callback)
+
+        monkeypatch.setattr(db, "_execute_write", interpose_route_change)
+
+        report = db.reset_session_model_routes(
+            target_model="new/model",
+            target_provider="openrouter",
+        )
+
+        assert report["rows_affected"] == 0
+        assert report["remaining_non_target"] == 1
+        assert db.get_session("stale")["model"] == "concurrent/model"
+        backup_db = SessionDB(Path(report["backup_path"]))
+        try:
+            assert backup_db.get_session("stale")["model"] == "old/model"
+        finally:
+            backup_db.close()
+    finally:
+        db.close()
+
+
+def test_reset_clears_cached_system_prompt_for_rewritten_route(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _seed_session(
+            db,
+            "stale",
+            model="old/model",
+            billing_provider="legacy",
+            model_config={"model": "old/model", "provider": "legacy"},
+        )
+        db.update_system_prompt(
+            "stale", "Model: old/model\nProvider: legacy\nCached instructions"
+        )
+        before = db.get_session("stale")
+        assert before["system_prompt"] is not None
+        assert before["system_prompt_hash"] is not None
+
+        report = db.reset_session_model_routes(
+            target_model="new/model",
+            target_provider="openrouter",
+        )
+
+        assert report["rows_affected"] == 1
+        after = db.get_session("stale")
+        assert after["system_prompt"] is None
+        assert after["system_prompt_hash"] is None
+        assert db._conn.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
 def test_reset_clears_stale_endpoint_keys_when_target_has_none(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:

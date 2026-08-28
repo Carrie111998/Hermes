@@ -8513,6 +8513,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             candidates = _candidates(conn)
         candidate_ids = [str(row["id"]) for row in candidates]
+        route_fields = (
+            "model",
+            "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "model_config",
+        )
         if dry_run or not candidates:
             return {
                 "dry_run": bool(dry_run),
@@ -8536,6 +8543,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             suffix += 1
         with self._lock:
             self._conn.execute("VACUUM INTO ?", (str(backup),))
+        backed_up_routes: Dict[str, Any] = {}
+        candidate_id_set = set(candidate_ids)
+        with sqlite3.connect(str(backup)) as backup_conn:
+            backup_conn.row_factory = sqlite3.Row
+            for backup_row in backup_conn.execute("SELECT * FROM sessions"):
+                backup_data = dict(backup_row)
+                backup_id = str(backup_data["id"])
+                if backup_id in candidate_id_set:
+                    backed_up_routes[backup_id] = tuple(
+                        backup_data.get(field) for field in route_fields
+                    )
 
         def _do(conn):
             changed: List[str] = []
@@ -8550,6 +8568,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if current is None:
                     continue
                 row = dict(current)
+                if candidate_id not in backed_up_routes or tuple(
+                    row.get(field) for field in route_fields
+                ) != backed_up_routes[candidate_id]:
+                    continue
                 if not _needs_reset(row):
                     continue
                 config = self._session_model_route(row)["_parsed_model_config"]
@@ -8558,7 +8580,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 conn.execute(
                     "UPDATE sessions SET model = ?, billing_provider = ?, "
-                    "billing_base_url = ?, billing_mode = ?, model_config = ? "
+                    "billing_base_url = ?, billing_mode = ?, model_config = ?, "
+                    "system_prompt = NULL, system_prompt_hash = NULL "
                     "WHERE id = ?",
                     (
                         target_model,
@@ -8570,6 +8593,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ),
                 )
                 changed.append(str(row["id"]))
+            if changed:
+                self._delete_unreferenced_system_prompts(conn)
             return changed
 
         changed_ids = self._execute_write(_do)
