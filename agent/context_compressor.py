@@ -3086,6 +3086,17 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression failure cooldown clear failed (non-sqlite): %s", exc)
 
+    def _compression_cancelled(self) -> bool:
+        """Read the host-owned cooperative cancellation signal, if installed."""
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+        if not callable(cancelled_check):
+            return False
+        try:
+            return bool(cancelled_check())
+        except Exception:
+            logger.debug("compression cancellation check failed", exc_info=True)
+            return False
+
     def update_model(
         self,
         model: str,
@@ -4756,6 +4767,13 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
         digests: list[str] = []
         for ci in range(n_chunks):
+            if self._compression_cancelled():
+                logger.info(
+                    "Lean chunk digest map cancelled before segment %d/%d",
+                    ci + 1,
+                    n_chunks,
+                )
+                break
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]
             if not segment.strip():
                 continue
@@ -4785,6 +4803,13 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
                 body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
             digests.append(f"### Segment {ci + 1}/{n_chunks}\n{body}")
+            if self._compression_cancelled():
+                logger.info(
+                    "Lean chunk digest map cancelled after segment %d/%d",
+                    ci + 1,
+                    n_chunks,
+                )
+                break
         if not digests:
             return ""
         return (
@@ -4910,6 +4935,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         placeholder.
         """
         prompt_started_at = time.monotonic()
+        if self._compression_cancelled():
+            raise AuxiliaryExplicitCancellation()
         now = prompt_started_at
         if now < self._summary_failure_cooldown_until:
             logger.debug(
@@ -5264,6 +5291,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     effective_aux_context=_aux_context,
                     phase_timings=_latency_info,
                 )
+            if self._compression_cancelled():
+                raise AuxiliaryExplicitCancellation()
             # ``_validate_llm_response`` only guarantees ``choices[0].message``
             # exists, not that it's an object with ``.content``. Some
             # OpenAI-compatible proxies / local backends return a dict- or
