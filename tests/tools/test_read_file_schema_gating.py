@@ -130,9 +130,13 @@ class TestNeedsOcrPath(unittest.TestCase):
         self.assertIn("[NEEDS OCR", out)
         self.assertIn("pages 2, 3", out)
         self.assertIn("attempted and failed", out)
-        # Maintainer caveat #2: local OCR guidance leads after a failure.
-        self.assertIn("Prefer LOCAL OCR", out)
+        # Maintainer-directed: HINT at checking for an OCR skill; never
+        # name one (none is guaranteed to exist), never sell config knobs.
+        self.assertIn("check whether an OCR skill is available", out)
         self.assertIn("skills_list", out)
+        self.assertNotIn("ocr-and-documents", out)
+        self.assertNotIn("marker-pdf", out)
+        self.assertNotIn("hosted_ocr", out)
 
     def test_disabled_warns_without_attempt(self):
         from tools import read_extract as rx
@@ -143,8 +147,10 @@ class TestNeedsOcrPath(unittest.TestCase):
             out = rx._extract_anydoc("scan.pdf")
         self.assertIn("[NEEDS OCR", out)
         self.assertEqual(len(calls), 1)  # no hosted attempt
-        self.assertIn("hosted_ocr: true", out)  # teaches the enable path
-        self.assertIn("skills_list", out)  # and local OCR
+        # Same shape when disabled: skill hint, no knob advertising.
+        self.assertIn("check whether an OCR skill is available", out)
+        self.assertNotIn("hosted_ocr", out)
+        self.assertNotIn("ocr-and-documents", out)
 
     def test_pin_lockstep(self):
         """pyproject core pin and lazy_deps self-heal pin must match."""

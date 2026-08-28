@@ -234,9 +234,10 @@ def _needs_ocr_warning(path: str, pages, hosted_error: str = "") -> str:
     """Typed replacement for the heuristic coverage note on full-OCR PDFs.
 
     Fired when anydoc raises NeedsOcrError and hosted OCR is disabled,
-    unavailable, or failed. Maintainer caveat #2: when no working
-    Firecrawl route exists, point at LOCAL OCR via the skills system
-    instead of a service the user doesn't have.
+    unavailable, or failed. Maintainer-directed shape: hint at CHECKING
+    for an OCR skill (never name one — none is guaranteed to exist), and
+    never advertise the hosted_ocr config knob — when hosted fails or is
+    absent, a skill or ignoring the gap are the paths that exist.
     """
     page_list = ", ".join(str(p) for p in pages) if pages else "unknown"
     msg = (
@@ -244,27 +245,14 @@ def _needs_ocr_warning(path: str, pages, hosted_error: str = "") -> str:
         "with no text layer — their content is MISSING below. "
     )
     if hosted_error:
-        msg += (
-            f"Hosted OCR was attempted and failed ({hosted_error}). "
-            "Prefer LOCAL OCR: search your skills (skills_list — e.g. the "
-            "ocr-and-documents skill / marker-pdf) for bulk ranges, or "
-        )
-    else:
-        msg += "Options: "
+        msg += f"Hosted OCR was attempted and failed ({hosted_error}). "
     msg += (
-        "render just the pages you need with `pdftoppm -jpeg "
-        f"-r 150 -f <first> -l <last> '{path}' /tmp/page` and inspect via "
-        "vision_analyze"
+        "If the missing pages matter: render just those pages with "
+        f"`pdftoppm -jpeg -r 150 -f <first> -l <last> '{path}' /tmp/page` "
+        "and inspect via vision_analyze, or check whether an OCR skill is "
+        "available (skills_list)."
     )
-    if not hosted_error:
-        msg += (
-            "; or search your skills for local OCR (skills_list — e.g. the "
-            "ocr-and-documents skill / marker-pdf) for bulk ranges"
-            "; or enable automatic hosted OCR by setting "
-            "file_tools.hosted_ocr: true in config.yaml (sends the "
-            "document to Firecrawl Parse; needs FIRECRAWL_API_KEY)"
-        )
-    return msg + ".]\n"
+    return msg + "]\n"
 
 
 def _extract_anydoc(path: str) -> str:
