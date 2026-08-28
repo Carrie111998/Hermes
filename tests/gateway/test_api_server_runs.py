@@ -1251,7 +1251,25 @@ class TestRunIdempotency:
         restarted = _make_adapter()
         _use_idempotency_db(restarted, path)
         app = _create_runs_app(restarted)
+        original_discard = RoomArtifactOutbox.discard
+        attempts = 0
+
+        def fail_once(instance, artifact_scope):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("temporary cleanup failure")
+            return original_discard(instance, artifact_scope)
+
+        monkeypatch.setattr(RoomArtifactOutbox, "discard", fail_once)
         async with TestClient(TestServer(app)) as cli:
+            failed = await cli.get("/v1/runs/run_stale")
+            assert failed.status == 500
+            persisted = restarted._run_idempotency_store.status_for_run(
+                scope,
+                "run_stale",
+            )
+            assert persisted["status"]["status"] == "running"
             response = await cli.get("/v1/runs/run_stale")
             body = await response.json()
         assert response.status == 200
