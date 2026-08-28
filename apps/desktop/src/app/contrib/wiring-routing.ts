@@ -7,6 +7,14 @@
 
 import type { SessionOwnerRoute } from '@/store/session-request-router'
 
+export function branchSessionForOwner(
+  branchStoredSession: (storedSessionId: string, sessionProfile?: null | string) => Promise<boolean>,
+  storedSessionId: string,
+  sessionProfile?: null | string
+): Promise<boolean> {
+  return branchStoredSession(storedSessionId, sessionProfile)
+}
+
 /**
  * Resolve a runtime session id back to its stored id by reverse-scanning the
  * stored->runtime binding map — the same ladder use-session-tile-delegate's

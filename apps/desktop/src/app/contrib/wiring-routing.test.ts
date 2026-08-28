@@ -1,6 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { findStoredIdForRuntimeId, resolveRoutingSessionId, resolveSessionRpcOwner } from './wiring-routing'
+import {
+  branchSessionForOwner,
+  findStoredIdForRuntimeId,
+  resolveRoutingSessionId,
+  resolveSessionRpcOwner
+} from './wiring-routing'
+
+describe('branchSessionForOwner', () => {
+  it('forwards the project-tree row profile to the stored-session branch action', async () => {
+    const branchStoredSession = vi.fn(async () => true)
+
+    await expect(branchSessionForOwner(branchStoredSession, 'stored-sfb', 'sfb')).resolves.toBe(true)
+
+    expect(branchStoredSession).toHaveBeenCalledWith('stored-sfb', 'sfb')
+  })
+})
 
 describe('findStoredIdForRuntimeId', () => {
   it('reverse-resolves a runtime id to its stored id', () => {

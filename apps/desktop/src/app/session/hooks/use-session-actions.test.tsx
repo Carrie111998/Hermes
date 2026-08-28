@@ -1557,6 +1557,7 @@ describe('branchStoredSession desktop source tagging', () => {
   afterEach(() => {
     cleanup()
     setSessions([])
+    $projectTree.set([])
     $sessionTiles.set([])
     setSelectedStoredSessionId(null)
     vi.restoreAllMocks()
@@ -1901,6 +1902,141 @@ describe('branchStoredSession desktop source tagging', () => {
 
     expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
     expect(createParams).toMatchObject({ profile: 'work' })
+  })
+
+  it('resolves the parent workspace when its profile was forwarded but the row is not cached', async () => {
+    setSessions([])
+    vi.mocked(getSession).mockResolvedValue(
+      storedSession({ cwd: '/repo/worktree', id: 'stored-parent', message_count: 1, profile: 'work' })
+    )
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let branchStoredSession: ((storedSessionId: string, profile?: string) => Promise<boolean>) | null = null
+
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent', 'work')).resolves.toBe(true)
+
+    expect(getSession).toHaveBeenCalled()
+    expect(createParams).toMatchObject({
+      cwd: '/repo/worktree',
+      parent_session_id: 'stored-parent',
+      profile: 'work'
+    })
+  })
+
+  it('creates a branch on the owning profile when the parent exists only in the project tree', async () => {
+    setSessions([])
+    $projectTree.set([
+      {
+        id: 'p_work',
+        label: 'Work',
+        path: '/repo/work',
+        repos: [
+          {
+            groups: [
+              {
+                id: '/repo/work::branch::main',
+                label: 'main',
+                path: '/repo/work',
+                sessionCount: 1,
+                sessions: [storedSession({ id: 'stored-parent', message_count: 1, profile: 'work' })]
+              }
+            ],
+            id: '/repo/work',
+            label: 'work',
+            path: '/repo/work',
+            sessionCount: 1
+          }
+        ],
+        sessionCount: 1
+      } as never
+    ])
+    vi.mocked(getSession).mockRejectedValue(new Error('the project-tree row is the only owner source'))
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let branchStoredSession: ((storedSessionId: string) => Promise<boolean>) | null = null
+
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
+
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
+    expect(getAllSessionMessages).toHaveBeenCalledWith('stored-parent', 'work')
+    expect(createParams).toMatchObject({ parent_session_id: 'stored-parent', profile: 'work' })
+  })
+
+  it('prefers an owned project-tree row over an ownerless duplicate in recents', async () => {
+    setSessions([storedSession({ id: 'stored-parent', message_count: 1, profile: undefined })])
+    $projectTree.set([
+      {
+        id: 'p_work',
+        label: 'Work',
+        path: '/repo/work',
+        previewSessions: [storedSession({ id: 'stored-parent', message_count: 1, profile: 'work' })],
+        repos: [],
+        sessionCount: 1
+      } as never
+    ])
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let branchStoredSession: ((storedSessionId: string) => Promise<boolean>) | null = null
+
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
+
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
+    expect(getAllSessionMessages).toHaveBeenCalledWith('stored-parent', 'work')
+    expect(createParams).toMatchObject({ parent_session_id: 'stored-parent', profile: 'work' })
   })
 
   it('omits profile for a profile-less parent so single-profile users are unchanged', async () => {

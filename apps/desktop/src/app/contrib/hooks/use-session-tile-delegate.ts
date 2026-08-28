@@ -50,7 +50,7 @@ function mergeTileTranscript(
 
 interface SessionTileDelegateParams {
   archiveSession: (storedSessionId: string) => Promise<unknown>
-  branchStoredSession: (storedSessionId: string) => Promise<unknown>
+  branchStoredSession: (storedSessionId: string, sessionProfile?: null | string) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
   removeSession: (storedSessionId: string) => Promise<unknown>
   requestGateway: GatewayRequester
@@ -134,7 +134,10 @@ export function useSessionTileDelegate({
         await archiveSession(storedSessionId)
       },
       branchSession: async storedSessionId => {
-        await branchStoredSession(storedSessionId)
+        const owner = await ownerForStoredSession(storedSessionId)
+        const profile = typeof owner === 'string' ? owner : owner?.profile
+
+        await branchStoredSession(storedSessionId, profile)
       },
       deleteSession: async storedSessionId => {
         await removeSession(storedSessionId)
