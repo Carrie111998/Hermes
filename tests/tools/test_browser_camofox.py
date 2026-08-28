@@ -619,6 +619,39 @@ class TestCamofoxImportCookies:
         assert body["cookies"][0]["name"] == "foo"
 
     @patch("tools.browser_camofox.requests.post")
+    def test_uses_profile_scoped_api_key(self, mock_post, tmp_path, monkeypatch):
+        """Multiplexed gateways must not fall back to process-global secrets."""
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from tools.browser_camofox import camofox_import_cookies
+        import tools.browser_camofox as camofox
+
+        monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
+        monkeypatch.delenv("CAMOFOX_URL", raising=False)
+        monkeypatch.setattr(
+            camofox,
+            "_get_camofox_config",
+            lambda: {"cookies_dir": str(tmp_path)},
+        )
+        (tmp_path / "x.txt").write_text(
+            ".example.com\tTRUE\t/\tFALSE\t0\tfoo\tbar\n", encoding="utf-8"
+        )
+        mock_post.return_value = _mock_response(json_data={"ok": True, "count": 1})
+
+        token = set_secret_scope({
+            "CAMOFOX_API_KEY": "profile-secret",
+            "CAMOFOX_URL": "http://localhost:9377",
+        })
+        try:
+            result = json.loads(camofox_import_cookies("x.txt", task_id="t-scoped"))
+        finally:
+            reset_secret_scope(token)
+
+        assert result["success"] is True
+        assert mock_post.call_args.kwargs["headers"] == {
+            "Authorization": "Bearer profile-secret"
+        }
+
+    @patch("tools.browser_camofox.requests.post")
     def test_uses_configured_command_timeout(self, mock_post, tmp_path, monkeypatch):
         from tools.browser_camofox import camofox_import_cookies
         self._prep(tmp_path, monkeypatch)
@@ -777,3 +810,15 @@ class TestBrowserImportCookiesRouting:
         monkeypatch.setenv("CAMOFOX_API_KEY", "secret")
         from tools.browser_tool import _check_import_cookies_requirements
         assert _check_import_cookies_requirements() is True
+
+    def test_visible_with_profile_scoped_api_key(self, monkeypatch):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+        token = set_secret_scope({"CAMOFOX_API_KEY": "profile-secret"})
+        try:
+            assert browser_tool._check_import_cookies_requirements() is True
+        finally:
+            reset_secret_scope(token)
