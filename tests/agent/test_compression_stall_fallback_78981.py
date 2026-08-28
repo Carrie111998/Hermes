@@ -358,3 +358,187 @@ def test_unpinned_summary_call_keeps_task_routing():
     assert summary
     assert calls and "provider" not in calls[0]
     assert calls[0]["model"] == "aux-summarizer"
+
+
+# ---------------------------------------------------------------------------
+# Primary-route hardening: a chain entry that IS the primary is never a
+# fallback candidate (the observed misconfig: fallback_chain[0] duplicating
+# auxiliary.compression itself, so the "fallback" re-ran the stalled route).
+# ---------------------------------------------------------------------------
+
+PRIMARY_CONFIG = {
+    "provider": "openai-codex",
+    "model": "gpt-5.5",
+    "base_url": "https://chatgpt.com/backend-api/codex",
+}
+
+
+def _patch_task_config(config):
+    return patch(
+        "agent.auxiliary_client._get_auxiliary_task_config",
+        return_value=config,
+    )
+
+
+def test_primary_identical_first_entry_is_skipped_for_the_next_entry():
+    chain = [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+        CHAIN_ENTRY,
+    ]
+    with _patch_task_config(dict(PRIMARY_CONFIG, fallback_chain=chain)):
+        route = resolve_compression_fallback_route()
+
+    assert route is not None
+    assert route["model"] == "backup-summarizer"
+    assert route["label"] == "fallback_chain[1](custom)"
+
+
+def test_normalized_primary_duplicates_cannot_evade_the_skip():
+    """Trailing slash, case difference, and provider alias all still name the
+    same backend as the primary and must not survive as fallback candidates."""
+    chain = [
+        {  # trailing slash on base_url
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex/",
+        },
+        {  # case differences in every field
+            "provider": "OpenAI-Codex",
+            "model": "GPT-5.5",
+            "base_url": "HTTPS://chatgpt.com/backend-api/CODEX",
+        },
+        {  # provider alias ("codex" normalizes to "openai-codex")
+            "provider": "codex",
+            "model": "gpt-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+        CHAIN_ENTRY,
+    ]
+    with _patch_task_config(dict(PRIMARY_CONFIG, fallback_chain=chain)):
+        route = resolve_compression_fallback_route()
+
+    assert route is not None
+    assert route["model"] == "backup-summarizer"
+    assert route["label"] == "fallback_chain[3](custom)"
+
+
+def test_chain_of_only_primary_duplicates_resolves_to_no_route():
+    chain = [
+        {
+            "provider": "codex",
+            "model": "GPT-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex/",
+        },
+    ]
+    with _patch_task_config(dict(PRIMARY_CONFIG, fallback_chain=chain)):
+        assert resolve_compression_fallback_route() is None
+
+
+def test_same_model_on_a_different_base_url_is_a_real_fallback():
+    """Identity is (provider, model, base_url): the same model served from a
+    different endpoint is a genuinely distinct route and must be kept."""
+    chain = [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "base_url": "https://other-endpoint.invalid/v1",
+        },
+    ]
+    with _patch_task_config(dict(PRIMARY_CONFIG, fallback_chain=chain)):
+        route = resolve_compression_fallback_route()
+
+    assert route is not None
+    assert route["base_url"] == "https://other-endpoint.invalid/v1"
+
+
+def test_unknown_primary_identity_skips_nothing():
+    """Without an explicit primary provider+model in config (auto-resolved
+    routes) no candidate can be proven identical — the declared chain wins."""
+    chain = [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+    ]
+    with _patch_task_config({"fallback_chain": chain}):
+        route = resolve_compression_fallback_route()
+
+    assert route is not None
+    assert route["model"] == "gpt-5.5"
+
+
+# ---------------------------------------------------------------------------
+# Stall classification: only an idle-stalled route consults the chain. A
+# summary phase that is still streaming when the total ceiling elapses is
+# slow (or the region is simply too large for the ceiling), not stalled — a
+# fallback re-run of the identical attempt burns a second full ceiling on a
+# retry that cannot finish either.
+# ---------------------------------------------------------------------------
+
+
+def test_ceiling_with_fresh_progress_skips_the_fallback_retry():
+    original = [{"role": "user", "content": "keep-me"}]
+    worker_calls = []
+    release = threading.Event()
+
+    def streaming_worker(fence: CompressionCommitFence):
+        worker_calls.append(fence)
+        # Stream continuously: progress stays fresher than the idle budget
+        # for well past the total ceiling.
+        for _ in range(200):
+            if release.is_set():
+                break
+            fence.touch_progress()
+            threading.Event().wait(0.01)
+        if not fence.begin_commit():
+            return (original, "late")
+        try:
+            return ([{"role": "assistant", "content": "late"}], "late")
+        finally:
+            fence.finish_commit()
+
+    timeouts = []
+    try:
+        with _patch_chain([CHAIN_ENTRY]):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=streaming_worker,
+                messages=original,
+                system_prompt_fallback="degraded-prompt",
+                idle_timeout_seconds=0.3,
+                total_ceiling_seconds=0.6,
+                on_timeout=lambda *args: timeouts.append(args),
+            )
+    finally:
+        release.set()
+
+    assert len(worker_calls) == 1, (
+        "a streaming-but-slow attempt must not be retried on the fallback "
+        "chain — the retry is bound by the same ceiling and equally doomed"
+    )
+    assert msgs is original
+    assert prompt == "degraded-prompt"
+    assert len(timeouts) == 1, "the degrade must still be reported"
+
+
+def test_idle_stall_still_consults_the_fallback_chain():
+    """The classification must not break #78981's core contract: a silent
+    stall (no progress for a full idle window) still gets its one retry."""
+    original = [{"role": "user", "content": "keep-me"}]
+    compressed = [{"role": "user", "content": "summary"}]
+    worker = _StalledSummaryWorker(compressed)
+
+    try:
+        msgs, prompt = _run(
+            worker, chain=[CHAIN_ENTRY], timeouts=[], messages=original
+        )
+    finally:
+        worker.release.set()
+
+    assert worker.attempts == 2
+    assert msgs == compressed
+    assert prompt == "summarized-prompt"

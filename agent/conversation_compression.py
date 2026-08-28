@@ -455,6 +455,7 @@ def _restore_compressor_attempt_state(
     durable_cooldown_authoritative: Optional[bool] = None,
     durable_cooldown_state: Optional[dict[str, Any]] = None,
     attempt_generation: Optional[int] = None,
+    preserve_newer_cooldown: bool = False,
 ) -> None:
     """Restore the safe per-attempt snapshot after a pre-commit hard cancel.
 
@@ -464,6 +465,17 @@ def _restore_compressor_attempt_state(
     primary and hands the compressor to a fallback attempt, and the late
     primary's unwind must not roll fallback-owned state back to the
     primary's pre-attempt snapshot (#96634 post-merge review, claim 1).
+
+    ``preserve_newer_cooldown``: a fence-refused worker can return tens of
+    minutes AFTER its host already timed out and recorded a fresh timeout
+    cooldown (``record_timeout_failure``). Restoring the attempt-start
+    snapshot wholesale would roll that newer cooldown (deadline, error, and
+    the consecutive-failure ladder counter) back to pre-attempt values —
+    in-memory AND durable — so the next auto-compress re-fires almost
+    immediately and the 60/300/900 ladder never climbs (the #78981 fence-
+    cancel churn shape). When the flag is set and the live cooldown deadline
+    is newer than the snapshot's, the cooldown fields are kept as-is and the
+    durable cooldown rollback is skipped.
     """
     if attempt_generation is not None and not _compressor_attempt_is_current(
         compressor, attempt_generation
@@ -476,6 +488,33 @@ def _restore_compressor_attempt_state(
             getattr(compressor, "_compression_attempt_generation", None),
         )
         return
+    if preserve_newer_cooldown:
+        try:
+            _live_deadline = float(
+                getattr(compressor, "_summary_failure_cooldown_until", 0.0)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            _live_deadline = 0.0
+        try:
+            _snap_deadline = float(
+                snapshot.get("_summary_failure_cooldown_until") or 0.0
+            )
+        except (TypeError, ValueError):
+            _snap_deadline = 0.0
+        if _live_deadline > _snap_deadline:
+            _preserved = _COMPRESSOR_COOLDOWN_STATE_FIELDS + (
+                "_consecutive_timeout_failures",
+            )
+            snapshot = {
+                name: value
+                for name, value in snapshot.items()
+                if name not in _preserved
+            }
+            # The host's newer cooldown row is authoritative now; never
+            # overwrite it with the attempt-start durable state.
+            durable_cooldown_authoritative = False
+            durable_cooldown_state = None
     # A successful summary clears the durable cooldown before the outer commit
     # boundary. Recreate (or clear) that row before restoring exact in-memory
     # values, otherwise the next refresh would overwrite this rollback. Unknown
@@ -1001,6 +1040,30 @@ def resolve_context_compression_timeouts(
     return idle, ceiling
 
 
+def _normalized_route_identity(
+    provider: Any, model: Any, base_url: Any
+) -> Tuple[str, str, str]:
+    """Normalized ``(provider, model, base_url)`` identity for route equality.
+
+    Providers compare through the auxiliary client's own alias table
+    (``_normalize_aux_provider``: ``codex`` → ``openai-codex``, ``google`` →
+    ``gemini``, case-insensitive, …) so an aliased spelling of the same
+    backend cannot masquerade as a different route. Models compare
+    case-insensitively; base URLs case-insensitively with trailing slashes
+    stripped (clients themselves append/strip them freely).
+    """
+    provider_text = str(provider or "").strip()
+    try:
+        from agent.auxiliary_client import _normalize_aux_provider
+
+        provider_text = _normalize_aux_provider(provider_text)
+    except Exception:
+        provider_text = provider_text.lower()
+    model_text = str(model or "").strip().lower()
+    base_text = str(base_url or "").strip().lower().rstrip("/")
+    return provider_text, model_text, base_text
+
+
 def resolve_compression_fallback_route() -> Optional[dict]:
     """Return the first usable ``auxiliary.compression.fallback_chain`` entry.
 
@@ -1011,11 +1074,18 @@ def resolve_compression_fallback_route() -> Optional[dict]:
     resolves the same config into explicit ``call_llm`` route arguments the
     stall path can pin onto one retry.
 
-    Only the first structurally complete entry is returned: one extra bounded
-    attempt is the budget for a stall, and if that entry cannot build a client
-    (or errors) the auxiliary client's own exception path still walks the rest
-    of the chain from there. Returns ``None`` when no entry is usable, which
-    keeps the historical continue-without-compression behaviour.
+    An entry that names the ACTIVE PRIMARY compression route (same normalized
+    provider/model/base_url — see ``_normalized_route_identity``) is skipped:
+    "retrying" a stalled route on itself burns a whole second timeout budget
+    for a retry that cannot behave differently (the observed misconfig shape:
+    the chain's first entry duplicating ``auxiliary.compression`` itself).
+    Scanning continues to the next entry.
+
+    Beyond that, only the first structurally complete entry is returned: one
+    extra bounded attempt is the budget for a stall, and if that entry cannot
+    build a client (or errors) the auxiliary client's own exception path still
+    walks the rest of the chain from there. Returns ``None`` when no entry is
+    usable, which keeps the historical continue-without-compression behaviour.
     """
     try:
         from agent.auxiliary_client import (
@@ -1023,12 +1093,30 @@ def resolve_compression_fallback_route() -> Optional[dict]:
             _get_auxiliary_task_config,
         )
 
-        chain = _get_auxiliary_task_config("compression").get("fallback_chain")
+        task_config = _get_auxiliary_task_config("compression")
+        chain = task_config.get("fallback_chain")
     except Exception:
         logger.debug("compression fallback_chain lookup failed", exc_info=True)
         return None
     if not isinstance(chain, list):
         return None
+
+    # Identity of the active primary compression route. Comparable only when
+    # the config names both provider and model; otherwise (auto-resolved
+    # routes) no candidate is skipped — a wrong skip would silently disable
+    # the user's declared fallback.
+    primary_identity: Optional[Tuple[str, str, str]] = None
+    try:
+        primary_provider = str(task_config.get("provider") or "").strip()
+        primary_model = str(task_config.get("model") or "").strip()
+        if primary_provider and primary_model:
+            primary_identity = _normalized_route_identity(
+                primary_provider,
+                primary_model,
+                task_config.get("base_url"),
+            )
+    except Exception:
+        primary_identity = None
 
     for index, entry in enumerate(chain):
         if not isinstance(entry, dict):
@@ -1038,6 +1126,21 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         # Both are required to name a route. _resolve_fallback_entry applies
         # the same rule when the aux client walks this chain itself.
         if not provider or not model:
+            continue
+        if primary_identity is not None and (
+            _normalized_route_identity(
+                provider, model, entry.get("base_url")
+            )
+            == primary_identity
+        ):
+            logger.warning(
+                "compression fallback_chain[%d] (%s/%s) is the active "
+                "primary compression route — skipping it as a stall-fallback "
+                "candidate",
+                index,
+                provider,
+                model,
+            )
             continue
         try:
             api_key = _fallback_entry_api_key(entry)
@@ -1311,11 +1414,18 @@ def run_compress_context_with_progress_timeout(
     # settle admission themselves (worker result returned, or fence cancel
     # won); everything else revokes in the ``finally``.
     handled_exit = False
+    # How the pre-commit wait ended: True = the worker went silent for a full
+    # idle window (a genuinely stalled route — #78981's shape); False = the
+    # total ceiling elapsed while progress was still fresh (a slow-but-alive
+    # summary phase). Only the former is a route-health signal that justifies
+    # the stall-fallback retry.
+    idle_stalled = False
     try:
         while True:
             waited = time.monotonic() - wait_started
             remaining_ceiling = ceiling - waited
             if remaining_ceiling <= 0:
+                idle_stalled = fence.seconds_since_progress() >= idle
                 break
             # #76354 S3 analogue for this wait: charge the idle budget from
             # the LAST PROGRESS event, not from the start of this wait slice.
@@ -1342,6 +1452,7 @@ def run_compress_context_with_progress_timeout(
                         ceiling,
                     )
                     continue
+                idle_stalled = since_progress >= idle
                 break
 
         # F6: a not-yet-started future must not linger as a stale queued job.
@@ -1438,7 +1549,23 @@ def run_compress_context_with_progress_timeout(
         # acquire it immediately. Run it BEFORE on_timeout: that callback
         # records the summary-failure cooldown, which would make the retry's
         # own summary call a no-op.
-        if stall_fallback:
+        #
+        # Only a genuine idle stall consults the fallback chain. When the
+        # ceiling elapsed while tokens were still streaming, the route is
+        # slow, not unhealthy — most often an oversized session whose summary
+        # phase simply cannot finish inside the ceiling. A fallback re-run of
+        # that same attempt is bound by the same ceiling, so it burns a
+        # second full ceiling on a retry that is structurally just as doomed.
+        if stall_fallback and not idle_stalled:
+            logger.warning(
+                "Context compression hit the total ceiling (%.0fs) while the "
+                "summary route was still streaming (last progress %.1fs ago) "
+                "— the route is slow, not stalled; skipping the "
+                "stall-fallback retry and continuing without compression",
+                ceiling,
+                since_progress,
+            )
+        if stall_fallback and idle_stalled:
             recovered = _retry_compression_on_fallback_chain(
                 worker=worker,
                 messages=messages,
@@ -2812,8 +2939,10 @@ def compress_context(
             )
             if not _codex_fence_entered:
                 _restore_compressor_attempt_state(
-                    agent.context_compressor, _compressor_attempt_snapshot,
+                    agent.context_compressor,
+                    _compressor_attempt_snapshot,
                     attempt_generation=_attempt_generation,
+                    preserve_newer_cooldown=True,
                 )
                 existing_prompt = getattr(agent, "_cached_system_prompt", None)
                 if not existing_prompt:
@@ -3758,12 +3887,17 @@ def compress_context(
         if commit_fence is not None:
             _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
             if not _commit_fence_entered:
+                # A refused commit usually means the host timed out long ago
+                # and has since recorded a fresh timeout cooldown; this late
+                # rollback must not clobber that newer cooldown (see
+                # _restore_compressor_attempt_state).
                 _restore_compressor_attempt_state(
                     agent.context_compressor,
                     _compressor_attempt_snapshot,
                     durable_cooldown_authoritative=_durable_cooldown_authoritative,
                     durable_cooldown_state=_durable_cooldown_state,
                     attempt_generation=_attempt_generation,
+                    preserve_newer_cooldown=True,
                 )
                 if (
                     messages_before_compression is not None
