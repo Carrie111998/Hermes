@@ -319,6 +319,25 @@ def test_member_mention_joins_the_next_round_not_the_current_round(
     assert first.round_index == 0
     assert second.member.profile == "build"
     assert second.round_index == 1
+    assert "@research lead this" in second.payload["prompt"]
+    assert "@build can add the implementation detail." in second.payload["prompt"]
+
+
+def test_plain_member_reply_does_not_wake_another_bot_round(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="@research answer the user")
+    _settle_next(room, db, text="The answer is ready for the user.")
+
+    decision = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    assert decision.status == "settled"
+    assert decision.reason == "silent_round"
 
 
 @pytest.mark.parametrize("value", ["", "pass", "pass.", "(pass)", " ( PASS ). "])
@@ -527,7 +546,17 @@ def test_three_round_bound(room_db: tuple[Path, dict]):
     _append_user(db, event_id="user-1", text="Discuss.")
 
     for index in range(6):
-        _settle_next(room, db, text=f"Reply {index}.")
+        task = _next_task(room, db)
+        peer = "build" if task.member.profile == "research" else "research"
+        publication = discussion.plan_publication(
+            room,
+            _events(db),
+            task,
+            status="settled",
+            result={"text": f"Reply {index}. @{peer}"},
+            local_profiles=LOCAL_PROFILES,
+        )
+        _append_publication(db, publication)
 
     decision = discussion.plan_next_task(
         room,
@@ -559,7 +588,7 @@ def test_ten_message_bound(tmp_path: Path):
     _append_user(db, event_id="user-1", text="Discuss.")
 
     for index in range(discussion.MAX_DISCUSSION_MESSAGES):
-        _settle_next(room, db, text=f"Reply {index}.")
+        _settle_next(room, db, text=f"Reply {index}. @everyone")
 
     decision = discussion.plan_next_task(
         room,

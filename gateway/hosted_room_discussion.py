@@ -575,8 +575,10 @@ def is_pass_text(value: Any) -> bool:
 def resolve_mentions(
     texts: Iterable[str],
     members: Sequence[DiscussionMember],
+    *,
+    default_all: bool = True,
 ) -> tuple[DiscussionMember, ...]:
-    """Resolve member handles deterministically; no known mention means all."""
+    """Resolve member handles deterministically against the frozen roster."""
 
     by_handle = {member.handle.casefold(): member for member in members}
     mentioned: set[str] = set()
@@ -588,9 +590,38 @@ def resolve_mentions(
                 everyone = True
             elif handle in by_handle:
                 mentioned.add(handle)
-    if everyone or not mentioned:
+    if everyone or (default_all and not mentioned):
         return tuple(members)
     return tuple(member for member in members if member.handle.casefold() in mentioned)
+
+
+def _unaddressed_member_mentions(
+    messages: Sequence[_ValidatedEvent],
+    room: DiscussionRoom,
+) -> tuple[DiscussionMember, ...]:
+    """Return peers explicitly cited by a Bot and not heard from afterward."""
+
+    cited_at: dict[str, int] = {}
+    last_post_at: dict[str, int] = {}
+    for event in messages:
+        if event.kind != "message.member":
+            continue
+        speaker_id = str(event.payload["member_id"])
+        last_post_at[speaker_id] = event.seq
+        cited = resolve_mentions(
+            (str(event.payload["text"]),),
+            room.members,
+            default_all=False,
+        )
+        for member in cited:
+            if member.member_id != speaker_id:
+                cited_at[member.member_id] = event.seq
+    return tuple(
+        member
+        for member in room.members
+        if member.member_id in cited_at
+        and last_post_at.get(member.member_id, 0) <= cited_at[member.member_id]
+    )
 
 
 def _validate_event(
@@ -1127,15 +1158,16 @@ def plan_next_task(
     seen_through_seq = max(event.seq for event in thread_messages)
 
     for round_index in range(MAX_DISCUSSION_ROUNDS):
-        # Mentions emitted during a round recruit members for the next round,
-        # never retroactively into the one already in progress.
-        mention_texts = [
-            str(event.payload["text"])
-            for event in discussion_messages
-            if event.kind == "message.user"
-            or int(event.payload["round_index"]) < round_index
-        ]
-        responders = resolve_mentions(mention_texts, room.members)
+        # The user's message selects the first round, with no mention meaning
+        # everyone. Later rounds are opt-in: only a peer explicitly cited by a
+        # Bot and not heard from afterward gets another turn. Every member's
+        # watermark remains intact, so a peer cited later still receives the
+        # complete bounded transcript delta without consuming turns meanwhile.
+        responders = (
+            resolve_mentions((str(discussion.payload["text"]),), room.members)
+            if round_index == 0
+            else _unaddressed_member_mentions(discussion_messages, room)
+        )
         ordered = _rotate(responders, round_index)
         for member_index, member in enumerate(ordered):
             if (round_index, member.member_id) in terminals:
