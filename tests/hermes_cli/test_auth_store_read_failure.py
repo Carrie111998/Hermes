@@ -45,10 +45,10 @@ def _fail_read(exc):
     ids=["emfile", "eacces", "eio"],
 )
 def test_read_failure_raises_and_leaves_the_store_alone(store_file, monkeypatch, exc):
-    from pathlib import Path
+    import hermes_cli.auth_store as auth_store
 
     before = store_file.read_bytes()
-    monkeypatch.setattr(Path, "read_text", _fail_read(exc))
+    monkeypatch.setattr(auth_store, "_read_auth_bytes", _fail_read(exc))
 
     with pytest.raises(OSError):
         auth._load_auth_store(store_file)
@@ -80,14 +80,14 @@ def test_log_does_not_claim_a_backup_that_was_not_written(
     store_file, monkeypatch, caplog
 ):
     """The old message advertised the .corrupt path even when copy2 failed."""
-    import shutil
+    import hermes_cli.auth_store as auth_store
 
     store_file.write_text("{ not json", encoding="utf-8")
 
     def _no_copy(*args, **kwargs):
         raise OSError(errno.EMFILE, "Too many open files")
 
-    monkeypatch.setattr(shutil, "copy2", _no_copy)
+    monkeypatch.setattr(auth_store, "_write_corrupt_sidecar", _no_copy)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
         with pytest.raises(auth.AuthStoreCorruptionError) as caught:

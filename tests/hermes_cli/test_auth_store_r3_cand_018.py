@@ -37,10 +37,12 @@ def test_failed_preservation_is_a_hard_stop(tmp_path, monkeypatch):
     primary = tmp_path / "auth.json"
     original = _malformed_store(primary)
 
+    import hermes_cli.auth_store as auth_store
+
     def fail_copy(*args, **kwargs):
         raise OSError("synthetic preservation failure")
 
-    monkeypatch.setattr(auth.shutil, "copy2", fail_copy)
+    monkeypatch.setattr(auth_store, "_write_corrupt_sidecar", fail_copy)
     with pytest.raises(auth.AuthStoreCorruptionError) as caught:
         auth._load_auth_store(primary)
 
