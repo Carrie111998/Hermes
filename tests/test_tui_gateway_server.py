@@ -19873,7 +19873,9 @@ def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch):
     """
     monkeypatch.setattr(server, "_default_session_cwd", lambda: "/gateway/launch/dir")
     monkeypatch.setattr(server, "_git_branch_for_cwd", lambda cwd: "bb/feature")
-    monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
+    monkeypatch.setattr(
+        server, "_project_info_for_cwd", lambda cwd, profile_home=None: None
+    )
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
     info = server._fallback_session_info({"cwd": "/projects/session-own-repo"})
@@ -19890,7 +19892,9 @@ def test_fallback_session_info_always_emits_branch(monkeypatch):
     """
     monkeypatch.setattr(server, "_default_session_cwd", lambda: "/gateway/launch/dir")
     monkeypatch.setattr(server, "_git_branch_for_cwd", lambda cwd: "")
-    monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
+    monkeypatch.setattr(
+        server, "_project_info_for_cwd", lambda cwd, profile_home=None: None
+    )
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
     info = server._fallback_session_info({"cwd": "/plain/folder"})
