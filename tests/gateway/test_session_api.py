@@ -891,3 +891,85 @@ async def test_patch_session_still_rejects_unknown_fields(adapter, session_db):
         resp = await cli.patch(f"/api/sessions/{session_id}", json={"nonsense": 1})
         assert resp.status == 400, await resp.text()
         assert (await resp.json())["error"]["code"] == "unsupported_session_field"
+
+
+@pytest.mark.asyncio
+async def test_delete_session_removes_on_disk_artifacts_default_home(
+    adapter, session_db, tmp_path, monkeypatch
+):
+    """DELETE /api/sessions/{id} must remove the session's on-disk artifacts
+    under the default-home sessions directory when no gateway runner is wired —
+    writer-named snapshot + request dumps as well as legacy bare names — while
+    another session's files in the same directory survive."""
+    import hermes_constants
+    from hermes_state_common import safe_session_filename_component
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sid = session_db.create_session("del-disk-cleanup", "api_server")
+    safe = safe_session_filename_component(sid)
+    (sessions_dir / f"session_{safe}.json").write_text("{}")
+    (sessions_dir / f"request_dump_{safe}_t1.json").write_text("{}")
+    (sessions_dir / f"{sid}.json").write_text("{}")
+    (sessions_dir / f"{sid}.jsonl").write_text("")
+    (sessions_dir / "session_other_session.json").write_text("{}")
+    (sessions_dir / "request_dump_other_session_t1.json").write_text("{}")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{sid}")
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["deleted"] is True
+
+    assert session_db.get_session(sid) is None
+    assert not (sessions_dir / f"session_{safe}.json").exists()
+    assert not (sessions_dir / f"request_dump_{safe}_t1.json").exists()
+    assert not (sessions_dir / f"{sid}.json").exists()
+    assert not (sessions_dir / f"{sid}.jsonl").exists()
+    # Unrelated sessions' files in the same directory must survive.
+    assert (sessions_dir / "session_other_session.json").exists()
+    assert (sessions_dir / "request_dump_other_session_t1.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_session_honors_configured_sessions_dir(
+    adapter, session_db, tmp_path, monkeypatch
+):
+    """With a gateway runner injected, cleanup must target the runner's
+    configured ``sessions_dir`` (the directory GatewayRunner builds its
+    session store from), not the default-home sessions reconstruction."""
+    import hermes_constants
+    from types import SimpleNamespace
+
+    from hermes_state_common import safe_session_filename_component
+
+    configured = tmp_path / "custom-sessions"
+    configured.mkdir()
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(sessions_dir=configured)
+    )
+
+    default_home = tmp_path / "default-home"
+    default_sessions = default_home / "sessions"
+    default_sessions.mkdir(parents=True)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: default_home)
+
+    sid = session_db.create_session("del-configured-dir", "api_server")
+    safe = safe_session_filename_component(sid)
+    # Same artifact names in both layouts: only the configured one is cleaned.
+    (configured / f"session_{safe}.json").write_text("{}")
+    (configured / f"request_dump_{safe}_t.json").write_text("{}")
+    (default_sessions / f"session_{safe}.json").write_text("{}")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{sid}")
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["deleted"] is True
+
+    assert not (configured / f"session_{safe}.json").exists()
+    assert not (configured / f"request_dump_{safe}_t.json").exists()
+    # The default-home copy for the same id is NOT the active store.
+    assert (default_sessions / f"session_{safe}.json").exists()
