@@ -168,7 +168,7 @@ export function useHudHandoff({ navigate, resumeSession }: HudHandoffParams): vo
         if (delegate) {
           void (
             handoff.ownerRoute
-              ? delegate.resumeTile(target, undefined, handoff.ownerRoute)
+              ? delegate.resumeTile(target, { ownerRoute: handoff.ownerRoute })
               : delegate.resumeTile(target)
           ).catch(() => undefined)
 

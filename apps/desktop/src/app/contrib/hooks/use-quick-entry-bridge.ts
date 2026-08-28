@@ -98,7 +98,10 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
           const storedSessionId = session?.id || target
 
           const resume = session
-            ? delegate.resumeTile(storedSessionId, session.ownerGeneration, session.ownerRoute)
+            ? delegate.resumeTile(storedSessionId, {
+                ownerGeneration: session.ownerGeneration,
+                ownerRoute: session.ownerRoute
+              })
             : delegate.resumeTile(storedSessionId)
 
           void resume

@@ -108,7 +108,9 @@ describe('Quick Entry duplicate-owner target contract', () => {
       })
     })
 
-    await vi.waitFor(() => expect(resumeTile).toHaveBeenCalledWith('shared', 9, ownerB))
+    await vi.waitFor(() =>
+      expect(resumeTile).toHaveBeenCalledWith('shared', { ownerGeneration: 9, ownerRoute: ownerB })
+    )
     expect(submitToSession).toHaveBeenCalledWith('runtime-owner-b', 'owner B only', ownerB)
   })
 
@@ -140,7 +142,9 @@ describe('Quick Entry duplicate-owner target contract', () => {
       })
     })
 
-    await vi.waitFor(() => expect(resumeTile).toHaveBeenCalledWith('shared', 9, ownerB))
+    await vi.waitFor(() =>
+      expect(resumeTile).toHaveBeenCalledWith('shared', { ownerGeneration: 9, ownerRoute: ownerB })
+    )
     await vi.waitFor(() => expect($notifications.get()).toHaveLength(1))
 
     expect(submitToSession).not.toHaveBeenCalled()
@@ -176,7 +180,12 @@ describe('Quick Entry duplicate-owner target contract', () => {
       })
     })
 
-    await vi.waitFor(() => expect(resumeTile).toHaveBeenCalledWith('ownerless-tile', 4, undefined))
+    await vi.waitFor(() =>
+      expect(resumeTile).toHaveBeenCalledWith('ownerless-tile', {
+        ownerGeneration: 4,
+        ownerRoute: undefined
+      })
+    )
     await vi.waitFor(() => expect($notifications.get()).toHaveLength(1))
     expect(submitText).not.toHaveBeenCalled()
   })

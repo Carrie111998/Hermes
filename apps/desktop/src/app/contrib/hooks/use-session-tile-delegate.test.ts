@@ -235,7 +235,9 @@ describe('useSessionTileDelegate resumeTile', () => {
         finishOwnerA = resolve
       })
     )
+
     renderTile(vi.fn(), { updateSessionState })
+
     const resumed = sessionTileDelegate()!.resumeTile(storedSessionId, {
       ownerGeneration: generationA,
       ownerRoute: ownerA
@@ -420,11 +422,10 @@ describe('useSessionTileDelegate resumeTile', () => {
       }
     )
 
-    await sessionTileDelegate()!.resumeTile(
-      storedSessionId,
-      sessionTileOwnerGeneration(storedSessionId, ownerB),
-      ownerB
-    )
+    await sessionTileDelegate()!.resumeTile(storedSessionId, {
+      ownerGeneration: sessionTileOwnerGeneration(storedSessionId, ownerB),
+      ownerRoute: ownerB
+    })
     sessionTileDelegate()!.invalidateRuntimeBindings!(new Set([sessionTileIdentity(storedSessionId, ownerB)]))
 
     expect(runtimeIdByStoredSessionIdRef.current.get(storedSessionId)).toBe('runtime-b')
