@@ -1979,6 +1979,8 @@ export interface Translations {
     transcribingDictation: string
     voiceControls: string
     voiceDictation: string
+    delegationRoutingOn: string
+    delegationRoutingOff: string
     speakReplies: string
     stopSpeakingReplies: string
     wakeWordListening: (phrase: string) => string

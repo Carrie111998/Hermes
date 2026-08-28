@@ -156,11 +156,6 @@ export function inferFieldSchema(value: unknown): ConfigFieldSchema {
   return { type: 'string' }
 }
 
-// Config keys that intentionally default by absence in the backend. They still
-// need a declared renderer type so Settings can expose the existing policy as
-// an OFF switch before the user has ever written it to config.yaml.
-const ABSENT_BOOLEAN_FIELDS = new Set(['delegate_wave.route_repo_changes'])
-
 // Backend schema omits some declared keys; config presence is the availability signal.
 export function sectionFieldEntries(
   schema: Record<string, ConfigFieldSchema>,
@@ -172,13 +167,7 @@ export function sectionFieldEntries(
       s.keys.flatMap(k => {
         const value = getNested(config, k)
 
-        const field =
-          schema[k] ??
-          (value === undefined
-            ? ABSENT_BOOLEAN_FIELDS.has(k)
-              ? ({ type: 'boolean' } satisfies ConfigFieldSchema)
-              : undefined
-            : inferFieldSchema(value))
+        const field = schema[k] ?? (value === undefined ? undefined : inferFieldSchema(value))
 
         return field ? [[k, field] as [string, ConfigFieldSchema]] : []
       })

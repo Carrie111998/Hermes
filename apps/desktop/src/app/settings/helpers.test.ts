@@ -331,10 +331,10 @@ describe('settings helpers', () => {
   })
 
   describe('sectionFieldEntries', () => {
-    it('shows the repository-routing switch as off before it exists in config', () => {
-      const fields = new Map(sectionFieldEntries({}, {}).get('safety') ?? [])
-
-      expect(fields.get('delegate_wave.route_repo_changes')).toEqual({ type: 'boolean' })
+    // The repository-routing switch moved to the composer row, so Settings no
+    // longer renders it. The key itself still has to round-trip: the composer
+    // toggle writes it through the same getNested/setNested pair.
+    it('round-trips the repository-routing key the composer toggle writes', () => {
       expect(getNested({}, 'delegate_wave.route_repo_changes')).toBeUndefined()
       expect(setNested({}, 'delegate_wave.route_repo_changes', true)).toEqual({
         delegate_wave: { route_repo_changes: true }

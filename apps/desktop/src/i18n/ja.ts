@@ -482,7 +482,6 @@ export const ja = defineLocale({
       }
     },
     fieldLabels: defineFieldCopy({
-      'delegate_wave.route_repo_changes': 'リポジトリ変更を委任',
       model: 'デフォルトモデル',
       modelContextLength: 'コンテキストウィンドウ',
       fallbackProviders: 'フォールバックモデル',
@@ -645,8 +644,6 @@ export const ja = defineLocale({
       }
     }),
     fieldDescriptions: defineFieldCopy({
-      'delegate_wave.route_repo_changes':
-        'Hermes がファイルを直接編集せず、リポジトリ変更の依頼を delegate-wave に送ります。',
       model: 'コンポーザーで別のモデルを選ばない限り、新しいチャットで使用されます。',
       modelContextLength: '0 のままにすると、選択したモデルから検出されたコンテキストウィンドウを使用します。',
       fallbackProviders: 'デフォルトモデルが失敗したときに試す provider:model 形式のバックアップです。',
@@ -2034,6 +2031,8 @@ export const ja = defineLocale({
     transcribingDictation: '口述を文字起こし中',
     voiceControls: '音声',
     voiceDictation: '音声口述',
+    delegationRoutingOn: 'リポジトリの変更は Delegate Wave 経由 — クリックで Hermes が直接編集',
+    delegationRoutingOff: 'Hermes がリポジトリを直接編集 — クリックで Delegate Wave 経由に',
     speakReplies: '返信を読み上げる',
     stopSpeakingReplies: '返信の読み上げを停止',
     wakeWordListening: phrase => `ウェイクワード:「${phrase}」— 待機中`,

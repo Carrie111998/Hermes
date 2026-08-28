@@ -2332,6 +2332,8 @@ export const en: Translations = {
     transcribingDictation: 'Transcribing dictation',
     voiceControls: 'Voice',
     voiceDictation: 'Voice dictation',
+    delegationRoutingOn: 'Repository changes go to Delegate Wave — click to let Hermes edit directly',
+    delegationRoutingOff: 'Hermes edits repositories directly — click to route changes to Delegate Wave',
     speakReplies: 'Read replies aloud',
     stopSpeakingReplies: 'Stop reading replies aloud',
     wakeWordListening: phrase => `Wake word: "${phrase}" — listening`,

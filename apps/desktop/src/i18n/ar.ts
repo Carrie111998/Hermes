@@ -535,7 +535,6 @@ export const ar = defineLocale({
       }
     },
     fieldLabels: {
-      'delegate_wave.route_repo_changes': 'توجيه تغييرات المستودع',
       model: 'النموذج الافتراضي',
       modelContextLength: 'نافذة السياق',
       fallbackProviders: 'النماذج الاحتياطية',
@@ -624,8 +623,6 @@ export const ar = defineLocale({
       'updates.nonInteractiveLocalChanges': 'تغييرات التحديث داخل التطبيق'
     },
     fieldDescriptions: {
-      'delegate_wave.route_repo_changes':
-        'أرسل طلبات تغيير المستودع إلى delegate-wave بدلاً من السماح لـ Hermes بتعديل الملفات مباشرةً.',
       model: 'يستخدم في المحادثات الجديدة ما لم تختر نموذجاً مختلفاً من محرر الرسائل.',
       modelContextLength: 'اتركه 0 لاستخدام نافذة السياق المكتشفة للنموذج المحدد.',
       fallbackProviders: 'إدخالات احتياطية بصيغة provider:model لتجربتها إذا فشل النموذج الافتراضي.',

@@ -641,7 +641,6 @@ export const zh: Translations = {
       }
     },
     fieldLabels: defineFieldCopy({
-      'delegate_wave.route_repo_changes': '委派仓库更改',
       model: '默认模型',
       modelContextLength: '上下文窗口',
       fallbackProviders: '备用模型',
@@ -804,7 +803,6 @@ export const zh: Translations = {
       }
     }),
     fieldDescriptions: defineFieldCopy({
-      'delegate_wave.route_repo_changes': '将仓库更改请求发送给 delegate-wave，而不是让 Hermes 直接编辑文件。',
       model: '用于新对话，除非你在输入框中选择其他模型。',
       modelContextLength: '保持为 0 则使用所选模型检测到的上下文窗口。',
       fallbackProviders: '默认模型失败时尝试的备用 provider:model 条目。',
@@ -2514,6 +2512,8 @@ export const zh: Translations = {
     transcribingDictation: '正在转写听写',
     voiceControls: '语音',
     voiceDictation: '语音听写',
+    delegationRoutingOn: '仓库更改经由 Delegate Wave — 点击改为 Hermes 直接编辑',
+    delegationRoutingOff: 'Hermes 直接编辑仓库 — 点击改为经由 Delegate Wave',
     speakReplies: '朗读回复',
     stopSpeakingReplies: '停止朗读回复',
     wakeWordListening: phrase => `唤醒词:"${phrase}" — 正在监听`,
