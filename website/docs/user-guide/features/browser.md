@@ -223,6 +223,21 @@ to fully quit the browser — it won't loop or kill again on its own.
 
 [Camofox](https://github.com/jo-inc/camofox-browser) is a self-hosted Node.js server wrapping Camoufox (a Firefox fork with C++ fingerprint spoofing). It provides local anti-detection browsing without cloud dependencies.
 
+Camofox's own quick start is native Node — no Docker. That path works on Windows, including with Hermes-managed Node (no system Node required):
+
+```bash
+git clone https://github.com/jo-inc/camofox-browser
+cd camofox-browser
+npm install && npm start
+# -> http://localhost:9377
+```
+
+First run downloads the Camoufox binary (~300MB). `GET http://localhost:9377/health` should report `ok: true`. Shorthand: `npx @askjo/camofox-browser`.
+
+**Headed vs headless (native installs).** Docker's headed path is VNC (`ENABLE_VNC=1`). On a native install the lever is `interactive.mode` in `camofox.config.json` (or the `CAMOFOX_INTERACTIVE` env var): `off` (default, headless), `desktop` (visible Camoufox window for manual logins), `novnc`, or `auto`. Restart the Camofox server after changing it.
+
+#### Docker
+
 ```bash
 # Clone the Camofox browser server first
 git clone https://github.com/jo-inc/camofox-browser
@@ -343,7 +358,11 @@ If the flag is placed at the wrong path, Hermes silently falls back to a random 
 
 1. Start Hermes and your Camofox server.
 2. Open Google (or any login site) in a browser task and sign in manually.
-3. End the browser task normally.
+3. End the browser task normally. Camofox checkpoints storage on session close and process shutdown — do not kill the Node process (a hard kill skips the shutdown hook and drops uncheckpointed logins). If you set `CAMOFOX_ADMIN_KEY`, you can also stop the engine without killing Node:
+   ```bash
+   curl -X POST http://localhost:9377/stop -H "x-admin-key: $CAMOFOX_ADMIN_KEY"
+   ```
+   `POST /stop` requires that admin key; without it, end the Hermes task and let the Node process exit cleanly.
 4. Start a new browser task.
 5. Open the same site again — you should still be signed in.
 
