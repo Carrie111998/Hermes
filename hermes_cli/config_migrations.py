@@ -890,6 +890,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (37, _migrate_to_37),
     (38, _migrate_to_38),
     (39, _migrate_to_39),
+    # v40's webhook secret evacuation runs before this ladder in
+    # migrate_config(), so no second config write belongs in this registry.
 )
 
 

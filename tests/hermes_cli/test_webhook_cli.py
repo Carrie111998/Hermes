@@ -10,6 +10,7 @@ from hermes_cli.webhook import (
     webhook_command,
     _get_webhook_base_url,
     _load_subscriptions,
+    _resolve_route_secret,
     _save_subscriptions,
     _subscriptions_path,
 )
@@ -37,6 +38,7 @@ def _make_args(**kwargs):
         "secret": "",
         "payload": "",
         "script": "",
+        "json": False,
     }
     defaults.update(kwargs)
     return Namespace(**defaults)
@@ -58,12 +60,17 @@ class TestSubscribe:
         webhook_command(_make_args(
             webhook_action="subscribe", name="s", secret="my-secret"
         ))
-        assert _load_subscriptions()["s"]["secret"] == "my-secret"
+        route = _load_subscriptions()["s"]
+        assert "secret" not in route
+        assert route["secret_ref"].startswith("WEBHOOK_ROUTE_S_")
+        assert _resolve_route_secret(route) == "my-secret"
 
 
     def test_auto_secret(self):
         webhook_command(_make_args(webhook_action="subscribe", name="s"))
-        secret = _load_subscriptions()["s"]["secret"]
+        route = _load_subscriptions()["s"]
+        assert "secret" not in route
+        secret = _resolve_route_secret(route)
         assert len(secret) > 20
 
 
@@ -104,26 +111,64 @@ class TestPersistence:
     def test_save_creates_secret_file_owner_only_under_permissive_umask(self):
         old_umask = os.umask(0o022)
         try:
-            _save_subscriptions({"demo": {"secret": "TOPSECRET", "prompt": "x"}})
+            _save_subscriptions(
+                {"demo": {"secret_ref": "WEBHOOK_ROUTE_DEMO", "prompt": "x"}}
+            )
         finally:
             os.umask(old_umask)
 
         path = _subscriptions_path()
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
-        assert "TOPSECRET" in path.read_text(encoding="utf-8")
+        assert "WEBHOOK_ROUTE_DEMO" in path.read_text(encoding="utf-8")
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
     def test_save_narrows_existing_broad_secret_file_mode(self):
         # Simulate a pre-existing 0o644 file from before this hardening landed.
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"old": {"secret": "stale", "prompt": "x"}}))
+        path.write_text(
+            json.dumps(
+                {"old": {"secret_ref": "WEBHOOK_ROUTE_OLD", "prompt": "x"}}
+            )
+        )
         path.chmod(0o644)
 
-        _save_subscriptions({"demo": {"secret": "FRESH", "prompt": "x"}})
+        _save_subscriptions(
+            {"demo": {"secret_ref": "WEBHOOK_ROUTE_DEMO", "prompt": "x"}}
+        )
 
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
-        assert "FRESH" in path.read_text(encoding="utf-8")
+        assert "WEBHOOK_ROUTE_DEMO" in path.read_text(encoding="utf-8")
+
+    def test_plaintext_route_write_is_rejected(self):
+        with pytest.raises(ValueError, match="Refusing to persist plaintext"):
+            _save_subscriptions({"demo": {"secret": "must-not-egress"}})
+        assert not _subscriptions_path().exists()
+
+
+class TestMigration:
+
+    def test_runs_while_adapter_disabled_and_emits_value_free_json(
+        self, monkeypatch, capsys
+    ):
+        sentinel = "CLI_MIGRATION_SENTINEL_92d8"
+        path = _subscriptions_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"legacy": {"secret": sentinel}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("hermes_cli.webhook._is_webhook_enabled", lambda: False)
+
+        webhook_command(
+            _make_args(webhook_action="migrate-secrets", json=True)
+        )
+
+        output = capsys.readouterr().out
+        assert sentinel not in output
+        assert '"migrated_routes"' in output
+        assert sentinel not in path.read_text(encoding="utf-8")
+        assert sentinel in (path.parent / ".env").read_text(encoding="utf-8")
 
 
 class TestWebhookEnabledGate:
@@ -152,4 +197,3 @@ class TestWebhookEnabledGate:
         )
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is False
-

@@ -42,7 +42,7 @@ There are two ways to enable the webhook adapter.
 hermes gateway setup
 ```
 
-Follow the prompts to enable webhooks, set the port, and set a global HMAC secret.
+Follow the prompts to enable webhooks, set the port, and set a global HMAC secret. The value is stored in the active profile's `.env`; route/config files contain only its reference name.
 
 ### Via environment variables
 
@@ -53,6 +53,20 @@ WEBHOOK_ENABLED=true
 WEBHOOK_PORT=8644        # default
 WEBHOOK_SECRET=your-global-secret
 ```
+
+### Migrate legacy plaintext secrets
+
+The v40 config migration automatically moves legacy webhook values out of
+`config.yaml`, `webhook_subscriptions.json`, and their `.bak*` siblings before
+switching those files to `secret_ref`. You can run the same idempotent migration
+explicitly and inspect value-free receipts:
+
+```bash
+hermes webhook migrate-secrets --json
+```
+
+Migration fails closed: all values must be stored and resolved successfully
+before the live source is switched.
 
 ### Verify the server
 
@@ -79,7 +93,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | Property | Required | Description |
 |----------|----------|-------------|
 | `events` | No | List of event types to accept (e.g. `["pull_request"]`). If empty, all events are accepted. Event type is read from `X-GitHub-Event`, `X-GitLab-Event`, or `event_type` in the payload. |
-| `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
+| `secret_ref` | **Yes** | Name of the profile secret containing the HMAC credential. The value belongs in the profile's `.env`, never in `config.yaml`. Falls back to global `WEBHOOK_SECRET` when omitted. Store `INSECURE_NO_AUTH` under the reference for loopback-only testing. |
 | `profile` | No | Profile authorized to execute this route when `gateway.multiplex_profiles` is enabled. Omit it for a default-profile-only route; set a profile name (for example `coder`) to bind the route and its secret to `/p/coder/webhooks/<route>`. |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. Payload fields are untrusted — see [Authenticated does not mean trusted](#authenticated-does-not-mean-trusted). |
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
@@ -92,17 +106,25 @@ Routes define how different webhook sources are handled. Each route is a named e
 
 ### Full example
 
+First store the credentials in the active profile's secret backend:
+
+```bash
+hermes config set WEBHOOK_SECRET global-fallback-secret
+hermes config set WEBHOOK_ROUTE_GITHUB_PR github-webhook-secret
+hermes config set WEBHOOK_ROUTE_DEPLOY deploy-secret
+```
+
 ```yaml
 platforms:
   webhook:
     enabled: true
     extra:
       port: 8644
-      secret: "global-fallback-secret"
+      secret_ref: WEBHOOK_SECRET
       routes:
         github-pr:
           events: ["pull_request"]
-          secret: "github-webhook-secret"
+          secret_ref: WEBHOOK_ROUTE_GITHUB_PR
           prompt: |
             Review this pull request:
             Repository: {repository.full_name}
@@ -118,7 +140,7 @@ platforms:
             pr_number: "{number}"
         deploy-notify:
           events: ["push"]
-          secret: "deploy-secret"
+          secret_ref: WEBHOOK_ROUTE_DEPLOY
           prompt: "New push to {repository.full_name} branch {ref}: {head_commit.message}"
           filters:
             - field: "ref"
@@ -130,6 +152,10 @@ platforms:
 
 Use `filters` when a provider sends a broad event stream but only some payloads should wake the agent or trigger `deliver_only` delivery. Filters run after signature validation, body parsing, and `events`, but before prompt rendering, idempotency, agent dispatch, or direct delivery.
 
+```bash
+hermes config set WEBHOOK_ROUTE_TODOIST todoist-secret
+```
+
 ```yaml
 platforms:
   webhook:
@@ -137,7 +163,7 @@ platforms:
       routes:
         todoist:
           events: ["item:updated"]
-          secret: "todoist-secret"
+          secret_ref: WEBHOOK_ROUTE_TODOIST
           filters:
             - field: "payload.labels"
               contains: "hermes"
@@ -238,11 +264,13 @@ This walkthrough sets up automatic code review on every pull request.
 1. Go to your repository → **Settings** → **Webhooks** → **Add webhook**
 2. Set **Payload URL** to `http://your-server:8644/webhooks/github-pr`
 3. Set **Content type** to `application/json`
-4. Set **Secret** to match your route config (e.g. `github-webhook-secret`)
+4. Set **Secret** to the value stored under the route's `secret_ref` (e.g. `github-webhook-secret`)
 5. Under **Which events?**, select **Let me select individual events** and check **Pull requests**
 6. Click **Add webhook**
 
 ### 2. Add the route config
+
+Store the token first: `hermes config set WEBHOOK_ROUTE_GITLAB_MR your-gitlab-secret-token`.
 
 Add the `github-pr` route to your `~/.hermes/config.yaml` as shown in the example above.
 
@@ -282,7 +310,7 @@ platforms:
       routes:
         gitlab-mr:
           events: ["merge_request"]
-          secret: "your-gitlab-secret-token"
+          secret_ref: WEBHOOK_ROUTE_GITLAB_MR
           prompt: |
             Review this merge request:
             Project: {project.path_with_namespace}
@@ -345,16 +373,21 @@ Benefits:
 
 ### Example: Telegram push from Supabase
 
+```bash
+hermes config set WEBHOOK_SECRET global-secret
+hermes config set WEBHOOK_ROUTE_ANTENNA_MATCHES antenna-webhook-secret
+```
+
 ```yaml
 platforms:
   webhook:
     enabled: true
     extra:
       port: 8644
-      secret: "global-secret"
+      secret_ref: WEBHOOK_SECRET
       routes:
         antenna-matches:
-          secret: "antenna-webhook-secret"
+          secret_ref: WEBHOOK_ROUTE_ANTENNA_MATCHES
           deliver: "telegram"
           deliver_only: true
           prompt: "🎉 New match: {match.user_name} matched with you!"
@@ -436,6 +469,7 @@ hermes webhook test github-issues --payload '{"issue": {"number": 42, "title": "
 ### How dynamic subscriptions work
 
 - Subscriptions are stored in `~/.hermes/webhook_subscriptions.json`
+- Subscription files contain only `secret_ref` identifiers; credential values are stored in the active profile's `.env`
 - The webhook adapter hot-reloads this file on each incoming request (mtime-gated, negligible overhead)
 - Static routes from `config.yaml` always take precedence over dynamic ones with the same name
 - Dynamic subscriptions use the same route format and capabilities as static routes (events, prompt templates, skills, delivery)
@@ -453,6 +487,10 @@ Webhook agent runs default to a deliberately constrained toolset (`web_search`, 
 
 For **trusted** routes — a localhost monitoring daemon pushing system alerts, an internal CI system — you can grant a wider toolset to that route only, without widening every other webhook route:
 
+```bash
+hermes config set WEBHOOK_ROUTE_OOM_EMERGENCY oom-emergency-secret
+```
+
 ```yaml
 platforms:
   webhook:
@@ -460,18 +498,18 @@ platforms:
     extra:
       routes:
         oom-emergency:
-          secret: "monitor-secret"
+          secret_ref: WEBHOOK_ROUTE_OOM_EMERGENCY
           prompt: "Memory emergency: {detail}. Diagnose with ps/free/py-spy and report."
           toolsets: ["terminal", "file", "code_execution", "web"]
           deliver: "telegram"
 ```
 
-For dynamic subscriptions, add the `toolsets` key by editing `~/.hermes/webhook_subscriptions.json` directly:
+For dynamic subscriptions, store the referenced value first, then add the `toolsets` key by editing `~/.hermes/webhook_subscriptions.json` directly:
 
 ```json
 {
   "oom-emergency": {
-    "secret": "...",
+    "secret_ref": "WEBHOOK_ROUTE_OOM_EMERGENCY",
     "prompt": "...",
     "toolsets": ["terminal", "file", "web"],
     "deliver": "telegram"
@@ -568,7 +606,7 @@ This is the same trust model that applies to everything the agent reads: web pag
 
 ### Signature validation failing
 
-- Ensure the secret in your route config exactly matches the secret configured in the webhook source
+- Resolve the route's `secret_ref` in the active profile and ensure that value exactly matches the secret configured in the webhook source
 - For GitHub, the secret is HMAC-based — check `X-Hub-Signature-256`
 - For GitLab, the secret is a plain token match — check `X-Gitlab-Token`
 - Check gateway logs for `Invalid signature` warnings

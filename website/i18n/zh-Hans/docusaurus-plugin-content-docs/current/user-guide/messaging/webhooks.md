@@ -42,7 +42,7 @@ agent 处理事件后，可通过在 PR 上发布评论、向 Telegram/Discord �
 hermes gateway setup
 ```
 
-按照提示启用 webhooks、设置端口和全局 HMAC secret。
+按照提示启用 webhooks、设置端口和全局 HMAC secret。secret 值保存在当前 profile 的 `.env` 中，配置仅保存引用名。
 
 ### 通过环境变量
 
@@ -53,6 +53,19 @@ WEBHOOK_ENABLED=true
 WEBHOOK_PORT=8644        # default
 WEBHOOK_SECRET=your-global-secret
 ```
+
+### 迁移旧版明文 secret
+
+v40 配置迁移会自动将旧版 webhook 值从 `config.yaml`、
+`webhook_subscriptions.json` 及其 `.bak*` 副本移动到当前 profile 的
+secret 存储，然后把这些文件切换为 `secret_ref`。也可显式运行同一个幂等迁移，
+并查看不含 secret 值的回执：
+
+```bash
+hermes webhook migrate-secrets --json
+```
+
+迁移会故障关闭：只有全部值均成功保存并可解析后，才会切换实时源文件。
 
 ### 验证服务器
 
@@ -79,7 +92,7 @@ curl http://localhost:8644/health
 | 属性 | 是否必填 | 描述 |
 |----------|----------|-------------|
 | `events` | 否 | 要接受的事件类型列表（例如 `["pull_request"]`）。若为空，则接受所有事件。事件类型从 `X-GitHub-Event`、`X-GitLab-Event` 或 payload 中的 `event_type` 读取。 |
-| `secret` | **是** | 用于签名验证的 HMAC secret。若路由未设置，则回退到全局 `secret`。仅用于测试时可设为 `"INSECURE_NO_AUTH"`（跳过验证）。 |
+| `secret_ref` | **是** | 当前 profile `.env` 中 HMAC secret 的引用名。若路由未设置，则回退到全局 `secret_ref`。仅用于本地测试时，可将引用对应的值设为 `"INSECURE_NO_AUTH"`（跳过验证）。 |
 | `prompt` | 否 | 使用点号表示法访问 payload 字段的模板字符串（例如 `{pull_request.title}`）。若省略，则将完整 JSON payload 转储到 prompt 中。 |
 | `filters` | 否 | 声明式 payload 过滤器，在认证/请求体/事件过滤之后、agent 或直接投递之前求值。不匹配时返回 `{"status":"ignored","reason":"filter"}`（HTTP 200）。 |
 | `script` | 否 | 位于 `~/.hermes/scripts/` 下的过滤/转换脚本。webhook payload 以 JSON 形式通过 stdin 传入。stdout 为 JSON 对象时会在模板渲染前替换 payload；文本 stdout 以 `script_output` 形式暴露；空 stdout、`[SILENT]` 或非零退出码会忽略该 webhook。 |
@@ -90,17 +103,25 @@ curl http://localhost:8644/health
 
 ### 完整示例
 
+先将值保存到当前 profile：
+
+```bash
+hermes config set WEBHOOK_SECRET global-fallback-secret
+hermes config set WEBHOOK_ROUTE_GITHUB_PR github-webhook-secret
+hermes config set WEBHOOK_ROUTE_DEPLOY_NOTIFY deploy-secret
+```
+
 ```yaml
 platforms:
   webhook:
     enabled: true
     extra:
       port: 8644
-      secret: "global-fallback-secret"
+      secret_ref: WEBHOOK_SECRET
       routes:
         github-pr:
           events: ["pull_request"]
-          secret: "github-webhook-secret"
+          secret_ref: WEBHOOK_ROUTE_GITHUB_PR
           prompt: |
             Review this pull request:
             Repository: {repository.full_name}
@@ -116,7 +137,7 @@ platforms:
             pr_number: "{number}"
         deploy-notify:
           events: ["push"]
-          secret: "deploy-secret"
+          secret_ref: WEBHOOK_ROUTE_DEPLOY_NOTIFY
           prompt: "New push to {repository.full_name} branch {ref}: {head_commit.message}"
           filters:
             - field: "ref"
@@ -128,6 +149,10 @@ platforms:
 
 当服务商发送宽泛的事件流、但只有部分 payload 应唤醒 agent 或触发 `deliver_only` 投递时，使用 `filters`。过滤器在签名验证、请求体解析和 `events` 之后运行，但在 prompt 渲染、幂等去重、agent 调度或直接投递之前运行。
 
+```bash
+hermes config set WEBHOOK_ROUTE_TODOIST todoist-secret
+```
+
 ```yaml
 platforms:
   webhook:
@@ -135,7 +160,7 @@ platforms:
       routes:
         todoist:
           events: ["item:updated"]
-          secret: "todoist-secret"
+          secret_ref: WEBHOOK_ROUTE_TODOIST
           filters:
             - field: "payload.labels"
               contains: "hermes"
@@ -236,7 +261,7 @@ webhooks:
 1. 进入你的仓库 → **Settings** → **Webhooks** → **Add webhook**
 2. 将 **Payload URL** 设为 `http://your-server:8644/webhooks/github-pr`
 3. 将 **Content type** 设为 `application/json`
-4. 将 **Secret** 设为与路由配置匹配的值（例如 `github-webhook-secret`）
+4. 将 **Secret** 设为 `WEBHOOK_ROUTE_GITHUB_PR` 引用所对应的值
 5. 在 **Which events?** 下，选择 **Let me select individual events** 并勾选 **Pull requests**
 6. 点击 **Add webhook**
 
@@ -272,6 +297,10 @@ GitLab webhook 的工作方式类似，但使用不同的认证机制。GitLab �
 
 ### 2. 添加路由配置
 
+```bash
+hermes config set WEBHOOK_ROUTE_GITLAB_MR your-gitlab-secret-token
+```
+
 ```yaml
 platforms:
   webhook:
@@ -280,7 +309,7 @@ platforms:
       routes:
         gitlab-mr:
           events: ["merge_request"]
-          secret: "your-gitlab-secret-token"
+          secret_ref: WEBHOOK_ROUTE_GITLAB_MR
           prompt: |
             Review this merge request:
             Project: {project.path_with_namespace}
@@ -343,16 +372,21 @@ platforms:
 
 ### 示例：从 Supabase 推送到 Telegram
 
+```bash
+hermes config set WEBHOOK_SECRET global-secret
+hermes config set WEBHOOK_ROUTE_ANTENNA_MATCHES antenna-webhook-secret
+```
+
 ```yaml
 platforms:
   webhook:
     enabled: true
     extra:
       port: 8644
-      secret: "global-secret"
+      secret_ref: WEBHOOK_SECRET
       routes:
         antenna-matches:
-          secret: "antenna-webhook-secret"
+          secret_ref: WEBHOOK_ROUTE_ANTENNA_MATCHES
           deliver: "telegram"
           deliver_only: true
           prompt: "🎉 New match: {match.user_name} matched with you!"
@@ -410,7 +444,7 @@ hermes webhook subscribe github-issues \
   --description "Triage new GitHub issues"
 ```
 
-此命令返回 webhook URL 和自动生成的 HMAC secret。将你的服务配置为 POST 到该 URL。
+此命令返回 webhook URL 和仅显示一次的自动生成 HMAC secret。将你的服务配置为 POST 到该 URL。订阅 JSON 只保存 `secret_ref`；实际值保存在当前 profile 的 `.env` 中。
 
 ### 列出订阅
 
@@ -433,7 +467,7 @@ hermes webhook test github-issues --payload '{"issue": {"number": 42, "title": "
 
 ### 动态订阅的工作原理
 
-- 订阅存储在 `~/.hermes/webhook_subscriptions.json`
+- 订阅的非敏感配置和 `secret_ref` 存储在 `~/.hermes/webhook_subscriptions.json`；secret 值存储在当前 profile 的 `.env` 中
 - webhook 适配器在每次收到请求时热重载该文件（基于 mtime 检测，开销可忽略不计）
 - `config.yaml` 中的静态路由始终优先于同名的动态订阅
 - 动态订阅与静态路由使用相同的格式和功能（events、prompt 模板、skills、delivery）
@@ -461,7 +495,7 @@ webhook 适配器包含多层安全机制：
 
 ### Secret 为必填项
 
-每个路由必须有 secret——直接设置在路由上或从全局 `secret` 继承。没有 secret 的路由会导致适配器在启动时报错退出。仅用于开发/测试时，可将 secret 设为 `"INSECURE_NO_AUTH"` 以完全跳过验证。
+每个路由必须能通过路由级 `secret_ref` 或全局 `secret_ref` 解析出 secret。引用缺失或无法解析会导致适配器在启动时报错退出。仅用于开发/测试时，可将引用对应的值设为 `"INSECURE_NO_AUTH"` 以完全跳过验证。
 
 `INSECURE_NO_AUTH` 仅在 gateway 绑定到回环地址（`127.0.0.1`、`localhost`、`::1`）时被接受。若与非回环绑定（如 `0.0.0.0` 或局域网 IP）组合使用，适配器拒绝启动——这可防止在公共接口上意外暴露未认证的端点。
 
@@ -512,7 +546,7 @@ Webhook payload 包含攻击者可控的数据——PR 标题、commit 消息、
 
 ### 签名验证失败
 
-- 确保路由配置中的 secret 与 webhook 来源中配置的 secret 完全一致
+- 确保路由 `secret_ref` 在当前 profile 中解析出的值与 webhook 来源中配置的 secret 完全一致
 - 对于 GitHub，secret 基于 HMAC——检查 `X-Hub-Signature-256`
 - 对于 GitLab，secret 为明文 token 匹配——检查 `X-Gitlab-Token`
 - 检查 gateway 日志中的 `Invalid signature` 警告

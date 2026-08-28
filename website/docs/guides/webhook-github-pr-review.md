@@ -36,6 +36,13 @@ Webhook payloads contain attacker-controlled data — PR titles, commit messages
 
 ## Step 1 — Enable the webhook platform
 
+Store the HMAC value in your active profile's `.env`, then reference it from
+`config.yaml`:
+
+```bash
+hermes config set WEBHOOK_ROUTE_GITHUB_PR_REVIEW your-webhook-secret-here
+```
+
 Add the following to your `~/.hermes/config.yaml`:
 
 ```yaml
@@ -48,7 +55,7 @@ platforms:
 
       routes:
         github-pr-review:
-          secret: "your-webhook-secret-here"   # must match the GitHub webhook secret exactly
+          secret_ref: WEBHOOK_ROUTE_GITHUB_PR_REVIEW
           events:
             - pull_request
 
@@ -80,7 +87,7 @@ platforms:
 
 | Field | Description |
 |---|---|
-| `secret` (route-level) | HMAC secret for this route. Falls back to `extra.secret` global if omitted. |
+| `secret_ref` (route-level) | Name of the profile `.env` entry containing this route's HMAC secret. Falls back to the global `extra.secret_ref` when omitted. |
 | `events` | List of `X-GitHub-Event` header values to accept. Empty list = accept all. |
 | `prompt` | Template; `{field}` and `{nested.field}` resolve from the GitHub payload. |
 | `deliver` | `github_comment` posts via `gh pr comment`. `log` just writes to the gateway log. |
@@ -120,7 +127,7 @@ curl http://localhost:8644/health
 2. Fill in:
    - **Payload URL:** `https://your-public-url.example.com/webhooks/github-pr-review`
    - **Content type:** `application/json`
-   - **Secret:** the same value you set for `secret` in the route config
+   - **Secret:** the value stored under `WEBHOOK_ROUTE_GITHUB_PR_REVIEW`
    - **Which events?** → Select individual events → check **Pull requests**
 3. Click **Add webhook**
 
@@ -213,7 +220,7 @@ platforms:
     extra:
       routes:
         github-pr-review:
-          secret: "your-webhook-secret-here"
+          secret_ref: WEBHOOK_ROUTE_GITHUB_PR_REVIEW
           events: [pull_request]
           prompt: |
             A pull request event was received (action: {action}).
@@ -280,7 +287,7 @@ GitLab payload fields differ from GitHub's — e.g. `{object_attributes.title}` 
 ## Security notes
 
 - **Never use `INSECURE_NO_AUTH`** in production — it disables signature validation entirely. It is only for local development.
-- **Rotate your webhook secret** periodically and update it in both GitHub (webhook settings) and your `config.yaml`.
+- **Rotate your webhook secret** periodically. Update the value in GitHub's webhook settings and run `hermes config set WEBHOOK_ROUTE_GITHUB_PR_REVIEW <new-value>`; the reference in `config.yaml` stays unchanged.
 - **Rate limiting** is 30 req/min per route by default (configurable via `extra.rate_limit`). Exceeding it returns `429`.
 - **Duplicate deliveries** (webhook retries) are deduplicated via a 1-hour idempotency cache. The cache key is `X-GitHub-Delivery` if present, then `X-Request-ID`, then a millisecond timestamp. When neither delivery ID header is set, retries are **not** deduplicated.
 - **Prompt injection:** PR titles, descriptions, and commit messages are attacker-controlled. Malicious PRs could attempt to manipulate the agent's actions. Run the gateway in a sandboxed environment (Docker, VM) when exposed to the public internet.
@@ -291,7 +298,7 @@ GitLab payload fields differ from GitHub's — e.g. `{object_attributes.title}` 
 
 | Symptom | Check |
 |---|---|
-| `401 Invalid signature` | Secret in config.yaml doesn't match GitHub webhook secret |
+| `401 Invalid signature` | Value resolved through the route's `secret_ref` doesn't match the GitHub webhook secret |
 | `404 Unknown route` | Route name in the URL doesn't match the key in `routes:` |
 | `429 Rate limit exceeded` | 30 req/min per route exceeded — common when re-delivering test events from GitHub's UI; wait a minute or raise `extra.rate_limit` |
 | No comment posted | `gh` not installed, not on PATH, or not authenticated (`gh auth login`) |
@@ -312,13 +319,13 @@ platforms:
     enabled: true
     extra:
       port: 8644               # listen port (default: 8644)
-      secret: ""               # optional global fallback secret
+      secret_ref: WEBHOOK_SECRET # optional global fallback reference
       rate_limit: 30           # requests per minute per route
       max_body_bytes: 1048576  # payload size limit in bytes (default: 1 MB)
 
       routes:
         <route-name>:
-          secret: "required-per-route"
+          secret_ref: WEBHOOK_ROUTE_NAME
           events: []            # [] = accept all; otherwise list X-GitHub-Event values
           prompt: ""            # {field} / {nested.field} resolved from payload
           skills: []            # first matching skill is loaded (only one)

@@ -342,10 +342,23 @@ class TestWebhookEndpoints:
             },
         )
         assert r.status_code == 200
-        assert r.json()["script"] == "todoist_filter.py"
+        created = r.json()
+        assert created["script"] == "todoist_filter.py"
+        assert created["secret"]
+        assert created["secret_ref"].startswith("WEBHOOK_ROUTE_TODOIST_")
 
         subs = self.client.get("/api/webhooks").json()["subscriptions"]
         assert subs[0]["script"] == "todoist_filter.py"
+        assert subs[0]["secret_set"] is True
+        assert "secret" not in subs[0]
+
+        from hermes_constants import get_hermes_home
+
+        route_store = (
+            get_hermes_home() / "webhook_subscriptions.json"
+        ).read_text(encoding="utf-8")
+        assert created["secret"] not in route_store
+        assert created["secret_ref"] in route_store
 
     def test_enable_platform_starts_gateway_restart(self, monkeypatch):
         import hermes_cli.web_server as ws

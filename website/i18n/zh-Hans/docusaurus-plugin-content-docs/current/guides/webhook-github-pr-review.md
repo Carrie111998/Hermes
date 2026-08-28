@@ -36,7 +36,13 @@ Webhook payload 包含攻击者可控的数据——PR 标题、commit 消息和
 
 ## 第一步——启用 webhook 平台
 
-在你的 `~/.hermes/config.yaml` 中添加以下内容：
+先将 HMAC 值保存到当前 profile 的 `.env`：
+
+```bash
+hermes config set WEBHOOK_ROUTE_GITHUB_PR_REVIEW your-webhook-secret-here
+```
+
+然后在你的 `~/.hermes/config.yaml` 中添加以下内容：
 
 ```yaml
 platforms:
@@ -48,7 +54,7 @@ platforms:
 
       routes:
         github-pr-review:
-          secret: "your-webhook-secret-here"   # 必须与 GitHub webhook secret 完全一致
+          secret_ref: WEBHOOK_ROUTE_GITHUB_PR_REVIEW
           events:
             - pull_request
 
@@ -80,7 +86,7 @@ platforms:
 
 | 字段 | 说明 |
 |---|---|
-| `secret`（路由级别） | 该路由的 HMAC secret。如果省略，则回退到 `extra.secret` 全局配置。 |
+| `secret_ref`（路由级别） | 当前 profile `.env` 中该路由 HMAC secret 的引用名。如果省略，则回退到全局 `extra.secret_ref`。 |
 | `events` | 要接受的 `X-GitHub-Event` 请求头值列表。空列表 = 接受所有。 |
 | `prompt` | 模板；`{field}` 和 `{nested.field}` 从 GitHub payload 中解析。 |
 | `deliver` | `github_comment` 通过 `gh pr comment` 发布。`log` 仅写入 gateway 日志。 |
@@ -205,7 +211,7 @@ platforms:
     extra:
       routes:
         github-pr-review:
-          secret: "your-webhook-secret-here"
+          secret_ref: WEBHOOK_ROUTE_GITHUB_PR_REVIEW
           events: [pull_request]
           prompt: |
             A pull request event was received (action: {action}).
@@ -272,7 +278,7 @@ GitLab 的 payload 字段与 GitHub 不同——例如，MR 标题使用 `{objec
 ## 安全说明
 
 - **永远不要在生产环境中使用 `INSECURE_NO_AUTH`**——它会完全禁用签名验证。仅用于本地开发。
-- **定期轮换你的 webhook secret**，并在 GitHub（webhook 设置）和你的 `config.yaml` 中同步更新。
+- **定期轮换你的 webhook secret**。在 GitHub webhook 设置中更新值，并运行 `hermes config set WEBHOOK_ROUTE_GITHUB_PR_REVIEW <new-value>`；`config.yaml` 中的引用无需改变。
 - **速率限制**默认为每条路由每分钟 30 次请求（可通过 `extra.rate_limit` 配置）。超出限制返回 `429`。
 - **重复投递**（webhook 重试）通过 1 小时的幂等性缓存进行去重。缓存键依次为 `X-GitHub-Delivery`（如果存在）、`X-Request-ID`、毫秒级时间戳。当两个投递 ID 请求头都未设置时，重试**不会**去重。
 - **Prompt 注入：** PR 标题、描述和 commit 消息均为攻击者可控内容。恶意 PR 可能尝试操纵 agent 的行为。当暴露在公网时，请在沙箱环境（Docker、VM）中运行 gateway。
@@ -283,7 +289,7 @@ GitLab 的 payload 字段与 GitHub 不同——例如，MR 标题使用 `{objec
 
 | 现象 | 检查项 |
 |---|---|
-| `401 Invalid signature` | config.yaml 中的 secret 与 GitHub webhook secret 不匹配 |
+| `401 Invalid signature` | 路由 `secret_ref` 解析出的值与 GitHub webhook secret 不匹配 |
 | `404 Unknown route` | URL 中的路由名称与 `routes:` 中的键不匹配 |
 | `429 Rate limit exceeded` | 每条路由每分钟 30 次请求已超出——在 GitHub UI 中重新投递测试事件时常见；等待一分钟或提高 `extra.rate_limit` |
 | 未发布评论 | `gh` 未安装、不在 PATH 中，或未完成认证（`gh auth login`） |
@@ -305,13 +311,13 @@ platforms:
     extra:
       host: "0.0.0.0"         # 绑定地址（默认：0.0.0.0）
       port: 8644               # 监听端口（默认：8644）
-      secret: ""               # 可选的全局回退 secret
+      secret_ref: WEBHOOK_SECRET # 可选的全局回退引用
       rate_limit: 30           # 每条路由每分钟请求数
       max_body_bytes: 1048576  # payload 大小限制，单位字节（默认：1 MB）
 
       routes:
         <route-name>:
-          secret: "required-per-route"
+          secret_ref: WEBHOOK_ROUTE_NAME
           events: []            # [] = 接受所有；否则列出 X-GitHub-Event 值
           prompt: ""            # {field} / {nested.field} 从 payload 中解析
           skills: []            # 加载第一个匹配的 skill（仅一个）
