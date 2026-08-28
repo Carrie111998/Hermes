@@ -423,7 +423,7 @@ def apply_disabled_toolsets_to_tool_names(
     Composite/scenario toolsets (e.g. ``debugging``) resolve to their member
     tools; platform bundles and posture toolsets only subtract their non-core
     delta so shared core tools stay available (#17309, #33924, #57315).
-  """
+    """
     if not disabled_toolsets:
         return set(tools_to_include)
 
