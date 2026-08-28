@@ -5428,12 +5428,56 @@ class TurnRunner:
                 "tools": [],
             }
 
+        # Heartbeat model override: when the turn is a heartbeat and
+        # heartbeat.{model,provider} is configured, temporarily switch
+        # the route for this turn only. The next interactive user turn
+        # returns to the session's primary route automatically because
+        # the override is applied here (not persisted to session state).
+        _hb_route = None
+        if ctx.is_heartbeat:
+            from hermes_cli.heartbeat import _get_heartbeat_route, has_heartbeat_route_config
+            if has_heartbeat_route_config():
+                _hb_route = _get_heartbeat_route()
+                _orig_model = model
+                _orig_provider = runtime_kwargs.get("provider")
+                if _hb_route["provider"]:
+                    # Resolve the heartbeat provider's credentials
+                    try:
+                        _hb_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                            _hb_route["provider"]
+                        )
+                        runtime_kwargs.update(_hb_kwargs)
+                        # Use heartbeat model if set, else provider's default
+                        if _hb_route["model"]:
+                            model = _hb_route["model"]
+                        else:
+                            model = runtime_kwargs.pop("model", model)
+                    except Exception as exc:
+                        logger.warning(
+                            "heartbeat provider '%s' resolution failed: %s; "
+                            "falling back to session route",
+                            _hb_route["provider"], exc,
+                        )
+                elif _hb_route["model"]:
+                    # Only model override, keep session provider
+                    model = _hb_route["model"]
+                logger.info(
+                    "heartbeat turn: model %s->%s, provider %s->%s",
+                    _orig_model, model,
+                    _orig_provider, runtime_kwargs.get("provider"),
+                )
+
         pr = self._runner._provider_routing
         reasoning_config = self._runner._resolve_session_reasoning_config(
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
         )
+        # Heartbeat reasoning_effort override: apply to turn-scoped config
+        # without mutating the shared runner state.
+        if _hb_route and _hb_route.get("reasoning_effort"):
+            reasoning_config = dict(reasoning_config or {})
+            reasoning_config["reasoning_effort"] = _hb_route["reasoning_effort"]
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -20880,6 +20924,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                is_heartbeat=bool((event.metadata or {}).get("is_heartbeat")),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -22095,6 +22140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=source,
                             message_id=None,
                             channel_prompt=None,
+                            metadata={"is_heartbeat": True},
                         )
                         self._enqueue_fifo(quick_key, hb_event, adapter)
                     except Exception as exc:
@@ -28613,6 +28659,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        is_heartbeat: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28633,6 +28680,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                is_heartbeat=is_heartbeat,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28646,6 +28694,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                is_heartbeat=is_heartbeat,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28789,6 +28838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        is_heartbeat: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -29095,6 +29145,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             moa_config=moa_config,
+            is_heartbeat=is_heartbeat,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,

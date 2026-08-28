@@ -2097,6 +2097,17 @@ DEFAULT_CONFIG = {
         "surface_child_process_notifications": False,
     },
 
+    # Heartbeat — optional model/provider override for /heartbeat turns.
+    # When set, heartbeat turns use a different (typically cheaper/faster)
+    # model than the session's primary interactive model. The next
+    # interactive user turn returns to the session route automatically.
+    # Empty values inherit from the session's current model/provider.
+    "heartbeat": {
+        "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit session model)
+        "provider": "",    # e.g. "openrouter" (empty = inherit session provider)
+        "reasoning_effort": "",  # e.g. "low" (empty = inherit session reasoning)
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.

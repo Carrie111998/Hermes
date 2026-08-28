@@ -4998,6 +4998,22 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _HeartbeatInputMessage:
+    """Sentinel wrapper for heartbeat prompts in ``_pending_input``.
+
+    Distinguishes heartbeat turns from user-typed messages so the CLI can
+    apply heartbeat model/provider overrides for that turn only (#92579).
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -12809,7 +12825,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             continue
                         prompt = mgr.due_prompt()
                         if prompt:
-                            self._pending_input.put(prompt)
+                            self._pending_input.put(_HeartbeatInputMessage(prompt))
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
@@ -16303,6 +16319,66 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
+
+        # Heartbeat model override: when the turn is a heartbeat and
+        # heartbeat.{model,provider} is configured, switch the route for
+        # this turn only. The next interactive turn returns to the session
+        # route automatically because _active_agent_route_signature will
+        # differ, forcing agent re-initialization.
+        if getattr(self, "_is_heartbeat_turn", False):
+            from hermes_cli.heartbeat import _get_heartbeat_route, has_heartbeat_route_config
+            if has_heartbeat_route_config():
+                hb_route = _get_heartbeat_route()
+                _orig_model = turn_route["model"]
+                _orig_runtime = dict(turn_route["runtime"])
+                if hb_route["provider"]:
+                    try:
+                        from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+                        _hb_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                            hb_route["provider"]
+                        )
+                        turn_route["runtime"]["provider"] = hb_route["provider"]
+                        turn_route["runtime"]["api_key"] = _hb_kwargs.get("api_key")
+                        turn_route["runtime"]["base_url"] = _hb_kwargs.get("base_url")
+                        turn_route["runtime"]["api_mode"] = _hb_kwargs.get("api_mode")
+                        turn_route["runtime"]["credential_pool"] = _hb_kwargs.get("credential_pool")
+                        if hb_route["model"]:
+                            turn_route["model"] = hb_route["model"]
+                        else:
+                            turn_route["model"] = _hb_kwargs.get("model", _orig_model)
+                    except Exception as exc:
+                        logging.warning(
+                            "heartbeat provider '%s' resolution failed: %s; "
+                            "falling back to session route",
+                            hb_route["provider"], exc,
+                        )
+                elif hb_route["model"]:
+                    turn_route["model"] = hb_route["model"]
+                # Rebuild signature so agent re-initializes with heartbeat route.
+                # Include reasoning_effort so a reasoning-only override also
+                # triggers agent re-initialization.
+                turn_route["signature"] = (
+                    turn_route["model"],
+                    turn_route["runtime"].get("provider"),
+                    turn_route["runtime"].get("requested_provider"),
+                    turn_route["runtime"].get("base_url"),
+                    turn_route["runtime"].get("api_mode"),
+                    turn_route["runtime"].get("command"),
+                    tuple(turn_route["runtime"].get("args") or []),
+                    hb_route.get("reasoning_effort", ""),
+                )
+                if (turn_route["model"] != _orig_model or
+                        turn_route["runtime"].get("provider") != _orig_runtime.get("provider")):
+                    logging.info(
+                        "heartbeat turn: model %s->%s, provider %s->%s",
+                        _orig_model, turn_route["model"],
+                        _orig_runtime.get("provider"), turn_route["runtime"].get("provider"),
+                    )
+                # Apply heartbeat reasoning effort if configured
+                if hb_route["reasoning_effort"]:
+                    turn_route["request_overrides"] = turn_route.get("request_overrides") or {}
+                    turn_route["request_overrides"]["reasoning_effort"] = hb_route["reasoning_effort"]
+
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -20376,6 +20452,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if is_voice_input:
                         user_input = user_input.text
 
+                    # Heartbeat prompts arrive wrapped in a sentinel so the
+                    # CLI can apply heartbeat model/provider overrides for
+                    # that turn only (#92579).
+                    is_heartbeat_input = isinstance(user_input, _HeartbeatInputMessage)
+                    if is_heartbeat_input:
+                        user_input = user_input.text
+
                     if not user_input:
                         continue
 
@@ -20490,9 +20573,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
+                        self._is_heartbeat_turn = is_heartbeat_input
                         self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
                     finally:
                         self._agent_running = False
+                        self._is_heartbeat_turn = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
                         self._pending_tool_info.clear()
