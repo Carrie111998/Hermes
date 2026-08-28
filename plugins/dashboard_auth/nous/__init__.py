@@ -436,6 +436,14 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 access_token
             )
+        except jwt.DecodeError:
+            # Not a JWT at all (e.g. opaque session token from another provider).
+            # Return None so the middleware tries the next provider instead of
+            # reporting this one as unreachable (503).
+            return None
+        except jwt.InvalidTokenError:
+            # Malformed JWT header / unknown kid — also not this provider's token.
+            return None
         except jwt.PyJWKClientError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
