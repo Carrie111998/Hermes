@@ -1829,77 +1829,96 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
-        await self._cancel_pending_tasks(self._pending_text_batch_tasks)
-        await self._cancel_pending_tasks(self._pending_media_batch_tasks)
-        self._reset_batch_buffers()
+        try:
+            await self._cancel_pending_tasks(self._pending_text_batch_tasks)
+            await self._cancel_pending_tasks(self._pending_media_batch_tasks)
+            self._reset_batch_buffers()
 
-        # Send a WebSocket CLOSE frame to Feishu BEFORE tearing down the
-        # thread loop. Without this, Feishu's server never learns the
-        # connection is dead and continues routing messages to the stale
-        # endpoint — the channel goes silent until the server-side
-        # CLOSE-WAIT expires (minutes to hours). See issue #10202.
-        #
-        # ``_disable_websocket_auto_reconnect()`` nils ``self._ws_client``,
-        # so capture the client reference first.
-        ws_client = self._ws_client
-        ws_thread_loop = self._ws_thread_loop
-        self._disable_websocket_auto_reconnect()
-        await self._stop_webhook_server()
+            # Send a WebSocket CLOSE frame to Feishu BEFORE tearing down the
+            # thread loop. Without this, Feishu's server never learns the
+            # connection is dead and continues routing messages to the stale
+            # endpoint — the channel goes silent until the server-side
+            # CLOSE-WAIT expires (minutes to hours). See issue #10202.
+            #
+            # ``_disable_websocket_auto_reconnect()`` nils ``self._ws_client``,
+            # so capture the client reference first.
+            ws_client = self._ws_client
+            ws_thread_loop = self._ws_thread_loop
+            self._disable_websocket_auto_reconnect()
+            await self._stop_webhook_server()
 
-        if (
-            ws_client is not None
-            and ws_thread_loop is not None
-            and not ws_thread_loop.is_closed()
-            and hasattr(ws_client, "_disconnect")
-        ):
-            try:
-                future = asyncio.run_coroutine_threadsafe(
-                    ws_client._disconnect(), ws_thread_loop
-                )
-                # 5s is generous — the CLOSE frame is a single WebSocket
-                # control frame. If it takes longer than that the
-                # connection is already wedged and we gain nothing by
-                # waiting further.
-                await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
-                logger.debug("[Feishu] Sent WebSocket CLOSE frame to Feishu")
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[Feishu] CLOSE frame not acknowledged within 5s — "
-                    "Feishu may briefly route messages to the stale "
-                    "connection until server-side timeout"
-                )
-            except Exception as exc:
-                logger.debug(
-                    "[Feishu] Could not send WebSocket CLOSE frame: %s",
-                    exc,
-                    exc_info=True,
-                )
+            if (
+                ws_client is not None
+                and ws_thread_loop is not None
+                and not ws_thread_loop.is_closed()
+                and hasattr(ws_client, "_disconnect")
+            ):
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        ws_client._disconnect(), ws_thread_loop
+                    )
+                    # 5s is generous — the CLOSE frame is a single WebSocket
+                    # control frame. If it takes longer than that the
+                    # connection is already wedged and we gain nothing by
+                    # waiting further.
+                    await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
+                    logger.debug("[Feishu] Sent WebSocket CLOSE frame to Feishu")
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[Feishu] CLOSE frame not acknowledged within 5s — "
+                        "Feishu may briefly route messages to the stale "
+                        "connection until server-side timeout"
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[Feishu] Could not send WebSocket CLOSE frame: %s",
+                        exc,
+                        exc_info=True,
+                    )
 
-        if ws_thread_loop is not None and not ws_thread_loop.is_closed():
-            logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
+            if ws_thread_loop is not None and not ws_thread_loop.is_closed():
+                logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
 
-            def cancel_all_tasks() -> None:
-                tasks = [t for t in asyncio.all_tasks(ws_thread_loop) if not t.done()]
-                logger.debug("[Feishu] Found %d pending tasks in websocket thread", len(tasks))
-                for task in tasks:
-                    task.cancel()
-                ws_thread_loop.call_later(0.1, ws_thread_loop.stop)
+                def cancel_all_tasks() -> None:
+                    tasks = [t for t in asyncio.all_tasks(ws_thread_loop) if not t.done()]
+                    logger.debug("[Feishu] Found %d pending tasks in websocket thread", len(tasks))
+                    for task in tasks:
+                        task.cancel()
+                    ws_thread_loop.call_later(0.1, ws_thread_loop.stop)
 
-            ws_thread_loop.call_soon_threadsafe(cancel_all_tasks)
+                ws_thread_loop.call_soon_threadsafe(cancel_all_tasks)
 
-        ws_future = self._ws_future
-        if ws_future is not None:
-            try:
-                logger.debug("[Feishu] Waiting for websocket thread to exit (timeout=10s)")
-                await asyncio.wait_for(asyncio.shield(ws_future), timeout=10.0)
-                logger.debug("[Feishu] Websocket thread exited cleanly")
-            except asyncio.TimeoutError:
-                logger.warning("[Feishu] Websocket thread did not exit within 10s - may be stuck")
-            except asyncio.CancelledError:
-                logger.debug("[Feishu] Websocket thread cancelled during disconnect")
-            except Exception as exc:
-                logger.debug("[Feishu] Websocket thread exited with error: %s", exc, exc_info=True)
+            ws_future = self._ws_future
+            if ws_future is not None:
+                try:
+                    logger.debug("[Feishu] Waiting for websocket thread to exit (timeout=10s)")
+                    await asyncio.wait_for(asyncio.shield(ws_future), timeout=10.0)
+                    logger.debug("[Feishu] Websocket thread exited cleanly")
+                except asyncio.TimeoutError:
+                    logger.warning("[Feishu] Websocket thread did not exit within 10s - may be stuck")
+                except asyncio.CancelledError:
+                    logger.debug("[Feishu] Websocket thread cancelled during disconnect")
+                except Exception as exc:
+                    logger.debug("[Feishu] Websocket thread exited with error: %s", exc, exc_info=True)
 
+            logger.info("[Feishu] Disconnected")
+        finally:
+            await self._local_teardown()
+
+    async def _local_teardown(self) -> None:
+        """Release every adapter-owned resource the replacement process needs.
+
+        Runs from ``disconnect()``'s ``finally`` so a gateway-level
+        cancellation cannot skip it: the planned-restart path cancels
+        ``disconnect()`` after 5 s while the waits above can legitimately
+        spend 15 s (CLOSE ack + thread exit). When cancellation landed on a
+        wait, the old cleanup block was skipped entirely — the SDK executor,
+        seen-id persistence, and the Feishu app-scoped lock stayed alive in
+        the old process, so the replacement repeatedly failed to claim the
+        Feishu app and the planned restart stalled (#96801). Everything in
+        here is synchronous and fast, so a single cancellation cannot
+        interrupt it mid-way.
+        """
         self._ws_future = None
         self._ws_thread_loop = None
         self._loop = None
@@ -1907,9 +1926,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._shutdown_sdk_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
-
         self._mark_disconnected()
-        logger.info("[Feishu] Disconnected")
 
     async def _cancel_pending_tasks(self, tasks: Dict[str, asyncio.Task]) -> None:
         pending = [task for task in tasks.values() if task and not task.done()]

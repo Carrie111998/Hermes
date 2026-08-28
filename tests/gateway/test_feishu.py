@@ -181,6 +181,92 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         # _disable_websocket_auto_reconnect() must still run.
         self.assertIsNone(adapter._ws_client)
 
+    def test_disconnect_local_teardown_survives_cancellation(self):
+        """A gateway-level cancel landing on a wait inside disconnect() must
+        still release every adapter-owned resource (#96801).
+
+        The planned-restart path cancels disconnect() after 5s while the
+        CLOSE-ack (5s) and thread-exit (10s) waits can legitimately spend
+        15s. Before the fix, the cancellation skipped the local cleanup
+        block entirely — SDK executor, seen-id persistence, and the
+        Feishu app-scoped lock stayed owned by the old process, so the
+        replacement could not claim the app.
+        """
+        import threading
+        from types import SimpleNamespace
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        ws_thread_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_loop() -> None:
+            asyncio.set_event_loop(ws_thread_loop)
+            ready.set()
+            ws_thread_loop.run_forever()
+
+        thread = threading.Thread(target=_run_loop, daemon=True)
+        thread.start()
+        ready.wait()
+
+        # A CLOSE that never completes: the coroutine hangs forever, so
+        # disconnect() sits on the 5s wait_for when the cancel arrives.
+        started = threading.Event()
+
+        async def _hanging_disconnect() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        ws_client = SimpleNamespace(_disconnect=_hanging_disconnect, _auto_reconnect=True)
+        adapter._ws_client = ws_client
+        adapter._ws_thread_loop = ws_thread_loop
+        adapter._ws_future = None
+        # Local-teardown observables: an app-lock identity the release path
+        # must clear, and the disconnected marker (base-class method writes
+        # runtime status — replace it to observe the call without IO).
+        adapter._app_lock_identity = "test-lock-identity"
+        mark_disconnected_calls = []
+        adapter._mark_disconnected = lambda: mark_disconnected_calls.append(1)
+
+        async def _cancel_mid_disconnect() -> None:
+            task = asyncio.create_task(adapter.disconnect())
+            # Let disconnect() reach the CLOSE wait (it needs the thread
+            # loop to schedule the coroutine first).
+            for _ in range(100):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            asyncio.run(_cancel_mid_disconnect())
+        finally:
+            if not ws_thread_loop.is_closed():
+                ws_thread_loop.call_soon_threadsafe(ws_thread_loop.stop)
+            thread.join(timeout=2.0)
+            if not ws_thread_loop.is_closed():
+                ws_thread_loop.close()
+
+        self.assertIsNone(
+            adapter._app_lock_identity,
+            "cancellation must not skip the app-lock release",
+        )
+        self.assertTrue(
+            mark_disconnected_calls,
+            "cancellation must not skip the disconnected marker",
+        )
+        self.assertIsNone(
+            adapter._sdk_executor,
+            "cancellation must not skip the SDK executor shutdown",
+        )
+
 
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
