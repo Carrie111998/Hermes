@@ -136,6 +136,34 @@ describe('ensureGatewayAgent → $connection / $activeGatewayProfile sync', () =
     expect($currentProvider.get()).toBe('custom:local')
   })
 
+  it('does not persist a legacy profile reseed when its owner descriptor is unresolved', async () => {
+    setComposerSelectionOwner('homelab', 'default')
+    setCurrentModel('grok-4')
+    setCurrentProvider('xai-oauth')
+    setCurrentModelSource('manual')
+    getConnection.mockRejectedValue(new Error('source unreachable'))
+
+    const unbind = $activeGatewayProfile.subscribe(profile => {
+      if (profile === 'research') {
+        setCurrentModel('unresolved-model')
+        setCurrentProvider('unresolved-provider')
+        setCurrentModelSource('default')
+      }
+    })
+
+    await ensureGatewayProfile('research')
+    unbind()
+
+    setComposerSelectionOwner('homelab', 'default')
+    expect($currentModel.get()).toBe('grok-4')
+    expect($currentProvider.get()).toBe('xai-oauth')
+    expect(
+      [...Array(window.localStorage.length)].map((_, index) =>
+        window.localStorage.getItem(window.localStorage.key(index) || '')
+      )
+    ).not.toContain('unresolved-model')
+  })
+
   it('does not republish a registry identity invalidated during activation', async () => {
     ensureGatewayForAgent.mockResolvedValueOnce(false)
 

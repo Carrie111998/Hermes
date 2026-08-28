@@ -59,7 +59,7 @@ export function ModelPickerDialog({
 
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(profile, sessionId),
-    queryFn: () => requestModelOptions({ gateway: gw, sessionId }),
+    queryFn: () => requestModelOptions({ gateway: gw, profile, sessionId }),
     enabled: open
   })
 

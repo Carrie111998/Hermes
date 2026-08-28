@@ -107,6 +107,20 @@ describe('composer model persistence scope', () => {
     expect($currentProvider.get()).toBe('xai-oauth')
   })
 
+  it('keeps inferred local-primary connections on the historical bare keys', () => {
+    setComposerSelectionOwner('remote', 'default')
+    window.localStorage.setItem('hermes.desktop.composer.model', 'legacy-model')
+    window.localStorage.setItem('hermes.desktop.composer.provider', 'legacy-provider')
+
+    setConnection({ baseUrl: '', connectionId: 'local', mode: 'local', profile: 'default' } as never)
+
+    expect($currentModel.get()).toBe('legacy-model')
+    expect($currentProvider.get()).toBe('legacy-provider')
+    setCurrentModel('next-model')
+    expect(window.localStorage.getItem('hermes.desktop.composer.model')).toBe('next-model')
+    expect(window.localStorage.getItem('hermes.desktop.composer.model.registry.local.default')).toBeNull()
+  })
+
   it('uses the live registry owner when the connection descriptor is stale', () => {
     const remote = (profile: string) =>
       ({ baseUrl: 'https://aibox.example', connectionId: 'aibox', mode: 'remote', profile }) as never

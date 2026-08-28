@@ -41,6 +41,13 @@ function composerScopeForConnection(connection: HermesConnection | null): string
     return null
   }
 
+  // Electron may infer the sole `local` registry id onto the ordinary primary
+  // descriptor. That remains the legacy single-backend path: only an explicit
+  // registry-scoped route earns a new namespace.
+  if (connection.mode !== 'remote' && !connection.registryScoped) {
+    return ''
+  }
+
   if (connection.connectionId) {
     return `.registry.${encodeURIComponent(connection.connectionId)}.${encodeURIComponent(connection.profile || 'default')}`
   }
