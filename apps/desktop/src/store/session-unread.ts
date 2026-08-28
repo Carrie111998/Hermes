@@ -251,9 +251,13 @@ function ackSessionRow(row: SessionInfo): void {
 
 /** Clear persisted unread for a stored id even when its row isn't loaded —
  *  the marker alone can be retired; the watermark needs the row's count. With
- *  no row there is no profile to read, so we retire it from the active
- *  gateway's bucket (the profile whose sessions you can actually be opening);
- *  other profiles' identically-named ids stay untouched. */
+ *  no row there is no profile to read, so the marker is retired from EVERY
+ *  bucket: the live edge files it under the ROW's own profile (which can be
+ *  any profile, not just the active gateway's), and the user just opened this
+ *  session — whatever the id denotes, it is seen now. Same-id sessions in
+ *  different profiles stay independent when rows ARE loaded (the row path
+ *  above resolves by profile); this fallback only fires when no matching row
+ *  exists anywhere, so there is nothing to misattribute. */
 export function ackStoredSessionId(storedSessionId: null | string): void {
   if (!storedSessionId) {
     return
@@ -267,17 +271,14 @@ export function ackStoredSessionId(storedSessionId: null | string): void {
     return
   }
 
-  const profile = normalizeProfileKey($activeGatewayProfile.get())
-  const markers = $unreadFinishedMarkers.get()[profile]
+  const markers = $unreadFinishedMarkers.get()
 
-  if (!markers) {
-    return
-  }
+  for (const [profile, ids] of Object.entries(markers)) {
+    const next = ids.filter(id => id !== storedSessionId)
 
-  const next = markers.filter(id => id !== storedSessionId)
-
-  if (next.length !== markers.length) {
-    setMarkerBucket(profile, next)
+    if (next.length !== ids.length) {
+      setMarkerBucket(profile, next)
+    }
   }
 }
 
