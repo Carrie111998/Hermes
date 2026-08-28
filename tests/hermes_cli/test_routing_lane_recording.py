@@ -16,6 +16,9 @@ Commit 11. Three things, and deliberately only three:
 from __future__ import annotations
 
 import json
+import os
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -1237,8 +1240,9 @@ def test_a_record_is_written_to_its_owning_profiles_log(board, tmp_path, monkeyp
     coder_home = tmp_path / "profiles" / "coder"
     (coder_home / "logs").mkdir(parents=True)
     monkeypatch.setattr(
-        "hermes_cli.profiles.get_profile_dir",
-        lambda name: coder_home if name == "coder" else tmp_path / "home")
+        "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: tmp_path / "home")
     monkeypatch.setattr(
         "hermes_cli.profiles.get_active_profile_name", lambda: "default")
 
@@ -1383,3 +1387,269 @@ def test_the_record_id_stays_stable_for_duplicate_detection(board, tmp_path):
     assert rec["record_id"] == row_id, (
         "the stable id is what makes the at-least-once crash window detectable"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fourth round: owner containment, and a bounded pending query
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def profiles_root(tmp_path, monkeypatch):
+    """A realistic root: `<root>/profiles/<name>`, with the worker as `coder`."""
+    root = tmp_path / "root"
+    profiles = root / "profiles"
+    (profiles / "coder").mkdir(parents=True)
+    (profiles / "reviewer").mkdir()
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: profiles)
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: root)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "coder")
+    monkeypatch.setenv("HERMES_HOME", str(profiles / "coder"))
+    return SimpleNamespace(root=root, profiles=profiles, outside=tmp_path / "escape")
+
+
+ESCAPES = [
+    "../../escape", "..", ".", "../escape", "../../../etc",
+    "coder/../../escape", "/etc/passwd", "C:\\Windows",
+    "coder\\..\\escape", "%2e%2e/escape", "..%2F..%2Fescape",
+    "coder/subdir", "a/b", "\\\\server\\share",
+]
+
+
+@pytest.mark.parametrize("name", ESCAPES)
+def test_a_traversing_owner_never_resolves(profiles_root, name):
+    from hermes_cli import routing_audit
+
+    assert routing_audit.resolve_profile_log_path(name) is None, name
+
+
+@pytest.mark.parametrize("name", ["", "   ", "\t\n"])
+def test_a_blank_owner_falls_back_to_this_process(profiles_root, name):
+    from hermes_cli import routing_audit
+
+    resolved = routing_audit.resolve_profile_log_path(name)
+    assert resolved == profiles_root.profiles / "coder" / "logs" / "routing.jsonl"
+
+
+@pytest.mark.parametrize("name", ["hermes", "test", "tmp", "root", "sudo"])
+def test_reserved_owner_names_are_refused(profiles_root, name):
+    from hermes_cli import routing_audit
+
+    (profiles_root.profiles / name).mkdir(exist_ok=True)
+    assert routing_audit.resolve_profile_log_path(name) is None
+
+
+def test_a_legitimate_named_owner_resolves(profiles_root):
+    from hermes_cli import routing_audit
+
+    assert routing_audit.resolve_profile_log_path("reviewer") == (
+        profiles_root.profiles / "reviewer" / "logs" / "routing.jsonl")
+
+
+def test_the_default_owner_is_the_root_home_not_a_child(profiles_root):
+    from hermes_cli import routing_audit
+
+    resolved = routing_audit.resolve_profile_log_path("default")
+    assert resolved == profiles_root.root / "logs" / "routing.jsonl"
+    assert profiles_root.profiles not in resolved.parents
+
+
+@pytest.mark.parametrize("given,canon", [
+    ("Reviewer", "reviewer"), ("REVIEWER", "reviewer"),
+    ("  reviewer  ", "reviewer"), ("Default", "default"),
+])
+def test_owner_names_are_canonicalised_before_resolution(profiles_root, given, canon):
+    from hermes_cli import routing_audit
+
+    resolved = routing_audit.resolve_profile_log_path(given)
+    assert resolved is not None
+    assert resolved.parent.parent.name == canon or canon == "default"
+
+
+def test_a_missing_owner_directory_is_unresolvable(profiles_root):
+    from hermes_cli import routing_audit
+
+    assert routing_audit.resolve_profile_log_path("never-created") is None
+
+
+def test_a_symlink_inside_the_root_is_allowed(profiles_root):
+    from hermes_cli import routing_audit
+
+    real = profiles_root.profiles / "real-target"
+    real.mkdir()
+    link = profiles_root.profiles / "linked"
+    link.symlink_to(real, target_is_directory=True)
+    resolved = routing_audit.resolve_profile_log_path("linked")
+    assert resolved == real.resolve() / "logs" / "routing.jsonl"
+
+
+def test_a_symlink_outside_the_root_fails_closed(profiles_root):
+    from hermes_cli import routing_audit
+
+    outside = profiles_root.outside
+    outside.mkdir(parents=True)
+    link = profiles_root.profiles / "escaped"
+    link.symlink_to(outside, target_is_directory=True)
+    assert routing_audit.resolve_profile_log_path("escaped") is None
+
+
+def test_a_traversing_owner_is_quarantined_and_writes_nothing(
+    profiles_root, monkeypatch, tmp_path
+):
+    """The end-to-end reproduction: nothing outside the root, nothing marked."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "esc.db"))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    outside = profiles_root.outside
+    outside.mkdir(parents=True, exist_ok=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="../../escape")
+        kb.set_routing_lane(conn, tid, "coding_routine")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="done")
+        assert kb.project_routing_outbox(conn) == 0
+        row = conn.execute(
+            "SELECT projected_at, quarantined_at, error FROM routing_outbox "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+
+    assert not (outside / "logs" / "routing.jsonl").exists()
+    assert row["projected_at"] is None
+    assert row["quarantined_at"] is not None
+    assert "unresolvable profile" in row["error"]
+
+
+def test_the_quarantine_reason_is_bounded_and_printable(profiles_root, tmp_path,
+                                                        monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "bounded.db"))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    hostile = "../" * 200 + "\x00\x1b[31m" + "A" * 500
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "INSERT INTO routing_outbox (run_id, profile, payload, created_at) "
+            "VALUES (1, ?, '{}', 1)", (hostile,))
+        conn.commit()
+        kb.project_routing_outbox(conn)
+        err = conn.execute(
+            "SELECT error FROM routing_outbox WHERE run_id = 1").fetchone()["error"]
+    finally:
+        conn.close()
+    assert len(err) < 120, err
+    assert "\x00" not in err and "\x1b" not in err
+    assert "/logs/routing.jsonl" not in err, "no resolved local path"
+
+
+def test_a_coder_record_is_not_cross_written_by_a_default_drainer(
+    profiles_root, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cross.db"))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="reviewer")
+        kb.set_routing_lane(conn, tid, "review_only")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="done")
+        # A `default` process performs the recovery.
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default")
+        monkeypatch.setenv("HERMES_HOME", str(profiles_root.root))
+        assert kb.project_routing_outbox(conn) == 1
+    finally:
+        conn.close()
+
+    owner_log = profiles_root.profiles / "reviewer" / "logs" / "routing.jsonl"
+    drainer_log = profiles_root.root / "logs" / "routing.jsonl"
+    assert owner_log.exists(), "the owner's log must receive it"
+    assert not drainer_log.exists(), "the drainer's log must stay untouched"
+
+
+# --- the pending query stays bounded ---------------------------------------
+
+PENDING_QUERY = (
+    "SELECT id, run_id, profile, payload FROM routing_outbox "
+    " WHERE projected_at IS NULL AND quarantined_at IS NULL "
+    " ORDER BY id LIMIT 50"
+)
+
+
+def _plan(conn):
+    return " | ".join(r["detail"] for r in
+                      conn.execute("EXPLAIN QUERY PLAN " + PENDING_QUERY))
+
+
+def test_a_fresh_board_has_the_pending_index(board):
+    conn = kb.connect()
+    try:
+        names = {r["name"] for r in conn.execute("PRAGMA index_list(routing_outbox)")}
+        plan = _plan(conn)
+    finally:
+        conn.close()
+    assert "idx_routing_outbox_pending" in names
+    assert "idx_routing_outbox_pending" in plan, plan
+
+
+def test_a_legacy_board_gains_the_pending_index_on_open(board, tmp_path):
+    """A board created before the columns existed must still get the index."""
+    import sqlite3
+
+    legacy = tmp_path / "legacy-outbox.db"
+    os.environ["HERMES_KANBAN_DB"] = str(legacy)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    raw = sqlite3.connect(legacy)
+    raw.executescript(
+        "DROP INDEX IF EXISTS idx_routing_outbox_pending;"
+        "ALTER TABLE routing_outbox DROP COLUMN quarantined_at;"
+        "ALTER TABLE routing_outbox DROP COLUMN error;"
+    )
+    raw.commit()
+    cols = {r[1] for r in raw.execute("PRAGMA table_info(routing_outbox)")}
+    assert "quarantined_at" not in cols, "the fixture must really be legacy"
+    raw.close()
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(routing_outbox)")}
+        names = {r["name"] for r in conn.execute("PRAGMA index_list(routing_outbox)")}
+        plan = _plan(conn)
+    finally:
+        conn.close()
+    assert {"quarantined_at", "error"} <= cols
+    assert "idx_routing_outbox_pending" in names
+    assert "idx_routing_outbox_pending" in plan, plan
+
+
+def test_history_is_preserved_and_the_tick_stays_bounded(board):
+    """The index is partial, so lifetime history costs the tick nothing."""
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            for i in range(5000):
+                conn.execute(
+                    "INSERT INTO routing_outbox "
+                    "(run_id, profile, payload, created_at, projected_at) "
+                    "VALUES (?, 'coder', '{}', 1, 1)", (i,))
+            conn.execute(
+                "INSERT INTO routing_outbox "
+                "(run_id, profile, payload, created_at, quarantined_at) "
+                "VALUES (90001, 'coder', '{}', 1, 1)")
+            conn.execute(
+                "INSERT INTO routing_outbox "
+                "(run_id, profile, payload, created_at) "
+                "VALUES (90002, 'coder', '{}', 1)")
+        assert "idx_routing_outbox_pending" in _plan(conn)
+        pending = conn.execute(PENDING_QUERY).fetchall()
+        total = conn.execute("SELECT COUNT(*) c FROM routing_outbox").fetchone()["c"]
+    finally:
+        conn.close()
+    assert [r["run_id"] for r in pending] == [90002], "only the pending row"
+    assert total == 5002, "projected and quarantined history is preserved"

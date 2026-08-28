@@ -65,35 +65,67 @@ def resolve_profile_log_path(profile: "str | None") -> "Path | None":
     it — otherwise a PM or default process performing recovery silently
     relocates a coder's accounting into its own log.
 
-    Resolution takes a profile **name**, never a path: a stored payload must
-    not be able to choose where Hermes writes. The name goes through the
-    profiles module's own normalisation, and the answer is accepted only when
-    the resulting home actually exists (or is this process's own home). An
-    unresolvable name returns ``None`` so the caller can quarantine the record
-    rather than guess a destination.
+    Resolution takes a profile **name**, never a path, and the name is treated
+    as untrusted input:
+
+    1. normalise to the canonical on-disk id;
+    2. **validate** with Hermes' own ``validate_profile_name`` — normalisation
+       alone lowercases and strips, and does *not* reject ``/``, ``\`` or
+       ``..``. A name like ``../../escape`` previously resolved to a directory
+       outside the profiles root and was written to;
+    3. ``default`` is handled explicitly as the root home, not as a child
+       directory of the profiles root;
+    4. the caller's own profile resolves to this process's home;
+    5. any other name must be an existing directory whose **resolved real
+       path** lies inside the **resolved profiles root**. That containment
+       check is also the symlink policy: a symlinked profile directory is
+       accepted only when it still lands inside the permitted root, and
+       anything pointing outside fails closed.
+
+    Returns ``None`` for every rejection, so the caller quarantines the record
+    rather than guessing a destination.
     """
     from hermes_constants import get_hermes_home
 
-    name = str(profile or "").strip()
-    if not name:
+    if not isinstance(profile, str) or not profile.strip():
         # No owner recorded (a legacy row): this process's own log is the only
         # defensible destination.
         return get_hermes_home() / "logs" / "routing.jsonl"
     try:
         from hermes_cli.profiles import (
+            _get_default_hermes_home,
+            _get_profiles_root,
             get_active_profile_name,
-            get_profile_dir,
             normalize_profile_name,
+            validate_profile_name,
         )
 
-        canon = normalize_profile_name(name)
-        if canon == normalize_profile_name(get_active_profile_name() or ""):
+        canon = normalize_profile_name(profile)
+        validate_profile_name(canon)          # rejects separators + traversal
+
+        if canon == "default":
+            return Path(_get_default_hermes_home()) / "logs" / "routing.jsonl"
+
+        try:
+            active = normalize_profile_name(get_active_profile_name() or "")
+        except Exception:
+            active = ""
+        if canon and canon == active:
             return get_hermes_home() / "logs" / "routing.jsonl"
-        home = get_profile_dir(canon)
-        if home and Path(home).is_dir():
-            return Path(home) / "logs" / "routing.jsonl"
+
+        root = Path(_get_profiles_root())
+        candidate = root / canon
+        if not candidate.is_dir():
+            return None
+        real_root = root.resolve()
+        real_candidate = candidate.resolve()
+        if real_candidate != real_root and real_root not in real_candidate.parents:
+            # Escaped the permitted root — by traversal, or by a symlink
+            # pointing outside it. Fail closed.
+            return None
+        return real_candidate / "logs" / "routing.jsonl"
     except Exception as exc:
-        _log.debug("routing log path for %r unresolvable: %s", name, exc)
+        _log.debug("routing log path unresolvable: %s", type(exc).__name__)
     return None
 
 

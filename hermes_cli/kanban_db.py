@@ -2881,6 +2881,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ):
             if col not in outbox_cols:
                 _add_column_if_missing(conn, "routing_outbox", col, decl)
+        # Partial index for the projector's hot query
+        #   WHERE projected_at IS NULL AND quarantined_at IS NULL ORDER BY id
+        # Created HERE rather than in SCHEMA_SQL because a legacy outbox lacks
+        # both columns when SCHEMA_SQL runs, and CREATE INDEX over a missing
+        # column aborts initialization. Partial, so it only ever holds the
+        # pending rows: projected and quarantined history stays on disk without
+        # growing the index or the per-tick scan.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_routing_outbox_pending "
+            "ON routing_outbox(id) "
+            "WHERE projected_at IS NULL AND quarantined_at IS NULL"
+        )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -4660,11 +4672,18 @@ def project_routing_outbox(
                     continue
                 destination = routing_audit.resolve_profile_log_path(row["profile"])
                 if destination is None:
+                    # The reason names the owner but is bounded and stripped of
+                    # control characters, and never carries a resolved local
+                    # path — the value that failed validation is attacker-
+                    # influenced.
+                    owner = "".join(
+                        ch for ch in str(row["profile"] or "")[:64]
+                        if ch.isprintable()
+                    )
                     conn.execute(
                         "UPDATE routing_outbox SET quarantined_at = ?, error = ? "
                         " WHERE id = ?",
-                        (now, f"unresolvable profile: {row['profile']!r}",
-                         row["id"]),
+                        (now, f"unresolvable profile: {owner!r}", row["id"]),
                     )
                     _log.warning(
                         "routing outbox: quarantined record %s (run %s): "
