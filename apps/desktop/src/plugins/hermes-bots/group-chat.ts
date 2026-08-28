@@ -1215,7 +1215,7 @@ export const GROUP_CHAT_MAX_ROUNDS = 3
 // Re-export config helpers so callers can resolve the effective cap without
 // importing the config module directly. The config module itself is internal
 // to this plugin directory.
-export { getGroupChatConfig, isFreeModel, getEffectiveRoundCap, getCurrentModelName, estimateTokens } from './group-chat-config'
+export { estimateTokens, getCurrentModelName, getEffectiveRoundCap, getGroupChatConfig, isFreeModel } from './group-chat-config'
 
 // #94478 review: continuation rounds are bounded independently of the message cap so a pathological mention chain can't consume the room's whole budget on handoffs.
 export const GROUP_CHAT_MAX_MESSAGES = 10
