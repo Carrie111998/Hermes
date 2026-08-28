@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_BROWSER_CDP_PORT = 9222
 DEFAULT_BROWSER_CDP_URL = f"http://127.0.0.1:{DEFAULT_BROWSER_CDP_PORT}"
 
-_DARWIN_APPS = (
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    "/Applications/Brave Origin.app/Contents/MacOS/Brave Origin",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+_DARWIN_APP_SUFFIXES = (
+    "Google Chrome.app/Contents/MacOS/Google Chrome",
+    "Chromium.app/Contents/MacOS/Chromium",
+    "Brave Browser.app/Contents/MacOS/Brave Browser",
+    "Brave Origin.app/Contents/MacOS/Brave Origin",
+    "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 )
 
 _WINDOWS_BROWSER_GROUPS = (
@@ -1112,6 +1112,16 @@ def cleanup_real_profile_snapshots() -> None:
         logger.debug("real-profile cleanup failed for %s: %s", root, e)
 
 
+def get_darwin_browser_app_paths(home: str | None = None) -> tuple[str, ...]:
+    """Return system and per-user macOS browser bundle executable paths."""
+    if home is None:
+        home = os.path.expanduser("~")
+    roots = ["/Applications"]
+    if home:
+        roots.append(os.path.join(home, "Applications"))
+    return tuple(os.path.join(root, suffix) for suffix in _DARWIN_APP_SUFFIXES for root in roots)
+
+
 def get_chrome_debug_candidates(system: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
@@ -1138,7 +1148,7 @@ def get_chrome_debug_candidates(system: str) -> list[str]:
                     add(posixpath.join(base, *parts))
 
     if system == "Darwin":
-        for app in _DARWIN_APPS:
+        for app in get_darwin_browser_app_paths():
             add(app)
         return candidates
 
