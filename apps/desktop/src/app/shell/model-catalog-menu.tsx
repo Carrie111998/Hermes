@@ -1,6 +1,15 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
-import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  createContext,
+  type PointerEvent,
+  type ReactNode,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -132,6 +141,7 @@ export function ModelCatalogMenu({
   const copy = t.shell.modelMenu
   const closeMenu = useContext(ModelMenuCloseContext)
   const [search, setSearch] = useState('')
+  const [openSubKey, setOpenSubKey] = useState<string | null>(null)
   const collapsedProviders = useStoreCollapsed()
   const defaultEffort = useDefaultEffort()
   // Which models the user curated in Edit Models. Read HERE rather than taken
@@ -302,6 +312,8 @@ export function ModelCatalogMenu({
 
   // Keep the selected row in view while arrowing through the scrollable list.
   const listRef = useRef<HTMLDivElement>(null)
+  const pointerSamples = useRef<Array<{ at: number; x: number; y: number }>>([])
+  const pointerIntentActive = useRef(false)
 
   useEffect(() => {
     listRef.current?.querySelector('[data-kb-active]')?.scrollIntoView({ block: 'nearest' })
@@ -314,6 +326,44 @@ export function ModelCatalogMenu({
       className: cn(dropdownMenuRow, active && 'bg-(--ui-control-active-background) text-foreground'),
       ...(active ? { 'data-kb-active': '' } : {})
     }
+  }
+
+  const deferSiblingHover = (event: PointerEvent<HTMLElement>): boolean => {
+    if (event.pointerType !== 'mouse') {
+      return false
+    }
+
+    const samples = pointerSamples.current
+    const previous = samples.at(-2)
+    const current = samples.at(-1)
+    const hoveredTrigger = (event.target as Element).closest<HTMLElement>('[data-model-sub-trigger]')
+    const openTrigger = listRef.current?.querySelector<HTMLElement>('[data-model-sub-trigger][data-state="open"]')
+    const contentId = openTrigger?.getAttribute('aria-controls')
+    const submenu = contentId ? document.getElementById(contentId) : null
+
+    if (
+      !previous ||
+      !current ||
+      current.at - previous.at > 120 ||
+      !openTrigger ||
+      !submenu ||
+      openTrigger === hoveredTrigger
+    ) {
+      return false
+    }
+
+    const triggerRect = openTrigger.getBoundingClientRect()
+    const submenuRect = submenu.getBoundingClientRect()
+    const submenuIsLeft = submenuRect.right <= triggerRect.left
+    const triggerX = submenuIsLeft ? triggerRect.right : triggerRect.left
+    const submenuX = submenuIsLeft ? submenuRect.right : submenuRect.left
+
+    return (
+      current.x >= Math.min(triggerX, submenuX) &&
+      current.x <= Math.max(triggerX, submenuX) &&
+      current.y >= Math.min(triggerRect.top, submenuRect.top) - 8 &&
+      current.y <= Math.max(triggerRect.bottom, submenuRect.bottom) + 8
+    )
   }
 
   // Rows are hover-selectable, so they go inert with the pointer.
@@ -368,7 +418,26 @@ export function ModelCatalogMenu({
           {copy.noModels}
         </DropdownMenuItem>
       ) : (
-        <div className={cn('max-h-[max(150px,30dvh)] overflow-y-auto py-0.5', quietRows)} ref={listRef}>
+        <div
+          className={cn('max-h-[max(150px,30dvh)] overflow-y-auto py-0.5', quietRows)}
+          onPointerMoveCapture={event => {
+            if (event.pointerType !== 'mouse') {
+              return
+            }
+
+            pointerSamples.current = [
+              ...pointerSamples.current.slice(-2),
+              { at: event.timeStamp, x: event.clientX, y: event.clientY }
+            ]
+
+            pointerIntentActive.current = deferSiblingHover(event)
+
+            if (pointerIntentActive.current) {
+              event.preventDefault()
+            }
+          }}
+          ref={listRef}
+        >
           {groups.map(group => {
             const slug = group.provider.slug
 
@@ -397,6 +466,8 @@ export function ModelCatalogMenu({
                 </DropdownMenuItem>
                 {!collapsed &&
                   group.families.map(family => {
+                    const subKey = `${group.provider.slug}:${family.id}`
+
                     // The active id may be the base or its -fast sibling; either
                     // way this one family row represents both.
                     const activeId =
@@ -442,13 +513,31 @@ export function ModelCatalogMenu({
                     }
 
                     return (
-                      <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
+                      <DropdownMenuSub
+                        key={subKey}
+                        onOpenChange={open => {
+                          if (pointerIntentActive.current && (!open || openSubKey !== subKey)) {
+                            return
+                          }
+
+                          setOpenSubKey(open ? subKey : null)
+                        }}
+                        open={openSubKey === subKey}
+                      >
                         <DropdownMenuSubTrigger
+                          data-model-sub-trigger=""
                           hideChevron
                           onClick={activate}
                           onKeyDown={event => {
+                            pointerIntentActive.current = false
+
                             if (event.key === 'Enter' || event.key === ' ') {
                               activate()
+                            }
+                          }}
+                          onPointerMove={event => {
+                            if (deferSiblingHover(event)) {
+                              event.preventDefault()
                             }
                           }}
                           {...kbRowProps(`${group.provider.slug}:${family.id}`)}
