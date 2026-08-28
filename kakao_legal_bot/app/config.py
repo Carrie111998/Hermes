@@ -14,6 +14,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 
+DEFAULT_INTRO = """안녕하세요, {bot_name}입니다 🙂
+{lawyer_name}님의 상담 채널에 연결되셨습니다. (접수번호 {consult_id})
+
+이 대화방은 상담자님 전용이라 다른 분에게는 보이지 않습니다.
+상황을 편하게 적어주시면 관련 법령·판례를 찾아 정리해 드리고,
+문서가 필요하시면 초안을 만들어 {lawyer_name}님 검토 후 보내드립니다.
+(제 답변은 일반적인 법률 정보이고, 최종 판단은 {lawyer_name}님이 확인해 드립니다.)"""
+
+
 def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
@@ -196,6 +205,10 @@ class Settings:
             _env("INTAKE_PLAYBOOK_PATH", "./kakao_legal_bot/intake_playbook.md")
         )
     )
+    # 새 상담방의 첫 인사. 파일이 없으면 내장 기본 문구를 씁니다.
+    intro_path: Path | None = field(
+        default_factory=lambda: Path(_env("INTRO_PATH")) if _env("INTRO_PATH") else None
+    )
 
     # ── RAG ──────────────────────────────────────────────────────────────
     corpus_dir: Path = field(default_factory=lambda: Path(_env("CORPUS_DIR", "./corpus")))
@@ -328,6 +341,30 @@ class Settings:
     def total_answer_budget_s(self) -> float:
         """Hard ceiling: the first budget plus the extension we promised."""
         return max(self.answer_timeout_s, 0.0) + max(self.answer_extension_s, 0.0)
+
+    def intro_message(self, consult_id: int | str = 0) -> str:
+        """새 상담방의 첫 인사. ``INTRO_PATH`` 파일이 있으면 그것을 씁니다.
+
+        인사말은 성격의 일부라 파일로 빼두면 코드를 만지지 않고 고칠 수
+        있습니다. 자리표시자는 {bot_name} {lawyer_name} {consult_id}.
+        """
+        template = DEFAULT_INTRO
+        if self.intro_path is not None:
+            try:
+                text = self.intro_path.read_text(encoding="utf-8").strip()
+                if text:
+                    template = text
+            except OSError:
+                pass
+        try:
+            return template.format(
+                bot_name=self.bot_name,
+                lawyer_name=self.lawyer_name,
+                consult_id=consult_id or "-",
+            )
+        except (KeyError, IndexError, ValueError):
+            # 인사말의 괄호 실수가 첫 접촉을 침묵시키면 안 됩니다.
+            return template
 
     def patience_message(self) -> str:
         """"…{minutes}분내로 답변드리겠습니다" with the real number filled in."""

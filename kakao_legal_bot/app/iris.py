@@ -130,7 +130,13 @@ class IrisEvent:
             payload, "chat_type", "room_type"
         )
         if is_direct is None and chat_type:
-            is_direct = chat_type.lower() in {"directchat", "direct", "single", "memochat"}
+            # OD(오픈채팅 1:1)가 핵심입니다 — 오픈프로필 링크로 들어온 상담자마다
+            # 카카오가 새 1:1 방을 만들어 주고, Iris 에는 OD 로 옵니다. 이걸
+            # 그룹으로 잘못 읽으면 호출 없이는 답하지 않아 새 상담이 조용히 죽습니다.
+            is_direct = chat_type.lower() in {
+                "directchat", "direct", "single", "memochat",
+                "od", "opendirect", "open_direct", "directopenchat",
+            }
 
         # A room without an id is unroutable; fall back to the name so at
         # least single-room setups keep working.

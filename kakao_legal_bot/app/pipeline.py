@@ -29,13 +29,6 @@ from .workflows import create_draft, notify_escalation
 
 log = logging.getLogger(__name__)
 
-INTRO_TEXT = """안녕하세요, {bot_name}입니다 🙂
-{lawyer_name}님의 상담 채널에서 1차 안내를 맡고 있습니다.
-
-상황을 편하게 적어주시면 관련 법령·판례를 찾아 정리해 드리고,
-문서가 필요하시면 초안을 만들어 {lawyer_name}님 검토 후 이메일로 보내드립니다.
-(제 답변은 일반적인 법률 정보이고, 최종 판단은 {lawyer_name}님이 확인해 드립니다.)"""
-
 TIMEOUT_TEXT = """자료를 찾는 데 예상보다 오래 걸리고 있습니다.
 {lawyer_name}님께 질문을 그대로 전달해 두었으니 확인 후 직접 답변드리겠습니다."""
 
@@ -109,6 +102,15 @@ class Pipeline:
                 settings.history_turns,
             )
 
+        # ── 새 상담방 온보딩 ─────────────────────────────────────────────
+        # 오픈프로필 링크나 듀얼번호 친구추가로 들어오면 카카오가 상담자마다
+        # 새 1:1 방을 만들어 줍니다. 그 방의 **첫 이벤트가 무엇이든** — 입장
+        # 피드든, 스티커든, 인사말이든 — 즉시 환영 인사와 접수번호를 보냅니다.
+        # 상담자가 질문을 궁리하는 동안 방이 비어 있으면 나가 버리니까요.
+        welcomed = bool(room["intro_sent"])
+        if not welcomed and self._is_new_consultation_room(event, room):
+            welcomed = await self._welcome(event)
+
         decision = decide(
             event,
             settings,
@@ -141,18 +143,11 @@ class Pipeline:
             )
             return
 
-        # First contact in this room: the greeting also doubles as the fast
-        # first message, so the room is never silent while we think.
-        if not room["intro_sent"]:
-            await asyncio.to_thread(db.set_room_flag, room_id, "intro_sent", 1)
-            with contextlib.suppress(Exception):
-                await services.sender.send(
-                    room_id,
-                    INTRO_TEXT.format(
-                        bot_name=settings.bot_name, lawyer_name=settings.lawyer_name
-                    ),
-                    record_role="",
-                )
+        # First contact that slipped past the onboarding above (단체방에서
+        # 호출로 시작한 경우 등): the greeting doubles as the fast first
+        # message, so the room is never silent while we think.
+        if not welcomed:
+            await self._welcome(event)
 
         # A room's first question is the one the lawyer needs to know about:
         # who applied, and how the consultation is going. The flag is set
@@ -165,6 +160,53 @@ class Pipeline:
             consult_id = await self._alert_new_consultation(event, decision.question)
 
         await self._answer(event, decision.question, first_turn=first_turn, consult_id=consult_id)
+
+    # ── new-room onboarding ──────────────────────────────────────────────
+    def _is_new_consultation_room(self, event: IrisEvent, room) -> bool:  # noqa: ANN001
+        """이 첫 이벤트에 환영 인사를 보내도 되는 방인가.
+
+        1:1(오픈채팅 1:1 포함)인 방만, 그리고 상담자가 낸 이벤트일 때만.
+        변호사 본인 방, 정지된 방, 무시 목록의 발신자는 건너뜁니다 — 단체방은
+        호출을 받았을 때에만 인사하므로 여기가 아니라 답변 경로에서 합니다.
+        """
+        settings = self.services.settings
+        direct = str(room["kind"]) == "direct" or event.is_direct_chat is True
+        if not direct or bool(room["muted"]):
+            return False
+        if event.room_id == settings.lawyer_room_id:
+            return False
+        if _is_lawyer_row(event, settings):
+            return False
+        # 봇 자신의 발신 에코와 무시 목록 — 변호사가 듀얼번호 계정으로 먼저
+        # 말을 건 방에 봇이 끼어들어 인사하면 안 됩니다.
+        from .trigger import bot_names
+
+        if event.sender_name and event.sender_name in bot_names(settings):
+            return False
+        ignored = {value.lower() for value in settings.ignore_senders}
+        for sender in (event.sender_id, event.sender_name):
+            if sender and sender.strip().lower() in ignored:
+                return False
+        return True
+
+    async def _welcome(self, event: IrisEvent) -> bool:
+        """환영 인사 + 접수번호. 방마다 한 번, 경쟁해도 한 번."""
+        services = self.services
+        settings = services.settings
+        room_id = event.room_id
+        # 플래그를 먼저 세워 거의 동시에 온 두 이벤트가 둘 다 인사하지 않게.
+        await asyncio.to_thread(services.db.set_room_flag, room_id, "intro_sent", 1)
+        consult_id = 0
+        with contextlib.suppress(Exception):
+            consultation = await asyncio.to_thread(
+                services.db.get_or_create_consultation, room_id, event.sender_name
+            )
+            consult_id = int(consultation["id"])
+        with contextlib.suppress(Exception):
+            await services.sender.send(
+                room_id, settings.intro_message(consult_id), record_role=""
+            )
+        return True
 
     # ── lawyer alerts (first question of a room only) ────────────────────
     async def _alert_new_consultation(self, event: IrisEvent, question: str) -> int:
