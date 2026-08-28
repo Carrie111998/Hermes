@@ -4397,6 +4397,7 @@ class BasePlatformAdapter(ABC):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        binding: Optional[Any] = None,
     ) -> SendResult:
         """Send a clarify prompt to the user.
 
@@ -4428,16 +4429,10 @@ class BasePlatformAdapter(ABC):
         override this for a richer UX.
         """
         if choices:
-            # Multi-select clarifies register their flag on the pending entry;
-            # look it up by id so the signature stays adapter-compatible.
-            _is_multi = False
-            try:
-                from tools import clarify_gateway as _cg
-                with _cg._lock:
-                    _entry = _cg._entries.get(clarify_id)
-                _is_multi = bool(_entry and getattr(_entry, "multi_select", False))
-            except Exception:
-                _is_multi = False
+            # Query through the primitive API; adapters must not inspect its
+            # lock or storage directly.
+            from tools.clarify_gateway import is_multi_select
+            _is_multi = is_multi_select(clarify_id)
             lines = [f"❓ {question}", ""]
             for i, choice in enumerate(choices, start=1):
                 lines.append(f"  {i}. {choice}")

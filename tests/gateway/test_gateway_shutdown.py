@@ -1,5 +1,7 @@
 import asyncio
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +64,9 @@ def test_cron_provider_stop_cannot_override_gateway_exit_code(caplog):
 
 @pytest.mark.asyncio
 async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks():
+    from tools import clarify_gateway as cm
+
+    cm.clear_all()
     runner, adapter = make_restart_runner()
     runner._pending_messages = {"session": "pending text"}
     runner._pending_approvals = {"session": {"command": "rm -rf /tmp/x"}}
@@ -82,18 +87,39 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     adapter.disconnect = disconnect_mock
 
     session_key = build_session_key(event.source)
+    clarify_entry = cm.register(
+        "shutdown-pending", session_key, "Pick", ["A"]
+    )
     running_agent = MagicMock()
     runner._running_agents = {session_key: running_agent}
     # Simulate the agent exiting once interrupted so stop()'s 5s
     # interrupt-deadline poll loop returns immediately.
-    running_agent.interrupt.side_effect = lambda *a, **k: runner._running_agents.clear()
+    def _interrupt_after_clarify(*_args, **_kwargs):
+        assert not cm.has_pending(session_key)
+        assert clarify_entry.event.is_set()
+        runner._running_agents.clear()
 
-    with (
-        patch("gateway.status.remove_pid_file"),
-        patch("gateway.status.write_runtime_status"),
-        patch("agent.auxiliary_client.shutdown_cached_clients") as shutdown_cached_clients,
-    ):
-        await runner.stop()
+    running_agent.interrupt.side_effect = _interrupt_after_clarify
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        waiter = pool.submit(
+            cm.wait_for_response, clarify_entry.clarify_id, 5.0
+        )
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with cm._lock:
+                if clarify_entry.waiter_started:
+                    break
+            await asyncio.sleep(0)
+        assert clarify_entry.waiter_started
+
+        with (
+            patch("gateway.status.remove_pid_file"),
+            patch("gateway.status.write_runtime_status"),
+            patch("agent.auxiliary_client.shutdown_cached_clients") as shutdown_cached_clients,
+        ):
+            await runner.stop()
+        assert waiter.result(timeout=2.0) == ""
 
     running_agent.interrupt.assert_called_once_with("Gateway shutting down")
     disconnect_mock.assert_awaited_once()
@@ -103,6 +129,7 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     assert runner._pending_messages == {}
     assert runner._pending_approvals == {}
     assert runner._shutdown_event.is_set() is True
+    cm.clear_all()
 
 
 @pytest.mark.asyncio
@@ -343,5 +370,4 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-
 

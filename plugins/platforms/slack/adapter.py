@@ -7349,6 +7349,7 @@ class SlackAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        binding: Optional[Any] = None,
     ) -> SendResult:
         """Render a clarify prompt as Block Kit interactive buttons.
 

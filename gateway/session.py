@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1251,7 +1251,7 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None, session_boundary_cleanup_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -1289,6 +1289,7 @@ class SessionStore:
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
         self._has_active_processes_fn = has_active_processes_fn
+        self._session_boundary_cleanup_fn = session_boundary_cleanup_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
         # backward compatibility; disable via gateway.write_sessions_json.
@@ -1326,6 +1327,48 @@ class SessionStore:
             lock=self._db_handles_lock,
         )
         self._open_session_db_for_active_scope()
+
+    def _clear_session_boundary_locked(self, session_key: str) -> None:
+        """Invalidate turn-bound state before releasing or rotating a route.
+
+        ``self._lock`` must be held. The production callback clears the
+        clarify primitive under its own lock, establishing the total order
+        ``SessionStore._lock -> clarify_gateway._lock``. Bound callbacks use
+        :meth:`run_if_session_current` and never acquire these locks inversely.
+        """
+        cleanup = getattr(self, "_session_boundary_cleanup_fn", None)
+        if not session_key or not callable(cleanup):
+            return
+        try:
+            cleanup(session_key)
+        except Exception:
+            logger.debug(
+                "Session-boundary cleanup failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
+    def run_if_session_current(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        action: Callable[[], bool],
+    ) -> bool:
+        """Run ``action`` iff the route still points at the expected session.
+
+        Validation and ``action`` execute under ``self._lock``. Telegram's
+        bound-clarify action acquires only ``clarify_gateway._lock`` inside
+        this transaction, making consumption/event wakeup atomic with route
+        rotation while preserving the documented total lock order.
+        """
+        if not session_key or not expected_session_id or not callable(action):
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or str(entry.session_id) != str(expected_session_id):
+                return False
+            return bool(action())
 
     def _open_session_db_for_active_scope(self):
         """Return the SessionDB for the profile scope active on this task.
@@ -1614,6 +1657,7 @@ class SessionStore:
                             row["end_reason"],
                             recovered_entry.session_id,
                         )
+                        self._clear_session_boundary_locked(key)
                         self._entries[key] = recovered_entry
                         recovered_keys += 1
                         continue
@@ -1650,6 +1694,7 @@ class SessionStore:
             return
 
         for key in stale_keys:
+            self._clear_session_boundary_locked(key)
             del self._entries[key]
 
         if stale_keys or recovered_keys:
@@ -1710,6 +1755,12 @@ class SessionStore:
                 continue
             elif current[key] == baseline[key]:
                 # Unchanged fallback data yields to the authoritative DB copy.
+                existing = self._entries.get(key)
+                if (
+                    existing is not None
+                    and existing.session_id != durable_entry.session_id
+                ):
+                    self._clear_session_boundary_locked(key)
                 self._entries[key] = durable_entry
 
         self._routing_db_loaded = True
@@ -2370,6 +2421,7 @@ class SessionStore:
         behavior (flag only, no override drop).
         """
         with self._lock:
+            self._clear_session_boundary_locked(entry.session_key)
             entry.expiry_finalized = True
             if clear_model_override:
                 # Session finalization is a conversation boundary — drop the
@@ -2583,6 +2635,7 @@ class SessionStore:
             or canonical_session_id == original_session_id
         ):
             return False
+        self._clear_session_boundary_locked(entry.session_key)
         logger.info(
             "SessionStore healed compressed session mapping: %s -> %s",
             entry.session_id,
@@ -2714,6 +2767,7 @@ class SessionStore:
                     else:
                         adopt = source.chat_type == "dm"
                     if adopt and self._claim_legacy_slack_key(legacy_key):
+                        self._clear_session_boundary_locked(legacy_key)
                         migrated_legacy_entry = self._entries.pop(legacy_key)
                         migrated_legacy_entry.session_key = session_key
                         migrated_legacy_entry.origin = source
@@ -2832,6 +2886,7 @@ class SessionStore:
                         "(#54878)",
                         session_key, entry.session_id,
                     )
+                    self._clear_session_boundary_locked(session_key)
                     self._entries.pop(session_key, None)
                     # If an expiry watcher (daily/idle reset) already finalized
                     # this session, honour the reset decision instead of silently
@@ -2860,6 +2915,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        self._clear_session_boundary_locked(session_key)
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2930,6 +2986,8 @@ class SessionStore:
                     force_new and current is force_new_observed_entry
                 )
                 if may_publish:
+                    if current is not None and current.session_id != candidate.session_id:
+                        self._clear_session_boundary_locked(session_key)
                     self._entries[session_key] = candidate
                     published = candidate
                 else:
@@ -3369,6 +3427,7 @@ class SessionStore:
                 if entry.updated_at < cutoff:
                     removed_keys.append(key)
             for key in removed_keys:
+                self._clear_session_boundary_locked(key)
                 self._entries.pop(key, None)
             if removed_keys:
                 self._save()
@@ -3430,6 +3489,7 @@ class SessionStore:
 
             old_entry = self._entries[session_key]
             db_end_session_id = old_entry.session_id
+            self._clear_session_boundary_locked(session_key)
 
             now = _now()
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -3574,6 +3634,7 @@ class SessionStore:
                 return old_entry
 
             db_end_session_id = old_entry.session_id
+            self._clear_session_boundary_locked(session_key)
 
             now = _now()
             new_entry = SessionEntry(
@@ -3804,8 +3865,9 @@ class SessionStore:
                             # Publish routing only after the retry queue has moved,
                             # so new child writes cannot bypass older parent backlog.
                             with self._lock:
-                                for entry in self._entries.values():
+                                for route_key, entry in self._entries.items():
                                     if entry.session_id == session_id:
+                                        self._clear_session_boundary_locked(route_key)
                                         entry.session_id = child_id
                                 self._save()
                             if not pending:

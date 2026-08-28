@@ -2015,6 +2015,7 @@ class PhotonAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        binding: Optional[Any] = None,
     ) -> SendResult:
         if not choices:
             # No choices → open-ended. Base behaviour (plain text; the next

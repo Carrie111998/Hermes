@@ -12,14 +12,31 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 
 def _clear_clarify_state():
     """Reset module-level state between tests."""
     from tools import clarify_gateway as cm
     with cm._lock:
         cm._entries.clear()
+        cm._wait_entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+
+
+def _active_transaction(expected_session_id: str, active=None):
+    """Return a tiny SessionStore-shaped transaction for primitive tests."""
+    active = active if active is not None else {"session_id": expected_session_id}
+    route_lock = active.setdefault("_lock", threading.RLock())
+
+    def _transaction(action):
+        with route_lock:
+            if active["session_id"] != expected_session_id:
+                return False
+            return action()
+
+    return _transaction
 
 
 class TestClarifyPrimitive:
@@ -51,6 +68,147 @@ class TestClarifyPrimitive:
         assert cm.resolve_gateway_clarify("id-race", "A") is True
         assert cm.resolve_gateway_clarify("id-race", "") is False
         assert entry.response == "A"
+
+    def test_bound_choice_normalizes_origin_and_consumes_before_wakeup(self):
+        """A matching authenticated callback consumes the binding before resuming."""
+        from tools import clarify_gateway as cm
+
+        active = {"session_id": "session-1"}
+        entry = cm.register(
+            "bound-1",
+            " stable-key ",
+            "Pick one",
+            ["A", "B"],
+            origin=cm.ClarifyOrigin(" 777 ", " 12345 ", " 9 "),
+            session_id=" session-1 ",
+            active_session_transaction=_active_transaction("session-1", active),
+        )
+        binding = entry.binding
+
+        assert binding == cm.ClarifyBinding(
+            clarify_id="bound-1",
+            session_key="stable-key",
+            session_id="session-1",
+            origin=cm.ClarifyOrigin("777", "12345", "9"),
+        )
+        with pytest.raises(AttributeError):
+            binding.session_id = "changed"
+
+        class _ObservingEvent:
+            def __init__(self):
+                self.was_set = False
+
+            def is_set(self):
+                return self.was_set
+
+            def set(self):
+                assert cm.get_entry("bound-1") is None
+                assert cm.has_pending("stable-key") is False
+                self.was_set = True
+
+        entry.event = _ObservingEvent()
+        assert cm.resolve_bound_choice(
+            "bound-1",
+            1,
+            binding=binding,
+            observed_origin=cm.ClarifyOrigin("777", "12345", "9"),
+        ) is True
+        assert entry.response == "B"
+        assert entry.event.is_set()
+        assert cm.resolve_bound_choice(
+            "bound-1", 1, binding=binding, observed_origin=binding.origin,
+        ) is False
+
+    @pytest.mark.parametrize(
+        "observed",
+        [
+            ("778", "12345", "9"),
+            ("777", "54321", "9"),
+            ("777", "12345", "10"),
+        ],
+    )
+    def test_bound_choice_rejects_each_origin_mismatch(self, observed):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register(
+            "bound-mismatch",
+            "stable-key",
+            "Pick",
+            ["A"],
+            origin=cm.ClarifyOrigin("777", "12345", "9"),
+            session_id="session-1",
+            active_session_transaction=_active_transaction("session-1"),
+        )
+
+        assert cm.resolve_bound_choice(
+            entry.clarify_id,
+            0,
+            binding=entry.binding,
+            observed_origin=cm.ClarifyOrigin(*observed),
+        ) is False
+        assert cm.get_entry(entry.clarify_id) is entry
+        assert not entry.event.is_set()
+
+    def test_bound_choice_rejects_stale_active_session_and_binding(self):
+        from tools import clarify_gateway as cm
+
+        active = {"session_id": "session-1"}
+        entry = cm.register(
+            "bound-stale",
+            "stable-key",
+            "Pick",
+            ["A"],
+            origin=cm.ClarifyOrigin("777", "12345", None),
+            session_id="session-1",
+            active_session_transaction=_active_transaction("session-1", active),
+        )
+        active["session_id"] = "session-2"
+
+        assert cm.resolve_bound_choice(
+            entry.clarify_id, 0, binding=entry.binding, observed_origin=entry.binding.origin,
+        ) is False
+        forged = cm.ClarifyBinding(
+            entry.clarify_id, "stable-key", "session-2", entry.binding.origin,
+        )
+        assert cm.resolve_bound_choice(
+            entry.clarify_id, 0, binding=forged, observed_origin=entry.binding.origin,
+        ) is False
+        assert cm.get_entry(entry.clarify_id) is entry
+        assert not entry.event.is_set()
+
+    def test_bound_other_callback_is_single_use_and_text_keeps_origin_binding(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register(
+            "bound-other",
+            "stable-key",
+            "Pick",
+            ["A"],
+            origin=cm.ClarifyOrigin("777", "12345", "9"),
+            session_id="session-1",
+            active_session_transaction=_active_transaction("session-1"),
+        )
+        assert cm.mark_bound_awaiting_text(
+            entry.clarify_id,
+            binding=entry.binding,
+            observed_origin=entry.binding.origin,
+        ) is True
+        assert cm.mark_bound_awaiting_text(
+            entry.clarify_id,
+            binding=entry.binding,
+            observed_origin=entry.binding.origin,
+        ) is False
+        assert cm.attempt_text_response_for_session(
+            "stable-key",
+            "custom",
+            observed_origin=cm.ClarifyOrigin("778", "12345", "9"),
+        ) == cm.TEXT_NO_PENDING
+        assert not entry.event.is_set()
+        assert cm.attempt_text_response_for_session(
+            "stable-key", "custom", observed_origin=entry.binding.origin,
+        ) == cm.TEXT_RESOLVED
+        assert entry.response == "custom"
+        assert entry.event.is_set()
 
     def test_open_ended_auto_awaits_text(self):
         """Clarify with no choices is in text-capture mode immediately."""
@@ -100,6 +258,32 @@ class TestClarifyPrimitive:
             result = fut.result(timeout=10.0)
             # clear_session sets response="" then the wait returns it
             assert result == ""
+
+    def test_clear_session_removes_bound_callback_and_waiter_registration(self):
+        """Session boundaries invalidate both active callback and waiter lookup."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register(
+            "bound-clear",
+            "stable-key",
+            "Pick",
+            ["A"],
+            origin=cm.ClarifyOrigin("777", "12345", None),
+            session_id="session-1",
+            active_session_transaction=_active_transaction("session-1"),
+        )
+
+        assert cm.clear_session("stable-key") == 1
+        assert cm.get_entry(entry.clarify_id) is None
+        with cm._lock:
+            assert entry.clarify_id not in cm._wait_entries
+        assert cm.wait_for_response(entry.clarify_id, timeout=0.01) is None
+        assert cm.resolve_bound_choice(
+            entry.clarify_id,
+            0,
+            binding=entry.binding,
+            observed_origin=entry.binding.origin,
+        ) is False
 
 
     def test_clear_session_preserves_resolved_response(self):

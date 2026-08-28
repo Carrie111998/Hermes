@@ -839,9 +839,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
-        # Clarify button state: clarify_id → session_key (for the clarify tool's
-        # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
-        self._clarify_state: Dict[str, str] = {}
+        # Clarify callback state lives only in tools.clarify_gateway; keeping
+        # no adapter-local fallback makes missing/legacy bindings fail closed.
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -6445,6 +6444,7 @@ class TelegramAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        binding: Optional[Any] = None,
     ) -> SendResult:
         """Render a clarify prompt with one inline button per choice.
 
@@ -6457,6 +6457,9 @@ class TelegramAdapter(BasePlatformAdapter):
         text — no buttons.  The next message in the session is captured by
         the gateway's text-intercept and resolves the clarify.
         """
+        from tools.clarify_gateway import ClarifyBinding
+        if not isinstance(binding, ClarifyBinding):
+            return SendResult(success=False, error="Missing immutable clarify binding")
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -6513,7 +6516,6 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
-            self._clarify_state[clarify_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
@@ -7425,10 +7427,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return
 
-                session_key = self._clarify_state.get(clarify_id)
-                if not session_key:
+                from tools.clarify_gateway import ClarifyBinding, ClarifyOrigin, get_binding
+
+                # Telegram callbacks cross an authenticated transport boundary
+                # and therefore require an immutable origin/session binding.
+                # Never fall back to adapter-local or legacy unbound state: a
+                # callback without a current binding fails closed.
+                clarify_binding = get_binding(clarify_id)
+                if not isinstance(clarify_binding, ClarifyBinding):
                     await query.answer(text="This prompt has already been resolved.")
                     return
+
+                observed_origin = ClarifyOrigin(
+                    caller_id,
+                    str(query_chat_id) if query_chat_id is not None else "",
+                    str(query_thread_id) if query_thread_id is not None else None,
+                )
 
                 user_display = getattr(query.from_user, "first_name", "User")
 
@@ -7436,20 +7450,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Flip into text-capture mode and tell the user to type
                     # their answer.  The gateway's text-intercept will pick
                     # up the next message in this session and resolve the
-                    # clarify.  Do NOT pop _clarify_state yet — we still
-                    # need it if the user is slow to respond and the entry
-                    # is cleared by something else.
+                    # clarify. The primitive retains the immutable binding
+                    # while the user is slow to respond.
                     flipped = False
                     try:
-                        from tools.clarify_gateway import mark_awaiting_text
-                        flipped = mark_awaiting_text(clarify_id)
+                        from tools.clarify_gateway import mark_bound_awaiting_text
+                        flipped = mark_bound_awaiting_text(
+                            clarify_id,
+                            binding=clarify_binding,
+                            observed_origin=observed_origin,
+                        )
                     except Exception as exc:
                         logger.warning("[%s] mark_awaiting_text failed: %s", self.name, exc)
 
                     if not flipped:
-                        # Entry evicted (clarify_timeout) or gateway restarted
-                        # between ask and tap — a typed answer would go nowhere.
-                        self._clarify_state.pop(clarify_id, None)
+                        # Never pop on a validation failure: a mismatched caller
+                        # must not invalidate the legitimate user's prompt.
                         await self._notify_clarify_expired(query, user_display)
                         return
 
@@ -7471,34 +7487,32 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="Invalid choice.")
                     return
 
-                # Look up the choice text from the entry registered in the
-                # clarify primitive.  Fall back to the index if the entry
-                # has been cleaned up (race with timeout / session reset).
+                # Resolve through the primitive so choice lookup, binding
+                # validation, active-session validation, and consumption share
+                # one lock. The public read is presentation-only.
                 resolved_text: Optional[str] = None
                 try:
-                    from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
-                    entry = _clarify_entries.get(clarify_id)
-                    if entry and entry.choices and 0 <= idx < len(entry.choices):
-                        resolved_text = entry.choices[idx]
+                    from tools.clarify_gateway import get_entry
+                    pending_entry = get_entry(clarify_id)
+                    if pending_entry and pending_entry.choices and 0 <= idx < len(pending_entry.choices):
+                        resolved_text = str(pending_entry.choices[idx])
                 except Exception:
-                    resolved_text = None
+                    pending_entry = None
 
-                if resolved_text is None:
-                    # Race: entry vanished. Echo the index as a number so
-                    # the agent at least sees an intentional response
-                    # rather than nothing.
-                    resolved_text = f"choice {idx + 1}"
-
-                # Pop state and resolve
-                self._clarify_state.pop(clarify_id, None)
                 try:
-                    from tools.clarify_gateway import resolve_gateway_clarify
-                    resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+                    from tools.clarify_gateway import resolve_bound_choice
+                    resolved = resolve_bound_choice(
+                        clarify_id,
+                        idx,
+                        binding=clarify_binding,
+                        observed_origin=observed_origin,
+                    )
                 except Exception as exc:
-                    logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
+                    logger.error("[%s] clarify resolution failed: %s", self.name, exc)
                     resolved = False
 
                 if resolved:
+                    resolved_text = resolved_text or f"choice {idx + 1}"
                     await query.answer(text=f"✓ {resolved_text[:60]}")
                     try:
                         await query.edit_message_text(

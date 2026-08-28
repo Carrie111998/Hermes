@@ -44,6 +44,47 @@ logger = logging.getLogger(__name__)
 # Module-level state
 # =========================================================================
 
+def _normalize_id(value: object, *, optional: bool = False) -> Optional[str]:
+    """Normalize a transport/session identifier at the trust boundary."""
+    if value is None:
+        return None if optional else ""
+    normalized = str(value).strip()
+    if optional and not normalized:
+        return None
+    return normalized
+
+
+@dataclass(frozen=True)
+class ClarifyOrigin:
+    """Authenticated transport origin observed for a prompt or callback."""
+
+    user_id: str
+    chat_id: str
+    thread_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "user_id", _normalize_id(self.user_id) or "")
+        object.__setattr__(self, "chat_id", _normalize_id(self.chat_id) or "")
+        object.__setattr__(self, "thread_id", _normalize_id(self.thread_id, optional=True))
+
+
+@dataclass(frozen=True)
+class ClarifyBinding:
+    """Immutable identity binding for one pending clarify callback."""
+
+    clarify_id: str
+    session_key: str
+    session_id: str
+    origin: ClarifyOrigin
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "clarify_id", _normalize_id(self.clarify_id) or "")
+        object.__setattr__(self, "session_key", _normalize_id(self.session_key) or "")
+        object.__setattr__(self, "session_id", _normalize_id(self.session_id) or "")
+        if not isinstance(self.origin, ClarifyOrigin):
+            raise TypeError("origin must be a ClarifyOrigin")
+
+
 @dataclass
 class _ClarifyEntry:
     """One pending clarify request inside a gateway session."""
@@ -55,6 +96,12 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    binding: Optional[ClarifyBinding] = None
+    active_session_transaction: Optional[Callable[[Callable[[], bool]], bool]] = field(
+        default=None, repr=False, compare=False,
+    )
+    callback_consumed: bool = False
+    waiter_started: bool = False
 
     def signature(self) -> Dict[str, object]:
         return {
@@ -63,12 +110,16 @@ class _ClarifyEntry:
             "question": self.question,
             "choices": list(self.choices) if self.choices else None,
             "multi_select": bool(self.multi_select),
+            "binding": self.binding,
         }
 
 
 _lock = threading.RLock()
 # clarify_id → _ClarifyEntry  (primary lookup for button callbacks)
 _entries: Dict[str, _ClarifyEntry] = {}
+# Waiter-owned references survive atomic callback consumption. This closes the
+# race where a very fast callback resolves before wait_for_response starts.
+_wait_entries: Dict[str, _ClarifyEntry] = {}
 # session_key → list[clarify_id]  (FIFO; for text-fallback intercept and session cleanup)
 _session_index: Dict[str, List[str]] = {}
 
@@ -83,24 +134,49 @@ def register(
     question: str,
     choices: Optional[List[str]],
     multi_select: bool = False,
+    *,
+    origin: Optional[ClarifyOrigin] = None,
+    session_id: Optional[str] = None,
+    active_session_transaction: Optional[
+        Callable[[Callable[[], bool]], bool]
+    ] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
-    The caller (gateway clarify_callback) will then send the prompt to the
-    user and block on ``wait_for_response(clarify_id, timeout)``.
+    Supplying any binding field requires all binding fields. Bound identifiers
+    and origins are normalized once and retained in an immutable value object.
     """
+    normalized_clarify_id = _normalize_id(clarify_id) or ""
+    normalized_session_key = _normalize_id(session_key) or ""
+    binding = None
+    if origin is not None or session_id is not None or active_session_transaction is not None:
+        if not isinstance(origin, ClarifyOrigin):
+            raise ValueError("bound clarifies require an authenticated origin")
+        normalized_session_id = _normalize_id(session_id) or ""
+        if not normalized_clarify_id or not normalized_session_key or not normalized_session_id:
+            raise ValueError("bound clarify identifiers must be non-empty")
+        if not origin.user_id or not origin.chat_id:
+            raise ValueError("bound clarify origin user_id/chat_id must be non-empty")
+        if not callable(active_session_transaction):
+            raise ValueError("bound clarifies require an active session transaction")
+        binding = ClarifyBinding(
+            normalized_clarify_id, normalized_session_key, normalized_session_id, origin,
+        )
+
     entry = _ClarifyEntry(
-        clarify_id=clarify_id,
-        session_key=session_key,
+        clarify_id=normalized_clarify_id if binding else clarify_id,
+        session_key=normalized_session_key if binding else session_key,
         question=question,
         choices=list(choices) if choices else None,
         multi_select=bool(multi_select) and bool(choices),
-        # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
+        binding=binding,
+        active_session_transaction=active_session_transaction,
     )
     with _lock:
-        _entries[clarify_id] = entry
-        _session_index.setdefault(session_key, []).append(clarify_id)
+        _entries[entry.clarify_id] = entry
+        _wait_entries[entry.clarify_id] = entry
+        _session_index.setdefault(entry.session_key, []).append(entry.clarify_id)
     return entry
 
 
@@ -119,7 +195,9 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     Returns the resolved response string, or ``None`` on timeout.
     """
     with _lock:
-        entry = _entries.get(clarify_id)
+        entry = _wait_entries.get(clarify_id)
+        if entry is not None:
+            entry.waiter_started = True
     if entry is None:
         return None
 
@@ -148,6 +226,7 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     with _lock:
         # Remove from indices regardless of resolution outcome.
         _entries.pop(clarify_id, None)
+        _wait_entries.pop(clarify_id, None)
         ids = _session_index.get(entry.session_key)
         if ids and clarify_id in ids:
             ids.remove(clarify_id)
@@ -162,18 +241,161 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 # =========================================================================
 
 def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
-    """Unblock the agent thread waiting on ``clarify_id``.
+    """Unblock an unbound/legacy entry waiting on ``clarify_id``.
 
-    Returns True if an entry was found and resolved, False otherwise
-    (already resolved, expired, or never existed).
+    Bound adapters must use the validating APIs below; this compatibility path
+    intentionally refuses to bypass an entry's origin/session binding.
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None or entry.event.is_set():
+        if entry is None or entry.event.is_set() or entry.binding is not None:
             return False
         entry.response = str(response) if response is not None else ""
         entry.event.set()
         return True
+
+
+def get_entry(clarify_id: str) -> Optional[_ClarifyEntry]:
+    """Return an active callback entry without exposing primitive storage."""
+    with _lock:
+        return _entries.get(clarify_id)
+
+
+def get_binding(clarify_id: str) -> Optional[ClarifyBinding]:
+    """Return an active immutable callback binding, or None after invalidation."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        return entry.binding if entry is not None else None
+
+
+def is_multi_select(clarify_id: str) -> bool:
+    """Return whether an active clarify accepts multiple selections."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        return bool(entry and entry.multi_select)
+
+
+def _binding_matches_locked(
+    entry: _ClarifyEntry,
+    binding: Optional[ClarifyBinding],
+    observed_origin: Optional[ClarifyOrigin],
+    *,
+    allow_consumed_callback: bool = False,
+) -> bool:
+    """Validate immutable binding and authenticated origin. Primitive lock held."""
+    if (
+        entry.binding is None
+        or binding is None
+        or entry.binding != binding
+        or observed_origin is None
+        or entry.binding.origin != observed_origin
+        or (entry.callback_consumed and not allow_consumed_callback)
+    ):
+        return False
+    return callable(entry.active_session_transaction)
+
+
+def _run_bound_transaction(
+    clarify_id: str,
+    *,
+    binding: Optional[ClarifyBinding],
+    observed_origin: Optional[ClarifyOrigin],
+    mutate: Callable[[_ClarifyEntry], bool],
+    allow_consumed_callback: bool = False,
+) -> bool:
+    """Run one bound operation atomically with the active SessionStore route.
+
+    The transaction supplied at registration owns the outer SessionStore lock,
+    validates the expected session id, and calls ``_inside_store_lock`` while
+    still holding it.  The closure then acquires this module's lock.  The total
+    order is therefore always ``SessionStore._lock -> clarify_gateway._lock``.
+
+    The preliminary primitive-lock read only obtains the transaction callable;
+    it releases that lock before entering the SessionStore transaction.  The
+    entry and binding are re-read under both locks, so invalidation between the
+    two phases fails closed without introducing an inverse acquisition.
+    """
+    with _lock:
+        entry = _entries.get(clarify_id)
+        transaction = entry.active_session_transaction if entry is not None else None
+    if not callable(transaction):
+        return False
+
+    def _inside_store_lock() -> bool:
+        with _lock:
+            current = _entries.get(clarify_id)
+            if current is None or not _binding_matches_locked(
+                current,
+                binding,
+                observed_origin,
+                allow_consumed_callback=allow_consumed_callback,
+            ):
+                return False
+            return bool(mutate(current))
+
+    try:
+        return bool(transaction(_inside_store_lock))
+    except Exception:
+        logger.debug("Bound clarify transaction failed", exc_info=True)
+        return False
+
+
+def _remove_active_entry_locked(entry: _ClarifyEntry) -> None:
+    """Consume an active callback and its session index under the primitive lock."""
+    _entries.pop(entry.clarify_id, None)
+    ids = _session_index.get(entry.session_key)
+    if ids and entry.clarify_id in ids:
+        ids.remove(entry.clarify_id)
+        if not ids:
+            _session_index.pop(entry.session_key, None)
+
+
+def resolve_bound_choice(
+    clarify_id: str,
+    choice_index: int,
+    *,
+    binding: Optional[ClarifyBinding],
+    observed_origin: Optional[ClarifyOrigin],
+) -> bool:
+    """Validate and atomically consume a bound indexed callback exactly once."""
+    def _resolve(entry: _ClarifyEntry) -> bool:
+        if not entry.choices or not isinstance(choice_index, int):
+            return False
+        if choice_index < 0 or choice_index >= len(entry.choices):
+            return False
+        entry.callback_consumed = True
+        _remove_active_entry_locked(entry)
+        entry.response = str(entry.choices[choice_index])
+        # Wake only after the active binding and index have been consumed.
+        entry.event.set()
+        return True
+
+    return _run_bound_transaction(
+        clarify_id,
+        binding=binding,
+        observed_origin=observed_origin,
+        mutate=_resolve,
+    )
+
+
+def mark_bound_awaiting_text(
+    clarify_id: str,
+    *,
+    binding: Optional[ClarifyBinding],
+    observed_origin: Optional[ClarifyOrigin],
+) -> bool:
+    """Validate and single-consume an Other callback while retaining text state."""
+    def _mark(entry: _ClarifyEntry) -> bool:
+        entry.callback_consumed = True
+        entry.awaiting_text = True
+        return True
+
+    return _run_bound_transaction(
+        clarify_id,
+        binding=binding,
+        observed_origin=observed_origin,
+        mutate=_mark,
+    )
 
 
 def get_pending_for_session(
@@ -425,7 +647,74 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     return _json.dumps(selected, ensure_ascii=False)
 
 
-def attempt_text_response_for_session(session_key: str, response: str) -> str:
+def _resolve_bound_text(
+    clarify_id: str,
+    response: str,
+    observed_origin: Optional[ClarifyOrigin],
+) -> bool:
+    """Validate a bound text reply and consume it inside the route transaction."""
+    binding = get_binding(clarify_id)
+
+    def _resolve(entry: _ClarifyEntry) -> bool:
+        # Other callbacks are consumed before the typed answer; direct typed
+        # choices and open-ended prompts are not. All three are valid after the
+        # origin/session check above.
+        _remove_active_entry_locked(entry)
+        entry.response = str(response) if response is not None else ""
+        entry.event.set()
+        return True
+
+    return _run_bound_transaction(
+        clarify_id,
+        binding=binding,
+        observed_origin=observed_origin,
+        mutate=_resolve,
+        allow_consumed_callback=True,
+    )
+
+
+def cancel_bound_clarify(
+    clarify_id: str,
+    *,
+    binding: Optional[ClarifyBinding],
+    observed_origin: Optional[ClarifyOrigin],
+) -> bool:
+    """Cancel a matching bound prompt without permitting a legacy bypass."""
+    def _cancel(entry: _ClarifyEntry) -> bool:
+        _remove_active_entry_locked(entry)
+        entry.response = ""
+        entry.event.set()
+        return True
+
+    return _run_bound_transaction(
+        clarify_id,
+        binding=binding,
+        observed_origin=observed_origin,
+        mutate=_cancel,
+        allow_consumed_callback=True,
+    )
+
+
+def _bound_entry_is_current(
+    entry: _ClarifyEntry,
+    observed_origin: Optional[ClarifyOrigin],
+) -> bool:
+    """Fail closed before classifying a typed reply for a bound prompt."""
+    return _run_bound_transaction(
+        entry.clarify_id,
+        binding=entry.binding,
+        observed_origin=observed_origin,
+        mutate=lambda _current: True,
+        allow_consumed_callback=True,
+    )
+
+
+def attempt_text_response_for_session(
+    session_key: str,
+    response: str,
+    *,
+    observed_origin: Optional[ClarifyOrigin] = None,
+) -> str:
     """Try to resolve the oldest pending clarify in ``session_key`` from typed text.
 
     Returns one of:
@@ -439,6 +728,10 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
     entry = get_pending_for_session(session_key, include_choice_prompts=True)
     if entry is None:
         return TEXT_NO_PENDING
+    if entry.binding is not None and not _bound_entry_is_current(
+        entry, observed_origin
+    ):
+        return TEXT_NO_PENDING
 
     coerced, reason = _coerce_text_response_detailed(entry, response)
     if coerced is None:
@@ -446,7 +739,11 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
             return TEXT_REJECTED_SELECTION
         return TEXT_REJECTED_PROSE
 
-    if resolve_gateway_clarify(entry.clarify_id, coerced):
+    if entry.binding is not None:
+        resolved = _resolve_bound_text(entry.clarify_id, coerced, observed_origin)
+    else:
+        resolved = resolve_gateway_clarify(entry.clarify_id, coerced)
+    if resolved:
         return TEXT_RESOLVED
     # Lost a race with a button/callback resolution — treat as no work left.
     return TEXT_NO_PENDING
@@ -470,7 +767,7 @@ def mark_awaiting_text(clarify_id: str) -> bool:
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.binding is not None:
             return False
         entry.awaiting_text = True
         return True
@@ -513,6 +810,11 @@ def clear_session(session_key: str) -> int:
             # state — a cleared session must not be resurrected by late
             # callbacks — but a resolved entry keeps its real response.
             if entry.event.is_set():
+                # A fast callback can resolve before wait_for_response starts.
+                # Preserve its waiter-owned reference until that waiter has a
+                # chance to observe the real first-writer-wins answer.
+                if entry.waiter_started:
+                    _wait_entries.pop(entry.clarify_id, None)
                 continue
             # Empty string sentinel — agent code can distinguish from a real
             # response by inspecting the wait_for_response return value
@@ -520,8 +822,32 @@ def clear_session(session_key: str) -> int:
             # falsy result as "user did not respond".
             entry.response = ""
             entry.event.set()
+            _wait_entries.pop(entry.clarify_id, None)
             cancelled += 1
     return cancelled
+
+
+def clear_all() -> int:
+    """Cancel every unresolved gateway clarify during process shutdown.
+
+    The mutation is one primitive-lock transaction so a callback either wins
+    first (its answer is preserved) or observes the cleared registry and fails.
+    """
+    with _lock:
+        entries = list(_entries.values())
+        _entries.clear()
+        _session_index.clear()
+        cancelled = 0
+        for entry in entries:
+            if entry.event.is_set():
+                if entry.waiter_started:
+                    _wait_entries.pop(entry.clarify_id, None)
+                continue
+            entry.response = ""
+            entry.event.set()
+            _wait_entries.pop(entry.clarify_id, None)
+            cancelled += 1
+        return cancelled
 
 
 # =========================================================================

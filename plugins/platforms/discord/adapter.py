@@ -7610,6 +7610,7 @@ class DiscordAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        binding: Optional[Any] = None,
     ) -> SendResult:
         """Render a clarify prompt with one Discord button per choice.
 
@@ -9761,8 +9762,8 @@ def _define_discord_view_classes() -> None:
             # we round-trip the original value, not a button-label variant.
             resolved_text: Optional[str] = None
             try:
-                from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
-                entry = _clarify_entries.get(self.clarify_id)
+                from tools.clarify_gateway import get_entry
+                entry = get_entry(self.clarify_id)
                 if entry and entry.choices and 0 <= index < len(entry.choices):
                     resolved_text = entry.choices[index]
             except Exception:

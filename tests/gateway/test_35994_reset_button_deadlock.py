@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -87,6 +88,36 @@ def _make_runner_with_cached_agent(close_fn):
     agent.shutdown_memory_provider = MagicMock()
     runner._agent_cache = {session_key: agent}
     return runner
+
+
+@pytest.mark.asyncio
+async def test_new_invalidates_clarify_before_closing_old_agent():
+    """The real /new handler wakes its waiter before agent.close()."""
+    from tools import clarify_gateway as cm
+
+    cm.clear_all()
+    session_key = build_session_key(_make_source())
+    entry = cm.register("new-pending", session_key, "Pick", ["A"])
+
+    def _close_after_clear():
+        assert not cm.has_pending(session_key)
+        assert entry.event.is_set()
+
+    runner = _make_runner_with_cached_agent(_close_after_clear)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        waiter = pool.submit(cm.wait_for_response, entry.clarify_id, 5.0)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with cm._lock:
+                if entry.waiter_started:
+                    break
+            await asyncio.sleep(0)
+        assert entry.waiter_started
+        await runner._handle_reset_command(_make_event("/new"))
+        assert waiter.result(timeout=2.0) == ""
+
+    cm.clear_all()
 
 
 @pytest.mark.asyncio

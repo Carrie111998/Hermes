@@ -1434,8 +1434,16 @@ class GatewaySlashCommandsMixin:
 
         The session is preserved so the user can continue the conversation.
         """
-        from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _INTERRUPT_REASON_STOP,
+            _clear_pending_clarify_session,
+        )
         source = event.source
+        # Normal command dispatch can reach this handler without a running
+        # agent. Invalidate an orphan clarify before get_or_create_session can
+        # reuse or rotate the route.
+        _clear_pending_clarify_session(self._session_key_for_source(source))
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 

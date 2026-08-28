@@ -5,7 +5,9 @@ Mirrors test_telegram_approval_buttons.py for the new ``send_clarify`` and
 """
 
 import os
+import inspect
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -39,8 +41,41 @@ def _clear_clarify_state():
     from tools import clarify_gateway as cm
     with cm._lock:
         cm._entries.clear()
+        cm._wait_entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+
+
+def _register_bound(
+    clarify_id="cidA",
+    *,
+    user_id="777",
+    chat_id="12345",
+    thread_id=None,
+    session_id="session-1",
+    active=None,
+    choices=None,
+):
+    from tools import clarify_gateway as cm
+
+    active = active if active is not None else {"session_id": session_id}
+    route_lock = active.setdefault("_lock", threading.RLock())
+
+    def _active_session_transaction(action):
+        with route_lock:
+            if active["session_id"] != session_id:
+                return False
+            return action()
+
+    return cm.register(
+        clarify_id,
+        "sk-cb",
+        "Pick",
+        choices or ["red", "green", "blue"],
+        origin=cm.ClarifyOrigin(user_id, chat_id, thread_id),
+        session_id=session_id,
+        active_session_transaction=_active_session_transaction,
+    )
 
 
 # ===========================================================================
@@ -60,12 +95,14 @@ class TestTelegramSendClarify:
         mock_msg.message_id = 100
         adapter._bot.send_message = AsyncMock(return_value=mock_msg)
 
+        entry = _register_bound("cid1", choices=["alpha", "beta", "gamma"])
         result = await adapter.send_clarify(
             chat_id="12345",
             question="Which option?",
             choices=["alpha", "beta", "gamma"],
             clarify_id="cid1",
             session_key="sk1",
+            binding=entry.binding,
         )
 
         assert result.success is True
@@ -81,10 +118,8 @@ class TestTelegramSendClarify:
         # InlineKeyboardMarkup with N+1 buttons (3 choices + Other)
         markup = kwargs["reply_markup"]
         assert markup is not None
-        # Mocked InlineKeyboardMarkup — just verify it was constructed
-        # with rows.  We check state instead of poking the mock structure.
-        assert "cid1" in adapter._clarify_state
-        assert adapter._clarify_state["cid1"] == "sk1"
+        # Binding lifecycle is owned only by the primitive.
+        assert not hasattr(adapter, "_clarify_state")
 
 
         # The button label should be short ("1"), not the long choice
@@ -98,17 +133,34 @@ class TestTelegramSendClarify:
         mock_msg.message_id = 103
         adapter._bot.send_message = AsyncMock(return_value=mock_msg)
 
+        entry = _register_bound("cid5", choices=["x"])
         await adapter.send_clarify(
             chat_id="12345",
             question="<script>alert(1)</script>",
             choices=["x"],
             clarify_id="cid5",
             session_key="sk5",
+            binding=entry.binding,
         )
         kwargs = adapter._bot.send_message.call_args[1]
         # Must NOT contain raw <script> — html.escape should have neutralized
         assert "<script>" not in kwargs["text"]
         assert "&lt;script&gt;" in kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_multi_choice_refuses_missing_binding(self):
+        adapter = _make_adapter()
+        result = await adapter.send_clarify(
+            chat_id="12345",
+            question="Pick",
+            choices=["x"],
+            clarify_id="unbound",
+            session_key="sk",
+        )
+
+        assert result.success is False
+        assert "binding" in result.error.lower()
+        adapter._bot.send_message.assert_not_awaited()
 
 
 # ===========================================================================
@@ -126,14 +178,14 @@ class TestTelegramClarifyCallback:
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
-        # Pre-register a clarify entry so the callback can look up the choice text
-        cm.register("cidA", "sk-cb", "Pick", ["red", "green", "blue"])
-        adapter._clarify_state["cidA"] = "sk-cb"
+        entry = _register_bound()
 
         query = AsyncMock()
         query.data = "cl:cidA:1"  # green
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
         query.message.text = "Pick"
         query.from_user = MagicMock()
         query.from_user.id = "777"
@@ -148,20 +200,122 @@ class TestTelegramClarifyCallback:
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             await adapter._handle_callback_query(update, context)
 
-        # State popped
-        assert "cidA" not in adapter._clarify_state
-        # Wait shouldn't be needed — resolve_gateway_clarify is sync.
-        # The entry's response should be set.
-        # We test by reading the entry's response directly.
-        with cm._lock:
-            entry = cm._entries.get("cidA")
-        # Entry might be popped by wait_for_response, but here we never
-        # called wait — so it's still in _entries with response set.
-        assert entry is not None
+        # Bound callback consumption removes the active lookup atomically but
+        # preserves the waiter-owned entry and chosen response.
+        assert cm.get_entry("cidA") is None
         assert entry.response == "green"
         assert entry.event.is_set()
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_unbound_callback_fails_closed(self):
+        """Telegram must never resolve an unbound pre-binding prompt."""
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        entry = cm.register("legacy", "sk-cb", "Pick", ["red", "green"])
+        # Prove that even an old in-process adapter map cannot reopen the
+        # removed compatibility path.
+        adapter._clarify_state = {"legacy": "sk-cb"}
+        query = AsyncMock()
+        query.data = "cl:legacy:1"
+        query.message = MagicMock(chat_id=12345, message_thread_id=None, text="Pick")
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id="777", first_name="Tester")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(
+                MagicMock(callback_query=query), MagicMock()
+            )
+
+        assert cm.get_entry("legacy") is entry
+        assert not entry.event.is_set()
+        assert "resolved" in query.answer.call_args.kwargs["text"].lower()
+        query.edit_message_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("user_id", "chat_id", "thread_id"),
+        [
+            ("778", 12345, None),
+            ("777", 54321, None),
+            ("777", 12345, 10),
+        ],
+    )
+    async def test_bound_callback_rejects_each_authenticated_origin_mismatch(
+        self, user_id, chat_id, thread_id,
+    ):
+        """Global allowlisting cannot bypass the prompt's observed origin."""
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        entry = _register_bound(thread_id="9" if thread_id is not None else None)
+        query = AsyncMock()
+        query.data = f"cl:{entry.clarify_id}:0"
+        query.message = MagicMock()
+        query.message.chat_id = chat_id
+        query.message.chat.type = "private"
+        query.message.message_thread_id = thread_id
+        query.message.text = "Pick"
+        query.from_user = MagicMock(id=user_id, first_name="Tester")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+        assert cm.get_entry(entry.clarify_id) is entry
+        assert not entry.event.is_set()
+        assert "expired" in query.answer.call_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_bound_callback_rejects_stale_session_then_consumes_once(self):
+        from tools import clarify_gateway as cm
+
+        active = {"session_id": "session-1"}
+        adapter = _make_adapter()
+        entry = _register_bound(active=active)
+        query = AsyncMock()
+        query.data = f"cl:{entry.clarify_id}:0"
+        query.message = MagicMock(chat_id=12345, message_thread_id=None, text="Pick")
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id="777", first_name="Tester")
+
+        active["session_id"] = "session-2"
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+        assert not entry.event.is_set()
+
+        active["session_id"] = "session-1"
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+        assert entry.response == "red"
+        assert entry.event.is_set()
+        assert cm.get_entry(entry.clarify_id) is None
+        assert query.answer.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_bound_other_callback_arms_text_once_without_adapter_state(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        entry = _register_bound()
+        query = AsyncMock()
+        query.data = f"cl:{entry.clarify_id}:other"
+        query.message = MagicMock(chat_id=12345, message_thread_id=None, text="Pick")
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id="777", first_name="Tester")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+        assert entry.awaiting_text is True
+        assert entry.callback_consumed is True
+        assert not entry.event.is_set()
+        assert query.answer.call_count == 2
+        assert "expired" in query.answer.call_args.kwargs["text"].lower()
 
 
     @pytest.mark.asyncio
@@ -169,8 +323,9 @@ class TestTelegramClarifyCallback:
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
-        cm.register("cidC", "sk-auth", "Pick", ["a", "b"])
-        adapter._clarify_state["cidC"] = "sk-auth"
+        entry = _register_bound(
+            clarify_id="cidC", user_id="999", choices=["a", "b"]
+        )
 
         # Hook up a runner that says NOT authorized
         class _DenyRunner:
@@ -200,14 +355,10 @@ class TestTelegramClarifyCallback:
         await adapter._handle_callback_query(update, context)
 
         # Must not resolve, must answer with not-authorized message
-        with cm._lock:
-            entry = cm._entries.get("cidC")
-        assert entry is not None
+        assert cm.get_entry("cidC") is entry
         assert not entry.event.is_set()
         query.answer.assert_called_once()
         assert "not authorized" in query.answer.call_args[1]["text"].lower()
-        # State preserved
-        assert adapter._clarify_state["cidC"] == "sk-auth"
 
 
 # ===========================================================================
@@ -254,3 +405,30 @@ class TestBaseAdapterClarifyFallback:
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
 
+
+def test_shared_send_clarify_contract_accepts_binding_across_adapters():
+    """Every shared consumer accepts the runner's immutable binding keyword."""
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+    from gateway.relay.adapter import RelayAdapter
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    from plugins.platforms.google_chat.adapter import GoogleChatAdapter
+    from plugins.platforms.photon.adapter import PhotonAdapter
+    from plugins.platforms.slack.adapter import SlackAdapter
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    adapters = (
+        BasePlatformAdapter,
+        TelegramAdapter,
+        DiscordAdapter,
+        SlackAdapter,
+        WhatsAppAdapter,
+        WhatsAppCloudAdapter,
+        GoogleChatAdapter,
+        PhotonAdapter,
+        RelayAdapter,
+    )
+    for adapter_type in adapters:
+        parameter = inspect.signature(adapter_type.send_clarify).parameters.get("binding")
+        assert parameter is not None, adapter_type.__name__
+        assert parameter.default is None, adapter_type.__name__
