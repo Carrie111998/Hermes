@@ -95,3 +95,80 @@ def test_status_withholds_host_detail_in_gated_mode(gated_client):
     assert not leaked, f"/api/status leaked host detail under the gate: {leaked}"
 
 
+
+# ---------------------------------------------------------------------------
+# dashboard.public_status_detail: operator detail on the anonymous probe
+# ---------------------------------------------------------------------------
+
+# Profile names, the gateway topology mode, and the host memory / disk
+# rollups describe the deployment, not its liveness. They are public by
+# default because Hermes Cloud renders them in the Portal from an
+# unauthenticated read. A self-hosted dashboard exposed to the internet has
+# no such reader, so ``dashboard.public_status_detail: minimal`` withholds
+# them from anonymous callers while keeping them for a signed-in operator.
+_OPERATOR_DETAIL_FIELDS = frozenset({
+    "profiles", "gateway_mode", "memory", "disk",
+})
+
+
+def _login(client):
+    """Walk the stub IDP round trip so the client holds a session cookie."""
+    to_idp = client.get("/auth/login?provider=stub", follow_redirects=False)
+    assert to_idp.status_code in (302, 307), to_idp.status_code
+    callback = to_idp.headers["location"]
+    landed = client.get(callback, follow_redirects=False)
+    assert landed.status_code in (302, 307), landed.status_code
+
+
+def test_status_publishes_operator_detail_by_default(gated_client, monkeypatch):
+    """Default stays ``full``: the Cloud Portal's profile list must not
+    regress on an install that never opts in."""
+    monkeypatch.setattr(web_server, "load_config", lambda: {})
+    body = gated_client.get("/api/status").json()
+    assert "profiles" in body
+    assert "memory" in body
+
+
+def test_status_withholds_operator_detail_when_minimal(gated_client, monkeypatch):
+    """``minimal`` + gated bind + anonymous caller: the deployment detail
+    must be absent from the public probe."""
+    monkeypatch.setattr(
+        web_server, "load_config",
+        lambda: {"dashboard": {"public_status_detail": "minimal"}},
+    )
+    r = gated_client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+    # Liveness + auth-gate shape stays public: the probe contract holds.
+    for key in ("version", "gateway_state", "auth_required", "auth_providers"):
+        assert key in body, f"liveness field {key!r} must stay public"
+    leaked = _OPERATOR_DETAIL_FIELDS & set(body.keys())
+    assert not leaked, f"/api/status leaked operator detail: {leaked}"
+
+
+def test_status_keeps_operator_detail_for_signed_in_caller(gated_client, monkeypatch):
+    """``minimal`` must not blind the operator's own dashboard: a request
+    carrying a valid session cookie still gets the full payload, so the
+    Status page keeps rendering profiles and the resource banners."""
+    monkeypatch.setattr(
+        web_server, "load_config",
+        lambda: {"dashboard": {"public_status_detail": "minimal"}},
+    )
+    _login(gated_client)
+    body = gated_client.get("/api/status").json()
+    assert "profiles" in body, "signed-in caller lost the profile list"
+    assert "memory" in body, "signed-in caller lost the memory rollup"
+
+
+def test_status_probe_survives_a_broken_session_cookie(gated_client, monkeypatch):
+    """The public probe must never fail because a cookie could not be
+    verified. A liveness endpoint that 500s on a stale cookie is worse
+    than the disclosure it was hardening against."""
+    monkeypatch.setattr(
+        web_server, "load_config",
+        lambda: {"dashboard": {"public_status_detail": "minimal"}},
+    )
+    gated_client.cookies.set("hermes_session_at", "not-a-valid-token")
+    r = gated_client.get("/api/status")
+    assert r.status_code == 200
+    assert _OPERATOR_DETAIL_FIELDS.isdisjoint(r.json().keys())
