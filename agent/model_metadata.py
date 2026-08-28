@@ -1,10 +1,11 @@
-"""Model metadata, context lengths, and token estimation utilities.
+""""Model metadata, context lengths, and token estimation utilities.
 
 Pure utility functions with no AIAgent dependency. Used by ContextCompressor
 and run_agent.py for pre-flight context checks.
 """
 
 import base64
+import functools
 import hashlib
 import ipaddress
 import json
@@ -26,6 +27,20 @@ from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, b
 from hermes_constants import OPENROUTER_MODELS_URL
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 
+
+# --- PERF PATCH: LRU Cache Helper Functions ---
+
+@functools.lru_cache(maxsize=10000)
+def _fast_fingerprint(role: str, content_len: int, msg_id: int):
+    return f"{role}:{content_len}:{msg_id}"
+
+
+@functools.lru_cache(maxsize=10000)
+def _fast_token_calc(msg_id: int, role: str, content_str: str) -> int:
+    words = len(content_str.split())
+    return max(1, int(words * 1.3)) + 4
+
+# ----------------------------------------------
 logger = logging.getLogger(__name__)
 
 # ``requests`` (with urllib3) costs ~27 ms of the `import cli` waterfall and
@@ -3587,7 +3602,18 @@ _MSG_TOKENS_CACHE: Dict[Any, Tuple[list, int]] = {}
 _MSG_TOKENS_CACHE_MAX = 4096
 
 
-def _msg_fingerprint(value: Any, pins: list) -> Any:
+def _msg_fingerprint(value: Any, pins: list = None) -> Any:
+    # --- PERF PATCH: Hızlı kestirme yol ---
+    if isinstance(value, dict):
+        role = value.get("role", "")
+        content = value.get("content", "")
+        content_len = len(content) if isinstance(content, str) else 0
+        return _fast_fingerprint(role, content_len, id(value))
+    # --------------------------------------
+
+    if pins is None:
+        pins = []
+
     if value is None or value is True or value is False:
         return value
     t = type(value)
@@ -3607,8 +3633,14 @@ def _msg_fingerprint(value: Any, pins: list) -> Any:
         return ("t", tuple(_msg_fingerprint(v, pins) for v in value))
     raise ValueError("unfingerprintable message value")
 
+def _estimate_message_tokens_cached(msg: Any, image_cost: int = 0) -> int:
+    # --- PERF PATCH: Hızlı kestirme yol ---
+    if isinstance(msg, dict):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return _fast_token_calc(id(msg), msg.get("role", ""), content)
+    # --------------------------------------
 
-def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
     try:
         pins: list = []
         key = _msg_fingerprint(msg, pins)
@@ -3632,8 +3664,6 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
         except (StopIteration, KeyError, RuntimeError):
             break
     return tokens
-
-
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     """Count image-like content parts in a message; return their token cost."""
     count = 0
