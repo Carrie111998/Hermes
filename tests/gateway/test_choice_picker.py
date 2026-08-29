@@ -107,6 +107,28 @@ class TestReasoningChoicePicker:
         override = runner._session_reasoning_overrides.get(session_key)
         assert override == {"enabled": True, "effort": "ultra"}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["/reasoning --global", "/reasoning —global"])
+    async def test_reasoning_picker_global_flag_persists_effort(
+        self, tmp_path, monkeypatch, command
+    ):
+        """A flag-only global invocation opens the picker and persists its choice."""
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+        event = _make_event(command)
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert result is None
+        on_choice = adapter.calls[0]["on_choice_selected"]
+        reply = await on_choice(event.source.chat_id, "ultra")
+
+        assert "ultra" in reply
+        saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert saved["agent"]["reasoning_effort"] == "ultra"
+        assert runner._session_reasoning_overrides == {}
+
 
 class TestFastChoicePicker:
     def _patch_fast_support(self, monkeypatch, tmp_path):
@@ -143,5 +165,4 @@ class TestFastChoicePicker:
         assert runner._service_tier == "priority"
         assert runner._session_service_tier_overrides
         assert not (tmp_path / "config.yaml").exists()
-
 

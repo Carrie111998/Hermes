@@ -3823,7 +3823,7 @@ class GatewaySlashCommandsMixin:
             model=_session_model,
         )
 
-        if not raw_args:
+        if not args:
             # Show current state
             rc = self._reasoning_config
             if rc is None:
@@ -3853,7 +3853,10 @@ class GatewaySlashCommandsMixin:
 
             async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
                 return self._apply_reasoning_selection(
-                    session_key, _picker_platform_key, value
+                    session_key,
+                    _picker_platform_key,
+                    value,
+                    persist_global=persist_global,
                 )
 
             picker_sent = await self._try_send_choice_picker(
