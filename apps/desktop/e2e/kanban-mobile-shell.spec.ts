@@ -9,7 +9,7 @@ import { expect, test } from './test'
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..', '..')
 const COLUMNS = ['triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review', 'done'] as const
-const MOBILE_WIDTHS = [320, 360, 390, 430] as const
+const MOBILE_WIDTHS = [320, 375, 390, 430] as const
 const LONG_TITLE = 'Synthetic review card with an intentionally long unbroken-token-safe title for drawer and clipping validation'
 
 function runBoardScript(hermesHome: string, source: string) {
@@ -225,6 +225,8 @@ test.afterAll(async () => {
 test('actual shell validates exact mobile viewports and all lane input paths', async ({}, testInfo) => {
   const page = fixture!.page
   const manifest: Array<Record<string, number | string>> = []
+
+  expect(MOBILE_WIDTHS).toEqual([320, 375, 390, 430])
 
   for (const width of MOBILE_WIDTHS) {
     await setContentViewport(fixture!, width)
