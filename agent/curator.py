@@ -138,8 +138,8 @@ def is_paused() -> bool:
 def _load_config() -> Dict[str, Any]:
     """Read curator.* config from ~/.hermes/config.yaml. Tolerates missing file."""
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
     except Exception as e:
         logger.debug("Failed to load config for curator: %s", e)
         return {}
@@ -369,7 +369,22 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
             continue
 
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            ok, _msg = _u.archive_skill(name)
+            # Tag the ledger entry with the curator actor: this archive is an
+            # autonomous curator transition, not a foreground agent/user call.
+            try:
+                from tools.skill_ledger import reset_ledger_actor, set_ledger_actor
+                _tok = set_ledger_actor("curator")
+            except Exception:
+                _tok = None
+                reset_ledger_actor = None  # type: ignore[assignment]
+            try:
+                ok, _msg = _u.archive_skill(name)
+            finally:
+                if _tok is not None and reset_ledger_actor is not None:
+                    try:
+                        reset_ledger_actor(_tok)
+                    except Exception:
+                        pass
             if ok:
                 counts["archived"] += 1
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
@@ -524,6 +539,13 @@ CURATOR_REVIEW_PROMPT = (
     "merges.\n\n"
     "Your toolset:\n"
     "  - skills_list, skill_view        — read the current landscape\n"
+    "    READ BEFORE WRITE — enforced, not advisory. Before skill_manage "
+    "action=patch, action=edit, action=write_file on a file that already "
+    "exists, or action=remove_file, call skill_view on that SAME target in "
+    "this review turn — skill_view(name) for SKILL.md, "
+    "skill_view(name, file_path=...) for a supporting file — and build the "
+    "write from the content it just returned. A write without that read is "
+    "REFUSED and nothing is saved.\n"
     "  - skill_manage action=patch      — add sections to the umbrella\n"
     "  - skill_manage action=create     — create a new umbrella SKILL.md\n"
     "  - skill_manage action=write_file — add a references/, templates/, "
@@ -902,7 +924,6 @@ def _reconcile_classification(
     Every removed skill is placed in exactly one bucket.
     """
     heur_cons = {e["name"]: e for e in heuristic.get("consolidated", [])}
-    heur_pruned = {e["name"] for e in heuristic.get("pruned", [])}
 
     model_cons = {e["from"]: e for e in model_block.get("consolidations", [])}
     model_pruned = {e["name"]: e for e in model_block.get("prunings", [])}
@@ -1876,9 +1897,9 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _acp_args = None
     _model_name = ""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        _cfg = load_config()
+        _cfg = load_config_readonly()
         _binding = _resolve_review_runtime(_cfg)
         _provider, _model_name = _binding.provider, _binding.model
         _rp = resolve_runtime_provider(
@@ -1924,6 +1945,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             credential_pool=_credential_pool,
             request_overrides=_request_overrides,
             **_agent_kwargs,
+            enabled_toolsets=["skills", "terminal"],
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The
