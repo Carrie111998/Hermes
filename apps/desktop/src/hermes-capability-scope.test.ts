@@ -2,13 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   getHermesConfigRecord,
+  getComputerUseStatus,
   getMcpCatalog,
   getSkillContent,
   getSkills,
   getToolsets,
   getUsageAnalytics,
+  grantComputerUsePermissions,
   installSkillFromHub,
+  profileScopeCacheKey,
   profileScopeKey,
+  profileScopeRouteKey,
   saveMcpServers,
   setApiRequestConnection,
   setApiRequestProfile,
@@ -82,6 +86,8 @@ describe('capability helpers are connection-scoped', () => {
     void setToolsetEnabled('browser', true, { connectionId: 'homelab', profile: 'inbox-bot' })
     void saveMcpServers({}, { connectionId: 'homelab', profile: 'inbox-bot' })
     void installSkillFromHub('official/research/arxiv', { connectionId: 'homelab', profile: 'inbox-bot' })
+    void getComputerUseStatus({ connectionId: 'homelab', profile: 'inbox-bot' })
+    void grantComputerUsePermissions({ connectionId: 'homelab', profile: 'inbox-bot' })
 
     for (const call of api.mock.calls) {
       expect((call[0] as { connectionId?: string }).connectionId).toBe('homelab')
@@ -106,5 +112,26 @@ describe('capability helpers are connection-scoped', () => {
     expect(profileScopeKey({ connectionId: 'local', profile: 'coder' })).toBe('coder')
     expect(profileScopeKey({ connectionId: 'homelab', profile: 'coder' })).toBe('homelab::coder')
     expect(profileScopeKey({ connectionId: 'homelab' })).toBe('homelab::default')
+  })
+
+  it('profileScopeRouteKey keeps same-named local and remote profiles distinct', () => {
+    const remoteDefault = profileScopeRouteKey('default', 'homelab')
+    const localDefaultPin = profileScopeRouteKey({ connectionId: 'local', profile: 'default' })
+    const remoteDefaultPin = profileScopeRouteKey({ connectionId: 'homelab', profile: 'default' })
+
+    expect(profileScopeKey({ connectionId: 'local', profile: 'default' })).toBe(profileScopeKey('default'))
+    expect(localDefaultPin).toBe('local::default')
+    expect(remoteDefault).toBe('homelab::default')
+    expect(remoteDefaultPin).toBe('homelab::default')
+    expect(localDefaultPin).not.toBe(remoteDefault)
+    expect(localDefaultPin).not.toBe(remoteDefaultPin)
+  })
+
+  it('profileScopeCacheKey keeps an ambient remote default off a local pin', () => {
+    setApiRequestConnection('homelab')
+
+    expect(profileScopeCacheKey('default')).toBe('homelab::default')
+    expect(profileScopeCacheKey({ connectionId: 'local', profile: 'default' })).toBe('local::default')
+    expect(profileScopeCacheKey('default')).not.toBe(profileScopeCacheKey({ connectionId: 'local', profile: 'default' }))
   })
 })

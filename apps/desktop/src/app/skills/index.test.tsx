@@ -384,6 +384,73 @@ describe('SkillsView toolset management', { timeout: 60_000 }, () => {
     expect(getProfiles).not.toHaveBeenCalled()
   })
 
+  it('fixedProfile without fixedConnection rides the active connection and follows a backend flip', async () => {
+    // Bot Mode's profile-only pin: the pinned profile is served by WHICHEVER
+    // connection is active, resolved as an exact (connectionId, profile)
+    // snapshot — a same-profile app-wide backend flip must re-point the
+    // surface even though the profile name never changes. (A bare profile
+    // name here would resolve the ambient connection outside React's
+    // knowledge, and the Computer Use grant lifecycle prop would stay on the
+    // previous backend.)
+    const { setPrimaryGatewayConnectionId } = await import('@/store/gateway')
+    const { resetToolCallsCache } = await import('./index')
+
+    resetToolCallsCache()
+    setPrimaryGatewayConnectionId('homelab')
+
+    const botSkill = (connectionId: string) => [
+      {
+        name: `${connectionId}-bot-skill`,
+        description: 'bot skill',
+        category: 'bot',
+        enabled: true,
+        usage: 2,
+        provenance: 'bundled' as const
+      }
+    ]
+
+    getSkills.mockImplementation((scope?: unknown) =>
+      Promise.resolve(
+        botSkill(
+          !!scope &&
+            typeof scope === 'object' &&
+            (scope as { connectionId?: string }).connectionId === 'local'
+            ? 'local'
+            : 'remote'
+        )
+      )
+    )
+
+    try {
+      const { SkillsView } = await import('./index')
+
+      await act(async () => {
+        render(
+          <QueryClientProvider client={queryClient}>
+            <MemoryRouter initialEntries={['/skills']}>
+              <SkillsView fixedProfile="inbox-bot" />
+            </MemoryRouter>
+          </QueryClientProvider>
+        )
+      })
+
+      await waitFor(() => expect(getSkills).toHaveBeenCalledWith({ connectionId: 'homelab', profile: 'inbox-bot' }))
+      expect(await screen.findAllByText('remote-bot-skill')).not.toHaveLength(0)
+
+      // App-wide switch to the local default — the pinned profile follows.
+      await act(async () => {
+        setPrimaryGatewayConnectionId(null)
+      })
+
+      await waitFor(() => expect(getSkills).toHaveBeenCalledWith({ connectionId: 'local', profile: 'inbox-bot' }))
+      expect(await screen.findAllByText('local-bot-skill')).not.toHaveLength(0)
+      expect(screen.queryAllByText('remote-bot-skill')).toHaveLength(0)
+    } finally {
+      setPrimaryGatewayConnectionId(null)
+      resetToolCallsCache()
+    }
+  })
+
   it('offers (connection, profile) scope rows on multi-connection desktops', async () => {
     // With a v2 registry holding >1 connection, the scope selector lists the
     // union agent roster — profile + owning device — instead of the local
@@ -431,6 +498,240 @@ describe('SkillsView toolset management', { timeout: 60_000 }, () => {
       expect(await screen.findByText('default — This device (current)')).toBeTruthy()
     } finally {
       delete (window as { hermesDesktop?: unknown }).hermesDesktop
+    }
+  })
+
+  it('does not keep remote default caches after switching to the local default', async () => {
+    Element.prototype.scrollIntoView = vi.fn()
+
+    const { setPrimaryGatewayConnectionId } = await import('@/store/gateway')
+    const { resetToolCallsCache } = await import('./index')
+
+    resetToolCallsCache()
+    setPrimaryGatewayConnectionId('homelab')
+
+    const localPin = { connectionId: 'local', profile: 'default' }
+    const localSkill = {
+      name: 'local-only-skill',
+      description: 'from local',
+      category: 'local',
+      enabled: true,
+      usage: 1,
+      provenance: 'bundled' as const
+    }
+    const remoteSkill = {
+      name: 'remote-only-skill',
+      description: 'from remote',
+      category: 'remote',
+      enabled: true,
+      usage: 9,
+      provenance: 'bundled' as const
+    }
+    const isLocalPin = (scope: unknown) =>
+      !!scope && typeof scope === 'object' && (scope as { connectionId?: string }).connectionId === 'local'
+
+    getSkills.mockImplementation((scope?: unknown) => Promise.resolve(isLocalPin(scope) ? [localSkill] : [remoteSkill]))
+    getToolsets.mockImplementation((scope?: unknown) =>
+      Promise.resolve([
+        isLocalPin(scope)
+          ? toolset({ name: 'web', label: 'Local Search', tools: ['local_search'] })
+          : toolset({ name: 'web', label: 'Remote Search', tools: ['remote_search'] })
+      ])
+    )
+    getUsageAnalytics.mockImplementation((_days: number, scope?: unknown) =>
+      Promise.resolve({
+        tools: isLocalPin(scope) ? [{ tool: 'local_search', count: 7 }] : [{ tool: 'remote_search', count: 99 }]
+      })
+    )
+
+    const connections = {
+      list: vi.fn().mockResolvedValue({
+        version: 2,
+        primary: 'homelab',
+        secureTokenStorage: true,
+        connections: [
+          { id: 'local', kind: 'local', label: 'This device', tokenSet: false, tokenPreview: null },
+          { id: 'homelab', kind: 'remote', label: 'Homelab', tokenSet: true, tokenPreview: '…' }
+        ]
+      })
+    }
+    const getAgentRoster = vi.fn().mockResolvedValue({
+      agents: [
+        {
+          connectionId: 'local',
+          connectionKind: 'local',
+          connectionLabel: 'This device',
+          profile: 'default',
+          handle: 'default'
+        },
+        {
+          connectionId: 'homelab',
+          connectionKind: 'remote',
+          connectionLabel: 'Homelab',
+          profile: 'default',
+          handle: 'default-homelab'
+        }
+      ],
+      sources: []
+    })
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = { connections, getAgentRoster }
+
+    try {
+      const { SkillsView } = await import('./index')
+
+      await act(async () => {
+        render(
+          <QueryClientProvider client={queryClient}>
+            <MemoryRouter initialEntries={['/skills']}>
+              <SkillsView embedded />
+            </MemoryRouter>
+          </QueryClientProvider>
+        )
+      })
+
+      // The ambient scope resolves the EXACT active route — the remote default
+      // is an explicit (connectionId, profile) snapshot, not a bare profile
+      // name whose cache key re-reads the mutable ambient connection tag.
+      const remoteScope = { connectionId: 'homelab', profile: 'default' }
+
+      await waitFor(() => expect(getSkills).toHaveBeenCalledWith(remoteScope))
+      expect(await screen.findAllByText('remote-only-skill')).not.toHaveLength(0)
+      expect(screen.queryAllByText('local-only-skill')).toHaveLength(0)
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /Tools/ }))
+      })
+      expect(await screen.findAllByText('Remote Search')).not.toHaveLength(0)
+
+      const trigger = await screen.findByRole('combobox')
+
+      await act(async () => {
+        fireEvent.click(trigger)
+      })
+      const option = await screen.findByRole('option', { name: 'default — This device' })
+
+      await act(async () => {
+        fireEvent.click(option)
+      })
+
+      await waitFor(() => expect(getToolsets).toHaveBeenCalledWith(localPin))
+      expect(getSkills).toHaveBeenCalledWith(localPin)
+      await waitFor(() => expect(getUsageAnalytics).toHaveBeenCalledWith(365, localPin))
+      expect(await screen.findAllByText('Local Search')).not.toHaveLength(0)
+      expect(screen.queryAllByText('Remote Search')).toHaveLength(0)
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /Skills/ }))
+      })
+      expect(await screen.findAllByText('local-only-skill')).not.toHaveLength(0)
+      expect(screen.queryAllByText('remote-only-skill')).toHaveLength(0)
+
+      const sw = await screen.findByRole('switch', { name: 'local-only-skill' })
+
+      await act(async () => {
+        fireEvent.click(sw)
+      })
+      await waitFor(() => expect(setSkillEnabled).toHaveBeenCalledWith('local-only-skill', false, localPin))
+    } finally {
+      setPrimaryGatewayConnectionId(null)
+      delete (window as { hermesDesktop?: unknown }).hermesDesktop
+      resetToolCallsCache()
+    }
+  })
+
+  it('re-scopes when the app-wide active backend switches from remote default to local default', async () => {
+    // The selector is NOT involved: the app-wide route flip (Settings →
+    // Gateway apply / statusbar source switch) republishes the active-route
+    // snapshot while $activeGatewayProfile stays "default" on both sides —
+    // only the exact (connectionId, profile) subscription can re-point the
+    // ambient scope, or Skills/Toolsets keep the remote machine's lists.
+    const { setPrimaryGatewayConnectionId } = await import('@/store/gateway')
+    const { resetToolCallsCache } = await import('./index')
+
+    resetToolCallsCache()
+    // Remote default active app-wide (the primary's published registry
+    // identity — the same seam gateway-boot's connection-apply publish uses).
+    setPrimaryGatewayConnectionId('homelab')
+
+    const remoteScope = { connectionId: 'homelab', profile: 'default' }
+    const localScope = { connectionId: 'local', profile: 'default' }
+    const remoteSkill = {
+      name: 'remote-only-skill',
+      description: 'from remote',
+      category: 'remote',
+      enabled: true,
+      usage: 9,
+      provenance: 'bundled' as const
+    }
+    const localSkill = {
+      name: 'local-only-skill',
+      description: 'from local',
+      category: 'local',
+      enabled: true,
+      usage: 1,
+      provenance: 'bundled' as const
+    }
+    const isLocalScope = (scope: unknown) =>
+      !!scope && typeof scope === 'object' && (scope as { connectionId?: string }).connectionId === 'local'
+
+    getSkills.mockImplementation((scope?: unknown) => Promise.resolve(isLocalScope(scope) ? [localSkill] : [remoteSkill]))
+    getToolsets.mockImplementation((scope?: unknown) =>
+      Promise.resolve([
+        isLocalScope(scope)
+          ? toolset({ name: 'web', label: 'Local Search', tools: ['local_search'] })
+          : toolset({ name: 'web', label: 'Remote Search', tools: ['remote_search'] })
+      ])
+    )
+    getUsageAnalytics.mockImplementation((_days: number, scope?: unknown) =>
+      Promise.resolve({
+        tools: isLocalScope(scope) ? [{ tool: 'local_search', count: 7 }] : [{ tool: 'remote_search', count: 99 }]
+      })
+    )
+
+    try {
+      const { SkillsView } = await import('./index')
+
+      await act(async () => {
+        render(
+          <QueryClientProvider client={queryClient}>
+            <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
+              <SkillsView />
+            </MemoryRouter>
+          </QueryClientProvider>
+        )
+      })
+
+      await waitFor(() => expect(getToolsets).toHaveBeenCalledWith(remoteScope))
+      expect(await screen.findAllByText('Remote Search')).not.toHaveLength(0)
+      expect(screen.queryAllByText('Local Search')).toHaveLength(0)
+
+      // The app-wide switch to the local default: Electron republishes the
+      // primary descriptor (connectionId null = the local pool). No selector,
+      // no profile change.
+      await act(async () => {
+        setPrimaryGatewayConnectionId(null)
+      })
+
+      await waitFor(() => expect(getToolsets).toHaveBeenCalledWith(localScope))
+      expect(await screen.findAllByText('Local Search')).not.toHaveLength(0)
+      expect(screen.queryAllByText('Remote Search')).toHaveLength(0)
+
+      // The usage badges reloaded for the new scope too (the analytics mirror
+      // resets with the scope key, so the lazy loader re-runs).
+      await waitFor(() => expect(getUsageAnalytics).toHaveBeenCalledWith(365, localScope))
+      expect((await screen.findAllByText('×7')).length).toBeGreaterThan(0)
+
+      // And writes route to the newly active backend.
+      const sw = await screen.findByRole('switch', { name: 'Turn Local Search toolset off' })
+
+      await act(async () => {
+        fireEvent.click(sw)
+      })
+      await waitFor(() => expect(setToolsetEnabled).toHaveBeenCalledWith('web', false, localScope))
+    } finally {
+      setPrimaryGatewayConnectionId(null)
+      resetToolCallsCache()
     }
   })
 })

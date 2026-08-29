@@ -312,7 +312,7 @@ function PostSetupRunner({ toolset, postSetupKey, installed = false, onComplete,
         const polled = await getActionStatus(started.name, 300, profile)
         last = polled
         setStatus(polled)
-        upsertDesktopActionTask(polled)
+        upsertDesktopActionTask(polled, profile)
 
         if (!polled.running) {
           break

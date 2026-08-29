@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { getHermesConfigRecord, type ProfileScope, profileScopeKey } from '@/hermes'
+import { getHermesConfigRecord, type ProfileScope, profileScopeCacheKey } from '@/hermes'
 import { queryClient, writeCache } from '@/lib/query-client'
 import type { HermesConfigRecord } from '@/types/hermes'
 
@@ -18,11 +18,11 @@ export const HERMES_CONFIG_KEY = ['hermes-config-record'] as const
 // the Capabilities scope selector configuring ANOTHER profile, possibly on
 // another registered gateway — gets its own suffixed key so switching the
 // selector refetches and never paints stale cross-profile config (the
-// AGENTS.md scope-in-key rule). profileScopeKey folds a remote pin's
-// connection id into the suffix, so two gateways' same-named profiles never
+// AGENTS.md scope-in-key rule). profileScopeCacheKey keeps an ambient remote
+// `default` distinct from an explicit local pin, so same-named profiles never
 // share a cache row.
 export const hermesConfigKey = (profile?: ProfileScope) =>
-  profile == null ? HERMES_CONFIG_KEY : ([...HERMES_CONFIG_KEY, profileScopeKey(profile)] as const)
+  profile == null ? HERMES_CONFIG_KEY : ([...HERMES_CONFIG_KEY, profileScopeCacheKey(profile)] as const)
 
 // staleTime 0 → serve cache instantly, background-revalidate on every mount.
 // `profile` scopes both the query key and the fetch; omitting it preserves the
