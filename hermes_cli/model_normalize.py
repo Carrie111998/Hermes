@@ -77,7 +77,11 @@ _AGGREGATOR_PROVIDERS: frozenset[str] = frozenset({
 # values of _VENDOR_PREFIXES, e.g. the `z-ai` of `z-ai/glm-5.2`). On a
 # native provider such a prefix is never a legal model name — only the bare
 # id is served — so _MATCHING_PREFIX_STRIP_PROVIDERS strips it (#93980).
-_KNOWN_VENDOR_SLUGS: frozenset[str] = frozenset(set(_VENDOR_PREFIXES.values()))
+# Normalized to lowercase at construction so the ``.lower()`` membership
+# checks below stay correct even if a mixed-case slug is ever added here.
+_KNOWN_VENDOR_SLUGS: frozenset[str] = frozenset(
+    v.lower() for v in _VENDOR_PREFIXES.values()
+)
 
 # Providers that want bare names with dots replaced by hyphens.
 _DOT_TO_HYPHEN_PROVIDERS: frozenset[str] = frozenset({
@@ -575,6 +579,15 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
         # proxy-required routing prefix (e.g. LiteLLM's `ollama/glm-5.2`
         # on a custom endpoint — see _strip_matching_provider_prefix)
         # is never mangled.
+        #
+        # Scope decisions, deliberate: (a) exactly one slug level is
+        # stripped — a stacked id like `litellm/z-ai/glm-5.2` keeps its
+        # prefixes because a leftover prefix chain means the id came
+        # through a proxy route whose segments we cannot safely guess
+        # beyond the top-level vendor slug; (b) this only runs for
+        # _MATCHING_PREFIX_STRIP_PROVIDERS — a `custom` endpoint may
+        # *require* its own routing prefixes, so it stays a strict
+        # passthrough (#93980 pins that case).
         if "/" in result:
             _prefix, _bare = result.split("/", 1)
             if _bare.strip() and _prefix.strip().lower() in _KNOWN_VENDOR_SLUGS:
