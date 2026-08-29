@@ -712,7 +712,7 @@ def test_failed_exact_head_static_receipt_immediately_dispatches_one_typed_fixer
     assert task.initial_status == "running"
     assert task.max_runtime_seconds == 60 * 60
     assert task.max_retries == 2
-    assert task.idempotency_key.endswith(":typed-fixer-v2")
+    assert task.idempotency_key.endswith(":typed-fixer-v3")
     assert "first 90 seconds" in task.instructions
     assert "do not repeat completed work" in task.instructions
     assert task.evidence["ci_receipt_id"] == "f" * 64
@@ -1445,7 +1445,7 @@ def test_auto_dispatch_starts_an_admitted_exact_head_repair_ready_with_push_and_
     task = kanban.tasks[0]
     assert getattr(task, "initial_status", None) == "running"
     assert getattr(task, "max_retries", None) == 2
-    assert task.max_runtime_seconds == 900
+    assert task.max_runtime_seconds == 1200
     assert "first 90 seconds" in task.instructions
     assert "do not retry a tool-blocked command" in task.instructions.casefold()
     assert "Do not keep re-evaluating equivalent approaches" in task.instructions
@@ -1507,7 +1507,7 @@ def test_scan_dispatches_one_read_only_exact_head_ci_audit_when_actions_are_disa
     assert task.initial_status == "running"
     assert task.max_retries == 3
     assert task.max_runtime_seconds == 8 * 60 * 60
-    assert task.idempotency_key.endswith(":supervised-v2")
+    assert task.idempotency_key.endswith(":supervised-v3")
     assert task.evidence_heading == "Canonical PR audit receipt (JSON)"
     assert task.evidence == {
         "repository": "acme/widgets",
@@ -1517,7 +1517,7 @@ def test_scan_dispatches_one_read_only_exact_head_ci_audit_when_actions_are_disa
         "post_results": True,
     }
     assert "Do not edit source files" in task.instructions
-    assert "Do not push, approve, or merge" in task.instructions
+    assert "Do not publish, approve, or merge" in task.instructions
     assert "post one factual audit summary" in task.instructions
     assert "pr-ci-receipt:v1" in task.instructions
     assert "scripts/run_hygiene_lane.py" in task.instructions

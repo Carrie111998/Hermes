@@ -57,6 +57,23 @@ def _has_only_expected_merge_blockers(section: object) -> bool:
     return True
 
 
+def _has_successful_merge(section: object) -> bool:
+    if not isinstance(section, dict):
+        return False
+    merged = section.get("merged")
+    return bool(
+        isinstance(merged, list)
+        and merged
+        and all(
+            isinstance(item, dict)
+            and isinstance(item.get("pr_number"), int)
+            and not isinstance(item.get("pr_number"), bool)
+            and item["pr_number"] > 0
+            for item in merged
+        )
+    )
+
+
 def _cron_exit_code(stdout: str, process_returncode: int, stderr: str = "") -> int:
     """Classify durable progress without discarding degraded scan telemetry."""
 
@@ -73,17 +90,24 @@ def _cron_exit_code(stdout: str, process_returncode: int, stderr: str = "") -> i
         return process_returncode
     if not isinstance(payload, dict):
         return process_returncode
-    if payload.get("status") != "ok":
+    if payload.get("status") not in {"ok", "degraded"}:
+        return process_returncode
+    merge = payload.get("merge")
+    partial_merge_success = _has_successful_merge(merge)
+    if payload.get("status") == "degraded" and not partial_merge_success:
         return process_returncode
     repair = payload.get("repair")
     if _has_reported_failure(payload) or _has_reported_failure(repair):
         return process_returncode
-    merge = payload.get("merge")
     if isinstance(merge, dict) and merge.get("status") == "degraded":
         if not _has_only_expected_merge_blockers(merge):
             return process_returncode
     maintenance = payload.get("release_maintenance")
-    if isinstance(maintenance, dict) and maintenance.get("status") == "degraded":
+    if (
+        isinstance(maintenance, dict)
+        and maintenance.get("status") == "degraded"
+        and not partial_merge_success
+    ):
         return process_returncode
     if not isinstance(repair, dict):
         return process_returncode
