@@ -108,26 +108,39 @@ def open_sidecar(path: str) -> sqlite3.Connection:
     return con
 
 
-def board_for_conn(conn: sqlite3.Connection) -> str:
-    """Derive the board slug from a live kanban connection's main database
-    file path. The parent dir name of the DB file IS the board slug for
-    named boards (e.g. .../kanban/boards/jarvis-os/kanban.db -> jarvis-os);
-    the legacy default board lives at <root>/kanban.db -> 'default'."""
+def board_for_conn(conn: sqlite3.Connection) -> "str | None":
+    """Board slug for a kanban connection, or None if it is not a fleet board.
+
+    Returns the slug ONLY for a database that genuinely lives at
+    ``<root>/kanban/boards/<slug>/kanban.db``, or ``"default"`` for the legacy
+    ``<root>/kanban.db``. Anything else — a scratch DB in a worker workspace, a
+    pytest tmpdir, a throwaway copy — returns None and MUST NOT be signed.
+
+    This previously returned the parent directory name of ANY path, so any
+    process holding the real HERMES_HOME while operating on a scratch database
+    minted a board slug from that path and wrote it into the production audit
+    store. That left ~600 signatures across ~115 phantom board names
+    (kanban_per_profile_cap_test_*, test_apply_approvals_*, '.hermes',
+    'hermes_home', 'alpha', 'proja'...) — rows that can never be verified,
+    because no such board exists to verify them against.
+    """
     try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        # row: (seq, name, file); main DB is name == 'main'
         for r in conn.execute("PRAGMA database_list"):
             if r[1] == "main" and r[2] and not r[2].startswith(":"):
                 dbpath = os.path.abspath(r[2])
-                parent = os.path.basename(os.path.dirname(dbpath))
-                if parent == "boards":
+                root = os.path.abspath(_canonical_root())
+                parent_dir = os.path.dirname(dbpath)
+                boards_root = os.path.join(root, "kanban", "boards")
+                if os.path.dirname(parent_dir) == boards_root:
+                    return os.path.basename(parent_dir)
+                if dbpath == os.path.join(root, "kanban.db"):
                     return "default"
-                if parent and parent != "kanban":
-                    return parent
-                return "default"
+                return None
     except Exception:
-        pass
-    return os.environ.get("HERMES_KANBAN_BOARD", "default").strip() or "default"
+        return None
+    return None
+
+
 def canonical_json(d: dict) -> str:
     """Deterministic serialization identical to the hash-chain's convention
     (sort_keys, compact separators, ensure_ascii). Signing and hashing the
@@ -372,9 +385,34 @@ def _cmd_resolve_key(args):
 
 
 def _cmd_verify(args):
+    """Verify the sidecar and REPORT FAILURE IN THE EXIT CODE.
+
+    This previously always returned 0. That makes the whole mechanism
+    decorative when driven by automation: a `hermes cron` no-agent job never
+    parses stdout — the exit code is the only signal it has — so a detected
+    forgery would have been printed into a stream nobody reads and recorded as
+    a successful run.
+
+    Exit 1 on BAD (signature does not verify: tampered content or wrong key) or
+    UNTRUSTED (a valid signature from a signer that is not in allowed_signers).
+    STALE and UNSIGNED are NOT failures: events written before signing was
+    enabled, or by a build without a key, are expected and would otherwise make
+    the check permanently red and therefore ignored.
+    """
     counts = verify_sidecar(args.kanban_db, args.sidecar, args.allowed_signers)
     parts = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    print(f"EVENT-SIG-VERIFY: board={os.path.basename(os.path.dirname(args.kanban_db))} {parts}")
+    board = os.path.basename(os.path.dirname(args.kanban_db))
+    print(f"EVENT-SIG-VERIFY: board={board} {parts}")
+    bad = int(counts.get("BAD", 0) or 0)
+    untrusted = int(counts.get("UNTRUSTED", 0) or 0)
+    if bad or untrusted:
+        print(
+            f"EVENT-SIG-VERIFY: FAIL board={board} BAD={bad} UNTRUSTED={untrusted}"
+            " — signature verification failed; the event ledger may have been"
+            " altered or signed by an unregistered key.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

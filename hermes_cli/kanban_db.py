@@ -5263,6 +5263,10 @@ def _append_event(
             if key is not None:
                 identity, key_path = key
                 board = board_for_conn(conn)
+                if board is None:
+                    # Not a fleet board (scratch/test DB) — never write a
+                    # signature that could not be verified anyway.
+                    return
                 sig = sign_event_payload(
                     event_id, task_id, run_id, kind, pl, now, key_path
                 )
