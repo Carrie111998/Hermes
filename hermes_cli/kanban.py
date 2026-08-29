@@ -213,6 +213,47 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
+def _hoist_kind_token(argv: list[str]) -> list[str]:
+    """Move a ``--kind <val>`` / ``--kind=<val>`` token to the front of the
+    token list so argparse can still consume a trailing ``nargs='*'`` reason.
+
+    argparse's ``nargs='*'`` positional cannot consume tokens that follow an
+    option once positional consumption has started: ``block t_X --kind
+    needs_input some reason`` fails with ``unrecognized arguments: some
+    reason`` because ``--kind`` sits mid-stream after the positional has
+    begun consuming. Hoisting the option to the head of the token list —
+    before every positional — lets the reason positional take everything
+    that follows. Stops at ``--`` (everything after it is literal) and never
+    rewrites a ``--kind`` that is missing its value (argparse reports the
+    real error instead). Only ``block`` uses ``--kind`` in the kanban tree.
+    """
+    argv = list(argv)
+    for i, tok in enumerate(argv):
+        if tok == "--":
+            break
+        if tok == "--kind":
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                return [tok, argv[i + 1]] + argv[:i] + argv[i + 2:]
+            break
+        if tok.startswith("--kind="):
+            return [tok] + argv[:i] + argv[i + 1:]
+    return argv
+
+
+class _KanbanParser(argparse.ArgumentParser):
+    """Argparse subclass that hoists ``--kind`` ahead of positionals.
+
+    Used as ``parser_class`` for the kanban subcommand tree so every
+    subparser (including ``block``) parses with the hoist applied. The
+    hoist is a no-op for every subcommand that does not use ``--kind``.
+    """
+
+    def parse_known_args(self, args=None, namespace=None):  # type: ignore[override]
+        if args is None:
+            args = sys.argv[1:]
+        return super().parse_known_args(_hoist_kind_token(args), namespace)
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -245,7 +286,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "to see all boards."
         ),
     )
-    sub = kanban_parser.add_subparsers(dest="kanban_action")
+    sub = kanban_parser.add_subparsers(dest="kanban_action", parser_class=_KanbanParser)
 
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
