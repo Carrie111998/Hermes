@@ -381,6 +381,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_config TEXT,
     system_prompt TEXT,
     system_prompt_hash TEXT,
+    system_prompt_fingerprint TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,

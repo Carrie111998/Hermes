@@ -8258,15 +8258,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def update_system_prompt(
-        self, session_id: str, system_prompt: Optional[str]
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        fingerprint: Optional[str] = None,
     ) -> None:
-        """Store the full assembled system prompt snapshot."""
+        """Store the assembled system prompt snapshot and its input fingerprint.
+
+        Prompt hash and fingerprint are written in a single UPDATE so a
+        reader cannot observe one without the other. A NULL fingerprint
+        (legacy row, TOCTOU disagreement, or compute failure at persist
+        time) is treated as stale on the next restore and rebuilt once.
+        """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            if system_prompt is None:
+                fingerprint_value = None
+            else:
+                fingerprint_value = fingerprint
             conn.execute(
                 "UPDATE sessions "
-                "SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
-                (system_prompt_hash, session_id),
+                "SET system_prompt_hash = ?, system_prompt = NULL, "
+                "system_prompt_fingerprint = ? WHERE id = ?",
+                (system_prompt_hash, fingerprint_value, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
@@ -8315,7 +8329,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 "UPDATE sessions SET "
                 "model = ?, model_config = ?, "
-                "system_prompt = NULL, system_prompt_hash = NULL "
+                "system_prompt = NULL, system_prompt_hash = NULL, "
+                "system_prompt_fingerprint = NULL "
                 "WHERE id = ?",
                 (model, merged, session_id),
             )
@@ -8449,7 +8464,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    model_config = ?,
                    model = COALESCE(?, model),
                    system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   system_prompt_hash = NULL,
+                   system_prompt_fingerprint = NULL
                    WHERE id = ?""",
                 (merged, model, session_id),
             )
@@ -8582,7 +8598,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    billing_base_url = ?,
                    billing_mode = COALESCE(?, billing_mode),
                    system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   system_prompt_hash = NULL,
+                   system_prompt_fingerprint = NULL
                    WHERE id = ?""",
                 (provider, base_url, billing_mode, session_id),
             )

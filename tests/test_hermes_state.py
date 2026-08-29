@@ -5350,3 +5350,42 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+class TestSystemPromptFingerprintPair:
+    """Prompt snapshot and managed-context fingerprint are one UPDATE (#68563)."""
+
+    def test_update_system_prompt_pairs_fingerprint_atomically(self, db):
+        db.create_session("s-fp", source="api", model="m")
+        db.update_system_prompt("s-fp", "assembled prompt", fingerprint="fp-v1")
+        row = db.get_session("s-fp")
+        assert row["system_prompt"] == "assembled prompt"
+        assert row["system_prompt_fingerprint"] == "fp-v1"
+        raw = db._conn.execute(
+            "SELECT system_prompt, system_prompt_hash, "
+            "system_prompt_fingerprint FROM sessions WHERE id = ?",
+            ("s-fp",),
+        ).fetchone()
+        assert raw["system_prompt"] is None
+        assert raw["system_prompt_hash"]
+        assert raw["system_prompt_fingerprint"] == "fp-v1"
+
+        db.update_system_prompt("s-fp", None)
+        cleared = db.get_session("s-fp")
+        assert cleared["system_prompt"] is None
+        assert cleared["system_prompt_fingerprint"] is None
+
+    def test_schema_declares_fingerprint_column(self, db):
+        cols = {
+            row[1]
+            for row in db._conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        assert "system_prompt_fingerprint" in cols
+
+    def test_clearing_prompt_also_clears_fingerprint(self, db):
+        db.create_session("s-fp2", source="api", model="m")
+        db.update_system_prompt("s-fp2", "p", fingerprint="fp")
+        db.update_session_model("s-fp2", "other")
+        row = db.get_session("s-fp2")
+        assert row["system_prompt"] is None
+        assert row["system_prompt_fingerprint"] is None
