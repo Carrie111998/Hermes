@@ -484,7 +484,7 @@ def request_exactly_one_rerun(
         raise RerunCommandError("PR head changed before rerun")
     args = ["run", "rerun", bound_run_id, "--repo", repo, "--failed"]
     try:
-        outcome = subprocess.run(["gh", *args], check=True, capture_output=True, text=True) if runner is None else runner(args)
+        outcome = subprocess.run(["gh", *args], check=True, capture_output=True, text=True, encoding="utf-8") if runner is None else runner(args)
     except Exception as exc:
         if isinstance(exc, RerunCommandError):
             raise
@@ -585,7 +585,7 @@ def build_fixture_from_api(
 
 def _gh_json(args: list[str]) -> Any:
     try:
-        result = subprocess.run(["gh", *args], check=True, capture_output=True, text=True)
+        result = subprocess.run(["gh", *args], check=True, capture_output=True, text=True, encoding="utf-8")
         return json.loads(result.stdout)
     except Exception as exc:
         raise EvidenceError(str(exc)) from exc
