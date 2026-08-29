@@ -142,6 +142,51 @@ class TestIncludeCompacted:
         ]
         assert decoded == 120
 
+    def test_compacted_latest_page_decodes_only_requested_rows(self, db, monkeypatch):
+        """The Desktop tail read stays bounded after in-place compaction."""
+        sid = "compacted-long-session"
+        db.create_session(sid, source="desktop")
+        db.append_messages_batch(
+            sid,
+            [
+                {"role": "user", "content": f"archived message {index}"}
+                for index in range(3_000)
+            ],
+        )
+        db.archive_and_compact(
+            sid,
+            [{"role": "assistant", "content": "summary of archived turns"}],
+        )
+        db.append_messages_batch(
+            sid,
+            [
+                {"role": "user", "content": f"live message {index}"}
+                for index in range(200)
+            ],
+        )
+
+        original_decode = db._decode_content
+        decoded = 0
+
+        def _counted_decode(content):
+            nonlocal decoded
+            decoded += 1
+            return original_decode(content)
+
+        monkeypatch.setattr(db, "_decode_content", _counted_decode)
+
+        page = db.get_messages(
+            sid,
+            include_compacted=True,
+            latest=True,
+            limit=120,
+        )
+
+        assert [message["content"] for message in page] == [
+            f"live message {index}" for index in range(80, 200)
+        ]
+        assert decoded == 120
+
 
 class TestDisplayDedupe:
     """Compaction epochs copy the protected tail into each new generation, so
@@ -236,6 +281,49 @@ class TestDisplayDedupe:
         page = db.get_messages(sid, include_compacted=True, limit=2, offset=2)
         assert [m["id"] for m in page] == all_ids[2:]
         assert len(page) == 2
+
+    def test_composite_carrier_dedupe_still_applies_before_latest_paging(self, db):
+        """SQL paging must retain the live projection of a wrapped user turn."""
+        from agent.context_compressor import (
+            HISTORICAL_TASK_HEADING,
+            SUMMARY_PREFIX,
+            _SUMMARY_END_MARKER,
+        )
+
+        sid = "composite-carrier-page"
+        timestamp = 1_700_000_000.0
+        db.create_session(sid, source="desktop")
+        original_id = db.append_message(
+            sid,
+            "user",
+            "REAL ASK",
+            timestamp=timestamp,
+        )
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
+                [original_id],
+            )
+        )
+        carrier_id = db.append_message(
+            sid,
+            "user",
+            f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n"
+            f"{_SUMMARY_END_MARKER}\n\nREAL ASK",
+            timestamp=timestamp,
+        )
+        answer_id = db.append_message(sid, "assistant", "answer")
+
+        page = db.get_messages(
+            sid,
+            include_compacted=True,
+            latest=True,
+            limit=1,
+            offset=1,
+        )
+
+        assert _row_ids(db, sid, include_compacted=True) == [carrier_id, answer_id]
+        assert [message["id"] for message in page] == [carrier_id]
 
     def test_distinct_tool_calls_with_same_content_are_not_merged(self, db):
         """Two real tool messages that happen to share role/content/timestamp
