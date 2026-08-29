@@ -15,6 +15,7 @@
 import { $rightRailActiveTabId } from '@/store/layout'
 import { $previewTabs } from '@/store/preview'
 
+import { type ConsoleDigest, consoleDigest } from './preview-console-digest'
 import { nudgeOverlay } from './preview-nudge'
 
 export interface PreviewReadOptions {
@@ -25,6 +26,10 @@ export interface PreviewReadOptions {
 }
 
 export interface PreviewReadResult {
+  /** The page's console. Present for live web pages; a file peek has none.
+   *  Carried on every read because an error the agent never asked about is an
+   *  error it never finds — see preview-console-digest.ts. */
+  console?: ConsoleDigest
   end: number
   kind: string
   note?: string
@@ -99,7 +104,13 @@ export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<
       nudgeOverlay('read')
 
       return windowText(
-        { kind: target.kind, path: target.path, title: page.title || target.label, url: page.url || target.url },
+        {
+          console: consoleDigest(tab.id),
+          kind: target.kind,
+          path: target.path,
+          title: page.title || target.label,
+          url: page.url || target.url
+        },
         page.text,
         opts
       )

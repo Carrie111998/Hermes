@@ -34,6 +34,7 @@ from tools.registry import registry, tool_error
 
 ACTIONS = (
     "elements",
+    "navigate",
     "click",
     "hover",
     "type",
@@ -56,6 +57,7 @@ def drive_preview_tool(
     ref: Optional[str] = None,
     selector: Optional[str] = None,
     text: Optional[str] = None,
+    url: Optional[str] = None,
     key: Optional[str] = None,
     submit: Optional[bool] = None,
     amount: Optional[int] = None,
@@ -83,6 +85,9 @@ def drive_preview_tool(
     if verb == "press" and not key:
         return tool_error("press needs a key, e.g. 'Enter' or 'Escape'.")
 
+    if verb == "navigate" and not url:
+        return tool_error("navigate needs a url, e.g. 'https://example.com'.")
+
     if to is not None and to not in SCROLL_TO:
         return tool_error(f"to must be one of: {', '.join(SCROLL_TO)}.")
 
@@ -94,6 +99,7 @@ def drive_preview_tool(
                 ("ref", ref),
                 ("selector", selector),
                 ("text", text),
+                ("url", url),
                 ("key", key),
                 ("submit", submit),
                 ("full", full),
@@ -158,6 +164,9 @@ ACT_PREVIEW_SCHEMA = {
         "'elements' already does this once, so reach for it only when asked to "
         "flick, flash, or bounce around the page some more, and note one call "
         "runs a whole multi-second burst, so never loop it per element), and "
+        "'navigate' (go to a url in the tab you are already driving — use this "
+        "to move between pages mid-task, rather than open_preview, which is "
+        "for opening a browser in the first place), and "
         "'back'/'forward'/'reload' for history. The pane draws every move as "
         "it happens so the user can follow along; those marks fade on their "
         "own, and annotate_preview is how you leave one up on purpose. Use "
@@ -182,6 +191,10 @@ ACT_PREVIEW_SCHEMA = {
                 "description": "CSS selector, as a fallback when no ref fits. Prefer ref.",
             },
             "text": {"type": "string", "description": "For 'type': the text to enter."},
+            "url": {
+                "type": "string",
+                "description": "For 'navigate': the address to go to, in the tab you are already driving.",
+            },
             "submit": {
                 "type": "boolean",
                 "description": "For 'type': press Enter and submit the owning form afterwards.",
@@ -222,6 +235,7 @@ registry.register(
         ref=args.get("ref"),
         selector=args.get("selector"),
         text=args.get("text"),
+        url=args.get("url"),
         key=args.get("key"),
         submit=args.get("submit"),
         amount=args.get("amount"),

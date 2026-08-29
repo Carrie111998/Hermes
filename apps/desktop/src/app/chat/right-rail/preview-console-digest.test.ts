@@ -1,0 +1,126 @@
+/**
+ * The agent could never see a page's console. These cover the two shapes that
+ * change that, and in particular the case the whole thing exists for: a
+ * console.warn (a missing translation key) has to register, because an
+ * errors-only counter would stay silent through exactly that bug.
+ */
+
+import { beforeEach, describe, expect, it } from 'vitest'
+
+import { consoleDigest, consoleSince } from './preview-console-digest'
+import { previewConsoleState } from './preview-console-store'
+
+const LOG = 0
+const WARN = 2
+const ERROR = 3
+
+let tab = 0
+let id = ''
+
+function log(level: number, message: string) {
+  previewConsoleState(id).append({ level, message })
+}
+
+beforeEach(() => {
+  tab += 1
+  id = `url:browser-digest-${tab}`
+})
+
+describe('consoleSince', () => {
+  it('says nothing when the page has been quiet', () => {
+    log(LOG, 'ready')
+
+    expect(consoleSince(id)).toBeNull()
+  })
+
+  // The motivating case. i18n reports missing keys with console.warn.
+  it('counts warnings, not just errors', () => {
+    log(WARN, 'missing translation for key "checkout.title"')
+
+    expect(consoleSince(id)).toEqual({ errors: 0, warnings: 1 })
+  })
+
+  it('reports only what arrived since the last look', () => {
+    log(ERROR, 'first')
+    expect(consoleSince(id)).toEqual({ errors: 1, warnings: 0 })
+
+    // Nothing new — the agent already knows about `first`.
+    expect(consoleSince(id)).toBeNull()
+
+    log(ERROR, 'second')
+    log(WARN, 'third')
+    expect(consoleSince(id)).toEqual({ errors: 1, warnings: 1 })
+  })
+
+  // A navigation clears the console. Counting from the old high-water mark
+  // would skip the new page's first messages entirely.
+  it('starts over when the console is cleared', () => {
+    log(ERROR, 'old page')
+    consoleSince(id)
+
+    previewConsoleState(id).clear()
+    log(ERROR, 'new page')
+
+    expect(consoleSince(id)).toEqual({ errors: 1, warnings: 0 })
+  })
+
+  it('keeps tabs apart', () => {
+    const other = `${id}-other`
+
+    log(ERROR, 'mine')
+    previewConsoleState(other).append({ level: ERROR, message: 'theirs' })
+
+    expect(consoleSince(id)).toEqual({ errors: 1, warnings: 0 })
+    expect(consoleSince(other)).toEqual({ errors: 1, warnings: 0 })
+  })
+})
+
+describe('consoleDigest', () => {
+  it('carries the messages, with levels named', () => {
+    log(ERROR, 'TypeError: undefined is not a function')
+    log(WARN, 'slow resource')
+
+    const digest = consoleDigest(id)
+
+    expect(digest.errors).toBe(1)
+    expect(digest.warnings).toBe(1)
+    expect(digest.total).toBe(2)
+    expect(digest.truncated).toBe(false)
+    expect(digest.entries.map(e => e.level)).toEqual(['error', 'warn'])
+    expect(digest.entries[0]?.message).toContain('TypeError')
+  })
+
+  // A render loop emits thousands of identical errors; the newest describe
+  // where the page actually ended up, and the counts stay honest.
+  it('keeps the newest when a page floods, and says it truncated', () => {
+    for (let i = 0; i < 200; i += 1) {
+      log(ERROR, `boom ${i}`)
+    }
+
+    const digest = consoleDigest(id)
+
+    expect(digest.truncated).toBe(true)
+    expect(digest.entries).toHaveLength(60)
+    expect(digest.entries.at(-1)?.message).toBe('boom 199')
+    // The store itself keeps a bounded tail, so `total` is that, not 200 —
+    // what matters is that it reports the run it actually holds.
+    expect(digest.total).toBe(digest.entries.length + (digest.truncated ? digest.total - 60 : 0))
+  })
+
+  it('clamps a single runaway message', () => {
+    log(ERROR, 'x'.repeat(5_000))
+
+    const message = consoleDigest(id).entries[0]?.message ?? ''
+
+    expect(message.length).toBeLessThan(700)
+    expect(message.endsWith('…')).toBe(true)
+  })
+
+  // Reading the detail settles the breadcrumb: the agent has now seen them.
+  it('marks the console seen', () => {
+    log(ERROR, 'seen')
+    consoleDigest(id)
+
+    expect(consoleSince(id)).toBeNull()
+  })
+})

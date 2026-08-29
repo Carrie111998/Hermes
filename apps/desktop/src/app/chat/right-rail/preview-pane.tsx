@@ -575,8 +575,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       return
     }
 
-    return registerPreviewNav(tabId, { back: goBack, forward: goForward, reload: reloadPreview })
-  }, [goBack, goForward, isRemoteHtml, isWebPreview, reloadPreview, tabId])
+    return registerPreviewNav(tabId, { back: goBack, forward: goForward, navigate: navigateTo, reload: reloadPreview })
+  }, [goBack, goForward, isRemoteHtml, isWebPreview, navigateTo, reloadPreview, tabId])
 
   // Publish the PAGE reader for this tab (the read_preview tool): extract the
   // rendered page's title + visible text from the webview. innerText (not

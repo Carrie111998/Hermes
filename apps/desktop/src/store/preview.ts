@@ -166,6 +166,23 @@ function activePreviewTab(): PreviewTab | null {
   return resolveActiveTab($previewTabs.get(), $rightRailActiveTabId.get())
 }
 
+/** The tab an AGENT ACTION operates on — clicking, typing, navigating.
+ *
+ *  Not the active tab. Resolving a write by "what's on screen" means the agent
+ *  clicks around the page you just switched to, which is the same mistake as
+ *  #93190 one layer down: the agent's tab is where it opened its page, and
+ *  focus is yours to move while it works.
+ *
+ *  Falls back to the active tab only when the agent has no tab of its own —
+ *  "click the button on this page" about the page you are looking at. READS
+ *  keep using the active tab unconditionally: answering "what does this page
+ *  say?" about the one on screen is right, and a read cannot damage it. */
+export function agentPreviewTabId(): RightRailTabId | null {
+  const tabs = $previewTabs.get()
+
+  return (tabs.findLast(tab => isBrowserTab(tab) && tab.agent) ?? resolveActiveTab(tabs, $rightRailActiveTabId.get()))?.id ?? null
+}
+
 // A restored active id whose tab didn't survive validation would leave the rail
 // pointing at nothing.
 selectRightRailTab(activePreviewTab()?.id ?? null)
@@ -420,7 +437,7 @@ const blankPage = (): PreviewTarget => ({ kind: 'url', label: 'Browser', source:
  *  invites an address. */
 export function openBrowserTab() {
   const tabs = $previewTabs.get()
-  const current = tabs.find(tab => tab.id === browserTabId(tabs))
+  const current = tabs.find(tab => tab.id === browserTabId(tabs, 'manual'))
 
   openPreview(current?.target ?? blankPage())
 }

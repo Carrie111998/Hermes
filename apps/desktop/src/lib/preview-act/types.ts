@@ -85,6 +85,11 @@ export interface PreviewActAction {
 export interface PreviewActResult {
   /** What the action landed on, for the agent's own log. */
   acted?: string
+  /** Errors and warnings the page logged since the last action, when there
+   *  were any. A breadcrumb, not the messages: it rides along on a result the
+   *  agent already receives, and a non-zero count is the cue to call
+   *  read_preview for the detail. See preview-console-digest.ts. */
+  console_since_last_call?: { errors: number; warnings: number }
   /** What moved since the last look. Present INSTEAD of `elements` once the
    *  agent holds a baseline for this page. */
   delta?: PreviewActDelta

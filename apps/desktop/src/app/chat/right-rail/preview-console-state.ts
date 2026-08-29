@@ -35,6 +35,12 @@ export function createPreviewConsoleState() {
   const $open = atom(false)
   const $selectedLogIds = atom<ReadonlySet<number>>(new Set())
   let nextLogId = 0
+  // How much of this console the AGENT has been told about. It lives here
+  // rather than beside the reporter because only this store knows when the log
+  // restarts: both `clear` and `reset` make every later message new again, and
+  // a watermark kept outside could not tell a cleared console from a quiet one
+  // (the count returns to where it was). See preview-console-digest.ts.
+  let reportedId = 0
 
   return {
     $height,
@@ -48,6 +54,7 @@ export function createPreviewConsoleState() {
     clear() {
       $logs.set([])
       $selectedLogIds.set(new Set())
+      reportedId = 0
     },
     clearSelection() {
       if ($selectedLogIds.get().size === 0) {
@@ -56,10 +63,20 @@ export function createPreviewConsoleState() {
 
       $selectedLogIds.set(new Set())
     },
+    /** Everything logged since the agent was last told, and mark it told. */
+    drainUnreported(): ConsoleEntry[] {
+      const logs = $logs.get()
+      const fresh = logs.filter(log => log.id > reportedId)
+
+      reportedId = logs.length > 0 ? logs[logs.length - 1].id : reportedId
+
+      return fresh
+    },
     reset() {
       nextLogId = 0
       $logs.set([])
       $selectedLogIds.set(new Set())
+      reportedId = 0
     },
     setHeight(next: Updater<number>) {
       updateAtom($height, next)

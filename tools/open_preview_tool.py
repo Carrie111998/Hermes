@@ -56,13 +56,29 @@ def open_preview_tool(url: str, label: str = "") -> str:
 OPEN_PREVIEW_SCHEMA = {
     "name": "open_preview",
     "description": (
-        "Open something in the preview pane beside the chat in the Hermes desktop "
-        "app. Use this when the user asks to see a page, dev server, or file in the "
-        "preview pane — e.g. \"open cnn.com in the preview pane\" or \"preview "
-        "localhost:3000\". Accepts a web URL (a bare domain like www.cnn.com is fine), "
-        "a localhost dev-server URL, or a file path (HTML renders live; other files "
-        "show their contents). The pane opens for the current window only. To close "
-        "the pane or a tab, use close_preview."
+        "Open a page in the in-app browser beside this chat — YOUR browser in "
+        "the Hermes desktop app, not just a viewer for the user. Reach for it "
+        "whenever a web page would answer the question or finish the job: "
+        "checking your own work on a dev server, reading documentation, "
+        "verifying a fix rendered, following a link the user pasted. You do "
+        "not need to be asked to open it; if you would benefit from looking at "
+        "a page, open one. Of course also use it when the user asks to see "
+        "something — \"open cnn.com\", \"preview localhost:3000\". "
+        "Accepts a web URL (a bare domain like www.cnn.com is fine), a "
+        "localhost dev-server URL, or a file path (HTML renders live; other "
+        "files show their contents). "
+        "You get your OWN browser tab: opening a page never replaces the tab "
+        "the user is reading, and you keep the same tab as you work, so open "
+        "once and then move around with drive_preview action='navigate'. "
+        "Then read_preview reads the page (including its console errors) and "
+        "drive_preview clicks, types and navigates in it. "
+        "Prefer this over the browser_* tools whenever the user could "
+        "reasonably want to watch, or the page is theirs (a local dev server, "
+        "an app they are building): this pane is visible to them and costs no "
+        "extra browser process. The browser_* tools are for bulk, headless or "
+        "background automation that nobody needs to see. "
+        "The pane opens for the current window only. To close the pane or a "
+        "tab, use close_preview."
     ),
     "parameters": {
         "type": "object",
