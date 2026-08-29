@@ -166,6 +166,40 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_run_id_mismatch_error(task_id: str, kb, conn) -> Optional[str]:
+    """Return a distinct, actionable error when this worker's env run id is
+    stale relative to the task's current DB run id.
+
+    The dispatcher pins ``HERMES_KANBAN_RUN_ID`` at spawn time. When a card
+    is re-claimed (rapid churn, manual reclaim, dependency re-queue), a
+    worker spawned under an older run keeps its env run id while the DB
+    ``current_run_id`` advances — the terminal tools' ``expected_run_id``
+    guard then rejects every call with the generic "unknown id or not in
+    running/ready", the worker exits rc=0 without a terminal call, and the
+    dispatcher records a protocol violation (t_d985491b run-id-skew
+    evidence). Detect that skew here and fail loudly with the real cause so
+    the worker reports it instead of silently crashing.
+    """
+    env_run_id = _worker_run_id(task_id)
+    if env_run_id is None:
+        return None
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        return None
+    db_run_id = task.current_run_id
+    if db_run_id is None or int(db_run_id) == env_run_id:
+        return None
+    return (
+        f"run-id mismatch: this worker's HERMES_KANBAN_RUN_ID={env_run_id} "
+        f"but task {task_id} current DB run is {db_run_id}. The card was "
+        f"re-claimed under a newer run after this worker spawned — this "
+        f"worker's environment is STALE. Do NOT keep calling terminal kanban "
+        f"tools (they will all fail the run-id guard). Report this stale-run "
+        f"error to the operator; the dispatcher/operator must re-dispatch the "
+        f"card with a fresh environment, or reclaim this run first."
+    )
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -765,6 +799,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
+            stale_err = _worker_run_id_mismatch_error(tid, kb, conn)
+            if stale_err:
+                return tool_error(stale_err)
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -864,6 +902,10 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        stale_err = _worker_run_id_mismatch_error(tid, kb, conn)
+        if stale_err:
+            conn.close()
+            return tool_error(stale_err)
         try:
             ok = kb.block_task(
                 conn, tid,
@@ -944,6 +986,9 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
+            stale_err = _worker_run_id_mismatch_error(tid, kb, conn)
+            if stale_err:
+                return tool_error(stale_err)
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,

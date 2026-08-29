@@ -4576,6 +4576,15 @@ def recompute_ready(
        counter would reset on every recovery cycle and the circuit
        breaker could never trip (#35072).
 
+    ``todo`` tasks blocked as ``dependency`` with ZERO parent links are
+    also never auto-promoted (advisory-only hold, t_d985491b churn): the
+    kernel has no durable gate to hold, so re-promoting them re-queues
+    the card to ``ready`` every tick and the dispatcher re-spawns it
+    every ~40s. They rest in ``todo`` until the operator adds a parent
+    edge (``link_tasks`` — then the normal parent-completion gate
+    applies) or explicitly releases them (``promote_task`` /
+    ``hermes kanban promote``).
+
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
     disagree about when a task is permanently blocked:
@@ -4590,12 +4599,13 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, block_kind "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            block_kind = row["block_kind"] if "block_kind" in row.keys() else None
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for explicit human intervention — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4608,6 +4618,15 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
+            # A ``dependency`` block with NO parent links is advisory-only
+            # (see block_task): the kernel has no durable gate to hold, so
+            # auto-promoting here is exactly the t_d985491b churn — the card
+            # was re-queued to ready every tick and re-dispatched every ~40s
+            # because `all()` over zero parents is vacuously True. Park it
+            # until an explicit unblock / promote, or a parent edge is added
+            # (then the normal parent-completion gate below takes over).
+            if block_kind == "dependency" and not parents:
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
@@ -6354,6 +6373,19 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # A dependency block with NO parent link is advisory-only: the
+            # kernel has no durable gate to hold (recompute_ready promotes
+            # when every parent is done — vacuously true for zero parents,
+            # which previously re-queued the card every tick and caused the
+            # t_d985491b 28-run dispatch churn). Flag it loudly so operators
+            # see the block is advisory until a parent edge is added (or the
+            # card is explicitly unblocked); recompute_ready also refuses to
+            # auto-promote these cards (see recompute_ready).
+            parent_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_links WHERE child_id = ?",
+                (task_id,),
+            ).fetchone()["n"]
+            advisory = int(parent_count or 0) == 0
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6385,6 +6417,8 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "source_status": source_status,
+                    "advisory": advisory,
+                    "parent_links": int(parent_count or 0),
                 },
                 run_id=run_id,
             )
@@ -10971,6 +11005,17 @@ def _default_spawn(
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    # Never inherit a stale HERMES_KANBAN_RUN_ID / CLAIM_LOCK from the
+    # dispatcher's own environment (a gateway/daemon that was itself spawned
+    # as a kanban worker, or a process that previously claimed another run,
+    # can leak an old value into every child it spawns). The worker env must
+    # always carry the CURRENT claim's run id — a mismatched run id makes
+    # every terminal kanban tool fail with "unknown id or not in
+    # running/ready" and produces rc=0 protocol-violation crashes
+    # (t_d985491b run-id-skew evidence: env 124143 vs DB current 124146).
+    # Pop first, then set only from the freshly claimed task row.
+    env.pop("HERMES_KANBAN_RUN_ID", None)
+    env.pop("HERMES_KANBAN_CLAIM_LOCK", None)
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:

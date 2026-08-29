@@ -1526,6 +1526,107 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
         )
 
 
+def test_recompute_ready_does_not_promote_dependency_block_without_parent(kanban_home):
+    """A `dependency` block with NO parent link must stay parked in `todo`.
+
+    Regression for the t_d985491b dispatch churn: `block_task(kind=
+    'dependency')` routes to `todo`, and `recompute_ready` used to promote it
+    straight back to `ready` because `all(...)` over zero parents is vacuously
+    True — the dispatcher then re-claimed and re-spawned the card every ~40s
+    (28 runs observed). With no durable parent gate the block is advisory; it
+    must rest until an explicit unblock/promote or a parent edge is added.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="advisory-dep", assignee="worker")
+        kb.claim_task(conn, tid)
+        ok = kb.block_task(
+            conn, tid, kind="dependency", reason="waiting on PR #345 merge"
+        )
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
+        assert task.block_kind == "dependency"
+
+        # No parents → recompute_ready must NOT promote it back to ready.
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "todo"
+
+        # Operator explicit release (documented escape hatch for the
+        # advisory hold) still works.
+        ok, err = kb.promote_task(conn, tid, actor="ops")
+        assert ok is True, err
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Re-block and verify the hold re-engages for the next dispatch
+        # cycle (a fresh worker re-verifying the same unmet gate).
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, kind="dependency", reason="still waiting"
+        ) is True
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "todo"
+
+        # The dependency_wait event must carry the advisory marker so
+        # operators see the block is advisory until a parent edge exists.
+        events = kb.list_events(conn, tid)
+        dep_wait = [e for e in events if e.kind == "dependency_wait"]
+        assert len(dep_wait) == 2  # first block + re-block
+        for ev in dep_wait:
+            payload = ev.payload or {}
+            assert payload.get("advisory") is True
+            assert payload.get("parent_links") == 0
+
+
+def test_recompute_ready_promotes_dependency_block_when_parent_edge_added(kanban_home):
+    """A `dependency` block WITH a parent link follows the normal gate.
+
+    This mirrors the real t_d985491b lifecycle: a card is dependency-blocked
+    with no parent edge (advisory hold — stays parked), then an operator adds
+    the durable parent edge. From then on the normal parent-completion gate
+    applies: parked while the parent is incomplete, promoted once it
+    completes. The advisory check must not break that path.
+    """
+    with kb.connect() as conn:
+        lander = kb.create_task(conn, title="PR #345 lander", assignee="devops")
+        consumer = kb.create_task(conn, title="consumer", assignee="worker")
+        assert kb.get_task(conn, consumer).status == "ready"
+
+        # Worker claims + blocks as dependency while there is NO parent edge.
+        kb.claim_task(conn, consumer)
+        ok = kb.block_task(
+            conn, consumer, kind="dependency", reason="waiting on lander"
+        )
+        assert ok is True
+        assert kb.get_task(conn, consumer).status == "todo"
+
+        # No parent edge yet → advisory hold; recompute_ready must NOT
+        # re-promote (the t_d985491b churn regression).
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, consumer).status == "todo"
+
+        # Operator adds the durable parent edge (the PM's kanban_link fix).
+        kb.link_tasks(conn, lander, consumer)
+        # Parent not done → still parked.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, consumer).status == "todo"
+
+        # Parent done → promoted through the normal parent gate. complete_task
+        # itself calls recompute_ready for dependents, so the child is already
+        # ready when complete returns; a bare recompute_ready then promotes 0.
+        kb.complete_task(conn, lander)
+        assert kb.get_task(conn, consumer).status == "ready"
+
+        # The advisory marker reflects block time (no edge existed yet) —
+        # it stays True even after the operator added the edge later.
+        events = kb.list_events(conn, consumer)
+        dep_wait = [e for e in events if e.kind == "dependency_wait"]
+        assert len(dep_wait) == 1
+        payload = dep_wait[0].payload or {}
+        assert payload.get("advisory") is True
+        assert payload.get("parent_links") == 0
+
+
 
 # ---------------------------------------------------------------------------
 # _add_column_if_missing / _migrate_add_optional_columns idempotency (#21708)
