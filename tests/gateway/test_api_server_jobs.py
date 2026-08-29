@@ -122,6 +122,8 @@ class TestCreateJob:
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
+                    "reasoning_effort": "high",
+                    "routing_slot": "critical",
                 }, headers={
                     "X-Forwarded-For": "203.0.113.11",
                     "User-Agent": "cron-client",
@@ -138,6 +140,8 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+                assert call_kwargs["reasoning_effort"] == "high"
+                assert call_kwargs["routing_slot"] == "critical"
 
 
     @pytest.mark.asyncio
@@ -230,6 +234,8 @@ class TestUpdateJob:
                     f"/api/jobs/{VALID_JOB_ID}",
                     json={
                         "name": "new-name",
+                        "reasoning_effort": "xhigh",
+                        "routing_slot": "synthesis",
                         "evil_field": "malicious",
                         "__proto__": "hack",
                     },
@@ -238,6 +244,8 @@ class TestUpdateJob:
                 call_args = mock_update.call_args
                 sanitized = call_args[0][1]
                 assert "name" in sanitized
+                assert sanitized["reasoning_effort"] == "xhigh"
+                assert sanitized["routing_slot"] == "synthesis"
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
 

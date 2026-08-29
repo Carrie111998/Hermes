@@ -63,7 +63,15 @@ describe('cronEditorUpdates', () => {
   it('omits prompt when saving a script-only job with an empty prompt', () => {
     expect(
       cronEditorUpdates(
-        { deliver: 'local', model: '', name: 'Weekly', prompt: '', provider: '', schedule: '0 9 * * 1' },
+        {
+          deliver: 'local',
+          model: '',
+          name: 'Weekly',
+          prompt: '',
+          provider: '',
+          routingSlot: '',
+          schedule: '0 9 * * 1'
+        },
         { scriptOnlyJob: true }
       )
     ).toEqual({
@@ -76,7 +84,15 @@ describe('cronEditorUpdates', () => {
   it('includes prompt when the user typed one on a script-only job', () => {
     expect(
       cronEditorUpdates(
-        { deliver: 'email', model: '', name: 'Weekly', prompt: 'note', provider: '', schedule: '0 9 * * 1' },
+        {
+          deliver: 'email',
+          model: '',
+          name: 'Weekly',
+          prompt: 'note',
+          provider: '',
+          routingSlot: '',
+          schedule: '0 9 * * 1'
+        },
         { scriptOnlyJob: true }
       ).prompt
     ).toBe('note')
@@ -90,6 +106,7 @@ describe('cronEditorUpdates', () => {
         name: 'Daily',
         prompt: 'go',
         provider: 'anthropic',
+        routingSlot: 'synthesis',
         schedule: '0 9 * * *'
       },
       { scriptOnlyJob: false }
@@ -97,25 +114,44 @@ describe('cronEditorUpdates', () => {
 
     expect(updates.model).toBe('claude-sonnet-4')
     expect(updates.provider).toBe('anthropic')
+    expect(updates.routing_slot).toBe('synthesis')
   })
 
   it('clears a previous pin when the override is reset to default', () => {
     const updates = cronEditorUpdates(
-      { deliver: 'local', model: '', name: 'Daily', prompt: 'go', provider: '', schedule: '0 9 * * *' },
+      {
+        deliver: 'local',
+        model: '',
+        name: 'Daily',
+        prompt: 'go',
+        provider: '',
+        routingSlot: '',
+        schedule: '0 9 * * *'
+      },
       { scriptOnlyJob: false }
     )
 
     expect(updates.model).toBe(null)
     expect(updates.provider).toBe(null)
+    expect(updates.routing_slot).toBe(null)
   })
 
   it('never touches model fields on script-only jobs', () => {
     const updates = cronEditorUpdates(
-      { deliver: 'local', model: 'x', name: 'Weekly', prompt: '', provider: 'y', schedule: '0 9 * * 1' },
+      {
+        deliver: 'local',
+        model: 'x',
+        name: 'Weekly',
+        prompt: '',
+        provider: 'y',
+        routingSlot: 'critical',
+        schedule: '0 9 * * 1'
+      },
       { scriptOnlyJob: true }
     )
 
     expect('model' in updates).toBe(false)
     expect('provider' in updates).toBe(false)
+    expect('routing_slot' in updates).toBe(false)
   })
 })

@@ -42,6 +42,8 @@ export interface CronEditorSaveValues {
   prompt: string
   /** Provider for the model override ('' = none). Always paired with model. */
   provider: string
+  /** Optional capability slot override ('' = deterministic classifier). */
+  routingSlot: string
   schedule: string
 }
 
@@ -89,6 +91,7 @@ export function cronEditorUpdates(values: CronEditorSaveValues, options: { scrip
   if (!options.scriptOnlyJob) {
     updates.model = values.model.trim() || null
     updates.provider = values.provider.trim() || null
+    updates.routing_slot = values.routingSlot.trim() || null
   }
 
   return updates

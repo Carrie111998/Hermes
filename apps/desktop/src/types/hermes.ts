@@ -856,6 +856,9 @@ export interface CronJob {
   no_agent?: boolean
   prompt?: null | string
   provider?: null | string
+  reasoning_effort?: null | string
+  routing?: Record<string, unknown>
+  routing_slot?: null | string
   schedule?: CronJobSchedule
   schedule_display?: null | string
   script?: null | string
@@ -868,6 +871,8 @@ export interface CronJobCreatePayload {
   name?: string
   prompt: string
   provider?: string
+  reasoning_effort?: string
+  routing_slot?: string
   schedule: string
 }
 
@@ -884,6 +889,8 @@ export interface CronJobUpdates {
   name?: string
   prompt?: string
   provider?: null | string
+  reasoning_effort?: null | string
+  routing_slot?: null | string
   schedule?: string
 }
 
