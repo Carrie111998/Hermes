@@ -61,7 +61,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import get_fallback_chain, fallback_enabled
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -2507,6 +2507,11 @@ def _try_resolve_fallback_provider() -> dict | None:
         # root-model normalization now reach the fallback chain too (a raw
         # read here used to miss administrator-pinned fallback_providers).
         cfg = _load_gateway_runtime_config()
+        # Manual mode (master kill-switch): forbid the pre-agent auth fallback —
+        # a primary credential failure must surface, not silently resolve onto a
+        # fallback provider before the agent is even built.
+        if not fallback_enabled(cfg):
+            return None
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _normalized_base_url(value: Any) -> str:
@@ -77,6 +81,100 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+# Master fallback kill-switch default.
+#
+# True keeps the historical behaviour (automatic provider/model fallback is
+# allowed) so existing suites and installs are unaffected when the
+# ``fallback.enabled`` key is absent. A deployment can set
+# ``fallback.enabled: false`` explicitly to run in manual mode — no silent
+# provider/model route change anywhere. To make manual mode the hard default
+# for ALL installs, flip this single constant to False.
+_FALLBACK_ENABLED_DEFAULT = True
+
+_FALSE_TOKENS = {"0", "false", "no", "off", "n", "f"}
+_TRUE_TOKENS = {"1", "true", "yes", "on", "y", "t"}
+
+
+def fallback_enabled(config: dict[str, Any] | None) -> bool:
+    """Return whether automatic provider/model fallback is permitted.
+
+    This is the single source of truth for the fallback master kill-switch.
+    When it returns ``False`` (manual mode), NO automatic route change may
+    occur at any layer — top-level chain, auxiliary fallback, summarizer to
+    main, or pre-agent auth fallback. Recovery is user-driven only (retry /
+    ``/model`` / an explicit handoff).
+
+    Default is :data:`_FALLBACK_ENABLED_DEFAULT` (True) when the key is absent
+    or malformed; scalar values are coerced leniently (bool / int / common
+    yes-no strings).
+    """
+
+    # Defensive: a non-dict config (e.g. a loader/plugin returning a bare
+    # string or int) must NOT raise here — this runs on the hot construction
+    # path for every implicit agent. Treat anything that is not a mapping as
+    # "key absent" -> historical default.
+    if not isinstance(config, dict):
+        return _FALLBACK_ENABLED_DEFAULT
+    fb = config.get("fallback")
+    if not isinstance(fb, dict) or "enabled" not in fb:
+        return _FALLBACK_ENABLED_DEFAULT
+
+    val = fb.get("enabled")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        word = val.strip().lower()
+        if word in _FALSE_TOKENS:
+            return False
+        if word in _TRUE_TOKENS:
+            return True
+    return _FALLBACK_ENABLED_DEFAULT
+
+
+def resolve_fallback_enabled_default() -> bool:
+    """Resolve the master fallback policy from the active config.
+
+    Used as the construction-time default whenever an agent is built WITHOUT an
+    explicit ``fallback_enabled`` (sentinel ``None``). This makes manual mode
+    fail-safe across every construction site (gateway, CLI, one-shot, cron,
+    TUI, background jobs, sub-agents and platform adapters) instead of silently
+    defaulting to fallback-ON the moment a call-site forgets to thread the flag
+    through.
+
+    A config-load failure is logged loudly (never silently swallowed — this is
+    a safety-critical path) and falls back to the historical default so a
+    transient read error cannot hard-break startup. ``default True`` therefore
+    applies only to a correctly loaded config whose ``fallback.enabled`` key is
+    absent, matching :func:`fallback_enabled`.
+    """
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        if not isinstance(cfg, dict):
+            # A loader/plugin/test-double returning a non-mapping must not crash
+            # every implicit agent construction — log the type and default.
+            logger.warning(
+                "fallback policy: load_config returned %s, not a mapping; "
+                "defaulting fallback.enabled=%s",
+                type(cfg).__name__,
+                _FALLBACK_ENABLED_DEFAULT,
+            )
+            return _FALLBACK_ENABLED_DEFAULT
+    except Exception as exc:  # pragma: no cover - defensive, exercised via test
+        logger.warning(
+            "fallback policy: could not load config (%s); defaulting "
+            "fallback.enabled=%s",
+            exc,
+            _FALLBACK_ENABLED_DEFAULT,
+        )
+        return _FALLBACK_ENABLED_DEFAULT
+    return fallback_enabled(cfg)
+
+
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 
@@ -86,7 +184,8 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     The returned list always contains fresh dict copies.
     """
 
-    config = config or {}
+    if not isinstance(config, dict):
+        config = {}
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
