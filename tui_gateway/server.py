@@ -26,7 +26,6 @@ from agent.secret_scope import (
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
-    assert_named_profile_home_live,
     get_hermes_home,
     get_hermes_home_override,
     reset_hermes_home_override,
@@ -2290,6 +2289,8 @@ def _transfer_db_to_agent(agent, db) -> bool:
 
 def _require_existing_profile_home(profile_home: str | Path) -> Path:
     """Resolve a live profile home without recreating a deleted profile."""
+    from hermes_constants import assert_named_profile_home_live
+
     path = Path(profile_home)
     try:
         assert_named_profile_home_live(path)
