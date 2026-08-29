@@ -2960,6 +2960,48 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+def _batch_model_rejection_notice(results, model):
+    """Config-level notice lines when a batch died on a rejected model id.
+
+    A typo'd ``delegation.model`` slug makes every subagent abort within a
+    second with the provider's rejection text as its summary, while the
+    per-task blocks keep labelling it ``status=completed`` + TRUNCATED — the
+    config-level cause stays buried in the batch dump (#97654). A task counts
+    as a rejection hit only when its summary/error text both names the
+    configured delegation model id and matches a ``model_not_found`` pattern
+    from ``agent.error_classifier`` (the same classification the failover
+    path consumes), so incidental prose about other models never triggers it.
+    """
+    if not results or not isinstance(model, str):
+        return None
+    model_l = model.strip().lower()
+    if not model_l or model_l == "?":
+        return None
+    from agent.error_classifier import _MODEL_NOT_FOUND_PATTERNS
+
+    hits = 0
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        text = " ".join(
+            str(r.get(k) or "") for k in ("summary", "error")
+        ).lower()
+        if text and model_l in text and any(p in text for p in _MODEL_NOT_FOUND_PATTERNS):
+            hits += 1
+    if not hits:
+        return None
+    return [
+        "",
+        f"⚠ SUBAGENT MODEL REJECTED: the configured Subagent Model \"{model}\" "
+        "was rejected by the provider (model_not_found). "
+        f"{hits}/{len(results)} task(s) in this batch failed for this "
+        "reason before doing any work — the per-task blocks below repeat "
+        "the same rejection once per task. Check the Subagent Model setting "
+        "(Settings → Advanced, or `hermes config get delegation.model`) and "
+        "re-dispatch.",
+    ]
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -3018,6 +3060,10 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
             return "\n".join(lines)
+        # Config-level rejection notice BEFORE the per-task wall — a rejected
+        # delegation model fails every task identically before doing any
+        # work, and that signal must not stay buried in the task blocks.
+        lines.extend(_batch_model_rejection_notice(results, model) or [])
         for r in sorted(results, key=lambda x: x.get("task_index", 0)):
             idx = r.get("task_index", 0)
             r_status = r.get("status", "?")
