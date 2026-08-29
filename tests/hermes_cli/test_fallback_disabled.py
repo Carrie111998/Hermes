@@ -25,8 +25,13 @@ class TestFallbackEnabledResolver:
         assert fc.fallback_enabled(None) is True
         assert fc.fallback_enabled({}) is True
 
-    def test_explicit_false_disables(self):
-        assert fc.fallback_enabled({"fallback": {"enabled": False}}) is False
+    def test_explicit_false_disables(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert fc.fallback_enabled({"fallback": {"enabled": False}}) is False
+            assert fc.fallback_enabled({"fallback": {"enabled": "false"}}) is False
+        # A recognized value must resolve silently — the unrecognized-value
+        # warning must not fire on the hot construction path's happy paths.
+        assert not caplog.records
 
     def test_explicit_true_enables(self):
         assert fc.fallback_enabled({"fallback": {"enabled": True}}) is True
@@ -40,6 +45,23 @@ class TestFallbackEnabledResolver:
     )
     def test_scalar_coercion(self, raw, expected):
         assert fc.fallback_enabled({"fallback": {"enabled": raw}}) is expected
+
+    def test_unrecognized_nonempty_string_warns_and_defaults(self, caplog):
+        # A typo'd switch (e.g. "disbled") must not silently keep fallback on
+        # without a trace — it defaults True but logs a visible warning.
+        with caplog.at_level(logging.WARNING):
+            assert fc.fallback_enabled({"fallback": {"enabled": "disbled"}}) is True
+        assert any(
+            "not a recognized boolean" in r.getMessage() for r in caplog.records
+        )
+
+    def test_blank_string_defaults_quietly(self, caplog):
+        # An empty / whitespace value is treated as "unset" — default, no noise.
+        with caplog.at_level(logging.WARNING):
+            assert fc.fallback_enabled({"fallback": {"enabled": "   "}}) is True
+        assert not any(
+            "recognized boolean" in r.getMessage() for r in caplog.records
+        )
 
     def test_malformed_fallback_key_defaults_true(self):
         assert fc.fallback_enabled({"fallback": "nonsense"}) is True

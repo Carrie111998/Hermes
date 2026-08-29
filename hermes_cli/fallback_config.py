@@ -111,7 +111,9 @@ def fallback_enabled(config: dict[str, Any] | None) -> bool:
 
     Default is :data:`_FALLBACK_ENABLED_DEFAULT` (True) when the key is absent
     or malformed; scalar values are coerced leniently (bool / int / common
-    yes-no strings).
+    yes-no strings). A non-empty string that is not a recognized boolean logs
+    a warning before returning the default, so a typo'd switch is visible
+    instead of silently keeping fallback on.
     """
 
     # Defensive: a non-dict config (e.g. a loader/plugin returning a bare
@@ -135,6 +137,18 @@ def fallback_enabled(config: dict[str, Any] | None) -> bool:
             return False
         if word in _TRUE_TOKENS:
             return True
+        if word:
+            # A non-empty value that is neither true- nor false-like is a
+            # misconfiguration. For a safety switch, silently keeping the
+            # historical default (fallback ON) is exactly the surprise an
+            # operator does not want, so make it visible instead of guessing.
+            logger.warning(
+                "fallback.enabled=%r is not a recognized boolean "
+                "(expected one of true/false/yes/no/on/off/1/0); keeping the "
+                "default fallback.enabled=%s — fix the value to silence this.",
+                val,
+                _FALLBACK_ENABLED_DEFAULT,
+            )
     return _FALLBACK_ENABLED_DEFAULT
 
 
