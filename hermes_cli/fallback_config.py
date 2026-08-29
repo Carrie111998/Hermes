@@ -87,8 +87,9 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
 # allowed) so existing suites and installs are unaffected when the
 # ``fallback.enabled`` key is absent. A deployment can set
 # ``fallback.enabled: false`` explicitly to run in manual mode — no silent
-# provider/model route change anywhere. To make manual mode the hard default
-# for ALL installs, flip this single constant to False.
+# provider/model route change at the call-sites that consult this flag. To
+# make manual mode the hard default for ALL installs, flip this single
+# constant to False.
 _FALLBACK_ENABLED_DEFAULT = True
 
 _FALSE_TOKENS = {"0", "false", "no", "off", "n", "f"}
@@ -98,11 +99,15 @@ _TRUE_TOKENS = {"1", "true", "yes", "on", "y", "t"}
 def fallback_enabled(config: dict[str, Any] | None) -> bool:
     """Return whether automatic provider/model fallback is permitted.
 
-    This is the single source of truth for the fallback master kill-switch.
-    When it returns ``False`` (manual mode), NO automatic route change may
-    occur at any layer — top-level chain, auxiliary fallback, summarizer to
-    main, or pre-agent auth fallback. Recovery is user-driven only (retry /
-    ``/model`` / an explicit handoff).
+    This is the single source of truth for the fallback master kill-switch:
+    the policy signal that automatic-routing call-sites consult before
+    changing provider/model. ``False`` means manual mode — recovery is
+    user-driven only (retry / ``/model`` / an explicit handoff).
+
+    It is currently consulted by the gateway's pre-agent auth fallback
+    (``_try_resolve_fallback_provider``). The other automatic-routing layers
+    (top-level chain, auxiliary fallback, summarizer-to-main) are expected to
+    consult the same flag as each of those call-sites is wired up.
 
     Default is :data:`_FALLBACK_ENABLED_DEFAULT` (True) when the key is absent
     or malformed; scalar values are coerced leniently (bool / int / common

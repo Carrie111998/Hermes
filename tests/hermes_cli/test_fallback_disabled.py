@@ -1,7 +1,8 @@
 """Master fallback kill-switch: policy readers in ``hermes_cli.fallback_config``.
 
-Manual mode: when ``fallback.enabled`` is false, NO automatic provider/model
-route change happens anywhere. The resolver default is True for backward
+Manual mode: when ``fallback.enabled`` is false, the call-sites that consult
+this flag make no automatic provider/model route change. The resolver default
+is True for backward
 compatibility with the historical behaviour and the existing test suite;
 a deployment sets ``fallback.enabled: false`` explicitly to opt in. Flipping
 the module default to False is a one-line change.
