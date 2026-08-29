@@ -64,3 +64,43 @@ class TestMem0WriteGate:
         provider = _provider("some-future-context")
         assert provider._write_enabled is True
         assert len(_sync_and_wait(provider)) == 1
+
+    def test_flag_is_reset_per_initialize_on_a_reused_instance(self):
+        """The flag lives on the instance, so a provider reused across sessions
+        must re-derive it from each initialize() rather than keep the old value.
+        """
+        provider = Mem0MemoryProvider()
+
+        provider.initialize("session-cron", agent_context="cron")
+        provider._user_id = "u123"
+        provider._agent_id = "hermes"
+        provider._backend = RecordingBackend()
+        assert provider._write_enabled is False
+        assert _sync_and_wait(provider) == []
+
+        # Same instance, now serving an owner conversation.
+        provider.initialize("session-primary", agent_context="primary")
+        provider._user_id = "u123"
+        provider._agent_id = "hermes"
+        provider._backend = RecordingBackend()
+        assert provider._write_enabled is True
+        assert len(_sync_and_wait(provider)) == 1
+
+        # ...and back again, so the flag is not sticky in either direction.
+        provider.initialize("session-subagent", agent_context="subagent")
+        provider._backend = RecordingBackend()
+        assert provider._write_enabled is False
+        assert _sync_and_wait(provider) == []
+
+    def test_gated_skip_is_logged(self, caplog):
+        """A silently dropped capture is hard to diagnose when the operator
+        expected memory writes, so the skip carries a debug line.
+        """
+        import logging
+        provider = _provider("cron")
+        with caplog.at_level(logging.DEBUG, logger="plugins.memory.mem0"):
+            _sync_and_wait(provider)
+        assert any(
+            "automatic capture skipped" in r.message and "cron" in r.getMessage()
+            for r in caplog.records
+        )
