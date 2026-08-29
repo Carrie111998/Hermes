@@ -2208,6 +2208,43 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
         self.assertEqual(mentions[0].open_id, "ou_alice")
 
 
+class TestFeishuReplyAnchors(unittest.TestCase):
+    def test_threaded_reply_prefers_the_current_message(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, _reply_anchor_for_event
+        from gateway.session import SessionSource
+
+        event = MessageEvent(
+            text="Can you read this?",
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_chat",
+                thread_id="omt_topic",
+            ),
+            message_id="om_current",
+            reply_to_message_id="om_quoted",
+        )
+
+        self.assertEqual(_reply_anchor_for_event(event), "om_current")
+
+    def test_threaded_reply_falls_back_to_the_quote_without_a_current_message(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, _reply_anchor_for_event
+        from gateway.session import SessionSource
+
+        event = MessageEvent(
+            text="Resumed reply",
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_chat",
+                thread_id="omt_topic",
+            ),
+            reply_to_message_id="om_quoted",
+        )
+
+        self.assertEqual(_reply_anchor_for_event(event), "om_quoted")
+
+
 class TestFeishuProcessInboundMessage(unittest.TestCase):
     def _build_adapter(self):
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -2226,6 +2263,40 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
         return adapter
+
+
+    def test_replying_to_a_message_keeps_the_current_message_as_reply_anchor(self):
+        """A quote supplies context, but must not steal the bot's reply anchor."""
+        adapter = self._build_adapter()
+        message = SimpleNamespace(
+            content=json.dumps({"text": "Can you read this?"}),
+            message_type="text",
+            message_id="om_current",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id="om_quoted",
+            upper_message_id=None,
+            root_id="om_root",
+            thread_id="omt_topic",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_current",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.message_id, "om_current")
+        self.assertEqual(event.reply_to_message_id, "om_quoted")
+        self.assertEqual(
+            adapter.build_source.call_args.kwargs["message_id"],
+            "om_current",
+        )
 
 
     def test_non_command_message_with_mentions_injects_hint(self):

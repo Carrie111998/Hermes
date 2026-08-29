@@ -201,8 +201,11 @@ def _reply_anchor_for_event(event) -> str | None:
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu" and thread_id:
+        # Keep the reply inside the topic via thread metadata, but anchor it to
+        # the newest user message. A quoted parent remains only a recovery
+        # fallback when a synthetic/resumed event has no current message ID.
+        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
 
 
