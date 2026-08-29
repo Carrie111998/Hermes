@@ -38,11 +38,15 @@ export function reduceMoaProgress(
   if (eventType === 'moa.phase' && payload?.phase === 'reference' && Array.isArray(payload.advisors)) {
     const concurrency = Math.max(0, Math.min(Number(payload.concurrency) || 0, payload.advisors.length))
     const reused = payload.guidance_reused === true
+    const preserveGuidance = reused ? previous : undefined
 
     return {
       advisors: payload.advisors.map((label, offset) => ({
         index: offset + 1,
         label: String(label),
+        ...(preserveGuidance?.advisors[offset]?.output !== undefined && {
+          output: preserveGuidance.advisors[offset].output
+        }),
         status: reused ? 'complete' : offset < concurrency ? 'running' : 'queued'
       })),
       aggregator: String(payload.aggregator || ''),
@@ -50,7 +54,7 @@ export function reduceMoaProgress(
       fanout: String(payload.fanout || 'user_turn'),
       guidanceReused: reused,
       phase: 'reference',
-      startedAt: occurredAt
+      startedAt: preserveGuidance?.startedAt ?? occurredAt
     }
   }
 

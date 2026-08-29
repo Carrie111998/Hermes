@@ -18,6 +18,7 @@ real provider.
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -160,6 +161,61 @@ def test_moa_progress_reports_failed_slot_without_reordering(moa_config, monkeyp
     assert progress[2]["status"] == "failed"
     assert progress[1]["status"] == "complete"
     assert progress[3]["status"] == "complete"
+
+
+def test_moa_progress_emits_later_slot_while_earlier_slot_is_running(monkeypatch):
+    """A settled future updates its stable slot before the whole batch finishes."""
+    from agent import moa_loop
+
+    monkeypatch.setattr(moa_loop, "get_transport", lambda *_args, **_kwargs: None)
+    first_started = threading.Event()
+    later_started = threading.Event()
+    release_first = threading.Event()
+    release_later = threading.Event()
+    later_reported = threading.Event()
+    errors: list[BaseException] = []
+
+    def fake_call_llm(**kwargs):
+        if kwargs["provider"] == "first":
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        else:
+            later_started.set()
+            assert release_later.wait(timeout=5)
+        return _response(f"advice from {kwargs['provider']}")
+
+    def progress(_done, _total, _label, index, status):
+        if index == 2 and status == "complete":
+            later_reported.set()
+
+    def run_fanout():
+        try:
+            moa_loop._run_references_parallel(
+                [
+                    {"provider": "first", "model": "slow"},
+                    {"provider": "later", "model": "fast"},
+                ],
+                [{"role": "user", "content": "review"}],
+                progress_callback=progress,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    worker = threading.Thread(target=run_fanout)
+    worker.start()
+    try:
+        assert first_started.wait(timeout=5)
+        assert later_started.wait(timeout=5)
+        release_later.set()
+        assert later_reported.wait(timeout=2)
+        assert not release_first.is_set()
+    finally:
+        release_first.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
 
 
 

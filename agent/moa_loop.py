@@ -13,7 +13,7 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as _futures_wait
 from types import SimpleNamespace
 from typing import Any
 
@@ -904,12 +904,16 @@ def _run_references_parallel(
             ] = idx
 
         # Collect every reference before returning — the aggregator needs the
-        # complete set, so there is no early-exit / first-completed path
-        # here, other than a user interrupt. Progress callbacks fire as each
-        # reference completes so frontends can render "MOA: k/n refs done".
+        # complete set, so there is no early return other than a user interrupt.
+        # Wake on each completion so frontends can update that stable advisor
+        # slot immediately; the timeout still bounds interrupt polling.
         pending = set(futures)
         while pending:
-            done, pending = _futures_wait(pending, timeout=_REFERENCE_POLL_INTERVAL_S)
+            done, pending = _futures_wait(
+                pending,
+                timeout=_REFERENCE_POLL_INTERVAL_S,
+                return_when=FIRST_COMPLETED,
+            )
             for future in done:
                 idx = futures[future]
                 results[idx] = future.result()

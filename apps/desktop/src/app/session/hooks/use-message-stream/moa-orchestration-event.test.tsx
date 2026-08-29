@@ -106,9 +106,33 @@ describe('structured MoA orchestration stream', () => {
     expect(state().phase).toBe('settled')
   })
 
-  it('distinguishes cached guidance reuse from a fresh fan-out', () => {
+  it('preserves advisor guidance and timing when a later iteration reuses the cache', () => {
     mountStream()
     emit('message.start')
+    emit('moa.phase', {
+      advisors: ['model-a', 'model-b'],
+      aggregator: 'agg-model',
+      concurrency: 2,
+      fanout: 'every_n:3',
+      guidance_reused: false,
+      phase: 'reference',
+      refs_done: 0,
+      refs_total: 2
+    })
+    emit('moa.progress', { index: 1, label: 'model-a', refs_done: 1, refs_total: 2, status: 'complete' })
+    emit('moa.reference', { count: 2, index: 1, label: 'model-a', text: 'first advisor guidance' })
+    emit('moa.progress', { index: 2, label: 'model-b', refs_done: 2, refs_total: 2, status: 'complete' })
+    emit('moa.reference', { count: 2, index: 2, label: 'model-b', text: 'second advisor guidance' })
+    emit('moa.phase', {
+      aggregator: 'agg-model',
+      guidance_reused: false,
+      phase: 'aggregator',
+      refs_done: 2,
+      refs_total: 2
+    })
+
+    const startedAt = state().startedAt
+
     emit('moa.phase', {
       advisors: ['model-a', 'model-b'],
       aggregator: 'agg-model',
@@ -119,8 +143,21 @@ describe('structured MoA orchestration stream', () => {
       refs_done: 2,
       refs_total: 2
     })
+    emit('moa.phase', {
+      aggregator: 'agg-model',
+      guidance_reused: true,
+      phase: 'aggregator',
+      refs_done: 2,
+      refs_total: 2
+    })
 
-    expect(state()).toMatchObject({ fanout: 'every_n:3', guidanceReused: true, phase: 'reference' })
-    expect(state().advisors.every(advisor => advisor.status === 'complete')).toBe(true)
+    expect(state()).toMatchObject({ fanout: 'every_n:3', guidanceReused: true, phase: 'aggregating', startedAt })
+    expect(state().advisors).toMatchObject([
+      { output: 'first advisor guidance', status: 'complete' },
+      { output: 'second advisor guidance', status: 'complete' }
+    ])
+
+    emit('message.complete', { text: 'final answer' })
+    expect(state()).toMatchObject({ guidanceReused: true, phase: 'settled', startedAt })
   })
 })

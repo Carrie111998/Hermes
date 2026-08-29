@@ -85,8 +85,8 @@ export function MoaOrchestration({ state }: { state: MoaProgressState }) {
         ? 'guidance reused'
         : `${settled}/${total} advisors in parallel → aggregator waiting`
       : state.phase === 'aggregating'
-        ? `${total}/${total} advisors → aggregator acting`
-        : `${total} advisors → ${state.aggregator || 'aggregator'}${duration === null ? '' : ` · ${formatElapsed(duration)}`}`
+        ? `${total}/${total} advisors${state.guidanceReused ? ' · guidance reused' : ''} → aggregator acting`
+        : `${total} advisors${state.guidanceReused ? ' · guidance reused' : ''} → ${state.aggregator || 'aggregator'}${duration === null ? '' : ` · ${formatElapsed(duration)}`}`
   const accessible = `Mixture of Agents. ${phaseCopy}.${failed ? ` ${failed} failed.` : ''}${interrupted ? ` ${interrupted} interrupted.` : ''}`
 
   return (

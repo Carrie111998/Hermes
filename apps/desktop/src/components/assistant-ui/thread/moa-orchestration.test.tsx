@@ -56,4 +56,10 @@ describe('MoaOrchestration', () => {
     expect(screen.getByTestId('thinking-orb').textContent).toBe('breathing')
     expect(screen.queryByText('parallel')).toBeNull()
   })
+
+  it.each(['aggregating', 'settled'] as const)('keeps cache reuse visible while %s', phase => {
+    render(<MoaOrchestration state={{ ...liveState, guidanceReused: true, phase }} />)
+
+    expect(screen.getByLabelText(/guidance reused/i)).not.toBeNull()
+  })
 })
