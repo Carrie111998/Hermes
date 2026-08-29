@@ -156,7 +156,7 @@ class SelfHostedBackend(Mem0Backend):
 class OSSBackend(Mem0Backend):
     """Wraps mem0.Memory for self-hosted (OSS) mode."""
 
-    def __init__(self, oss_config: dict):
+    def __init__(self, oss_config: dict, hermes_home: str | None = None):
         import os
         from mem0 import Memory
 
@@ -203,6 +203,20 @@ class OSSBackend(Mem0Backend):
             "embedder": _provider_block("embedder"),
             "version": "v1.1",
         }
+        # mem0ai derives history_db_path from MEM0_DIR or the native home at
+        # import time, so every profile in the process would share one
+        # history.db of raw recent messages (#97923). Scope it to the active
+        # Hermes profile unless the operator pinned an explicit path — via the
+        # oss config block or MEM0_DIR, which the SDK honors as its own
+        # default. mem0ai's SQLiteManager does not create parent directories,
+        # so the profile-local one must exist before Memory opens the db.
+        explicit_history_db = oss_config.get("history_db_path")
+        if explicit_history_db:
+            config["history_db_path"] = explicit_history_db
+        elif hermes_home and not os.environ.get("MEM0_DIR"):
+            history_dir = os.path.join(hermes_home, "mem0")
+            os.makedirs(history_dir, exist_ok=True)
+            config["history_db_path"] = os.path.join(history_dir, "history.db")
         self._memory = Memory.from_config(config)
 
     @staticmethod

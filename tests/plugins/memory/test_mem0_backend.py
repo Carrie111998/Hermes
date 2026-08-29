@@ -153,6 +153,100 @@ class TestOSSBackend:
         assert raw == before
 
 
+def _oss_test_config(tmp_path):
+    """Minimal OSS config: local qdrant under tmp, offline-capable providers."""
+    return {
+        "llm": {"provider": "openai", "config": {"model": "gpt-5-mini", "api_key": "sk-test"}},
+        "embedder": {"provider": "openai", "config": {"model": "text-embedding-3-small", "api_key": "sk-test"}},
+        "vector_store": {"provider": "qdrant", "config": {"path": str(tmp_path / "vs")}},
+    }
+
+
+class TestOSSHistoryDbScoping:
+    """#97923: OSS history.db must land under the active Hermes profile, with
+    operator-pinned paths (oss config key or MEM0_DIR) left to the SDK."""
+
+    def _stub_mem0(self, monkeypatch):
+        import sys
+        import types
+
+        captured = {}
+
+        class Memory:
+            @staticmethod
+            def from_config(config):
+                captured.update(config)
+                return FakeOSSMemory()
+
+        stub_mem0 = types.ModuleType("mem0")
+        stub_mem0.Memory = Memory  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mem0", stub_mem0)
+        return captured
+
+    def test_history_db_scoped_to_hermes_home(self, monkeypatch, tmp_path):
+        captured = self._stub_mem0(monkeypatch)
+        monkeypatch.delenv("MEM0_DIR", raising=False)
+        OSSBackend(_oss_test_config(tmp_path), hermes_home=str(tmp_path / "alpha"))
+        assert captured["history_db_path"] == str(tmp_path / "alpha" / "mem0" / "history.db")
+        # mem0ai's SQLiteManager does not create parent dirs; the fix must.
+        assert (tmp_path / "alpha" / "mem0").is_dir()
+
+    def test_history_db_not_injected_without_hermes_home(self, monkeypatch, tmp_path):
+        captured = self._stub_mem0(monkeypatch)
+        monkeypatch.delenv("MEM0_DIR", raising=False)
+        OSSBackend(_oss_test_config(tmp_path))
+        assert "history_db_path" not in captured
+
+    def test_mem0_dir_env_keeps_sdk_default(self, monkeypatch, tmp_path):
+        captured = self._stub_mem0(monkeypatch)
+        monkeypatch.setenv("MEM0_DIR", str(tmp_path / "pinned"))
+        OSSBackend(_oss_test_config(tmp_path), hermes_home=str(tmp_path / "alpha"))
+        # Operator pinned MEM0_DIR: the SDK default (<MEM0_DIR>/history.db) wins.
+        assert "history_db_path" not in captured
+
+    def test_explicit_config_path_wins(self, monkeypatch, tmp_path):
+        captured = self._stub_mem0(monkeypatch)
+        monkeypatch.delenv("MEM0_DIR", raising=False)
+        raw = _oss_test_config(tmp_path)
+        raw["history_db_path"] = str(tmp_path / "pinned" / "custom.db")
+        OSSBackend(raw, hermes_home=str(tmp_path / "alpha"))
+        assert captured["history_db_path"] == str(tmp_path / "pinned" / "custom.db")
+
+
+class TestOSSHistoryDbRealSDK:
+    """#97923 integration: two profiles sharing one native HOME must get
+    distinct history.db files from the real pinned mem0ai SDK.
+
+    Skipped unless the ``mem0`` extra is installed (CI runs the stubbed
+    tests above; this runs wherever mem0ai==2.0.10 is available)."""
+
+    def test_two_profiles_get_distinct_history_dbs(self, monkeypatch, tmp_path):
+        # Keep the SDK's import-time side effects (native ~/.mem0 dir,
+        # telemetry store) inside the test sandbox.
+        monkeypatch.setenv("HOME", str(tmp_path / "native-home"))
+        monkeypatch.setenv("MEM0_TELEMETRY", "False")
+        monkeypatch.delenv("MEM0_DIR", raising=False)
+        pytest.importorskip("mem0")
+
+        def backend_for(profile):
+            cfg = _oss_test_config(tmp_path)
+            cfg["vector_store"]["config"]["path"] = str(tmp_path / profile / "vs")
+            return OSSBackend(cfg, hermes_home=str(tmp_path / profile))
+
+        alpha, beta = backend_for("alpha"), backend_for("beta")
+        alpha_path = alpha._memory.config.history_db_path
+        beta_path = beta._memory.config.history_db_path
+        assert alpha_path == str(tmp_path / "alpha" / "mem0" / "history.db")
+        assert beta_path == str(tmp_path / "beta" / "mem0" / "history.db")
+        assert alpha_path != beta_path
+        # The SQLiteManager actually opened the profile-local file, and no
+        # shared history.db appeared under the native home.
+        assert alpha._memory.db.db_path == alpha_path
+        assert (tmp_path / "alpha" / "mem0" / "history.db").exists()
+        assert (tmp_path / "beta" / "mem0" / "history.db").exists()
+        assert not (tmp_path / "native-home" / ".mem0" / "history.db").exists()
+
+
 httpx = pytest.importorskip("httpx")
 
 
