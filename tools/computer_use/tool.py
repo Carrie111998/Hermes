@@ -47,7 +47,8 @@ import re
 import struct
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from contextvars import ContextVar, Token
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tools.computer_use.backend import (
     ActionResult,
@@ -63,18 +64,28 @@ logger = logging.getLogger(__name__)
 # Approval & safety
 # ---------------------------------------------------------------------------
 
-_approval_callback = None
+_approval_callback_var: ContextVar[Optional[Callable]] = ContextVar(
+    "computer_use_approval_callback", default=None
+)
 
 
-def set_approval_callback(cb) -> None:
+def set_approval_callback(cb):
     """Register a callback for computer_use approval prompts (used by CLI).
 
     Matches the terminal_tool._approval_callback pattern. The callback
     receives (action, args, summary) and returns one of:
       "approve_once" | "approve_session" | "always_approve" | "deny".
+
+    The callback is bound to the current execution context, not the process:
+    a context that never registered one must not observe another context's
+    responder. Returns a token for :func:`reset_approval_callback`.
     """
-    global _approval_callback
-    _approval_callback = cb
+    return _approval_callback_var.set(cb)
+
+
+def reset_approval_callback(token: Token) -> None:
+    """Restore the callback to its state before :func:`set_approval_callback`."""
+    _approval_callback_var.reset(token)
 
 
 # Actions that read, not mutate. Always allowed.
@@ -608,21 +619,17 @@ def _request_approval(action: str, args: Dict[str, Any],
             return None
         if scope_key in _always_allow.get(session_id, set()):
             return None
-    cb = _approval_callback
+    cb = _approval_callback_var.get()
     if cb is None:
-        # No prompt surface is wired (headless, gateway, messaging runs).
-        # Silence is not consent here either: deny, so destructive actions
-        # need an interactive session or a durable config grant (checked
-        # before this point), never an absent handler.
-        return json.dumps({
-            "error": (
-                "approval required, but no approval prompt is available on "
-                "this surface — ask the user to run this action from an "
-                "interactive session or grant it in config"
-            ),
-            "code": "approval_unavailable",
-            "action": action,
-        })
+        # No interactive prompt wired in THIS context (gateway, cron,
+        # messaging, headless runs). Escalate through the same human gate
+        # that dangerous shell commands use: gateway sessions get the normal
+        # approval round-trip, cron honors approvals.cron_mode, single-query
+        # honors approvals.single_query_mode, and a context with no possible
+        # responder fails closed. Grants are keyed to the approving session
+        # (see _request_shared_approval), so an answer given here can never
+        # stand in for an unattended context.
+        return _request_shared_approval(action, args, session_id)
     summary = _summarize_action(action, args)
     try:
         verdict = cb(action, args, summary)
@@ -646,6 +653,59 @@ def _request_approval(action: str, args: Dict[str, Any],
             "action": action,
         })
     return json.dumps({"error": "denied by user", "action": action})
+
+
+def _shared_approval_rule_key(session_id: str, action: str,
+                              args: Dict[str, Any]) -> str:
+    """Allowlist grain for shared-gate computer_use approvals.
+
+    Embeds the *approval* session key so an ``[a]lways`` is scoped to the
+    session that answered it: the gate's session-cache check runs before its
+    cron/single-query branches (issue #61064), and a grant earned
+    interactively must not short-circuit an unattended context that reuses
+    the same computer_use ``session_id``.
+    """
+    from tools.approval import get_current_session_key
+
+    delivery = "foreground" if args.get("delivery_mode") == "foreground" else "background"
+    return (f"computer_use:{get_current_session_key()}:"
+            f"{session_id}:{action}:{delivery}")
+
+
+def _request_shared_approval(action: str, args: Dict[str, Any],
+                             session_id: str = "") -> Optional[str]:
+    """Escalate a destructive action with no wired CLI prompt to the shared
+    human-approval gate (``tools.approval.request_tool_approval``).
+
+    The gate owns the per-context decision policy: gateway sessions get the
+    normal approval round-trip, cron honors ``approvals.cron_mode``,
+    single-query honors ``approvals.single_query_mode``, and a context with
+    no possible responder fails closed.
+    """
+    from tools.approval import request_tool_approval
+
+    summary = _summarize_action(action, args)
+    result = request_tool_approval(
+        tool_name="computer_use",
+        reason=f"computer_use {summary}",
+        rule_key=_shared_approval_rule_key(session_id, action, args),
+    )
+    if result.get("approved"):
+        return None
+    payload: Dict[str, Any] = {
+        "error": result.get("message") or "denied by user",
+        "action": action,
+    }
+    outcome = result.get("outcome")
+    if outcome == "timeout":
+        payload["code"] = "approval_timeout"
+    elif outcome == "denied":
+        payload["code"] = "denied_by_user"
+    else:
+        # Cron/single-query policy denial, or no interactive user or gateway
+        # present at all: the action never ran and there is nobody to ask.
+        payload["code"] = "approval_unavailable"
+    return json.dumps(payload)
 
 
 def _summarize_action(action: str, args: Dict[str, Any]) -> str:
