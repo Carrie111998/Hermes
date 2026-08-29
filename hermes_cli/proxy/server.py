@@ -142,6 +142,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 upstream_url = f"{upstream_url}?{request.query_string}"
 
             fwd_headers = _filter_request_headers(request.headers)
+            # Provider requirements take precedence over downstream SDK
+            # fingerprints. In particular, Nous Portal's Cloudflare policy
+            # rejects OpenAI/Python user agents with error 1010.
+            fwd_headers.update(adapter.upstream_headers)
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
 
             logger.debug(

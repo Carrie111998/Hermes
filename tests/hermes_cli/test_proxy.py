@@ -238,12 +238,14 @@ class FakeAdapter(UpstreamAdapter):
 
     def __init__(self, base_url: str, bearer: str = "test-bearer",
                  allowed=None, raise_on_credential=False,
-                 retry_bearer: str | None = None):
+                 retry_bearer: str | None = None,
+                 upstream_headers: Dict[str, str] | None = None):
         self._base_url = base_url
         self._bearer = bearer
         self._allowed = frozenset(allowed or ["/chat/completions"])
         self._raise = raise_on_credential
         self._retry_bearer = retry_bearer
+        self._upstream_headers = upstream_headers or {}
         self.calls = 0
         self.retry_calls = 0
 
@@ -255,6 +257,9 @@ class FakeAdapter(UpstreamAdapter):
 
     @property
     def allowed_paths(self): return self._allowed
+
+    @property
+    def upstream_headers(self): return self._upstream_headers
 
     def is_authenticated(self): return True
 
@@ -297,6 +302,7 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
             "method": request.method,
             "path": request.path,
             "auth": request.headers.get("Authorization"),
+            "user_agent": request.headers.get("User-Agent"),
             "body": body.decode("utf-8") if body else "",
         })
         return web.json_response({"echoed": True, "path": request.path})
@@ -358,6 +364,32 @@ def test_server_strips_client_auth_header():
                     await resp.read()
             assert captured["requests"][0]["auth"] == "Bearer ours"
             assert "SHOULD_NOT_LEAK" not in captured["requests"][0]["auth"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_adapter_headers_override_client_headers():
+    """Provider-required headers must win over client SDK fingerprints."""
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            upstream_headers={"User-Agent": "HermesAgent/test"},
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={"User-Agent": "OpenAI/Python test"},
+                ) as resp:
+                    await resp.read()
+            assert captured["requests"][0]["user_agent"] == "HermesAgent/test"
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
