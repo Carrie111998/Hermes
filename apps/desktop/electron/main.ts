@@ -368,6 +368,7 @@ import {
   parseCompareBehindCount,
   resolveBehindCount,
   resolveCommitLogSelection,
+  resolveSshBehindCount,
   shouldCountCommits
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
@@ -2951,11 +2952,28 @@ async function checkUpdates() {
     // flagging that as an update nudges the user into wiping their work.
     const tipsEqual = Boolean(currentSha && currentSha === targetSha)
 
-    const sshBehind = tipsEqual
-      ? 0
-      : await fetchCompareBehindCount({ currentSha, originUrl: OFFICIAL_REPO_HTTPS_URL, targetSha })
+    // `ls-remote` gives a tip, not a direction. Ask git whether that tip is
+    // already reachable from HEAD before trusting the compare API, which
+    // cannot see a commit that exists only on this machine.
+    const targetIsAncestorOfHead =
+      !tipsEqual &&
+      Boolean(currentSha) &&
+      Boolean(targetSha) &&
+      (await runGit(['merge-base', '--is-ancestor', targetSha, 'HEAD'], { cwd: updateRoot })).code === 0
 
-    const upToDate = tipsEqual || sshBehind === 0
+    const compareBehind =
+      tipsEqual || targetIsAncestorOfHead
+        ? 0
+        : await fetchCompareBehindCount({ currentSha, originUrl: OFFICIAL_REPO_HTTPS_URL, targetSha })
+
+    const sshBehind = resolveSshBehindCount({
+      compareBehind,
+      currentSha,
+      targetIsAncestorOfHead,
+      targetSha
+    })
+
+    const upToDate = sshBehind === 0
 
     return {
       supported: true,
