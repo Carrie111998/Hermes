@@ -4325,11 +4325,46 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    # Per-agent authorship signing (t_3f244a06). In-process with the acting
+    # profile/seat key; FAIL-OPEN — a signing failure must never block the
+    # event insert. Signatures live in the sidecar DB (kanban-event-signatures.db),
+    # NOT a task_events column, because the hash-chain halts append on schema
+    # drift of task_events (compose-safety: chain=integrity, sig=authorship).
+    event_id = cur.lastrowid if cur and cur.lastrowid else None
+    if event_id is not None:
+        try:
+            from hermes_cli.kanban_event_signing import (
+                DEFAULT_SIDECAR,
+                board_for_conn,
+                resolve_signing_key,
+                sign_event_payload,
+                store_signature,
+            )
+
+            key = resolve_signing_key()
+            if key is not None:
+                identity, key_path = key
+                board = board_for_conn(conn)
+                sig = sign_event_payload(
+                    event_id, task_id, run_id, kind, pl, now, key_path
+                )
+                content = None
+                from hermes_cli.kanban_event_signing import event_content
+
+                content = event_content(event_id, task_id, run_id, kind, pl, now)
+                store_signature(
+                    DEFAULT_SIDECAR, board, event_id, identity, sig, content, now
+                )
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            _log.debug(
+                "kanban event signing skipped for event %s: %s: %s",
+                event_id, type(exc).__name__, exc,
+            )
 
 
 def _end_run(
