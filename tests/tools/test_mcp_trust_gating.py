@@ -231,6 +231,17 @@ class TestAnnotationCaptureAtDiscovery:
         assert not hints.get("delete_repo")
         assert not hints.get("no_annotations")
 
+    def test_sdk_tool_annotations_supported(self):
+        """The MCP SDK exposes aliased hints as snake_case attributes."""
+        from mcp.types import ToolAnnotations
+
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=ToolAnnotations(read_only_hint=True))
+        ) is True
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations=ToolAnnotations(read_only_hint=False))
+        ) is False
+
     def test_dict_annotations_supported(self):
         """Cached/JSON annotations arrive as plain dicts."""
         assert mcp_tool._annotation_read_only_hint(
