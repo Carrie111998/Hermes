@@ -246,6 +246,12 @@ export interface ResolvedConnectionDescriptor {
   token?: unknown
 }
 
+export interface SharedRegistryBackendDescriptor extends ResolvedConnectionDescriptor {
+  connectionId: string
+  profile: string
+  sharedRemote: true
+}
+
 /**
  * Recover registry identity for a descriptor resolved through the legacy v1
  * profile path. Registry-scoped routes already carry `connectionId`; that
@@ -377,6 +383,47 @@ export interface ReuseMatchingPrimarySshBackendOptions {
   profile: null | string | undefined
   registry: ConnectionRegistry
   source: RegistryConnection
+}
+
+export interface ReuseMatchingPrimarySharedRemoteBackendOptions {
+  connectionId: null | string | undefined
+  ensurePrimary: () => Promise<ResolvedConnectionDescriptor>
+  profile: null | string | undefined
+  registry: ConnectionRegistry
+  source: RegistryConnection
+}
+
+/**
+ * Reuse a URL/cloud registry primary without losing its shared-host routing
+ * contract. One remote gateway serves every profile, so the reused descriptor
+ * must retain `sharedRemote` just like a freshly connected registry backend.
+ * SSH is deliberately excluded because each SSH backend is profile-isolated.
+ */
+export async function reuseMatchingPrimarySharedRemoteBackend({
+  connectionId,
+  ensurePrimary,
+  profile,
+  registry,
+  source
+}: ReuseMatchingPrimarySharedRemoteBackendOptions): Promise<null | SharedRegistryBackendDescriptor> {
+  const id = String(connectionId ?? '').trim()
+
+  if (!id || id !== registry.primary || source.id !== id || (source.kind !== 'remote' && source.kind !== 'cloud')) {
+    return null
+  }
+
+  const descriptor = await ensurePrimary()
+
+  if (!registrySourceOwnsPrimaryBackend(registry, id, descriptor)) {
+    return null
+  }
+
+  return {
+    ...descriptor,
+    profile: String(profile ?? '').trim() || 'default',
+    connectionId: id,
+    sharedRemote: true
+  }
 }
 
 /**
