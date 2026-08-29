@@ -198,8 +198,12 @@ class TodoStore:
                 # Non-dict items get a synthetic key so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
-            item_id = str(item.get("id", "")).strip() or "?"
-            last_index[item_id] = i
+            item_id = str(item.get("id", "")).strip()
+            # Blank ids are NOT duplicates of each other — unlike a real
+            # repeated id (the model updating the same item twice), items
+            # missing an id are independent and must not collapse onto the
+            # shared "?" key _validate later assigns them.
+            last_index[item_id or f"__blank_{i}"] = i
         return [todos[i] for i in sorted(last_index.values())]
 
     @staticmethod

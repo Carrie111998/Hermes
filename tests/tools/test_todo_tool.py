@@ -31,6 +31,18 @@ class TestWriteAndRead:
             {"id": "2", "content": "Other task", "status": "pending"},
         ]
 
+    def test_multiple_blank_ids_are_not_collapsed(self):
+        """Distinct items missing an id must not collide on the shared '?'
+        placeholder — that would silently drop all but the last one."""
+        store = TodoStore()
+        items = store.write([
+            {"id": "", "content": "first", "status": "pending"},
+            {"id": "", "content": "second", "status": "pending"},
+            {"id": "  ", "content": "third", "status": "pending"},
+        ])
+        assert len(items) == 3
+        assert [i["content"] for i in items] == ["first", "second", "third"]
+
     def test_write_moves_active_item_before_earlier_pending_step(self):
         store = TodoStore()
         result = store.write([
