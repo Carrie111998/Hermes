@@ -4769,13 +4769,29 @@ def _clear_pending(sid: str | None = None) -> None:
 # ── Agent factory ────────────────────────────────────────────────────
 
 
+_skin_payload_cache: dict = {}
+_skin_payload_cache_lock = threading.Lock()
+
+
+def get_cached_skin_payload() -> dict:
+    """Return the last successfully resolved skin without I/O or config reads.
+
+    WebSocket liveness must never depend on the default executor: under a busy
+    multi-agent workload even a normally-cheap ``resolve_skin`` can spend tens
+    of seconds queued behind unrelated work. The dashboard primes this cache
+    before accepting sockets and every real skin resolution refreshes it.
+    """
+    with _skin_payload_cache_lock:
+        return dict(_skin_payload_cache)
+
+
 def resolve_skin() -> dict:
     try:
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin
 
         init_skin_from_config(_load_cfg())
         skin = get_active_skin()
-        return {
+        payload = {
             "name": skin.name,
             "colors": skin.colors,
             # Paired palettes: the TUI detects the terminal's polarity and
@@ -4790,6 +4806,11 @@ def resolve_skin() -> dict:
         }
     except Exception:
         return {}
+
+    with _skin_payload_cache_lock:
+        _skin_payload_cache.clear()
+        _skin_payload_cache.update(payload)
+    return dict(payload)
 
 
 # Signature of the last skin broadcast: (name, active user-file mtime). Lets the

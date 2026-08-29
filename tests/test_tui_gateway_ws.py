@@ -153,6 +153,133 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     assert events == ["accept", "ready_after_0"]
 
 
+def test_ws_ready_does_not_wait_for_skin_resolution(monkeypatch):
+    """A slow/default-executor skin lookup must not delay the liveness frame.
+
+    The Desktop starts its ready timeout as soon as the socket opens.  Waiting
+    for ``resolve_skin`` here turns unrelated worker saturation into a false
+    "Runtime not ready" failure and every reconnect adds another queued lookup.
+    """
+    skin_started = threading.Event()
+    release_skin = threading.Event()
+
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+    # These attributes are introduced by the fix.  ``raising=False`` keeps this
+    # test runnable against the pre-fix implementation for the RED assertion.
+    monkeypatch.setattr(server, "get_cached_skin_payload", lambda: {}, raising=False)
+    monkeypatch.setattr(ws_mod, "_skin_refresh_task", None, raising=False)
+
+    def blocking_resolve_skin():
+        skin_started.set()
+        assert release_skin.wait(timeout=2)
+        return {"name": "late-skin"}
+
+    monkeypatch.setattr(server, "resolve_skin", blocking_resolve_skin)
+
+    async def scenario():
+        ready_seen = asyncio.Event()
+        disconnect = asyncio.Event()
+
+        class FakeWS:
+            async def accept(self):
+                pass
+
+            async def send_text(self, line):
+                frame = json.loads(line)
+                if frame.get("params", {}).get("type") == "gateway.ready":
+                    ready_seen.set()
+
+            async def receive_text(self):
+                await disconnect.wait()
+                raise ws_mod._WebSocketDisconnect()
+
+            async def close(self):
+                pass
+
+        task = asyncio.create_task(ws_mod.handle_ws(FakeWS()))
+        try:
+            # The ready frame must beat the blocked skin lookup.  This times out
+            # on the old implementation, which awaited to_thread(resolve_skin).
+            await asyncio.wait_for(ready_seen.wait(), timeout=0.25)
+            assert not release_skin.is_set()
+            assert await asyncio.to_thread(skin_started.wait, 0.5)
+        finally:
+            release_skin.set()
+            disconnect.set()
+            await asyncio.wait_for(task, timeout=2)
+            refresh = getattr(ws_mod, "_skin_refresh_task", None)
+            if refresh is not None:
+                await asyncio.wait_for(asyncio.shield(refresh), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_cold_ws_connections_share_one_skin_refresh(monkeypatch):
+    """Reconnect bursts must collapse cache misses into one background lookup."""
+    calls = 0
+    calls_lock = threading.Lock()
+    skin_started = threading.Event()
+    release_skin = threading.Event()
+
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+    monkeypatch.setattr(server, "get_cached_skin_payload", lambda: {}, raising=False)
+    monkeypatch.setattr(ws_mod, "_skin_refresh_task", None, raising=False)
+
+    def blocking_resolve_skin():
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        skin_started.set()
+        assert release_skin.wait(timeout=2)
+        return {"name": "shared-skin"}
+
+    monkeypatch.setattr(server, "resolve_skin", blocking_resolve_skin)
+
+    async def scenario():
+        ready_events = [asyncio.Event(), asyncio.Event()]
+        disconnect = asyncio.Event()
+
+        class FakeWS:
+            def __init__(self, ready):
+                self.ready = ready
+
+            async def accept(self):
+                pass
+
+            async def send_text(self, line):
+                frame = json.loads(line)
+                if frame.get("params", {}).get("type") == "gateway.ready":
+                    self.ready.set()
+
+            async def receive_text(self):
+                await disconnect.wait()
+                raise ws_mod._WebSocketDisconnect()
+
+            async def close(self):
+                pass
+
+        tasks = [
+            asyncio.create_task(ws_mod.handle_ws(FakeWS(ready)))
+            for ready in ready_events
+        ]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(ready.wait() for ready in ready_events)),
+                timeout=0.25,
+            )
+            assert await asyncio.to_thread(skin_started.wait, 0.5)
+            assert calls == 1
+        finally:
+            release_skin.set()
+            disconnect.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+            refresh = getattr(ws_mod, "_skin_refresh_task", None)
+            if refresh is not None:
+                await asyncio.wait_for(asyncio.shield(refresh), timeout=2)
+
+    asyncio.run(scenario())
+
+
 def test_ws_ready_advertises_heartbeat_and_ping_is_inline(monkeypatch):
     sent = []
     inbound = iter(

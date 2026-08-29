@@ -352,6 +352,16 @@ def _warm_gateway_module() -> None:
         except Exception:
             pass
 
+    # Prime the no-I/O snapshot used by gateway.ready. This happens before the
+    # lifespan yields (and therefore before sockets are accepted), so a busy
+    # default executor can never hold the liveness frame hostage later.
+    try:
+        from tui_gateway import server as gateway_server
+
+        gateway_server.resolve_skin()
+    except Exception:
+        pass
+
 
 def _resolve_restart_drain_timeout() -> float:
     try:
