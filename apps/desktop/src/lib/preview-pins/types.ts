@@ -13,6 +13,23 @@ import type { PinAnchor } from './anchor'
  *  meaningful node to name. */
 export type PinKind = 'element' | 'region'
 
+/**
+ * An image the user attached to a comment — a mockup, a reference, a shot of
+ * how it looks somewhere else.
+ *
+ * Only the thumbnail travels in a pin. The full bytes are drained into the app
+ * as soon as they are taken and never ride in a report again: a `state` read
+ * happens every beat while annotating, and a megabyte of base64 crossing that
+ * channel each time would make the panel stutter for no gain.
+ */
+export interface PinShot {
+  h: number
+  id: string
+  /** Longest-edge-96 JPEG. Small enough to sit in every report and every seed. */
+  thumb: string
+  w: number
+}
+
 export interface PreviewPin {
   /** What the user wrote. Empty until they finish the bubble. */
   comment: string
@@ -33,6 +50,8 @@ export interface PreviewPin {
   /** Region pins only: fractions of the document box, like PinAnchor.rect. */
   region?: { h: number; w: number; x: number; y: number }
   resolved: boolean
+  /** Images pasted, dropped or picked into this comment. */
+  shots?: PinShot[]
   /** Short human label for the list: the element's accessible name, or the
    *  region's size. */
   target: string

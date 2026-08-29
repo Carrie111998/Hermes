@@ -32,11 +32,22 @@ const ENGINE = '__hermesPinEngine'
  */
 const VERB_TIMEOUT_MS = 4_000
 
-/** Restore pins the app is holding, for a page the engine has never seen. */
+/**
+ * Restore pins the app is holding, for a page the engine has never seen.
+ *
+ * Filtered against the guest page's OWN location, not the pane's idea of the
+ * URL — the pane's value lags a redirect, and a mismatch here is how every pin
+ * from the previous page lands on this one and comes back marked detached.
+ * The panel buckets by page too; this is the half that cannot be fooled.
+ */
 function seedScript(pins: PreviewPin[]): string {
-  return `w.${HOLDER}.__hermesPinState = {
-    armed: false, drag: null, seq: ${pins.length},
-    pins: ${JSON.stringify(pins)}
+  return `var here = String(location.href).replace(/#$/, '');
+  var seed = (${JSON.stringify(pins)}).filter(function (pin) {
+    return !pin.pageUrl || String(pin.pageUrl).replace(/#$/, '') === here;
+  });
+  w.${HOLDER}.__hermesPinState = {
+    armed: false, drag: null, hidden: false, seq: seed.length,
+    pins: seed
   };`
 }
 

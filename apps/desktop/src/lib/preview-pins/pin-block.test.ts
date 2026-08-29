@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { pinAttachmentLabel, pinCommentBlock } from './pin-block'
+import { openPins, orderedShots, pinAttachmentLabel, pinCommentBlock } from './pin-block'
 import type { PreviewPin } from './types'
 
 function pin(overrides: Partial<PreviewPin> = {}): PreviewPin {
@@ -106,6 +106,104 @@ describe('pinCommentBlock', () => {
     // (#49624); the same defensiveness applies to what they carry.
     expect(() => pinCommentBlock(JSON.stringify([null, pin()]))).not.toThrow()
     expect(pinCommentBlock(JSON.stringify([null, pin()]))).toContain('button "Save"')
+  })
+})
+
+describe('pinCommentBlock across pages', () => {
+  const HOME = 'http://localhost:5178/en/index.html'
+  const ABOUT = 'http://localhost:5178/en/about.html'
+
+  it('grows a heading per page once the review left the first one', () => {
+    const block = pinCommentBlock(JSON.stringify([
+      pin({ comment: 'hero is cramped', createdAt: 1, id: 'a', pageUrl: HOME }),
+      pin({ comment: 'team photos are stretched', createdAt: 2, id: 'b', pageUrl: ABOUT })
+    ]))
+
+    expect(block).toContain(HOME)
+    expect(block).toContain(ABOUT)
+    expect(block).toContain('hero is cramped')
+    expect(block).toContain('team photos are stretched')
+  })
+
+  it('keeps the one-page fence header, which is shorter and says the same', () => {
+    const block = pinCommentBlock(JSON.stringify([pin({ pageUrl: HOME })]))
+    expect(block).toContain(`\`\`\`preview-comments ${HOME}`)
+  })
+
+  it('numbers straight through the pages, because those are the image numbers', () => {
+    const block = pinCommentBlock(JSON.stringify([
+      pin({ comment: 'one', createdAt: 1, id: 'a', pageUrl: HOME }),
+      pin({ comment: 'two', createdAt: 2, id: 'b', pageUrl: ABOUT }),
+      pin({ comment: 'three', createdAt: 3, id: 'c', pageUrl: ABOUT })
+    ]))
+
+    expect(block).toContain('1.')
+    expect(block).toContain('2.')
+    expect(block).toContain('3.')
+  })
+
+  it('keeps each page\'s pins together even when interleaved in time', () => {
+    const block = pinCommentBlock(JSON.stringify([
+      pin({ comment: 'home first', createdAt: 1, id: 'a', pageUrl: HOME }),
+      pin({ comment: 'about', createdAt: 2, id: 'b', pageUrl: ABOUT }),
+      pin({ comment: 'home again', createdAt: 3, id: 'c', pageUrl: HOME })
+    ]))
+
+    // Going back to a page mid-review must not split it into two sections.
+    expect(block!.indexOf('home first')).toBeLessThan(block!.indexOf('home again'))
+    expect(block!.indexOf('home again')).toBeLessThan(block!.indexOf('about'))
+  })
+})
+
+describe('pinCommentBlock with images', () => {
+  const shot = (id: string) => ({ h: 40, id, thumb: 'data:image/jpeg;base64,x', w: 60 })
+
+  it('names the image on the line that owns it', () => {
+    const block = pinCommentBlock(JSON.stringify([
+      pin({ comment: 'should look like this', shots: [shot('s1')] })
+    ]))
+
+    // Attachments arrive as bare pictures; without the marker the model cannot
+    // tell which comment each one illustrates.
+    expect(block).toContain('[image 1]')
+  })
+
+  it('numbers images across pins in the order they will be attached', () => {
+    const block = pinCommentBlock(JSON.stringify([
+      pin({ comment: 'first', createdAt: 1, id: 'a', shots: [shot('s1')] }),
+      pin({ comment: 'second', createdAt: 2, id: 'b', shots: [shot('s2'), shot('s3')] })
+    ]))
+
+    expect(block).toContain('[image 1]')
+    expect(block).toContain('[image 2] [image 3]')
+    expect(block!.indexOf('[image 1]')).toBeLessThan(block!.indexOf('[image 2]'))
+  })
+
+  it('says nothing about images when there are none', () => {
+    expect(pinCommentBlock(JSON.stringify([pin()]))).not.toContain('[image')
+  })
+})
+
+describe('orderedShots', () => {
+  const shot = (id: string) => ({ h: 40, id, thumb: 'data:image/jpeg;base64,x', w: 60 })
+
+  it('walks pins in block order so image N is the same N in both', () => {
+    const pins = openPins(JSON.stringify([
+      pin({ createdAt: 2, id: 'b', shots: [shot('s2')] }),
+      pin({ createdAt: 1, id: 'a', shots: [shot('s1')] })
+    ]))
+
+    expect(orderedShots(pins).map(entry => entry.shotId)).toEqual(['s1', 's2'])
+  })
+
+  it('skips pins carrying no image', () => {
+    const pins = openPins(JSON.stringify([pin(), pin({ id: 'b', shots: [shot('s1')] })]))
+    expect(orderedShots(pins)).toHaveLength(1)
+  })
+
+  it('leaves out resolved pins, matching the block', () => {
+    const pins = openPins(JSON.stringify([pin({ resolved: true, shots: [shot('s1')] })]))
+    expect(orderedShots(pins)).toHaveLength(0)
   })
 })
 

@@ -16,6 +16,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
 import { pinAttachmentLabel } from '@/lib/preview-pins/pin-block'
+import { allPins, mergeReport, otherPages, type PinBook, pinsForPage } from '@/lib/preview-pins/pin-book'
 import type { PreviewPin } from '@/lib/preview-pins/types'
 import { cn } from '@/lib/utils'
 import { addComposerAttachment } from '@/store/composer'
@@ -41,8 +42,10 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
   const [pins, setPins] = useState<PreviewPin[]>([])
   const [armed, setArmed] = useState(false)
   const [live, setLive] = useState(true)
-  /** Last known pins, so a navigation can replay them into a fresh engine. */
-  const held = useRef<PreviewPin[]>([])
+  /** Every page's pins, so a review can walk the site. The engine only ever
+   *  holds the current page's; this is the side that outlives a navigation. */
+  const book = useRef<PinBook>({})
+  const [elsewhere, setElsewhere] = useState({ count: 0, pages: 0 })
 
   const sync = useCallback(async (report: Awaited<ReturnType<typeof readPins>>) => {
     if (!report) {
@@ -54,7 +57,11 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
     setLive(true)
     setArmed(report.armed === true)
     setPins(report.pins)
-    held.current = report.pins
+    // File under the page's OWN url, not the pane's — the pane's value lags a
+    // redirect, and filing under the wrong key is how a page's comments end up
+    // replayed onto a different page.
+    book.current = mergeReport(book.current, report.url, report.pins)
+    setElsewhere(otherPages(book.current, report.url))
   }, [])
 
   // Poll only while the panel is open AND armed. A background poll against a
@@ -78,35 +85,45 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
       return
     }
 
-    void showPins(held.current).then(sync)
-  }, [open, sync])
+    void showPins(pinsForPage(book.current, url)).then(sync)
+  }, [open, sync, url])
 
   // A pane teardown is a close the effect above never sees.
   useEffect(() => () => void hidePins(), [])
 
   // A navigation destroys the engine and every pin with it. Seed the new one
-  // from what the panel is holding, then re-run the ladder over it.
+  // from this page's bucket — and only this page's — then re-run the ladder.
   useEffect(() => {
-    if (!open || !held.current.length) {return}
-    void reattachPins(held.current).then(sync)
+    if (!open) {return}
+    void reattachPins(pinsForPage(book.current, url)).then(sync)
   }, [open, sync, url])
 
   const toggleArmed = async () => {
-    const report = armed ? await disarmPins() : await armPins(held.current)
+    const report = armed ? await disarmPins() : await armPins(pinsForPage(book.current, url))
     await sync(report)
   }
 
   const attach = () => {
-    const openPins = pins.filter(pin => !pin.resolved)
+    // The whole review, not just the page in front of us. Someone who commented
+    // on the home page and then on a product page meant one request.
+    const sending = allPins(book.current).filter(pin => !pin.resolved)
 
-    if (!openPins.length) {return}
+    if (!sending.length) {return}
     addComposerAttachment({
-      detail: JSON.stringify(openPins),
-      id: `pins:${url}:${openPins.map(pin => pin.id).join(',')}`,
+      detail: JSON.stringify(sending),
+      // Derived from the pins alone: once a batch spans pages, no single url
+      // identifies it.
+      id: `pins:${sending.map(pin => pin.id).join(',')}`,
       kind: 'pins',
-      label: pinAttachmentLabel(openPins),
-      refText: `${openPins.length} preview comment${openPins.length === 1 ? '' : 's'}`
+      label: pinAttachmentLabel(sending),
+      refText: `${sending.length} preview comment${sending.length === 1 ? '' : 's'}`
     })
+  }
+
+  const clearEverything = async () => {
+    book.current = {}
+    setElsewhere({ count: 0, pages: 0 })
+    await clearPins().then(sync)
   }
 
   if (!open) {return null}
@@ -128,29 +145,37 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
           {armed ? 'Annotating' : 'Annotate'}
         </button>
 
-        <span className="text-muted-foreground">
+        <span className="truncate text-muted-foreground">
           {!live
             ? 'no live page'
             : armed
               ? 'click an element, or drag a region · Esc to stop'
               : `${openCount} open`}
+          {/* Comments left on pages the user has since navigated away from.
+              Without this the panel looks empty on a fresh page and the review
+              they already wrote appears to have been lost. */}
+          {!armed && elsewhere.count > 0 && (
+            <span className="ms-1 text-muted-foreground/70">
+              · {elsewhere.count} on {elsewhere.pages} other page{elsewhere.pages === 1 ? '' : 's'}
+            </span>
+          )}
         </span>
 
-        <div className="ms-auto flex items-center gap-1">
+        <div className="ms-auto flex shrink-0 items-center gap-1">
           <button
             className="rounded px-2 py-1 hover:bg-muted disabled:opacity-40"
-            disabled={!openCount}
+            disabled={!openCount && !elsewhere.count}
             onClick={attach}
-            title="Add these comments to the composer"
+            title="Add every open comment, across every page, to the composer"
             type="button"
           >
             Attach to chat
           </button>
           <button
             className="rounded px-2 py-1 hover:bg-muted disabled:opacity-40"
-            disabled={!pins.length}
-            onClick={() => void clearPins().then(sync)}
-            title="Remove every pin on this page"
+            disabled={!pins.length && !elsewhere.count}
+            onClick={() => void clearEverything()}
+            title="Discard the whole review, every page"
             type="button"
           >
             Clear
