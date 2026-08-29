@@ -951,6 +951,40 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return False
 
+    # Sentinel distinguishing "still disconnected after the wait" from a
+    # real return value (including None) a delegated call might produce.
+    _RECONNECT_FAILED = object()
+
+    async def _await_reconnection_or_delegate(self, method: str, *args, **kwargs):
+        """Retry ``method`` on a live replacement, or wait like ``send()`` does.
+
+        Every ``send_*``/``edit_message`` call used to fail immediately with
+        ``retryable=False`` when ``self._bot`` was None, instead of tolerating
+        a transient 10-20s blip the way ``send()`` does — the reply then sat
+        in the delivery ledger until the next gateway boot. This mirrors
+        ``send()``'s own guard so callers get the same behavior:
+
+        * a live replacement adapter already exists → delegate immediately.
+        * otherwise wait up to ``_RECONNECT_WAIT_SECONDS`` for reconnection.
+        * once waited: delegate to a replacement if one appeared, otherwise
+          give up.
+
+        Returns the delegated call's result if delegation happened, ``None``
+        if this instance itself reconnected (caller proceeds using
+        ``self._bot``), or ``_RECONNECT_FAILED`` if still disconnected.
+        """
+        live = self._replacement_telegram_adapter()
+        if live is not None:
+            return await getattr(live, method)(*args, **kwargs)
+        if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+            return self._RECONNECT_FAILED
+        live = self._replacement_telegram_adapter()
+        if not self._bot and live is not None:
+            return await getattr(live, method)(*args, **kwargs)
+        if not self._bot:
+            return self._RECONNECT_FAILED
+        return None
+
     def _should_drop_delayed_delivery(self) -> bool:
         """True once teardown/fatal-error started — delayed flushes must not dispatch.
 
@@ -5670,7 +5704,17 @@ class TelegramAdapter(BasePlatformAdapter):
         edits target the most recent visible message.
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "edit_message", chat_id, message_id, content,
+                finalize=finalize, metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -6232,7 +6276,13 @@ class TelegramAdapter(BasePlatformAdapter):
         same retry pattern to the non-streaming control paths.
         """
         if not self._bot:
-            raise RuntimeError("Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "_send_message_with_thread_fallback", **kwargs,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                raise RuntimeError("Not connected")
+            if outcome is not None:
+                return outcome
 
         message_thread_id = kwargs.get("message_thread_id")
         try:
@@ -6271,7 +6321,17 @@ class TelegramAdapter(BasePlatformAdapter):
         needs user input (stash restore, config migration).
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_update_prompt", chat_id, prompt, default,
+                session_key=session_key, metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
         try:
             default_hint = f" (default: {default})" if default else ""
             text = self.format_message(f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}")
@@ -6327,7 +6387,19 @@ class TelegramAdapter(BasePlatformAdapter):
         agent thread — same mechanism as the text ``/approve`` flow.
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_exec_approval", chat_id, command, session_key,
+                description=description, metadata=metadata,
+                allow_permanent=allow_permanent, allow_session=allow_session,
+                smart_denied=smart_denied,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             text = self._format_exec_approval(command, description, smart_denied)
@@ -6395,7 +6467,17 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Render a three-button slash-command confirmation prompt."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_slash_confirm", chat_id, title, message, session_key,
+                confirm_id, metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             preview = self.format_message(self._truncate_preview(message, 3800))
@@ -6458,7 +6540,17 @@ class TelegramAdapter(BasePlatformAdapter):
         the gateway's text-intercept and resolves the clarify.
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_clarify", chat_id, question, choices, clarify_id,
+                session_key, metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             text = f"❓ {_html.escape(question)}"
@@ -6535,7 +6627,18 @@ class TelegramAdapter(BasePlatformAdapter):
         Edits the same message in-place as the user navigates.
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_model_picker", chat_id, providers, current_model,
+                current_provider, session_key, on_model_selected,
+                metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             from hermes_cli.providers import get_label
@@ -6609,7 +6712,17 @@ class TelegramAdapter(BasePlatformAdapter):
         choice dict: ``{"value": str, "label": str, "is_current": bool}``.
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_choice_picker", chat_id, title, choices, session_key,
+                on_choice_selected, metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             buttons = []
@@ -7727,8 +7840,18 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
-        
+            outcome = await self._await_reconnection_or_delegate(
+                "send_voice", chat_id, audio_path, caption=caption,
+                reply_to=reply_to, metadata=metadata, **kwargs,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
+
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
@@ -8014,7 +8137,17 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local image file natively as a Telegram photo."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_image_file", chat_id, image_path, caption=caption,
+                reply_to=reply_to, metadata=metadata, **kwargs,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             if not os.path.exists(image_path):
@@ -8109,7 +8242,18 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_document", chat_id, file_path, caption=caption,
+                file_name=file_name, reply_to=reply_to, metadata=metadata,
+                **kwargs,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             if not os.path.exists(file_path):
@@ -8163,7 +8307,17 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a video natively as a Telegram video message."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_video", chat_id, video_path, caption=caption,
+                reply_to=reply_to, metadata=metadata, **kwargs,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         try:
             if not os.path.exists(video_path):
@@ -8217,7 +8371,17 @@ class TelegramAdapter(BasePlatformAdapter):
         Falls back to downloading and uploading as file (supports up to 10MB).
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            outcome = await self._await_reconnection_or_delegate(
+                "send_image", chat_id, image_url, caption=caption,
+                reply_to=reply_to, metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
 
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
@@ -8314,8 +8478,18 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
-        
+            outcome = await self._await_reconnection_or_delegate(
+                "send_animation", chat_id, animation_url, caption=caption,
+                reply_to=reply_to, metadata=metadata,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return SendResult(
+                    success=False, error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            if outcome is not None:
+                return outcome
+
         try:
             _anim_thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
