@@ -31,6 +31,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from hermes_cli.config_defaults import (
+    DEFAULT_MEMORY_CHAR_LIMIT,
+    DEFAULT_USER_CHAR_LIMIT,
+)
 from typing import Dict, Any, List, Optional, Tuple
 
 from utils import atomic_write_text, is_truthy_value
@@ -175,8 +179,8 @@ class MemoryStore:
 
     def __init__(
         self,
-        memory_char_limit: int = 2200,
-        user_char_limit: int = 1375,
+        memory_char_limit: int = DEFAULT_MEMORY_CHAR_LIMIT,
+        user_char_limit: int = DEFAULT_USER_CHAR_LIMIT,
         *,
         memory_enabled: bool = True,
         user_profile_enabled: bool = True,
@@ -921,8 +925,8 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
-    memory_char_limit = 2200
-    user_char_limit = 1375
+    memory_char_limit = DEFAULT_MEMORY_CHAR_LIMIT
+    user_char_limit = DEFAULT_USER_CHAR_LIMIT
     memory_enabled = True
     user_profile_enabled = True
     try:
