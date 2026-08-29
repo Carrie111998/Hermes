@@ -4266,6 +4266,13 @@ def _present_with_selected_transport(
         from agent.redact import redact_sensitive_text
         from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
 
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile_name = get_active_profile_name() or "default"
+        except Exception:
+            profile_name = "default"
+
         timeout_seconds = _get_approval_timeout()
         request = ApprovalRequest.create(
             command=redact_sensitive_text(command, force=True),
@@ -4277,6 +4284,7 @@ def _present_with_selected_transport(
             allow_session=allow_session,
             allow_permanent=allow_permanent,
             timeout_seconds=timeout_seconds,
+            profile_name=profile_name,
         )
     except Exception:
         # Never fall back to raw text if redaction or request construction

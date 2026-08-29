@@ -108,6 +108,64 @@ def test_host_accepts_bound_sync_and_async_decisions():
     assert async_result.failure is None
 
 
+def test_request_has_stable_host_owned_profile_and_conversation_scope(monkeypatch):
+    import hermes_cli.approval_transport as transport_module
+    from hermes_cli.approval_transport import ApprovalRequest
+
+    monkeypatch.setattr(
+        transport_module.uuid,
+        "uuid4",
+        lambda: type("UUID", (), {"hex": "fixed-request"})(),
+    )
+    first = ApprovalRequest.create(
+        command="echo ok",
+        description="safe",
+        pattern_key="example",
+        pattern_keys=("example",),
+        session_key="conversation-secret-looking-value",
+        surface="cli",
+        allow_session=False,
+        allow_permanent=False,
+        profile_name="work",
+    )
+    second = ApprovalRequest.create(
+        command="different command",
+        description="different",
+        pattern_key="other",
+        pattern_keys=("other",),
+        session_key="conversation-secret-looking-value",
+        surface="gateway",
+        allow_session=False,
+        allow_permanent=False,
+        profile_name="work",
+    )
+    other_profile = ApprovalRequest.create(
+        command="echo ok",
+        description="safe",
+        pattern_key="example",
+        pattern_keys=("example",),
+        session_key="conversation-secret-looking-value",
+        surface="cli",
+        allow_session=False,
+        allow_permanent=False,
+        profile_name="personal",
+    )
+
+    assert first.profile_name == "work"
+    assert first.scope_key == second.scope_key
+    assert first.scope_key != other_profile.scope_key
+    assert "conversation-secret-looking-value" not in first.scope_key
+    assert first.digest != other_profile.digest
+
+
+def test_legacy_create_callers_get_explicit_compatibility_defaults():
+    request = _request()
+
+    assert request.profile_name == "default"
+    assert request.scope_key
+    assert request.scope_key == _request().scope_key
+
+
 def test_host_rejects_scope_not_offered_by_request():
     from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
 
@@ -472,6 +530,8 @@ def present(request):
             "digest": request.digest,
             "command": request.command,
             "surface": request.surface,
+            "profile_name": request.profile_name,
+            "scope_key": request.scope_key,
             "timeout_seconds": request.timeout_seconds,
         }) + "\\n")
     return request.respond("once")
@@ -535,6 +595,8 @@ def register(ctx):
     assert records[0]["request_id"]
     assert records[0]["digest"]
     assert records[0]["surface"] == "cli"
+    assert records[0]["profile_name"] == "default"
+    assert records[0]["scope_key"]
     assert records[0]["timeout_seconds"] == 2
     assert records[2]["surface"] == "gateway"
     assert hardline["approved"] is False
