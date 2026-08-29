@@ -37,10 +37,13 @@ def test_should_use_color_non_tty_disables(monkeypatch):
 
 
 def test_should_use_color_no_color_takes_precedence_over_tty(monkeypatch):
-    # Even with NO_COLOR set, non-TTY still yields False — but the point is
-    # the env gate applies regardless of the tty state.
+    # A real TTY would otherwise enable color, but NO_COLOR must override it.
+    class _Tty(io.StringIO):
+        def isatty(self):
+            return True
+
     monkeypatch.setenv("NO_COLOR", "1")
-    monkeypatch.setattr("hermes_cli.colors.sys.stdout", io.StringIO())
+    monkeypatch.setattr("hermes_cli.colors.sys.stdout", _Tty())
     assert should_use_color() is False
 
 
