@@ -24,7 +24,9 @@ Design constraints:
 * **Side-channel only.** Nothing here touches message content, so prompt
   caching is unaffected.
 * **No config knobs.** Retention is a module constant (7 days), pruned
-  opportunistically on each new dispatch.
+  opportunistically on each new dispatch — against the same root that
+  dispatch writes to, so stale dirs under other profiles' pinned roots are
+  left to those profiles' own dispatches.
 """
 
 from __future__ import annotations
@@ -333,11 +335,12 @@ def create_live_transcripts(
 
     ``home`` pins every transcript and the manifest to one explicit profile
     home instead of an ambient resolve that raw thread boundaries can strip
-    of its ContextVar override (#91996).
+    of its ContextVar override (#91996). Retention pruning runs against the
+    same resolved root, so pinned homes clean their own stale dirs.
     """
     n = len(task_list)
     try:
-        prune_stale_live_dirs()
+        prune_stale_live_dirs(root=live_transcript_root(home))
     except Exception:
         pass
     try:
@@ -423,18 +426,23 @@ def update_manifest_statuses(delegation_id: Optional[str],
         logger.debug("Live transcript manifest update failed: %s", exc)
 
 
-def prune_stale_live_dirs(max_age_days: int = LIVE_RETENTION_DAYS) -> int:
+def prune_stale_live_dirs(
+    max_age_days: int = LIVE_RETENTION_DAYS, root: Optional[Path] = None
+) -> int:
     """Remove live/<delegation_id> dirs older than the retention window.
 
-    Returns how many were removed. Fully best-effort.
+    Returns how many were removed. Fully best-effort. ``root`` defaults to
+    the ambient resolve; callers that pin transcripts to an explicit home
+    pass the same root so the prune sweeps where the writes actually land
+    (stale dirs under other profiles' roots stay those profiles' business).
     """
     removed = 0
     try:
-        root = live_transcript_root()
-        if not root.is_dir():
+        root_dir = root if root is not None else live_transcript_root()
+        if not root_dir.is_dir():
             return 0
         cutoff = time.time() - max_age_days * 86400
-        for child in root.iterdir():
+        for child in root_dir.iterdir():
             try:
                 if child.is_dir() and child.stat().st_mtime < cutoff:
                     shutil.rmtree(child, ignore_errors=True)

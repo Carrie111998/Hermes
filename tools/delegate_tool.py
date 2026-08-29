@@ -31,6 +31,7 @@ import weakref
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -401,6 +402,26 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
 _CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+
+
+def _parent_live_home(parent_agent: Any) -> Optional[Path]:
+    """Resolve the live transcripts' profile home from parent-owned state.
+
+    The parent's per-profile SessionDB sits directly under its profile home
+    (``<home>/state.db``), so the db path's parent IS the home. Returns None
+    when the parent exposes no SessionDB — the caller then falls back to the
+    ambient resolve, which is exactly the #91996 failure mode, so the skip is
+    logged rather than silent.
+    """
+    parent_db = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
+    if parent_db is not None:
+        return parent_db.parent
+    logger.warning(
+        "delegate_task: parent agent exposes no _session_db; live-transcript "
+        "home pinning skipped, falling back to ambient HERMES_HOME resolve "
+        "(transcripts may land in a different profile, #91996)"
+    )
+    return None
 
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
@@ -3796,11 +3817,9 @@ def delegate_task(
     # and process-wide HERMES_HOME is unstable under concurrent
     # multi-profile workers — either way transcripts could land in the
     # wrong profile (#91996). state.db sits directly under the home, so
-    # its parent IS the home; None falls back to today's ambient resolve.
-    _live_home = None
-    _parent_db = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
-    if _parent_db is not None:
-        _live_home = _parent_db.parent
+    # its parent IS the home; None falls back to today's ambient resolve
+    # (with a warning — that fallback is exactly the #91996 failure mode).
+    _live_home = _parent_live_home(parent_agent)
 
     from tools.delegation_live_log import (
         create_live_transcripts,
