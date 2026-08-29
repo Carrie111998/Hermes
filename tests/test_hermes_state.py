@@ -824,6 +824,7 @@ class TestFTS5Search:
         traced_connections = [db._conn]
         if read_conn is not db._conn:
             traced_connections.append(read_conn)
+            db._read_pool.put_nowait(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
 
