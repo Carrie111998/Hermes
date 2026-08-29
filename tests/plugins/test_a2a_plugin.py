@@ -35,6 +35,36 @@ def _free_port() -> int:
     return port
 
 
+@pytest.fixture(autouse=True)
+def _isolate_tool_registry():
+    """Keep the process-global tool registry hermetic for this module.
+
+    Built-in tool modules (e.g. ``tools/web_tools.py``) call
+    ``registry.register()`` at import time, and plugin-scoped registrations
+    from earlier tests linger under other ``HERMES_HOME`` scope keys. When a
+    single pytest process collects another module that imports them, the
+    registry is non-empty here and ``A2AAdapter._advertised_skills()`` takes
+    its dynamic path — Agent Card tests then advertise whatever leaked in
+    instead of the configured static capabilities. Snapshot, clear, and
+    restore so every test in this file starts from an empty registry.
+    """
+    from tools.registry import registry
+
+    with registry._lock:
+        saved_tools = dict(registry._tools)
+        saved_scoped = {k: dict(v) for k, v in registry._scoped_tools.items()}
+        registry._tools.clear()
+        registry._scoped_tools.clear()
+    try:
+        yield
+    finally:
+        with registry._lock:
+            registry._tools.clear()
+            registry._tools.update(saved_tools)
+            registry._scoped_tools.clear()
+            registry._scoped_tools.update(saved_scoped)
+
+
 # --------------------------------------------------------------------------
 # Security
 # --------------------------------------------------------------------------
