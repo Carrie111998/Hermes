@@ -8860,7 +8860,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -9108,7 +9112,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     conn, tid,
                     error=error_text,
                     outcome="crashed",
-                    failure_limit=violation_limit,
+                    # The violation streak decides *when* to force-trip, while
+                    # recompute_ready() uses the dispatcher's configured
+                    # failure limit to decide whether a blocked task may be
+                    # promoted. Persist at least both thresholds so a valid
+                    # forced trip stays blocked even when an operator raises
+                    # kanban.failure_limit above the violation streak bound.
+                    failure_limit=max(violation_limit, int(failure_limit)),
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
@@ -9243,6 +9253,14 @@ def _record_task_failure(
         else:
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
+
+        # A forced trip is a terminal breaker decision made by a caller that
+        # already exhausted its own bounded policy (for example the clean-exit
+        # protocol-violation streak).  Keep the persisted counter consistent
+        # with that decision so recompute_ready() cannot immediately undo the
+        # block merely because the independent unified counter was lower.
+        if force_trip:
+            failures = max(failures, effective_limit)
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
@@ -9962,7 +9980,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -10887,14 +10905,13 @@ def _default_spawn(
     cmd.extend([
         "chat",
         "-q", prompt,
+        # All dispatcher workers need the result-preserving fully-quiet path.
+        # The ordinary single-query path prints provider errors but returns
+        # rc=0; -Q preserves structured failures so rate-limit/billing exits
+        # reach the dispatcher as EX_TEMPFAIL (75) instead of false protocol
+        # violations. Goal-mode workers also consume this same path.
+        "-Q",
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

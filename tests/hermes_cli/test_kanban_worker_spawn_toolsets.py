@@ -87,6 +87,7 @@ agent:
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
+    assert captured["cmd"].count("-Q") == 1
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
@@ -112,6 +113,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -132,6 +134,16 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
     assert args.query == "work kanban task t_spawn_tools"
+    assert args.quiet is True
+
+    goal_task = _make_task(kb, assignee="elias")
+    goal_task.goal_mode = True
+    kb._default_spawn(goal_task, str(workspace))
+    assert captured["cmd"].count("-Q") == 1
+    assert captured["env"]["HERMES_KANBAN_GOAL_MODE"] == "1"
+    goal_args = parser.parse_args(captured["cmd"][3:])
+    assert goal_args.query == "work kanban task t_spawn_tools"
+    assert goal_args.quiet is True
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
