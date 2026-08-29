@@ -29,6 +29,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Arcee AI** | `ARCEEAI_API_KEY` in `~/.hermes/.env` (provider: `arcee`; aliases: `arcee-ai`, `arceeai`) |
 | **GMI Cloud** | `GMI_API_KEY` in `~/.hermes/.env` (provider: `gmi`; aliases: `gmi-cloud`, `gmicloud`) |
 | **Actual Computer** | `ACTUAL_API_KEY` in `~/.hermes/.env` for the hosted relay, or `ACTUAL_BASE_URL=http://127.0.0.1:8080` for the local daemon — no key needed on loopback (provider: `actual`; aliases: `actual-computer`, `actualcomputer`, `aci`) |
+| **MindsHub** | `MINDSHUB_API_KEY` in `~/.hermes/.env` (provider: `mindshub`; alias: `mindshub-ai`; one key for Claude, GPT, Gemini, Kimi, DeepSeek, and more) |
 | **MiniMax** | `MINIMAX_API_KEY` in `~/.hermes/.env` (provider: `minimax`) |
 | **MiniMax China** | `MINIMAX_CN_API_KEY` in `~/.hermes/.env` (provider: `minimax-cn`) |
 | **xAI (Grok) — Responses API** | `XAI_API_KEY` in `~/.hermes/.env` (provider: `xai`) |
@@ -297,6 +298,10 @@ hermes chat --provider meta-ai --model muse-spark-1.2
 # Use the exact model ID returned by GMI's /v1/models endpoint.
 hermes chat --provider gmi --model zai-org/GLM-5.1-FP8
 # Requires: GMI_API_KEY in ~/.hermes/.env
+
+# MindsHub — one API key for Claude, GPT, Gemini, Kimi, DeepSeek, and more
+hermes chat --provider mindshub --model sonnet
+# Requires: MINDSHUB_API_KEY in ~/.hermes/.env
 ```
 
 Fireworks uses its native slash-form catalog IDs, such as `accounts/fireworks/models/kimi-k2p6`. Run `hermes model`, choose **Fireworks AI**, and select from the live catalog or enter another Fireworks model ID. The default endpoint is `https://api.fireworks.ai/inference/v1`; configure a different endpoint through `model.base_url` in `config.yaml`, not `.env`.
@@ -308,7 +313,7 @@ model:
   default: "zai-org/GLM-5.1-FP8"
 ```
 
-Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, `META_BASE_URL`, or `TOKENHUB_BASE_URL` environment variables.
+Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, `META_BASE_URL`, `TOKENHUB_BASE_URL`, or `MINDSHUB_BASE_URL` environment variables.
 
 :::note Meta contributor tier
 `muse-spark-1.2-contributor` is Meta's discounted tier — Meta may train on your prompts and completions, so [interactive model selection asks for confirmation](../user-guide/configuring-models.md) before using it. Use `muse-spark-1.2` (standard pricing, no training) for confidential work.
@@ -586,6 +591,33 @@ Notes:
 - Reasoning effort is clamped to Actual's supported range (`none/low/medium/high/max`) — a global `xhigh`/`ultra` setting will not 400 requests.
 - Small local models: Hermes' full default toolset plus the system prompt can exceed a 32k context window, producing an empty-stream error from llama.cpp-family servers. Restrict the toolset (`-t file,web`) or load the model with a larger context. The optional `actual-setup` skill (`hermes skills install official/devops/actual-setup`) covers setup and troubleshooting in detail.
 - Aliases: `actual-computer`, `actualcomputer`, `aci`.
+
+### MindsHub
+
+[MindsHub](https://mindshub.ai) is a fully OpenAI/Anthropic-compatible inference gateway: one API key and one bill for every model in its catalog — Claude, GPT, Gemini, Kimi, DeepSeek, Qwen, GLM, Grok, and more — addressed through short, stable aliases (`sonnet`, `opus`, `kimi`, `deepseek`, `gpt`, `gpt-codex`, ...) instead of raw provider model IDs. See the [MindsHub docs](https://docs.mindshub.ai/inference/) for the full catalog and pricing.
+
+```bash
+# MindsHub
+hermes chat --provider mindshub --model sonnet
+# Requires: MINDSHUB_API_KEY in ~/.hermes/.env
+
+# Switch models by alias — no provider change needed
+hermes chat --provider mindshub --model kimi
+hermes chat --provider mindshub --model deepseek
+```
+
+Or set it permanently in `config.yaml`:
+```yaml
+model:
+  provider: "mindshub"
+  default: "sonnet"
+```
+
+Get your API key from the [MindsHub console](https://console.mindshub.ai). The base URL can be overridden with `MINDSHUB_BASE_URL` (default: `https://api.mindshub.ai/v1`).
+
+:::tip Use catalog aliases, not raw model IDs
+MindsHub's OpenAI-compatible endpoints only accept catalog aliases in the `model` field (`sonnet`, not `claude-sonnet-5`) — a raw upstream provider model ID returns `404 model_not_found`. Run `hermes model` or `curl https://api.mindshub.ai/v1/models -H "Authorization: Bearer $MINDSHUB_API_KEY"` to see the current alias list; the catalog changes over time.
+:::
 
 ### StepFun
 
