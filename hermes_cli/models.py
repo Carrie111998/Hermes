@@ -4256,12 +4256,26 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                             primary, secondary = curated, live
                         merged = list(primary)
                         merged_lower = {_model_dedup_key(m) for m in primary}
-                        for m in secondary:
-                            if _model_dedup_key(m) not in merged_lower:
-                                merged.append(m)
-                                merged_lower.add(_model_dedup_key(m))
+                        extra = [
+                            m for m in secondary if _model_dedup_key(m) not in merged_lower
+                        ]
+                        if normalized not in _LIVE_FIRST_PICKER_PROVIDERS:
+                            # `extra` here is whatever the live /v1/models
+                            # endpoint returned beyond the curated list — no
+                            # hand-picked order to preserve (unlike `curated`,
+                            # which keeps its deliberate order above), so
+                            # alphabetize it instead of leaving it in the
+                            # provider's raw API order (e.g. HuggingFace's
+                            # ~130-model tail looked shuffled to users).
+                            extra.sort(key=str.lower)
+                        for m in extra:
+                            merged.append(m)
+                            merged_lower.add(_model_dedup_key(m))
                         return merged
-                    return live
+                    # No curated list at all — the live catalog IS the whole
+                    # picker, so there's no hand-picked order to preserve;
+                    # alphabetize it rather than show the raw API order.
+                    return sorted(live, key=str.lower)
             # Use profile's fallback_models if defined
             if _p.fallback_models:
                 return list(_p.fallback_models)
