@@ -104,3 +104,83 @@ async def test_send_image_upload_fallback_uses_media_read_timeout(adapter, monke
     upload = calls[1]
     assert isinstance(upload["photo"], (bytes, bytearray))
     assert upload["read_timeout"] == tg._MEDIA_SEND_READ_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_send_video_passes_probed_dimensions_to_telegram(adapter, monkeypatch, tmp_path):
+    """Telegram must receive explicit geometry instead of guessing the preview ratio."""
+    video = tmp_path / "wide.mp4"
+    video.write_bytes(b"fake-video")
+    monkeypatch.setattr(tg, "_probe_video_dimensions", lambda path: (1280, 720), raising=False)
+
+    msg = MagicMock(message_id=3)
+    adapter._bot.send_video = AsyncMock(return_value=msg)
+
+    result = await adapter.send_video("123", str(video), caption="wide")
+
+    assert result.success
+    call = adapter._bot.send_video.await_args
+    assert call is not None
+    payload = call.kwargs
+    assert payload["width"] == 1280
+    assert payload["height"] == 720
+    assert payload["supports_streaming"] is True
+
+
+@pytest.mark.parametrize(
+    ("rotation", "expected"),
+    [
+        (0, (160, 90)),
+        (90, (90, 160)),
+        (-90, (90, 160)),
+        (270, (90, 160)),
+    ],
+)
+def test_probe_video_dimensions_applies_display_rotation(monkeypatch, rotation, expected):
+    """Display-matrix quarter turns swap coded width and height."""
+    probe = MagicMock(
+        returncode=0,
+        stdout=(
+            '{"streams":[{"width":160,"height":90,'
+            f'"side_data_list":[{{"side_data_type":"Display Matrix","rotation":{rotation}}}]}}]}}'
+        ),
+    )
+    monkeypatch.setattr(tg.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(tg.subprocess, "run", MagicMock(return_value=probe))
+
+    assert tg._probe_video_dimensions("rotated.mp4") == expected
+
+
+def test_probe_video_dimensions_returns_none_without_ffprobe(monkeypatch):
+    run = MagicMock()
+    monkeypatch.setattr(tg.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tg.subprocess, "run", run)
+
+    assert tg._probe_video_dimensions("video.mp4") is None
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        MagicMock(returncode=1, stdout=""),
+        MagicMock(returncode=0, stdout="not-json"),
+        MagicMock(returncode=0, stdout='{"streams":[]}'),
+    ],
+)
+def test_probe_video_dimensions_returns_none_for_unusable_output(monkeypatch, probe):
+    monkeypatch.setattr(tg.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(tg.subprocess, "run", MagicMock(return_value=probe))
+
+    assert tg._probe_video_dimensions("video.mp4") is None
+
+
+def test_probe_video_dimensions_returns_none_on_timeout(monkeypatch):
+    monkeypatch.setattr(tg.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(
+        tg.subprocess,
+        "run",
+        MagicMock(side_effect=tg.subprocess.TimeoutExpired("ffprobe", 5)),
+    )
+
+    assert tg._probe_video_dimensions("video.mp4") is None
