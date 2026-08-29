@@ -118,12 +118,27 @@ export function createStreamThrottle(
     }
   }
 
+  function armRethrottleIfIdle() {
+    if (lastBusy || anyFullscreen() || !unthrottled || trailing !== null) {
+      return
+    }
+
+    trailing = timers.setTimeout(() => {
+      trailing = null
+      unthrottled = false
+      applyAll()
+    }, delayMs)
+  }
+
   return {
     isUnthrottled: () => unthrottled,
 
     register(win) {
       windows.add(win)
-      win.on?.('closed', () => windows.delete(win))
+      win.on?.('closed', () => {
+        windows.delete(win)
+        armRethrottleIfIdle()
+      })
       // Follow the compositor: entering fullscreen must lift throttling even
       // when no turn is in flight, leaving it may restore throttling once the
       // stream settles. Both events re-evaluate every window because the
@@ -137,19 +152,10 @@ export function createStreamThrottle(
         applyAll()
       })
       win.on?.('leave-full-screen', () => {
-        // Leaving fullscreen while a turn is in flight: the streaming lift
-        // stays until the normal settle path handles it — no extra calls.
-        if (lastBusy) {
-          return
-        }
         // Idle exit: nothing needs full cadence anymore. If a settle report
         // already passed through while fullscreen held the lift, arm the
         // trailing re-throttle now (same delay as a stream tail).
-        trailing = timers.setTimeout(() => {
-          trailing = null
-          unthrottled = false
-          applyAll()
-        }, delayMs)
+        armRethrottleIfIdle()
       })
       apply(win)
     },
@@ -178,16 +184,8 @@ export function createStreamThrottle(
         return
       }
 
-      if (!unthrottled || trailing !== null) {
-        return
-      }
-
       // Trailing edge: keep full cadence briefly so the final flush paints.
-      trailing = timers.setTimeout(() => {
-        trailing = null
-        unthrottled = false
-        applyAll()
-      }, delayMs)
+      armRethrottleIfIdle()
     }
   }
 }

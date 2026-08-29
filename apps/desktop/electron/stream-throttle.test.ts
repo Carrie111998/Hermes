@@ -44,6 +44,7 @@ function makeWindow() {
       listeners.get('closed')?.()
     },
     isDestroyed: () => destroyed,
+    listeners,
     on(event: string, fn: () => void) {
       listeners.set(event, fn)
     },
@@ -157,21 +158,15 @@ test('closed and destroyed windows drop out without throwing', () => {
 
 function makeFullscreenableWindow() {
   const win = makeWindow()
-  const listeners = new Map<string, () => void>()
   let fullscreen = false
   const ext = win as ReturnType<typeof makeWindow> & {
     isFullScreen: () => boolean
-    listeners: Map<string, () => void>
     goFullscreen(on: boolean): void
   }
   ext.isFullScreen = () => fullscreen
-  ext.listeners = listeners
-  win.on = (event: string, fn: () => void) => {
-    listeners.set(event, fn)
-  }
   ext.goFullscreen = (on: boolean) => {
     fullscreen = on
-    listeners.get(on ? 'enter-full-screen' : 'leave-full-screen')?.()
+    win.listeners.get(on ? 'enter-full-screen' : 'leave-full-screen')?.()
   }
 
   return ext
@@ -231,6 +226,49 @@ test('fullscreen keeps the fleet live on settle; everything re-throttles after l
   assert.deepEqual(fsWin.calls, [true, false, true])
   assert.deepEqual(normalWin.calls, [true, false, true])
   assert.equal(throttle.isUnthrottled(), false)
+})
+
+test('closing the only fullscreen window re-arms throttling for the remaining fleet', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const fsWin = makeFullscreenableWindow()
+  const normalWin = makeWindow()
+
+  throttle.register(fsWin)
+  throttle.register(normalWin)
+  fsWin.goFullscreen(true)
+  fsWin.close()
+
+  assert.equal(timers.pendingCount, 1)
+  assert.equal(throttle.isUnthrottled(), true)
+
+  timers.fire()
+  assert.equal(throttle.isUnthrottled(), false)
+  assert.deepEqual(normalWin.calls, [true, false, true])
+})
+
+test('leaving one of two fullscreen windows does not re-arm throttling', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const first = makeFullscreenableWindow()
+  const second = makeFullscreenableWindow()
+  const normalWin = makeWindow()
+
+  throttle.register(first)
+  throttle.register(second)
+  throttle.register(normalWin)
+  first.goFullscreen(true)
+  second.goFullscreen(true)
+  first.goFullscreen(false)
+
+  assert.equal(timers.pendingCount, 0)
+  timers.fire()
+  assert.equal(throttle.isUnthrottled(), true)
+  assert.deepEqual(second.calls.slice(-1), [false])
+  assert.deepEqual(normalWin.calls.slice(-1), [false])
+
+  second.goFullscreen(false)
+  assert.equal(timers.pendingCount, 1)
 })
 
 test('leaving fullscreen while a turn is still in flight keeps both windows live', () => {
