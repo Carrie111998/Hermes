@@ -10,6 +10,7 @@ import {
   isRemoteGateway,
   mediaExternalUrl,
   mediaGatewayStreamUrl,
+  mediaName,
   resolveMediaDisplaySrc,
   resolveMediaPlaybackSrc
 } from './media'
@@ -45,6 +46,13 @@ describe('filePathFromMediaPath', () => {
   })
 })
 
+describe('mediaName', () => {
+  it('extracts the basename from Windows drive and UNC paths', () => {
+    expect(mediaName('C:\\Users\\ADMIN\\My Files\\report.pdf')).toBe('report.pdf')
+    expect(mediaName('\\\\server\\Shared Files\\report.pdf')).toBe('report.pdf')
+  })
+})
+
 describe('mediaExternalUrl', () => {
   afterEach(() => {
     $connection.set(null)
@@ -59,6 +67,16 @@ describe('mediaExternalUrl', () => {
     $connection.set({ mode: 'local' } as never)
     expect(mediaExternalUrl('/tmp/a.png')).toBe('file:///tmp/a.png')
     expect(mediaExternalUrl('file:///tmp/a.png')).toBe('file:///tmp/a.png')
+  })
+
+  it('creates standards-compliant Windows drive and UNC file URLs', () => {
+    $connection.set({ mode: 'local' } as never)
+    expect(mediaExternalUrl('C:\\Program Files\\final report.pdf')).toBe(
+      'file:///C:/Program%20Files/final%20report.pdf'
+    )
+    expect(mediaExternalUrl('\\\\server\\Shared Files\\report.pdf')).toBe(
+      'file://server/Shared%20Files/report.pdf'
+    )
   })
 
   it('rewrites gateway-local paths to an authenticated download URL', () => {
