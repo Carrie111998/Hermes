@@ -3199,6 +3199,10 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Chats whose turn has finished. Discord send_typing starts a persistent
+        # loop; a late progress-path send_typing after stop_typing can recreate
+        # it forever (see #85427). Closed until the next _keep_typing session.
+        self._typing_closed: set = set()
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -5320,6 +5324,7 @@ class BasePlatformAdapter(ABC):
         # gated on network health.  Must stay below ``interval`` so a slow
         # call gets abandoned before the next scheduled tick.
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        self._typing_closed.discard(chat_id)
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -5385,6 +5390,7 @@ class BasePlatformAdapter(ABC):
         stop_attempts: int = 2,
     ) -> None:
         """Stop the refresh task and platform typing state as one operation."""
+        self._typing_closed.add(chat_id)
         self._typing_paused.add(chat_id)
         try:
             if typing_task is not None and not typing_task.done():

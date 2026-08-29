@@ -5600,6 +5600,11 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return
+        # Turn already finished — refuse to recreate the persistent loop.
+        # gateway/run.py progress restore and _keep_typing finally-unpause
+        # both call send_typing after stop_typing (#85427).
+        if chat_id in getattr(self, "_typing_closed", ()):
+            return
         # Don't start a duplicate loop
         if chat_id in self._typing_tasks:
             return
@@ -5635,18 +5640,22 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                # Only evict *this* loop. An unconditional pop orphans a newer
+                # loop registered by a concurrent send_typing (#85425).
+                if self._typing_tasks.get(chat_id) is asyncio.current_task():
+                    self._typing_tasks.pop(chat_id, None)
 
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
     async def stop_typing(self, chat_id: str) -> None:
         """Stop the persistent typing indicator for a channel."""
+        getattr(self, "_typing_closed", set()).add(chat_id)
         task = self._typing_tasks.pop(chat_id, None)
         if task:
             task.cancel()
             try:
-                await task
-            except (asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
