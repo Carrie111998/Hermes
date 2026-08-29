@@ -120,6 +120,41 @@ class TestCLIStatusBar:
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
 
+    def test_hostname_shown_in_status_bar_text_and_fragments(self):
+        from unittest.mock import MagicMock, patch
+
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+
+        host = HermesCLI._status_bar_hostname()
+        assert host  # non-empty on a real host (safe fallback is '')
+
+        text = cli_obj._build_status_bar_text(width=120)
+        assert host in text
+
+        cli_obj._status_bar_visible = True
+        mock_app = MagicMock()
+        mock_app.output.get_size.return_value = MagicMock(columns=120)
+        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+            frags = cli_obj._get_status_bar_fragments()
+        frag_text = "".join(value for _, value in frags)
+        assert host in frag_text
+
+    def test_status_bar_hostname_never_raises(self):
+        # Fallback must be '' (never crash the renderer) when gethostname fails.
+        with patch(
+            "cli.socket.gethostname",
+            side_effect=RuntimeError("no hostname in sandbox"),
+        ):
+            assert HermesCLI._status_bar_hostname() == ""
+
 
     def test_input_height_counts_prompt_only_on_first_wrapped_row(self):
         # Regression for prompt_toolkit classic CLI resize glitches: the prompt
