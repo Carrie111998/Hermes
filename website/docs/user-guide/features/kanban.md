@@ -227,8 +227,8 @@ kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
   review_dispatch: true            # default: spawn the assigned profile with
-                                   # the bundled sdlc-review skill. Set false
-                                   # for human-only review boards.
+                                   # native review-lane guidance. Set false for
+                                   # human-only review boards.
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`

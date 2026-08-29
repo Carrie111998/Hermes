@@ -85,6 +85,19 @@ def _prompt_parts(agent):
         return build_system_prompt_parts(agent)
 
 
+def test_fallback_kanban_guidance_is_session_static(monkeypatch):
+    agent = _make_agent(valid_tool_names=["kanban_show"])
+    del agent._kanban_worker_guidance
+
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW", "1")
+    first = _stable_prompt(agent)
+    monkeypatch.delenv("HERMES_KANBAN_REVIEW")
+    second = _stable_prompt(agent)
+
+    assert "Treat the handoff as a claim" in first
+    assert second == first
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""

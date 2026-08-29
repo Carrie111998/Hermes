@@ -2776,7 +2776,7 @@ DEFAULT_CONFIG = {
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
         # Automatically claim tasks in the first-class review column and spawn
-        # the assigned profile with the bundled sdlc-review skill. Disable for
+        # the assigned profile with native review-lane guidance. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier

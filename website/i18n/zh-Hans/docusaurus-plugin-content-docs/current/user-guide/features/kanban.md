@@ -161,8 +161,8 @@ hermes kanban stats
 kanban:
   dispatch_in_gateway: true        # 默认
   dispatch_interval_seconds: 60    # 默认
-  review_dispatch: true            # 默认：使用内置 sdlc-review skill 自动启动 reviewer。
-                                   # 纯人工审查看板可设为 false。
+  review_dispatch: true            # 默认：使用原生 review-lane 指引自动启动 reviewer。
+                                   # 不会自动加载 sdlc-review skill；纯人工审查看板可设为 false。
 ```
 
 通过 `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0` 在运行时覆盖配置标志以进行调试。标准 gateway 监督适用：直接运行 `hermes gateway start`，或将 gateway 配置为 systemd 用户单元（参见 gateway 文档）。没有运行中的 gateway，`ready` 任务会保持原状，直到 gateway 启动 —— `hermes kanban create` 在创建时会对此发出警告。

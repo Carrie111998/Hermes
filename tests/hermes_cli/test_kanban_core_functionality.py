@@ -693,7 +693,9 @@ def test_pid_alive_detects_zombie(kanban_home):
 
 
 
-def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
+def test_default_spawn_ready_lane_clears_review_env_and_loads_no_skill(
+    kanban_home, monkeypatch
+):
     """The dispatcher no longer auto-loads a bundled kanban skill.
 
     The kanban lifecycle (formerly the kanban-worker/kanban-orchestrator
@@ -705,6 +707,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     hermes subprocess (which would hang trying to call an LLM).
     """
     captured = {}
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW", "1")
 
     class FakeProc:
         def __init__(self):
@@ -741,6 +744,40 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_TASK") == tid
     assert env.get("HERMES_PROFILE") == "some-profile"
+    assert "HERMES_KANBAN_REVIEW" not in env
+
+
+def test_default_spawn_marks_review_lane_without_auto_loading_skill(
+    kanban_home, monkeypatch
+):
+    """Review guidance is native worker protocol, not a profile skill dependency."""
+    captured = {}
+
+    class FakeProc:
+        pid = 99999
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env", {})
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="review protocol test", assignee="blank-slate-reviewer"
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        setattr(task, "_dispatch_lane", "review")
+        from dataclasses import asdict
+        assert "_dispatch_lane" not in asdict(task)
+        pid = kb._default_spawn(task, str(workspace))
+
+    assert pid == 99999
+    assert "--skills" not in captured["cmd"]
+    assert captured["env"].get("HERMES_KANBAN_REVIEW") == "1"
 
 
 # ---------------------------------------------------------------------------

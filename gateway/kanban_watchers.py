@@ -1641,8 +1641,8 @@ class GatewayKanbanWatchersMixin:
             PATH, missing venv, credential loss for a real Hermes profile).
             """
             # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
+            # actually on. With ``review_dispatch`` off, a task parked in
+            # 'review' is "correctly idle"
             # waiting for a human, not a stuck dispatcher; probing it here would
             # fire a false "dispatcher stuck" warning that never clears. Shares
             # the exact gate the dispatcher uses so the two can't drift.

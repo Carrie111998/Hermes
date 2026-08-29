@@ -404,8 +404,8 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         assert tid not in [s[0] for s in res_off.spawned]
         assert kb.get_task(conn, tid).status == "review"
 
-        # Gate ON (the default; sdlc-review is bundled) -> the review task is
-        # picked up by the dispatcher.
+        # Gate ON (the default) -> native review-lane dispatch picks up the
+        # review task without auto-loading a skill.
         monkeypatch.setattr(
             cfgmod, "load_config",
             lambda *a, **k: {"kanban": {"review_dispatch": True}},
@@ -475,7 +475,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
-def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
+def test_review_dispatch_preserves_task_skills_and_marks_review_lane(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import hermes_cli.config as cfgmod
@@ -487,11 +487,23 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         "load_config",
         lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
     )
-    captured: list[list[str]] = []
+    captured: list[tuple[list[str], str | None]] = []
 
     def spawn(task, workspace):
-        captured.append(list(task.skills or []))
-        return None
+        """Legacy wrapper must inherit review semantics without a new kwarg."""
+        captured.append((list(task.skills or []), getattr(task, "_dispatch_lane", "")))
+        return kb._default_spawn(task, workspace)
+
+    class FakeProc:
+        pid = 99999
+
+    popen_calls: list[dict] = []
+
+    def fake_popen(_cmd, **kwargs):
+        popen_calls.append(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     with kb.connect() as conn:
         task_id = kb.create_task(
@@ -524,7 +536,49 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         result = kb.dispatch_once(conn, spawn_fn=spawn)
 
     assert task_id in [task[0] for task in result.spawned]
-    assert captured == [["domain-specific-review", "sdlc-review"]]
+    assert captured == [(["domain-specific-review"], "review")]
+    assert len(popen_calls) == 1
+    assert popen_calls[0]["env"].get("HERMES_KANBAN_REVIEW") == "1"
+
+
+def test_review_spawn_internal_type_error_is_not_retried(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    calls: list[str] = []
+
+    def spawn(task, workspace):
+        calls.append(getattr(task, "_dispatch_lane", ""))
+        raise TypeError("inside legacy wrapper")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review type error", assignee="reviewer")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        failed = kb.get_task(conn, task_id)
+
+    assert result.spawned == []
+    assert calls == ["review"]
+    assert failed is not None
+    assert failed.status == "review"
+    assert failed.consecutive_failures == 1
+    assert failed.last_failure_error == "inside legacy wrapper"
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(

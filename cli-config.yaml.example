@@ -318,8 +318,9 @@ model:
 # Kanban Review Dispatch
 # =============================================================================
 # First-class review tasks are dispatched automatically by default. The worker
-# is spawned with the bundled sdlc-review skill and can approve, request changes
-# back to the original implementer, or escalate a genuine external blocker.
+# receives native review-lane guidance and can approve, request changes back to
+# the original implementer, or escalate a genuine external blocker. Per-task
+# skills remain opt-in and are not changed by review dispatch.
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true

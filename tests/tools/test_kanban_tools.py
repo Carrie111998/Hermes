@@ -579,6 +579,19 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_review_guidance_is_native_and_review_lane_only():
+    from agent.prompt_builder import kanban_guidance
+
+    worker_guidance = kanban_guidance(review=False)
+    review_guidance = kanban_guidance(review=True)
+
+    assert "Treat the handoff as a claim" not in worker_guidance
+    assert "Treat the handoff as a claim" in review_guidance
+    assert "Do not edit the implementation" in review_guidance
+    assert "kanban_request_changes" in review_guidance
+    assert len(review_guidance) < 10000
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------

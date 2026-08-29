@@ -37,7 +37,7 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 
 ## How to Run
 
-This skill is loaded automatically by the review dispatcher. Start with `kanban_show` before inspecting files or choosing a verdict.
+The review dispatcher injects the mandatory review-lane protocol directly, so blank-slate profiles do not depend on this bundled skill. Load or assign this skill when the expanded review lenses and examples are useful. Start with `kanban_show` before inspecting files or choosing a verdict.
 
 1. Read the task specification and the latest `review_requested` handoff.
 2. Inspect the actual deliverable and run relevant verification.

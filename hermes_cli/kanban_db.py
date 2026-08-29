@@ -1141,7 +1141,6 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
-
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
@@ -9608,9 +9607,10 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
 def review_dispatch_enabled() -> bool:
     """Return whether first-class review tasks should dispatch automatically.
 
-    The default is true because Hermes ships the ``sdlc-review`` skill and the
-    review lifecycle includes a supported reviewer-owned changes-requested
-    transition. Operators can disable it for human-only review boards.
+    The default is true because review workers receive a native review-lane
+    protocol and the lifecycle includes a supported reviewer-owned
+    changes-requested transition. Operators can disable it for human-only
+    review boards.
     """
     try:
         from hermes_cli.config import load_config
@@ -10268,11 +10268,11 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
+                sig = None
+            if sig is not None and "board" in sig.parameters:
+                pid = _spawn(claimed, str(workspace), board=board)
+            else:
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
@@ -10308,17 +10308,18 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the candidate and either approves
-    # (→ done) or requests changes (→ ready/todo for the implementer).
+    # Review tasks are tasks that a worker moved to 'review' after creating a
+    # PR. The dispatcher marks the transient task context as the review lane;
+    # the default spawn then injects native review guidance without requiring a
+    # bundled skill. The reviewer either approves (→ done) or requests changes
+    # (→ ready/todo for the implementer).
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
-    # Auto-dispatch is enabled by default because Hermes bundles the
-    # ``sdlc-review`` skill and reviewer workers can now approve, request
-    # changes without block-loop accounting, or escalate a genuine blocker.
+    # Auto-dispatch is enabled by default because reviewer workers receive the
+    # native review contract and can approve, request changes without
+    # block-loop accounting, or escalate a genuine blocker.
     # Human-only boards can disable it with ``kanban.review_dispatch``.
     #
     # ``review_rows`` was enumerated before the ready loop; when it is
@@ -10368,6 +10369,10 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Private, in-memory spawn context. Do not add this to the Task dataclass:
+        # dashboard serialization uses dataclasses.asdict(Task), and lane identity
+        # is per-attempt metadata rather than part of the public task record.
+        setattr(claimed, "_dispatch_lane", "review")
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -10387,24 +10392,16 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
+                sig = None
+            if sig is not None and "board" in sig.parameters:
+                pid = _spawn(claimed, str(workspace), board=board)
+            else:
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
@@ -10774,6 +10771,13 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Review is a native Kanban lane, not a bundled-skill capability. Mark it
+    # so agent_init injects the review contract into the session-static system
+    # prompt even for profiles that intentionally opt out of bundled skills.
+    if getattr(task, "_dispatch_lane", "ready") == "review":
+        env["HERMES_KANBAN_REVIEW"] = "1"
+    else:
+        env.pop("HERMES_KANBAN_REVIEW", None)
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation

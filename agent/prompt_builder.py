@@ -399,6 +399,31 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+KANBAN_REVIEW_GUIDANCE = (
+    "# Kanban review-lane protocol\n"
+    "You are the independent reviewer for this task, not its implementer. Treat "
+    "the handoff as a claim to verify, not proof. Read the original task, latest "
+    "handoff, prior requested changes, and actual deliverable. Map every acceptance "
+    "criterion to evidence; for code, inspect the diff and callers, run relevant "
+    "focused tests/lint/type checks, exercise the reported failure and a normal "
+    "control path when practical, and consider error handling, races, data loss, "
+    "security boundaries, and relevant cross-platform behavior.\n"
+    "Choose exactly one terminal verdict. Approve only with concrete evidence via "
+    "`kanban_complete`. For correctable defects, first leave actionable findings "
+    "with locations, reproduction, impact, and minimum correction, then call "
+    "`kanban_request_changes`. Use `kanban_block` only for a genuine external "
+    "prerequisite or human decision. Do not edit the implementation while reviewing; "
+    "preserve role separation and independently re-test the next candidate. Never "
+    "persist secrets, tokens, or raw PII in review summaries or metadata."
+)
+
+
+def kanban_guidance(*, review: bool = False) -> str:
+    """Return the session-static Kanban protocol for this worker lane."""
+    if review:
+        return f"{KANBAN_GUIDANCE}\n\n{KANBAN_REVIEW_GUIDANCE}"
+    return KANBAN_GUIDANCE
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

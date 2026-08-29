@@ -37,7 +37,6 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
-    KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -51,6 +50,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    kanban_guidance,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -513,11 +513,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
     # this block. Resolved once at __init__ (see _kanban_worker_guidance).
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
+    if _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
+        # Fallback for code paths that bypass agent_init (rare).
+        _kanban_guidance = kanban_guidance(
+            review=os.environ.get("HERMES_KANBAN_REVIEW") == "1"
+        )
+        agent._kanban_worker_guidance = _kanban_guidance
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
-        # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
