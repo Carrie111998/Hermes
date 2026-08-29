@@ -1031,8 +1031,10 @@ class TestBuildAnthropicKwargs:
 
     def test_non_claude_anthropic_models_use_manual_path(self):
         """Non-Claude Anthropic-Messages models (minimax, qwen3, glm) must not
-        be misclassified as adaptive by the default-to-modern rule. Kimi is
-        the deliberate exception — see test_kimi_family_uses_adaptive_path."""
+        be misclassified as adaptive by the default-to-modern rule. Kimi and
+        the Qwen3.8 family are deliberate exceptions — see
+        test_bare_k3_coding_plan_slug_is_kimi_family and
+        test_qwen3_8_family_uses_adaptive_path."""
         from agent.anthropic_adapter import (
             _supports_adaptive_thinking,
             _supports_xhigh_effort,
@@ -1059,6 +1061,78 @@ class TestBuildAnthropicKwargs:
         # Prefix-lookalikes without a separator must not be swept in.
         for m in ("k30", "k3000-chat", "keras-3"):
             assert _model_name_is_kimi_family(m) is False, m
+
+    def test_qwen3_8_family_uses_adaptive_path(self):
+        """Third-party Anthropic-compatible endpoints serving Qwen3.8 honor
+        the adaptive contract (``thinking.type="adaptive"`` +
+        ``output_config.effort``) with a clean effort dose-response, while
+        the manual ``budget_tokens`` field is rejected with HTTP 502
+        upstream_error at any value — so Qwen3.8 must take the adaptive path
+        like Kimi/GLM-5, or every request hard-fails when reasoning effort
+        is configured. Verified live against qwen3.8-max via a third-party
+        relay (2026-08-25): effort low ≈0.5K thinking chars vs high ≈5.5K;
+        budget_tokens=8000 and 16000 → 502 upstream_error ×3 each.
+
+        xhigh stays allowed by default, mirroring the Kimi/GLM-5 treatment
+        (adaptive non-Claude families accept it unless proven otherwise);
+        not separately verified on the relay.
+        """
+        from agent.anthropic_adapter import (
+            _model_name_is_qwen3_8_family,
+            _supports_adaptive_thinking,
+            _supports_xhigh_effort,
+        )
+        for m in ("qwen3.8-max", "qwen3.8", "qwen3.8-plus", "Qwen/qwen3.8-max",
+                  "qwen-3.8-max", "qwen3.8p2"):
+            assert _model_name_is_qwen3_8_family(m) is True, m
+            assert _supports_adaptive_thinking(m) is True, m
+        assert _supports_xhigh_effort("qwen3.8-max") is True
+        # Older Qwen generations and lookalikes stay on the manual budget path.
+        for m in ("qwen3-max", "qwen3-235b-a22b", "qwen2.5-max", "qwq-32b",
+                  "qwen3.85", "qwen30.8"):
+            assert _model_name_is_qwen3_8_family(m) is False, m
+            assert _supports_adaptive_thinking(m) is False, m
+
+    def test_qwen3_8_builds_adaptive_effort_kwargs(self):
+        """build_anthropic_kwargs must emit the adaptive contract for Qwen3.8
+        (never the manual budget_tokens path, which third-party endpoints
+        reject with 502), and must NOT inject the manual-path side effects
+        (temperature=1 forcing, max_tokens bump). Thinking-off stays
+        omission-based like Kimi — no explicit disable on non-Claude."""
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        base = dict(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            max_tokens=1024,
+        )
+        kw = build_anthropic_kwargs(
+            model="Qwen/qwen3.8-max",
+            reasoning_config={"enabled": True, "effort": "high"},
+            **base,
+        )
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kw["output_config"] == {"effort": "high"}
+        assert "budget_tokens" not in kw["thinking"]
+        # Manual-path side effects must not leak into the adaptive path.
+        assert "temperature" not in kw
+        assert kw["max_tokens"] == 1024
+
+        kw_off = build_anthropic_kwargs(
+            model="qwen3.8-max",
+            reasoning_config={"enabled": False},
+            **base,
+        )
+        assert "thinking" not in kw_off
+
+        # Older Qwen keeps the manual path unchanged (regression guard).
+        kw_old = build_anthropic_kwargs(
+            model="qwen3-max",
+            reasoning_config={"enabled": True, "effort": "high"},
+            **base,
+        )
+        assert kw_old["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+        assert kw_old["temperature"] == 1
 
     def test_fast_mode_omitted_for_unsupported_model(self):
         """fast_mode=True on Opus 4.7 must NOT inject speed=fast (API 400s)."""
