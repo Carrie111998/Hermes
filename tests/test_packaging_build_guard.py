@@ -120,13 +120,16 @@ def test_wheel_ships_importable_hermes_state_support_modules(tmp_path):
     import_script = "\n".join(
         [
             "import importlib",
+            "from pathlib import Path",
             "import sys",
             f"wheel_path = {str(wheel_path)!r}",
             "sys.path.insert(0, wheel_path)",
             f"module_names = {HERMES_STATE_SUPPORT_MODULES!r}",
             "for name in module_names:",
             "    module = importlib.import_module(name)",
-            "    assert module.__file__.startswith(wheel_path + '/'), module.__file__",
+            "    archive = getattr(module.__loader__, 'archive', None)",
+            "    assert archive is not None, module.__loader__",
+            "    assert Path(archive).resolve() == Path(wheel_path).resolve(), archive",
         ]
     )
     imported = subprocess.run(

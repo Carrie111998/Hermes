@@ -151,6 +151,28 @@ def test_parentless_dependency_wait_promotes_after_link(kanban_home: Path) -> No
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_parentless_dependency_wait_promotes_when_linked_to_completed_parent(
+    kanban_home: Path,
+) -> None:
+    """Linking an already-completed parent also resumes normal promotion."""
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="child")
+        kb.block_task(conn, child, reason="waiting", kind="dependency")
+        assert kb.recompute_ready(conn) == 0
+
+        parent = _running_task(conn, title="completed parent")
+        kb.complete_task(conn, parent, result="done")
+        parent_task = kb.get_task(conn, parent)
+        assert parent_task is not None
+        assert parent_task.status == "done"
+
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.recompute_ready(conn)
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None
+        assert child_task.status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
