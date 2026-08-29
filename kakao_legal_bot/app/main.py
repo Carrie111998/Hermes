@@ -121,9 +121,20 @@ async def outbox_pull(request: Request, x_outbox_token: str = Header(default="")
 
     limit = min(int(request.query_params.get("limit", 10)), 50)
     rows = await asyncio.to_thread(services.db.claim_outbox, limit)
-    return JSONResponse(
-        {"messages": [{"id": row["id"], "room": row["room_id"], "text": row["text"]} for row in rows]}
-    )
+    messages = []
+    for row in rows:
+        # room_name 도 동봉합니다 — 폰 브리지(무루팅, 알림 기반)는 방을
+        # 이름으로만 특정할 수 있어서, id→이름 매핑이 날아가도 이걸로 배달합니다.
+        room = await asyncio.to_thread(services.db.get_room, str(row["room_id"]))
+        messages.append(
+            {
+                "id": row["id"],
+                "room": row["room_id"],
+                "room_name": str(room["room_name"]) if room is not None else "",
+                "text": row["text"],
+            }
+        )
+    return JSONResponse({"messages": messages})
 
 
 @router.post("/outbox/ack")

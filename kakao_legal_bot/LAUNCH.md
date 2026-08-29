@@ -33,11 +33,21 @@ PUBLIC_BASE_URL=https://<앱이름>.up.railway.app
 
 배포 후 `GET /health` 가 200이면 서버는 준비된 것입니다.
 
-## 2. 에뮬레이터 + Iris
+## 2. 카카오톡을 읽고 쓸 "몸" 연결 — 둘 중 하나
 
-루팅된 안드로이드 에뮬레이터에 듀얼번호로 카카오톡 로그인 → Iris 설치 →
-웹훅 주소를 `https://<서버>/iris/webhook` 으로, 시크릿을 위
-`IRIS_WEBHOOK_SECRET` 과 같게. (README 3-2 참조. NAT 뒤라면 relay/moa_relay.py)
+**옵션 A — 공기계 폰 (권장, 루팅 불필요).** 안 쓰는 실물 폰에 듀얼번호
+카카오톡을 올리고 메신저봇R + `relay/moa_phone_bridge.js` 를 넣습니다.
+PC 상시 가동이 필요 없고 폰은 충전만 해두면 됩니다. 서버 변수는
+`IRIS_SEND_MODE=poll` 한 줄(그리고 `IRIS_BASE_URL` 은 비움). 상세 순서는
+**PHONE.md** 에 처음부터 끝까지 적어 두었습니다.
+
+**옵션 B — 루팅 에뮬레이터 + Iris.** PC의 루팅된 안드로이드 에뮬레이터에
+듀얼번호로 카카오톡 로그인 → Iris 설치 → 웹훅 주소를
+`https://<서버>/iris/webhook` 으로, 시크릿을 위 `IRIS_WEBHOOK_SECRET` 과
+같게. (README 3-2 참조. NAT 뒤라면 relay/moa_relay.py)
+사진 인식·과거 대화 백필이 필요해지면 이쪽입니다.
+
+서버 코드는 두 옵션이 동일합니다 — 나중에 갈아타도 환경변수만 바꾸면 됩니다.
 
 ## 3. 변호사 카톡 연결 — `/등록` 한 번이면 끝
 

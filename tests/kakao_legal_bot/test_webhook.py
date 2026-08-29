@@ -124,11 +124,49 @@ def test_outbox_pull_and_ack_round_trip(client):
     headers = {"X-Outbox-Token": "outbox-token"}
 
     pulled = client.get("/outbox", headers=headers).json()["messages"]
-    assert pulled == [{"id": row_id, "room": "room-1", "text": "보낼 메시지"}]
+    assert pulled == [{"id": row_id, "room": "room-1", "room_name": "", "text": "보낼 메시지"}]
 
     acked = client.post("/outbox/ack", json={"ids": [row_id], "ok": True}, headers=headers)
     assert acked.json()["acked"] == 1
     assert client.services.db.outbox_depth() == 0
+
+
+def test_outbox_carries_the_room_name_for_the_phone_bridge(client):
+    """무루팅 폰 브리지는 알림 답장이라 방을 '이름'으로만 특정합니다.
+
+    id→이름 매핑이 폰에서 날아가도 배달되도록 서버가 이름을 동봉합니다.
+    """
+    client.services.db.upsert_room("ch-77", "홍길동", "direct")
+    client.services.db.enqueue_outbox("ch-77", "답변입니다")
+
+    pulled = client.get(
+        "/outbox", headers={"X-Outbox-Token": "outbox-token"}
+    ).json()["messages"]
+    assert pulled[0]["room"] == "ch-77"
+    assert pulled[0]["room_name"] == "홍길동"
+
+
+def test_a_phone_bridge_payload_parses_as_a_direct_room():
+    """moa_phone_bridge.js 가 보내는 모양 그대로 — 1:1 로 읽혀야 환영이 나갑니다."""
+    from kakao_legal_bot.app.iris import IrisEvent
+
+    event = IrisEvent.parse(
+        {
+            "room_id": "ch-77",
+            "room": "홍길동",
+            "sender": "홍길동",
+            "msg": "상담 문의드립니다",
+            "type": "1",
+            "log_id": "phone-1756400000000-42",
+            "chat_type": "direct",
+            "timestamp": 1756400000,
+        }
+    )
+    assert event.room_id == "ch-77"
+    assert event.sender_name == "홍길동"
+    assert event.is_direct_chat is True
+    assert event.is_text is True
+    assert event.event_key == "log:phone-1756400000000-42"
 
 
 def test_admin_requires_a_token(client):
