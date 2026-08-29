@@ -234,6 +234,35 @@ def _builtin_memory_prompt_snapshot(agent: Any) -> Optional[Tuple[str, str]]:
     return memory, user
 
 
+def _refresh_agent_tool_definitions(agent) -> bool:
+    """Rebuild agent.tools at the compaction commit boundary.
+
+    Forever-sessions (Bot Mode desktop chats, gateway channels) never
+    restart, so compaction is the only moment a config change can reach the
+    tool snapshot: dynamic schemas (image_generate capability gating,
+    delegate_task limits, execute_code interpreter/stub text) are built
+    once at agent init and then frozen for cache stability. The prompt
+    cache is already invalidated at this boundary, so refreshing here is
+    free; between compactions the snapshot stays byte-stable as before.
+
+    Delegates to tools.mcp_tool.refresh_agent_mcp_tools — the single shared
+    snapshot rebuild (atomic publish, generation guard, memory/LCM tool
+    re-injection) — in content_aware mode, which also swaps when schema
+    CONTENT changed under a stable name set (the dynamic-schema case; the
+    name-only diff is sufficient for its MCP-reload callers). Returns True
+    when new tools were added. Never raises: tool staleness must not fail
+    a compaction.
+    """
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    added = refresh_agent_mcp_tools(agent, content_aware=True)
+    if added:
+        logger.info(
+            "Compaction tool refresh added tools: %s", sorted(added),
+        )
+    return bool(added)
+
+
 def _cached_prompt_reflects_builtin_memory(agent: Any, cached_prompt: str) -> bool:
     """Whether the cached system prompt already embeds current built-in memory.
 
@@ -3853,6 +3882,24 @@ def compress_context(
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
 
+        # Refresh dynamic tool schemas at the same admitted-commit boundary
+        # that rebuilds the system prompt (maintainer-directed, #95681 arc):
+        # forever-sessions (Bot Mode chats, gateway channels) never restart,
+        # so compaction is the ONLY point where a config change — image
+        # model swap, delegation depth, code_execution mode — can reach
+        # agent.tools. The prompt cache is already broken here, so the
+        # refresh is free; when nothing changed the snapshot is byte-equal
+        # and we keep the existing list object (identity matters to
+        # provider-side tool-block caching on some backends).
+        try:
+            _refresh_agent_tool_definitions(agent)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "compaction tool-definition refresh failed; keeping the "
+                "session's existing tool snapshot",
+                exc_info=True,
+            )
+
         # Built-in memory is the only system-prompt input that a normal
         # compaction reloads. When the cached prompt already embeds the
         # freshly-reloaded memory blocks verbatim, keep the exact cached
@@ -4579,6 +4626,12 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
+        # Compaction rewrote the transcript, so the usage anchor's base
+        # message-list snapshot no longer describes what will be sent —
+        # invalidate it. Context checks fall back to full estimation until
+        # the next response with usage re-anchors (its structural id/index
+        # check would also fail closed, but explicit is safer).
+        agent._usage_anchor = None
         # Arm the effectiveness verdict only after a completed rewrite crosses
         # the full compaction boundary. Exceptions, aborts, and no-op attempts
         # leave this false, so unrelated later usage cannot be charged to an
@@ -4646,6 +4699,46 @@ def compress_context(
                 commit_fence.finish_commit()
 
 
+def _codex_compaction_cooldown_remaining(agent: Any) -> float:
+    """Seconds left on this session's compaction-failure cooldown (0 = clear)."""
+    compressor = getattr(agent, "context_compressor", None)
+    getter = getattr(compressor, "get_active_compression_failure_cooldown", None)
+    if not callable(getter):
+        return 0.0
+    try:
+        state = getter(refresh=True)
+    except Exception:
+        logger.debug("codex compaction cooldown lookup failed", exc_info=True)
+        return 0.0
+    if not state:
+        return 0.0
+    try:
+        return max(0.0, float(state.get("remaining_seconds") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_codex_compaction_failure(agent: Any, error: str) -> None:
+    """Arm the shared compression-failure cooldown after a failed compaction.
+
+    The codex path returns the transcript unchanged on failure, so the session
+    is still above threshold and the next turn retries immediately. Every other
+    compression path records a cooldown, an ineffective-compression strike, or
+    both; this one recorded neither, so an interrupted compaction retried once
+    per turn for as long as the condition persisted.
+    """
+    from agent.context_compressor import _SUMMARY_FAILURE_COOLDOWN_SECONDS
+
+    compressor = getattr(agent, "context_compressor", None)
+    recorder = getattr(compressor, "_record_compression_failure_cooldown", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(_SUMMARY_FAILURE_COOLDOWN_SECONDS, error)
+    except Exception:
+        logger.debug("codex compaction cooldown persist failed", exc_info=True)
+
+
 def _compress_context_via_codex_app_server(
     agent: Any,
     messages: list,
@@ -4680,6 +4773,25 @@ def _compress_context_via_codex_app_server(
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
         return messages, existing_prompt
+
+    # Automatic entrypoints must honor the compressor-owned cooldown, the same
+    # way the Hermes path below does. An active cooldown means a recent
+    # compaction already failed; retrying every turn is what thrashes.
+    if not force:
+        _cooldown_remaining = _codex_compaction_cooldown_remaining(agent)
+        if _cooldown_remaining > 0:
+            logger.info(
+                "codex app-server compaction skipped: failure cooldown active "
+                "for %.0fs (session=%s messages=%d tokens=~%s)",
+                _cooldown_remaining,
+                getattr(agent, "session_id", None) or "none",
+                len(messages),
+                f"{approx_tokens:,}" if approx_tokens else "unknown",
+            )
+            existing_prompt = getattr(agent, "_cached_system_prompt", None)
+            if not existing_prompt:
+                existing_prompt = agent._build_system_prompt(system_message)
+            return messages, existing_prompt
 
     codex_session = getattr(agent, "_codex_session", None)
     if codex_session is None:
@@ -4734,6 +4846,12 @@ def _compress_context_via_codex_app_server(
             )
         except Exception:
             pass
+        # The transcript is returned unchanged, so the session is still over
+        # threshold. Without a brake the next turn retries immediately.
+        _record_codex_compaction_failure(
+            agent,
+            str(getattr(result, "error", None) or "compaction interrupted"),
+        )
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
