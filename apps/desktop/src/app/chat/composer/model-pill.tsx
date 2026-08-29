@@ -92,6 +92,13 @@ export function ModelPill({
   const pinnedOverride =
     view.kind === 'primary' && !runtimeId && modelSource === 'manual' && Boolean(currentModel.trim())
 
+  // A draft only sends its sticky effort when the user actually picked it
+  // (see `desktopSessionCreateParams`); otherwise the gateway resolves the
+  // target profile's `agent.reasoning_effort`. Show that profile default rather
+  // than a mirror we are not going to send, so the pill cannot promise Medium
+  // and then start the chat on High. A live session keeps showing its own.
+  const displayedEffort = !runtimeId && modelSource !== 'manual' ? '' : reasoningEffort
+
   // The model resolves a beat after the gateway/session comes up. Rather than
   // flash a literal "No model", show a quiet loader (inherits the pill text
   // color at half opacity) until a model lands.
@@ -101,7 +108,7 @@ export function ModelPill({
     <>
       {currentModel.trim() ? (
         <span className="truncate">
-          {formatModelStatusLabel(currentModel, { defaultEffort, fastMode, reasoningEffort })}
+          {formatModelStatusLabel(currentModel, { defaultEffort, fastMode, reasoningEffort: displayedEffort })}
         </span>
       ) : (
         <GlyphSpinner className="opacity-50" spinner="braille" />

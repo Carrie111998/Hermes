@@ -4,7 +4,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import type { ChatBarState } from '@/app/chat/composer/types'
 import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
-import { $activeSessionId, $currentModel, setCurrentModel, setCurrentModelSource } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentModel,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentReasoningEffort,
+  setDefaultReasoningEffort
+} from '@/store/session'
 
 import { ModelPill } from './model-pill'
 
@@ -20,6 +27,49 @@ afterEach(() => {
   $activeSessionId.set(null)
   setCurrentModel('')
   setCurrentModelSource('')
+  setCurrentReasoningEffort('')
+  setDefaultReasoningEffort('')
+})
+
+// A draft sends its sticky effort only when the user picked it; otherwise the
+// gateway resolves the target profile's `agent.reasoning_effort`. The pill must
+// show what the chat will actually start on.
+describe('ModelPill reasoning-effort label', () => {
+  it('shows the profile default when the sticky effort is only a mirror', () => {
+    setCurrentModel('gpt-6')
+    setCurrentModelSource('default')
+    setCurrentReasoningEffort('medium')
+    setDefaultReasoningEffort('high')
+    $activeSessionId.set(null)
+
+    render(<ModelPill disabled={false} model={modelState()} />)
+
+    expect(screen.getByText(/· High$/)).toBeTruthy()
+  })
+
+  it('shows the sticky effort for a real user pick', () => {
+    setCurrentModel('gpt-6')
+    setCurrentModelSource('manual')
+    setCurrentReasoningEffort('medium')
+    setDefaultReasoningEffort('high')
+    $activeSessionId.set(null)
+
+    render(<ModelPill disabled={false} model={modelState()} />)
+
+    expect(screen.getByText(/· Med$/)).toBeTruthy()
+  })
+
+  it('keeps showing a live session own effort, pick or not', () => {
+    setCurrentModel('gpt-6')
+    setCurrentModelSource('default')
+    setCurrentReasoningEffort('medium')
+    setDefaultReasoningEffort('high')
+    $activeSessionId.set('live-1')
+
+    render(<ModelPill disabled={false} model={modelState()} />)
+
+    expect(screen.getByText(/· Med$/)).toBeTruthy()
+  })
 })
 
 // #62055: a manual composer pick is sticky and silently overrides the
