@@ -155,9 +155,12 @@ def test_exact_lookup_recovers_tail_row_next_to_damaged_high_edge(
 
     copied = report["copy"]["messages"]
     bounds = copied["rowid_bounds"]
-    # Premise check: the high edge probe really failed and fell back.
+    # Premise check: the high edge probe really failed; the covering-index
+    # aggregate (#98050) answers the true bound in one query, so the gallop
+    # fallback edges are no longer consulted on this shape.
     assert any("high rowid" in error for error in bounds["errors"]), bounds
-    assert "high" in bounds["fallback_edges"]
+    assert bounds.get("aggregate_recovered") == ["high"], bounds
+    assert bounds["fallback_edges"] == []
 
     conn = sqlite3.connect(str(output))
     try:
