@@ -71,8 +71,10 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
   return group.type === 'subagent' ? s.subagents(group.items.length) : s.background(group.items.length)
 }
 
-const hasRunningTodo = (group: StatusGroup) =>
-  group.type === 'todo' && group.items.some(item => item.todoStatus === 'in_progress' && item.state === 'running')
+const activeTodoForGroup = (group: StatusGroup) =>
+  group.type === 'todo'
+    ? group.items.find(item => item.todoStatus === 'in_progress' && item.state === 'running')
+    : undefined
 
 interface ComposerStatusStackProps {
   /** The queue, built by the composer (it owns the queue's callbacks). Rendered
@@ -160,6 +162,8 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   }
 
   for (const group of groups) {
+    const activeTodo = activeTodoForGroup(group)
+
     sections.push({
       key: group.type,
       node: (
@@ -180,12 +184,15 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
             ) : undefined
           }
           collapsedIndicator={
-            hasRunningTodo(group) ? (
-              <GlyphSpinner
-                ariaLabel={t.statusStack.running}
-                className="text-[0.8rem] leading-none text-muted-foreground/80"
-                spinner="braille"
-              />
+            activeTodo ? (
+              <>
+                <GlyphSpinner
+                  ariaLabel={t.statusStack.running}
+                  className="shrink-0 text-[0.8rem] leading-none text-muted-foreground/80"
+                  spinner="braille"
+                />
+                <span className="min-w-0 truncate text-foreground/92">{activeTodo.title}</span>
+              </>
             ) : undefined
           }
           defaultCollapsed={group.type !== 'todo' && group.type !== 'goal'}

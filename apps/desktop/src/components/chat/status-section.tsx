@@ -41,8 +41,10 @@ export function StatusSection({
         >
           <DisclosureCaret className="shrink-0" open={!collapsed} size="1em" />
           {icon && <span className="flex shrink-0 items-center">{icon}</span>}
-          <span className="min-w-0 truncate">{label}</span>
-          {collapsed && collapsedIndicator && <span className="flex shrink-0 items-center">{collapsedIndicator}</span>}
+          <span className={collapsed && collapsedIndicator ? 'shrink-0' : 'min-w-0 truncate'}>{label}</span>
+          {collapsed && collapsedIndicator && (
+            <span className="flex min-w-0 items-center gap-1.5 overflow-hidden">{collapsedIndicator}</span>
+          )}
         </button>
         {accessory && <div className="flex shrink-0 items-center gap-1">{accessory}</div>}
       </div>
