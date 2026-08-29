@@ -5668,14 +5668,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # for truncation, "error" for failure, "stop" for normal completion.
             if is_partial and err_msg and "truncat" in err_msg.lower():
                 finish_reason = "length"
-            elif agent_error is not None or is_failed or (not completed and err_msg):
+            elif agent_error is not None or is_partial or is_failed or not completed or err_msg:
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
 
             final_response = result.get("final_response") if isinstance(result, dict) else None
             if finish_reason == "stop" and not emitted_text_delta and isinstance(final_response, str) and final_response:
-                last_activity = await _emit(final_response)
+                last_activity = await _emit(_resolve_media_to_data_urls(final_response))
 
             # Finish chunk
             finish_chunk = {
