@@ -674,6 +674,7 @@ class InProcessCronScheduler(CronScheduler):
             use_cron_store,
         )
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        import hermes_time
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info(
@@ -689,6 +690,11 @@ class InProcessCronScheduler(CronScheduler):
         for entry in _existing_profile_homes(profile_homes):
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
+            # hermes_time caches the resolved timezone process-wide; after
+            # switching to this profile's home, re-resolve so cron instants
+            # persist in the profile's configured zone, not the dashboard
+            # backend's (#97905).
+            hermes_time.reset_cache()
             try:
                 with use_cron_store(home):
                     recovered = self.recover_interrupted()
@@ -713,6 +719,7 @@ class InProcessCronScheduler(CronScheduler):
                     for entry in _existing_profile_homes(profile_homes):
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
+                        hermes_time.reset_cache()
                         try:
                             with use_cron_store(home):
                                 cron_tick(
@@ -736,6 +743,7 @@ class InProcessCronScheduler(CronScheduler):
             for entry in _existing_profile_homes(profile_homes):
                 home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
+                hermes_time.reset_cache()
                 try:
                     with use_cron_store(home):
                         record_ticker_heartbeat(success=ok)

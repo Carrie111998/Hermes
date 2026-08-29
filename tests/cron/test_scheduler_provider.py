@@ -190,6 +190,52 @@ def test_inprocess_provider_ticks_and_stops():
     assert calls[0].get("sync") is False
 
 
+def test_multiplex_resets_timezone_cache_per_profile():
+    """The multiplex ticker must re-resolve hermes_time after each profile
+    home override; otherwise next_run_at is persisted in the dashboard
+    backend's timezone, not the ticked profile's configured zone (#97905)."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    resets = []
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+    homes = ["C:/fake/home-a", "C:/fake/home-b"]
+
+    def fake_tick(*args, **kwargs):
+        return 0
+
+    def fake_override(home):
+        return "tok"
+
+    def fake_reset_override(token):
+        return None
+
+    with (
+        patch("cron.scheduler.tick", side_effect=fake_tick),
+        patch("hermes_time.reset_cache", side_effect=lambda: resets.append(1)),
+        patch("hermes_constants.set_hermes_home_override", side_effect=fake_override),
+        patch("hermes_constants.reset_hermes_home_override", side_effect=fake_reset_override),
+        patch("cron.jobs.use_cron_store"),
+        patch("cron.jobs.record_ticker_heartbeat"),
+        patch("cron.jobs.clear_ticker_error"),
+        patch("cron.jobs.record_ticker_error"),
+        patch("cron.scheduler_provider._existing_profile_homes", side_effect=lambda h: h),
+    ):
+        t = threading.Thread(
+            target=prov._start_multiplex,
+            args=(stop,),
+            kwargs={"profile_homes": homes, "interval": 0},
+            daemon=True,
+        )
+        t.start()
+        assert _wait_until(lambda: len(resets) >= 2), "multiplex never reset hermes_time cache"
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive(), "multiplex did not exit after stop_event was set"
+    assert len(resets) >= 2, "hermes_time.reset_cache must be called per profile switch"
+
+
 # ── Phase 2: config key, discovery, resolver ─────────────────────────────────
 
 
