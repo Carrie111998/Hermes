@@ -1134,6 +1134,12 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # PR #90820 B2 / Round 3: when True, the dispatcher spawns the worker
+    # with a strict reduced toolset (no terminal / code_execution / git).
+    # The reduced toolset resolution fails closed BEFORE Popen if it
+    # cannot be validated — the worker never reaches subprocess.Popen
+    # without an authoritative toolset pin.
+    strict_readonly: bool = False
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1226,6 +1232,10 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            strict_readonly=(
+                bool(row["strict_readonly"])
+                if "strict_readonly" in keys and row["strict_readonly"] else False
             ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
@@ -1410,6 +1420,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Task-owned strict authority.  This must survive persistence and claim
+    -- reconstruction so dispatch can enforce the strict worker boundary.
+    strict_readonly      INTEGER NOT NULL DEFAULT 0,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2674,6 +2687,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "strict_readonly" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "strict_readonly",
+            "strict_readonly INTEGER NOT NULL DEFAULT 0",
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -3191,6 +3212,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    strict_readonly: bool = False,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3508,8 +3530,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, strict_readonly
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3557,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if strict_readonly else 0,
                     ),
                 )
                 for pid in parents:
@@ -3561,6 +3584,7 @@ def create_task(
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "strict_readonly": bool(strict_readonly) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
@@ -5590,6 +5614,21 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
+    # PR #90820 autonomy lifecycle (Round 3): release the in-process
+    # active reservation at the production boundary. Connecting
+    # clear_active() to the real completion path (here, right next to
+    # _fire_kanban_lifecycle_hook("kanban_task_completed")) guarantees
+    # the slot is released AFTER the task is durably done — never
+    # prematurely while the worker is still active. The slot key is
+    # the kanban task id, so re-admitting the same task is a no-op
+    # (clear_active skips when the objective_id differs).
+    try:
+        from agent.autonomy import clear_active as _autonomy_clear_active
+        _autonomy_clear_active(task_id)
+    except Exception:
+        # Best-effort: a failing autonomy hook must never block the
+        # durable completion path (which has already committed).
+        _log.debug("autonomy clear_active on completion failed", exc_info=True)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_kanban_lifecycle_hook(
@@ -10264,12 +10303,16 @@ def _dispatch_once_locked(
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
+            # Introspect the callable and pass dispatch authority only when
+            # supported, preserving older two-argument test/custom spawners.
             import inspect
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    spawn_kwargs = {"board": board}
+                    if "strict_readonly" in sig.parameters:
+                        spawn_kwargs["strict_readonly"] = claimed.strict_readonly
+                    pid = _spawn(claimed, str(workspace), **spawn_kwargs)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
@@ -10401,7 +10444,10 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    spawn_kwargs = {"board": board}
+                    if "strict_readonly" in sig.parameters:
+                        spawn_kwargs["strict_readonly"] = claimed.strict_readonly
+                    pid = _spawn(claimed, str(workspace), **spawn_kwargs)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
@@ -10691,6 +10737,80 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+# Toolsets that are FORBIDDEN inside a strict-readonly worker. The worker
+# can only write files inside its own task workspace and must not reach
+# arbitrary shell execution, code execution, or git operations on the
+# repo under itself. PR #90820 B2 / Round 3 contract.
+_STRICT_WORKER_FORBIDDEN_TOOLSETS = frozenset({
+    "terminal",
+    "code_execution",
+    "git",
+    "kanban_orchestrator",
+})
+
+
+def _resolve_strict_worker_toolsets(hermes_home: Optional[str]) -> list[str]:
+    """Return the STRICT reduced toolset for a strict-readonly worker.
+
+    Strict-readonly workers are confined to their own task workspace:
+    they can mutate files inside that workspace only (via the file-tools
+    strict gate) and self-complete via the kanban toolset, but they MUST
+    NOT reach the shell, run code, or operate on git. The reduced
+    toolset is computed from the resolved assignee-profile CLI tools
+    with the forbidden set removed. ``kanban`` is preserved so the
+    worker can call ``kanban_complete``.
+
+    Contract (PR #90820 B2 / Round 3):
+
+    * Valid reduced toolset → returns the sorted list. Worker spawn
+      proceeds and includes ``--toolsets <reduced>`` on the cmdline.
+    * Missing HERMES_HOME (no profile) → raises ``ValueError`` BEFORE
+      any subprocess is created.
+    * Resolver raises (load_config, _get_platform_tools, anything) →
+      re-raises the underlying exception BEFORE any subprocess.
+    * Resolver returns an empty / unusable result (e.g. the assignee
+      profile resolves to NO toolsets, or only forbidden ones) → raises
+      ``ValueError`` BEFORE any subprocess.
+
+    Strict workers cannot broaden their toolset as a fallback; missing
+    or unusable toolset resolution is a hard error.
+    """
+    if not hermes_home:
+        raise ValueError(
+            "strict-readonly worker requires HERMES_HOME to resolve the "
+            "assignee profile's CLI toolsets, but it was missing."
+        )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import _get_platform_tools
+
+    token = set_hermes_home_override(hermes_home)
+    try:
+        cfg = load_config()
+        resolved = sorted(_get_platform_tools(cfg, "cli"))
+    finally:
+        reset_hermes_home_override(token)
+
+    if not resolved:
+        raise ValueError(
+            "strict-readonly worker: assignee profile resolved to NO "
+            "CLI toolsets; refusing to spawn a strict worker without an "
+            "explicit --toolsets pin."
+        )
+
+    # Filter: drop any forbidden toolset. If everything was forbidden,
+    # the reduced toolset is empty → fail closed.
+    reduced = [t for t in resolved if t not in _STRICT_WORKER_FORBIDDEN_TOOLSETS]
+    if not reduced:
+        raise ValueError(
+            f"strict-readonly worker: every resolved toolset "
+            f"({resolved!r}) is in the strict-forbidden set "
+            f"({sorted(_STRICT_WORKER_FORBIDDEN_TOOLSETS)!r}); refusing to "
+            f"spawn a strict worker with no usable toolsets."
+        )
+    return reduced
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -10722,6 +10842,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    strict_readonly: bool = False,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10734,6 +10855,14 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    ``strict_readonly`` (PR #90820 B2 / Round 3): when True, the worker
+    is spawned with a strict reduced toolset that excludes terminal /
+    code_execution / git / kanban_orchestrator — the worker can only
+    mutate files inside its task workspace and self-complete via the
+    kanban toolset. The reduced toolset is resolved through
+    :func:`_resolve_strict_worker_toolsets` which raises BEFORE this
+    function reaches ``subprocess.Popen`` if resolution is invalid.
     """
     import subprocess
     if not task.assignee:
@@ -10802,6 +10931,12 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # Strict-readonly mode (PR #90820 B2): when the dispatcher invokes this
+    # spawn with strict_readonly=True, pin the env so the child can verify
+    # its own mode without trusting argv (defense in depth against a
+    # prompt-injected worker that tries to disable the gate).
+    if strict_readonly:
+        env["HERMES_KANBAN_STRICT_READONLY"] = "1"
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -10881,7 +11016,13 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets: Optional[list[str]]
+    if strict_readonly:
+        # Fail-closed BEFORE Popen. Strict workers may not proceed
+        # without a validated reduced toolset — this is the B2 contract.
+        worker_toolsets = _resolve_strict_worker_toolsets(env.get("HERMES_HOME"))
+    else:
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

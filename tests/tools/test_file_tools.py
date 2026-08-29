@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -150,16 +151,43 @@ class TestPatchHandler:
 
     @patch("tools.file_tools._get_file_ops")
     def test_patch_mode_calls_patch_v4a(self, mock_get):
+        """Round-3 B3 — patch_tool dispatches V4A through the parsed
+        ``apply_v4a_operations`` path (single parsed identity). The
+        legacy ``file_ops.patch_v4a`` shim is no longer called.
+
+        We mock the underlying primitives ``apply_v4a_operations``
+        calls (``read_file_raw`` + ``write_file``) and assert the
+        returned ``PatchResult`` serializes to a success dict.
+        """
+        from types import SimpleNamespace
+
         mock_ops = MagicMock()
-        result_obj = MagicMock()
-        result_obj.to_dict.return_value = {"status": "ok", "operations": 1}
-        mock_ops.patch_v4a.return_value = result_obj
+        # ``read_file_raw`` returns a ReadResult-shaped object. The
+        # validation phase reads ``.error`` and ``.content``; pass a
+        # SimpleNamespace so ``content`` is a real ``str`` that can be
+        # split, joined, and ``str.replace``d by the simulator.
+        mock_ops.read_file_raw.return_value = SimpleNamespace(
+            error=None, content="old line\n"
+        )
+        mock_ops.write_file.return_value = SimpleNamespace(error=None)
+        mock_ops.delete_file.return_value = SimpleNamespace(error=None)
+        mock_ops.move_file.return_value = SimpleNamespace(error=None)
         mock_get.return_value = mock_ops
 
         from tools.file_tools import patch_tool
-        result = json.loads(patch_tool(mode="patch", patch="*** Begin Patch\n..."))
-        assert result["status"] == "ok"
-        mock_ops.patch_v4a.assert_called_once()
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: /tmp/f.py\n"
+            "@@ -1 +1 @@\n"
+            "-old line\n"
+            "+new line\n"
+            "*** End Patch\n"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
+        assert result["success"] is True
+        # Confirm the dispatch went through the new primitive path,
+        # not the legacy ``file_ops.patch_v4a`` shim.
+        assert not mock_ops.patch_v4a.called
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -263,11 +291,28 @@ class TestPatchSensitivePathExtraction:
 
     @patch("tools.file_tools._get_file_ops")
     def test_patch_move_safe_paths_not_blocked(self, mock_get):
-        """Safe Move operations should still reach the file_ops dispatch."""
+        """Safe Move operations should still reach the file_ops dispatch.
+
+        Round-3 B3 — the move now flows through ``parse_v4a_patch`` →
+        ``apply_v4a_operations`` → ``file_ops.move_file``. The legacy
+        ``file_ops.patch_v4a`` shim is no longer the dispatch surface;
+        we assert against the underlying ``move_file`` primitive.
+        """
+        from types import SimpleNamespace
+
         mock_ops = MagicMock()
-        result_obj = MagicMock()
-        result_obj.to_dict.return_value = {"status": "ok"}
-        mock_ops.patch_v4a.return_value = result_obj
+        # ``move_file`` returns a WriteResult-shaped object; the apply
+        # phase only reads ``.error`` to decide success.
+        mock_ops.move_file.return_value = SimpleNamespace(error=None)
+
+        def _fake_read(path):
+            # Source path: file exists. Destination path: file does NOT
+            # exist (the validation phase rejects an overwriting move).
+            if path == "/tmp/a.txt":
+                return SimpleNamespace(error=None, content="hello")
+            return SimpleNamespace(error="file not found", content=None)
+
+        mock_ops.read_file_raw.side_effect = _fake_read
         mock_get.return_value = mock_ops
 
         from tools.file_tools import patch_tool
@@ -278,7 +323,8 @@ class TestPatchSensitivePathExtraction:
         )
         result = json.loads(patch_tool(mode="patch", patch=patch_text))
         assert "error" not in result
-        mock_ops.patch_v4a.assert_called_once()
+        # The dispatch went through move_file (the new V4A apply path).
+        mock_ops.move_file.assert_called_once_with("/tmp/a.txt", "/tmp/b.txt")
 
 
 class TestSearchHandler:
@@ -1042,5 +1088,145 @@ class TestSSHConfigWriteGateSingleQuery:
         assert missing == [], (
             f"_run_approval_gate call at ssh_config_write gate is missing "
             f"required kwargs {missing}; it would raise TypeError instead "
-            f"of showing an approval prompt"
+            "of routing through the approval flow."
         )
+
+
+class TestStrictWorkspaceMutationContainment:
+    """Runtime witnesses for every file-tool mutation under strict workers."""
+
+    @pytest.fixture
+    def strict_workspace(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_KANBAN_STRICT_READONLY", "1")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        return workspace
+
+    def test_denies_every_outside_mutation_before_file_ops(
+        self, strict_workspace, tmp_path, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(ft, "_get_file_ops", lambda task_id: calls.append(task_id))
+
+        def denied(result):
+            payload = json.loads(result)
+            assert "error" in payload
+            assert "strict-readonly" in payload["error"]
+            assert outside.read_text(encoding="utf-8") == "outside\n"
+            assert not calls
+
+        denied(ft.write_file_tool(str(outside), "mutated"))
+        denied(ft.patch_tool(
+            mode="replace", path=str(outside), old_string="outside", new_string="mutated"
+        ))
+        denied(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Add File: " + str(outside) + "\n+new\n*** End Patch\n"
+        )))
+        denied(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Update File: " + str(outside) + "\n@@ -1 +1 @@\n-outside\n+mutated\n*** End Patch\n"
+        )))
+        denied(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Delete File: " + str(outside) + "\n*** End Patch\n"
+        )))
+        inside = strict_workspace / "inside.txt"
+        inside.write_text("inside\n", encoding="utf-8")
+        denied(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Move File: " + str(outside) + " -> " + str(inside) + "\n*** End Patch\n"
+        )))
+        denied(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Move File: " + str(inside) + " -> " + str(outside) + "\n*** End Patch\n"
+        )))
+        assert inside.read_text(encoding="utf-8") == "inside\n"
+
+    def test_denies_missing_workspace_dotdot_and_symlink_escape(
+        self, strict_workspace, tmp_path, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        monkeypatch.setattr(ft, "_get_file_ops", lambda task_id: pytest.fail("must not execute"))
+        monkeypatch.delenv("HERMES_KANBAN_WORKSPACE")
+        assert "error" in json.loads(ft.write_file_tool(str(outside), "nope"))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(strict_workspace))
+        assert "error" in json.loads(ft.write_file_tool("../outside.txt", "nope"))
+        link = strict_workspace / "escape"
+        try:
+            link.symlink_to(tmp_path, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation unavailable on this platform")
+        assert "error" in json.loads(ft.write_file_tool(str(link / "outside.txt"), "nope"))
+        assert outside.read_text(encoding="utf-8") == "outside\n"
+
+    def test_all_mutations_inside_workspace_execute(self, strict_workspace, monkeypatch):
+        """The strict gate confines writes; it does not disable permitted work."""
+        from types import SimpleNamespace
+        import tools.file_tools as ft
+
+        class Result:
+            error = None
+
+            def to_dict(self):
+                return {"success": True}
+
+        class LocalOps:
+            env = None
+
+            @staticmethod
+            def write_file(path, content):
+                target = Path(path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                return Result()
+
+            @staticmethod
+            def patch_replace(path, old, new, replace_all):
+                target = Path(path)
+                content = target.read_text(encoding="utf-8")
+                target.write_text(content.replace(old, new, -1 if replace_all else 1), encoding="utf-8")
+                return Result()
+
+            @staticmethod
+            def read_file_raw(path):
+                target = Path(path)
+                if not target.exists():
+                    return SimpleNamespace(error="not found", content="")
+                return SimpleNamespace(error=None, content=target.read_text(encoding="utf-8"))
+
+            @staticmethod
+            def delete_file(path):
+                Path(path).unlink()
+                return Result()
+
+            @staticmethod
+            def move_file(source, destination):
+                Path(source).rename(destination)
+                return Result()
+
+        monkeypatch.setattr(ft, "_get_file_ops", lambda task_id: LocalOps())
+        direct = strict_workspace / "direct.txt"
+        assert json.loads(ft.write_file_tool(str(direct), "one\n"))["success"] is True
+        assert json.loads(ft.patch_tool(
+            mode="replace", path=str(direct), old_string="one", new_string="two"
+        ))["success"] is True
+        added = strict_workspace / "added.txt"
+        assert json.loads(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Add File: " + str(added) + "\n+added\n*** End Patch\n"
+        )))["success"] is True
+        assert json.loads(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Update File: " + str(added) + "\n@@ -1 +1 @@\n-added\n+updated\n*** End Patch\n"
+        )))["success"] is True
+        assert json.loads(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Delete File: " + str(added) + "\n*** End Patch\n"
+        )))["success"] is True
+        moved = strict_workspace / "moved.txt"
+        assert json.loads(ft.patch_tool(mode="patch", patch=(
+            "*** Begin Patch\n*** Move File: " + str(direct) + " -> " + str(moved) + "\n*** End Patch\n"
+        )))["success"] is True
+        assert moved.read_text(encoding="utf-8") == "two\n"
+        assert not direct.exists()
