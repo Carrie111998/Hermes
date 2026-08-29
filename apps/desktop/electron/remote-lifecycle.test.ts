@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
+import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -11,6 +11,7 @@ import { profileSshOverride } from './connection-config'
 import {
   assertRemoteInstallUpdateClear,
   buildSpawnCommand,
+  buildSpawnPayload,
   classifySshReuseProof,
   cleanupStale,
   connect,
@@ -44,6 +45,7 @@ import {
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
+const execFile = promisify(execFileCallback)
 
 test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
   assert.equal(
@@ -1567,6 +1569,28 @@ test('buildSpawnCommand lockfile publication is POSIX sh (no bash substitution)'
   // a quoted-string pid as malformed-pid skew and fails closed).
   assert.doesNotMatch(cmd, /\$\{lock_json\/\//, 'must not use ${var//} substitution under sh')
   assert.ok(cmd.includes('sed "s/\\"__PID__\\"/${child}/"'), 'pid substitution must use sed on the quoted placeholder')
+})
+
+test.skipIf(process.platform !== 'linux')('buildSpawnPayload parses as POSIX sh under dash', async () => {
+  const payload = buildSpawnPayload('/x/hermes', 'work', {
+    hermesHome: '~/.hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+    ownershipId: OWNERSHIP_ID,
+    reservationNonce: SPAWN_NONCE,
+    spawnNonce: SPAWN_NONCE,
+    tokenFilePath: spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE),
+    lockMetadata: { ownershipId: OWNERSHIP_ID, pid: '__PID__' }
+  })
+
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-remote-payload-'))
+  const payloadPath = path.join(directory, 'payload.sh')
+
+  try {
+    await writeFile(payloadPath, payload, { mode: 0o700 })
+    await execFile('dash', ['-n', payloadPath])
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('spawnRemoteDashboard removes a token file when upload reporting fails', async () => {
