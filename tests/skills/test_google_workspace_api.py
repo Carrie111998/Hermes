@@ -136,6 +136,75 @@ def test_api_calendar_list_uses_events_list(api_module):
     assert params["calendarId"] == "primary"
 
 
+def test_api_gmail_profile_uses_gws_get_profile(api_module, capsys):
+    """gmail profile delegates to users.getProfile and emits only identity."""
+    completed = MagicMock(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "emailAddress": " sandbox@example.invalid ",
+                "messagesTotal": 12,
+                "threadsTotal": 8,
+                "historyId": "123",
+            }
+        ),
+        stderr="",
+    )
+
+    with patch.object(api_module.subprocess, "run", return_value=completed) as run:
+        api_module.gmail_profile(api_module.argparse.Namespace())
+
+    cmd = run.call_args.args[0]
+    assert cmd[:4] == ["/usr/bin/gws", "gmail", "users", "getProfile"]
+    params = json.loads(cmd[cmd.index("--params") + 1])
+    assert params == {"userId": "me"}
+    assert json.loads(capsys.readouterr().out) == {
+        "emailAddress": "sandbox@example.invalid"
+    }
+
+
+def test_api_gmail_profile_uses_python_client_fallback(api_module, capsys):
+    """gmail profile preserves the wrapper's Python-client fallback."""
+    request = MagicMock()
+    request.execute.return_value = {"emailAddress": "sandbox@example.invalid"}
+    users = MagicMock()
+    users.getProfile.return_value = request
+    service = MagicMock()
+    service.users.return_value = users
+    api_module._gws_binary = lambda: None
+
+    with patch.object(api_module, "build_service", return_value=service) as build:
+        api_module.gmail_profile(api_module.argparse.Namespace())
+
+    build.assert_called_once_with("gmail", "v1")
+    users.getProfile.assert_called_once_with(userId="me")
+    request.execute.assert_called_once_with()
+    assert json.loads(capsys.readouterr().out) == {
+        "emailAddress": "sandbox@example.invalid"
+    }
+
+
+def test_api_gmail_profile_fails_when_identity_is_missing(api_module, capsys):
+    """gmail profile fails closed instead of treating metadata as identity."""
+    with patch.object(api_module, "_run_gws", return_value={"messagesTotal": 12}):
+        with pytest.raises(SystemExit) as exc_info:
+            api_module.gmail_profile(api_module.argparse.Namespace())
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "account identity" in captured.err
+
+
+def test_api_main_dispatches_gmail_profile(api_module):
+    """The public CLI exposes gmail profile without additional arguments."""
+    with patch.object(api_module, "gmail_profile") as profile:
+        with patch.object(sys, "argv", ["google_api.py", "gmail", "profile"]):
+            api_module.main()
+
+    profile.assert_called_once()
+
+
 
 
 

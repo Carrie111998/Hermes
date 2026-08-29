@@ -6,6 +6,7 @@ existing Hermes-facing JSON contract and falls back to the Python client
 libraries if `gws` is not installed.
 
 Usage:
+  python google_api.py gmail profile
   python google_api.py gmail search "is:unread" [--max 10]
   python google_api.py gmail get MESSAGE_ID
   python google_api.py gmail send --to user@example.com --subject "Hi" --body "Hello"
@@ -418,6 +419,27 @@ def gmail_reply(args):
 
     result = service.users().messages().send(userId="me", body=body).execute()
     print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+
+
+def gmail_profile(args):
+    if _gws_binary():
+        result = _run_gws(
+            ["gmail", "users", "getProfile"],
+            params={"userId": "me"},
+        )
+    else:
+        service = build_service("gmail", "v1")
+        result = service.users().getProfile(userId="me").execute()
+
+    email_address = result.get("emailAddress") if isinstance(result, dict) else None
+    if not isinstance(email_address, str) or not email_address.strip():
+        print(
+            "ERROR: Gmail profile did not include an account identity.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    print(json.dumps({"emailAddress": email_address.strip()}, indent=2))
 
 
 
@@ -1083,6 +1105,9 @@ def main():
     p.add_argument("--body", required=True)
     p.add_argument("--from", dest="from_header", default="", help="Custom From header (e.g. '\"Agent Name\" <user@example.com>')")
     p.set_defaults(func=gmail_reply)
+
+    p = gmail_sub.add_parser("profile")
+    p.set_defaults(func=gmail_profile)
 
     p = gmail_sub.add_parser("labels")
     p.set_defaults(func=gmail_labels)

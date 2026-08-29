@@ -188,6 +188,9 @@ GAPI="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/google-workspace/
 ### Gmail
 
 ```bash
+# Show the authenticated Gmail account identity
+$GAPI gmail profile
+
 # Search (returns JSON array with id, from, subject, date, snippet)
 $GAPI gmail search "is:unread" --max 10
 $GAPI gmail search "from:boss@company.com newer_than:1d"
@@ -303,6 +306,7 @@ $GAPI docs append DOC_ID --text "Additional content to append"
 
 All commands return JSON. Parse with `jq` or read directly. Key fields:
 
+- **Gmail profile**: `{emailAddress}`
 - **Gmail search**: `[{id, threadId, from, to, subject, date, snippet, labels}]`
 - **Gmail get**: `{id, threadId, from, to, subject, date, labels, body}`
 - **Gmail send/reply**: `{status: "sent", id, threadId}`
