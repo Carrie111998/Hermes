@@ -184,6 +184,12 @@
   resize: none;
 }
 
+:root[data-hermes-bot-mode] [data-bot-group-composer] textarea:placeholder-shown {
+  overflow-x: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 720px) {
   :root[data-hermes-bot-mode] [data-slot='aui_thread-content'] {
     padding-inline: 1rem;
