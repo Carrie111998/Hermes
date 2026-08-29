@@ -3733,6 +3733,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _m()._resolve_update_branch(args)
+        # An explicit `--branch NAME` is a request to land on that branch, not
+        # merely to fast-forward it. Track that intent so the "already up to
+        # date" early-return below does not switch the checkout back to whatever
+        # branch the user happened to start on.
+        branch_explicit = bool(getattr(args, "branch", None))
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
@@ -3849,7 +3854,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
-            if current_branch not in {branch, "HEAD"}:
+            if current_branch not in {branch, "HEAD"} and not branch_explicit:
                 subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=_m().PROJECT_ROOT,
@@ -3919,6 +3924,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
+            elif branch_explicit and current_branch != branch:
+                print(f"✓ Already up to date — now on '{branch}'.")
             else:
                 print("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():
