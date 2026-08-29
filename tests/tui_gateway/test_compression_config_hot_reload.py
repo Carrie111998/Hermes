@@ -82,6 +82,31 @@ def test_unchanged_compression_config_is_noop(monkeypatch):
     assert compressor.threshold_tokens == 99_999
 
 
+def test_provider_model_context_change_invalidates_live_compression_signature():
+    def _cfg(context_length):
+        return {
+            "model": {
+                "default": "gpt-5.6-sol",
+                "provider": "relay",
+                "base_url": "https://relay.example.test/v1",
+            },
+            "providers": {
+                "relay": {
+                    "api": "https://relay.example.test/v1",
+                    "models": {
+                        "gpt-5.6-sol": {"context_length": context_length},
+                    },
+                },
+            },
+            "compression": {},
+        }
+
+    before = server._tui_compression_config_signature(_cfg(256_000))
+    after = server._tui_compression_config_signature(_cfg(192_000))
+
+    assert before != after
+
+
 def test_clearing_threshold_tokens_restores_ratio_trigger(monkeypatch):
     session, compressor = _session_with_compressor(threshold_tokens_cap=100_000)
     assert compressor.threshold_tokens == 100_000
@@ -219,6 +244,170 @@ def test_removing_context_length_reinfers_from_model_metadata(monkeypatch):
     assert compressor._config_context_length is None
     assert compressor.context_length == 1_000_000
     assert compressor.threshold_tokens == int(1_000_000 * 0.50)
+
+
+def test_removing_context_length_invalidates_summary_budget(monkeypatch):
+    import agent.context_compressor as cc_mod
+
+    session, compressor = _neutral_session()
+    assert compressor.max_summary_tokens == 10_000
+
+    monkeypatch.setattr(
+        cc_mod,
+        "get_model_context_length",
+        lambda *a, **k: 100_000,
+    )
+    _sync_with_cfg(monkeypatch, session, {"model": {}, "compression": {}})
+
+    assert compressor.context_length == 100_000
+    assert compressor.max_summary_tokens == 5_000
+
+
+def test_provider_model_context_length_survives_live_sync_without_global_pin(
+    monkeypatch,
+):
+    import agent.context_compressor as cc_mod
+
+    base_url = "https://relay.example.test/v1"
+    compressor = ContextCompressor(
+        model="gpt-5.6-sol",
+        config_context_length=256_000,
+        quiet_mode=True,
+    )
+    agent = SimpleNamespace(
+        model="gpt-5.6-sol",
+        provider="custom",
+        base_url=base_url,
+        context_compressor=compressor,
+        compression_enabled=True,
+        compression_idle_compact_after_seconds=0,
+        _config_context_length=256_000,
+    )
+    session = {"agent": agent, "session_key": "session-provider-context"}
+    cfg = {
+        "model": {
+            "default": "gpt-5.6-sol",
+            "provider": "relay",
+            "base_url": base_url,
+        },
+        "providers": {
+            "relay": {
+                "api": base_url,
+                "models": {
+                    "gpt-5.6-sol": {"context_length": 256_000},
+                },
+            },
+        },
+        "compression": {},
+    }
+    monkeypatch.setattr(
+        cc_mod,
+        "get_model_context_length",
+        lambda *a, **k: 1_050_000,
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+
+    server._sync_agent_compression_with_config("sid-provider-context", session)
+
+    assert compressor._config_context_length == 256_000
+    assert compressor.context_length == 256_000
+    assert agent._config_context_length == 256_000
+
+
+def test_global_context_pin_does_not_override_different_active_custom_route(
+    monkeypatch,
+):
+    default_url = "https://default.example.test/v1"
+    active_url = "https://active.example.test/v1"
+    compressor = ContextCompressor(
+        model="active-model",
+        config_context_length=100_000,
+        quiet_mode=True,
+    )
+    agent = SimpleNamespace(
+        model="active-model",
+        provider="custom",
+        base_url=active_url,
+        context_compressor=compressor,
+        compression_enabled=True,
+        compression_idle_compact_after_seconds=0,
+        _config_context_length=100_000,
+    )
+    session = {"agent": agent, "session_key": "session-active-route"}
+    cfg = {
+        "model": {
+            "default": "default-model",
+            "provider": "default-relay",
+            "base_url": default_url,
+            "context_length": 500_000,
+        },
+        "providers": {
+            "active-relay": {
+                "api": active_url,
+                "models": {
+                    "active-model": {"context_length": 100_000},
+                },
+            },
+            "default-relay": {
+                "api": default_url,
+                "models": {
+                    "default-model": {"context_length": 500_000},
+                },
+            },
+        },
+        "compression": {},
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+
+    server._sync_agent_compression_with_config("sid-active-route", session)
+
+    assert compressor._config_context_length == 100_000
+    assert compressor.context_length == 100_000
+    assert agent._config_context_length == 100_000
+
+
+def test_global_context_pin_wins_on_same_named_custom_route_without_model_url(
+    monkeypatch,
+):
+    base_url = "https://relay.example.test/v1"
+    compressor = ContextCompressor(
+        model="gpt-5.6-sol",
+        config_context_length=100_000,
+        quiet_mode=True,
+    )
+    agent = SimpleNamespace(
+        model="gpt-5.6-sol",
+        provider="custom",
+        base_url=base_url,
+        context_compressor=compressor,
+        compression_enabled=True,
+        compression_idle_compact_after_seconds=0,
+        _config_context_length=100_000,
+    )
+    session = {"agent": agent, "session_key": "session-same-named-route"}
+    cfg = {
+        "model": {
+            "default": "gpt-5.6-sol",
+            "provider": "relay",
+            "context_length": 500_000,
+        },
+        "providers": {
+            "relay": {
+                "api": base_url,
+                "models": {
+                    "gpt-5.6-sol": {"context_length": 100_000},
+                },
+            },
+        },
+        "compression": {},
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+
+    server._sync_agent_compression_with_config("sid-same-named-route", session)
+
+    assert compressor._config_context_length == 500_000
+    assert compressor.context_length == 500_000
+    assert agent._config_context_length == 500_000
 
 
 def test_removing_idle_compact_after_seconds_restores_zero(monkeypatch):
