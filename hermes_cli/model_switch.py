@@ -2655,7 +2655,7 @@ def list_authenticated_providers(
     # Compared against hermes_id / mdev_id (section 1), pid / hermes_slug
     # (section 2) and canonical slug (section 2b) so a single entry like
     # ``copilot`` hides the provider regardless of which key it surfaces under.
-    _excluded: set = {str(p).strip().lower() for p in (excluded_providers or []) if p}
+    _excluded: set = _normalize_excluded_providers(excluded_providers)
     # Effective base URLs of every built-in row we emit (normalized lower+rstrip).
     # Section 4 uses this to hide ``custom_providers`` entries that point at the
     # same endpoint as a built-in (e.g. a user-defined "my-dashscope" on
@@ -3903,6 +3903,17 @@ def list_authenticated_providers(
     return results
 
 
+def _normalize_excluded_providers(excluded_providers: list | None) -> set:
+    """Normalize provider-exclusion entries for membership checks.
+
+    Shared by ``list_authenticated_providers`` and the virtual-MoA
+    membership check in ``list_picker_providers`` so both sides normalize
+    identically (lowercase, whitespace-stripped, falsy entries dropped) —
+    a change to one side cannot silently desync the other.
+    """
+    return {str(p).strip().lower() for p in (excluded_providers or []) if p}
+
+
 def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = "") -> List[dict]:
     """Add the virtual MoA provider row used by interactive model pickers.
 
@@ -3967,9 +3978,12 @@ def list_picker_providers(
     # The virtual MoA row is prepended outside the exclusion-filtered
     # ``list_authenticated_providers`` path, so it needs its own membership
     # check against the same normalized ``excluded_providers`` set (#94068).
-    _excluded_moa = {str(p).strip().lower() for p in (excluded_providers or []) if p}
-    if include_moa and "moa" not in _excluded_moa:
-        providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
+    # The ``"moa"`` literal mirrors the slug emitted by
+    # ``_prepend_moa_picker_provider`` / ``inventory._moa_provider_row``.
+    if include_moa:
+        _excluded_moa = _normalize_excluded_providers(excluded_providers)
+        if "moa" not in _excluded_moa:
+            providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
 
     filtered: List[dict] = []
     for p in providers:
