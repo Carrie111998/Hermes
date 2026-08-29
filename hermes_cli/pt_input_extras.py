@@ -321,9 +321,10 @@ def install_modify_other_keys_aliases() -> int:
     # combo is broken" symptom (#87711).
     # Map Shift+letter to the uppercase character so typing works normally.
     # This is safe across all Latin keyboard layouts: Shift always uppercases
-    # letters.  Shift+digit symbols are layout-specific (US: '!', AZERTY: '¹',
-    # etc.) so they are NOT mapped here — if the terminal sends those under
-    # modifyOtherKeys, they will leak, but that's better than wrong input.
+    # letters.  Shift+digit *base* codepoints (ESC[27;2;50~ for Shift+2) are
+    # layout-specific (US: '@', AZERTY: '²', etc.) so they are NOT mapped —
+    # leaking is better than wrong input.  See the punctuation block below for
+    # why *shifted* codepoints are safe to map.
     # Map both the lowercase and uppercase codepoints — some terminals send
     # the already-shifted codepoint (65 for 'A') with modifier=2.
     shift_map: dict[int, str] = {}
@@ -331,6 +332,19 @@ def install_modify_other_keys_aliases() -> int:
         upper_char = chr(ch - 32)  # 'A'..'Z'
         shift_map[ch] = upper_char
         shift_map[ch - 32] = upper_char
+    # Shift+punctuation: modifyOtherKeys=2 emitters (Ghostty, VS Code,
+    # iTerm2) report the *shifted* codepoint for symbol keys — Shift+2 (US:
+    # '@') arrives as ESC[27;2;64~ where 64 IS '@'.  Mapping the codepoint
+    # to itself is layout-safe: whatever character the terminal reports is
+    # by definition the character the layout produced, so no layout table is
+    # needed.  Without this, every Shift+symbol leaks as literal
+    # "[27;2;NN~]" in the prompt.  Digits are excluded: a base-digit
+    # codepoint under Shift (ESC[27;2;50~ for Shift+2) is layout-dependent
+    # and must keep leaking rather than insert a wrong character.
+    for cp in range(33, 127):
+        if cp in shift_map or chr(cp).isdigit():
+            continue
+        shift_map[cp] = chr(cp)
     _install_paired(2, shift_map)
 
     # -- Multi-modifier letters: Shift+Alt (4), Ctrl+Shift (6),

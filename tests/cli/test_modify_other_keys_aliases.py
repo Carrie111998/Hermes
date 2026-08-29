@@ -273,6 +273,54 @@ def test_does_not_clobber_shift_enter_alias():
     assert ANSI_SEQUENCES["\x1b[13;2u"] == (Keys.Escape, Keys.ControlM)
 
 
+# ---------------------------------------------------------------------------
+# Shift+punctuation → the shifted character itself
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "codepoint,char",
+    [
+        (64, "@"),   # Shift+2 on US layout — the original 'leak' report
+        (33, "!"),   # Shift+1
+        (36, "$"),   # Shift+4
+        (38, "&"),   # Shift+7
+        (95, "_"),   # Shift+minus
+        (126, "~"),  # Shift+backtick
+        (60, "<"),   # Shift+comma
+        (62, ">"),   # Shift+period
+        (63, "?"),   # Shift+slash
+        (34, '"'),   # Shift+quote
+    ],
+)
+def test_modify_other_keys_shift_punctuation_produces_character(codepoint, char):
+    """Shift+<symbol> under modifyOtherKeys=2 must produce the character the
+    terminal reported (the shifted codepoint), not leak as literal
+    '[27;2;NN~' text.  modifyOtherKeys=2 emitters (Ghostty, VS Code, iTerm2)
+    send the *shifted* codepoint — 64 IS '@' — so mapping it to itself is
+    layout-safe."""
+    mok_seq = f"\x1b[27;2;{codepoint}~"
+    assert _parse(mok_seq) == [char], (
+        f"modifyOtherKeys Shift codepoint {codepoint} ({mok_seq!r}) should"
+        f" produce {char!r}"
+    )
+    csiu_seq = f"\x1b[{codepoint};2u"
+    assert _parse(csiu_seq) == [char], (
+        f"CSI-u Shift codepoint {codepoint} ({csiu_seq!r}) should produce"
+        f" {char!r}"
+    )
+
+
+@pytest.mark.parametrize("digit", list("0123456789"))
+def test_shift_base_digit_codepoint_stays_unmapped(digit):
+    """A *base*-digit codepoint under Shift (ESC[27;2;50~ for Shift+2) is
+    layout-dependent (US: '@', AZERTY: '²') and must keep leaking rather
+    than insert a wrong character — digits are excluded from the symbol
+    self-mapping."""
+    cp = ord(digit)
+    assert ANSI_SEQUENCES.get(f"\x1b[27;2;{cp}~") is None
+    assert ANSI_SEQUENCES.get(f"\x1b[{cp};2u") is None
+
+
 def test_does_not_clobber_ctrl_enter_alias():
     """install_modify_other_keys_aliases must not overwrite mappings
     installed by install_ctrl_enter_alias (which maps Ctrl+Enter)."""
