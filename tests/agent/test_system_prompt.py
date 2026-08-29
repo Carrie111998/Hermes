@@ -560,8 +560,8 @@ class TestSessionStartLike:
 
         now = datetime(2026, 1, 2, 9, 0, tzinfo=ZoneInfo("UTC"))
         agent = SimpleNamespace(
-            session_id="20260101_230500_abc123",
-            session_start=datetime(2026, 1, 1, 23, 5),
+            session_id="20260101_120000_abc123",
+            session_start=datetime(2026, 1, 1, 12, 0),
         )
         start = _session_start_like(agent, now)
         assert start.strftime("%Y-%m-%d") == "2026-01-01"
@@ -602,7 +602,7 @@ def test_conversation_start_uses_session_start_not_build_time(monkeypatch):
     agent = _make_agent(
         valid_tool_names=["read_file"],
         _parallel_tool_call_guidance=False,
-        session_id="20260101_230500_abc123",
+        session_id="20260101_120000_abc123",
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
@@ -626,3 +626,41 @@ def test_conversation_start_uses_session_start_not_build_time(monkeypatch):
 
     assert "Conversation started: Thursday, January 01, 2026" in prompt
     assert "Conversation started: Friday" not in prompt
+
+class TestConversationStartedTwoLine:
+    """Maintainer design on top of #96224's anchor: long-lived sessions get a
+    second 'as of the last context rebuild' line so a model in a forever-chat
+    (Bot Mode, messenger channels) is not led to believe it still lives on
+    the session's birth day. Same-day sessions keep the one-line shape."""
+
+    def _agent(self, session_id):
+        return _make_agent(
+            session_id=session_id, session_start=None,
+            _bot_chat_timeless_prompt=False,
+        )
+
+    def _volatile(self, agent):
+        import agent.system_prompt as sp
+        parts = sp.build_system_prompt_parts(agent)
+        return parts["volatile"]
+
+    def test_old_session_gets_rebuild_date_line(self):
+        vol = self._volatile(self._agent("20200110_090000_old"))
+        assert "Conversation started:" in vol
+        assert "as of the last context rebuild" in vol
+        assert "trust this over the start date" in vol
+
+    def test_same_day_session_keeps_single_line(self):
+        from hermes_time import now as hermes_now
+        sid = hermes_now().strftime("%Y%m%d_%H%M%S_fresh")
+        vol = self._volatile(self._agent(sid))
+        assert "Conversation started:" in vol
+        assert "as of the last context rebuild" not in vol
+
+    def test_timeless_bot_chat_unaffected(self):
+        agent = self._agent("20200110_090000_old")
+        agent._bot_chat_timeless_prompt = True
+        vol = self._volatile(agent)
+        assert "Conversation started:" not in vol
+        assert "as of the last context rebuild" not in vol
+
