@@ -5058,6 +5058,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _leftover_pausable_gateway_pids,
     _log_only_write,
     _mark_skip_upstream_prompt,
+    _merge_upstream_ref,
     _npm_bin_exists,
     _npm_lockfile_changed,
     _npm_manifest_paths,
