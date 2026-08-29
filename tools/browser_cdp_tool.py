@@ -68,6 +68,8 @@ _CDP_FLAGGED_BINARY_PATHS: Dict[str, tuple] = {
     "Fetch.getResponseBody": (("body",),),
     "IO.read": (("data",),),
     "Network.getRequestPostData": (("postData",),),
+    "Network.getResponseBodyForInterception": (("body",),),
+    "Page.getResourceContent": (("content",),),
 }
 
 

@@ -338,6 +338,75 @@ def test_fetch_get_response_body_base64_discriminator_passes_through(cdp_server)
     assert result["result"]["body"] == body_b64
 
 
+def test_get_response_body_for_interception_base64_discriminator_passes_through(cdp_server):
+    """Network.getResponseBodyForInterception pins the same body/base64Encoded
+    contract as Network.getResponseBody — same protocol-defined shape,
+    deprecated but still a live method (#94138 sibling gap)."""
+    body_b64 = "/" + "gAAAA" + "E" * 60 + "=="
+    cdp_server.on(
+        "Network.getResponseBodyForInterception",
+        lambda params, sid: {"body": body_b64, "base64Encoded": True},
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.getResponseBodyForInterception")
+    )
+
+    assert result["success"] is True
+    assert result["result"]["body"] == body_b64
+
+
+def test_get_response_body_for_interception_text_discriminator_still_redacts(cdp_server):
+    """Same method with base64Encoded: false — the body is text and a real
+    secret in it must still be redacted."""
+    fake_key = "sk-" + "CDPINTERCEPTBODY1234567890"
+    cdp_server.on(
+        "Network.getResponseBodyForInterception",
+        lambda params, sid: {"body": f"leak {fake_key} here", "base64Encoded": False},
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.getResponseBodyForInterception")
+    )
+
+    assert result["success"] is True
+    assert "CDPINTERCEPTBODY" not in json.dumps(result)
+
+
+def test_get_resource_content_base64_discriminator_passes_through(cdp_server):
+    """Page.getResourceContent's content field honors the same
+    body/base64Encoded contract on its own carrier key (#94138 sibling gap)."""
+    content_b64 = "/" + "gAAAA" + "F" * 60 + "=="
+    cdp_server.on(
+        "Page.getResourceContent",
+        lambda params, sid: {"content": content_b64, "base64Encoded": True},
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Page.getResourceContent")
+    )
+
+    assert result["success"] is True
+    assert result["result"]["content"] == content_b64
+
+
+def test_get_resource_content_text_discriminator_still_redacts(cdp_server):
+    """Same method with base64Encoded: false — the content is text and a real
+    secret in it must still be redacted."""
+    fake_key = "sk-" + "CDPRESOURCECONTENT1234567890"
+    cdp_server.on(
+        "Page.getResourceContent",
+        lambda params, sid: {"content": f"leak {fake_key} here", "base64Encoded": False},
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Page.getResourceContent")
+    )
+
+    assert result["success"] is True
+    assert "CDPRESOURCECONTENT" not in json.dumps(result)
+
+
 def test_runtime_evaluate_spoofed_base64_flag_still_redacts(cdp_server):
     """base64Encoded is trusted ONLY on the protocol-defined carrier paths.
     A Runtime.evaluate by-value object carrying
