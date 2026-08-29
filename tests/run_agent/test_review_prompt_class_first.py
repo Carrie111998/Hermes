@@ -76,6 +76,25 @@ def test_combined_review_prompt_has_memory_section():
     assert "memory tool" in prompt
 
 
+def test_memory_maintenance_policy_is_shared_by_memory_review_paths():
+    """Combined reviews must not bypass the lossless memory workflow."""
+    required = (
+        "audit",
+        "classify",
+        "Consolidate",
+        "atomic operations batch",
+        "every unique fact",
+        "when equivalence is uncertain",
+    )
+    for label, prompt in (
+        ("memory-only", AIAgent._MEMORY_REVIEW_PROMPT),
+        ("combined", AIAgent._COMBINED_REVIEW_PROMPT),
+    ):
+        lower = prompt.lower()
+        for phrase in required:
+            assert phrase.lower() in lower, f"{label}: missing {phrase!r}"
+
+
 
 
 
