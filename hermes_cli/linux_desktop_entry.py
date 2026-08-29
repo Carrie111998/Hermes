@@ -640,7 +640,7 @@ def _install_icon_to_hicolor(icon: Path) -> bool:
     try:
         raw = icon.read_bytes()
         is_256 = False
-        if raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
+        if len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
             width, height = struct.unpack(">II", raw[16:24])
             is_256 = (width, height) == (256, 256)
         subdir = "256x256" if is_256 else "scalable"

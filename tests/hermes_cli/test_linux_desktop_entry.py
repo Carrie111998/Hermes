@@ -961,3 +961,28 @@ def test_probe_accepts_shell_launcher_wrapper(tmp_path, xdg_home, monkeypatch):
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
     assert exec_line == f"{good_wrapper} desktop"
+
+
+def test_install_icon_handles_truncated_png_header(tmp_path, xdg_home, monkeypatch):
+    """A truncated PNG (valid signature + IHDR tag, <24 bytes) must not
+    raise struct.error out of the fail-safe: it lands in scalable/ like
+    any other unknown-size image."""
+    root = _make_project(tmp_path)
+    icon = lde.icon_path(root)
+    icon.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00"  # 22 bytes
+    )
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+
+    values = _parse(entry.read_text(encoding="utf-8"))
+    assert values["Icon"] == "hermes"
+    dest = xdg_home / "icons" / "hicolor" / "scalable" / "apps" / "hermes.png"
+    assert dest.is_file()
