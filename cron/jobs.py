@@ -1951,6 +1951,29 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+_MONITOR_COMMIT_POLICIES = {"detection_time", "after_delivery"}
+
+
+def _normalize_monitor_commit_policy(
+    value: Optional[str],
+    *,
+    monitor_script: Optional[str],
+    monitor_url: Optional[str],
+) -> Optional[str]:
+    """Validate the optional monitor commit boundary for supported job APIs."""
+    normalized = str(value).strip().lower() if value is not None else ""
+    if not normalized:
+        return None
+    if normalized not in _MONITOR_COMMIT_POLICIES:
+        choices = ", ".join(sorted(_MONITOR_COMMIT_POLICIES))
+        raise ValueError(f"monitor_commit_policy must be one of: {choices}")
+    if not (monitor_script or monitor_url):
+        raise ValueError(
+            "monitor_commit_policy requires monitor_script or monitor_url"
+        )
+    return normalized
+
+
 def _validate_job_mode_invariants(
     monitor_script: Optional[str],
     monitor_url: Optional[str],
@@ -1999,6 +2022,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    monitor_commit_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2056,6 +2080,10 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        monitor_commit_policy: Optional monitor state commit boundary.
+                ``detection_time`` preserves the eager default;
+                ``after_delivery`` retries a changed observation until
+                downstream agent execution and delivery succeed.
         reasoning_effort: Optional per-job reasoning effort pin. One of the
                 canonical Hermes levels (none|minimal|low|medium|high|xhigh|
                 max|ultra, case-insensitive). When set, it wins over BOTH the
@@ -2103,6 +2131,11 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_monitor_commit_policy = _normalize_monitor_commit_policy(
+        monitor_commit_policy,
+        monitor_script=normalized_monitor_script,
+        monitor_url=normalized_monitor_url,
+    )
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2215,6 +2248,8 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    if normalized_monitor_commit_policy is not None:
+        job["monitor_commit_policy"] = normalized_monitor_commit_policy
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2333,6 +2368,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
 
+            if {
+                "monitor_script",
+                "monitor_url",
+                "monitor_commit_policy",
+            }.intersection(updates):
+                normalized_policy = _normalize_monitor_commit_policy(
+                    updated.get("monitor_commit_policy"),
+                    monitor_script=updated.get("monitor_script") or None,
+                    monitor_url=updated.get("monitor_url") or None,
+                )
+                if normalized_policy is None:
+                    updated.pop("monitor_commit_policy", None)
+                else:
+                    updated["monitor_commit_policy"] = normalized_policy
+
             if (
                 is_terminal_job(job)
                 and not _is_recoverable_error_job(job)
@@ -2354,7 +2404,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # monitor: the scheduler's no_agent short-circuit runs before
             # the monitor gate). Scoped to changed fields so legacy records
             # untouched by this update keep loading.
-            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+            if {
+                "monitor_script",
+                "monitor_url",
+                "monitor_commit_policy",
+                "no_agent",
+                "script",
+            }.intersection(updates):
                 _upd_script = updated.get("script")
                 _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
                 _validate_job_mode_invariants(

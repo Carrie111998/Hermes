@@ -93,6 +93,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--monitor-commit-policy",
+        choices=("detection_time", "after_delivery"),
+        help=(
+            "Monitor state commit boundary. detection_time preserves the "
+            "eager default; after_delivery retries a changed observation "
+            "until the triggered agent run and delivery succeed."
+        ),
+    )
+    cron_create.add_argument(
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
@@ -227,6 +236,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help=(
             "Set/replace the monitor source URL. Pass empty string to clear."
         ),
+    )
+    cron_edit.add_argument(
+        "--monitor-commit-policy",
+        choices=("detection_time", "after_delivery"),
+        help="Set the monitor state commit boundary.",
     )
     cron_edit.add_argument(
         "--workdir",

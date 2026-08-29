@@ -194,7 +194,11 @@ def cron_list(show_all: bool = False):
             print(f"    Script:    {script}")
         monitor_source = job.get("monitor_script") or job.get("monitor_url")
         if monitor_source:
-            print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
+            monitor_policy = job.get("monitor_commit_policy") or "detection_time"
+            print(
+                f"    Monitor:   {monitor_source} "
+                f"(agent runs only on output change; commit={monitor_policy})"
+            )
             mon_state = job.get("monitor_state") or {}
             if mon_state.get("last_changed_at"):
                 print(f"    Changed:   {mon_state['last_changed_at']}")
@@ -543,6 +547,7 @@ def cron_create(args):
         no_agent=getattr(args, "no_agent", False) or None,
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
+        monitor_commit_policy=getattr(args, "monitor_commit_policy", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
     )
@@ -561,6 +566,8 @@ def cron_create(args):
         print(f"  Monitor: {job_data['monitor_script']} (agent runs only on output change)")
     if job_data.get("monitor_url"):
         print(f"  Monitor: {job_data['monitor_url']} (agent runs only on output change)")
+    if job_data.get("monitor_commit_policy"):
+        print(f"  Monitor commit: {job_data['monitor_commit_policy']}")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("continuity"):
@@ -618,6 +625,7 @@ def cron_edit(args):
         no_agent=getattr(args, "no_agent", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
+        monitor_commit_policy=getattr(args, "monitor_commit_policy", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
     )
@@ -639,6 +647,8 @@ def cron_edit(args):
         print(f"  Monitor: {updated['monitor_script']} (agent runs only on output change)")
     if updated.get("monitor_url"):
         print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
+    if updated.get("monitor_commit_policy"):
+        print(f"  Monitor commit: {updated['monitor_commit_policy']}")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("continuity"):

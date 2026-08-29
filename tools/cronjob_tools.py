@@ -785,6 +785,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_script"] = job["monitor_script"]
     if job.get("monitor_url"):
         result["monitor_url"] = job["monitor_url"]
+    if job.get("monitor_commit_policy"):
+        result["monitor_commit_policy"] = job["monitor_commit_policy"]
     if job.get("monitor_state"):
         result["monitor_state"] = job["monitor_state"]
     if job.get("no_agent"):
@@ -1482,6 +1484,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    monitor_commit_policy: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1592,6 +1595,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    monitor_commit_policy=monitor_commit_policy,
                     # reasoning_effort reaches here from the CLI
                     # (hermes cron create --reasoning-effort) ONLY — it is
                     # deliberately absent from CRONJOB_SCHEMA and the model
@@ -1867,6 +1871,8 @@ def cronjob(
                         "clear one before setting the other.",
                         success=False,
                     )
+            if monitor_commit_policy is not None:
+                updates["monitor_commit_policy"] = monitor_commit_policy
             if context_from is not None or continuity is not None:
                 # Empty string / empty list clears the field; otherwise validate
                 # each referenced job exists before storing. Normalized to a list
@@ -1997,6 +2003,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional change-detector that gates the agent: an http(s) URL (fetched each tick) or a script path (same rules as `script`, run each tick) — cheap, no LLM. Output identical to the previous tick skips the agent run entirely; changed output wakes the agent with a diff injected into the prompt. First tick always runs (baseline). Output must be deterministic (no timestamps) or every tick looks changed. Incompatible with no_agent. On update, '' clears."
             },
+            "monitor_commit_policy": {
+                "type": "string",
+                "enum": ["detection_time", "after_delivery"],
+                "description": "Optional commit boundary for monitor state. detection_time preserves the eager default. after_delivery leaves the prior hash intact until the triggered agent run and required delivery succeed, so transient failures retry the same change next tick. Requires monitor."
+            },
             "no_agent": {
                 "type": "boolean",
                 "default": False,
@@ -2092,6 +2103,7 @@ def _cronjob_handler(args, **kw):
         attach_to_session=args.get("attach_to_session"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
+        monitor_commit_policy=args.get("monitor_commit_policy"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )
