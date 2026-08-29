@@ -155,6 +155,20 @@ def _exec_bundles(ctx: CommandContext) -> CommandReply:
     )
 
 
+def _exec_menu(ctx: CommandContext) -> CommandReply:
+    """Text fallback for platforms without Telegram inline keyboards."""
+    return CommandReply(
+        "⚡ Quick actions\n\n"
+        "• /new — start a new session\n"
+        "• /stop — stop current work\n"
+        "• /status — show gateway status\n"
+        "• /sessions — browse previous sessions\n"
+        "• /fast fast — prioritize speed\n"
+        "• /reasoning high — use deeper reasoning",
+        format="markdown",
+    )
+
+
 def _exec_help(ctx: CommandContext) -> CommandReply:
     """Core gateway /help body (pre platform mention decoration)."""
     from agent.i18n import t
@@ -251,6 +265,7 @@ EXECUTORS: dict[str, Callable[[CommandContext], CommandReply]] = {
     "egress": _exec_egress,
     "profile": _exec_profile,
     "bundles": _exec_bundles,
+    "gateway_menu": _exec_menu,
     "gateway_help": _exec_help,
     "gateway_commands": _exec_commands,
 }

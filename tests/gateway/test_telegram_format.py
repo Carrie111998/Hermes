@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +68,25 @@ class TestEscapeMdv2:
 
 class TestFormatMessageBasic:
 
+    def test_structured_mobile_blocks_remain_visually_separated(self, adapter):
+        text = (
+            "## Result\n\n"
+            "A concise conclusion.\n\n"
+            "**Problem:** Messages merge visually.\n\n"
+            "**Risk:** The action is missed.\n\n"
+            "**My advice:** Follow these steps.\n\n"
+            "1. Run `hermes status`\n"
+            "2. Check `/home/hermes/config.yaml`"
+        )
+
+        result = adapter.format_message(text)
+
+        assert "*Result*\n\nA concise conclusion" in result
+        assert "\n\n*Problem:*" in result
+        assert "\n\n*Risk:*" in result
+        assert "\n\n*My advice:*" in result
+        assert "`hermes status`" in result
+        assert "`/home/hermes/config.yaml`" in result
 
     def test_plain_text_specials_escaped(self, adapter):
         result = adapter.format_message("Price is $5.00!")
@@ -599,6 +618,7 @@ def _guest_test_adapter(*, guest_mode=True, require_mention=True, allowed_chats=
         },
     )
     adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
     adapter.config = config
     adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
     adapter._mention_patterns = adapter._compile_mention_patterns()

@@ -3,9 +3,10 @@ repeated 'Interrupting current task...' while /stop reports no active task.
 
 Covers three layers of the fix:
 
-1. Adapter-side task ownership (_session_tasks map): /stop, /new, /reset
-   actually cancel the in-flight adapter task and release the guard in
-   order, so follow-up messages reach the new session.
+1. Adapter-side task ownership (_session_tasks map): /stop cancels the
+   in-flight adapter task immediately, while confirmation-gated /new and
+   /reset preserve it until approval; approved commands then release the
+   guard in order so follow-up messages reach the new session.
 
 2. Adapter-side on-entry self-heal: if _active_sessions still has an
    entry but the recorded owner task is already done/cancelled, clear it
@@ -108,18 +109,21 @@ class TestAdapterSessionCancellation:
     async def test_command_cancels_active_task_and_unblocks_follow_up(
         self, command_text
     ):
-        """/stop /new /reset must cancel the adapter task and let follow-ups through."""
+        """Only /stop cancels immediately; approved /new aliases cancel once."""
         adapter = _make_adapter()
         sk = _session_key()
         processing_started = asyncio.Event()
         processing_cancelled = asyncio.Event()
         blocked_first_message = True
+        approved_calls = 0
 
         async def _handler(event):
             nonlocal blocked_first_message
             cmd = event.get_command()
-            if cmd in {"stop", "new", "reset", "model"}:
+            if cmd in {"stop", "model"}:
                 return f"handled:{cmd}"
+            if cmd in {"new", "reset"}:
+                return f"confirm:{cmd}"
 
             if blocked_first_message:
                 blocked_first_message = False
@@ -131,25 +135,50 @@ class TestAdapterSessionCancellation:
                     raise
             return f"handled:text:{event.text}"
 
+        async def _execute_approved_command():
+            nonlocal approved_calls
+            approved_calls += 1
+            return f"handled:{command_text.lstrip('/')}"
+
         adapter._message_handler = _handler
 
         await adapter.handle_message(_make_event("hello world"))
         await processing_started.wait()
         await asyncio.sleep(0)
 
-        assert sk in adapter._active_sessions
-        assert sk in adapter._session_tasks
+        original_guard = adapter._active_sessions[sk]
+        original_owner = adapter._session_tasks[sk]
 
         await adapter.handle_message(_make_event(command_text))
 
-        assert processing_cancelled.is_set(), (
-            f"{command_text} did not cancel the active processing task"
-        )
+        if command_text == "/stop":
+            assert processing_cancelled.is_set()
+            assert approved_calls == 0
+        else:
+            assert not processing_cancelled.is_set(), (
+                f"{command_text} cancelled before destructive approval"
+            )
+            assert adapter._active_sessions.get(sk) is original_guard
+            assert adapter._session_tasks.get(sk) is original_owner
+            assert not original_owner.done()
+            expected = command_text.lstrip("/")
+            assert any(f"confirm:{expected}" in r for r in adapter.sent_responses)
+
+            approved_result = await adapter._run_approved_active_session_command(
+                sk, _execute_approved_command
+            )
+
+            assert approved_result == f"handled:{expected}"
+            assert approved_calls == 1
+            assert processing_cancelled.is_set(), (
+                f"approved {command_text} did not cancel active processing"
+            )
+
         assert sk not in adapter._active_sessions
         assert sk not in adapter._pending_messages
         assert sk not in adapter._session_tasks
-        expected = command_text.lstrip("/")
-        assert any(f"handled:{expected}" in r for r in adapter.sent_responses)
+        if command_text == "/stop":
+            assert any("handled:stop" in r for r in adapter.sent_responses)
 
         # Follow-up must go through normally now that the session is clean.
         await adapter.handle_message(

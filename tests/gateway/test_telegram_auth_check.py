@@ -5,7 +5,7 @@ event building, or response generation occurs.
 """
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -370,3 +370,32 @@ def test_multiplex_closure_handler_without_callback_falls_back_to_env(monkeypatc
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=555, chat_id=-100123, chat_type="group")
     ) is False
+
+
+@pytest.mark.parametrize(
+    ("local_key", "local_allow", "user_id", "chat_type", "profile_grant", "expected"),
+    [
+        ("allow_from", ["1"], "2", "dm", True, False),
+        ("allow_from", ["1"], "1", "dm", False, True),
+        ("group_allow_from", ["1"], "2", "group", True, False),
+        (None, None, "2", "dm", True, True),
+    ],
+)
+def test_callback_auth_local_allowlist_precedes_profile_grants(
+    local_key, local_allow, user_id, chat_type, profile_grant, expected
+):
+    extras = {local_key: local_allow} if local_key is not None else {}
+    adapter = _make_adapter(**extras)
+    profile_auth = MagicMock(return_value=profile_grant)
+    adapter.set_authorization_check(profile_auth)
+
+    assert adapter._is_callback_user_authorized(
+        user_id,
+        chat_id=user_id if chat_type == "dm" else "-100",
+        chat_type=chat_type,
+    ) is expected
+
+    if local_key is None:
+        profile_auth.assert_called_once()
+    else:
+        profile_auth.assert_not_called()

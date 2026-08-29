@@ -199,6 +199,72 @@ class TestEphemeralChangeKeyParity:
 # ---------------------------------------------------------------------------
 
 class TestSessionContextPin:
+    def test_mobile_response_design_is_pinned_for_session(self, monkeypatch):
+        runner = _make_runner()
+        ctx = _make_context(
+            platform=Platform.TELEGRAM,
+            chat_id="tg1",
+            chat_type="dm",
+            thread_id=None,
+            parent_chat_id=None,
+        )
+        config = {"display": {"response_design": "structured"}}
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: config)
+
+        first = runner._pinned_session_context_prompt(ctx, False, "sk-mobile")  # noqa: SLF001
+        config["display"]["response_design"] = "off"
+        second = runner._pinned_session_context_prompt(ctx, False, "sk-mobile")  # noqa: SLF001
+
+        assert "## Mobile response design (Telegram)" in first
+        assert second is first
+
+    def test_mobile_response_design_survives_legitimate_context_repin(self, monkeypatch):
+        runner = _make_runner()
+        first_ctx = _make_context(
+            platform=Platform.TELEGRAM,
+            chat_id="tg1",
+            chat_name="before",
+            chat_type="dm",
+            thread_id=None,
+            parent_chat_id=None,
+        )
+        config = {"display": {"response_design": "structured"}}
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: config)
+        first = runner._pinned_session_context_prompt(first_ctx, False, "sk-repin")  # noqa: SLF001
+
+        config["display"]["response_design"] = "off"
+        second_ctx = _make_context(
+            platform=Platform.TELEGRAM,
+            chat_id="tg1",
+            chat_name="after",
+            chat_type="dm",
+            thread_id=None,
+            parent_chat_id=None,
+        )
+        second = runner._pinned_session_context_prompt(second_ctx, False, "sk-repin")  # noqa: SLF001
+
+        assert first is not second
+        assert '"after"' in second
+        assert "## Mobile response design (Telegram)" in second
+
+    def test_mobile_response_design_can_be_disabled_for_new_session(self, monkeypatch):
+        runner = _make_runner()
+        ctx = _make_context(
+            platform=Platform.WHATSAPP,
+            chat_id="wa1",
+            chat_type="dm",
+            thread_id=None,
+            parent_chat_id=None,
+        )
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"display": {"response_design": "off"}},
+        )
+
+        text = runner._pinned_session_context_prompt(ctx, False, "sk-off")  # noqa: SLF001
+
+        assert "## Mobile response design" not in text
+
     def test_pin_hit_returns_identical_object(self):
         runner = _make_runner()
         ctx = _make_context()

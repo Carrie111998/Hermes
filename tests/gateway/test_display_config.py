@@ -50,6 +50,31 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
+    def test_response_design_defaults_to_structured_only_on_mobile_targets(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "response_design") == "structured"
+        assert resolve_display_setting({}, "whatsapp", "response_design") == "structured"
+        assert resolve_display_setting({}, "email", "response_design") == "off"
+
+    def test_response_design_global_and_platform_override_resolution(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "response_design": "off",
+                "platforms": {"telegram": {"response_design": "structured"}},
+            }
+        }
+        assert resolve_display_setting(config, "telegram", "response_design") == "structured"
+        assert resolve_display_setting(config, "whatsapp", "response_design") == "off"
+
+    def test_invalid_response_design_mode_fails_closed(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"response_design": "decorative"}}
+        assert resolve_display_setting(config, "telegram", "response_design") == "off"
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides
