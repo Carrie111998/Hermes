@@ -201,11 +201,17 @@ def _reply_anchor_for_event(event) -> str | None:
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None
-    if platform == "feishu" and thread_id:
-        # Keep the reply inside the topic via thread metadata, but anchor it to
-        # the newest user message. A quoted parent remains only a recovery
-        # fallback when a synthetic/resumed event has no current message ID.
-        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
+    if platform == "feishu":
+        if thread_id:
+            # Keep the reply inside the topic via thread metadata, but anchor it to
+            # the newest user message. A quoted parent remains only a recovery
+            # fallback when a synthetic/resumed event has no current message ID.
+            return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
+        if getattr(source, "chat_type", None) == "group":
+            # A group-channel mention is a new top-level chat message unless the
+            # inbound event carries a real Feishu thread_id.  Passing message_id
+            # here would call message.reply and render the answer as a reply/topic.
+            return None
     return getattr(event, "message_id", None)
 
 

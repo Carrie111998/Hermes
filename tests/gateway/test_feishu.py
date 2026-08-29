@@ -2209,6 +2209,23 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
 
 
 class TestFeishuReplyAnchors(unittest.TestCase):
+    def test_top_level_group_message_has_no_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, _reply_anchor_for_event
+        from gateway.session import SessionSource
+
+        event = MessageEvent(
+            text="Hello from the main chat",
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_chat",
+                chat_type="group",
+            ),
+            message_id="om_current",
+        )
+
+        self.assertIsNone(_reply_anchor_for_event(event))
+
     def test_threaded_reply_prefers_the_current_message(self):
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent, _reply_anchor_for_event
@@ -2265,8 +2282,37 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         return adapter
 
 
-    def test_replying_to_a_message_keeps_the_current_message_as_reply_anchor(self):
-        """A quote supplies context, but must not steal the bot's reply anchor."""
+    def test_top_level_quote_keeps_context_without_becoming_a_thread(self):
+        adapter = self._build_adapter()
+        message = SimpleNamespace(
+            content=json.dumps({"text": "Can you read the quote?"}),
+            message_type="text",
+            message_id="om_current",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id="om_quoted",
+            upper_message_id=None,
+            root_id="om_root",
+            thread_id=None,
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_current",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.message_id, "om_current")
+        self.assertEqual(event.reply_to_message_id, "om_quoted")
+        self.assertIsNone(adapter.build_source.call_args.kwargs["thread_id"])
+
+    def test_topic_reply_keeps_the_current_message_as_reply_anchor(self):
+        """A true topic stays threaded and anchors to the newest user message."""
         adapter = self._build_adapter()
         message = SimpleNamespace(
             content=json.dumps({"text": "Can you read this?"}),
