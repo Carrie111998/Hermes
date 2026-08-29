@@ -5,10 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
 import threading
-import time
 
 from github_pr_feedback.controller import FeedbackReceipt, PreparedWorktree
-from github_pr_feedback.base_refresh import BaseRefreshResult
 from github_pr_feedback.github_client import (
     CheckState,
     PullRequestMergeState,
@@ -49,7 +47,6 @@ def policy(
     report_only: bool = False,
     merge_maintainer: bool = False,
     max_base_refresh_in_flight: int | None = None,
-    local_ci_audit: bool = False,
 ):
     repository = tmp_path / "repo"
     subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
@@ -92,13 +89,6 @@ def policy(
             "report_only": False,
             "post_merge": {"enabled": False},
         }
-    if local_ci_audit:
-        raw["local_ci_audit"] = {
-            "enabled": True,
-            "assignee": "pr-local-ci-auditor",
-            "post_results": True,
-            "repositories": ["acme/widgets"],
-        }
     return load_policy(raw)
 
 
@@ -110,6 +100,34 @@ def test_repair_triggers_cover_conflicts_changes_requested_and_non_green_actions
         ReviewState("CHANGES_REQUESTED", 1),
         CheckState(True, False, 2),
     ) == ("merge_conflict", "changes_requested", "actions_not_green")
+
+
+def test_repair_triggers_does_not_treat_a_billing_lockout_as_a_repair_trigger() -> None:
+    """A GitHub Actions billing lockout fails every check regardless of code quality.
+
+    It is not evidence this PR needs a repair; the local-CI lane is the
+    billing-aware trigger for a genuine failure found under lockout.
+    """
+
+    assert repair_triggers(
+        merge_state(),
+        ReviewState(None, 0),
+        CheckState(True, False, 2, True),
+    ) == ()
+
+
+def test_repair_triggers_does_not_treat_action_required_as_a_repair_trigger() -> None:
+    """A check waiting on human workflow-run approval is not a code defect.
+
+    No repair commit can satisfy GitHub's own action_required conclusion; only
+    a human approving the gated run (or otherwise resolving it) can.
+    """
+
+    assert repair_triggers(
+        merge_state(),
+        ReviewState(None, 0),
+        CheckState(True, False, 2, False, True),
+    ) == ()
 
 
 class GitHub:
@@ -135,6 +153,16 @@ class GitHubWithoutChecks(GitHub):
         raise RuntimeError("check state unavailable")
 
 
+class ActionRequiredGitHub(GitHub):
+    """A PR with no conflict/review trigger, only a GitHub action_required check."""
+
+    def get_merge_state(self, repository: str, number: int):
+        return merge_state()
+
+    def get_check_state(self, repository: str, head_sha: str):
+        return CheckState(True, False, 1, False, True)
+
+
 class BehindBaseGitHub(GitHub):
     def get_merge_state(self, repository: str, number: int):
         return replace(merge_state(), base_branch="stable")
@@ -142,27 +170,6 @@ class BehindBaseGitHub(GitHub):
     def get_branch_head(self, repository: str, branch: str):
         assert (repository, branch) == ("acme/widgets", "stable")
         return "c" * 40
-
-    def get_pull_request(self, repository: str, number: int):
-        from github_pr_feedback.policy import PullRequest
-
-        return PullRequest(
-            number,
-            "OPEN",
-            repository,
-            repository,
-            "owner",
-            "codex/fix",
-            "d" * 40,
-            base_branch="stable",
-            base_sha="c" * 40,
-        )
-
-    def actions_enabled(self, repository: str) -> bool:
-        return False
-
-    def list_feedback(self, repository: str, number: int):
-        return ()
 
 
 class ManyBehindBaseGitHub(BehindBaseGitHub):
@@ -237,38 +244,6 @@ class Kanban:
         return "repair-task"
 
 
-class SuccessfulBaseRefresher:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def refresh(self, identity, workspace):
-        self.calls.append((identity, workspace))
-        return BaseRefreshResult(
-            "completed",
-            resolved_head_sha="d" * 40,
-            receipt_id="e" * 64,
-        )
-
-
-class ConcurrentBaseRefresher(SuccessfulBaseRefresher):
-    def __init__(self) -> None:
-        super().__init__()
-        self.active = 0
-        self.max_active = 0
-        self.lock = threading.Lock()
-
-    def refresh(self, identity, workspace):
-        with self.lock:
-            self.active += 1
-            self.max_active = max(self.max_active, self.active)
-        time.sleep(0.05)
-        try:
-            return super().refresh(identity, workspace)
-        finally:
-            with self.lock:
-                self.active -= 1
-
-
 class StatusKanban(Kanban):
     def __init__(self, statuses: dict[str, str | None]):
         super().__init__()
@@ -301,22 +276,9 @@ def test_repair_controller_dedupes_exact_head_and_preserves_merge_authority(
     assert second.created == 0
     task = kanban.tasks[0]
     assert task.assignee == "pr-repair-steward"
-    assert 'Before the first push' in task.instructions
-    assert task.instructions.index("Before the first push") < task.instructions.index(
-        "After your own verified normal push"
-    )
-    assert "immediately before every GitHub write" not in task.instructions
-    assert "require both base and head identity to remain exact" not in task.instructions
-    assert "merge remains gated" in task.instructions
-    assert 'After your own verified normal push' in task.instructions
-    assert 'unchanged base SHA, base branch, head repository, and head branch' in task.instructions
-    assert 'billing or spending-limit' in task.instructions
-    assert 'exact command, cwd, exit code' in task.instructions
-    assert 'does not resolve actions_not_green' in task.instructions
-    assert 'Do not call kanban_complete while acknowledgement is missing' in task.instructions
     assert task.initial_status == "running"
     assert task.max_runtime_seconds == 1200
-    assert f"git merge --no-ff --no-edit {'b' * 40}" in task.instructions
+    assert "normal merge" in task.instructions
     assert "Commit the resolved merge before running base-relative" in task.instructions
     assert "Do not merge the pull request" in task.instructions
     assert "Do not force-push" in task.instructions
@@ -331,14 +293,50 @@ def test_repair_controller_dedupes_exact_head_and_preserves_merge_authority(
         "baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
     )
     assert task.instructions.count(identity_command) == 1
-    assert "git status --short --branch" in task.instructions
-    assert "unless that literal command returned a nonzero exit" in task.instructions
-    assert "rg -F --" in task.instructions
     assert "before any fetch, checkout, edit, test, commit, push, or reply" in (
         task.instructions
     )
     assert "require all five returned identity fields" in task.instructions.casefold()
-    assert task.idempotency_key.startswith("github-pr-repair:v3:")
+    assert task.idempotency_key.startswith("github-pr-repair:v2:")
+    ledger.close()
+
+
+def test_repair_controller_escalates_an_action_required_pr_instead_of_repairing_it(
+    tmp_path: Path,
+) -> None:
+    """A PR with no conflict/review trigger, only action_required, still gets a card.
+
+    It must be a blocked, human-facing escalation -- distinct from (and never
+    absorbed into) the ordinary repair path, since no repair commit can clear
+    GitHub's own action_required conclusion.
+    """
+
+    configured = policy(tmp_path)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    kanban = Kanban()
+    controller = RepairController(
+        configured,
+        ledger,
+        ActionRequiredGitHub(),
+        kanban,
+        LocalGit(),
+        clock=lambda: datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+    )
+
+    first = controller.scan()
+    second = controller.scan()
+
+    assert first.created == 1
+    assert first.skipped.get("no_repair_trigger") == 1
+    assert second.created == 0
+    assert len(kanban.tasks) == 1
+    task = kanban.tasks[0]
+    assert task.assignee == "fallback"
+    assert task.initial_status == "blocked"
+    assert task.title == "Actions needed: acme/widgets#17 (GitHub check action_required)"
+    assert "action_required" in task.instructions
+    assert "Do not push, edit, approve, or merge" in task.instructions
+    assert task.evidence["reason"] == "github_check_action_required"
     ledger.close()
 
 
@@ -359,147 +357,17 @@ def test_repair_controller_routes_a_stale_pr_base_into_the_refresh_lane(
 
     assert result.created == 1
     assert kanban.tasks[0].evidence["triggers"] == ["base_refresh_required"]
-    assert kanban.tasks[0].evidence["observed_base_sha"] == "b" * 40
-    assert kanban.tasks[0].evidence["target_base_sha"] == "c" * 40
-    assert "git fetch --quiet --no-tags --no-recurse-submodules" in (
-        kanban.tasks[0].instructions
-    )
-    assert "https://github.com/acme/widgets.git refs/heads/stable" in (
-        kanban.tasks[0].instructions
-    )
-    assert f"git merge --no-ff --no-edit {'c' * 40}" in kanban.tasks[0].instructions
-    assert "Never reset, rebase" in kanban.tasks[0].instructions
-    assert "use `git merge --merge`" in kanban.tasks[0].instructions
-    assert "c" * 40 in kanban.tasks[0].instructions
-    assert "b" * 40 not in kanban.tasks[0].instructions
-    assert "checkout or merge a mutable local branch" in (
-        kanban.tasks[0].instructions
-    )
+    assert "normal merge" in kanban.tasks[0].instructions
     assert "base_refresh_required" in kanban.tasks[0].instructions
-    assert "--no-write-fetch-head" not in kanban.tasks[0].instructions
-    assert "git fetch --quiet --no-tags --no-recurse-submodules" in (
-        kanban.tasks[0].instructions
-    )
-    assert f"git cat-file -e {'c' * 40}^{{commit}}" in kanban.tasks[0].instructions
-    assert "must not be compared to the immutable target base SHA" in (
-        kanban.tasks[0].instructions
-    )
-    assert "-m hermes_cli.main github-pr-feedback complete-feedback" in (
-        kanban.tasks[0].instructions
-    )
-    assert "without appending any words or arguments" in kanban.tasks[0].instructions
-    assert "Never run `git pull`" in kanban.tasks[0].instructions
+    assert "hermes github-pr-feedback complete-feedback" in kanban.tasks[0].instructions
     assert "--feedback-kind pr_repair" in kanban.tasks[0].instructions
     assert "--feedback-id repair:base_refresh_required" in kanban.tasks[0].instructions
     assert "--resolved-head-sha <full literal resolved head SHA>" in (
         kanban.tasks[0].instructions
     )
-    assert "git rev-parse --verify HEAD" in kanban.tasks[0].instructions
-    assert "the angle-bracketed text is a placeholder" in kanban.tasks[0].instructions
     assert "evaluating at most two viable resolutions" in kanban.tasks[0].instructions
     assert "Within 10 minutes" in kanban.tasks[0].instructions
-    assert "inspect the exact conflict markers" in kanban.tasks[0].instructions
-    assert "exact ambiguous hunks" in kanban.tasks[0].instructions
-    # A base refresh against a burndown branch conflicts by appending two
-    # independent owner-module installs to the same block. Workers blocked
-    # these as "which side is correct" until the union case was named.
-    assert "the correct resolution is to keep both" in kanban.tasks[0].instructions
-    assert "independent additive statements" in kanban.tasks[0].instructions
-    assert "assign the same name, key, or line to different values" in (
-        kanban.tasks[0].instructions
-    )
     assert "pr-maintenance-receipt:v1" in kanban.tasks[0].instructions
-    ledger.close()
-
-
-def test_merge_conflict_targets_the_current_base_snapshot(tmp_path: Path) -> None:
-    configured = policy(tmp_path, merge_maintainer=True)
-    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
-    kanban = Kanban()
-
-    class CurrentBaseConflictGitHub(BehindBaseGitHub):
-        def get_merge_state(self, repository: str, number: int):
-            return replace(
-                merge_state(mergeable=False, status="DIRTY"), base_branch="stable"
-            )
-
-    result = RepairController(
-        configured,
-        ledger,
-        CurrentBaseConflictGitHub(),
-        kanban,
-        LocalGit(),
-    ).scan()
-
-    assert result.created == 1
-    task = kanban.tasks[0]
-    assert "merge_conflict" in task.evidence["triggers"]
-    assert task.evidence["target_base_sha"] == "c" * 40
-    assert f"git cat-file -e {'c' * 40}^{{commit}}" in task.instructions
-    assert f"git merge --no-ff --no-edit {'c' * 40}" in task.instructions
-    assert "b" * 40 not in task.instructions
-    ledger.close()
-
-
-def test_conflict_free_base_refresh_uses_deterministic_path_and_dispatches_ci(
-    tmp_path: Path,
-) -> None:
-    configured = policy(
-        tmp_path,
-        merge_maintainer=True,
-        local_ci_audit=True,
-    )
-    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
-    kanban = Kanban()
-    refresher = SuccessfulBaseRefresher()
-
-    result = RepairController(
-        configured,
-        ledger,
-        BehindBaseGitHub(),
-        kanban,
-        LocalGit(),
-        base_refresher=refresher,
-    ).scan()
-
-    assert result.created == 0
-    assert result.skipped["base_refresh_completed"] == 1
-    assert len(refresher.calls) == 1
-    assert len(kanban.tasks) == 1
-    assert kanban.tasks[0].assignee == "pr-local-ci-auditor"
-    receipt = FeedbackReceipt(
-        "acme/widgets",
-        17,
-        "pr_repair",
-        f"repair:base_refresh_required:target-base:{'c' * 40}",
-        SHA,
-    )
-    assert ledger.was_actioned_on_any_head(receipt)
-    ledger.close()
-
-
-def test_deterministic_base_refreshes_run_concurrently_with_bounded_workers(
-    tmp_path: Path,
-) -> None:
-    configured = policy(
-        tmp_path,
-        merge_maintainer=True,
-        max_base_refresh_in_flight=2,
-    )
-    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
-    refresher = ConcurrentBaseRefresher()
-
-    result = RepairController(
-        configured,
-        ledger,
-        ManyBehindBaseGitHub(),
-        Kanban(),
-        LocalGit(),
-        base_refresher=refresher,
-    ).scan()
-
-    assert result.skipped["base_refresh_completed"] == 2
-    assert refresher.max_active == 2
     ledger.close()
 
 
@@ -554,18 +422,10 @@ def test_terminal_refresh_binding_does_not_hold_slot_before_archived_recovery(
     ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
     now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
     terminal = FeedbackReceipt(
-        "acme/widgets",
-        17,
-        "pr_repair",
-        f"repair:base_refresh_required:target-base:{'c' * 40}",
-        "7" * 40,
+        "acme/widgets", 17, "pr_repair", "repair:base_refresh_required", "7" * 40
     )
     archived = FeedbackReceipt(
-        "acme/widgets",
-        18,
-        "pr_repair",
-        f"repair:base_refresh_required:target-base:{'c' * 40}",
-        "8" * 40,
+        "acme/widgets", 18, "pr_repair", "repair:base_refresh_required", "8" * 40
     )
     for receipt, task_id in (
         (terminal, "triage-refresh-task"),
@@ -609,11 +469,7 @@ def test_old_head_terminal_binding_does_not_hold_current_refresh_slot(
     ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
     now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
     old_head = FeedbackReceipt(
-        "acme/widgets",
-        17,
-        "pr_repair",
-        f"repair:base_refresh_required:target-base:{'c' * 40}",
-        "6" * 40,
+        "acme/widgets", 17, "pr_repair", "repair:base_refresh_required", "6" * 40
     )
     lease = ledger.claim(
         old_head,

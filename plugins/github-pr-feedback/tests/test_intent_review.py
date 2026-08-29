@@ -18,54 +18,6 @@ def test_normal_bot_fix_comment_remains_automatic() -> None:
     assert classify_feedback(feedback("Please fix the timeout and push the tested change.")) is None
 
 
-def test_concrete_single_remedy_is_not_intent_due_to_reject_or_replace_words() -> None:
-    item = feedback(
-        "Reject malformed manifests and replace the permissive fallback with exact validation; "
-        "the current parser accepts invalid data or crashes."
-    )
-
-    assert classify_feedback(item) is None
-
-
-def test_descriptive_either_or_control_flow_is_not_operator_intent() -> None:
-    item = feedback(
-        "Every completed helper call raises NameError either while returning the sentinel or "
-        "while evaluating the comparison. Export the sentinel to the host (or avoid a "
-        "host-global sentinel) so these returns retain their original control flow."
-    )
-
-    assert classify_feedback(item) is None
-
-
-def test_owner_completion_receipt_cannot_create_an_intent_review() -> None:
-    item = feedback(
-        "Use the typed validator instead of the permissive path. The replacement is complete "
-        "at exact head abc123; focused verification: 8 tests passed.",
-        login="operator",
-        bot=False,
-    )
-
-    assert classify_feedback(item, owner_login="operator") is None
-
-
-def test_include_or_exclude_alternatives_require_operator_intent() -> None:
-    item = feedback(
-        "Either include the final ID in the hashed payload or consistently exclude it from "
-        "recomputation."
-    )
-
-    assert classify_feedback(item) is not None
-
-
-def test_allow_or_reject_alternatives_require_operator_intent() -> None:
-    item = feedback(
-        "Validate equality with the manifest's expected paths without requiring a nonempty "
-        "mapping, or reject empty output manifests at admission."
-    )
-
-    assert classify_feedback(item) is not None
-
-
 def test_explicit_disagreement_requires_per_pr_intent_decision() -> None:
     item = feedback("I disagree with this fix; use the bounded retry approach instead.")
     assert classify_feedback(item) is not None

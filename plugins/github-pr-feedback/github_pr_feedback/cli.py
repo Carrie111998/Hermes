@@ -18,7 +18,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 
-from .controller import KanbanTask, LocalGitRepository, ScanController
+from .controller import KanbanTask, LocalGitRepository, PooledLocalGitRepository, ScanController
 from .ci_coordinator import CIAuditJob, GroupedCICoordinator
 from .ci_runner import (
     CIAuditIdentity,
@@ -33,10 +33,21 @@ from .merge_controller import (
     CanonicalMergeEvidenceSource,
     MergeController,
     MergeDecision,
+    _codex_reviewed_head,
 )
-from .policy import FeedbackReceipt, PluginPolicy, load_policy
+from .policy import (
+    CODEX_REVIEW_TRIGGER,
+    FeedbackReceipt,
+    PluginPolicy,
+    hermes_attribution_line,
+    load_policy,
+)
 from .post_merge import PostMergeExecutor
-from .repair_controller import RepairController
+from .repair_controller import (
+    PR_REPAIR_ATTRIBUTION_PREFIX,
+    RepairController,
+    pr_repair_attribution_required,
+)
 from .release_maintenance import (
     FINAL_LANE,
     MaintenanceGitHub,
@@ -62,6 +73,81 @@ _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(token|secret|password|authorization|api[_-]?key)\s*[:=]\s*\S+"
 )
+# kind is deliberately unconstrained (any word token, not an enumerated set):
+# this same marker covers pr_repair and ci_repair (repair_controller.py /
+# controller.py's typed CI fixer) as well as every ordinary admitted-feedback
+# kind (issue_comment, review_comment, review) via controller.py's _task().
+# The receipt's own FeedbackReceipt already validates feedback_kind against
+# its canonical set; this regex only needs to prove *some* completed-and-
+# matching-head marker exists, not police which kind it names.
+_PR_REPAIR_RECEIPT_COMMENT = re.compile(
+    r"<!--\s*pr-maintenance-receipt:v1\s+status=completed\s+kind=\w+\s+"
+    r"head=([0-9a-fA-F]{40,64})\s*-->"
+)
+# Feedback kinds whose worker-completed reply must carry the marker above.
+# pr_local_ci completes through a different typed-receipt flow (audit-pr),
+# and pr_actions_needed starts blocked and is never worker-completed at all.
+_MARKER_REQUIRED_FEEDBACK_KINDS = frozenset(
+    {"pr_repair", "issue_comment", "review_comment", "review"}
+)
+
+
+def _factual_reply_is_missing(
+    github: GitHubClient, receipt: FeedbackReceipt, *, resolved_head_sha: str
+) -> bool:
+    """Whether no comment yet carries this exact completion's required receipt marker.
+
+    Covers every feedback kind whose worker-completed reply is required to
+    carry the marker (see _MARKER_REQUIRED_FEEDBACK_KINDS) -- repair receipts
+    and ordinary admitted review/issue-comment feedback alike.
+    complete-feedback only reread the resolved PR head match before this
+    check existed; a worker could push a fix, skip the required factual
+    reply, and still successfully complete the task with no trace anything
+    was skipped. This independently rereads canonical PR comments the same
+    way every other completion gate in this plugin rereads canonical state,
+    instead of trusting the worker's self-report that it replied.
+    """
+
+    try:
+        feedback = github.list_feedback(receipt.repository, receipt.pr_number)
+    except GitHubClientError:
+        return True
+    for item in feedback:
+        match = _PR_REPAIR_RECEIPT_COMMENT.search(item.body)
+        if not match or match.group(1).casefold() != resolved_head_sha.casefold():
+            continue
+        if not pr_repair_attribution_required(receipt.repository):
+            return False
+        if PR_REPAIR_ATTRIBUTION_PREFIX in item.body:
+            return False
+    return True
+
+
+def _retrigger_codex_review(
+    github: GitHubClient, repository: str, pr_number: int, resolved_head_sha: str
+) -> str:
+    """Mention @codex review after a verified repair push, once, if needed.
+
+    Codex's GitHub App never re-reviews on an ordinary push -- only on PR
+    opened, marked ready, or this exact mention (see merge_controller's
+    codex_review_pending). Without this, a repaired PR would carry a
+    permanently stale Codex review and sit blocked on that gate forever.
+    Rereads canonical comments first so a PR whose new head Codex has
+    already reviewed (e.g. two repairs landing back to back) does not get a
+    redundant mention.
+    """
+
+    try:
+        feedback = github.list_feedback(repository, pr_number)
+    except GitHubClientError:
+        return "unavailable"
+    if _codex_reviewed_head(feedback, resolved_head_sha):
+        return "already_current"
+    try:
+        github.post_issue_comment(repository, pr_number, CODEX_REVIEW_TRIGGER)
+    except GitHubClientError:
+        return "unavailable"
+    return "triggered"
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,11 +399,7 @@ def _kanban_create_error(result: KanbanCommandResult) -> str:
 
 def _kanban_create_argv(task: KanbanTask) -> list[str]:
     body = (
-        f"{task.instructions}\n\n"
-        f"Canonical receipt worktree: {task.repository_path}\n\n"
-        "The worker starts in this directory. Do not search for the worktree; "
-        "run the required preflight commands here first.\n\n"
-        f"{task.evidence_heading}:\n"
+        f"{task.instructions}\n\n{task.evidence_heading}:\n"
         f"{json.dumps(task.evidence, sort_keys=True)}"
     )
     argv = [
@@ -486,6 +568,14 @@ def _scan(ctx: Any) -> int:
         repair_payload: dict[str, object] | None = None
         maintenance_payload: dict[str, object] | None = None
         try:
+            try:
+                PooledLocalGitRepository(
+                    ledger, ledger.path.parent / "worktree-pool"
+                ).reconcile_leases(KanbanSubprocessClient())
+            except Exception:  # noqa: BLE001 - proactive release is an optimization,
+                # never allowed to block the scan it runs ahead of; a slot left
+                # leased simply falls back to its lease timeout.
+                pass
             result = _controller(policy, ledger).scan()
             if policy.repair_steward is not None:
                 repair = RepairController(
@@ -626,6 +716,11 @@ def _complete_feedback(ctx: Any, args: argparse.Namespace) -> int:
             json.dumps({"status": "invalid_or_raced_feedback_action"}, sort_keys=True)
         )
         return 1
+    if receipt.feedback_kind in _MARKER_REQUIRED_FEEDBACK_KINDS and _factual_reply_is_missing(
+        github, receipt, resolved_head_sha=str(args.resolved_head_sha)
+    ):
+        print(json.dumps({"status": "factual_reply_missing"}, sort_keys=True))
+        return 1
     ledger = FeedbackLedger.for_current_profile()
     try:
         ledger.begin_feedback_action(
@@ -657,6 +752,11 @@ def _complete_feedback(ctx: Any, args: argparse.Namespace) -> int:
         print(json.dumps({"status": "feedback_action_not_recorded"}, sort_keys=True))
         return_code = 1
     else:
+        codex_retrigger_status = "not_applicable"
+        if receipt.feedback_kind in _MARKER_REQUIRED_FEEDBACK_KINDS:
+            codex_retrigger_status = _retrigger_codex_review(
+                github, receipt.repository, receipt.pr_number, str(args.resolved_head_sha)
+            )
         local_ci_status = _controller(policy, ledger).dispatch_local_ci_after_feedback(
             current
         )
@@ -671,6 +771,7 @@ def _complete_feedback(ctx: Any, args: argparse.Namespace) -> int:
                     "resolved_head_sha": str(args.resolved_head_sha).casefold(),
                     "review_thread_resolved": review_thread_resolved,
                     "local_ci_status": local_ci_status,
+                    "codex_retrigger_status": codex_retrigger_status,
                 },
                 sort_keys=True,
             )
@@ -864,8 +965,14 @@ def _ci_audit_comment(receipt: CIAuditReceipt) -> str:
         f"({command.classification}, {command.duration_ms / 1000:.2f}s)"
         for command in receipt.commands
     )
+    attribution = (
+        f"{hermes_attribution_line('pr-local-ci-auditor', action='CI audit')}\n\n"
+        if pr_repair_attribution_required(receipt.identity.repository)
+        else ""
+    )
     body = (
-        f"Addressed local CI audit for exact head `{receipt.identity.head_sha}` "
+        attribution
+        + f"Addressed local CI audit for exact head `{receipt.identity.head_sha}` "
         f"(base `{receipt.identity.base_sha}`). Commands: {commands}. "
         f"Authoritative receipt: `{receipt.receipt_id}`. "
         + (
@@ -1056,6 +1163,10 @@ def _run_merge_scan(
         # Report-only mode has no repair owner, so retain its explicit human-facing
         # readiness report without enabling any write authority.
         if merge_policy.report_only and pull_request is not None:
+            if not blocker_codes:
+                _announce_ready_to_merge(
+                    github, merge_policy.repository, pull_request
+                )
             try:
                 kanban.create_or_get_task(
                     _merge_maintainer_task(policy, pull_request, result.decision)
@@ -1144,6 +1255,39 @@ def _run_single_pr_merge_handoff(
     else:
         payload["next_repair"] = _scan_payload(repair_result)
     return payload
+
+
+_READY_TO_MERGE_MARKER_PREFIX = "<!-- pr-ready-to-merge-receipt:v1 head="
+
+
+def _announce_ready_to_merge(github: GitHubClient, repository: str, pull_request) -> None:
+    """Post one visible, idempotent PR comment when every report-only gate clears.
+
+    Report-only mode never merges automatically, so a human maintainer has no
+    other visible signal that a PR is done: the deterministic readiness card
+    only completes an internal Kanban record. Marker-gated on the exact head
+    SHA so a re-scan of an already-announced head is a no-op, and a new head
+    (new commits) gets its own fresh announcement.
+    """
+
+    marker = f"{_READY_TO_MERGE_MARKER_PREFIX}{pull_request.head_sha} -->"
+    try:
+        feedback = github.list_feedback(repository, pull_request.number)
+    except (GitHubClientError, RuntimeError):
+        return
+    if any(marker in (item.body or "") for item in feedback):
+        return
+    body = (
+        "**Ready to merge.** Local CI passed and every tracked repair/review "
+        "item is clear for this exact head. The merge maintainer is running "
+        "in report-only mode, so nothing merges automatically here — merge "
+        "manually when ready.\n\n"
+        f"{marker}"
+    )
+    try:
+        github.post_issue_comment(repository, pull_request.number, body)
+    except (GitHubClientError, RuntimeError):
+        pass
 
 
 def _merge_maintainer_task(

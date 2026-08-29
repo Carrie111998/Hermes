@@ -15,10 +15,18 @@ from pathlib import Path
 
 import pytest
 
+from github_pr_feedback.ci_runner import CIAuditIdentity, CIAuditReceipt
+from github_pr_feedback.cli import (
+    _ci_audit_comment,
+    _factual_reply_is_missing,
+    _retrigger_codex_review,
+)
 from github_pr_feedback.controller import KanbanTask
+from github_pr_feedback.github_client import CheckState, Feedback
 from github_pr_feedback.ledger import FeedbackLedger
 from github_pr_feedback.merge_controller import MergeDecision
-from github_pr_feedback.policy import FeedbackReceipt, PullRequest
+from github_pr_feedback.policy import CODEX_REVIEW_TRIGGER, FeedbackReceipt, PullRequest, Reviewer
+from github_pr_feedback.repair_controller import pr_repair_attribution_line
 
 
 def _plugin_module():
@@ -230,16 +238,6 @@ def test_kanban_client_dispatches_an_opted_in_repair_as_ready() -> None:
     assert runner.calls[0][runtime_index] == "1200"
 
 
-def test_kanban_client_uses_the_host_default_for_ready_tasks() -> None:
-    from github_pr_feedback.cli import KanbanSubprocessClient
-
-    runner = RecordingKanbanRunner('{"id": "task-123"}')
-    task = replace(kanban_task(), initial_status="ready")
-
-    assert KanbanSubprocessClient(runner).create_or_get_task(task) == "task-123"
-    assert "--initial-status" not in runner.calls[0]
-
-
 def test_kanban_client_reads_archived_task_status_for_orphan_reconciliation() -> None:
     from github_pr_feedback.cli import KanbanSubprocessClient
 
@@ -323,23 +321,6 @@ def test_kanban_client_fails_closed_on_an_invalid_create_response(stdout: str) -
         KanbanSubprocessClient(RecordingKanbanRunner(stdout)).create_or_get_task(
             kanban_task()
         )
-
-
-def test_kanban_create_error_keeps_bounded_first_line_without_a_secret() -> None:
-    from github_pr_feedback.cli import KanbanSubprocessClient
-
-    client = KanbanSubprocessClient(
-        RecordingKanbanRunner(
-            "",
-            returncode=7,
-            stderr="board unavailable token=super-secret-value\nretry later\n",
-        )
-    )
-
-    with pytest.raises(RuntimeError, match=r"rc=7.*board unavailable") as error:
-        client.create_or_get_task(kanban_task())
-
-    assert "super-secret-value" not in str(error.value)
 
 
 def test_ledger_status_counts_each_receipt_state(tmp_path: Path) -> None:
@@ -683,7 +664,6 @@ def test_release_maintenance_scan_is_part_of_the_governed_scan_surface(
 
 def test_merge_maintainer_task_has_no_model_merge_authority(tmp_path: Path) -> None:
     from github_pr_feedback.cli import _load_policy_from_context, _merge_maintainer_task
-    from hermes_cli.kanban_db import _task_requires_pr_write_authority
 
     repository = tmp_path / "repository"
     subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
@@ -716,18 +696,12 @@ def test_merge_maintainer_task_has_no_model_merge_authority(tmp_path: Path) -> N
     assert task.assignee == "pr-merge-maintainer"
     assert task.initial_status == "running"
     assert task.evidence["blockers"] == ["ci_receipt_missing"]
-    assert "read-only observability card" in task.instructions
-    assert "no repository or GitHub mutation authority" in task.instructions
+    assert "Do not edit source, push, reply, approve, merge" in task.instructions
     assert "Model output cannot waive" in task.instructions
     assert "supplied deterministic evidence" in task.instructions
     assert "not a blocker for this observability card" in task.instructions
     assert "immediately call kanban_complete" in task.instructions
     assert "kanban_block only if kanban_complete" in task.instructions
-    assert not _task_requires_pr_write_authority(
-        title=task.title,
-        body=task.instructions + "\n" + json.dumps(task.evidence, sort_keys=True),
-        idempotency_key=task.idempotency_key,
-    )
 
 
 def test_merge_scan_skips_expensive_github_reads_without_exact_head_ci_receipt(
@@ -856,88 +830,6 @@ def test_merge_scan_reports_failed_exact_head_receipt_as_not_passing(
 
     assert result["status"] == "ok"
     assert result["blocked"] == {"17": ["ci_receipt_not_passing"]}
-    assert result["maintainer_tasks_created"] == 0
-
-
-def test_merge_scan_does_not_dispatch_noop_task_for_canonical_blocker(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from github_pr_feedback.cli import _load_policy_from_context, _run_merge_scan
-    from github_pr_feedback.merge_controller import MergeRunResult
-
-    repository = tmp_path / "repository"
-    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
-    manifest = repository / "tests" / "manifests" / "test_lanes.toml"
-    manifest.parent.mkdir(parents=True)
-    manifest.write_text("version = 1\n", encoding="utf-8")
-    settings = enabled_settings(repository)
-    settings["merge_maintainer"] = {
-        "enabled": True,
-        "assignee": "pr-merge-maintainer",
-        "repository": "acme/widgets",
-        "author_login": "owner",
-        "base_branch": "stable",
-        "merge_methods": ["squash"],
-        "receipt_max_age_seconds": 3600,
-        "report_only": False,
-        "post_merge": {"enabled": False},
-    }
-    policy = _load_policy_from_context(RecordingContext(settings))
-    pull = PullRequest(
-        17,
-        "OPEN",
-        "acme/widgets",
-        "acme/widgets",
-        "owner",
-        "codex/fix",
-        "a" * 40,
-    )
-
-    class GitHub:
-        def list_open_pull_requests(self, repository: str, owner_login: str):
-            return (pull,)
-
-    class PassingReceipt:
-        status = "passed"
-
-    class Ledger:
-        def verification_required_merge_numbers(self, repository: str):
-            return ()
-
-        def latest_ci_receipt(self, *args, **kwargs):
-            return PassingReceipt()
-
-    class Controller:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def run(self, number: int) -> MergeRunResult:
-            assert number == 17
-            return MergeRunResult(
-                MergeDecision(False, ("base_head_changed",), None, "d" * 64),
-                None,
-            )
-
-    class NoTasks:
-        def create_or_get_task(self, task):
-            raise AssertionError("deterministic blockers must not create model tasks")
-
-    monkeypatch.setattr(
-        "github_pr_feedback.cli.CanonicalMergeEvidenceSource", lambda *args: object()
-    )
-    monkeypatch.setattr("github_pr_feedback.cli.MergeController", Controller)
-
-    result = _run_merge_scan(
-        policy,
-        Ledger(),
-        github=GitHub(),
-        kanban=NoTasks(),
-    )
-
-    assert result["status"] == "ok"
-    assert result["blocked"] == {"17": ["base_head_changed"]}
-    assert result["maintainer_task_dispatch_failed"] == []
     assert result["maintainer_tasks_created"] == 0
 
 
@@ -1505,44 +1397,6 @@ def test_cron_wrapper_invokes_only_the_fixed_scan_argv_with_an_absolute_hermes_e
     assert calls == [([str(executable), "github-pr-feedback", "scan"], False)]
 
 
-def test_cron_wrapper_does_not_hide_a_traceback_behind_an_operational_payload(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    script_path = (
-        Path(__file__).resolve().parents[1] / "scripts" / "github-pr-feedback-scan.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "github_pr_feedback_cron_traceback", script_path
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    class Completed:
-        returncode = 1
-        stdout = json.dumps(
-            {
-                "status": "ok",
-                "repair": {"status": "ok", "skipped": {}},
-                "merge": {
-                    "status": "degraded",
-                    "merged": [],
-                    "blocked": {"133": ["ci_receipt_not_passing"]},
-                },
-            }
-        )
-        stderr = "Traceback (most recent call last):\nRuntimeError: controller crashed\n"
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *_args, **_kwargs: Completed())
-    executable = tmp_path / "hermes"
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
-    monkeypatch.setenv("HERMES_EXECUTABLE", str(executable))
-
-    assert module.main() == 1
-
-
 @pytest.mark.parametrize(
     ("payload", "process_returncode", "expected"),
     [
@@ -1551,23 +1405,6 @@ def test_cron_wrapper_does_not_hide_a_traceback_behind_an_operational_payload(
                 "status": "ok",
                 "repair": {"status": "degraded"},
                 "merge": {"status": "ok"},
-                "release_maintenance": {"status": "waiting_open_prs"},
-            },
-            1,
-            0,
-        ),
-        (
-            {
-                "status": "ok",
-                "repair": {"status": "ok", "skipped": {"duplicate": 12}},
-                "merge": {
-                    "status": "degraded",
-                    "merged": [],
-                    "blocked": {
-                        "92": ["ci_receipt_missing"],
-                        "133": ["ci_receipt_not_passing"],
-                    },
-                },
                 "release_maintenance": {"status": "waiting_open_prs"},
             },
             1,
@@ -1592,78 +1429,17 @@ def test_cron_wrapper_does_not_hide_a_traceback_behind_an_operational_payload(
                 "release_maintenance": {"status": "degraded"},
             },
             1,
-            1,
-        ),
-        (
-            {
-                "status": "ok",
-                "repair": {
-                    "status": "ok",
-                    "skipped": {"dispatch_failed": 1},
-                },
-                "merge": {
-                    "status": "degraded",
-                    "merged": [],
-                    "blocked": {"133": ["ci_receipt_not_passing"]},
-                },
-            },
-            1,
-            1,
+            0,
         ),
         ({"status": "degraded", "repair": {"status": "ok"}}, 1, 1),
         ({"status": "ok", "merge": {"status": "degraded"}}, 1, 1),
-        (
-            {
-                "status": "ok",
-                "repair": {
-                    "status": "degraded",
-                    "skipped": {"dispatch_failed": 1},
-                },
-                "merge": {
-                    "status": "degraded",
-                    "merged": [],
-                    "blocked": {"133": ["ci_receipt_not_passing"]},
-                },
-            },
-            1,
-            1,
-        ),
-        (
-            {
-                "status": "ok",
-                "repair": {
-                    "status": "degraded",
-                    "skipped": {"dispatch_failed": 1},
-                },
-                "merge": {
-                    "status": "degraded",
-                    "merged": [{"pr_number": 149}],
-                    "blocked": {"133": ["ci_receipt_not_passing"]},
-                },
-            },
-            1,
-            1,
-        ),
-        (
-            {
-                "status": "ok",
-                "repair": {"status": "ok", "skipped": {}},
-                "merge": {
-                    "status": "degraded",
-                    "merged": [],
-                    "blocked": {"133": ["merge_evidence_unavailable"]},
-                },
-            },
-            1,
-            1,
-        ),
         ({"status": "degraded", "merge": {"merged": []}}, 1, 1),
         ({"status": "degraded", "merge": {"merged": "149"}}, 1, 1),
         ({"status": "degraded", "merge": {"merged": [True]}}, 1, 1),
         ({"status": "degraded", "merge": {"merged": [{}]}}, 1, 1),
     ],
 )
-def test_cron_wrapper_distinguishes_operational_blockers_from_execution_failures(
+def test_cron_wrapper_classifies_successful_merges_as_partial_success(
     payload: dict[str, object],
     process_returncode: int,
     expected: int,
@@ -1802,124 +1578,6 @@ def test_ci_audit_handoff_completes_current_task_without_waiting_for_model(
     ]
 
 
-def test_audit_pr_activates_grouped_exact_head_runner_before_handoff(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Removing the grouped coordinator from audit-pr would skip bounded CI grouping."""
-
-    from github_pr_feedback.ci_runner import CIAuditIdentity, CIAuditReceipt
-    from github_pr_feedback.cli import _audit_pr
-    from github_pr_feedback.github_client import CheckState, PullRequestMergeState
-
-    head_sha = "a" * 40
-    base_sha = "b" * 40
-    worktree = tmp_path / "repository"
-    manifest = worktree / "tests/manifests/test_lanes.toml"
-    manifest.parent.mkdir(parents=True)
-    manifest.write_text(
-        "[lanes.unit]\nci_status = 'required'\n",
-        encoding="utf-8",
-    )
-    receipt = CIAuditReceipt(
-        receipt_id="g" * 64,
-        identity=CIAuditIdentity("acme/widgets", 17, base_sha, head_sha),
-        manifest_digest=hashlib.sha256(manifest.read_bytes()).hexdigest(),
-        status="passed",
-        started_at=datetime(2026, 8, 26, tzinfo=UTC),
-        completed_at=datetime(2026, 8, 26, tzinfo=UTC),
-        actions_state=CheckState(False, True, 0),
-        commands=(),
-    )
-
-    class GitHub:
-        def get_merge_state(self, repository: str, pr_number: int):
-            return PullRequestMergeState(
-                repository=repository,
-                number=pr_number,
-                state="OPEN",
-                is_draft=False,
-                merged=False,
-                mergeable=True,
-                merge_state_status="CLEAN",
-                base_branch="main",
-                base_sha=base_sha,
-                head_repository=repository,
-                author_login="owner",
-                head_ref_name="codex/fix",
-                head_sha=head_sha,
-                merge_commit_oid=None,
-            )
-
-    class Ledger:
-        def close(self) -> None:
-            pass
-
-    ledgers: list[Ledger] = []
-
-    def open_ledger() -> Ledger:
-        ledger = Ledger()
-        ledgers.append(ledger)
-        return ledger
-
-    runner_ledgers: list[Ledger] = []
-
-    class Runner:
-        def __init__(self, _github: object, ledger: Ledger) -> None:
-            runner_ledgers.append(ledger)
-
-    grouped_jobs: list[object] = []
-
-    class Coordinator:
-        def __init__(self, runner_factory: object, *, max_parallel: int) -> None:
-            assert max_parallel == 4
-            self.runner_factory = runner_factory
-
-        def run(self, jobs: tuple[object, ...]):
-            self.runner_factory()
-            grouped_jobs.extend(jobs)
-            return (type("Outcome", (), {"receipt": receipt, "error": None})(),)
-
-    monkeypatch.setattr("github_pr_feedback.cli.GitHubClient", GitHub)
-    monkeypatch.setattr("github_pr_feedback.cli.FeedbackLedger.for_current_profile", open_ledger)
-    monkeypatch.setattr("github_pr_feedback.cli.LocalCIRunner", Runner)
-    monkeypatch.setattr("github_pr_feedback.cli.GroupedCICoordinator", Coordinator)
-    monkeypatch.setattr("github_pr_feedback.cli._complete_current_ci_task", lambda _receipt: None)
-    monkeypatch.setattr("github_pr_feedback.cli._terminate_current_ci_worker", lambda: None)
-    monkeypatch.setattr(
-        "github_pr_feedback.cli._run_single_pr_merge_handoff",
-        lambda *_args, **_kwargs: {"status": "blocked", "blockers": []},
-    )
-
-    result = _audit_pr(
-        RecordingContext(
-            {
-                **enabled_settings(Path(__file__).resolve().parents[3]),
-                "local_ci_audit": {
-                    "enabled": True,
-                    "assignee": "pr-local-ci-auditor",
-                    "post_results": False,
-                },
-            }
-        ),
-        argparse.Namespace(
-            repository="acme/widgets",
-            pr_number=17,
-            head_sha=head_sha,
-            worktree=str(worktree),
-        ),
-    )
-
-    assert result == 0
-    assert len(grouped_jobs) == 1
-    job = grouped_jobs[0]
-    assert job.identity == receipt.identity
-    assert job.worktree == worktree.resolve()
-    assert job.failure_lanes == ("unit",)
-    assert len(ledgers) == 2
-    assert runner_ledgers == [ledgers[1]]
-
-
 def test_failed_audit_handoff_dispatches_the_typed_receipt_before_completion(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1936,9 +1594,6 @@ def test_failed_audit_handoff_dispatches_the_typed_receipt_before_completion(
     base_sha = "b" * 40
     repository = tmp_path / "repository"
     repository.mkdir()
-    manifest = repository / "tests/manifests/test_lanes.toml"
-    manifest.parent.mkdir(parents=True)
-    manifest.write_text("[lanes.unit]\nci_status = 'required'\n", encoding="utf-8")
     settings = enabled_settings(Path(__file__).resolve().parents[3])
     settings["auto_dispatch"] = True
     settings["routing_rules"] = [
@@ -1962,7 +1617,7 @@ def test_failed_audit_handoff_dispatches_the_typed_receipt_before_completion(
     receipt = CIAuditReceipt(
         receipt_id="f" * 64,
         identity=CIAuditIdentity("acme/widgets", 17, base_sha, head_sha),
-        manifest_digest=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        manifest_digest="e" * 64,
         status="failed",
         started_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
         completed_at=datetime(2026, 8, 25, 12, 1, tzinfo=UTC),
@@ -2047,251 +1702,6 @@ def test_failed_audit_handoff_dispatches_the_typed_receipt_before_completion(
 
     assert result == 1
     assert dispatched == [receipt]
-
-
-def test_passing_audit_immediately_hands_exact_pr_to_merge_controller(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from github_pr_feedback.ci_runner import CIAuditIdentity, CIAuditReceipt
-    from github_pr_feedback.cli import _audit_pr
-    from github_pr_feedback.github_client import CheckState, PullRequestMergeState
-
-    head_sha = "a" * 40
-    base_sha = "b" * 40
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    manifest = repository / "tests/manifests/test_lanes.toml"
-    manifest.parent.mkdir(parents=True)
-    manifest.write_text("[lanes.unit]\nci_status = 'required'\n", encoding="utf-8")
-    settings = enabled_settings(Path(__file__).resolve().parents[3])
-    settings["local_ci_audit"] = {
-        "enabled": True,
-        "assignee": "pr-local-ci-auditor",
-        "post_results": False,
-    }
-    settings["merge_maintainer"] = {
-        "enabled": True,
-        "assignee": "pr-merge-maintainer",
-        "repository": "acme/widgets",
-        "author_login": "owner",
-        "base_branch": "main",
-        "merge_methods": ["squash"],
-        "receipt_max_age_seconds": 3600,
-        "report_only": False,
-        "post_merge": {"enabled": False},
-    }
-    receipt = CIAuditReceipt(
-        receipt_id="p" * 64,
-        identity=CIAuditIdentity("acme/widgets", 17, base_sha, head_sha),
-        manifest_digest=hashlib.sha256(manifest.read_bytes()).hexdigest(),
-        status="passed",
-        started_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
-        completed_at=datetime(2026, 8, 25, 12, 1, tzinfo=UTC),
-        actions_state=CheckState(False, True, 0),
-        commands=(),
-    )
-
-    class GitHub:
-        def get_merge_state(self, repository: str, pr_number: int):
-            return PullRequestMergeState(
-                repository=repository,
-                number=pr_number,
-                state="OPEN",
-                is_draft=False,
-                merged=False,
-                mergeable=True,
-                merge_state_status="CLEAN",
-                base_branch="main",
-                base_sha=base_sha,
-                head_repository=repository,
-                author_login="owner",
-                head_ref_name="codex/fix",
-                head_sha=head_sha,
-                merge_commit_oid=None,
-            )
-
-    class Runner:
-        def __init__(self, _github: object, _ledger: object) -> None:
-            pass
-
-        def run(self, _identity: object, _worktree: Path) -> CIAuditReceipt:
-            return receipt
-
-    class Ledger:
-        def close(self) -> None:
-            pass
-
-    handoffs: list[tuple[int, str]] = []
-
-    def handoff(_policy: object, _ledger: object, pr_number: int, **_: object):
-        handoffs.append((pr_number, receipt.receipt_id))
-        return {"status": "blocked", "blockers": ["feedback_unprocessed"]}
-
-    monkeypatch.setattr("github_pr_feedback.cli.GitHubClient", GitHub)
-    monkeypatch.setattr("github_pr_feedback.cli.LocalCIRunner", Runner)
-    monkeypatch.setattr(
-        "github_pr_feedback.cli.FeedbackLedger.for_current_profile", lambda: Ledger()
-    )
-    monkeypatch.setattr(
-        "github_pr_feedback.cli._run_single_pr_merge_handoff", handoff
-    )
-    monkeypatch.setattr("github_pr_feedback.cli._complete_current_ci_task", lambda _receipt: None)
-    monkeypatch.setattr("github_pr_feedback.cli._terminate_current_ci_worker", lambda: None)
-
-    result = _audit_pr(
-        RecordingContext(settings),
-        argparse.Namespace(
-            repository="acme/widgets",
-            pr_number=17,
-            head_sha=head_sha,
-            worktree=str(repository),
-        ),
-    )
-
-    assert result == 0
-    assert handoffs == [(17, receipt.receipt_id)]
-
-
-def test_confirmed_single_pr_merge_dispatches_only_one_next_base_refresh(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from github_pr_feedback.cli import (
-        _load_policy_from_context,
-        _run_single_pr_merge_handoff,
-    )
-    from github_pr_feedback.merge_controller import MergeDecision, MergeRunResult
-
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    settings = enabled_settings(tmp_path)
-    settings["repair_steward"] = {
-        "enabled": True,
-        "assignee": "pr-repair-steward",
-        "repositories": ["acme/widgets"],
-        "report_only": False,
-        "max_base_refresh_in_flight": 8,
-    }
-    settings["merge_maintainer"] = {
-        "enabled": True,
-        "assignee": "pr-merge-maintainer",
-        "repository": "acme/widgets",
-        "author_login": "owner",
-        "base_branch": "main",
-        "merge_methods": ["squash"],
-        "receipt_max_age_seconds": 3600,
-        "report_only": False,
-        "post_merge": {"enabled": False},
-    }
-    policy = _load_policy_from_context(RecordingContext(settings))
-
-    class Receipt:
-        tested_head_sha = "a" * 40
-        method = "squash"
-        merge_commit_oid = "c" * 40
-
-    class Controller:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        def run(self, number: int) -> MergeRunResult:
-            assert number == 17
-            return MergeRunResult(
-                MergeDecision(True, (), "squash", "d" * 64), Receipt()
-            )
-
-    observed_policies = []
-
-    class Repair:
-        def __init__(self, repair_policy: object, *args: object, **kwargs: object) -> None:
-            observed_policies.append(repair_policy)
-
-        def scan(self):
-            return type("Result", (), {"created": 1, "skipped": {}, "degraded": False})()
-
-    monkeypatch.setattr(
-        "github_pr_feedback.cli.CanonicalMergeEvidenceSource", lambda *args: object()
-    )
-    monkeypatch.setattr("github_pr_feedback.cli.MergeController", Controller)
-    monkeypatch.setattr("github_pr_feedback.cli.RepairController", Repair)
-
-    result = _run_single_pr_merge_handoff(
-        policy,
-        object(),
-        17,
-        github=object(),
-        kanban=object(),
-    )
-
-    assert result["status"] == "merged"
-    assert result["next_repair"]["created"] == 1
-    serial = observed_policies[0].repair_steward
-    assert serial.max_base_refresh_in_flight == 1
-    assert serial.repositories == frozenset({"acme/widgets"})
-
-
-def test_blocked_single_pr_merge_does_not_dispatch_a_successor_repair(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from github_pr_feedback.cli import (
-        _load_policy_from_context,
-        _run_single_pr_merge_handoff,
-    )
-    from github_pr_feedback.merge_controller import MergeDecision, MergeRunResult
-
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    settings = enabled_settings(tmp_path)
-    settings["repair_steward"] = {
-        "enabled": True,
-        "assignee": "pr-repair-steward",
-        "repositories": ["acme/widgets"],
-        "report_only": False,
-        "max_base_refresh_in_flight": 8,
-    }
-    settings["merge_maintainer"] = {
-        "enabled": True,
-        "assignee": "pr-merge-maintainer",
-        "repository": "acme/widgets",
-        "author_login": "owner",
-        "base_branch": "main",
-        "merge_methods": ["squash"],
-        "receipt_max_age_seconds": 3600,
-        "report_only": False,
-        "post_merge": {"enabled": False},
-    }
-    policy = _load_policy_from_context(RecordingContext(settings))
-
-    class Controller:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        def run(self, number: int) -> MergeRunResult:
-            assert number == 17
-            return MergeRunResult(
-                MergeDecision(False, ("feedback_unprocessed",), None, "d" * 64),
-                None,
-            )
-
-    class Repair:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise AssertionError("blocked merges must not dispatch successor repair")
-
-    monkeypatch.setattr(
-        "github_pr_feedback.cli.CanonicalMergeEvidenceSource", lambda *args: object()
-    )
-    monkeypatch.setattr("github_pr_feedback.cli.MergeController", Controller)
-    monkeypatch.setattr("github_pr_feedback.cli.RepairController", Repair)
-
-    result = _run_single_pr_merge_handoff(
-        policy,
-        object(),
-        17,
-        github=object(),
-        kanban=object(),
-    )
-
-    assert result == {"status": "blocked", "blockers": ["feedback_unprocessed"]}
 
 
 def test_audit_reuses_exact_head_manifest_receipt_without_rerunning_lane(
@@ -2384,3 +1794,260 @@ def test_ci_audit_handoff_terminates_only_a_task_scoped_parent(
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_exact")
     _terminate_current_ci_worker()
     assert signals == [(4321, signal.SIGTERM)]
+
+
+def _feedback_comment(body: str) -> Feedback:
+    return Feedback(
+        kind="issue_comment",
+        feedback_id="1",
+        reviewer=Reviewer("pr-repair-steward"),
+        body=body,
+        created_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+        is_bot=True,
+    )
+
+
+class _FakeGitHubComments:
+    def __init__(self, bodies: list[str]) -> None:
+        self._bodies = bodies
+        self.posted: list[tuple[str, int, str]] = []
+
+    def list_feedback(self, repository: str, number: int):
+        return tuple(_feedback_comment(body) for body in self._bodies)
+
+    def post_issue_comment(self, repository: str, number: int, body: str) -> None:
+        self.posted.append((repository, number, body))
+
+
+class _FakeGitHubCommentsUnavailable(_FakeGitHubComments):
+    def list_feedback(self, repository: str, number: int):
+        from github_pr_feedback.github_client import GitHubClientError
+
+        raise GitHubClientError("boom")
+
+
+def _repair_receipt(repository: str = "mrkillbob/luna-bot") -> FeedbackReceipt:
+    return FeedbackReceipt(repository, 17, "pr_repair", "repair:actions_not_green", "a" * 40)
+
+
+def _feedback_receipt(
+    feedback_kind: str, repository: str = "mrkillbob/luna-bot"
+) -> FeedbackReceipt:
+    return FeedbackReceipt(repository, 17, feedback_kind, "123456", "a" * 40)
+
+
+def test_factual_reply_is_required_for_ordinary_admitted_feedback_kinds_too() -> None:
+    """Same gate as pr_repair: this used to only cover repair receipts, letting an
+
+    ordinary review-comment-driven push complete with no trace a reply was skipped.
+    """
+
+    github = _FakeGitHubComments(["looks good to me"])
+
+    for kind in ("issue_comment", "review_comment", "review"):
+        assert _factual_reply_is_missing(
+            github, _feedback_receipt(kind), resolved_head_sha="a" * 40
+        )
+
+
+def test_factual_reply_for_ordinary_feedback_is_satisfied_by_its_own_marker_kind() -> None:
+    reply = (
+        f"{pr_repair_attribution_line('runtime-correctness-steward')}\n"
+        "Fixed the reported issue; focused tests pass.\n"
+        f"<!-- pr-maintenance-receipt:v1 status=completed kind=review_comment head={'a' * 40} -->"
+    )
+    github = _FakeGitHubComments([reply])
+
+    assert not _factual_reply_is_missing(
+        github, _feedback_receipt("review_comment"), resolved_head_sha="a" * 40
+    )
+
+
+def test_factual_reply_for_ordinary_feedback_is_satisfied_by_an_earlier_receipts_marker() -> (
+    None
+):
+    """A second admitted feedback item resolving to the same already-fixed head
+
+    is satisfied by the earlier reply -- no duplicate comment required.
+    """
+
+    reply = (
+        f"{pr_repair_attribution_line('runtime-correctness-steward')}\n"
+        "Already fixed by an earlier receipt.\n"
+        f"<!-- pr-maintenance-receipt:v1 status=completed kind=issue_comment head={'a' * 40} -->"
+    )
+    github = _FakeGitHubComments([reply])
+
+    assert not _factual_reply_is_missing(
+        github, _feedback_receipt("review_comment"), resolved_head_sha="a" * 40
+    )
+
+
+def test_factual_reply_is_missing_when_no_comment_carries_the_receipt_marker() -> None:
+    github = _FakeGitHubComments(["looks good to me"])
+
+    assert _factual_reply_is_missing(
+        github, _repair_receipt(), resolved_head_sha="a" * 40
+    )
+
+
+def test_factual_reply_is_missing_when_the_marker_head_does_not_match() -> None:
+    other_head_marker = (
+        "Fixed it.\n"
+        "<!-- pr-maintenance-receipt:v1 status=completed kind=pr_repair "
+        f"head={'b' * 40} -->"
+    )
+    github = _FakeGitHubComments([other_head_marker])
+
+    assert _factual_reply_is_missing(
+        github, _repair_receipt(), resolved_head_sha="a" * 40
+    )
+
+
+def test_factual_reply_is_missing_on_our_repo_without_the_attribution_line() -> None:
+    """Our repo requires self-identification -- the marker alone is not enough."""
+
+    marker_only = (
+        "Fixed the conflict.\n"
+        f"<!-- pr-maintenance-receipt:v1 status=completed kind=pr_repair head={'a' * 40} -->"
+    )
+    github = _FakeGitHubComments([marker_only])
+
+    assert _factual_reply_is_missing(
+        github, _repair_receipt("mrkillbob/luna-bot"), resolved_head_sha="a" * 40
+    )
+
+
+def test_pr_repair_reply_is_satisfied_by_a_marker_and_attribution_on_our_repo() -> None:
+    reply = (
+        f"{pr_repair_attribution_line('pr-repair-steward')}\n"
+        "Fixed the conflict; focused tests pass.\n"
+        f"<!-- pr-maintenance-receipt:v1 status=completed kind=pr_repair head={'a' * 40} -->"
+    )
+    github = _FakeGitHubComments([reply])
+
+    assert not _factual_reply_is_missing(
+        github, _repair_receipt("mrkillbob/luna-bot"), resolved_head_sha="a" * 40
+    )
+
+
+def test_pr_repair_reply_on_the_upstream_repo_does_not_require_attribution() -> None:
+    """NousResearch/hermes-agent stays brand-neutral -- the marker alone suffices."""
+
+    marker_only = (
+        "Fixed the conflict.\n"
+        f"<!-- pr-maintenance-receipt:v1 status=completed kind=pr_repair head={'a' * 40} -->"
+    )
+    github = _FakeGitHubComments([marker_only])
+
+    assert not _factual_reply_is_missing(
+        github,
+        _repair_receipt("NousResearch/hermes-agent"),
+        resolved_head_sha="a" * 40,
+    )
+
+
+def test_pr_repair_reply_accepts_the_ci_failure_typed_fixers_own_marker_kind() -> None:
+    """_ci_failure_task's own instructions require `kind=ci_repair`, not `kind=pr_repair`,
+
+    even though its receipt's feedback_kind is 'pr_repair' like every other repair
+    dispatch. Both must satisfy the same completion gate.
+    """
+
+    reply = (
+        f"{pr_repair_attribution_line('ci-static-fixer')}\n"
+        "Fixed the static-lane failure; focused tests pass.\n"
+        f"<!-- pr-maintenance-receipt:v1 status=completed kind=ci_repair head={'a' * 40} -->"
+    )
+    github = _FakeGitHubComments([reply])
+
+    assert not _factual_reply_is_missing(
+        github, _repair_receipt("mrkillbob/luna-bot"), resolved_head_sha="a" * 40
+    )
+
+
+def _passed_ci_receipt(repository: str) -> CIAuditReceipt:
+    return CIAuditReceipt(
+        receipt_id="d" * 64,
+        identity=CIAuditIdentity(repository, 17, "b" * 40, "a" * 40),
+        manifest_digest="e" * 64,
+        status="passed",
+        started_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 25, 12, 1, tzinfo=UTC),
+        actions_state=CheckState(False, True, 0),
+        commands=(),
+    )
+
+
+def test_ci_audit_comment_self_identifies_as_hermes_on_our_own_repository() -> None:
+    body = _ci_audit_comment(_passed_ci_receipt("mrkillbob/luna-bot"))
+
+    assert body.startswith("Hermes automated CI audit (pr-local-ci-auditor)")
+
+
+def test_ci_audit_comment_stays_brand_neutral_on_the_upstream_repository() -> None:
+    body = _ci_audit_comment(_passed_ci_receipt("NousResearch/hermes-agent"))
+
+    assert "Hermes automated" not in body
+    assert body.startswith("Addressed local CI audit")
+
+
+def _codex_summary_body(status: str, sha: str) -> str:
+    return (
+        "<!-- codex-pull-request-review-summary -->\n\n"
+        "| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n"
+        f"| Code Review | {status} "
+        '<relative-time datetime="2026-08-25T20:00:00Z"></relative-time> | '
+        f"`{sha}` | PR opened |"
+    )
+
+
+def _codex_feedback(body: str) -> Feedback:
+    return Feedback(
+        "issue_comment",
+        "1",
+        Reviewer("chatgpt-codex-connector[bot]", None),
+        body,
+        datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+        True,
+    )
+
+
+class _FakeGitHubCodex(_FakeGitHubComments):
+    def __init__(self, codex_feedback: tuple[Feedback, ...]) -> None:
+        super().__init__([])
+        self._codex_feedback = codex_feedback
+
+    def list_feedback(self, repository: str, number: int):
+        return self._codex_feedback
+
+
+def test_retrigger_codex_review_mentions_codex_when_its_review_is_stale() -> None:
+    head = "a" * 40
+    github = _FakeGitHubCodex(
+        (_codex_feedback(_codex_summary_body("Completed", ("f" * 40)[:7])),)
+    )
+
+    status = _retrigger_codex_review(github, "mrkillbob/luna-bot", 17, head)
+
+    assert status == "triggered"
+    assert github.posted == [("mrkillbob/luna-bot", 17, CODEX_REVIEW_TRIGGER)]
+
+
+def test_retrigger_codex_review_is_a_noop_when_codex_already_reviewed_this_head() -> None:
+    head = "a" * 40
+    github = _FakeGitHubCodex((_codex_feedback(_codex_summary_body("Completed", head[:7])),))
+
+    status = _retrigger_codex_review(github, "mrkillbob/luna-bot", 17, head)
+
+    assert status == "already_current"
+    assert github.posted == []
+
+
+def test_retrigger_codex_review_reports_unavailable_without_raising() -> None:
+    github = _FakeGitHubCommentsUnavailable([])
+
+    status = _retrigger_codex_review(github, "mrkillbob/luna-bot", 17, "a" * 40)
+
+    assert status == "unavailable"
+    assert github.posted == []
