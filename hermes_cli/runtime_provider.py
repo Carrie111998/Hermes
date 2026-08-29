@@ -433,6 +433,12 @@ _VALID_API_MODES = {
     "codex_app_server",
 }
 
+# ``codex_app_server`` never sends this value upstream: the Codex subprocess
+# owns its transport and reads authentication from CODEX_HOME.  A non-empty
+# sentinel preserves the client-shaped runtime contract expected by existing
+# CLI/gateway callers until the turn is handed to that subprocess.
+_CODEX_APP_SERVER_AUTH_PLACEHOLDER = "codex-cli-managed"
+
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
     """Validate an api_mode value from config. Returns None if invalid.
@@ -2159,6 +2165,24 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
         except AuthError:
+            app_server_mode = _maybe_apply_codex_app_server_runtime(
+                provider="openai-codex",
+                api_mode="codex_responses",
+                model_cfg=model_cfg,
+            )
+            if app_server_mode == "codex_app_server":
+                # App-server authentication belongs to Codex CLI, not Hermes'
+                # separate Codex OAuth store.  Keep the resolver's non-empty
+                # credential shape for legacy callers, but do not require a
+                # second login before Codex can read its own CODEX_HOME state.
+                return {
+                    "provider": "openai-codex",
+                    "api_mode": app_server_mode,
+                    "base_url": DEFAULT_CODEX_BASE_URL,
+                    "api_key": _CODEX_APP_SERVER_AUTH_PLACEHOLDER,
+                    "source": "codex-cli-app-server",
+                    "requested_provider": requested_provider,
+                }
             if requested_provider != "auto":
                 raise
             # Auto-detected Codex but credentials are stale/revoked —

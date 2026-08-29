@@ -86,6 +86,84 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+@pytest.mark.parametrize("requested", ["openai-codex", "auto"])
+def test_codex_app_server_does_not_require_hermes_codex_credentials(
+    monkeypatch, requested
+):
+    """Codex CLI owns auth when the app-server runtime is explicitly enabled."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-sol",
+            "openai_runtime": "codex_app_server",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda _provider: SimpleNamespace(has_credentials=lambda: False),
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: (_ for _ in ()).throw(
+            rp.AuthError(
+                "No Codex credentials stored.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested=requested)
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["base_url"] == rp.DEFAULT_CODEX_BASE_URL
+    assert resolved["api_key"]
+    assert resolved["source"] == "codex-cli-app-server"
+    assert resolved["requested_provider"] == requested
+
+
+def test_codex_responses_still_requires_hermes_codex_credentials(monkeypatch):
+    """The credential bypass is limited to the explicit app-server opt-in."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-sol",
+            "openai_runtime": "auto",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda _provider: SimpleNamespace(has_credentials=lambda: False),
+    )
+    missing = rp.AuthError(
+        "No Codex credentials stored.",
+        provider="openai-codex",
+        code="codex_auth_missing",
+        relogin_required=True,
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: (_ for _ in ()).throw(missing),
+    )
+
+    with pytest.raises(rp.AuthError) as exc_info:
+        rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert exc_info.value is missing
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth
