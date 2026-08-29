@@ -10,6 +10,9 @@ export function resolveUnambiguousConnectionProfile(input: {
   const last = String(input.lastProfileByConnection[input.connectionId] ?? '').trim()
   const roster = input.rosterProfiles.map(profile => profile.trim()).filter(Boolean)
 
+  // The persisted tuple is still exact when observational roster data is not
+  // available yet (cold or sleeping gateway). If a roster is available, it
+  // must confirm that the remembered profile still exists.
   if (last && (roster.length === 0 || roster.includes(last))) {
     return last
   }

@@ -698,7 +698,8 @@ export function shouldRetrySshInventory(
   return nowMs - lastAttemptMs >= retryAfterMs
 }
 
-const PROFILE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
+// Keep this aligned with hermes_cli.profiles.validate_profile_name().
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
 /** Turn `ls ~/.hermes/profiles` output into roster names. Always includes
  *  `default`. Drops rollback snapshots and junk lines. */

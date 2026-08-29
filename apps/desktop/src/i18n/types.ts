@@ -2014,6 +2014,11 @@ export interface Translations {
     stop: string
     send: string
     sessionsSwitchingSendBlocked: string
+    workspaceAuthRequiredSendBlocked: string
+    workspaceRouteInvalidSendBlocked: string
+    workspaceSwitchFailedSendBlocked: string
+    workspaceUnreachableSendBlocked: string
+    workspaceUnsupportedBuildSendBlocked: string
     speaking: string
     transcribing: string
     thinking: string

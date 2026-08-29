@@ -436,6 +436,54 @@ describe('ProfileRail fleet mode', () => {
     expect(globalThis.document.activeElement).toBe(omer)
   })
 
+  it('moves focus to the named active tuple after a successful gateway switch', async () => {
+    armFleet()
+    await renderFleet()
+
+    selectConnection.mockImplementationOnce(async () => {
+      activeConnectionId.set('local')
+      gatewayProfile.set('omer')
+      profiles.set([
+        { is_default: true, name: 'default' },
+        { is_default: false, name: 'omer' }
+      ])
+    })
+
+    const omer = screen.getByRole('button', { name: 'Switch to omer on This device' })
+    omer.focus()
+    fireEvent.click(omer)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(globalThis.document.activeElement).toBe(screen.getByRole('status', { name: 'omer · This device' }))
+  })
+
+  it('moves focus to the default active tuple after a successful gateway switch', async () => {
+    armFleet()
+    await renderFleet()
+
+    selectConnection.mockImplementationOnce(async () => {
+      activeConnectionId.set('local')
+      gatewayProfile.set('default')
+      profiles.set([
+        { is_default: true, name: 'default' },
+        { is_default: false, name: 'omer' }
+      ])
+    })
+
+    const home = screen.getByRole('button', { name: 'Switch to default on This device' })
+    home.focus()
+    fireEvent.click(home)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(globalThis.document.activeElement).toBe(screen.getByRole('status', { name: 'default · This device' }))
+  })
+
   it('treats a named active exact tuple as status, including mac-cockpit', async () => {
     armFleet()
     activeConnectionId.set('local')

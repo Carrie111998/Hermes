@@ -896,7 +896,7 @@ test('shouldRetrySshInventory: first try, cooldown, then retry; cache never retr
 
 test('parseRemoteProfileListing: Mini/Spark dirs become roster names and drop rollbacks', () => {
   const listed = parseRemoteProfileListing(
-    ['bob', 'dixie', 'goose', 'rambo', 'bob.rollback-old', '.hidden', '', 'not a name'].join('\n')
+    ['bob', 'dixie', 'goose', 'rambo', 'Capitalized', 'bob.rollback-old', '.hidden', '', 'not a name'].join('\n')
   )
 
   assert.deepEqual(listed, ['default', 'bob', 'dixie', 'goose', 'rambo'])

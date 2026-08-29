@@ -493,7 +493,9 @@ function localProfileEntry(existing) {
   return ssh ? { mode: 'local', savedSsh: ssh } : { mode: 'local' }
 }
 
-const PROFILE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
+// Keep this aligned with hermes_cli.profiles.validate_profile_name(). Profile
+// ids are canonical lowercase identities; display labels are a separate layer.
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
 function objectRecord(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : null

@@ -22,6 +22,11 @@ export const WORKSPACE_SEND_SURFACE_STATES = [
 ] as const
 
 export type WorkspaceSendSurfaceState = (typeof WORKSPACE_SEND_SURFACE_STATES)[number]
+export type WorkspaceSendAllowedState = Extract<
+  WorkspaceSendSurfaceState,
+  'already_active' | 'bot_talk_across' | 'idle_fleet'
+>
+export type WorkspaceSendBlockedState = Exclude<WorkspaceSendSurfaceState, WorkspaceSendAllowedState>
 
 export type WorkspaceSendTuple = {
   connectionId: string
@@ -45,10 +50,8 @@ export type WorkspaceSendInput = {
   unsupportedBuild?: boolean
 }
 
-export type WorkspaceSendVerdict = {
-  allowed: boolean
-  state: WorkspaceSendSurfaceState
-}
+export type WorkspaceSendVerdict =
+  { allowed: true; state: WorkspaceSendAllowedState } | { allowed: false; state: WorkspaceSendBlockedState }
 
 export type WorkspaceSubmitResult =
   { ok: true; reason?: WorkspaceSendSurfaceState } | { ok: false; reason: WorkspaceSendSurfaceState }

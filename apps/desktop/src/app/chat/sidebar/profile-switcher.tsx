@@ -175,9 +175,27 @@ export function ProfileRail() {
   const [pendingRoute, setPendingRoute] = useState<null | string>(null)
   const pendingRouteRef = useRef<null | string>(null)
   const [fleetSwitchStatus, setFleetSwitchStatus] = useState<null | string>(null)
+  const [focusRouteKey, setFocusRouteKey] = useState<null | string>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useFleetRoster(multipleConnections)
+
+  useEffect(() => {
+    if (!focusRouteKey) {
+      return
+    }
+
+    const target = Array.from(globalThis.document.querySelectorAll<HTMLElement>('[data-route-key]')).find(
+      element => element.dataset.routeKey === focusRouteKey
+    )
+
+    if (!target) {
+      return
+    }
+
+    target.focus()
+    setFocusRouteKey(null)
+  }, [activeConnectionId, focusRouteKey, gatewayProfile])
 
   const connections = registry?.connections
 
@@ -247,6 +265,13 @@ export function ProfileRail() {
         setFleetSwitchStatus(current =>
           current === p.fleet.switching(agent.profile, agent.connectionLabel) ? null : current
         )
+
+        // The condensed menu already restores focus to its trigger. The square
+        // rail replaces the clicked button with a status tuple, so explicitly
+        // move keyboard focus to that exact new tuple.
+        if (!condensed) {
+          setFocusRouteKey(key)
+        }
       })
       .catch((error: unknown) => {
         const failure = p.fleet.switchFailed(agent.profile, agent.connectionLabel, previous)
@@ -405,9 +430,11 @@ export function ProfileRail() {
                   return (
                     <FleetActiveNamedSquare
                       color={resolveProfileColor(profile.name, colors)}
+                      connectionId={activeConnection.id}
                       key={profile.name}
                       label={p.fleet.onGateway(profileLabel(profile), activeConnection.label)}
                       name={profile.name}
+                      routeKey={fleetRouteKey(activeConnection.id, profile.name)}
                     />
                   )
                 }
@@ -551,6 +578,9 @@ export function ProfileRail() {
                               activeConnection
                                 ? p.fleet.onGateway(profileLabel(defaultProfile), activeConnection.label)
                                 : profileLabel(defaultProfile)
+                            }
+                            routeKey={
+                              activeConnection ? fleetRouteKey(activeConnection.id, defaultProfile.name) : undefined
                             }
                           />
                         ) : (
@@ -1014,15 +1044,27 @@ function ProfilePill({
   )
 }
 
-function FleetActiveTuple({ connectionId, glyph, label }: { connectionId?: string; glyph: string; label: string }) {
+function FleetActiveTuple({
+  connectionId,
+  glyph,
+  label,
+  routeKey
+}: {
+  connectionId?: string
+  glyph: string
+  label: string
+  routeKey?: string
+}) {
   return (
     <Tip label={label}>
       <span
         aria-label={label}
         className="inline-flex size-6 shrink-0 items-center justify-center rounded-[4px] bg-(--ui-control-active-background) text-foreground"
         data-connection-id={connectionId}
+        data-route-key={routeKey}
         data-slot="profile-rail-active-tuple"
         role="status"
+        tabIndex={-1}
       >
         <Codicon name={glyph} size="0.875rem" />
       </span>
@@ -1030,7 +1072,19 @@ function FleetActiveTuple({ connectionId, glyph, label }: { connectionId?: strin
   )
 }
 
-function FleetActiveNamedSquare({ color, label, name }: { color: null | string; label: string; name: string }) {
+function FleetActiveNamedSquare({
+  color,
+  connectionId,
+  label,
+  name,
+  routeKey
+}: {
+  color: null | string
+  connectionId: string
+  label: string
+  name: string
+  routeKey: string
+}) {
   const hue = color ?? 'var(--ui-text-quaternary)'
 
   return (
@@ -1038,6 +1092,8 @@ function FleetActiveNamedSquare({ color, label, name }: { color: null | string; 
       <span
         aria-label={label}
         className="relative grid size-5 shrink-0 select-none place-items-center rounded-[3px] text-[0.5625rem] font-semibold uppercase leading-none"
+        data-connection-id={connectionId}
+        data-route-key={routeKey}
         data-slot="profile-rail-active-tuple"
         role="status"
         style={{
@@ -1045,6 +1101,7 @@ function FleetActiveNamedSquare({ color, label, name }: { color: null | string; 
           boxShadow: `inset 0 0 0 1.5px ${hue}`,
           color: color ?? undefined
         }}
+        tabIndex={-1}
       >
         {name.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
       </span>

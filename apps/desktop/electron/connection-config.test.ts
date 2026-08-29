@@ -355,6 +355,7 @@ test('configured local intent fails closed for malformed, unknown, and misspelle
   const raw = {
     profiles: {
       'mac-cockpit': { mode: 'locla' },
+      Capitalized: { mode: 'local' },
       unknown: { mode: 'future-local' },
       missing: {},
       remote: { mode: 'remote', url: 'https://example.test' },
