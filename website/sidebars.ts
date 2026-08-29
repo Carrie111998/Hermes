@@ -320,6 +320,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-software-development',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/software-development/software-development-codebase-design',
                     'user-guide/skills/bundled/software-development/software-development-dogfood',
                     'user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring',
                     'user-guide/skills/bundled/software-development/software-development-inspecting-hermes-desktop-dom',
