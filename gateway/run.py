@@ -6143,11 +6143,26 @@ class TurnRunner:
 
             if not ctx._status_adapter:
                 return ""
-            if (
-                getattr(self._runner, "_running", True) is False
-                or getattr(self._runner, "_draining", False) is True
-            ):
-                return "[clarify unavailable while gateway is shutting down]"
+
+            def _clarify_admission_failure() -> "str | None":
+                if (
+                    getattr(self._runner, "_running", True) is False
+                    or getattr(self._runner, "_draining", False) is True
+                ):
+                    return "[clarify unavailable while gateway is shutting down]"
+                try:
+                    if not ctx._run_still_current():
+                        return "[clarify unavailable because this turn is no longer active]"
+                except Exception:
+                    return "[clarify unavailable because this turn is no longer active]"
+                _agent = ctx.agent_holder[0] if ctx.agent_holder else None
+                if getattr(_agent, "is_interrupted", False) is True:
+                    return "[clarify unavailable because this turn was interrupted]"
+                return None
+
+            _admission_failure = _clarify_admission_failure()
+            if _admission_failure is not None:
+                return _admission_failure
 
             clarify_id = _uuid.uuid4().hex[:10]
             _clarify_binding_kwargs = {}
@@ -6174,18 +6189,17 @@ class TurnRunner:
                 run_generation=ctx.run_generation,
                 **_clarify_binding_kwargs,
             )
-            # Bracket registration with the liveness check. If shutdown raced
-            # the first check and its global clear ran before this register,
-            # the second check owns cancellation so no new waiter survives.
-            if (
-                getattr(self._runner, "_running", True) is False
-                or getattr(self._runner, "_draining", False) is True
-            ):
+            # Bracket registration with turn liveness. If /stop, teardown, or
+            # shutdown cleared before this register won the race, the second
+            # check owns this exact registration so no stale waiter survives
+            # and no prompt is delivered for an abandoned generation.
+            _admission_failure = _clarify_admission_failure()
+            if _admission_failure is not None:
                 _clarify_mod.clear_session(
                     ctx.session_key or "",
                     clarify_id=clarify_id,
                 )
-                return "[clarify unavailable while gateway is shutting down]"
+                return _admission_failure
 
             # For WeCom native streaming: finalize the current stream before
             # showing the clarify prompt so the post-answer output opens a

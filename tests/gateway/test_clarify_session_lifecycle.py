@@ -283,6 +283,108 @@ def test_turn_runner_old_unwind_preserves_new_generation_clarify():
         assert new_waiter.result(timeout=2.0) == "new"
 
 
+def test_turn_runner_teardown_before_clarify_registration_fences_stale_prompt():
+    """A stopped turn cannot register after its generation teardown finished."""
+    from gateway.run import TurnRunner
+    from gateway.turn_context import TurnContext
+    from tools import clarify_gateway as cm
+
+    register_entered = threading.Event()
+    allow_register = threading.Event()
+    turn_alive = threading.Event()
+    turn_alive.set()
+    original_register = cm.register
+
+    def _register_after_teardown(*args, **kwargs):
+        register_entered.set()
+        assert allow_register.wait(2.0)
+        return original_register(*args, **kwargs)
+
+    class _ClarifyingAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.session_id = kwargs["session_id"]
+            self.tools = []
+            self.context_compressor = SimpleNamespace(
+                last_prompt_tokens=0,
+                context_length=200_000,
+            )
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+
+        def run_conversation(self, _message, **_kwargs):
+            response = self.clarify_callback("Pick", ["A"])
+            return {
+                "final_response": response,
+                "failed": False,
+                "messages": [],
+            }
+
+    runner = MagicMock()
+    runner.config = SimpleNamespace(streaming=None)
+    runner._provider_routing = {}
+    runner._agent_cache_lock = None
+    runner._agent_cache = {}
+    runner._session_db = None
+    runner._prefill_messages = None
+    runner._pending_model_notes = {}
+    runner._pending_skills_reload_notes = {}
+    runner.session_store._entries = {}
+    runner._running = True
+    runner._draining = False
+    runner._get_system_prompt_for_channel.return_value = None
+    runner._resolve_session_agent_runtime.return_value = ("test-model", {})
+    runner._resolve_session_reasoning_config.return_value = None
+    runner._resolve_session_service_tier.return_value = None
+    runner._resolve_turn_agent_config.return_value = {
+        "model": "test-model",
+        "runtime": {},
+    }
+    runner._agent_config_signature.return_value = ("test-signature",)
+    runner._extract_cache_busting_config.return_value = {}
+    runner._refresh_fallback_model.return_value = None
+    runner._consume_pending_native_image_paths.return_value = []
+    runner._consume_pending_turn_sidecar_notes.return_value = []
+    runner._is_telegram_topic_lane.return_value = False
+    runner._is_discord_auto_thread_lane.return_value = False
+    runner._is_relay_discord_channel_lane.return_value = False
+
+    session_key = build_session_key(_source())
+    ctx = TurnContext(
+        source=_source(),
+        message="old turn",
+        history=[],
+        session_id="old-session",
+        session_key=session_key,
+        run_generation=1,
+        user_config={},
+        AIAgent=_ClarifyingAgent,
+        resolve_display_setting=lambda *_args: False,
+        _run_still_current=turn_alive.is_set,
+        _hooks_ref=SimpleNamespace(loaded_hooks=False),
+        _status_adapter=MagicMock(),
+        _status_chat_id="123456",
+    )
+
+    with (
+        patch.object(cm, "register", side_effect=_register_after_teardown),
+        patch(
+            "gateway.run.safe_schedule_threadsafe",
+            side_effect=AssertionError("stale clarify reached delivery"),
+        ),
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        old_run = pool.submit(TurnRunner(runner, ctx).run_sync)
+        assert register_entered.wait(2.0)
+        turn_alive.clear()
+        assert cm.clear_session(session_key, run_generation=1) == 0
+        allow_register.set()
+        result = old_run.result(timeout=2.0)
+
+    assert "no longer active" in result["final_response"]
+    assert not cm.has_pending(session_key)
+
+
 def test_idle_reset_exact_boundary_then_invalidates_before_rotation(tmp_path):
     """Idle policy remains strict-greater-than and clears on the first due tick."""
     from tools import clarify_gateway as cm
