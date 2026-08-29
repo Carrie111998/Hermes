@@ -2971,6 +2971,10 @@ def _batch_model_rejection_notice(results, model):
     configured delegation model id and matches a ``model_not_found`` pattern
     from ``agent.error_classifier`` (the same classification the failover
     path consumes), so incidental prose about other models never triggers it.
+    The containment check is best-effort: a provider that wraps or escapes
+    the model id (so it no longer appears verbatim in the task text) is
+    missed, and the ``model_not_found`` pattern gate is what keeps a model
+    id that is a substring of unrelated text from firing.
     """
     if not results or not isinstance(model, str):
         return None
@@ -2994,8 +2998,8 @@ def _batch_model_rejection_notice(results, model):
         "",
         f"⚠ SUBAGENT MODEL REJECTED: the configured Subagent Model \"{model}\" "
         "was rejected by the provider (model_not_found). "
-        f"{hits}/{len(results)} task(s) in this batch failed for this "
-        "reason before doing any work — the per-task blocks below repeat "
+        f"{hits}/{len(results)} task(s) in this batch failed with this "
+        "rejection — the per-task blocks below repeat "
         "the same rejection once per task. Check the Subagent Model setting "
         "(Settings → Advanced, or `hermes config get delegation.model`) and "
         "re-dispatch.",
