@@ -69,10 +69,12 @@ class DummyAgent:
         self.events = []
         self.built_prompts = []
         self.touch_calls = []
+        self.touch_provenances = []
         self._compression_activity_heartbeat_interval = 0.1
 
-    def _touch_activity(self, desc):
+    def _touch_activity(self, desc, *, provenance=None, force_persist=False):
         self.touch_calls.append(desc)
+        self.touch_provenances.append(provenance)
 
     def _emit_status(self, message):
         self.statuses.append(message)
@@ -136,11 +138,42 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
     assert "context compression started" in agent.touch_calls
     assert "context compression in progress" in agent.touch_calls
     assert agent.touch_calls[-1] == "context compression completed"
+    from agent.session_activity import ActivityProvenance
+
+    assert agent.touch_provenances
+    assert all(
+        p is ActivityProvenance.AGENT_COMPRESSION for p in agent.touch_provenances
+    )
 
 
 
 
 
+
+def test_codex_app_server_compression_failure_preserves_bookkeeping():
+    agent = DummyAgent(TurnResult(error="compact failed"))
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        force=True,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent._codex_session.calls == 1
+    assert agent.context_compressor.compression_count == 0
+    assert agent.context_compressor.last_prompt_tokens == 123
+    assert agent.warnings
+    assert agent.touch_calls[0] == "context compression started"
+    assert agent.touch_calls[-1] == "context compression failed"
+    assert agent.status_events == [
+        ("lifecycle", COMPACTION_STATUS),
+        ("warn", "⚠ Codex app-server compaction failed: compact failed"),
+    ]
 
 
 
