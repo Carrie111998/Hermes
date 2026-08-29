@@ -72,5 +72,31 @@ def test_plugin_toolset_names_do_not_mask_real_corruption():
     assert any("unknown toolset 'hermes'" in w for w in warnings)
 
 
+def test_per_platform_plugin_names_do_not_cross_mask():
+    # A plugin known only for one platform must NOT mask an invalid entry
+    # on another. Before the per-platform fix, the flat union carried ``a2a``
+    # (known only for ``discord``) to every platform, silently accepting the
+    # genuinely wrong ``a2a`` entry on ``cli`` — the exact live-config case.
+    cfg = {"cli": ["hermes-cli", "a2a"], "discord": ["hermes-discord", "a2a"]}
+    known = {"cli": ["eikon", "buzz"], "discord": ["a2a", "eikon"]}
+    warnings = validate_platform_toolsets(
+        cfg, _is_valid, plugin_toolset_names=known
+    )
+    # discord's a2a is legitimately known; cli's a2a is not.
+    assert not any("platform 'discord'" in w for w in warnings)
+    assert any("platform 'cli'" in w and "unknown toolset 'a2a'" in w for w in warnings)
+
+
+def test_per_platform_mapping_still_accepts_known_plugin():
+    # Same mapping shape as production: names valid under their own platform
+    # validate clean, matching the pre-existing flat-union behavior.
+    cfg = {"cli": ["hermes-cli", "eikon"], "discord": ["hermes-discord", "a2a"]}
+    known = {"cli": ["eikon", "buzz"], "discord": ["a2a", "eikon"]}
+    warnings = validate_platform_toolsets(
+        cfg, _is_valid, plugin_toolset_names=known
+    )
+    assert warnings == []
+
+
 
 

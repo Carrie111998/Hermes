@@ -39,13 +39,20 @@ def validate_platform_toolsets(
             ``dict`` values carry toolset entries; anything else yields no
             warnings (nothing to validate).
         is_valid_toolset: Predicate returning ``True`` for a known toolset name.
-        plugin_toolset_names: Optional iterable of plugin-registered toolset
-            names (e.g. ``eikon``, ``buzz``, ``a2a``). These only appear in the
-            tool registry after plugins load — which is after config-time
-            validation runs — so ``is_valid_toolset`` alone flags them as
-            unknown even though they resolve fine at runtime. Treat any name
-            carried here as valid too (callers pass the union of
-            ``known_plugin_toolsets`` from config).
+        plugin_toolset_names: Optional iterable or per-platform mapping of
+            plugin-registered toolset names (e.g. ``eikon``, ``buzz``, ``a2a``).
+            These only appear in the tool registry after plugins load — which
+            is after config-time validation runs — so ``is_valid_toolset``
+            alone flags them as unknown even though they resolve fine at
+            runtime. Two accepted shapes:
+
+            - An iterable of names: every name is treated as valid for *every*
+              platform (legacy behavior; callers passing ``known_plugin_toolsets``
+              as a flat union use this).
+            - A ``{platform: [names]}`` mapping: names are valid only for their
+              own platform. This preserves the per-platform precision that
+              ``known_plugin_toolsets`` encodes — a plugin known only for one
+              platform cannot mask an invalid entry on another.
 
     Returns:
         A list of warning strings (empty when everything is valid).
@@ -54,10 +61,24 @@ def validate_platform_toolsets(
     if not isinstance(platform_toolsets, dict) or not platform_toolsets:
         return warnings
 
-    known_plugin = set(plugin_toolset_names) if plugin_toolset_names else set()
+    # Normalize plugin names to per-platform lookup. Mapping input is used
+    # keyed by platform; a flat iterable is replicated to every platform so
+    # both shapes share one code path below.
+    if isinstance(plugin_toolset_names, dict):
+        known_plugin = {
+            platform: {n for n in names if isinstance(n, str)}
+            for platform, names in plugin_toolset_names.items()
+        }
+    else:
+        _flat = {
+            n for n in (plugin_toolset_names or ()) if isinstance(n, str)
+        }
+        known_plugin = {platform: set(_flat) for platform in platform_toolsets}
 
-    def _is_valid(name: str) -> bool:
-        return bool(is_valid_toolset(name)) or name in known_plugin
+    def _is_valid(name: str, platform: str) -> bool:
+        return bool(is_valid_toolset(name)) or name in known_plugin.get(
+            platform, ()
+        )
 
     valid_count = 0
     for platform, raw in platform_toolsets.items():
@@ -65,7 +86,7 @@ def validate_platform_toolsets(
         for name in names:
             if not isinstance(name, str) or not name:
                 continue
-            if _is_valid(name):
+            if _is_valid(name, platform):
                 valid_count += 1
                 continue
             suggestion = f"hermes-{platform}"
