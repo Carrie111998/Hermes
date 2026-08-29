@@ -24,6 +24,18 @@ vi.mock('@/i18n', () => ({
         connectGateway: 'Manage gateways…',
         failedLoadSoul: 'Failed to load SOUL.md',
         failedSaveSoul: 'Failed to save SOUL.md',
+        fleet: {
+          allOnGateway: 'All profiles on this gateway',
+          consequence: 'Sessions moves to this gateway; the open chat stays on its current machine.',
+          deleteOn: (gateway: string) => ` on ${gateway}`,
+          gateway: (gateway: string) => `Profiles on ${gateway}`,
+          gatewayUnreachable: (gateway: string) => `${gateway} · unreachable`,
+          onGateway: (name: string, gateway: string) => `${name} · ${gateway}`,
+          switchFailed: (name: string, gateway: string, previous: string) =>
+            `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
+          switching: (name: string, gateway: string) => `Switching Sessions to ${name} on ${gateway}…`,
+          switchTo: (name: string, gateway: string) => `Switch to ${name} on ${gateway}`
+        },
         importProfile: 'Import profile…',
         manageProfiles: 'Manage profiles…',
         newProfile: 'New profile',
