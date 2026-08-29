@@ -1388,3 +1388,52 @@ def test_sanitize_stubs_interrupted_first_occurrence_keeps_replay_pair():
     assert out[5]["content"] == "real result"
 
 
+def test_sanitize_strips_empty_and_whitespace_tool_name():
+    """Tool messages carrying empty, whitespace, or null 'name' must have 'name' stripped."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "run"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "g", "arguments": "{}"}},
+                {"id": "call_3", "type": "function", "function": {"name": "h", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "", "content": "res1"},
+        {"role": "tool", "tool_call_id": "call_2", "name": "   ", "content": "res2"},
+        {"role": "tool", "tool_call_id": "call_3", "name": "valid_fn", "content": "res3"},
+    ]
+
+    out = sanitize_api_messages(list(messages))
+    assert "name" not in out[2]
+    assert "name" not in out[3]
+    assert out[4].get("name") == "valid_fn"
+
+
+def test_sanitize_stub_omits_empty_name():
+    """Stub tool results must not attach an empty 'name' key when tool_call has no name."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "run"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_empty_name", "type": "function", "function": {"name": "", "arguments": "{}"}},
+            ],
+        },
+        {"role": "user", "content": "next turn"},
+    ]
+
+    out = sanitize_api_messages(list(messages))
+    stub = out[2]
+    assert stub["role"] == "tool"
+    assert stub["tool_call_id"] == "call_empty_name"
+    assert "name" not in stub or stub["name"] != ""
+
+
