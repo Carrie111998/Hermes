@@ -217,6 +217,7 @@ async def upload_files(token: str, request: Request) -> HTMLResponse:
     limit = settings.upload_max_mb * 1024 * 1024
     saved: list[str] = []
     rejected: list[str] = []
+    to_analyze: list[tuple[int, Any, str, str]] = []
     for item in form.getlist("files"):
         if isinstance(item, str) or not getattr(item, "filename", ""):
             continue
@@ -226,11 +227,12 @@ async def upload_files(token: str, request: Request) -> HTMLResponse:
         if len(content) > limit:
             rejected.append(item.filename)
             continue
-        _, _path = await asyncio.to_thread(
+        upload_id, path = await asyncio.to_thread(
             save_upload, settings, services.db, room_id,
             item.filename, content, item.content_type or "",
         )
         saved.append(f"{item.filename} ({human_size(len(content))})")
+        to_analyze.append((upload_id, path, item.filename, item.content_type or ""))
 
     if saved:
         listing = "\n".join(f"- {name}" for name in saved)
@@ -260,6 +262,8 @@ async def upload_files(token: str, request: Request) -> HTMLResponse:
                 f"자료 {len(saved)}건을 접수했습니다. 변호사님께 바로 전달드렸습니다. 📎",
                 record_role="",
             )
+        # 내용 분석(제미나이 비전)은 백그라운드로 — 업로드 응답을 막지 않는다.
+        _spawn(_analyze_uploads(services, room_id, to_analyze))
 
     banner = ""
     if saved:
@@ -279,6 +283,56 @@ async def upload_files(token: str, request: Request) -> HTMLResponse:
             count=f" · 지금까지 {received}건 접수" if received else "",
         )
     )
+
+
+async def _analyze_uploads(
+    services: Services, room_id: str, entries: list[tuple[int, Any, str, str]]
+) -> None:
+    """올라온 파일을 제미나이가 읽고, 그 요약을 세 곳에 심는다.
+
+    ① uploads.summary → 실시간 방 화면  ② 대화 기록 시스템 메시지 →
+    다음 턴부터 AI 가 자료 내용을 앎  ③ 상담방·변호사 카톡 확인 한 통.
+    분석이 안 되는 파일(형식·크기·키 없음)은 조용히 건너뜁니다 — 원본
+    보관과 변호사 열람은 이미 끝나 있으니까요.
+    """
+    from .vision import describe_file
+
+    settings = services.settings
+    summaries: list[tuple[str, str]] = []
+    for upload_id, path, filename, content_type in entries:
+        try:
+            text = await describe_file(settings, path, filename, content_type)
+        except Exception:  # noqa: BLE001 — 분석 실패가 접수를 깨면 안 된다
+            log.exception("upload analysis failed: %s", filename)
+            continue
+        if not text:
+            continue
+        await asyncio.to_thread(services.db.set_upload_summary, upload_id, text)
+        await asyncio.to_thread(
+            services.db.add_message,
+            room_id,
+            "system",
+            f"[자료 분석] {filename}:\n{text}",
+            "",
+            "",
+            settings.history_turns,
+            settings.archive_enabled,
+        )
+        summaries.append((filename, text))
+
+    if not summaries:
+        return
+    lines = "\n\n".join(f"📄 {name}\n{text}" for name, text in summaries)
+    with contextlib.suppress(Exception):
+        await services.sender.send(
+            room_id,
+            f"올려주신 자료를 확인했습니다.\n\n{lines}\n\n"
+            "제가 읽은 내용이 다르거나 빠진 부분이 있으면 말씀해 주세요. "
+            "이 내용을 반영해 상담을 이어가겠습니다.",
+            record_role="bot",
+        )
+    with contextlib.suppress(Exception):
+        await services.sender.notify_lawyer(f"🔎 자료 분석 결과\n방: {room_id}\n\n{lines}"[:3500])
 
 
 def _require_worker_token(services: Services, request: Request, header_value: str) -> None:

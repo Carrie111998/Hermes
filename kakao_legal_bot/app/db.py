@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_done"})
 
@@ -34,6 +34,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("drafts", "claimed_at", "REAL"),
     ("drafts", "llm_body", "TEXT NOT NULL DEFAULT ''"),
     ("intakes", "track", "TEXT NOT NULL DEFAULT 'civil'"),
+    ("uploads", "summary", "TEXT NOT NULL DEFAULT ''"),
 )
 
 _SCHEMA = """
@@ -190,6 +191,8 @@ CREATE TABLE IF NOT EXISTS uploads (
     stored_name  TEXT NOT NULL,                           -- 디스크의 무작위 이름
     content_type TEXT NOT NULL DEFAULT '',
     size         INTEGER NOT NULL DEFAULT 0,
+    -- 제미나이 비전이 읽어낸 요약 (사진·PDF·녹음). 참고용 — 원본이 근거.
+    summary      TEXT NOT NULL DEFAULT '',
     created_at   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_uploads_room ON uploads(room_id, id DESC);
@@ -951,6 +954,9 @@ class Database:
 
     def get_upload(self, upload_id: int) -> sqlite3.Row | None:
         return self._query_one("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+
+    def set_upload_summary(self, upload_id: int, summary: str) -> None:
+        self._exec("UPDATE uploads SET summary = ? WHERE id = ?", (summary, upload_id))
 
     def list_uploads(self, room_id: str = "", limit: int = 100) -> list[sqlite3.Row]:
         if room_id:

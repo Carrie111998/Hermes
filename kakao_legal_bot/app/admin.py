@@ -411,7 +411,13 @@ async def show_room(
     files = "".join(
         f'<li><a href="/admin/uploads/{row["id"]}?token={_esc(token)}">'
         f'{_esc(row["filename"])}</a>'
-        f'<span class="meta"> · {int(row["size"]) // 1024}KB · {_ago(row["created_at"])}</span></li>'
+        f'<span class="meta"> · {int(row["size"]) // 1024}KB · {_ago(row["created_at"])}</span>'
+        + (
+            f'<div class="meta" style="white-space:pre-wrap">🔎 {_esc(row["summary"])}</div>'
+            if "summary" in row.keys() and row["summary"]
+            else ""
+        )
+        + "</li>"
         for row in uploads
     )
     extra_css = """<style>
