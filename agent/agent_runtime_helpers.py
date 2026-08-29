@@ -1088,6 +1088,32 @@ def sync_credential_pool_entry_id(agent) -> None:
         agent._credential_pool_entry_id = None
 
 
+def is_xai_stale_oauth_error(
+    error_context: Optional[Dict[str, Any]], status_code: Optional[int]
+) -> bool:
+    """True for xAI's authoritative "stale token, not entitlement" 403.
+
+    xAI answers an *expired* OAuth access token with HTTP 403 -- not 401 --
+    carrying either a ``[WKE=unauthenticated:...]`` suffix or the phrase
+    ``OAuth2 access token could not be validated``.  Both mean the token is
+    merely stale and a refresh recovers it, which is exactly what separates
+    them from the entitlement 403s that refreshing can never fix (#29344).
+
+    Shared by the credential-pool recovery path and the singleton
+    ``codex_responses`` refresh path so the two cannot drift apart.
+    """
+    if status_code != 403 or not isinstance(error_context, dict):
+        return False
+    haystack = " ".join(
+        str(error_context.get(k) or "").lower()
+        for k in ("message", "reason", "code", "error")
+    )
+    return (
+        "[wke=unauthenticated:" in haystack
+        or "oauth2 access token could not be validated" in haystack
+    )
+
+
 def recover_with_credential_pool(
     agent,
     *,
@@ -1352,11 +1378,7 @@ def recover_with_credential_pool(
         ):
             is_entitlement = True
         if not is_entitlement and status_code == 403 and (agent.provider or "") == "xai-oauth":
-            _is_xai_auth_failure = (
-                "[wke=unauthenticated:" in _auth_haystack
-                or "oauth2 access token could not be validated" in _auth_haystack
-            )
-            if not _is_xai_auth_failure:
+            if not is_xai_stale_oauth_error(error_context, status_code):
                 is_entitlement = True
         if is_entitlement:
             _ra().logger.info(
