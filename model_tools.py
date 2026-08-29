@@ -325,6 +325,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    restrict_toolsets_to_static: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -340,6 +341,19 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        restrict_toolsets_to_static: When True, resolve every toolset in
+            ``enabled_toolsets``/``disabled_toolsets`` against ONLY the static
+            ``toolsets.TOOLSETS`` definition — tools a plugin/overlay
+            registered into a toolset via the registry are excluded. For most
+            callers the registry merge is exactly what you want (a user
+            session should pick up plugin tools). It matters for a caller
+            that treats ``enabled_toolsets`` as a hard security boundary
+            (e.g. the curator's background-review fork, restricted to
+            ``["skills"]`` so it cannot reach the filesystem): without this,
+            a plugin registering a new tool into "skills" silently widens
+            that fork's callable surface even though the fork's own code
+            never changed. Leave False unless the caller needs that
+            guarantee.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -374,6 +388,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                bool(restrict_toolsets_to_static),
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -387,7 +402,8 @@ def get_tool_definitions(
             return list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+                                       skip_tool_search_assembly=skip_tool_search_assembly,
+                                       restrict_toolsets_to_static=restrict_toolsets_to_static)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -419,10 +435,12 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    restrict_toolsets_to_static: bool = False,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
     tools_to_include: set = set()
+    _include_registry = not restrict_toolsets_to_static
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
@@ -440,7 +458,7 @@ def _compute_tool_definitions(
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
-                resolved = resolve_toolset(toolset_name)
+                resolved = resolve_toolset(toolset_name, include_registry=_include_registry)
                 tools_to_include.update(resolved)
                 if not quiet_mode:
                     print(f"✅ Enabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
@@ -455,7 +473,7 @@ def _compute_tool_definitions(
         # Default: start with everything
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
-            tools_to_include.update(resolve_toolset(ts_name))
+            tools_to_include.update(resolve_toolset(ts_name, include_registry=_include_registry))
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
@@ -488,7 +506,7 @@ def _compute_tool_definitions(
                             ", ".join(resolved) if resolved else "none",
                         )
                 else:
-                    resolved = resolve_toolset(toolset_name)
+                    resolved = resolve_toolset(toolset_name, include_registry=_include_registry)
                     tools_to_include.difference_update(resolved)
                 if not quiet_mode:
                     print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")

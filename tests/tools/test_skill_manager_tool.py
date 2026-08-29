@@ -915,6 +915,49 @@ class TestCuratorConsolidationDeleteGuard:
         # Skill must remain active on disk — fail closed, no archive.
         assert (skills_root / "active-skill").exists()
 
+    def test_verified_consolidation_migrates_cron_refs_in_same_transaction(
+        self, tmp_path, monkeypatch
+    ):
+        """A verified consolidation delete must rewrite cron job references
+        to the archived skill BEFORE returning success — not as a later,
+        best-effort batch pass at the end of the curator run. Otherwise an
+        enabled cron job can point at an already-archived, unresolvable
+        skill name for the window between the two.
+        """
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("umbrella", _skill_content("umbrella"))
+            _create_curator_skill("narrow", _skill_content("narrow"))
+
+            with patch(
+                "cron.jobs.rewrite_skill_refs",
+                return_value={"rewrites": [], "jobs_updated": 1, "jobs_scanned": 1},
+            ) as mock_rewrite:
+                result = _delete_skill("narrow", absorbed_into="umbrella")
+
+        assert result["success"] is True, result
+        mock_rewrite.assert_called_once_with(consolidated={"narrow": "umbrella"})
+
+    def test_failed_cron_migration_rolls_back_the_archive(self, tmp_path, monkeypatch):
+        """If cron reference migration fails, the archive must be undone —
+        never leave a skill archived with a cron job still pointing at its
+        now-unresolvable name.
+        """
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
+            _create_curator_skill("umbrella", _skill_content("umbrella"))
+            _create_curator_skill("narrow", _skill_content("narrow"))
+
+            with patch(
+                "cron.jobs.rewrite_skill_refs",
+                side_effect=RuntimeError("jobs.json is corrupt"),
+            ):
+                result = _delete_skill("narrow", absorbed_into="umbrella")
+
+        assert result["success"] is False
+        assert "rolled back" in result["error"].lower()
+        # The rollback must actually have happened — the skill is back.
+        assert (skills_root / "narrow").exists()
+        assert (skills_root / "narrow" / "SKILL.md").exists()
+
     def test_background_review_read_survives_copied_tool_contexts(
         self, tmp_path, monkeypatch
     ):

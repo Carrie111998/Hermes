@@ -1305,6 +1305,48 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             return {"success": False, "error": f"failed to archive '{name}': {e}"}
         if not ok:
             return {"success": False, "error": archive_msg}
+
+        # Migrate cron job skill references IN THE SAME TRANSACTION as the
+        # archive, not as a post-hoc batch pass at the end of the curator
+        # run. A cron job referencing `name` would otherwise silently fail
+        # to load it on its next run the moment the archive above commits —
+        # the old best-effort, end-of-run rewrite left a window where an
+        # enabled cron job pointed at an already-archived, unresolvable
+        # skill name. If the rewrite itself fails, undo the archive rather
+        # than leave that dangling reference: the delete didn't happen.
+        if is_consolidation:
+            try:
+                from cron.jobs import rewrite_skill_refs
+                rewrite_skill_refs(consolidated={name: absorbed_target})
+            except Exception as e:
+                _restored, _restore_msg = False, ""
+                try:
+                    from tools.skill_usage import restore_skill
+                    _restored, _restore_msg = restore_skill(name)
+                except Exception as e2:
+                    _restore_msg = str(e2)
+                if _restored:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"failed to migrate cron job references from '{name}' to "
+                            f"'{absorbed_target}': {e}. The archive was rolled back "
+                            f"('{name}' is active again) so no cron job is left "
+                            "pointing at an archived skill. Retry once the cron "
+                            "module issue is resolved."
+                        ),
+                    }
+                return {
+                    "success": False,
+                    "error": (
+                        f"failed to migrate cron job references from '{name}' to "
+                        f"'{absorbed_target}': {e}. Rolling back the archive ALSO "
+                        f"failed: {_restore_msg}. '{name}' is archived but any "
+                        "enabled cron job referencing it may now fail to load it — "
+                        "this needs manual attention."
+                    ),
+                }
+
         message = f"Skill '{name}' archived ({archive_msg})."
         if is_consolidation:
             message += f" Content absorbed into '{absorbed_target}'."

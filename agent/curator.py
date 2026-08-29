@@ -467,10 +467,14 @@ CURATOR_REVIEW_PROMPT = (
     "counters are new and often mostly zero. Judge overlap on CONTENT, "
     "not on use_count. 'use=0' is not evidence a skill is valuable; it's "
     "absence of evidence either way. Corollary: 'use=0' is ALSO not a "
-    "reason to PRUNE a skill. Never archive a never-used skill (use=0) "
-    "unless it is at least 30 days old (check last_activity / created date) "
-    "AND its content is genuinely obsolete or fully absorbed elsewhere — a "
-    "recently-created skill simply may not have had its trigger come up yet.\n"
+    "reason to prune a skill on its own — a recently-created skill simply "
+    "may not have had its trigger come up yet. This pass NEVER archives a "
+    "skill with no forwarding target (see 'Your toolset' below — "
+    "skill_manage(delete) always requires a real absorbed_into umbrella "
+    "here). If a never-used skill is at least 30 days old AND its content "
+    "is genuinely obsolete with nothing worth absorbing, do not call "
+    "skill_manage on it — leave it and list it under `prunings` in the "
+    "structured summary as a flagged recommendation for a human to action.\n"
     "5. DO NOT reject consolidation on the grounds that 'each skill has "
     "a distinct trigger'. Pairwise distinctness is the wrong bar. The "
     "right bar is: 'would a human maintainer write this as N separate "
@@ -549,11 +553,18 @@ CURATOR_REVIEW_PROMPT = (
     "  - skill_manage action=write_file — add a references/, templates/, "
     "or scripts/ file under an existing skill (the skill must already "
     "exist)\n"
-    "  - skill_manage action=delete     — archive a skill. MUST pass "
-    "`absorbed_into=<umbrella>` when you've merged its content into another "
-    "skill, or `absorbed_into=\"\"` when you're truly pruning with no "
-    "forwarding target. This drives cron-job skill-reference migration — "
-    "guessing from your YAML summary after the fact is fragile.\n"
+    "  - skill_manage action=delete     — archive a skill you have merged "
+    "into an umbrella. MUST pass `absorbed_into=<umbrella>` naming that "
+    "umbrella (it must already exist on disk) — this drives cron-job "
+    "skill-reference migration, atomically with the archive itself. This "
+    "pass has no path to archive a skill with no forwarding target: the "
+    "tool deterministically refuses `skill_manage(delete)` calls from this "
+    "fork that omit `absorbed_into` or pass it empty, and keeps the skill "
+    "active. If you believe a skill should be pruned outright with nothing "
+    "to absorb it into, do NOT call skill_manage — just list it under "
+    "`prunings` in the structured summary below as a recommendation; a "
+    "human (or the separate deterministic inactivity sweep) decides "
+    "whether to act on it.\n"
     "  - There is no shell/filesystem tool in this fork. Use "
     "`skill_manage(action=write_file)` for new support files and preserve the "
     "original package when safe re-homing cannot be completed.\n\n"
@@ -567,8 +578,8 @@ CURATOR_REVIEW_PROMPT = (
     "stopped too early — go back and look at the clusters you left "
     "alone.\n\n"
     "When done, write a human summary AND a structured machine-readable "
-    "block so downstream tooling can distinguish consolidation from "
-    "pruning. Format EXACTLY:\n\n"
+    "block so downstream tooling can distinguish consolidations you made "
+    "from prune candidates you're only flagging. Format EXACTLY:\n\n"
     "## Structured summary (required)\n"
     "```yaml\n"
     "consolidations:\n"
@@ -577,16 +588,19 @@ CURATOR_REVIEW_PROMPT = (
     "    reason: <one short sentence — why merged, not just 'similar'>\n"
     "prunings:\n"
     "  - name: <skill-name>\n"
-    "    reason: <one short sentence — why archived with no merge target>\n"
+    "    reason: <one short sentence — why this looks safe to prune outright>\n"
     "```\n\n"
-    "Every skill you moved to .archive/ MUST appear in exactly one of the "
-    "two lists. If you consolidated X into umbrella Y (patched Y, wrote "
-    "a references file to Y, or created Y with X's content absorbed), X "
-    "goes under `consolidations` with `into: Y`. If you archived X with "
-    "no absorption — truly stale, irrelevant, or obsolete — X goes under "
-    "`prunings`. Leave a list empty (`consolidations: []`) if none. Do "
-    "not omit the block. The block comes AFTER your human-readable "
-    "summary of clusters processed, patches made, and decisions left alone."
+    "Every skill you archived via skill_manage(delete) MUST appear under "
+    "`consolidations` with `into: Y` naming the umbrella you absorbed it "
+    "into — that is the only kind of delete this pass can perform. "
+    "`prunings` is different: it's a RECOMMENDATION list, not a record of "
+    "actions taken. List a skill there when you judge it truly stale, "
+    "irrelevant, or obsolete with nothing worth absorbing — but do NOT "
+    "call skill_manage(delete) on it; leave it active and let a human or "
+    "the separate deterministic inactivity sweep decide. Leave a list "
+    "empty (`consolidations: []`) if none. Do not omit the block. The "
+    "block comes AFTER your human-readable summary of clusters processed, "
+    "patches made, and decisions left alone."
 )
 
 
@@ -1213,8 +1227,18 @@ def _write_run_report(
     # it at run time — the scheduler skips it and the job runs without
     # the instructions it was scheduled to follow. Rewriting the
     # references in-place keeps scheduled jobs working across
-    # consolidation passes. Best-effort: never let a cron-module issue
-    # break the curator.
+    # consolidation passes.
+    #
+    # This is now a BACKSTOP, not the primary mechanism: `_delete_skill`
+    # (tools/skill_manager_tool.py) already migrates each skill's cron
+    # refs synchronously, in the same transaction as its archive, rolling
+    # the archive back if that migration fails — so by the time we get
+    # here every consolidation this run should already be settled and this
+    # call is a no-op (rewrite_skill_refs is idempotent). It stays as a
+    # defensive sweep for reconciliation-only findings (e.g. the model
+    # omitted a real consolidation from its structured summary, caught
+    # only by the tool-call audit) and for older run data. Best-effort:
+    # never let a cron-module issue break the curator's reporting.
     cron_rewrites: Dict[str, Any] = {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
     try:
         consolidated_map = {
@@ -1948,6 +1972,14 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             # dependent-reference migration. Giving this fork terminal access
             # allowed a raw `mv` into .archive/ to bypass that path entirely.
             enabled_toolsets=["skills"],
+            # enabled_toolsets=["skills"] is a security boundary here, not a
+            # convenience filter — this fork must never be able to reach the
+            # filesystem or network directly. The normal toolset resolution
+            # merges in tools a plugin/overlay registered into "skills" via
+            # the registry, which would silently widen this fork's callable
+            # surface without anyone touching this file. Pin it to the
+            # static ["skills_list", "skill_view", "skill_manage"] set.
+            restrict_toolsets_to_static=True,
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The
@@ -1971,15 +2003,41 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # start (see agent/turn_context.py).
         review_agent._memory_write_origin = "background_review"
 
+        # Runtime (dispatch-time) belt-and-suspenders on top of
+        # restrict_toolsets_to_static above: even if some future change to
+        # tool assembly (schema caching, provider-specific tool injection,
+        # a permissive function-call parser) let a non-"skills" tool name
+        # reach the model, this thread-local whitelist still refuses to
+        # dispatch it. Same mechanism agent/background_review.py uses for
+        # the memory/skill review fork (#15204) — checked at every tool
+        # dispatch site via hermes_cli.plugins.resolve_pre_tool_block.
+        from hermes_cli.plugins import (
+            set_thread_tool_whitelist,
+            clear_thread_tool_whitelist,
+        )
+        review_whitelist = {
+            t["function"]["name"] for t in (getattr(review_agent, "tools", None) or [])
+        }
+        set_thread_tool_whitelist(
+            review_whitelist,
+            deny_msg_fmt=(
+                "Curator consolidation pass denied non-whitelisted tool: "
+                "{tool_name}. Only skill management tools are allowed."
+            ),
+        )
+
         # Redirect the forked agent's stdout/stderr to /dev/null while it
         # runs so its tool-call chatter doesn't pollute the foreground
         # terminal. The background-thread runner also hides it; this
         # belt-and-suspenders path matters when a caller invokes
         # run_curator_review(synchronous=True) from the CLI.
-        with open(os.devnull, "w", encoding="utf-8") as _devnull, \
-             contextlib.redirect_stdout(_devnull), \
-             contextlib.redirect_stderr(_devnull):
-            conv_result = review_agent.run_conversation(user_message=prompt)
+        try:
+            with open(os.devnull, "w", encoding="utf-8") as _devnull, \
+                 contextlib.redirect_stdout(_devnull), \
+                 contextlib.redirect_stderr(_devnull):
+                conv_result = review_agent.run_conversation(user_message=prompt)
+        finally:
+            clear_thread_tool_whitelist()
 
         final = ""
         if isinstance(conv_result, dict):

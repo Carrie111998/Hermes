@@ -871,6 +871,9 @@ def test_review_fork_restricts_toolsets_to_skills(curator_env, monkeypatch):
     class _StubAgent:
         def __init__(self, *args, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets", "UNSET")
+            captured["restrict_toolsets_to_static"] = kwargs.get(
+                "restrict_toolsets_to_static", "UNSET"
+            )
             self._memory_write_origin = "assistant_tool"
             self._memory_nudge_interval = 0
             self._skill_nudge_interval = 0
@@ -893,6 +896,14 @@ def test_review_fork_restricts_toolsets_to_skills(curator_env, monkeypatch):
         "AIAgent; the full default tool catalog (plus lcm_* "
         "context_engine tools) would be advertised; got "
         f"{captured.get('enabled_toolsets')!r}"
+    )
+    assert captured.get("restrict_toolsets_to_static") is True, (
+        "curator review fork did not pass restrict_toolsets_to_static=True; "
+        "enabled_toolsets=['skills'] alone still merges in any tool a "
+        "plugin/overlay registered into the 'skills' toolset via the "
+        "registry, widening the fork's callable surface past what the "
+        "prompt and guards assume; got "
+        f"{captured.get('restrict_toolsets_to_static')!r}"
     )
 
 
@@ -920,3 +931,111 @@ def test_review_fork_toolset_surface_is_skills_only():
     assert "read_file" not in surface
     assert "web_search" not in surface
     assert "lcm_grep" not in surface
+
+
+def test_restrict_toolsets_to_static_blocks_registry_widened_skills_toolset():
+    """Close the gap the documentary test above cannot: a plugin/overlay that
+    registers a new tool into the "skills" toolset must NOT reach the
+    curator's advertised tool schema when restrict_toolsets_to_static=True is
+    set, even though plain enabled_toolsets=["skills"] resolution (the
+    default, registry-merged path) would include it.
+    """
+    from tools.registry import registry
+    import model_tools
+
+    fake_tool_name = "__test_plugin_widened_skills_tool__"
+
+    def _fake_handler(**_kwargs):
+        return "unused"
+
+    registry.register(
+        name=fake_tool_name,
+        toolset="skills",
+        schema={
+            "name": fake_tool_name,
+            "description": "test-only tool registered into the skills toolset",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=_fake_handler,
+    )
+    try:
+        # Sanity: the registry merge actually widens the toolset (proves
+        # this test would catch a regression, not just assert a no-op).
+        widened = model_tools.get_tool_definitions(
+            enabled_toolsets=["skills"], quiet_mode=True
+        )
+        widened_names = {t["function"]["name"] for t in widened}
+        assert fake_tool_name in widened_names, (
+            "test setup didn't actually widen the 'skills' toolset via the "
+            "registry — fake tool missing from the registry-merged resolution"
+        )
+
+        restricted = model_tools.get_tool_definitions(
+            enabled_toolsets=["skills"],
+            quiet_mode=True,
+            restrict_toolsets_to_static=True,
+        )
+        restricted_names = {t["function"]["name"] for t in restricted}
+        assert fake_tool_name not in restricted_names, (
+            "restrict_toolsets_to_static=True still let a registry-widened "
+            "'skills' toolset tool through — the curator fork's callable "
+            "surface is not actually pinned to the static allowlist"
+        )
+        assert restricted_names == {"skills_list", "skill_view", "skill_manage"}
+    finally:
+        registry.deregister(fake_tool_name)
+
+
+def test_review_fork_installs_and_clears_runtime_tool_whitelist(curator_env, monkeypatch):
+    """Belt-and-suspenders on top of restrict_toolsets_to_static: the curator
+    fork must also install a dispatch-time thread-local whitelist (the same
+    mechanism agent/background_review.py uses for the memory/skill review
+    fork, #15204) so a tool call outside the resolved surface is refused at
+    dispatch time too, and the whitelist must be cleared afterward so it
+    doesn't leak onto unrelated tool calls in this thread.
+    """
+    curator = curator_env["curator"]
+    import importlib
+    importlib.reload(curator)
+
+    captured = {}
+
+    class _StubAgent:
+        def __init__(self, *args, **kwargs):
+            self.tools = [
+                {"function": {"name": n}}
+                for n in ("skills_list", "skill_view", "skill_manage")
+            ]
+            self._memory_write_origin = "assistant_tool"
+            self._memory_nudge_interval = 0
+            self._skill_nudge_interval = 0
+            self._session_messages = []
+
+        def run_conversation(self, user_message=None, **kwargs):
+            # Assert from inside the call — this is when the whitelist must
+            # actually be active.
+            from hermes_cli.plugins import _thread_tool_whitelist
+            captured["during_call"] = set(
+                getattr(_thread_tool_whitelist, "allowed", None) or []
+            )
+            return {"final_response": "no change"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
+
+    meta = curator._run_llm_review("review prompt")
+    assert meta.get("error") is None, meta.get("error")
+
+    assert captured.get("during_call") == {"skills_list", "skill_view", "skill_manage"}, (
+        f"expected the exact static skills surface to be whitelisted during "
+        f"the call, got {captured.get('during_call')!r}"
+    )
+
+    from hermes_cli.plugins import _thread_tool_whitelist
+    assert getattr(_thread_tool_whitelist, "allowed", None) is None, (
+        "curator's thread-local tool whitelist was not cleared after the "
+        "review fork finished — it would leak onto subsequent tool calls "
+        "made from this thread"
+    )
