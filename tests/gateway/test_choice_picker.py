@@ -8,6 +8,7 @@ command, so picker and typed arguments can never diverge.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -144,4 +145,51 @@ class TestFastChoicePicker:
         assert runner._session_service_tier_overrides
         assert not (tmp_path / "config.yaml").exists()
 
+    @pytest.mark.asyncio
+    async def test_fast_global_picker_persists_to_originating_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """A delayed picker tap must not fall back to the default profile."""
+        from agent.secret_scope import set_multiplex_active
 
+        default_home = tmp_path / "default"
+        named_home = tmp_path / "profiles" / "work"
+        default_home.mkdir(parents=True)
+        named_home.mkdir(parents=True)
+        (default_home / "config.yaml").write_text(
+            "agent:\n  service_tier: normal\n", encoding="utf-8"
+        )
+        (named_home / "config.yaml").write_text(
+            "agent:\n  service_tier: normal\n", encoding="utf-8"
+        )
+
+        self._patch_fast_support(monkeypatch, default_home)
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+        runner.config = SimpleNamespace(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = lambda _source: named_home
+        event = _make_event("/fast --global")
+        event.source.profile = "work"
+        session_key = runner._session_key_for_source(event.source)
+
+        set_multiplex_active(True)
+        try:
+            with gateway_run._profile_runtime_scope(named_home):
+                runner._set_session_service_tier_override(session_key, None)
+                await runner._handle_fast_command(event)
+            on_choice = adapter.calls[0]["on_choice_selected"]
+            reply = await on_choice(event.source.chat_id, "fast")
+            with gateway_run._profile_runtime_scope(named_home):
+                assert session_key not in runner._session_service_tier_overrides
+        finally:
+            set_multiplex_active(False)
+
+        default_config = yaml.safe_load(
+            (default_home / "config.yaml").read_text(encoding="utf-8")
+        )
+        named_config = yaml.safe_load(
+            (named_home / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert default_config["agent"]["service_tier"] == "normal"
+        assert named_config["agent"]["service_tier"] == "fast"
+        assert "saved" in reply.lower()

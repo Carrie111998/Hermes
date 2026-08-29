@@ -144,6 +144,44 @@ async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_typed_fast_global_persists_to_originating_profile(monkeypatch, tmp_path):
+    default_home = tmp_path / "default"
+    named_home = tmp_path / "profiles" / "work"
+    default_home.mkdir(parents=True)
+    named_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text(
+        "agent:\n  service_tier: normal\n", encoding="utf-8"
+    )
+    (named_home / "config.yaml").write_text(
+        "agent:\n  service_tier: normal\n", encoding="utf-8"
+    )
+    runner = _make_runner()
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner._resolve_profile_home_for_source = lambda _source: named_home
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", default_home)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4"
+    )
+    event = _make_event("/fast fast --global")
+    event.source.profile = "work"
+
+    with gateway_run._profile_runtime_scope(named_home):
+        response = await runner._handle_fast_command(event)
+
+    default_config = yaml.safe_load(
+        (default_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    named_config = yaml.safe_load(
+        (named_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert default_config["agent"]["service_tier"] == "normal"
+    assert named_config["agent"]["service_tier"] == "fast"
+    assert "FAST" in response
+
+
+@pytest.mark.asyncio
 async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path):
     """A session /fast normal wins over agent.service_tier: fast in config."""
     runner = _make_runner()
@@ -168,5 +206,3 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key=session_key) is None
     # A different session still gets the config default.
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
-
-
