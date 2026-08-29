@@ -112,26 +112,49 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       '.pin.resolved{background:#7fc08e}',
       '.pin.orphan{background:#8a8a8a}',
       '.box{position:fixed;border:2px dashed #d99a5b;background:rgba(217,154,91,.1);pointer-events:none}',
-      '.bubble{position:fixed;width:250px;background:#1e1d1a;color:#eae7e1;border:1px solid #3a3733;',
-      'border-radius:8px;padding:9px;pointer-events:auto;box-shadow:0 4px 18px rgba(0,0,0,.5);',
-      'font:13px/1.45 system-ui}',
-      '.bubble textarea{width:100%;min-height:54px;background:#161513;color:#eae7e1;',
-      'border:1px solid #3a3733;border-radius:5px;padding:6px;font:13px system-ui;resize:vertical}',
-      '.bubble .row{display:flex;gap:6px;margin-top:7px}',
-      '.bubble button{flex:1;padding:5px;border:1px solid #3a3733;border-radius:5px;',
-      'background:#242220;color:#eae7e1;font:600 12px system-ui;cursor:pointer}',
-      '.bubble button:hover{background:#2e2b28}',
-      '.bubble button.go{background:#d99a5b;color:#1c1b19;border-color:#d99a5b}',
-      '.bubble button.add{flex:0 0 auto;padding:5px 9px}',
-      '.strip{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}',
-      '.strip figure{position:relative;margin:0;width:56px;height:42px;border-radius:4px;',
-      'overflow:hidden;border:1px solid #3a3733;background:#111}',
+      // The bubble sizes itself to the page it is floating over: comfortable on
+      // a desktop layout, still inside the margins on a 320px phone viewport.
+      '.bubble{position:fixed;width:min(304px,calc(100vw - 24px));background:#1c1b19;',
+      'color:#eae7e1;border:1px solid #35322e;border-radius:12px;padding:10px;',
+      'pointer-events:auto;box-shadow:0 10px 34px rgba(0,0,0,.5),0 1px 0 rgba(255,255,255,.04) inset;',
+      'font:13px/1.5 system-ui,sans-serif;box-sizing:border-box}',
+      '.bubble *{box-sizing:border-box}',
+      // Head: the pin's own number and what it is fastened to, so an open
+      // bubble is never ambiguous about which marker it belongs to.
+      '.head{display:flex;align-items:center;gap:6px;margin:0 0 8px;color:#a09a91;font-size:11px}',
+      '.head b{display:inline-flex;align-items:center;justify-content:center;min-width:17px;',
+      'height:17px;padding:0 4px;border-radius:9px;background:#d99a5b;color:#1c1b19;font:700 10px system-ui}',
+      '.head span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}',
+      '.bubble textarea{display:block;width:100%;min-height:56px;max-height:168px;',
+      'background:#131211;color:#f0ede8;border:1px solid #35322e;border-radius:8px;',
+      // No resize grip: it drew a corner wart and the field grows on its own.
+      'padding:8px;font:13px/1.5 system-ui,sans-serif;resize:none;outline:none}',
+      '.bubble textarea::placeholder{color:#6f6a63}',
+      '.bubble textarea:focus{border-color:#d99a5b;box-shadow:0 0 0 3px rgba(217,154,91,.16)}',
+      '.row{display:flex;align-items:center;gap:6px;margin-top:9px}',
+      '.bubble button{border:1px solid #35322e;border-radius:8px;background:#26241f;',
+      'color:#eae7e1;font:600 12px system-ui,sans-serif;cursor:pointer;padding:6px 12px;',
+      'display:inline-flex;align-items:center;justify-content:center;gap:5px;transition:background .12s}',
+      '.bubble button:hover{background:#312e28}',
+      '.bubble button:focus-visible{outline:2px solid #d99a5b;outline-offset:1px}',
+      // Icon-only actions stay quiet; the one committing action is the loud one.
+      '.bubble button.icon{padding:6px;width:30px;height:30px;background:transparent;border-color:transparent;color:#a09a91}',
+      '.bubble button.icon:hover{background:#26241f;color:#eae7e1}',
+      '.bubble button.icon.danger:hover{background:#3a2020;color:#ef9a9a}',
+      '.bubble button.go{margin-inline-start:auto;background:#d99a5b;color:#1c1b19;border-color:#d99a5b}',
+      '.bubble button.go:hover{background:#e4a869}',
+      '.bubble svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.7;',
+      'stroke-linecap:round;stroke-linejoin:round}',
+      '.strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}',
+      '.strip figure{position:relative;margin:0;width:52px;height:40px;border-radius:7px;',
+      'overflow:hidden;border:1px solid #35322e;background:#0e0d0c}',
       '.strip img{width:100%;height:100%;object-fit:cover;display:block}',
-      '.strip span{position:absolute;top:1px;inset-inline-end:1px;width:15px;height:15px;',
-      'line-height:14px;text-align:center;border-radius:50%;background:rgba(0,0,0,.72);',
-      'color:#fff;font:700 10px system-ui;cursor:pointer}',
-      '.hint{margin-top:6px;color:#8d8880;font:11px/1.4 system-ui}',
-      '.bubble.over{outline:2px dashed #d99a5b;outline-offset:2px}',
+      '.strip span{position:absolute;top:2px;inset-inline-end:2px;width:16px;height:16px;',
+      'line-height:15px;text-align:center;border-radius:50%;background:rgba(12,11,10,.82);',
+      'color:#fff;font:700 11px system-ui;cursor:pointer;opacity:0;transition:opacity .12s}',
+      '.strip figure:hover span{opacity:1}',
+      '.hint{margin-top:8px;color:#7d776f;font:11px/1.4 system-ui,sans-serif}',
+      '.bubble.over{border-color:#d99a5b;box-shadow:0 0 0 3px rgba(217,154,91,.2)}',
       // A marker whose comment carries an image says so, so the strip is not a
       // surprise waiting inside a bubble nobody reopens.
       '.pin.shot::after{content:"";position:absolute;right:-2px;bottom:-2px;width:7px;',
@@ -254,7 +277,21 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     image.src = source
   }
 
-  const openBubble = (pinId: string, left: number, top: number) => {
+  /**
+   * Where to open a comment, given where the user clicked and what they clicked.
+   *
+   * `avoid` is the pinned element's box. Opening on top of the thing being
+   * commented on is the one placement that is always wrong — you cannot look at
+   * the problem while you describe it — so the bubble goes under it when there
+   * is room and above it when there is not, falling back to the cursor for
+   * region pins, which have no element to dodge.
+   */
+  const openBubble = (
+    pinId: string,
+    left: number,
+    top: number,
+    avoid?: { bottom: number; left: number; top: number } | null
+  ) => {
     closeBubble()
     const pin = pins.find(entry => entry.id === pinId)
 
@@ -274,20 +311,65 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       const box = bubble.getBoundingClientRect()
       const vw = view ? view.innerWidth : 800
       const vh = view ? view.innerHeight : 600
-      bubble.style.left = Math.max(8, Math.min(left, vw - (box.width || 250) - 8)) + 'px'
-      bubble.style.top = Math.max(8, Math.min(top, vh - (box.height || 140) - 8)) + 'px'
+      const width = box.width || 250
+      const height = box.height || 140
+      let x = left
+      let y = top
+
+      if (avoid) {
+        x = avoid.left
+        y = avoid.bottom + 10
+
+        // No room underneath: sit above it instead of hanging off the fold.
+        if (y + height + 8 > vh) {y = avoid.top - height - 10}
+      }
+
+      bubble.style.left = Math.max(8, Math.min(x, vw - width - 8)) + 'px'
+      bubble.style.top = Math.max(8, Math.min(y, vh - height - 8)) + 'px'
     }
+
+    /** A stroke icon, drawn rather than imported — the guest page has no icon
+     *  font and no way to reach the app's. */
+    const icon = (path: string) => {
+      const svg = doc.createElementNS('http://www.w3.org/2000/svg', 'svg')
+      svg.setAttribute('viewBox', '0 0 24 24')
+      const shape = doc.createElementNS('http://www.w3.org/2000/svg', 'path')
+      shape.setAttribute('d', path)
+      svg.append(shape)
+
+      return svg
+    }
+
+    const head = doc.createElement('div')
+    head.className = 'head'
+    const badge = doc.createElement('b')
+    badge.textContent = String(pins.indexOf(pin) + 1)
+    const where = doc.createElement('span')
+    where.textContent = String(pin.target || 'region')
+    head.append(badge, where)
 
     const area = doc.createElement('textarea')
     area.value = String(pin.comment || '')
     area.placeholder = 'What should change here?'
+    // The comment is the user's own language, and this app is used in Arabic.
+    // `auto` aligns and places the caret per what they actually type instead of
+    // forcing every comment to read left-to-right.
+    area.setAttribute('dir', 'auto')
+
+    /** Grow with the text, up to the CSS cap, then scroll. */
+    const grow = () => {
+      area.style.height = 'auto'
+      area.style.height = Math.min(168, Math.max(56, area.scrollHeight)) + 'px'
+    }
 
     const strip = doc.createElement('div')
     strip.className = 'strip'
 
     const hint = doc.createElement('div')
     hint.className = 'hint'
-    hint.textContent = 'Paste or drop an image · ⌘/Ctrl+Enter to save'
+    // One line. Two lines of instructions under a two-line comment is more
+    // chrome than content.
+    hint.textContent = 'Paste or drop an image · Esc to close'
 
     const shotsOf = () => (pin.shots as Record<string, unknown>[] | undefined) ?? []
 
@@ -369,14 +451,16 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     const row = doc.createElement('div')
     row.className = 'row'
     const add = doc.createElement('button')
-    add.className = 'add'
+    add.className = 'icon'
     add.title = 'Attach an image'
-    add.textContent = '＋'
+    add.append(icon('M3 5h18v14H3zM3 16l5-5 4 4 3-3 6 6'))
+    const remove = doc.createElement('button')
+    remove.className = 'icon danger'
+    remove.title = 'Delete this comment'
+    remove.append(icon('M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13'))
     const save = doc.createElement('button')
     save.className = 'go'
-    save.textContent = 'Save'
-    const remove = doc.createElement('button')
-    remove.textContent = 'Delete'
+    save.textContent = 'Done'
 
     add.addEventListener('click', event => {
       event.stopPropagation()
@@ -405,6 +489,8 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     // out of habit is not a trade worth making for a tidier save path.
     area.addEventListener('input', () => {
       pin.comment = area.value
+      grow()
+      place()
     })
 
     // Typing in the page must not reach the page. A review comment containing
@@ -446,11 +532,17 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       ingest(data ? data.files : null)
     })
 
-    row.append(add, save, remove)
-    bubble.append(area, strip, hint, row, picker)
+    // Quiet actions first, the committing one pushed to the end by CSS: the
+    // eye lands on Done, and Delete is never a neighbour of it.
+    row.append(add, remove, save)
+    bubble.append(head, area, strip, hint, row, picker)
     shadow().append(bubble)
+    grow()
     drawStrip()
     area.focus()
+    // Put the caret after the existing text rather than selecting all of it,
+    // so reopening a comment to add a sentence does not risk wiping it.
+    area.setSelectionRange(area.value.length, area.value.length)
   }
 
   // ---- annotation mode ---------------------------------------------------
@@ -547,6 +639,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
   const onUp = (event: MouseEvent) => {
     if (!state.armed || insideOverlay(event)) {return}
+    let placedOver: { bottom: number; left: number; top: number } | null = null
     const drag = state.drag as { x0: number; y0: number } | null
     state.drag = null
     clearLayer('.box')
@@ -581,6 +674,8 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       const el = targetAt(event.clientX, event.clientY)
 
       if (!el) {return}
+      const box = el.getBoundingClientRect()
+      placedOver = { bottom: box.bottom, left: box.left, top: box.top }
       const anchor = kit.capture(el)
       id = addPin({
         anchor,
@@ -593,7 +688,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
     clearLayer('.hl')
     paint()
-    openBubble(id, event.clientX + 14, event.clientY + 14)
+    openBubble(id, event.clientX + 14, event.clientY + 14, placedOver)
   }
 
   const onKey = (event: KeyboardEvent) => {
@@ -610,7 +705,17 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     if (!id) {return}
     event.preventDefault()
     event.stopPropagation()
-    openBubble(id, event.clientX + 14, event.clientY + 14)
+    // Reopening: find the element again so the comment dodges it just as it did
+    // when it was placed.
+    const pin = pins.find(entry => entry.id === id)
+    const match = pin && pin.kind === 'element' && pin.anchor ? kit.resolve(pin.anchor as never) : null
+    const box = match?.element ? match.element.getBoundingClientRect() : null
+    openBubble(
+      id,
+      event.clientX + 14,
+      event.clientY + 14,
+      box ? { bottom: box.bottom, left: box.left, top: box.top } : null
+    )
   }
 
   const onScroll = () => paint()

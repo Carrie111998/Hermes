@@ -291,6 +291,51 @@ try {
     (await evaluate(`document.activeElement && document.activeElement.id !== 'save'`)) === true
   )
 
+  // ---- the comment bubble sits beside its element, not on top of it -------
+
+  const bubbleVsTarget = await evaluate(`(() => {
+    const node = document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble')
+    if (!node) return null
+    const b = node.getBoundingClientRect()
+    const t = document.getElementById('save').getBoundingClientRect()
+    const overlaps = b.left < t.right && b.right > t.left && b.top < t.bottom && b.bottom > t.top
+    return {
+      fitsHorizontally: b.left >= 0 && b.right <= innerWidth + 1,
+      fitsVertically: b.top >= 0 && b.bottom <= innerHeight + 1,
+      head: (node.querySelector('.head span') || {}).textContent || '',
+      overlaps,
+      width: Math.round(b.width)
+    }
+  })()`)
+
+  check('the bubble opened on placement', bubbleVsTarget !== null)
+  check(
+    'it does not cover the element being commented on',
+    bubbleVsTarget && !bubbleVsTarget.overlaps,
+    JSON.stringify(bubbleVsTarget)
+  )
+  check('it stays inside the viewport', bubbleVsTarget && bubbleVsTarget.fitsHorizontally && bubbleVsTarget.fitsVertically, JSON.stringify(bubbleVsTarget))
+  check('it names the element it belongs to', bubbleVsTarget?.head === 'Save changes', bubbleVsTarget?.head)
+
+  // A narrow phone viewport must not push it off the side.
+  await send('Emulation.setDeviceMetricsOverride', { deviceScaleFactor: 0, height: 700, mobile: false, width: 360 })
+  await wait(300)
+  await evaluate(`(() => {
+    const node = document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble')
+    node.dispatchEvent(new Event('x'))
+    return true
+  })()`)
+  const narrow = await evaluate(`(() => {
+    const node = document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble')
+    const b = node.getBoundingClientRect()
+    return { fits: b.width <= innerWidth - 16, viewport: innerWidth, width: Math.round(b.width) }
+  })()`)
+  check('it narrows with a phone-width viewport', narrow?.fits, JSON.stringify(narrow))
+  await send('Emulation.clearDeviceMetricsOverride')
+  await wait(200)
+
+  await evaluate(`document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble .go').click(); true`)
+
   await evaluate(`window.__pins({ comment: 'too much space above this', id: ${JSON.stringify(pins[0].id)}, verb: 'comment' })`)
 
   // ---- overlay in the real render tree ------------------------------------
