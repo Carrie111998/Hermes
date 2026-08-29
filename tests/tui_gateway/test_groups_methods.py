@@ -179,6 +179,23 @@ def test_attachment_put_send_read_roundtrip_is_recipient_scoped(home):
     )
     assert denied["error"]["code"] == 4141
 
+    _result(
+        srv._methods["groups.disband"](
+            5,
+            {"room_id": "room-1", "cancel_id": "disband-file-room"},
+        )
+    )
+    after_disband = srv._methods["groups.attachment.read"](
+        6,
+        {
+            "room_id": "room-1",
+            "attachment_id": stored["attachment_id"],
+            "purpose": "viewer",
+            "event_id": "event-attachment-1",
+        },
+    )
+    assert after_disband["error"]["code"] == 4141
+
 
 def test_groups_list_returns_bounded_pages(home):
     _create_room()

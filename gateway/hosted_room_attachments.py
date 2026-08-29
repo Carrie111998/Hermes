@@ -300,6 +300,7 @@ class HostedRoomAttachmentStore:
         self._prepare_private_root()
         conn = self._connect()
         conn.close()
+        self.reconcile_room_events()
         self.prune()
 
     def _prepare_private_root(self) -> None:
@@ -334,6 +335,7 @@ class HostedRoomAttachmentStore:
                 sha256 TEXT NOT NULL,
                 blob_id TEXT NOT NULL,
                 recipient_member_ids_json TEXT NOT NULL DEFAULT '[]',
+                viewer_access INTEGER NOT NULL DEFAULT 0 CHECK (viewer_access IN (0, 1)),
                 state TEXT NOT NULL CHECK (state IN ('uploaded', 'committed', 'disbanded')),
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -342,6 +344,15 @@ class HostedRoomAttachmentStore:
                 FOREIGN KEY (blob_id) REFERENCES hosted_room_attachment_blobs(blob_id)
             )"""
         )
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(hosted_room_attachments)")
+        }
+        if "viewer_access" not in columns:
+            conn.execute(
+                """ALTER TABLE hosted_room_attachments
+                   ADD COLUMN viewer_access INTEGER NOT NULL DEFAULT 0"""
+            )
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_hosted_room_attachments_room_state
                ON hosted_room_attachments(room_id, state, created_at)"""
@@ -608,6 +619,7 @@ class HostedRoomAttachmentStore:
         event_id: Any,
         manifest: Any,
         recipient_member_ids: Sequence[str],
+        viewer_access: bool = False,
         retention_seconds: float | None = None,
         hold_until_event: bool = False,
     ) -> list[dict[str, Any]]:
@@ -669,12 +681,52 @@ class HostedRoomAttachmentStore:
             for entry in normalized:
                 conn.execute(
                     """UPDATE hosted_room_attachments
-                          SET event_id=?, recipient_member_ids_json=?, state='committed',
+                          SET event_id=?, recipient_member_ids_json=?, viewer_access=?, state='committed',
                               updated_at=?, expires_at=?
                         WHERE attachment_id=?""",
-                    (event_id, recipients_json, now, expires_at, entry["attachment_id"]),
+                    (
+                        event_id,
+                        recipients_json,
+                        1 if viewer_access else 0,
+                        now,
+                        expires_at,
+                        entry["attachment_id"],
+                    ),
                 )
         return normalized
+
+    def abort_message_commit(
+        self,
+        *,
+        room_id: Any,
+        event_id: Any,
+        manifest: Any,
+    ) -> int:
+        """Return a failed pre-event commitment to its bounded upload state."""
+
+        room_id = _identifier(room_id, label="room_id")
+        event_id = _identifier(event_id, label="event_id")
+        attachment_ids = [entry["attachment_id"] for entry in validate_manifest(manifest)]
+        if not attachment_ids:
+            return 0
+        placeholders = ",".join("?" for _ in attachment_ids)
+        now = float(self.clock())
+        with self._transaction(immediate=True) as conn:
+            changed = conn.execute(
+                f"""UPDATE hosted_room_attachments
+                        SET event_id=NULL, recipient_member_ids_json='[]', viewer_access=0,
+                            state='uploaded', updated_at=?, expires_at=?
+                      WHERE room_id=? AND event_id=? AND state='committed'
+                        AND attachment_id IN ({placeholders})""",
+                (
+                    now,
+                    now + UNCOMMITTED_TTL_SECONDS,
+                    room_id,
+                    event_id,
+                    *attachment_ids,
+                ),
+            )
+            return int(changed.rowcount)
 
     def retain_event(self, *, room_id: Any, event_id: Any) -> int:
         """Retain committed blobs after their immutable room event is durable."""
@@ -707,11 +759,14 @@ class HostedRoomAttachmentStore:
         attachment_id: Any,
         recipient_member_id: Any,
         event_id: Any | None = None,
+        viewer: bool = False,
     ) -> AttachmentData:
         room_id = _identifier(room_id, label="room_id")
         attachment_id = _attachment_id(attachment_id)
-        recipient_member_id = _identifier(
-            recipient_member_id, label="recipient_member_id"
+        recipient_member_id = (
+            _identifier(recipient_member_id, label="recipient_member_id")
+            if recipient_member_id is not None
+            else ""
         )
         normalized_event = _identifier(event_id, label="event_id") if event_id is not None else None
         now = float(self.clock())
@@ -727,7 +782,12 @@ class HostedRoomAttachmentStore:
             if normalized_event is not None and str(row["event_id"] or "") != normalized_event:
                 raise AttachmentNotFoundError("attachment is not owned by this room event")
             recipients = json.loads(str(row["recipient_member_ids_json"]))
-            if recipient_member_id not in recipients:
+            if viewer:
+                if int(row["viewer_access"] or 0) != 1:
+                    raise AttachmentNotFoundError(
+                        "attachment is unavailable to Group Chat viewers"
+                    )
+            elif recipient_member_id not in recipients:
                 raise AttachmentNotFoundError("attachment is unavailable to this recipient")
             data = self._read_blob(
                 blob_id=str(row["blob_id"]),
@@ -735,6 +795,48 @@ class HostedRoomAttachmentStore:
                 sha256=str(row["sha256"]),
             )
             return AttachmentData(self._metadata(row), data)
+
+    def reconcile_room_events(self) -> int:
+        """Recover only attachment commitments named by the durable event payload."""
+
+        changed = 0
+        now = float(self.clock())
+        with self._transaction(immediate=True) as conn:
+            has_events = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='hosted_room_events'"""
+            ).fetchone()
+            if has_events is None:
+                return 0
+            rows = conn.execute(
+                """SELECT attachment.attachment_id, attachment.event_id,
+                          event.payload_json
+                     FROM hosted_room_attachments AS attachment
+                     JOIN hosted_room_events AS event
+                       ON event.room_id=attachment.room_id
+                      AND event.event_id=attachment.event_id
+                    WHERE attachment.state='committed'
+                      AND attachment.expires_at IS NOT NULL"""
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                    ids = {
+                        str(item.get("attachment_id") or "")
+                        for item in payload.get("attachments", [])
+                        if isinstance(item, Mapping)
+                    }
+                except Exception:
+                    continue
+                if str(row["attachment_id"]) not in ids:
+                    continue
+                changed += conn.execute(
+                    """UPDATE hosted_room_attachments
+                          SET expires_at=NULL, updated_at=?
+                        WHERE attachment_id=? AND state='committed'""",
+                    (now, str(row["attachment_id"])),
+                ).rowcount
+        return int(changed)
 
     def mark_room_disbanded(self, room_id: Any) -> int:
         room_id = _identifier(room_id, label="room_id")
@@ -772,22 +874,6 @@ class HostedRoomAttachmentStore:
                                AND room.disbanded_at IS NOT NULL
                         )""",
                     (DISBANDED_GRACE_SECONDS, now),
-                )
-            has_events = conn.execute(
-                """SELECT 1 FROM sqlite_master
-                    WHERE type='table' AND name='hosted_room_events'"""
-            ).fetchone()
-            if has_events is not None:
-                conn.execute(
-                    """UPDATE hosted_room_attachments
-                          SET expires_at=NULL, updated_at=?
-                        WHERE state='committed' AND expires_at IS NOT NULL
-                          AND EXISTS (
-                            SELECT 1 FROM hosted_room_events AS event
-                             WHERE event.room_id=hosted_room_attachments.room_id
-                               AND event.event_id=hosted_room_attachments.event_id
-                          )""",
-                    (now,),
                 )
             rows = conn.execute(
                 """SELECT attachment_id, blob_id FROM hosted_room_attachments

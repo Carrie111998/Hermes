@@ -397,7 +397,11 @@ def test_restart_reconciles_event_commit_and_expires_abandoned_commit(tmp_path):
         event_id="event-retained",
         kind="message.user",
         actor={"kind": "user", "id": "desktop"},
-        payload={"text": "inspect", "thread_id": "thread-1"},
+        payload={
+            "text": "inspect",
+            "thread_id": "thread-1",
+            "attachments": _manifest(retained),
+        },
         now=now[0],
     )
 

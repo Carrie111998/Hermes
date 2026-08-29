@@ -164,8 +164,9 @@ def _(rid, params: dict) -> dict:
         stored = service.read_attachment(
             room_id=params.get("room_id"),
             attachment_id=params.get("attachment_id"),
-            recipient_member_id="viewer",
+            recipient_member_id=None,
             event_id=params.get("event_id"),
+            viewer=True,
         )
         return _ok(
             rid,
@@ -313,6 +314,16 @@ def _(rid, params: dict) -> dict:
         service = get_hosted_room_service()
         if service is None:
             return _err(rid, 4123, _WORKER_UNAVAILABLE)
+
+        def disband_with_files() -> dict:
+            tombstone = disband_room(
+                service.db_path,
+                room_id=params.get("room_id"),
+            )
+            service.attachments.mark_room_disbanded(params.get("room_id"))
+            service.attachments.prune()
+            return tombstone
+
         try:
             existing = room_state(
                 service.db_path,
@@ -320,26 +331,17 @@ def _(rid, params: dict) -> dict:
                 include_disbanded=True,
             )
         except RoomHistoryExpiredError:
-            tombstone = disband_room(
-                service.db_path,
-                room_id=params.get("room_id"),
-            )
+            tombstone = disband_with_files()
             return _ok(rid, {"tombstone": tombstone})
         if existing.get("disbanded_at") is not None:
-            tombstone = disband_room(
-                service.db_path,
-                room_id=params.get("room_id"),
-            )
+            tombstone = disband_with_files()
             return _ok(rid, {"tombstone": tombstone})
         service.stop_room(
             str(params.get("room_id") or ""),
             cancel_id=str(params.get("cancel_id") or "room-disbanded"),
             require_acknowledged=True,
         )
-        tombstone = disband_room(
-            service.db_path,
-            room_id=params.get("room_id"),
-        )
+        tombstone = disband_with_files()
         return _ok(rid, {"tombstone": tombstone})
     except HostedRoomError as exc:
         reason = getattr(exc, "reason", None)

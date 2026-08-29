@@ -273,6 +273,106 @@ def test_attachment_send_freezes_roster_stages_bytes_and_logs_metadata_only(
         raise AssertionError("late member unexpectedly received historic attachment")
 
 
+def test_conflicting_event_id_releases_an_invisible_attachment_commit(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="duplicate-event",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "original", "thread_id": "thread-1"},
+    )
+    stored = service.put_attachment(
+        room_id="room-1",
+        upload_id="upload-conflict",
+        kind="file",
+        name="notes.txt",
+        mime="text/plain",
+        data=b"release notes",
+    )
+    manifest = [{
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }]
+
+    with pytest.raises(hosted_rooms.EventConflictError):
+        service.send(
+            room_id="room-1",
+            event_id="duplicate-event",
+            payload={
+                "text": "different",
+                "thread_id": "thread-1",
+                "attachments": manifest,
+            },
+        )
+
+    with sqlite3.connect(db) as conn:
+        state, event_id, expires_at = conn.execute(
+            """SELECT state, event_id, expires_at
+                 FROM hosted_room_attachments WHERE attachment_id=?""",
+            (stored["attachment_id"],),
+        ).fetchone()
+    assert state == "uploaded"
+    assert event_id is None
+    assert expires_at is not None
+
+
+def test_viewer_access_does_not_collide_with_a_bot_named_viewer(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("viewer", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Review room",
+        members=[
+            {"member_id": "viewer", "profile": "viewer", "handle": "viewer"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    stored = service.put_attachment(
+        room_id="room-1",
+        upload_id="upload-viewer",
+        kind="file",
+        name="notes.txt",
+        mime="text/plain",
+        data=b"release notes",
+    )
+    manifest = [{
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }]
+    service.send(
+        room_id="room-1",
+        event_id="event-viewer",
+        payload={"text": "Review", "thread_id": "thread-1", "attachments": manifest},
+    )
+
+    assert service.read_attachment(
+        room_id="room-1",
+        attachment_id=stored["attachment_id"],
+        recipient_member_id="viewer",
+        event_id="event-viewer",
+    ).data == b"release notes"
+    assert service.read_attachment(
+        room_id="room-1",
+        attachment_id=stored["attachment_id"],
+        recipient_member_id=None,
+        event_id="event-viewer",
+        viewer=True,
+    ).data == b"release notes"
+
+
 def test_partial_attachment_failure_never_submits_text_only_and_other_member_continues(
     tmp_path: Path,
 ):

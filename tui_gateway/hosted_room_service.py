@@ -82,6 +82,7 @@ class HostedRoomService:
             yield
 
     def start(self) -> None:
+        self.attachments.reconcile_room_events()
         self.attachments.prune()
         self.runtime.start()
 
@@ -379,8 +380,9 @@ class HostedRoomService:
         *,
         room_id: str,
         attachment_id: str,
-        recipient_member_id: str,
+        recipient_member_id: str | None,
         event_id: str | None = None,
+        viewer: bool = False,
     ) -> AttachmentData:
         """Return verified bytes only when send-time recipient ownership permits it."""
 
@@ -389,6 +391,7 @@ class HostedRoomService:
             attachment_id=attachment_id,
             recipient_member_id=recipient_member_id,
             event_id=event_id,
+            viewer=viewer,
         )
 
     def send(
@@ -414,17 +417,27 @@ class HostedRoomService:
                 room_id=room_id,
                 event_id=event_id,
                 manifest=normalized["attachments"],
-                recipient_member_ids=(*member_ids, "viewer"),
+                recipient_member_ids=member_ids,
+                viewer_access=True,
                 hold_until_event=True,
             )
-        event = hosted_rooms.append_event(
-            self.db_path,
-            room_id=room_id,
-            event_id=event_id,
-            kind="message.user",
-            actor={"kind": "user", "id": "desktop"},
-            payload=normalized,
-        )
+        try:
+            event = hosted_rooms.append_event(
+                self.db_path,
+                room_id=room_id,
+                event_id=event_id,
+                kind="message.user",
+                actor={"kind": "user", "id": "desktop"},
+                payload=normalized,
+            )
+        except Exception:
+            if normalized.get("attachments"):
+                self.attachments.abort_message_commit(
+                    room_id=room_id,
+                    event_id=event_id,
+                    manifest=normalized["attachments"],
+                )
+            raise
         if normalized.get("attachments"):
             self.attachments.retain_event(room_id=room_id, event_id=event_id)
         binding = next(
