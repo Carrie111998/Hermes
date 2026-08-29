@@ -874,9 +874,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
             self.config.extra.get("kira_email_approval_space") or ""
         ).strip()
         self._kira_email_approvers = {
-            item.strip().lower()
-            for item in str(self.config.extra.get("kira_email_approval_approvers") or "").split(",")
-            if item.strip() and "@" in item
+            item.strip()
+            for item in str(self.config.extra.get("kira_email_approval_approver_user_ids") or "").split(",")
+            if item.strip().startswith("users/")
         }
         self._kira_email_gate: Any = None
         try:
@@ -2438,8 +2438,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
     @staticmethod
     def _kira_email_card_fields(
         envelope: Dict[str, Any],
-    ) -> Optional[Tuple[str, str, str, str, str]]:
-        """Extract immutable card references only; card data never contains mail."""
+    ) -> Optional[Tuple[str, str, str, str, str, str]]:
+        """Extract immutable references and the raw Google Chat user resource."""
         payload = GoogleChatAdapter._card_clicked_payload(envelope)
         action = payload.get("action") or {}
         values = {
@@ -2447,14 +2447,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
             for item in (action.get("parameters") or [])
             if isinstance(item, dict)
         }
-        email = str((payload.get("user") or {}).get("email") or "").strip().lower()
+        user = payload.get("user") or {}
+        user_id = str(user.get("name") or "").strip()
+        email = str(user.get("email") or "").strip().lower()
         function = str(action.get("function") or "")
-        draft_id = values.get("draft_id", "")
+        request_id = values.get("request_id", "")
         decision = values.get("decision", "")
-        payload_hash = values.get("payload_sha256", "")
-        if not all((function, draft_id, decision, payload_hash, email)):
+        draft_hash = values.get("draft_hash", "")
+        if not all((function, request_id, decision, draft_hash, user_id)):
             return None
-        return function, draft_id, decision, payload_hash, email
+        return function, request_id, decision, draft_hash, user_id, email
 
     @staticmethod
     def _kira_email_card_event_id(envelope: Dict[str, Any]) -> str:
@@ -2465,46 +2467,37 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 return value
         return "chat-event-unknown"
 
-    async def create_kira_email_draft(
-        self, *, recipient: str, subject: str, body: str, thread: str = "",
+    async def create_kira_email_request(
+        self, *, recipient: str, subject: str, body: str, thread_id: str = "",
     ) -> Dict[str, Any]:
-        """Persist an immutable email then post its exact-draft card to GTR Ops.
-
-        The card shows the record ID and immutable SHA-256, but never the
-        recipient, subject, message body, or credential.  This method does
-        not create/send a Gmail draft.
-        """
+        """Persist a v2 direct-body request and post an identifier-only card."""
         gate = self._get_kira_email_gate()
-        status = gate.create(recipient=recipient, subject=subject, body=body, thread=thread)
-        draft_id = status["id"]
+        status = gate.create(
+            recipient=recipient, subject=subject, body=body, thread_id=thread_id,
+            created_by="kira-service",
+        )
+        request_id = status["request_id"]
         card = card_spec_to_cards_v2({
             "card_id": "kira-email-approval",
-            "header": {
-                "title": "Kira email approval required",
-                "subtitle": "Exact immutable draft",
-            },
+            "header": {"title": "Kira email approval required", "subtitle": "Exact immutable message"},
             "sections": [{"widgets": [
                 {"type": "text", "text": (
-                    f"Draft ID: `{draft_id}`<br>Exact payload SHA-256: `{status['payload_sha256']}`"
-                    f"<br>Expires: {int(status['expires_at'])}"
+                    f"Request ID: `{request_id}`<br>Exact payload SHA-256: `{status['draft_hash']}`"
+                    f"<br>Expires: {status['expires_at']}"
                 )},
                 {"type": "buttons", "buttons": [
                     {"text": "Approve exact draft", "action": "hermes_kira_email_approval", "parameters": {
-                        "draft_id": draft_id,
-                        "payload_sha256": status["payload_sha256"],
-                        "decision": "approve",
+                        "request_id": request_id, "draft_hash": status["draft_hash"], "decision": "approve",
                     }},
                     {"text": "Reject draft", "action": "hermes_kira_email_approval", "parameters": {
-                        "draft_id": draft_id,
-                        "payload_sha256": status["payload_sha256"],
-                        "decision": "reject",
+                        "request_id": request_id, "draft_hash": status["draft_hash"], "decision": "reject",
                     }},
                 ]},
             ]}],
         })
         result = await self.send_card(self._kira_email_ops_space, card)
         if not result.success:
-            logger.warning("[GoogleChat] Kira email approval card post failed for draft %s", draft_id)
+            logger.warning("[GoogleChat] Kira email approval card post failed for request %s", request_id)
         return status
 
     async def _handle_kira_email_card_click(self, envelope: Dict[str, Any]) -> None:
@@ -2512,7 +2505,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if not fields:
             logger.warning("[GoogleChat] rejected malformed Kira email card click")
             return
-        function, draft_id, decision, payload_hash, principal = fields
+        function, request_id, decision, draft_hash, actor_user_id, actor_email = fields
         if function != "hermes_kira_email_approval":
             return
         payload = self._card_clicked_payload(envelope)
@@ -2523,29 +2516,31 @@ class GoogleChatAdapter(BasePlatformAdapter):
         )
         try:
             outcome, status = self._get_kira_email_gate().decide(
-                draft_id,
+                request_id=request_id,
                 decision=decision,
-                payload_hash=payload_hash,
-                actor_principal=principal,
-                source_space=space,
-                chat_event_id=self._kira_email_card_event_id(envelope),
+                draft_hash=draft_hash,
+                actor_user_id=actor_user_id,
+                actor_email=actor_email,
+                space=space,
+                event_id=self._kira_email_card_event_id(envelope),
+                # This handler is reached only through the authenticated Google
+                # Chat ingress; direct callers receive no approval capability.
+                verified_credential=bool(envelope.get("_verified_google_chat_credential")),
             )
         except Exception:
             logger.exception("[GoogleChat] Kira email card click could not be stored")
             return
-        # Reply only in the configured Ops space.  The status is redacted;
-        # no email body is ever echoed into Chat or logs.
-        if space == self._kira_email_ops_space and outcome not in {"unauthorized", "wrong_space"}:
+        if space == self._kira_email_ops_space and outcome not in {"DENIED"}:
             state = status.get("state") if status else "unchanged"
-            await self.send(space, f"Kira exact-draft approval: {outcome}; state {state}.")
+            await self.send(space, f"Kira exact-message approval: {outcome}; state {state}.")
 
-    def get_kira_email_draft_status(self, draft_id: str) -> Dict[str, Any]:
+    def get_kira_email_request_status(self, request_id: str) -> Dict[str, Any]:
         """Read-only, redacted status/evidence for Kira project filing."""
-        return self._get_kira_email_gate().status(draft_id)
+        return self._get_kira_email_gate().status(request_id)
 
-    async def send_approved_kira_email_draft(self, draft_id: str, provider: Any) -> Dict[str, Any]:
-        """One-shot controlled sender; ``provider`` is the Composio bridge."""
-        return await self._get_kira_email_gate().send(draft_id, provider)
+    async def send_approved_kira_email_request(self, request_id: str, provider: Any) -> Dict[str, Any]:
+        """One-shot v2 direct sender; ``provider`` is the configured bridge."""
+        return await self._get_kira_email_gate().send(request_id, provider)
 
     # ------------------------------------------------------------------
     # Outbound send paths

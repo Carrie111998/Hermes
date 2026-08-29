@@ -1887,11 +1887,11 @@ class TestKiraExactEmailApprovalCard:
     async def test_card_has_only_exact_draft_actions_and_click_is_durable(self, adapter, tmp_path):
         adapter._kira_email_gate_home = tmp_path
         adapter._kira_email_ops_space = "spaces/gtr-ops"
-        adapter._kira_email_approvers = {"richard@goldentouchremodeling.com"}
+        adapter._kira_email_approvers = {"users/richard-immutable"}
         adapter.send_card = AsyncMock(return_value=_gc_mod.SendResult(success=True, message_id="chat-card-1"))
         adapter.send = AsyncMock(return_value=_gc_mod.SendResult(success=True))
 
-        status = await adapter.create_kira_email_draft(
+        status = await adapter.create_kira_email_request(
             recipient="vendor@example.com", subject="Quote", body="Please quote this work.",
         )
 
@@ -1905,17 +1905,18 @@ class TestKiraExactEmailApprovalCard:
 
         await adapter._handle_kira_email_card_click({
             "id": "card-event-1",
+            "_verified_google_chat_credential": True,
             "chat": {"cardClickedPayload": {
                 "space": {"name": "spaces/gtr-ops"},
-                "user": {"email": "richard@goldentouchremodeling.com"},
+                "user": {"name": "users/richard-immutable", "email": "richard@goldentouchremodeling.com"},
                 "action": {"function": "hermes_kira_email_approval", "parameters": [
-                    {"key": "draft_id", "value": status["id"]},
-                    {"key": "payload_sha256", "value": status["payload_sha256"]},
+                    {"key": "request_id", "value": status["request_id"]},
+                    {"key": "draft_hash", "value": status["draft_hash"]},
                     {"key": "decision", "value": "approve"},
                 ]},
             }},
         })
 
-        assert adapter.get_kira_email_draft_status(status["id"])["state"] == "APPROVED"
+        assert adapter.get_kira_email_request_status(status["request_id"])["status"] == "APPROVED"
         adapter.send.assert_awaited_once()
 
