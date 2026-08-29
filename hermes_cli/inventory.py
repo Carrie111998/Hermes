@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from contextvars import copy_context
 from dataclasses import dataclass, replace
-from threading import Lock, Thread
+from threading import Lock, Thread, current_thread
 from typing import Any, Optional
 
 
@@ -1013,7 +1013,12 @@ def _prewarm_pricing_async(
         ]
 
         def _worker() -> None:
-            _apply_pricing(worker_rows)
+            try:
+                _apply_pricing(worker_rows)
+            finally:
+                with _pricing_prewarm_lock:
+                    if _pricing_prewarm_threads.get(prewarm_key) is current_thread():
+                        _pricing_prewarm_threads.pop(prewarm_key, None)
 
         worker_context = copy_context()
         thread = Thread(

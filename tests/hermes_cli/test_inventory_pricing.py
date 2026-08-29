@@ -152,8 +152,9 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
         assert elapsed < 2.0, f"cold picker blocked for {elapsed:.2f}s"
         assert fetch_started.wait(timeout=1), "pricing should prewarm in the background"
     finally:
+        threads = list(inv._pricing_prewarm_threads.values())
         release_fetch.set()
-        for thread in inv._pricing_prewarm_threads.values():
+        for thread in threads:
             thread.join(timeout=2)
 
 
@@ -226,6 +227,41 @@ def test_prewarm_preserves_context_and_runs_once_per_profile(tmp_path, monkeypat
         for thread in threads:
             if thread is not None:
                 thread.join(timeout=2)
+
+
+def test_prewarm_deduplicates_inflight_scope_and_cleans_up(monkeypatch):
+    """Rapid opens share one worker, then a completed scope can run again."""
+    monkeypatch.setattr(inv, "_pricing_prewarm_threads", {})
+    started = Event()
+    release = Event()
+    calls = []
+
+    def blocked_prewarm(_rows):
+        calls.append(None)
+        started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(inv, "_apply_pricing", blocked_prewarm)
+    rows = [{"slug": "openrouter", "models": ["vendor/model"]}]
+
+    first = inv._prewarm_pricing_async(rows)
+    try:
+        assert started.wait(timeout=1)
+        second = inv._prewarm_pricing_async(rows)
+        assert second is first
+        assert len(calls) == 1
+    finally:
+        release.set()
+        first.join(timeout=2)
+
+    assert not first.is_alive()
+    assert inv._pricing_prewarm_threads == {}
+
+    retry = inv._prewarm_pricing_async(rows)
+    retry.join(timeout=2)
+    assert retry is not first
+    assert len(calls) == 2
+    assert inv._pricing_prewarm_threads == {}
 
 
 def test_prewarm_endpoint_rotation_starts_a_new_worker(tmp_path, monkeypatch):
