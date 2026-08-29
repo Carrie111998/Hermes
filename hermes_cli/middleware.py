@@ -8,6 +8,7 @@ contract helpers here so agent-loop call sites and plugins share one vocabulary.
 from __future__ import annotations
 
 import logging
+import os
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"
+REQUIRE_LLM_EXECUTION_MIDDLEWARE_ENV = "HERMES_REQUIRE_LLM_EXECUTION_MIDDLEWARE"
 
 TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
@@ -32,6 +34,16 @@ VALID_MIDDLEWARE: set[str] = {
     LLM_REQUEST_MIDDLEWARE,
     LLM_EXECUTION_MIDDLEWARE,
 }
+
+
+class RequiredMiddlewareError(RuntimeError):
+    """Provider execution was refused because required middleware was absent or failed."""
+
+def llm_execution_middleware_required() -> bool:
+    """Whether this installation opts into fail-closed provider execution."""
+    return str(os.environ.get(REQUIRE_LLM_EXECUTION_MIDDLEWARE_ENV, "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 @dataclass
@@ -187,16 +199,23 @@ def apply_api_request_middleware(
 def run_llm_execution_middleware(
     request: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
+    *,
+    required: bool = False,
     **context: Any,
 ) -> Any:
     """Run provider execution through registered LLM execution middleware."""
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
+        if required:
+            raise RequiredMiddlewareError(
+                "required LLM execution middleware is not registered"
+            )
         return next_call(request)
     return _run_execution_chain(
         LLM_EXECUTION_MIDDLEWARE,
         callbacks,
         next_call,
+        strict=required,
         request=request,
         original_request=context.pop("original_request", request),
         **context,
@@ -255,6 +274,7 @@ def _run_execution_chain(
     kind: str,
     callbacks: List[Callable],
     terminal_call: Callable[[Any], Any],
+    strict: bool = False,
     **kwargs: Any,
 ) -> Any:
     payload_key = "request" if "request" in kwargs else "args"
@@ -311,6 +331,10 @@ def _run_execution_chain(
                 return next_result
             if next_called:
                 raise
+            if strict:
+                raise RequiredMiddlewareError(
+                    f"required '{kind}' middleware failed before provider execution"
+                ) from exc
             return call_at(index + 1, payload)
 
     return call_at(0, kwargs[payload_key])
