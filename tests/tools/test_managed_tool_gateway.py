@@ -103,6 +103,20 @@ def test_read_nous_access_token_refreshes_expiring_cached_token(tmp_path, monkey
     assert managed_tool_gateway.read_nous_access_token() == "fresh-token"
 
 
+def test_peek_nous_access_token_reads_profile_credential_pool(tmp_path, monkeypatch):
+    """Availability probes must see device-code credentials in a profile."""
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "providers": {},
+        "credential_pool": {
+            "nous": [{"access_token": "pooled-token"}],
+        },
+    }))
+
+    assert managed_tool_gateway.peek_nous_access_token() == "pooled-token"
+
+
 def test_managed_vendor_endpoints_pin_the_deployed_gateway_url():
     """The exact URL an agent may connect to is a code fact, not a lookup.
 
