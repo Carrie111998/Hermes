@@ -11,16 +11,6 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
-@pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-    return home
-
-
 def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None):
     return kb.create_task(
         conn,
@@ -86,7 +76,5 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
     assert any("Decomposed into" in (c.body or "") for c in comments)
     assert any(ev.kind == "decomposed" for ev in events)
-
-
 
 
