@@ -7,6 +7,7 @@ config.yaml.
 """
 
 import os
+import sys
 
 import pytest
 
@@ -179,6 +180,50 @@ def test_scope_change_without_terminal_section_drops_bridged_env(
         reset_hermes_home_override(token_b)
 
     assert config_b["env_type"] == "local"
+
+
+def test_failed_rebridge_purges_previous_profile_before_latching(
+    monkeypatch, tmp_path
+):
+    """If the incoming profile's bridge fails — e.g. the config import
+    raises — the previous profile's bridged TERMINAL_* keys must already
+    be gone: a broken config machinery must not re-leak the previous
+    backend selection while the attempt flag latches the failure (#94200).
+    The call degrades to the historical local default instead."""
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    (home_a / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    (home_b / "config.yaml").write_text("terminal:\n  backend: local\n")
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token_a = set_hermes_home_override(str(home_a))
+    try:
+        terminal_tool._get_env_config()
+        assert os.environ["TERMINAL_ENV"] == "docker"
+    finally:
+        reset_hermes_home_override(token_a)
+
+    # Break profile B's bridge where it hurts: the config import itself,
+    # before the old code ever reached the key purge. Scoped so the
+    # post-bridge imports in _get_env_config stay untouched.
+    with monkeypatch.context() as m:
+        m.setitem(sys.modules, "hermes_cli.config", None)
+        token_b = set_hermes_home_override(str(home_b))
+        try:
+            terminal_tool._ensure_terminal_env_bridged()
+        finally:
+            reset_hermes_home_override(token_b)
+
+    # A's bridged key did not survive the failed re-bridge — the call
+    # degrades to the ambient env (no TERMINAL_ENV = local default), not
+    # to profile A's docker selection.
+    assert "TERMINAL_ENV" not in os.environ
+    # The failure still latches, keeping the one-shot semantics: a broken
+    # config must not be re-attempted on every call within this scope.
+    assert terminal_tool._terminal_config_bridge_attempted is True
 
 
 def test_same_scope_keeps_one_shot_semantics(monkeypatch, tmp_path):

@@ -1718,6 +1718,11 @@ _terminal_config_bridge_scope: "str | None" = None
 # starts from its own config/.env instead of the previous profile's
 # backend selection.
 _terminal_config_bridge_keys: "set[str]" = set()
+# Serializes the check/purge/re-bridge sequence below: under profile
+# multiplexing, agents on different threads can race their first terminal
+# call, and an interleaved snapshot/purge would attribute the wrong
+# TERMINAL_* ownership set (e.g. drop user-exported keys).
+_terminal_config_bridge_lock = threading.Lock()
 
 
 def _ensure_terminal_env_bridged() -> None:
@@ -1751,50 +1756,56 @@ def _ensure_terminal_env_bridged() -> None:
     """
     global _terminal_config_bridge_attempted
     global _terminal_config_bridge_scope, _terminal_config_bridge_keys
-    try:
-        from hermes_constants import get_hermes_home_override
+    with _terminal_config_bridge_lock:
+        try:
+            from hermes_constants import get_hermes_home_override
 
-        current_scope = get_hermes_home_override()
-    except Exception:
-        current_scope = None
-    if _terminal_config_bridge_attempted and _terminal_config_bridge_scope == current_scope:
-        return
-    _terminal_config_bridge_attempted = True
-    _terminal_config_bridge_scope = current_scope
-    try:
-        from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
-
+            current_scope = get_hermes_home_override()
+        except Exception:
+            current_scope = None
+        if _terminal_config_bridge_attempted and _terminal_config_bridge_scope == current_scope:
+            return
         # Profile handoff: drop the TERMINAL_* keys the previous scope's
         # bridge introduced (keys the user's shell/.env exported stay put)
         # so the incoming profile resolves from its own config instead of
-        # the previous profile's backend selection (#94200).
+        # the previous profile's backend selection (#94200). This runs
+        # BEFORE the attempt flags latch: if the config import or anything
+        # below raises, the stale keys are already gone and the except
+        # path degrades to the historical local default — it must not
+        # re-leak the previous profile's backend selection precisely when
+        # the config machinery is broken.
         for key in _terminal_config_bridge_keys:
             os.environ.pop(key, None)
         _terminal_config_bridge_keys = set()
-        before = {k for k in os.environ if k.startswith("TERMINAL_")}
+        _terminal_config_bridge_attempted = True
+        _terminal_config_bridge_scope = current_scope
+        try:
+            from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
 
-        # If config.yaml has an explicit terminal section, bridge with
-        # override enabled. The helper only overrides env vars for keys present
-        # in that raw section; merged defaults remain backfill-only. Without a
-        # terminal section, preserve an existing TERMINAL_ENV selection or
-        # backfill defaults when no selection exists.
-        raw_config = read_raw_config()
-        has_terminal_section = isinstance(raw_config.get("terminal"), dict)
+            before = {k for k in os.environ if k.startswith("TERMINAL_")}
 
-        if has_terminal_section:
-            # Explicit terminal keys in config.yaml win over matching env values.
-            apply_terminal_config_to_env(env=None, override=True)
-        elif "TERMINAL_ENV" not in os.environ:
-            # No terminal section in config.yaml, TERMINAL_ENV not set —
-            # backfill from config defaults
-            apply_terminal_config_to_env(env=None, override=False)
-        _terminal_config_bridge_keys = (
-            {k for k in os.environ if k.startswith("TERMINAL_")} - before
-        )
-    except Exception:
-        # Never let a config problem take the terminal tool down — the
-        # historical local default still applies.
-        logger.debug("terminal config → env fallback bridge failed", exc_info=True)
+            # If config.yaml has an explicit terminal section, bridge with
+            # override enabled. The helper only overrides env vars for keys present
+            # in that raw section; merged defaults remain backfill-only. Without a
+            # terminal section, preserve an existing TERMINAL_ENV selection or
+            # backfill defaults when no selection exists.
+            raw_config = read_raw_config()
+            has_terminal_section = isinstance(raw_config.get("terminal"), dict)
+
+            if has_terminal_section:
+                # Explicit terminal keys in config.yaml win over matching env values.
+                apply_terminal_config_to_env(env=None, override=True)
+            elif "TERMINAL_ENV" not in os.environ:
+                # No terminal section in config.yaml, TERMINAL_ENV not set —
+                # backfill from config defaults
+                apply_terminal_config_to_env(env=None, override=False)
+            _terminal_config_bridge_keys = (
+                {k for k in os.environ if k.startswith("TERMINAL_")} - before
+            )
+        except Exception:
+            # Never let a config problem take the terminal tool down — the
+            # historical local default still applies.
+            logger.debug("terminal config → env fallback bridge failed", exc_info=True)
 
 
 def _get_env_config() -> Dict[str, Any]:
