@@ -328,6 +328,8 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_active_compression_telemetry",
     "_compression_telemetry_seed",
     "_proactive_prune_rearm_tokens",
+    "_automatic_timeout_terminal_turn_id",
+    "_compression_terminal_outcome",
 )
 
 _COMPRESSOR_COOLDOWN_STATE_FIELDS = (
@@ -455,6 +457,7 @@ def _restore_compressor_attempt_state(
     durable_cooldown_authoritative: Optional[bool] = None,
     durable_cooldown_state: Optional[dict[str, Any]] = None,
     attempt_generation: Optional[int] = None,
+    attempt_fence: Optional[CompressionCommitFence] = None,
 ) -> None:
     """Restore the safe per-attempt snapshot after a pre-commit hard cancel.
 
@@ -465,6 +468,13 @@ def _restore_compressor_attempt_state(
     primary's unwind must not roll fallback-owned state back to the
     primary's pre-attempt snapshot (#96634 post-merge review, claim 1).
     """
+    if attempt_fence is not None and attempt_fence.host_timeout_won():
+        logger.info(
+            "Skipping compressor rollback: host timeout already owns attempt "
+            "outcome %s",
+            attempt_fence.attempt_id,
+        )
+        return
     if attempt_generation is not None and not _compressor_attempt_is_current(
         compressor, attempt_generation
     ):
@@ -657,6 +667,15 @@ class CompressionCommitFence:
         # still guarantee no FUTURE commit is admitted. Plain bool store —
         # atomic in CPython.
         self._admission_revoked = False
+        # One attempt identity/provenance record is shared by the host and its
+        # detached worker. Host timeout claims this record before recording
+        # cooldown; late unwind consults the same claim and cannot roll it back.
+        self._attempt_id = uuid.uuid4().hex
+        self._attempt_generation: Optional[int] = None
+        self._attempt_turn_id = ""
+        self._terminal_outcome_lock = threading.Lock()
+        self._terminal_outcome: Optional[dict[str, Any]] = None
+        self._host_timeout_recorded = False
         # Holder-qualified durable-lock release hook (#76354 review F4;
         # transplanted from PR #71569 by @ciabata-git). The worker publishes an
         # idempotent, holder-scoped release callable once it owns the durable
@@ -673,6 +692,81 @@ class CompressionCommitFence:
         # not killed by a fixed wall-clock deadline while tokens are moving.
         self._last_progress = time.monotonic()
 
+    @property
+    def attempt_id(self) -> str:
+        return self._attempt_id
+
+    @property
+    def attempt_identity(self) -> dict[str, Any]:
+        """Return this fence's immutable attempt/generation/turn identity."""
+        with self._terminal_outcome_lock:
+            return {
+                "attempt_id": self._attempt_id,
+                "generation": self._attempt_generation,
+                "turn_id": self._attempt_turn_id,
+            }
+
+    def bind_turn(self, turn_id: str = "") -> None:
+        """Bind the first non-empty turn id; never rebind a live fence."""
+        turn_id = str(turn_id or "")
+        if not turn_id:
+            return
+        with self._terminal_outcome_lock:
+            if not self._attempt_turn_id:
+                self._attempt_turn_id = turn_id
+
+    def bind_attempt(self, generation: int, turn_id: str = "") -> None:
+        """Bind the compressor generation and authoritative turn to this fence."""
+        with self._terminal_outcome_lock:
+            if self._attempt_generation is None:
+                self._attempt_generation = generation
+            if not self._attempt_turn_id and turn_id:
+                self._attempt_turn_id = str(turn_id)
+
+    def claim_terminal_outcome(self, failure_class: str, turn_id: str = "") -> bool:
+        """Claim one terminal host outcome; return True only for its winner."""
+        with self._terminal_outcome_lock:
+            if self._terminal_outcome is not None:
+                return False
+            self._terminal_outcome = {
+                "attempt_id": self._attempt_id,
+                "generation": self._attempt_generation,
+                "turn_id": str(self._attempt_turn_id or turn_id or ""),
+                "failure_class": str(failure_class),
+            }
+            return True
+
+    def claim_host_timeout_record(self, turn_id: str = "") -> bool:
+        """Claim the single cooldown write for this attempt's host timeout."""
+        with self._terminal_outcome_lock:
+            if self._terminal_outcome is None:
+                self._terminal_outcome = {
+                    "attempt_id": self._attempt_id,
+                    "generation": self._attempt_generation,
+                    "turn_id": str(self._attempt_turn_id or turn_id or ""),
+                    "failure_class": "host_timeout",
+                }
+            if self._terminal_outcome.get("failure_class") != "host_timeout":
+                return False
+            if self._host_timeout_recorded:
+                return False
+            self._host_timeout_recorded = True
+            return True
+
+    @property
+    def terminal_outcome(self) -> Optional[dict[str, Any]]:
+        with self._terminal_outcome_lock:
+            return copy.deepcopy(self._terminal_outcome)
+
+    def host_timeout_won(self) -> bool:
+        with self._terminal_outcome_lock:
+            return bool(
+                self._terminal_outcome
+                and self._terminal_outcome.get("failure_class") == "host_timeout"
+            )
+
+    # ``begin_commit`` retains the fence lock; this metadata lock is separate
+    # so late outcome inspection never waits behind a SessionDB commit.
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
 
@@ -936,6 +1030,140 @@ def _release_compression_admission(_future=None) -> None:
     with _compress_admission_lock:
         if _compress_admitted_count > 0:
             _compress_admitted_count -= 1
+
+
+class _CompressionAdmissionLease:
+    """Idempotent owner for one process-wide compression admission slot."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self, _future=None) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        _release_compression_admission()
+
+
+def _bind_compression_attempt_identity(
+    telemetry_agent: Any, fence: CompressionCommitFence
+) -> None:
+    """Publish the fence identity before a pooled worker can start."""
+    if telemetry_agent is None:
+        return
+    fence.bind_turn(str(getattr(telemetry_agent, "_current_turn_id", "") or ""))
+    attempt_id = fence.attempt_id
+    turn_id = fence.attempt_identity["turn_id"]
+    compressor = getattr(telemetry_agent, "context_compressor", None)
+    with _COMPRESSOR_ATTEMPT_LOCK:
+        try:
+            telemetry_agent._compression_attempt_id = attempt_id
+            telemetry_agent._compression_attempt_turn_id = turn_id
+        except Exception:
+            pass
+        if compressor is not None:
+            try:
+                compressor._compression_attempt_id = attempt_id
+                compressor._compression_attempt_turn_id = turn_id
+            except Exception:
+                pass
+
+
+def _compression_attempt_identity_matches(
+    telemetry_agent: Any, compressor: Any, outcome: dict[str, Any]
+) -> bool:
+    """Return whether the captured outcome still owns the live compressor."""
+    expected_attempt = outcome.get("attempt_id")
+    if not isinstance(expected_attempt, str) or not expected_attempt:
+        return False
+    for owner in (telemetry_agent, compressor):
+        if owner is None:
+            continue
+        current_attempt = getattr(owner, "_compression_attempt_id", None)
+        if isinstance(current_attempt, str) and current_attempt:
+            if current_attempt != expected_attempt:
+                return False
+    expected_generation = outcome.get("generation")
+    current_generation = (
+        getattr(compressor, "_compression_attempt_generation", None)
+        if compressor is not None
+        else None
+    )
+    if (
+        isinstance(expected_generation, int)
+        and isinstance(current_generation, int)
+        and current_generation != expected_generation
+    ):
+        return False
+    return True
+
+
+def _publish_compression_terminal_outcome(
+    telemetry_agent: Any,
+    fence: CompressionCommitFence,
+    failure_class: str,
+    *,
+    _host_timeout_record_won: bool = False,
+    _latch_automatic_timeout: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Publish a fence-owned outcome without rebinding to mutable turn state."""
+    if telemetry_agent is None:
+        return None
+    fence.claim_terminal_outcome(failure_class)
+    outcome = fence.terminal_outcome
+    if not isinstance(outcome, dict):
+        return None
+    compressor = getattr(telemetry_agent, "context_compressor", None)
+    with _COMPRESSOR_ATTEMPT_LOCK:
+        if not _compression_attempt_identity_matches(
+            telemetry_agent, compressor, outcome
+        ):
+            logger.info(
+                "Skipping stale compression terminal publication for attempt %s",
+                outcome.get("attempt_id"),
+            )
+            return None
+        try:
+            telemetry_agent._compression_attempt_id = outcome["attempt_id"]
+            telemetry_agent._compression_terminal_outcome = copy.deepcopy(outcome)
+        except Exception:
+            pass
+        if compressor is not None:
+            try:
+                compressor._compression_terminal_outcome = copy.deepcopy(outcome)
+                if (
+                    _host_timeout_record_won
+                    and _latch_automatic_timeout
+                    and outcome.get("failure_class") == "host_timeout"
+                ):
+                    compressor._automatic_timeout_terminal = True
+                    compressor._automatic_timeout_terminal_turn_id = str(
+                        outcome.get("turn_id") or ""
+                    )
+            except Exception:
+                pass
+    return outcome
+
+
+def _publish_compression_timeout_outcome(
+    telemetry_agent: Any,
+    fence: CompressionCommitFence,
+    *,
+    latch_automatic_timeout: bool,
+) -> tuple[Optional[dict[str, Any]], bool]:
+    """Claim/publish one timeout and atomically gate its automatic latch."""
+    fence.claim_terminal_outcome("host_timeout")
+    timeout_record_won = fence.claim_host_timeout_record()
+    outcome = _publish_compression_terminal_outcome(
+        telemetry_agent,
+        fence,
+        "host_timeout",
+        _host_timeout_record_won=timeout_record_won,
+        _latch_automatic_timeout=latch_automatic_timeout,
+    )
+    return outcome, bool(outcome is not None and timeout_record_won)
 
 
 def _get_compress_timeout_executor():
@@ -1245,6 +1473,7 @@ def run_compress_context_with_progress_timeout(
         return system_prompt_fallback
 
     fence = fence if fence is not None else CompressionCommitFence()
+    _bind_compression_attempt_identity(telemetry_agent, fence)
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
@@ -1271,6 +1500,9 @@ def run_compress_context_with_progress_timeout(
         # Round-2 #6: saturation refusals must be visible in the same
         # telemetry stream as every other failed attempt, or a wedged pool
         # looks like compression simply stopped being attempted.
+        _publish_compression_terminal_outcome(
+            telemetry_agent, fence, "pool_saturated"
+        )
         if telemetry_agent is not None:
             _emit_compression_attempt_telemetry(
                 telemetry_agent,
@@ -1291,18 +1523,23 @@ def run_compress_context_with_progress_timeout(
                 "Skipping stale compression job: fence cancelled before start"
             )
             return messages, ""
-        return worker(worker_fence)
+        # Make the exact attempt fence ambient for every auxiliary call made by
+        # a plugin or legacy compression engine, not only the built-in path.
+        from agent.auxiliary_client import aux_interrupt_protection
+        with aux_interrupt_protection(cancel_check=lambda: worker_fence.is_cancelled):
+            return worker(worker_fence)
 
     # Bare pool workers start with an empty ContextVar map; propagate the
     # parent conversation/approval context into the worker.
+    admission = _CompressionAdmissionLease()
     try:
         future = executor.submit(
             propagate_context_to_thread(_fence_gated_worker), fence
         )
     except BaseException:
-        _release_compression_admission()
+        admission.release()
         raise
-    future.add_done_callback(_release_compression_admission)
+    future.add_done_callback(admission.release)
     wait_started = time.monotonic()
     # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
     # exception while waiting) must revoke future commit admission before the
@@ -1327,6 +1564,7 @@ def run_compress_context_with_progress_timeout(
             )
             try:
                 result = future.result(timeout=wait_slice)
+                admission.release()
                 handled_exit = True
                 return result
             except concurrent.futures.TimeoutError:
@@ -1417,6 +1655,7 @@ def run_compress_context_with_progress_timeout(
                             )
                 try:
                     result = future.result(timeout=remaining)
+                    admission.release()
                     handled_exit = True
                     return result
                 except concurrent.futures.TimeoutError:
@@ -1426,11 +1665,14 @@ def run_compress_context_with_progress_timeout(
                     continue
 
         # Idle-timeout path: cancellation won before the commit boundary.
-        # The fence already blocks any future commit; F4 additionally frees
-        # the timed-out worker's durable lease via the holder-qualified hook
-        # so a NEW compressor can acquire the lock immediately (no ABA: the
-        # DB release is holder-scoped).
+        # Publish the attempt-owned terminal outcome before any detached unwind
+        # or fallback can touch compressor state. The admission lease remains
+        # owned by ``future`` and is released only by its done callback (or a
+        # failed submission), so non-cooperative workers stay bounded.
         handled_exit = True
+        _publish_compression_terminal_outcome(
+            telemetry_agent, fence, "host_timeout"
+        )
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
@@ -1478,6 +1720,11 @@ def run_compress_context_with_progress_timeout(
             # worker's durable lease via the holder-qualified hook) before
             # the host unwinds, so the detached worker can never publish.
             fence.revoke_commit_admission()
+            # A running future still owns its admission slot. Only release
+            # synchronously when cancel() won before the worker started; a
+            # done-callback owns the running-future release.
+            if future.cancel():
+                admission.release()
 
 class CompressionCheckpointUnavailable(RuntimeError):
     """Raised when required durable pre-compress checkpointing is unavailable."""
@@ -1567,8 +1814,16 @@ def _emit_compression_attempt_telemetry(
             telemetry = {}
         payload = dict(telemetry)
         payload.setdefault("event", "compression_attempt")
-        payload.setdefault("attempt_id", getattr(agent, "_compression_attempt_id", "") or uuid.uuid4().hex)
-        payload.setdefault("session_id", getattr(agent, "session_id", "") or "")
+        current_attempt_id = getattr(agent, "_compression_attempt_id", None)
+        payload["attempt_id"] = str(
+            current_attempt_id or payload.get("attempt_id") or uuid.uuid4().hex
+        )
+        payload["session_id"] = str(
+            getattr(agent, "session_id", "") or payload.get("session_id") or ""
+        )
+        current_turn_id = getattr(agent, "_current_turn_id", None)
+        if isinstance(current_turn_id, str) and current_turn_id:
+            payload["turn_id"] = current_turn_id
         payload["total_duration_ms"] = int((time.monotonic() - started_at) * 1000)
         payload["commit_status"] = commit_status
         payload["split_status"] = split_status
@@ -2773,7 +3028,17 @@ def compress_context(
     agent._compression_skipped_due_to_lock = None
 
     _attempt_started_at = time.monotonic()
-    _attempt_id = uuid.uuid4().hex
+    _attempt_id = (
+        getattr(commit_fence, "attempt_id", None)
+        if commit_fence is not None
+        else None
+    ) or uuid.uuid4().hex
+    if commit_fence is not None:
+        commit_fence.bind_attempt(
+            _attempt_generation,
+            str(getattr(agent, "_current_turn_id", "") or ""),
+        )
+        _bind_compression_attempt_identity(agent, commit_fence)
     _trigger_source = "manual" if force else "auto"
     try:
         agent._compression_attempt_id = _attempt_id
@@ -2814,6 +3079,7 @@ def compress_context(
                 _restore_compressor_attempt_state(
                     agent.context_compressor, _compressor_attempt_snapshot,
                     attempt_generation=_attempt_generation,
+                    attempt_fence=commit_fence,
                 )
                 existing_prompt = getattr(agent, "_cached_system_prompt", None)
                 if not existing_prompt:
@@ -3553,13 +3819,21 @@ def compress_context(
         if commit_fence is not None:
             _install_compression_cancelled_check(
                 agent.context_compressor,
-                lambda: commit_fence.is_cancelled,
+                lambda: _cancel_source(),
                 _attempt_generation,
             )
         # Incoming-message interrupts and active-turn redirects must not tear an
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
         # Event atomically; never infer cause from the racy message fields.
         _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+        def _cancel_source() -> bool:
+            return bool(
+                (commit_fence is not None and commit_fence.is_cancelled)
+                or (
+                    _hard_cancel_event is not None
+                    and _hard_cancel_event.is_set()
+                )
+            )
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -3572,16 +3846,13 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_check=_cancel_source
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
-                    if (
-                        _hard_cancel_event is not None
-                        and _hard_cancel_event.is_set()
-                    ):
+                    if _cancel_source():
                         raise AuxiliaryExplicitCancellation()
         finally:
             if commit_fence is not None:
@@ -3596,6 +3867,7 @@ def compress_context(
                 durable_cooldown_authoritative=_durable_cooldown_authoritative,
                 durable_cooldown_state=_durable_cooldown_state,
                 attempt_generation=_attempt_generation,
+                attempt_fence=commit_fence,
             )
         except BaseException as _rollback_exc:
             # Compensation failure must surface, but it must not strand the
@@ -3755,6 +4027,8 @@ def compress_context(
             _release_lock()
             return messages, _existing_sp
 
+        if _cancel_source():
+            raise AuxiliaryExplicitCancellation()
         if commit_fence is not None:
             _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
             if not _commit_fence_entered:
@@ -3764,6 +4038,7 @@ def compress_context(
                     durable_cooldown_authoritative=_durable_cooldown_authoritative,
                     durable_cooldown_state=_durable_cooldown_state,
                     attempt_generation=_attempt_generation,
+                    attempt_fence=commit_fence,
                 )
                 if (
                     messages_before_compression is not None

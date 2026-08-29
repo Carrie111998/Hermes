@@ -6,6 +6,10 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import copy
+import json
+import threading
+import time
 import pytest
 #pytestmark = pytest.mark.skip(reason="Hangs in non-interactive environments")
 
@@ -1212,3 +1216,279 @@ class TestOverflowWithCompactionDisabled:
         assert result.get("failed") is True
         assert result.get("compaction_disabled") is True
         assert "auto-compaction is disabled" in result["error"]
+
+    def _prepare_terminal_noop_overflow(self, agent, estimate):
+        agent.compression_enabled = True
+        agent.tools = []
+        agent._usage_anchor = None
+        agent._try_refresh_env_client_credentials = lambda: None
+        agent.context_compressor.context_length = 900_000
+        agent.context_compressor.threshold_tokens = 850_000
+        agent.context_compressor.get_active_compression_failure_cooldown = (
+            lambda refresh=False: {
+                "remaining_seconds": 60.0,
+                "error": "host compress_context timeout",
+            }
+        )
+        agent.context_compressor._last_compression_telemetry = {
+            "failure_class": "host_timeout"
+        }
+        history = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"old {'user' if i % 2 == 0 else 'assistant'} {i}",
+            }
+            for i in range(8)
+        ]
+        warnings = []
+        agent.status_callback = lambda event, message: warnings.append((event, message))
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="provider must not run"
+        )
+        return history, warnings, estimate
+
+    def test_over_context_without_current_terminal_outcome_runs_compression(self, agent):
+        """Stale cooldown/telemetry cannot invent hard-overflow provenance."""
+        history, _warnings, estimate = self._prepare_terminal_noop_overflow(
+            agent, 1_320_689
+        )
+        # Keep the old bookkeeping as a stale fixture, but make the current
+        # compression route available. There is deliberately no current
+        # attempt-bound terminal outcome.
+        agent.context_compressor.get_active_compression_failure_cooldown = (
+            lambda refresh=False: None
+        )
+        agent._compression_attempt_id = "current-attempt"
+        agent._compression_terminal_outcome = None
+        agent.context_compressor._compression_terminal_outcome = None
+        compressed = [{"role": "user", "content": "compacted"}]
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=estimate),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=estimate),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=estimate),
+            patch("agent.conversation_loop.anchored_context_tokens", return_value=None),
+            patch.object(agent, "_compress_context", return_value=(compressed, "compressed")) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=history)
+
+        mock_compress.assert_called()
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["completed"] is True
+        assert "compression_context_overflow" not in result
+        from agent.conversation_loop import _compression_terminal_noop_reason
+        assert _compression_terminal_noop_reason(agent, None) is None
+
+    def test_cooldown_blocked_request_below_full_context_may_continue(self, agent):
+        history, _warnings, estimate = self._prepare_terminal_noop_overflow(agent, 800_000)
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=estimate),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=estimate),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=estimate),
+            patch("agent.conversation_loop.anchored_context_tokens", return_value=None),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=history)
+
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["completed"] is True
+
+
+def test_terminal_timeout_keeps_fence_identity_when_next_turn_wins(monkeypatch, agent):
+    """A late timeout cannot publish or latch the mutable next turn."""
+    from agent.conversation_compression import (
+        CompressionCommitFence,
+        _claim_compressor_attempt,
+    )
+    from agent.conversation_loop import _compression_terminal_noop_reason
+
+    compressor = agent.context_compressor
+    agent._current_turn_id = "turn-1"
+    agent._compression_terminal_outcome = None
+    compressor._automatic_timeout_terminal = False
+    compressor._automatic_timeout_terminal_turn_id = None
+    compressor._compression_terminal_outcome = None
+    compressor._compression_attempt_generation = 7
+    publication_entered = threading.Event()
+    release_publication = threading.Event()
+    finished = threading.Event()
+    fence_box = {}
+    result_box = {}
+
+    def fake_timeout_wrapper(**kwargs):
+        fence = kwargs["fence"]
+        fence_box["fence"] = fence
+        fence.bind_attempt(7, "turn-1")
+        attempt_id = fence.attempt_id
+        agent._compression_attempt_id = attempt_id
+        compressor._compression_attempt_id = attempt_id
+        original_claim = fence.claim_terminal_outcome
+
+        def delayed_claim(*args, **claim_kwargs):
+            publication_entered.set()
+            assert release_publication.wait(timeout=5)
+            return original_claim(*args, **claim_kwargs)
+
+        fence.claim_terminal_outcome = delayed_claim
+        kwargs["on_timeout"](0.01, 0.01, 0.01)
+        finished.set()
+        return kwargs["messages"], "sys"
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.run_compress_context_with_progress_timeout",
+        fake_timeout_wrapper,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        lambda compression_cfg=None: (0.01, 0.01),
+    )
+    monkeypatch.setattr("agent.portal_tags.get_conversation_context", lambda: object())
+    agent._emit_warning = MagicMock()
+    agent._touch_activity = MagicMock()
+
+    def run():
+        result_box["value"] = AIAgent._compress_context(
+            agent, [{"role": "user", "content": "keep"}], "sys"
+        )
+
+    thread = threading.Thread(target=run, name="stale-timeout-publication")
+    thread.start()
+    assert publication_entered.wait(timeout=2)
+
+    # New-turn ownership advances while the old fence is paused before its
+    # terminal publication/latch transition.
+    agent._current_turn_id = "turn-2"
+    _claim_compressor_attempt(compressor)
+    agent._compression_attempt_id = "turn-2-attempt"
+    compressor._compression_attempt_id = "turn-2-attempt"
+    release_publication.set()
+
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert finished.is_set()
+    assert result_box["value"][0]
+    outcome = fence_box["fence"].terminal_outcome
+    assert outcome["turn_id"] == "turn-1"
+    assert compressor._automatic_timeout_terminal is False
+    assert compressor._automatic_timeout_terminal_turn_id is None
+    assert _compression_terminal_noop_reason(agent, None) is None
+
+
+def test_real_host_timeout_terminal_outcome_preserves_deep_transcript(agent):
+    """Host timeout provenance is current-attempt bound and persistence sees a copy."""
+    from agent.conversation_compression import (
+        CompressionCommitFence,
+        run_compress_context_with_progress_timeout,
+    )
+    from agent.conversation_loop import (
+        _compression_terminal_noop_reason,
+        _terminal_compression_overflow_result,
+    )
+
+    agent._current_turn_id = "turn-host-timeout"
+    agent.context_compressor.context_length = 100
+    agent.context_compressor._last_compression_telemetry = {
+        "attempt_id": "stale",
+        "failure_class": "host_timeout",
+    }
+    agent._preflight_compression_blocked = True
+    messages = [
+        {
+            "role": "user",
+            "content": {"blocks": [{"type": "text", "text": "keep"}]},
+        }
+    ]
+    before = copy.deepcopy(messages)
+    before_bytes = json.dumps(
+        before, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    persisted = []
+
+    def _persist(snapshot, _history):
+        persisted.append(snapshot)
+        snapshot[0]["content"]["blocks"].append({"type": "text", "text": "sink-only"})
+
+    agent._persist_session = MagicMock(side_effect=_persist)
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocked_worker(_fence):
+        started.set()
+        assert release.wait(timeout=5)
+        return ([], "late")
+
+    try:
+        result = run_compress_context_with_progress_timeout(
+            worker=blocked_worker,
+            messages=messages,
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.03,
+            total_ceiling_seconds=0.03,
+            fence=CompressionCommitFence(),
+            telemetry_agent=agent,
+            stall_fallback=False,
+        )
+        assert started.wait(timeout=1)
+        assert result[0] is messages
+        assert _compression_terminal_noop_reason(agent, None) == "host_timeout"
+        terminal = _terminal_compression_overflow_result(
+            agent, messages, 0, "host_timeout"
+        )
+        assert terminal["compression_failure_class"] == "host_timeout"
+        assert terminal["compression_attempt_id"] == agent._compression_attempt_id
+        assert terminal["compression_turn_id"] == agent._current_turn_id
+        assert messages == before
+        assert persisted
+        assert persisted[0] != messages
+        assert json.dumps(
+            messages, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8") == before_bytes
+    finally:
+        release.set()
+
+
+def test_real_pool_saturated_terminal_outcome_is_not_stale_local_flag(monkeypatch, agent):
+    """A genuine admission refusal binds pool_saturated to the active attempt."""
+    from agent.conversation_compression import (
+        run_compress_context_with_progress_timeout,
+    )
+    from agent.conversation_loop import _compression_terminal_noop_reason
+    import agent.conversation_compression as cc
+
+    agent._current_turn_id = "turn-pool-saturated"
+    agent._preflight_compression_blocked = True
+    agent.context_compressor._last_compression_telemetry = {
+        "attempt_id": "old-attempt",
+        "failure_class": "host_timeout",
+    }
+    previous_limit = cc._COMPRESS_EXECUTOR_MAX_WORKERS
+    try:
+        cc._COMPRESS_EXECUTOR_MAX_WORKERS = 1
+        with cc._compress_admission_lock:
+            cc._compress_admitted_count = 1
+        messages = [{"role": "user", "content": "unchanged"}]
+        result = run_compress_context_with_progress_timeout(
+            worker=lambda _fence: (_ for _ in ()).throw(
+                AssertionError("saturated path must not start a worker")
+            ),
+            messages=messages,
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=1,
+            total_ceiling_seconds=1,
+            telemetry_agent=agent,
+            stall_fallback=False,
+        )
+        assert result == (messages, "fallback")
+        assert _compression_terminal_noop_reason(agent, None) == "pool_saturated"
+        assert agent._compression_terminal_outcome["failure_class"] == "pool_saturated"
+        assert agent._compression_terminal_outcome["turn_id"] == "turn-pool-saturated"
+        agent._compression_attempt_id = "different-attempt"
+        assert _compression_terminal_noop_reason(agent, None) is None
+    finally:
+        with cc._compress_admission_lock:
+            cc._compress_admitted_count = 0
+        cc._COMPRESS_EXECUTOR_MAX_WORKERS = previous_limit
