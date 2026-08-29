@@ -2870,6 +2870,17 @@ def _resolve_runtime_agent_kwargs() -> dict:
         if isinstance(_runtime_mot, int) and _runtime_mot > 0:
             max_tokens = _runtime_mot
 
+    capabilities = runtime.get("capabilities")
+    capabilities = (
+        {
+            key: value
+            for key, value in capabilities.items()
+            if isinstance(key, str) and isinstance(value, bool)
+        }
+        if isinstance(capabilities, dict)
+        else {}
+    )
+
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
@@ -2880,6 +2891,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
         "max_tokens": max_tokens,
+        "capabilities": capabilities,
     }
 
 
