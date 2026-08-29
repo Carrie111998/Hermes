@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
+from gateway.hosted_room_policy_checkpoint import MAX_ACTIVE_POLICY_EVENTS
 from tui_gateway.hosted_room_service import HostedRoomService
 
 
@@ -88,8 +93,7 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     )
     _wait_for(
         lambda: any(
-            event["kind"] == "message.member"
-            for event in service._events("room-1")
+            event["kind"] == "message.member" for event in service._events("room-1")
         )
     )
     assert service.stop(timeout=1.0)
@@ -162,6 +166,189 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
     assert replayed == events
 
 
+def test_policy_checkpoint_bounds_replay_after_completed_room_history(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Long-running room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "default"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    authority = str(room["authority_gateway_id"])
+    rows = []
+    for index in range(200):
+        user_seq = index * 2 + 1
+        activity_seq = user_seq + 1
+        thread_id = f"thread-{index}"
+        event_id = f"user-{index}"
+        rows.extend((
+            (
+                "room-1",
+                user_seq,
+                event_id,
+                "message.user",
+                json.dumps({"kind": "user", "id": "load-test"}),
+                None,
+                json.dumps({"text": "done", "thread_id": thread_id}),
+                float(user_seq),
+            ),
+            (
+                "room-1",
+                activity_seq,
+                f"activity-{index}",
+                "room.activity",
+                json.dumps({"kind": "gateway", "id": authority}),
+                1,
+                json.dumps({
+                    "status": "settled",
+                    "reason_code": "silent_round",
+                    "thread_id": thread_id,
+                    "discussion_event_id": event_id,
+                }),
+                float(activity_seq),
+            ),
+        ))
+    with sqlite3.connect(db) as conn:
+        conn.executemany(
+            """INSERT INTO hosted_room_events(
+                   room_id, seq, event_id, kind, actor_json,
+                   authority_epoch, payload_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.execute(
+            """UPDATE hosted_rooms
+               SET next_seq=401, revision=revision+400, updated_at=400
+               WHERE room_id='room-1'"""
+        )
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-active",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "Review this", "thread_id": "thread-active"},
+        now=401,
+    )
+
+    original_read_events = hosted_rooms.read_events
+    reads = {"calls": 0, "rows": 0}
+
+    def counted_read_events(*args, **kwargs):
+        page = original_read_events(*args, **kwargs)
+        reads["calls"] += 1
+        reads["rows"] += len(page["events"])
+        return page
+
+    monkeypatch.setattr(hosted_rooms, "read_events", counted_read_events)
+    binding = service.bindings()[0]
+    service.prepare_room(binding)
+    assert reads["rows"] == 401
+    snapshot = service._policy_snapshot(hosted_rooms.room_state(db, room_id="room-1"))
+    assert len(snapshot.events) == 1
+    assert len(snapshot.events) <= MAX_ACTIVE_POLICY_EVENTS
+    with sqlite3.connect(db) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM hosted_room_policy_events").fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM hosted_room_policy_threads").fetchone()[
+                0
+            ]
+            == 1
+        )
+
+    reads.update(calls=0, rows=0)
+    service.prepare_room(binding)
+    assert reads == {"calls": 0, "rows": 0}
+
+
+def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
+    tmp_path: Path,
+):
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.rpc = _FakeRPC()
+    service.runtime.rpc = service.rpc
+    service.runtime.clock = clock
+    service.runtime.lease_ttl_seconds = 30
+    service.runtime.indeterminate_defer_seconds = 5
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Resilient room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "default"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-resilience",
+        payload={"text": "Check this", "thread_id": "thread-1"},
+    )
+    first = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    old_lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=service.bindings()[0].gateway_id,
+        authority_epoch=1,
+        process_generation="offline-member",
+        ttl_seconds=1,
+        clock=clock,
+    )
+    old_attempt = driver.start_task(
+        db,
+        first["identity"],
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+
+    now[0] = 102.0
+    binding = service.bindings()[0]
+    service.runtime._process_room(binding)
+    now[0] = 108.0
+    service.runtime._process_room(binding)
+
+    events = service._events("room-1")
+    deferred = next(event for event in events if event["kind"] == "turn.deferred")
+    assert deferred["payload"]["task_id"] == first["identity"].task_id
+    assert deferred["payload"]["execution_generation"] == 1
+    assert any(
+        event["kind"] == "message.member" and event["payload"]["member_id"] == "ops"
+        for event in events
+    )
+
+    requeued = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+    )
+    assert requeued["status"] == "queued"
+    lease = service.runtime._leases["room-1"]
+    retried = driver.start_task(
+        db,
+        first["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    assert retried.execution_generation == old_attempt.execution_generation + 1
+
+
 def test_stop_fence_prevents_the_next_room_member_from_starting(
     tmp_path: Path, monkeypatch
 ):
@@ -190,6 +377,157 @@ def test_stop_fence_prevents_the_next_room_member_from_starting(
     assert len(tasks) == 1
     assert tasks[0]["status"] == "cancelled"
     assert any(
-        event["kind"] == "room.stop_requested"
-        for event in service._events("room-1")
+        event["kind"] == "room.stop_requested" for event in service._events("room-1")
     )
+
+
+def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
+    tmp_path: Path,
+):
+    class PendingStopRPC(_FakeRPC):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_task_id = None
+
+        def info(self, *, profile, session_id, source):
+            return {"active": True, "task_id": self.active_task_id}
+
+        def interrupt(self, *, profile, session_id, source, expected_task_id):
+            return None
+
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = PendingStopRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="worker",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    rpc.sessions[("ops", "Group: room-1")] = {"session_id": "ops-session"}
+    rpc.active_task_id = task["identity"].task_id
+
+    with pytest.raises(RuntimeError, match="still stopping"):
+        service.stop_room(
+            "room-1",
+            cancel_id="stop-1",
+            require_acknowledged=True,
+        )
+
+    stopping = driver.get_task(db, task["identity"])
+    assert stopping["status"] == "stopping"
+    assert stopping["cancel_id"] == "stop-1"
+
+
+def test_local_pending_approval_requires_exact_task_generation_and_request(
+    tmp_path: Path,
+):
+    class ApprovalRPC(_FakeRPC):
+        def __init__(self) -> None:
+            super().__init__()
+            self.approvals = []
+
+        def approve(self, *, session_id, request_id, choice):
+            self.approvals.append((session_id, request_id, choice))
+            return {"resolved": 1}
+
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = ApprovalRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="worker",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    task = driver.get_task(db, task["identity"])
+    service.runtime._report_pending_action(
+        task,
+        session_id="ops-session",
+        info={
+            "pending_approval": {
+                "request_id": "approval-1",
+                "choices": ["once", "always", "deny"],
+            }
+        },
+    )
+
+    action = service.status("room-1")["pending_actions"][0]
+    assert action["member_id"] == "ops"
+    assert action["approval"]["choices"] == ["once", "deny"]
+    with pytest.raises(RuntimeError, match="no longer pending"):
+        service.approve_room_task(
+            "room-1",
+            member_id="ops",
+            task_id=task["identity"].task_id,
+            execution_generation=1,
+            choice="once",
+            request_id="wrong-request",
+        )
+
+    assert service.approve_room_task(
+        "room-1",
+        member_id="ops",
+        task_id=task["identity"].task_id,
+        execution_generation=1,
+        choice="once",
+        request_id="approval-1",
+    ) == {"resolved": 1}
+    assert rpc.approvals == [("ops-session", "approval-1", "once")]
+    assert service.status("room-1")["pending_actions"] == []

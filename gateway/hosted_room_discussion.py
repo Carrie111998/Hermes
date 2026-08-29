@@ -40,7 +40,7 @@ MAX_ATTACHMENT_SIZE_BYTES = 100 * 1024 * 1024
 MAX_ATTACHMENT_MANIFEST_BYTES = 32 * 1024
 
 DecisionStatus = Literal["idle", "task", "settled", "bounded"]
-TerminalKind = Literal["settled", "failed", "cancelled"]
+TerminalKind = Literal["settled", "failed", "cancelled", "deferred"]
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
@@ -98,6 +98,7 @@ _TERMINAL_EXTRA_FIELDS = {
     "turn.settled": frozenset({"message_event_id", "passed"}),
     "turn.failed": frozenset({"error"}),
     "turn.cancelled": frozenset({"reason"}),
+    "turn.deferred": frozenset({"execution_generation", "reason"}),
 }
 _TERMINAL_EVENT_KINDS = frozenset(_TERMINAL_EXTRA_FIELDS)
 _ROOM_ACTIVITY_FIELDS = frozenset({
@@ -799,6 +800,11 @@ def _validate_terminal_event(
         field = "error" if kind == "turn.failed" else "reason"
         if not isinstance(payload.get(field), str) or not payload[field].strip():
             raise DiscussionValidationError(f"{kind} {field} must be non-empty")
+        if kind == "turn.deferred":
+            _positive_int(
+                payload.get("execution_generation"),
+                label="execution_generation",
+            )
 
 
 def _validated_events(
@@ -868,10 +874,18 @@ def _derive_member_watermarks(
         if event.kind not in _TERMINAL_EVENT_KINDS:
             continue
         task_id = str(event.payload["task_id"])
-        if task_id in terminal_by_task:
-            raise DiscussionValidationError(
-                f"task '{task_id}' has more than one terminal room event"
-            )
+        previous = terminal_by_task.get(task_id)
+        if previous is not None:
+            if previous.kind != "turn.deferred":
+                raise DiscussionValidationError(
+                    f"task '{task_id}' has more than one terminal room event"
+                )
+            if event.kind == "turn.deferred" and int(
+                event.payload["execution_generation"]
+            ) <= int(previous.payload["execution_generation"]):
+                raise DiscussionValidationError(
+                    f"task '{task_id}' deferral generation did not advance"
+                )
         terminal_by_task[task_id] = event
         key = (str(event.payload["thread_id"]), str(event.payload["member_id"]))
         watermark = int(event.payload["seen_through_seq"])
@@ -1080,6 +1094,7 @@ def plan_next_task(
     events: Sequence[Mapping[str, Any]],
     *,
     local_profiles: Iterable[str],
+    initial_watermarks: Mapping[tuple[str, str], int] | None = None,
 ) -> DiscussionDecision:
     """Replay the complete room log and return at most one next member task."""
 
@@ -1087,11 +1102,7 @@ def plan_next_task(
     validated = _validated_events(events, room=room)
     user_events = _discussion_user_events(validated)
     stopped_through_seq = max(
-        (
-            event.seq
-            for event in validated
-            if event.kind == "room.stop_requested"
-        ),
+        (event.seq for event in validated if event.kind == "room.stop_requested"),
         default=0,
     )
     completed_discussion_ids = {
@@ -1154,7 +1165,13 @@ def plan_next_task(
         if event.kind in _TERMINAL_EVENT_KINDS
         and event.payload.get("discussion_event_id") == discussion.event_id
     }
-    watermarks = _derive_member_watermarks(validated)
+    watermarks = {
+        (str(thread_id), str(member_id)): int(value)
+        for (thread_id, member_id), value in (initial_watermarks or {}).items()
+        if int(value) >= 0
+    }
+    for key, value in _derive_member_watermarks(validated).items():
+        watermarks[key] = max(watermarks.get(key, 0), value)
     seen_through_seq = max(event.seq for event in thread_messages)
 
     for round_index in range(MAX_DISCUSSION_ROUNDS):
@@ -1327,6 +1344,7 @@ def plan_publication(
     *,
     status: TerminalKind,
     result: Any = None,
+    execution_generation: int | None = None,
     local_profiles: Iterable[str],
 ) -> PublicationPlan:
     """Plan idempotent room effects for one terminal driver task.
@@ -1343,8 +1361,16 @@ def plan_publication(
         raise DiscussionValidationError("task belongs to a different room")
     if task.member not in room.members:
         raise DiscussionValidationError("task member is not in the frozen roster")
-    if status not in {"settled", "failed", "cancelled"}:
+    if status not in {"settled", "failed", "cancelled", "deferred"}:
         raise DiscussionValidationError("invalid terminal publication status")
+    if status == "deferred" and (
+        isinstance(execution_generation, bool)
+        or not isinstance(execution_generation, int)
+        or execution_generation < 1
+    ):
+        raise DiscussionValidationError(
+            "deferred publication requires an execution generation"
+        )
 
     newer_same_thread = any(
         event.kind == "message.user"
@@ -1352,10 +1378,16 @@ def plan_publication(
         and event.payload.get("thread_id") == task.identity.thread_id
         for event in validated
     )
-    effective_status: TerminalKind = "cancelled" if newer_same_thread else status
+    effective_status: TerminalKind = (
+        "cancelled" if newer_same_thread and status != "deferred" else status
+    )
     digest = task.identity.task_id.removeprefix("dtask:")
     message_event_id = f"dmessage:{digest}"
-    terminal_event_id = f"dterminal:{digest}"
+    terminal_event_id = (
+        f"ddeferred:{digest}:g{execution_generation}"
+        if effective_status == "deferred"
+        else f"dterminal:{digest}"
+    )
     common = {
         "discussion_event_id": task.discussion_event_id,
         "member_id": task.member.member_id,
@@ -1414,7 +1446,7 @@ def plan_publication(
             ),
         }
         terminal_kind = "turn.failed"
-    else:
+    elif effective_status == "cancelled":
         terminal_payload = {
             **common,
             "reason": (
@@ -1428,6 +1460,17 @@ def plan_publication(
             ),
         }
         terminal_kind = "turn.cancelled"
+    else:
+        terminal_payload = {
+            **common,
+            "execution_generation": execution_generation,
+            "reason": _terminal_text(
+                result,
+                field="reason",
+                fallback="member_unavailable",
+            ),
+        }
+        terminal_kind = "turn.deferred"
 
     effects.append(
         EventPlan(

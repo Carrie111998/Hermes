@@ -202,6 +202,45 @@ def _settle_next(
     return task
 
 
+def test_deferred_member_allows_next_mentioned_member_and_later_terminal_result(
+    room_db,
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="Report.")
+    first = _next_task(room, db)
+    deferred = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="deferred",
+        result={"reason": "member_unavailable"},
+        execution_generation=1,
+        local_profiles=LOCAL_PROFILES,
+    )
+    _append_publication(db, deferred)
+
+    second = _next_task(room, db)
+    assert second.member.member_id != first.member.member_id
+
+    settled = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="settled",
+        result={"text": "Recovered on explicit retry."},
+        local_profiles=LOCAL_PROFILES,
+    )
+    _append_publication(db, settled)
+    decision = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert decision.status == "task"
+    assert decision.task is not None
+    assert decision.task.member.member_id == second.member.member_id
+
+
 def test_distinct_threads_are_planned_fifo_without_skipping(room_db):
     db, room = room_db
     _append_user(db, event_id="user-1", text="First", thread_id="thread-1")

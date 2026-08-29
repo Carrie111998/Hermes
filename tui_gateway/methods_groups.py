@@ -51,14 +51,30 @@ def stop_hosted_room_service(*, timeout: float = 5.0) -> bool:
     global _service
     with _service_lock:
         service = _service
-        _service = None
-    return True if service is None else service.stop(timeout=timeout)
+        if service is None:
+            return True
+        stopped = service.stop(timeout=timeout)
+        if stopped and _service is service:
+            _service = None
+        return stopped
 
 
 def get_hosted_room_service():
     """Return the active service, if its lifecycle owner started it."""
 
-    return _service
+    service = _service
+    if service is None:
+        return None
+    try:
+        status = service.runtime.status()
+    except Exception:
+        return None
+    return service if status.get("running") and not status.get("stopping") else None
+
+
+_WORKER_UNAVAILABLE = (
+    "Group Chat worker is unavailable. Restart the Hermes gateway and try again."
+)
 
 
 @method("groups.capabilities")
@@ -98,6 +114,8 @@ def _(rid, params: dict) -> dict:
                 "groups.log",
                 "groups.disband",
                 "groups.stop",
+                "groups.retry",
+                "groups.approve",
             ],
             "max_log_limit": MAX_LOG_LIMIT,
         },
@@ -141,29 +159,16 @@ def _(rid, params: dict) -> dict:
     Required params: ``room_id``, ``name``, and ``members``. Authority is
     derived from this gateway's stable install identity, never from the client.
     """
-    from gateway.hosted_rooms import (
-        HostedRoomError,
-        create_room,
-        default_db_path,
-        local_authority_gateway_id,
-    )
+    from gateway.hosted_rooms import HostedRoomError
 
     try:
         service = get_hosted_room_service()
-        room = (
-            service.create_room(
-                room_id=params.get("room_id"),
-                name=params.get("name"),
-                members=params.get("members"),
-            )
-            if service is not None
-            else create_room(
-                default_db_path(),
-                room_id=params.get("room_id"),
-                name=params.get("name"),
-                members=params.get("members"),
-                authority_gateway_id=local_authority_gateway_id(),
-            )
+        if service is None:
+            return _err(rid, 4123, _WORKER_UNAVAILABLE)
+        room = service.create_room(
+            room_id=params.get("room_id"),
+            name=params.get("name"),
+            members=params.get("members"),
         )
         return _ok(rid, {"room": room})
     except HostedRoomError as exc:
@@ -212,32 +217,23 @@ def _(rid, params: dict) -> dict:
     method. The actor is server-owned rather than trusted from params.
     Admission is durable; no Bot turn is started by this slice.
     """
-    from gateway.hosted_rooms import HostedRoomError, append_event, default_db_path
+    from gateway.hosted_rooms import HostedRoomError
 
     try:
         service = get_hosted_room_service()
-        event = (
-            service.send(
-                room_id=params.get("room_id"),
-                event_id=params.get("event_id"),
-                payload=params.get("payload"),
-            )
-            if service is not None
-            else append_event(
-                default_db_path(),
-                room_id=params.get("room_id"),
-                event_id=params.get("event_id"),
-                kind="message.user",
-                actor={"kind": "user", "id": "desktop"},
-                payload=params.get("payload"),
-            )
+        if service is None:
+            return _err(rid, 4123, _WORKER_UNAVAILABLE)
+        event = service.send(
+            room_id=params.get("room_id"),
+            event_id=params.get("event_id"),
+            payload=params.get("payload"),
         )
         return _ok(
             rid,
             {
                 "event": event,
                 "accepted": True,
-                "driver_started": service is not None,
+                "driver_started": True,
             },
         )
     except HostedRoomError as exc:
@@ -250,17 +246,30 @@ def _(rid, params: dict) -> dict:
 @method("groups.disband")
 def _(rid, params: dict) -> dict:
     """Permanently tombstone a hosted room id."""
-    from gateway.hosted_rooms import HostedRoomError, default_db_path, disband_room
+    from gateway.hosted_rooms import HostedRoomError, disband_room, room_state
 
     try:
         service = get_hosted_room_service()
-        if service is not None:
-            service.stop_room(
-                str(params.get("room_id") or ""),
-                cancel_id=str(params.get("cancel_id") or "room-disbanded"),
+        if service is None:
+            return _err(rid, 4123, _WORKER_UNAVAILABLE)
+        existing = room_state(
+            service.db_path,
+            room_id=params.get("room_id"),
+            include_disbanded=True,
+        )
+        if existing.get("disbanded_at") is not None:
+            tombstone = disband_room(
+                service.db_path,
+                room_id=params.get("room_id"),
             )
+            return _ok(rid, {"tombstone": tombstone})
+        service.stop_room(
+            str(params.get("room_id") or ""),
+            cancel_id=str(params.get("cancel_id") or "room-disbanded"),
+            require_acknowledged=True,
+        )
         tombstone = disband_room(
-            default_db_path(),
+            service.db_path,
             room_id=params.get("room_id"),
         )
         return _ok(rid, {"tombstone": tombstone})
@@ -286,6 +295,58 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"cancelled": count})
     except Exception as exc:
         return _err(rid, 5116, str(exc))
+
+
+@method("groups.approve")
+def _(rid, params: dict) -> dict:
+    """Resolve one exact approval requested by a local room member."""
+
+    service = get_hosted_room_service()
+    if service is None:
+        return _err(rid, 4115, "hosted room driver is unavailable")
+    try:
+        result = service.approve_room_task(
+            str(params.get("room_id") or ""),
+            member_id=str(params.get("member_id") or ""),
+            task_id=str(params.get("task_id") or ""),
+            execution_generation=int(params.get("execution_generation") or 0),
+            choice=str(params.get("choice") or ""),
+            request_id=str(params.get("request_id") or ""),
+        )
+        return _ok(rid, {"approved": True, "result": result})
+    except Exception as exc:
+        return _err(rid, 5119, str(exc))
+
+
+@method("groups.retry")
+def _(rid, params: dict) -> dict:
+    """Retry one indeterminate room task after explicit user confirmation."""
+
+    service = get_hosted_room_service()
+    if service is None:
+        return _err(rid, 4115, "hosted room driver is unavailable")
+    try:
+        task = service.retry_room_task(
+            str(params.get("room_id") or ""),
+            task_id=str(params.get("task_id") or ""),
+        )
+        identity = task.get("identity") if isinstance(task, dict) else None
+        receipt = {
+            "room_id": str(getattr(identity, "room_id", "") or ""),
+            "task_id": str(getattr(identity, "task_id", "") or ""),
+            "thread_id": str(getattr(identity, "thread_id", "") or ""),
+            "turn_id": str(getattr(identity, "turn_id", "") or ""),
+            "status": str(task.get("status") or "") if isinstance(task, dict) else "",
+            "execution_generation": int(task.get("execution_generation") or 0)
+            if isinstance(task, dict)
+            else 0,
+            "cancel_generation": int(task.get("cancel_generation") or 0)
+            if isinstance(task, dict)
+            else 0,
+        }
+        return _ok(rid, {"retried": True, "task": receipt})
+    except Exception as exc:
+        return _err(rid, 5118, str(exc))
 
 
 @method("groups.log")

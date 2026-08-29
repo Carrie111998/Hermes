@@ -17593,6 +17593,7 @@ from . import (  # noqa: E402
 # service accessor here so methods_groups handlers resolve the lifecycle-owned
 # singleton rather than starting one from an RPC call.
 get_hosted_room_service = _methods_groups.get_hosted_room_service
+_WORKER_UNAVAILABLE = _methods_groups._WORKER_UNAVAILABLE
 
 for _m in (
     _methods_browser_control,

@@ -112,6 +112,7 @@ class _TerminalReceipt:
 class _RecoveryInspection:
     terminal: _TerminalReceipt | None
     active: bool
+    status: str | None
 
 
 class HostedRoomRuntime:
@@ -128,19 +129,20 @@ class HostedRoomRuntime:
         prepare_room: Callable[[HostedRoomBinding], None] | None = None,
         publish_terminal: Callable[[HostedRoomBinding, Mapping[str, Any]], None]
         | None = None,
-        pending_action: Callable[
-            [str, str, Mapping[str, Any] | None], None
-        ]
+        pending_action: Callable[[str, str, Mapping[str, Any] | None], None]
         | None = None,
         clock: Callable[[], float] = time.time,
         lease_ttl_seconds: float = 30.0,
         poll_interval_seconds: float = 0.1,
+        indeterminate_defer_seconds: float = 60.0,
         process_generation: str | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
+        if indeterminate_defer_seconds <= 0:
+            raise ValueError("indeterminate_defer_seconds must be positive")
         if rpc is None and transport_resolver is None:
             raise ValueError("rpc or transport_resolver is required")
 
@@ -154,6 +156,7 @@ class HostedRoomRuntime:
         self.clock = clock
         self.lease_ttl_seconds = float(lease_ttl_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
+        self.indeterminate_defer_seconds = float(indeterminate_defer_seconds)
         self.process_generation = process_generation or uuid.uuid4().hex
         self._rooms_provider: Callable[[], Iterable[HostedRoomBinding]]
         if callable(rooms):
@@ -229,7 +232,7 @@ class HostedRoomRuntime:
     ) -> dict[str, Any]:
         """Persist a stop intent, then commit cancellation after acknowledgement."""
         before = state.get_task(self.db_path, identity)
-        if before["status"] == "queued":
+        if before["status"] in {"queued", "deferred"}:
             cancelled = state.cancel_task(
                 self.db_path,
                 identity,
@@ -266,7 +269,7 @@ class HostedRoomRuntime:
     def retry_indeterminate(self, identity: state.TaskIdentity) -> dict[str, Any]:
         """Explicitly retry one uncertain attempt under the current room lease."""
         task = state.get_task(self.db_path, identity)
-        if task["status"] != "indeterminate":
+        if task["status"] not in {"indeterminate", "deferred"}:
             raise state.InvalidTaskTransitionError(
                 f"cannot retry task in state '{task['status']}'"
             )
@@ -274,6 +277,26 @@ class HostedRoomRuntime:
         if binding is None:
             raise state.RoomUnavailableError("hosted room is unavailable")
         lease = self._ensure_lease(binding)
+        if task["status"] == "deferred":
+            retried = state.requeue_deferred_task(
+                self.db_path,
+                identity,
+                lease,
+                expected_execution_generation=task["execution_generation"],
+                expected_cancel_generation=task["cancel_generation"],
+                clock=self.clock,
+            )
+            with self._status_lock:
+                self._blocked_rooms.discard(identity.room_id)
+            self.wakeup()
+            return retried
+        inspection = self._inspect_local_recovery_session(task)
+        if inspection.active:
+            with self._status_lock:
+                self._blocked_rooms.add(identity.room_id)
+            raise state.InvalidTaskTransitionError(
+                "cannot retry while the original task attempt is still active"
+            )
         retried = state.requeue_indeterminate_task(
             self.db_path,
             identity,
@@ -591,13 +614,12 @@ class HostedRoomRuntime:
             self._current_task = attempt.identity
         try:
             with self.turn_lock(profile):
-                session = self._resolve_or_create(
-                    transport, profile, binding.room_id
-                )
+                session = self._resolve_or_create(transport, profile, binding.room_id)
                 # An in-process submit should fail before admission or return
                 # after it, but an unexpected exception at that boundary is
                 # still ambiguous. Never terminalize it as a proven failure.
                 submit_attempted = True
+
                 def on_terminal(receipt: Mapping[str, Any]) -> None:
                     status = receipt.get("status")
                     if status == "cancelled":
@@ -637,7 +659,9 @@ class HostedRoomRuntime:
                                     attempt.identity,
                                     attempt.lease,
                                     expected_execution_generation=attempt.execution_generation,
-                                    expected_cancel_generation=int(current["cancel_generation"]),
+                                    expected_cancel_generation=int(
+                                        current["cancel_generation"]
+                                    ),
                                     settlement_id=(
                                         receipt.get("settlement_id")
                                         or f"reply:{attempt.identity.task_id}:{attempt.execution_generation}"
@@ -776,7 +800,7 @@ class HostedRoomRuntime:
         for task in running:
             if task["run_process_generation"] == self.process_generation:
                 continue
-            inspection = self._inspect_recovery_session(binding, task)
+            inspection = self._inspect_local_recovery_session(task)
             if inspection.terminal is not None:
                 self._harvest_previous_attempt(binding, task, inspection.terminal)
             elif inspection.active:
@@ -798,7 +822,11 @@ class HostedRoomRuntime:
                 source=ROOM_SESSION_SOURCE,
             )
             if session is None:
-                return _RecoveryInspection(terminal=None, active=False)
+                return _RecoveryInspection(
+                    terminal=None,
+                    active=False,
+                    status=None,
+                )
             session_id = _session_id(session)
             resumed = transport.resume(
                 profile=profile,
@@ -824,6 +852,37 @@ class HostedRoomRuntime:
             return _RecoveryInspection(
                 terminal=receipt,
                 active=_info_is_active_for(info, task["identity"]),
+                status=str(info.get("status") or "") or None,
+            )
+
+    def _inspect_local_recovery_session(
+        self,
+        task: Mapping[str, Any],
+    ) -> _RecoveryInspection:
+        """Check live local state without resuming an indeterminate session."""
+
+        if self.rpc is None:
+            return _RecoveryInspection(terminal=None, active=False, status=None)
+        profile = task["payload"]["target_profile"]
+        with self.turn_lock(profile):
+            session = self.rpc.resolve_exact(
+                profile=profile,
+                title=room_session_title(task["identity"].room_id),
+                source=ROOM_SESSION_SOURCE,
+            )
+            if session is None:
+                return _RecoveryInspection(terminal=None, active=False, status=None)
+            session_id = _session_id(session)
+            info = self.rpc.info(
+                profile=profile,
+                session_id=session_id,
+                source=ROOM_SESSION_SOURCE,
+            )
+            self._report_pending_action(task, session_id=session_id, info=info)
+            return _RecoveryInspection(
+                terminal=None,
+                active=_info_is_active_for(info, task["identity"]),
+                status=str(info.get("status") or "") or None,
             )
 
     def _reconcile_indeterminate(
@@ -836,23 +895,33 @@ class HostedRoomRuntime:
             room_id=binding.room_id,
             status="indeterminate",
         )
+        if not unresolved:
+            with self._status_lock:
+                self._blocked_rooms.discard(binding.room_id)
+            return False
         for task in unresolved:
-            inspection = self._inspect_recovery_session(binding, task)
-            if inspection.terminal is None:
+            deferred_at = float(
+                task.get("indeterminate_at")
+                or task.get("updated_at")
+                or task.get("created_at")
+                or self.clock()
+            )
+            if self.clock() < deferred_at + self.indeterminate_defer_seconds:
                 with self._status_lock:
                     self._blocked_rooms.add(binding.room_id)
                 return True
-            state.resolve_indeterminate_task(
+            deferred = state.defer_indeterminate_task(
                 self.db_path,
                 task["identity"],
                 lease,
                 expected_execution_generation=task["execution_generation"],
                 expected_cancel_generation=task["cancel_generation"],
-                settlement_id=inspection.terminal.settlement_id,
-                status=inspection.terminal.status,
-                result=inspection.terminal.result,
+                reason="member_unavailable",
                 clock=self.clock,
             )
+            self._report_pending_action(task, session_id="", info={})
+            if self.publish_terminal is not None:
+                self.publish_terminal(binding, deferred)
         with self._status_lock:
             self._blocked_rooms.discard(binding.room_id)
         return False

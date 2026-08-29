@@ -27,6 +27,7 @@ TaskStatus = Literal[
     "failed",
     "cancelled",
     "indeterminate",
+    "deferred",
     "stopping",
 ]
 TerminalStatus = Literal["settled", "failed"]
@@ -41,6 +42,7 @@ TASK_STATUSES = frozenset({
     "failed",
     "cancelled",
     "indeterminate",
+    "deferred",
     "stopping",
 })
 TERMINAL_STATUSES = frozenset({"settled", "failed", "cancelled"})
@@ -308,7 +310,7 @@ def _create_task_table(
             status TEXT NOT NULL CHECK (
                 status IN (
                     'queued', 'running', 'settled', 'failed',
-                    'cancelled', 'indeterminate', 'stopping'
+                    'cancelled', 'indeterminate', 'deferred', 'stopping'
                 )
             ),
             execution_generation INTEGER NOT NULL DEFAULT 0
@@ -398,12 +400,13 @@ def _schema_objects_exist(conn: sqlite3.Connection) -> bool:
     return index is not None
 
 
-def _task_schema_supports_stopping(conn: sqlite3.Connection) -> bool:
+def _task_schema_supports_current_statuses(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         """SELECT sql FROM sqlite_master
            WHERE type='table' AND name='hosted_room_driver_tasks'"""
     ).fetchone()
-    return bool(row and "'stopping'" in str(row[0] or "").lower())
+    sql = str(row[0] or "").lower() if row else ""
+    return "'stopping'" in sql and "'deferred'" in sql
 
 
 def _migrate_task_status_constraint(conn: sqlite3.Connection) -> None:
@@ -438,7 +441,7 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
         apply_wal_with_fallback(conn, db_label="state.db (hosted_room_driver)")
         conn.execute("PRAGMA foreign_keys=ON")
         if _schema_objects_exist(conn):
-            if not _task_schema_supports_stopping(conn):
+            if not _task_schema_supports_current_statuses(conn):
                 conn.execute("BEGIN IMMEDIATE")
                 _migrate_task_status_constraint(conn)
                 conn.commit()
@@ -1218,6 +1221,127 @@ def requeue_indeterminate_task(
         return _task_from_row(_load_task(conn, identity))
 
 
+def defer_indeterminate_task(
+    db_path: Path | str,
+    identity: TaskIdentity,
+    lease: DriverLease,
+    *,
+    expected_execution_generation: int,
+    expected_cancel_generation: int,
+    reason: Any,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Fence one uncertain attempt and release later room work."""
+
+    if lease.room_id != identity.room_id:
+        raise DriverValidationError("lease and task belong to different rooms")
+    if (
+        not isinstance(expected_execution_generation, int)
+        or expected_execution_generation < 1
+    ):
+        raise DriverValidationError(
+            "expected_execution_generation must be a positive integer"
+        )
+    if (
+        not isinstance(expected_cancel_generation, int)
+        or expected_cancel_generation < 0
+    ):
+        raise DriverValidationError("expected_cancel_generation must be non-negative")
+    reason = _identifier(reason, label="defer_reason")
+    result_json = _canonical_json({"reason": reason, "retryable": True})
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        _require_active_lease(conn, lease, now=now)
+        row = _load_task(conn, identity)
+        if (
+            row["status"] == "deferred"
+            and int(row["execution_generation"]) == expected_execution_generation
+            and int(row["cancel_generation"]) == expected_cancel_generation
+            and row["result_json"] == result_json
+        ):
+            return _task_from_row(row, idempotent=True)
+        if (
+            row["status"] != "indeterminate"
+            or int(row["execution_generation"]) != expected_execution_generation
+            or int(row["cancel_generation"]) != expected_cancel_generation
+        ):
+            raise StaleTaskError("indeterminate task generation changed")
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='deferred', result_json=?, terminal_at=?, updated_at=?
+               WHERE room_id=? AND task_id=? AND status='indeterminate'
+                 AND execution_generation=? AND cancel_generation=?""",
+            (
+                result_json,
+                now,
+                now,
+                identity.room_id,
+                identity.task_id,
+                expected_execution_generation,
+                expected_cancel_generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleTaskError("indeterminate task changed during deferral")
+        return _task_from_row(_load_task(conn, identity))
+
+
+def requeue_deferred_task(
+    db_path: Path | str,
+    identity: TaskIdentity,
+    lease: DriverLease,
+    *,
+    expected_execution_generation: int,
+    expected_cancel_generation: int,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Explicitly retry a fenced deferred turn under a new generation."""
+
+    if lease.room_id != identity.room_id:
+        raise DriverValidationError("lease and task belong to different rooms")
+    if (
+        not isinstance(expected_execution_generation, int)
+        or expected_execution_generation < 1
+    ):
+        raise DriverValidationError(
+            "expected_execution_generation must be a positive integer"
+        )
+    if (
+        not isinstance(expected_cancel_generation, int)
+        or expected_cancel_generation < 0
+    ):
+        raise DriverValidationError("expected_cancel_generation must be non-negative")
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        _require_active_lease(conn, lease, now=now)
+        row = _load_task(conn, identity)
+        if (
+            row["status"] != "deferred"
+            or int(row["execution_generation"]) != expected_execution_generation
+            or int(row["cancel_generation"]) != expected_cancel_generation
+        ):
+            raise StaleTaskError("deferred task generation changed")
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='queued', run_gateway_id=NULL,
+                   run_process_generation=NULL, run_lease_generation=NULL,
+                   result_json=NULL, started_at=NULL, terminal_at=NULL,
+                   indeterminate_at=NULL, updated_at=?
+               WHERE room_id=? AND task_id=? AND status='deferred'
+                 AND execution_generation=? AND cancel_generation=?""",
+            (
+                now,
+                identity.room_id,
+                identity.task_id,
+                expected_execution_generation,
+                expected_cancel_generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleTaskError("deferred task changed during requeue")
+        return _task_from_row(_load_task(conn, identity))
+
+
 def cancel_task(
     db_path: Path | str,
     identity: TaskIdentity,
@@ -1242,7 +1366,7 @@ def cancel_task(
             raise InvalidTaskTransitionError(
                 f"cannot cancel task in state '{row['status']}'"
             )
-        if row["status"] != "queued":
+        if row["status"] not in {"queued", "deferred"}:
             raise InvalidTaskTransitionError(
                 "running work requires acknowledged two-phase cancellation"
             )
@@ -1255,7 +1379,7 @@ def cancel_task(
                SET status='cancelled', cancel_generation=?, cancel_id=?,
                    terminal_at=?, updated_at=?
                WHERE room_id=? AND task_id=?
-                 AND status='queued'
+                 AND status IN ('queued', 'deferred')
                  AND cancel_generation=?""",
             (
                 next_generation,

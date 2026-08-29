@@ -649,6 +649,87 @@ def test_indeterminate_retry_is_explicit_and_advances_execution_generation(db):
     assert retried.execution_generation == original.execution_generation + 1
 
 
+def test_indeterminate_task_can_be_deferred_retried_and_cancelled(db):
+    clock = FakeClock()
+    identity = _identity()
+    first = _lease(db, clock, ttl=5)
+    _admit(db, identity, clock)
+    original = driver.start_task(
+        db,
+        identity,
+        first,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    clock.advance(5)
+    recovered = _lease(db, clock, process="new-process", ttl=5)
+    driver.recover_room(db, recovered, clock=clock)
+
+    deferred = driver.defer_indeterminate_task(
+        db,
+        identity,
+        recovered,
+        expected_execution_generation=original.execution_generation,
+        expected_cancel_generation=original.cancel_generation,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    repeated = driver.defer_indeterminate_task(
+        db,
+        identity,
+        recovered,
+        expected_execution_generation=original.execution_generation,
+        expected_cancel_generation=original.cancel_generation,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    requeued = driver.requeue_deferred_task(
+        db,
+        identity,
+        recovered,
+        expected_execution_generation=original.execution_generation,
+        expected_cancel_generation=original.cancel_generation,
+        clock=clock,
+    )
+    retried = driver.start_task(
+        db,
+        identity,
+        recovered,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+
+    assert deferred["status"] == "deferred"
+    assert deferred["result"] == {
+        "reason": "member_unavailable",
+        "retryable": True,
+    }
+    assert repeated["idempotent"] is True
+    assert requeued["status"] == "queued"
+    assert retried.execution_generation == original.execution_generation + 1
+
+    clock.advance(5)
+    next_lease = _lease(db, clock, process="third-process")
+    driver.recover_room(db, next_lease, clock=clock)
+    driver.defer_indeterminate_task(
+        db,
+        identity,
+        next_lease,
+        expected_execution_generation=retried.execution_generation,
+        expected_cancel_generation=retried.cancel_generation,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    cancelled = driver.cancel_task(
+        db,
+        identity,
+        cancel_id="cancel-deferred",
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    assert cancelled["status"] == "cancelled"
+
+
 def test_state_survives_sqlite_reopen_and_concurrent_duplicate_admission(db):
     clock = FakeClock()
     identity = _identity()
@@ -787,6 +868,42 @@ def test_pre_stopping_schema_is_migrated_without_losing_tasks(db):
             "SELECT sql FROM sqlite_master WHERE name='hosted_room_driver_tasks'"
         ).fetchone()[0]
     assert "'stopping'" in table_sql
+
+
+def test_pre_deferred_schema_is_migrated_without_losing_tasks(db):
+    clock = FakeClock()
+    identity = _identity()
+    _admit(db, identity, clock)
+
+    with sqlite3.connect(db) as conn:
+        current_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='hosted_room_driver_tasks'"
+        ).fetchone()[0]
+        old_sql = current_sql.replace(", 'deferred'", "")
+        conn.execute("DROP INDEX idx_hosted_room_driver_tasks_status")
+        conn.execute(
+            "ALTER TABLE hosted_room_driver_tasks RENAME TO hosted_room_driver_tasks_current"
+        )
+        conn.execute(old_sql)
+        columns = ", ".join(driver._TASK_COLUMN_ORDER)
+        conn.execute(
+            f"""INSERT INTO hosted_room_driver_tasks ({columns})
+                 SELECT {columns} FROM hosted_room_driver_tasks_current"""
+        )
+        conn.execute("DROP TABLE hosted_room_driver_tasks_current")
+        conn.execute(
+            """CREATE INDEX idx_hosted_room_driver_tasks_status
+               ON hosted_room_driver_tasks(
+                   room_id, status, source_event_seq, created_at, task_id
+               )"""
+        )
+
+    assert driver.get_task(db, identity)["status"] == "queued"
+    with sqlite3.connect(db) as conn:
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='hosted_room_driver_tasks'"
+        ).fetchone()[0]
+    assert "'deferred'" in table_sql
 
 
 def test_first_schema_creation_is_safe_across_processes(db):

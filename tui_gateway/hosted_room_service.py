@@ -14,6 +14,10 @@ from typing import Any
 from gateway import hosted_room_discussion as discussion
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
+from gateway.hosted_room_policy_checkpoint import (
+    HostedRoomPolicyCheckpoint,
+    PolicySnapshot,
+)
 from tui_gateway.hosted_room_driver import HostedRoomBinding, HostedRoomRuntime
 from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
 
@@ -21,10 +25,14 @@ from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
 class HostedRoomService:
     """Own the hosted Discussion policy and its transport-free worker."""
 
-    def __init__(self, server: ModuleType, *, db_path: Path | str | None = None) -> None:
+    def __init__(
+        self, server: ModuleType, *, db_path: Path | str | None = None
+    ) -> None:
         self.server = server
         self.db_path = Path(db_path or hosted_rooms.default_db_path())
         self._policy_lock = threading.RLock()
+        self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
+        self.policy_checkpoint = HostedRoomPolicyCheckpoint(self.db_path)
         self.rpc = HostedRoomServerRPC(server)
         self.runtime = HostedRoomRuntime(
             db_path=self.db_path,
@@ -33,6 +41,7 @@ class HostedRoomService:
             turn_lock=self._turn_lock,
             prepare_room=self.prepare_room,
             publish_terminal=self.publish_terminal,
+            pending_action=self._set_pending_action,
         )
 
     @property
@@ -43,7 +52,9 @@ class HostedRoomService:
         profiles = {"default"}
         profiles_dir = self.root / "profiles"
         if profiles_dir.is_dir():
-            profiles.update(path.name for path in profiles_dir.iterdir() if path.is_dir())
+            profiles.update(
+                path.name for path in profiles_dir.iterdir() if path.is_dir()
+            )
         return tuple(sorted(profiles))
 
     def bindings(self) -> tuple[HostedRoomBinding, ...]:
@@ -72,6 +83,19 @@ class HostedRoomService:
     def wakeup(self) -> None:
         self.runtime.wakeup()
 
+    def _set_pending_action(
+        self,
+        room_id: str,
+        member_id: str,
+        action: Mapping[str, Any] | None,
+    ) -> None:
+        key = (room_id, member_id)
+        with self._policy_lock:
+            if action is None:
+                self._pending_actions.pop(key, None)
+            else:
+                self._pending_actions[key] = {**action, "member_id": member_id}
+
     def _events(self, room_id: str) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         cursor = 0
@@ -99,37 +123,57 @@ class HostedRoomService:
                 **event.append_kwargs(room_id),
             )
 
+    def _policy_snapshot(self, room: Mapping[str, Any]) -> PolicySnapshot:
+        return self.policy_checkpoint.snapshot(
+            room_id=str(room["room_id"]),
+            latest_seq=int(room["latest_seq"]),
+        )
+
     def _publish_terminal_tasks(
         self,
         room: Mapping[str, Any],
-        events: list[dict[str, Any]],
     ) -> bool:
         changed = False
         local_profiles = self.local_profiles()
-        for status in ("settled", "failed", "cancelled"):
+        for status in ("deferred", "settled", "failed", "cancelled"):
             for task in driver.list_tasks(
                 self.db_path,
                 room_id=str(room["room_id"]),
                 status=status,
             ):
+                identity = task["identity"]
+                if self.policy_checkpoint.publication_exists(
+                    room_id=str(room["room_id"]),
+                    task_id=identity.task_id,
+                    status=status,
+                    execution_generation=int(task["execution_generation"]),
+                ):
+                    continue
+                task_events = self.policy_checkpoint.events_for_task(
+                    room_id=str(room["room_id"]),
+                    source_event_seq=int(task["payload"]["source_event_seq"]),
+                )
                 plan = discussion.reconstruct_task_plan(
                     room,
-                    events,
+                    task_events,
                     task,
                     local_profiles=local_profiles,
                 )
                 publication = discussion.plan_publication(
                     room,
-                    events,
+                    task_events,
                     plan,
                     status=status,
                     result=task.get("result"),
+                    execution_generation=(
+                        int(task["execution_generation"])
+                        if status == "deferred"
+                        else None
+                    ),
                     local_profiles=local_profiles,
                 )
-                before = len(events)
                 self._append_plan(str(room["room_id"]), publication)
-                events = self._events(str(room["room_id"]))
-                changed = changed or len(events) > before
+                changed = True
         return changed
 
     def _append_room_status(
@@ -158,13 +202,20 @@ class HostedRoomService:
     def prepare_room(self, binding: HostedRoomBinding) -> None:
         with self._policy_lock:
             room = hosted_rooms.room_state(self.db_path, room_id=binding.room_id)
-            events = self._events(binding.room_id)
-            if self._publish_terminal_tasks(room, events):
-                events = self._events(binding.room_id)
+            snapshot = self._policy_snapshot(room)
+            events = list(snapshot.events)
+            if self._publish_terminal_tasks(room):
+                room = hosted_rooms.room_state(
+                    self.db_path,
+                    room_id=binding.room_id,
+                )
+                snapshot = self._policy_snapshot(room)
+                events = list(snapshot.events)
             decision = discussion.plan_next_task(
                 room,
                 events,
                 local_profiles=self.local_profiles(),
+                initial_watermarks=snapshot.watermarks,
             )
             if decision.status == "task" and decision.task is not None:
                 driver.admit_task(
@@ -176,15 +227,13 @@ class HostedRoomService:
                 # A stop can race the policy read from another process. Re-read
                 # after admission and cancel before the runtime can execute a
                 # task whose source event is now behind the room stop fence.
-                fresh_events = self._events(binding.room_id)
-                stopped_through_seq = max(
-                    (
-                        int(event["seq"])
-                        for event in fresh_events
-                        if event.get("kind") == "room.stop_requested"
-                    ),
-                    default=0,
+                fresh_room = hosted_rooms.room_state(
+                    self.db_path,
+                    room_id=binding.room_id,
                 )
+                stopped_through_seq = self._policy_snapshot(
+                    fresh_room
+                ).stopped_through_seq
                 if (
                     decision.source_event_seq is not None
                     and decision.source_event_seq < stopped_through_seq
@@ -248,7 +297,11 @@ class HostedRoomService:
             payload=normalized,
         )
         binding = next(
-            (candidate for candidate in self.bindings() if candidate.room_id == room_id),
+            (
+                candidate
+                for candidate in self.bindings()
+                if candidate.room_id == room_id
+            ),
             None,
         )
         if binding is None:
@@ -257,24 +310,125 @@ class HostedRoomService:
         self.runtime.wakeup()
         return event
 
-    def stop_room(self, room_id: str, *, cancel_id: str) -> int:
+    def stop_room(
+        self,
+        room_id: str,
+        *,
+        cancel_id: str,
+        require_acknowledged: bool = False,
+    ) -> int:
         hosted_rooms.request_room_stop(
             self.db_path,
             room_id=room_id,
             cancel_id=cancel_id,
         )
         cancelled = 0
+        pending = 0
         with self._policy_lock:
-            for status in ("queued", "running", "indeterminate"):
+            tasks = {}
+            for status in (
+                "queued",
+                "running",
+                "indeterminate",
+                "deferred",
+                "stopping",
+            ):
                 for task in driver.list_tasks(
                     self.db_path,
                     room_id=room_id,
                     status=status,
                 ):
-                    self.runtime.cancel(task["identity"], cancel_id=cancel_id)
-                    cancelled += 1
+                    identity = task["identity"]
+                    tasks[(identity.room_id, identity.task_id)] = task
+            for task in tasks.values():
+                task_cancel_id = (
+                    str(task.get("cancel_id") or "")
+                    if task.get("status") == "stopping"
+                    else ""
+                )
+                result = self.runtime.cancel(
+                    task["identity"],
+                    cancel_id=task_cancel_id or cancel_id,
+                )
+                cancelled += 1
+                if result["status"] == "stopping":
+                    pending += 1
+        if require_acknowledged and pending:
+            raise RuntimeError(
+                "room work is still stopping; retry deletion after Stop completes"
+            )
         self.runtime.wakeup()
         return cancelled
+
+    def retry_room_task(self, room_id: str, *, task_id: str) -> dict[str, Any]:
+        """Retry one uncertain or deferred task only after explicit user action."""
+
+        task = next(
+            (
+                candidate
+                for status in ("indeterminate", "deferred")
+                for candidate in driver.list_tasks(
+                    self.db_path, room_id=room_id, status=status
+                )
+                if candidate["identity"].task_id == task_id
+            ),
+            None,
+        )
+        if task is None:
+            raise driver.InvalidTaskTransitionError(
+                "no retryable room task matches task_id"
+            )
+        return self.runtime.retry_indeterminate(task["identity"])
+
+    def approve_room_task(
+        self,
+        room_id: str,
+        *,
+        member_id: str,
+        task_id: str,
+        execution_generation: int,
+        choice: str,
+        request_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Resolve one exact local approval and wake room observation."""
+
+        key = (room_id, member_id)
+        with self._policy_lock:
+            action = self._pending_actions.get(key)
+        requested_approval_id = str(request_id or "")
+        pending_approval_id = str((action or {}).get("request_id") or "")
+        if (
+            action is None
+            or action.get("task_id") != task_id
+            or int(action.get("execution_generation") or 0) != execution_generation
+            or not requested_approval_id
+            or requested_approval_id != pending_approval_id
+        ):
+            raise RuntimeError("room approval is no longer pending")
+        if choice not in {"once", "deny"}:
+            raise RuntimeError("room approval choice must be once or deny")
+        session_id = str(action.get("session_id") or "")
+        if not session_id:
+            raise RuntimeError("local room approval identity is unavailable")
+        result = self.rpc.approve(
+            session_id=session_id,
+            request_id=requested_approval_id,
+            choice=choice,
+        )
+        if result is None:
+            raise RuntimeError("room approval target is unavailable")
+        with self._policy_lock:
+            current = self._pending_actions.get(key)
+            if (
+                current is not None
+                and str(current.get("request_id") or "") == requested_approval_id
+                and current.get("task_id") == task_id
+                and int(current.get("execution_generation") or 0)
+                == execution_generation
+            ):
+                self._pending_actions.pop(key, None)
+        self.runtime.wakeup()
+        return result
 
     def status(self, room_id: str | None = None) -> dict[str, Any]:
         runtime = self.runtime.status()
@@ -282,13 +436,30 @@ class HostedRoomService:
             return runtime
         tasks = driver.list_tasks(self.db_path, room_id=room_id)
         counts = Counter(str(task["status"]) for task in tasks)
+        pending_actions = [
+            {
+                "kind": "retry",
+                "task_id": task["identity"].task_id,
+            }
+            for task in tasks
+            if task["status"] in {"indeterminate", "deferred"}
+        ]
+        with self._policy_lock:
+            pending_actions.extend(
+                dict(action)
+                for (
+                    action_room_id,
+                    _member_id,
+                ), action in self._pending_actions.items()
+                if action_room_id == room_id
+            )
         return {
             "running": runtime["running"],
             "working": bool(
-                counts.get("running")
-                or counts.get("queued")
-                or counts.get("stopping")
+                counts.get("running") or counts.get("queued") or counts.get("stopping")
             ),
-            "blocked": room_id in runtime["blocked_rooms"] or bool(counts.get("indeterminate")),
+            "blocked": room_id in runtime["blocked_rooms"]
+            or bool(counts.get("indeterminate") or counts.get("stopping")),
             "counts": dict(counts),
+            "pending_actions": pending_actions,
         }
