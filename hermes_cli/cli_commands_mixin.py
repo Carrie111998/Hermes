@@ -873,6 +873,59 @@ class CLICommandsMixin:
         _cprint("  Your CLI session is intact.")
         return True
 
+    def _manual_handoff_session(self, cmd_original: str = "") -> None:
+        """Handle ``/handoff-session [--extractive] [focus topic]``.
+
+        Write a durable session handoff file without compressing context.
+        Produces ``handoff-<session_id>.md`` with goals, decisions, next steps,
+        and a transcript excerpt for continuity after compaction or a restart.
+
+        By default the auxiliary LLM summarizes the session (strict: an LLM
+        failure is reported rather than silently downgraded). ``--extractive``
+        forces the dependency-free extractive handoff.
+        """
+        from cli import _cprint
+
+        if not self.agent:
+            _cprint("  No active agent -- send a message first.")
+            return
+
+        tokens = cmd_original.strip().split() if cmd_original else []
+        args = tokens[1:]
+        extractive = "--extractive" in args
+        focus_topic = " ".join(t for t in args if t != "--extractive").strip()
+
+        try:
+            from agent.handoff import generate_handoff, HandoffLLMError
+
+            history = list(self.conversation_history) if self.conversation_history else []
+            try:
+                handoff_path = generate_handoff(
+                    session_id=getattr(self.agent, "session_id", None) or self.session_id,
+                    messages=history,
+                    reason="manual_handoff",
+                    platform="cli",
+                    model=getattr(self.agent, "model", None),
+                    focus_topic=focus_topic or None,
+                    llm_summarize=not extractive,
+                    strict_llm=not extractive,
+                    session_name=getattr(self, "session_name", None),
+                )
+            except HandoffLLMError as exc:
+                # Strict LLM handoff failed — do NOT silently degrade. Tell the
+                # user and offer the explicit extractive recovery.
+                _cprint(f"  Could not generate an LLM handoff: {exc}")
+                _cprint("  Retry, or run /handoff-session --extractive to save a raw extractive handoff.")
+                return
+
+            mode = "extractive" if extractive else "LLM"
+            _cprint(f"  Handoff saved: {handoff_path} ({mode} handoff)")
+            _cprint(f"     Messages: {len(history)}")
+            if focus_topic:
+                _cprint(f"     Focus: {focus_topic}")
+        except Exception as exc:
+            _cprint(f"  Handoff failed: {exc}")
+
     def _handle_resume_command(self, cmd_original: str) -> None:
         """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
         from cli import _cprint, _sync_process_session_id
