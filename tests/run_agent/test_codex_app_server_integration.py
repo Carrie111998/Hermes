@@ -78,7 +78,7 @@ class TestRunConversationCodexPath:
         # No background review fork during tests
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello there")
-        assert result["final_response"] == "echo: hello there"
+        assert result["final_response"].startswith("echo: hello there\n\n[Runtime Context]")
         assert result["completed"] is True
         assert result["partial"] is False
         assert result["error"] is None
@@ -197,7 +197,9 @@ class TestRunConversationCodexPath:
         assert msgs[0]["content"] == "hello"
         # Last assistant message has the final text
         final = [m for m in msgs if m.get("role") == "assistant"
-                 and m.get("content") == "echo: hello"]
+                 and (m.get("content") or "").startswith(
+                     "echo: hello\n\n[Runtime Context]"
+                 )]
         assert final, f"expected final assistant message in {msgs}"
 
     def test_projected_messages_are_synced_to_external_memory(self, fake_session):

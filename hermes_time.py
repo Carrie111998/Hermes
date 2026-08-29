@@ -133,3 +133,75 @@ def now() -> datetime:
     return datetime.now().astimezone()
 
 
+def get_timezone_name() -> str:
+    """Return the configured IANA timezone name (e.g. ``Asia/Shanghai``).
+
+    Returns an empty string when no timezone is configured.
+    """
+    timezone = get_timezone()  # ensure the cache is resolved and validated
+    return (_cached_tz_name or "") if timezone is not None else ""
+
+
+def get_utc_offset_display(now_dt: Optional[datetime] = None) -> str:
+    """Return the UTC offset for the configured timezone (e.g. ``+08:00``).
+
+    ``now_dt`` defaults to ``now()``. With no configured timezone, the
+    server-local offset is used. Returns ``+00:00`` for UTC.
+    """
+    current = now_dt if now_dt is not None else now()
+    offset = current.utcoffset()
+    if offset is None:  # defensive: now() is always tz-aware
+        return "+00:00"
+    total_seconds = int(offset.total_seconds())
+    sign = "+" if total_seconds >= 0 else "-"
+    hours, remainder = divmod(abs(total_seconds), 3600)
+    minutes = remainder // 60
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def format_current_time_context(now_dt: Optional[datetime] = None) -> str:
+    """Format a ``[Runtime Context]`` time block for per-turn injection.
+
+    Injected into the API copy of the current turn's user message (never the
+    cached system prompt), so the volatile timestamp re-renders every turn
+    while the cached prompt prefix stays byte-stable. Generates ``now()`` when
+    ``now_dt`` is omitted; tests pass a fixed value for determinism.
+
+    Example::
+
+        [Runtime Context]
+        Current datetime: 2026-08-29T13:25:42+08:00
+        Timezone: Asia/Shanghai
+        UTC offset: +08:00
+    """
+    current = now_dt if now_dt is not None else now()
+    lines = [
+        "[Runtime Context]",
+        f"Current datetime: {current.isoformat(timespec='seconds')}",
+    ]
+    tz_name = get_timezone_name()
+    if tz_name:
+        lines.append(f"Timezone: {tz_name}")
+    lines.append(f"UTC offset: {get_utc_offset_display(current)}")
+    return "\n".join(lines)
+
+
+def prepend_current_time_context(
+    text: str,
+    now_dt: Optional[datetime] = None,
+) -> str:
+    """Prepend the per-turn current-time block to *text*.
+
+    Shared by the turn prologue and the max-iterations summary path so both
+    API copies carry the same volatile time block, formatted from the same
+    instant. Fail-open: if time formatting fails for any reason, *text* is
+    returned unchanged so a formatting problem can never block a turn.
+    """
+    try:
+        block = format_current_time_context(now_dt=now_dt)
+        if block:
+            return block + "\n\n" + text
+    except Exception:
+        pass
+    return text
+
