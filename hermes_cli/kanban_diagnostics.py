@@ -650,6 +650,59 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_missing_exit_signal(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Repeated rc=0/no-terminal-signal cards need review, not generic triage.
+
+    The dispatcher moves these tasks to ``completed_pending_review`` after the
+    clean-exit protocol-violation streak reaches its bound. This rule is
+    read-only: it makes the distinct terminal-review state searchable through
+    ``hermes kanban diagnostics`` and the dashboard without mutating the card.
+    """
+    if _task_field(task, "status") != "completed_pending_review":
+        return []
+
+    task_id = _task_field(task, "id")
+    missing_events = [ev for ev in events if _event_kind(ev) == "missing_exit_signal"]
+    latest = missing_events[-1] if missing_events else None
+    payload = _parse_payload(latest) if latest is not None else {}
+    last_err = (
+        payload.get("error")
+        or _task_field(task, "last_failure_error", "")
+        or "worker exited rc=0 without kanban_complete/kanban_block"
+    )
+
+    return [Diagnostic(
+        kind="missing_exit_signal",
+        severity="error",
+        title="Worker exited without terminal Kanban signal",
+        detail=(
+            "The dispatcher observed repeated worker rc=0 exits while the card "
+            "remained running, which means no kanban_complete or kanban_block "
+            "signal was recorded. Review the worker log/evidence, then close "
+            "the card with kanban_complete or kanban_block; do not treat this "
+            "as a generic crash, spawn failure, or iteration-budget condition."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="comment",
+                label="Add review finding before completing/blocking",
+                payload={"task_id": task_id} if task_id else {},
+                suggested=True,
+            ),
+            *_generic_recovery_actions(task, running=False),
+        ],
+        first_seen_at=_event_ts(latest) if latest is not None else now,
+        last_seen_at=_event_ts(latest) if latest is not None else now,
+        count=max(1, int(payload.get("protocol_violations") or len(missing_events) or 1)),
+        data={
+            "last_error": str(last_err),
+            "protocol_violations": payload.get("protocol_violations"),
+            "protocol_violation_limit": payload.get("protocol_violation_limit"),
+            "event_kind": "missing_exit_signal",
+        },
+    )]
+
+
 def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     """The worker spawns fine but keeps crashing mid-run. Check the last
     N runs' outcomes; N consecutive ``crashed`` without a successful
@@ -955,6 +1008,49 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _rule_review_lane_dependency_inversion(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Warn when a reviewer lane is parented to the blocked source it reviews.
+
+    The dependency gate itself remains strict in kanban_db.claim_task; this
+    diagnostic is advisory so dashboards/dry-runs can tell the operator why the
+    review child cannot run and which graph shape to use instead.
+    """
+    task_id = _task_field(task, "id")
+    warnings = cfg.get("review_lane_parent_warnings") or {}
+    warning = warnings.get(task_id) if task_id else None
+    if not isinstance(warning, dict):
+        return []
+    source_id = warning.get("source_task_id") or "<source>"
+    return [Diagnostic(
+        kind="review_lane_dependency_inversion",
+        severity="warning",
+        title="Reviewer lane is blocked by the source it must review",
+        detail=(
+            "This review-looking task has exactly one unfinished parent, and "
+            f"that parent ({source_id}) is a blocked review-required source. "
+            "Parent dependency gates are working correctly; the task graph is "
+            "inverted. Create an independent reviewer lane linked by body/comment, "
+            "or remove/supersede only the stale inverted parent edge after checking "
+            "for duplicate completed reviews."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="comment",
+                label="Route independent reviewer lane or repair parent edge",
+                suggested=True,
+            ),
+        ],
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "source_task_id": source_id,
+            "source_status": warning.get("source_status"),
+            "source_assignee": warning.get("source_assignee"),
+        },
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``ready`` status for too long without any worker
     claiming it.
@@ -1084,11 +1180,13 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_missing_exit_signal,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_review_lane_dependency_inversion,
     _rule_stranded_in_ready,
 ]
 
@@ -1099,11 +1197,13 @@ DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
+    "missing_exit_signal",
     "repeated_failures",
     "repeated_crashes",
     "review_dependency_deadlock",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "review_lane_dependency_inversion",
     "stranded_in_ready",
 )
 

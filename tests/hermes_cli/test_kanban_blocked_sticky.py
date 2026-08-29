@@ -83,6 +83,73 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
 # ---------------------------------------------------------------------------
 
 
+def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
+    """A task whose status was set to ``blocked`` directly (no ``blocked``
+    event) and whose ``consecutive_failures`` is below the circuit-breaker
+    limit must stay blocked — preserves the
+    pre-#28712 recovery semantics for genuinely transient failures.
+
+    The complementary case — a block whose failure count has *reached*
+    the limit must stay blocked — is covered by
+    ``test_kanban_db.py::test_recompute_ready_skips_tasks_at_failure_limit``
+    (#35072).  Together they pin the contract: ``recompute_ready`` defers
+    the give-up decision to the same effective limit the breaker uses, so
+    the two never disagree.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.complete_task(conn, parent, result="ok")
+
+        # Simulate a transient circuit-breaker / direct triage that flips
+        # status without emitting a ``blocked`` event — exactly what
+        # ``_record_task_failure`` does below the limit.  One failure is
+        # under the default limit (2), so recovery is still correct.
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=1, "
+            "last_failure_error='transient error' WHERE id=?",
+            (child,),
+        )
+        conn.commit()
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+
+
+def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
+    """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
+    sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
+    events — it only considers ``blocked``/``unblocked`` event kinds.
+
+    However, the blind-spot guard (t_6009ccaa) catches *any* task with
+    ``status='blocked'`` regardless of whether a ``blocked`` event exists.
+    A task that reached ``status='blocked'`` via ``_record_task_failure``
+    at/above the failure limit stays blocked via the guard (the failure-
+    limit check at lines 4413-4420 of ``recompute_ready`` would also keep
+    it blocked in this state, so both paths agree).
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.complete_task(conn, parent, result="ok")
+
+        # Status + event match what _record_task_failure writes when
+        # the breaker trips.
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id=?", (child,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'gave_up', NULL, ?)",
+            (child, int(time.time())),
+        )
+        conn.commit()
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +157,38 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
 # ---------------------------------------------------------------------------
 
 
+def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -> None:
+    """``hermes kanban unblock`` (or the ``kanban_unblock`` tool) correctly
+    clears the sticky-block state: the task transitions back to ``ready``
+    and the most recent block/unblock event is ``unblocked``.
+
+    However, a *subsequent* direct status flip to ``blocked`` without a
+    ``blocked`` event is caught by the blind-spot guard (t_6009ccaa) and
+    stays blocked — ANY ``status='blocked'`` task without a ``blocked``
+    event is kept blocked, regardless of the prior sticky history.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="review-required: ...",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.unblock_task(conn, tid)
+        # After unblock the task is no longer blocked at all.
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Now simulate a *later* direct status flip to 'blocked' without
+        # a 'blocked' event.  The blind-spot guard prevents auto-promotion.
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
 # ---------------------------------------------------------------------------
 # Full bug-shaped loop: block → promote → crash → gave_up → next tick
 # ---------------------------------------------------------------------------
@@ -161,3 +260,105 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test
 # here; dropped during salvage to avoid two assertions of the same contract.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Sticky gate honoured on the ``todo`` routing path (t_jarvis_autopromote_20260728)
+# ---------------------------------------------------------------------------
+
+
+def test_sticky_block_survives_blocked_to_todo_reset(kanban_home: Path) -> None:
+    """Live evidence 2026-07-28 20:26Z + 6-wake reclaim loop: a card that was
+    sticky-blocked, then reset to ``todo`` WITHOUT an ``unblocked`` event
+    (triage reset / approval-auto-clear / direct status write), escaped the
+    ``blocked``-status sticky guard and was promoted+claimed every tick.
+
+    With the guard extended to ``todo`` rows whose block_kind is not
+    ``dependency``, the card must stay parked until ``unblock_task`` emits
+    ``unblocked``.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="time-gated card")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="awaiting 24h soak gate",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Reset to todo WITHOUT an unblocked event (what jarvis-triage did),
+        # with block_kind cleared (not 'dependency').
+        conn.execute(
+            "UPDATE tasks SET status='todo', block_kind=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        # Sticky gate must hold on the todo path: no promotion across ticks.
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "todo"
+
+        # Explicit unblock event is the legitimate exit — emit it via SQL
+        # flip back to blocked + unblock_task (the operator path).
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.unblock_task(conn, tid)
+        assert kb.recompute_ready(conn) >= 0
+        assert kb.get_task(conn, tid).status in ("ready", "todo")
+
+
+def test_dependency_block_in_todo_still_auto_recovers(kanban_home: Path) -> None:
+    """The ``dependency`` block kind is the intentional auto-recovery path:
+    once parents are done, the card promotes.  The sticky-guard extension
+    must NOT break this contract."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.complete_task(conn, parent, result="ok")
+
+        kb.claim_task(conn, child)
+        kb.block_task(
+            conn, child,
+            reason="waiting on parent",
+            kind="dependency",
+            expected_run_id=kb.get_task(conn, child).current_run_id,
+        )
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Parents already done — dependency auto-recovery promotes it,
+        # and the sticky-guard extension must NOT block this path.
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_human_authority_block_resists_approval_auto_clear(kanban_home: Path) -> None:
+    """t_552cc9e1 / t_15b7ebc4: a ``needs_input`` human-authority hold must
+    NOT be auto-cleared by ``apply_approvals`` even when a genuine anchored
+    REVIEW_VERDICT=APPROVED comment exists. The hold stays blocked so a human
+    (Frank) must make the decision, and the sticky gate keeps it parked.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs Frank decision")
+        kb.add_comment(
+            conn, tid, "reviewer", "REVIEW_VERDICT=APPROVED please proceed",
+        )
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="awaiting Frank decision",
+            kind="needs_input",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # apply_approvals (the dispatcher lane) must NOT clear this hold.
+        cleared = kb.apply_approvals(conn)
+        assert tid not in cleared
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # And the sticky gate must keep it parked across recompute ticks.
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"

@@ -81,6 +81,50 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _dispatcher_tick_log(slug: str, res: Any) -> "tuple[bool, str, tuple]":
+    """Build the per-board dispatcher telemetry for one tick result.
+
+    A board logs only when it produced a meaningful outcome this tick —
+    spawned workers or reconciled missing-exit-signal tasks. Idle boards
+    stay silent so a quiet gateway does not spam logs, and the decision is
+    made per board so one busy board cannot make a sibling idle board log a
+    spurious zero line.
+
+    Returns ``(should_log, message, args)``; when ``should_log`` is True the
+    caller emits ``logger.info(message, *args)``. Missing-exit-signal
+    reconciliations get a distinct message with a dedicated bucket so the
+    diagnostic is searchable and never conflated with generic crashes.
+    """
+    if res is None:
+        return False, "", ()
+    spawned = getattr(res, "spawned", None) or []
+    missing = getattr(res, "missing_exit_signal", []) or []
+    if not spawned and not missing:
+        return False, "", ()
+    counts = (
+        len(spawned),
+        getattr(res, "reclaimed", 0),
+        len(getattr(res, "crashed", []) or []),
+        len(getattr(res, "timed_out", []) or []),
+        getattr(res, "promoted", 0),
+        len(getattr(res, "auto_blocked", []) or []),
+    )
+    if missing:
+        return (
+            True,
+            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+            "crashed=%d timed_out=%d promoted=%d "
+            "auto_blocked=%d missing_exit_signal=%d",
+            (slug, *counts, len(missing)),
+        )
+    return (
+        True,
+        "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+        "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+        (slug, *counts),
+    )
+
+
 def _kanban_dispatch_allowed() -> bool:
     """Return False while the global emergency stop (`hermes pause`) is engaged.
 
@@ -1800,21 +1844,13 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
-                        if res is not None and getattr(res, "spawned", None):
-                            any_spawned = True
+                        should_log, message, args = _dispatcher_tick_log(slug, res)
+                        if not should_log:
                             # Quiet by default — only log when something actually
                             # happened, so an idle gateway stays silent.
-                            logger.info(
-                                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
-                                slug,
-                                len(res.spawned),
-                                res.reclaimed,
-                                len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                                len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                                res.promoted,
-                                len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
-                            )
+                            continue
+                        any_spawned = True
+                        logger.info(message, *args)
                     # Health telemetry (aggregate across boards)
                     ready_pending = await _to_thread_process_service(_ready_nonempty)
                     if ready_pending and not any_spawned:

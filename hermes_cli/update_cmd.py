@@ -8092,10 +8092,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged. Before
                 # assuming an upstream force-push, check WHY: a checkout on a
-                # custom branch (local commits on top of origin/<branch>) also
-                # cannot fast-forward, and `reset --hard` here would silently
-                # discard that work. Merge instead and stop cleanly on
-                # conflict — an update must never destroy local commits.
+                # custom branch (local commits on top of origin/<branch>) or a
+                # fleet overlay (kanban/cron survival patches, FLEET-OVERLAY
+                # marker) also cannot fast-forward, and `reset --hard` here
+                # would silently discard that work. Merge instead and stop
+                # cleanly on conflict — an update must never destroy local
+                # commits.
+                _overlay = get_hermes_home() / "FLEET-OVERLAY"
                 _cur_branch = (
                     subprocess.run(
                         git_cmd + ["branch", "--show-current"],
@@ -8105,9 +8108,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ).stdout
                     or ""
                 ).strip()
-                if _cur_branch and _cur_branch != branch:
+                if _overlay.is_file() or (_cur_branch and _cur_branch != branch):
+                    reason = (
+                        "fleet overlay present"
+                        if _overlay.is_file()
+                        else f"checkout on custom branch '{_cur_branch}'"
+                    )
                     print(
-                        f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
+                        f"  ⚠ Fast-forward not possible ({reason}) — "
                         f"merging origin/{branch} instead of resetting so local commits survive..."
                     )
                     # Best-effort safety tag; recovery anchor if anything goes wrong.
@@ -8119,7 +8127,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         check=False,
                     )
                     merge_result = subprocess.run(
-                        git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
+                        git_cmd + ["merge", "--no-edit", "--no-ff", f"origin/{branch}"],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
@@ -8143,6 +8151,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             "  Then re-run the update. Local work is untouched."
                         )
                         sys.exit(1)
+                    pull_result = merge_result
                 else:
                     # Same branch as the update target — a true upstream
                     # force-push/rebase. Local changes are already stashed;

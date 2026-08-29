@@ -24,6 +24,62 @@ def _make_task(kb, *, assignee: str):
     )
 
 
+def test_default_spawn_clears_stale_kanban_run_env(monkeypatch, tmp_path):
+    """Worker env must never inherit a stale HERMES_KANBAN_RUN_ID/CLAIM_LOCK.
+
+    Regression for the t_d985491b run-id skew: the dispatcher's own process
+    (a gateway/daemon that previously claimed another run, or a worker-spawned
+    process) can carry a stale HERMES_KANBAN_RUN_ID in os.environ. Before the
+    fix, `_default_spawn` only OVERWROTE the value when the claimed task had a
+    current_run_id; if the task had none (or the value leaked from a prior
+    claim), the child inherited the stale run id and every terminal kanban
+    tool failed with "unknown id or not in running/ready" → rc=0 protocol
+    violation. The spawn env must be built from the claimed task only.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("toolsets: []\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    # Simulate a dispatcher whose own environment carries a stale run id.
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "424242")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "spark-4be3:999")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    # Claimed task with a fresh run id + lock → child must carry the FRESH
+    # values, never the stale inherited ones.
+    task = _make_task(kb, assignee="elias")  # current_run_id=7, claim_lock="lock"
+    kb._default_spawn(task, str(workspace))
+    assert captured["env"]["HERMES_KANBAN_RUN_ID"] == "7"
+    assert captured["env"]["HERMES_KANBAN_CLAIM_LOCK"] == "lock"
+
+    # Unclaimed task (current_run_id=None, claim_lock=None) → the stale env
+    # values must be REMOVED, not inherited.
+    task2 = _make_task(kb, assignee="elias")
+    task2.current_run_id = None
+    task2.claim_lock = None
+    kb._default_spawn(task2, str(workspace))
+    assert "HERMES_KANBAN_RUN_ID" not in captured["env"]
+    assert "HERMES_KANBAN_CLAIM_LOCK" not in captured["env"]
+
+
 def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):
     """Manual profile assignment should keep that profile's CLI tools.
 

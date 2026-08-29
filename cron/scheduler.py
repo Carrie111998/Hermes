@@ -1305,6 +1305,235 @@ def _consume_interrupted_flag(job_id: str, token: Optional[object] = None) -> bo
         return hit
 
 
+def _inflight_min_allowance_minutes() -> float:
+    """Floor for the stale in-flight allowance, in minutes.
+
+    Effective allowance per job is ``max(2 * interval, this)``, so a
+    slow-but-healthy long-interval job is never clipped by the sweep.
+    """
+    raw = os.getenv("HERMES_CRON_INFLIGHT_MAX_MINUTES", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_INFLIGHT_MAX_MINUTES=%r; using default %s",
+                raw,
+                _INFLIGHT_MIN_ALLOWANCE_MINUTES,
+            )
+    return _INFLIGHT_MIN_ALLOWANCE_MINUTES
+
+
+def _cron_interval_minutes(expr: str) -> Optional[float]:
+    """Approximate the natural interval of a cron expression, in minutes.
+
+    The persisted job store keeps ``schedule`` as an already-parsed dict
+    (``{"kind": "cron", "expr": "0 9 * * 1"}``), so the stale allowance for
+    a cron job cannot be derived from a schedule *string* — it must come
+    from the expression itself.  We measure the gap between the next two
+    fire times with croniter; that is the job's cadence, and the sweep's
+    allowance becomes ``max(2 * cadence, floor)`` exactly like interval
+    jobs.  Falls back to ``None`` (→ floor allowance) if croniter is
+    missing or the expression cannot be evaluated.
+    """
+    try:
+        from croniter import croniter
+        from datetime import datetime
+
+        base = datetime.now()
+        it = croniter(expr, base)
+        first = it.get_next(datetime)
+        second = it.get_next(datetime)
+        gap = (second - first).total_seconds() / 60.0
+        return gap if gap > 0 else None
+    except Exception:
+        return None
+
+
+def _job_interval_minutes(job: dict) -> Optional[float]:
+    """Best-effort interval length for a job, in minutes (None if unknown).
+
+    Reads the PERSISTED schedule shape first: the job store keeps
+    ``schedule`` as an already-parsed dict (``{"kind": "interval",
+    "minutes": N}`` or ``{"kind": "cron", "expr": "..."}``), NOT the string
+    form that ``parse_schedule`` consumes.  The string path is kept only as
+    a defensive fallback for programmatic callers that still build string
+    schedules (and for tests that exercise that shape).
+
+    ``kind == "once"`` (one-shot) has no recurring interval — returns None,
+    so the sweep uses the documented floor allowance.
+    """
+    try:
+        schedule = job.get("schedule")
+        if isinstance(schedule, dict):
+            kind = schedule.get("kind")
+            if kind == "interval":
+                minutes = schedule.get("minutes")
+                return float(minutes) if minutes else None
+            if kind == "cron":
+                return _cron_interval_minutes(str(schedule.get("expr") or ""))
+            return None
+        if isinstance(schedule, str) and schedule.strip():
+            from cron.jobs import parse_schedule
+
+            parsed = parse_schedule(schedule) or {}
+            if parsed.get("kind") == "interval":
+                minutes = parsed.get("minutes")
+                return float(minutes) if minutes else None
+            if parsed.get("kind") == "cron":
+                return _cron_interval_minutes(str(parsed.get("expr") or ""))
+    except Exception:
+        return None
+    return None
+
+
+def get_inflight_guard_stats() -> dict:
+    """Probe-visible snapshot of the in-flight guard.
+
+    ``forced_releases`` is a monotonic counter of stale claims this process
+    has force-released; any non-zero value means a cron job wedged and was
+    recovered without a gateway restart.
+    """
+    now = time.time()
+    with _running_lock:
+        return {
+            "running": sorted(_running_job_ids),
+            "running_ages_seconds": {
+                jid: round(now - started, 1)
+                for jid, started in _running_since.items()
+            },
+            "forced_releases": _forced_release_count,
+            "recent_forced_releases": list(_forced_releases),
+        }
+
+
+def _record_forced_release(job_id: str, name: str, age_seconds: float, allowance_seconds: float) -> None:
+    """Persist a countable signal for one forced release (best-effort)."""
+    entry = {
+        "job_id": job_id,
+        "name": name,
+        "age_seconds": round(age_seconds, 1),
+        "allowance_seconds": round(allowance_seconds, 1),
+        "at": _hermes_now().isoformat(),
+    }
+    with _running_lock:
+        _forced_releases.append(entry)
+        del _forced_releases[:-_FORCED_RELEASE_HISTORY]
+    try:
+        path = _get_hermes_home() / "cron" / "inflight_forced_releases.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception as e:  # never let telemetry break a tick
+        logger.debug("Could not append forced-release record: %s", e)
+
+
+def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
+    """Force-release in-flight claims that can no longer be making progress.
+
+    A claim is stale when it is older than ``max(2 * interval, floor)`` AND
+    either has no live future at all (the wedge class: the claim was taken
+    but the release path was never installed — e.g. a hang in the submit
+    path before ``pool.submit`` returned) or has a future that already
+    finished without discarding the id.
+
+    Every release logs a WARNING with the countable ``event=forced_release``
+    signal, bumps a probe-visible counter (``get_inflight_guard_stats()``),
+    mirrors a JSONL row under the cron dir, and writes ``last_error`` on the
+    job so the wedge surfaces on the job row instead of being invisible
+    until a downstream liveness key goes dead hours later.  A forced release
+    never consumes a finite-repeat job's budget (see below).
+
+    Returns the list of released job ids.
+    """
+    global _forced_release_count
+
+    by_id = {j.get("id"): j for j in (due_jobs or []) if isinstance(j, dict)}
+    floor_seconds = _inflight_min_allowance_minutes() * 60.0
+    now = time.time()
+    stale: list = []
+
+    with _running_lock:
+        for job_id in list(_running_job_ids):
+            started = _running_since.get(job_id)
+            if started is None:
+                # Claim predates this guard (or was injected directly) — adopt
+                # it now so it becomes sweepable one allowance from here.
+                _running_since[job_id] = now
+                continue
+            age = now - started
+            interval_minutes = _job_interval_minutes(by_id.get(job_id) or {})
+            allowance = floor_seconds
+            if interval_minutes:
+                allowance = max(allowance, 2.0 * interval_minutes * 60.0)
+            if age < allowance:
+                continue
+            fut = _running_futures.get(job_id)
+            if fut is _FUTURE_PENDING:
+                # The claim is past its allowance and the owning future still
+                # has not been installed — the submit path itself (SessionDB
+                # init, agent import, config load) hung before ``pool.submit``
+                # returned.  That is exactly the wedge class; release it.
+                pass
+            elif fut is not None and not fut.done():
+                continue  # genuinely still executing
+            _running_job_ids.discard(job_id)
+            _running_since.pop(job_id, None)
+            _running_futures.pop(job_id, None)
+            _forced_release_count += 1
+            stale.append((job_id, age, allowance, fut))
+
+    for job_id, age, allowance, fut in stale:
+        job = by_id.get(job_id) or {}
+        name = job.get("name") or job_id
+        if fut is _FUTURE_PENDING:
+            future_state = "pending"
+        elif fut is None:
+            future_state = "missing"
+        else:
+            future_state = "finished"
+        logger.warning(
+            "cron.inflight.forced_release event=forced_release job='%s' id=%s "
+            "age=%.0fs allowance=%.0fs future=%s — stale in-flight claim "
+            "released; the job was skipping every fire with 'already running'",
+            name,
+            job_id,
+            age,
+            allowance,
+            future_state,
+        )
+        _record_forced_release(job_id, name, age, allowance)
+        # Finite-repeat guard: a forced release is NOT a real run, so it must
+        # not consume a finite one-shot's repeat budget or let mark_job_run
+        # auto-delete the row (completed >= times).  The claim is released and
+        # the row is left untouched, so the job re-fires normally on its next
+        # due tick (self-heal) instead of being deleted.
+        repeat = job.get("repeat") or {}
+        if isinstance(repeat, dict) and repeat.get("times") is not None:
+            logger.warning(
+                "cron.inflight.forced_release.job_untouched job='%s' id=%s — "
+                "finite-repeat job released without mark_job_run (repeat budget "
+                "preserved); row left in place so it re-fires normally",
+                name,
+                job_id,
+            )
+            continue
+        try:
+            mark_job_run(
+                job_id,
+                False,
+                f"Stale in-flight claim force-released after {age / 60:.1f}m "
+                f"(allowance {allowance / 60:.1f}m); previous run never released "
+                f"the scheduler in-flight guard",
+            )
+        except Exception as e:
+            logger.warning("Could not record forced release for job %s: %s", job_id, e)
+
+    return [s[0] for s in stale]
+
+
 # Sequential (env-mutating) cron jobs — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
 # ticker thread.  A persistent single-thread executor preserves ordering across
@@ -3930,6 +4159,16 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS = _RUN_CLAIM_HEARTBEAT_SECONDS * 3
+_CRON_SYSTEMD_CONTEXT_MODE = "systemd-run-user-service"
+_CRON_SYSTEMD_PROPERTY_ALLOWLIST = {
+    "CPUQuota",
+    "IOWeight",
+    "MemoryHigh",
+    "MemoryMax",
+    "Nice",
+    "Slice",
+    "TasksMax",
+}
 
 
 def _get_script_timeout() -> int:
@@ -4093,6 +4332,84 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
 
     return str(interpreter), env_overlay
+
+def _sanitize_systemd_unit_fragment(value: object, *, default: str) -> str:
+    """Return a conservative unit-name fragment for transient cron services."""
+    raw = str(value or "").strip() or default
+    chars = []
+    for ch in raw:
+        if ch.isalnum() or ch in {"_", "-", "."}:
+            chars.append(ch)
+        else:
+            chars.append("-")
+    fragment = "".join(chars).strip("-.") or default
+    return fragment[:48]
+
+
+def _coerce_systemd_property_value(value: object) -> str:
+    """Constrain systemd property values to simple scalar tokens."""
+    text = str(value).strip()
+    if not text or len(text) > 128 or any(ch in text for ch in "\r\n\0"):
+        raise ValueError("systemd property values must be non-empty scalar strings")
+    return text
+
+
+def _systemd_cron_context_argv(
+    argv: list[str], *, exec_context: object, job_id: object = None
+) -> list[str]:
+    """Wrap a cron script command in a transient user service when requested.
+
+    ``systemd-run --user --scope`` cannot be combined with ``--wait`` on the
+    systemd version shipped on the DGX host, so the scheduler uses a transient
+    user service with ``--wait --pipe --collect``.  That still moves the native
+    workload out of the gateway service cgroup while preserving synchronous
+    stdout/stderr capture and existing cron success/timeout semantics.
+    """
+    if not exec_context:
+        return argv
+    if not isinstance(exec_context, dict):
+        raise ValueError("cron exec_context must be an object")
+    mode = str(exec_context.get("mode") or "").strip()
+    if not mode:
+        return argv
+    if mode != _CRON_SYSTEMD_CONTEXT_MODE:
+        raise ValueError(
+            f"unsupported cron exec_context mode {mode!r}; expected "
+            f"{_CRON_SYSTEMD_CONTEXT_MODE!r}"
+        )
+    if sys.platform == "win32":
+        raise ValueError("systemd cron exec_context is not supported on Windows")
+
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise ValueError("systemd-run not found on PATH for cron exec_context")
+
+    prefix = _sanitize_systemd_unit_fragment(
+        exec_context.get("unit_prefix"),
+        default="hermes-cron",
+    )
+    safe_job = _sanitize_systemd_unit_fragment(job_id, default="job")
+    unit = f"{prefix}-{safe_job}-{os.getpid()}"
+    wrapped = [
+        systemd_run,
+        "--user",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--quiet",
+        f"--unit={unit}",
+    ]
+
+    properties = exec_context.get("properties") or {}
+    if not isinstance(properties, dict):
+        raise ValueError("cron exec_context.properties must be an object")
+    for key, raw_value in sorted(properties.items()):
+        key_text = str(key).strip()
+        if key_text not in _CRON_SYSTEMD_PROPERTY_ALLOWLIST:
+            raise ValueError(f"unsupported cron exec_context systemd property {key_text!r}")
+        wrapped.append(f"--property={key_text}={_coerce_systemd_property_value(raw_value)}")
+
+    return wrapped + argv
 
 
 def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
@@ -4273,6 +4590,9 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *,
+    exec_context: object = None,
+    job_id: object = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4294,6 +4614,10 @@ def _run_job_script(
     Subprocess environment is passed through ``_sanitize_subprocess_env`` so
     provider credentials and other Hermes-managed secrets are not inherited
     (SECURITY.md §2.3), matching terminal and MCP child processes.
+
+    Jobs may opt into ``exec_context.mode: systemd-run-user-service`` to run the
+    script in a transient user service with dedicated/relaxed cgroup properties
+    while the scheduler still waits for and captures the script output.
 
     Args:
         script_path: Path to the script.  Relative paths are resolved
@@ -4403,6 +4727,14 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        try:
+            argv = _systemd_cron_context_argv(
+                argv,
+                exec_context=exec_context,
+                job_id=job_id,
+            )
+        except ValueError as exc:
+            return False, f"Cron exec_context error: {exc}"
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4498,7 +4830,13 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            exec_context=job.get("exec_context"),
+            job_id=job.get("id"),
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4529,10 +4867,22 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            exec_context=job.get("exec_context"),
+            job_id=job.get("id"),
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            exec_context=job.get("exec_context"),
+            job_id=job.get("id"),
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -4972,6 +5322,305 @@ def _block_and_pause_job(
     )
     alert = f"⚠ Cron job '{job_name}' was auto-paused\n\n{reason}"
     return False, doc, alert, reason
+
+
+# Channel id for the #critical-alerts Discord channel, the structural
+# complement to #critical-alerts: scheduler-level faults that must never sit
+# silent (the missing-script "dead-pin" black-hole class) are routed here.
+# Reused by the dead-pin guard below. Do not invent a new channel — this is
+# the one the dqsh_audit_watchdog cron (0ead099b5eac) and other critical
+# alerts already target.
+_CRITICAL_ALERTS_CHANNEL_ID = "1521973787363508325"  # #critical-alerts (Discord)
+
+
+def _is_missing_script_error(script_output: str) -> bool:
+    """Return True if a ``_run_job_script`` failure is the missing-file class.
+
+    The missing-file class is ``"Script not found: <path>"`` (file absent) or
+    ``"Script path is not a file: <path>"`` (path exists but is not a regular
+    file, e.g. a directory). These are *permanent* misconfigurations — the job
+    will never run until the operator fixes the path — so they warrant an
+    auto-pause. Transient failures (non-zero exit, timeout, execution error)
+    are deliberately excluded: a script that exists but crashed this tick
+    should keep firing so a fixed version resumes and so we don't mask a real
+    error behind a paused job.
+    """
+    if not script_output:
+        return False
+    # Exact-prefix match against the literals emitted by _run_job_script
+    # (``Script not found:`` / ``Script path is not a file:``). Substring
+    # matching over the whole output is unsafe: run_job feeds the script's
+    # own stderr/stdout into this classifier, so an existing script that
+    # exits non-zero while printing e.g. "not a file" would be misclassified
+    # as a dead-pin and auto-paused.
+    return script_output.startswith("Script not found:") or script_output.startswith(
+        "Script path is not a file:"
+    )
+
+
+def _alert_critical_alerts(message: str) -> None:
+    """Best-effort delivery of ``message`` to the #critical-alerts Discord channel.
+
+    This is the LOUD escape hatch for scheduler-level faults that must never
+    sit silent (the missing-script black-hole class). It prefers the gateway's
+    live Discord adapter when available, then falls back to ``logger.critical``
+    rather than raising — the operator still sees it in the scheduler log, and
+    the failure to alert is itself logged.
+
+    Fail-safe by design: a broken alert path must NEVER crash the scheduler
+    tick or prevent due jobs from running.
+    """
+    try:
+        from gateway.config import load_gateway_config, Platform
+        from tools.send_message_tool import _send_to_platform
+
+        config = load_gateway_config()
+        platform = Platform.DISCORD
+        pconfig = config.platforms.get(platform)
+        if pconfig and getattr(pconfig, "enabled", False):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            async def _emit() -> None:
+                await _send_to_platform(
+                    "discord",
+                    pconfig,
+                    _CRITICAL_ALERTS_CHANNEL_ID,
+                    message,
+                )
+
+            if loop is not None and loop.is_running():
+                asyncio.ensure_future(_emit())
+            else:
+                try:
+                    asyncio.run(_emit())
+                except RuntimeError:
+                    def _run() -> None:
+                        try:
+                            asyncio.run(_emit())
+                        except Exception:
+                            logger.exception("critical-alerts preflight send failed")
+                    try:
+                        concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(_run)
+                    except Exception:
+                        logger.exception("critical-alerts preflight send failed")
+            return
+        else:
+            logger.warning(
+                "Discord not enabled — cannot route #critical-alerts preflight; "
+                "emitting via logger.critical instead"
+            )
+    except Exception:
+        logger.exception("Failed to deliver #critical-alerts preflight; logging instead")
+
+    # Hard fallback: the alert is always visible in the scheduler log even if
+    # Discord delivery is unavailable.
+    logger.critical("%s", message)
+
+
+def _handle_cron_dead_pin(job: dict, script_path: str, script_output: str) -> None:
+    """Alert #critical-alerts and auto-pause a job whose script is missing.
+
+    Called from both the no_agent and LLM fire paths when ``_run_job_script``
+    fails with the missing-file class. Only missing-file failures auto-pause;
+    transient failures (non-zero exit, timeout) alert (via the caller's normal
+    error path) but keep firing.
+
+    The job's schedule is left untouched — only the broken job is paused,
+    pending operator fix + resume. This is the structural fix for the
+    silent-dead-pin incident class (e.g. a job failing for days with no alert).
+    """
+    job_id = job["id"]
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    alert = (
+        f"⚠ Cron dead-pin: job '{job_name}' references a script that does not exist.\n\n"
+        f"Job ID: {job_id}\n"
+        f"Script: {script_path}\n"
+        f"Script error: {script_output}\n\n"
+        f"Time: {now_iso}\n\n"
+        f"The job has been AUTO-PAUSED to stop the silent failure. Fix the script "
+        f"path (or restore the file) and resume it with "
+        f"cronjob(action='update', job_id='{job_id}', script='<correct path>') "
+        f"or cronjob(action='resume', job_id='{job_id}')."
+    )
+    _alert_critical_alerts(alert)
+
+    reason = f"dead-pin: script not found: {script_path}"
+    try:
+        from cron.jobs import pause_job
+        paused = pause_job(job_id, reason=reason)
+        if paused is None:
+            logger.warning(
+                "Dead-pin auto-pause: job '%s' not found (already removed?)", job_id
+            )
+        else:
+            logger.warning(
+                "Dead-pin auto-pause: job '%s' (%s) paused — %s", job_id, job_name, reason
+            )
+    except Exception as e:
+        # Never let a pause failure crash the tick; the alert already fired.
+        logger.error("Dead-pin auto-pause failed for job '%s': %s", job_id, e)
+
+
+# --- Missing-script startup preflight -------------------------------------
+# A cron job whose ``script`` path does not exist on disk fails *silently* in
+# production: ``_run_job_script`` hard-fails per run (``Script not found``) but
+# the error is only delivered to the job's own (often ``local`` / silent)
+# deliver target — never to a noise channel. The result is a black hole: a job
+# can error every tick for days (the elon preflight caught 3 jarvis jobs doing
+# exactly this for ~2 days) with no operator alert. We close that by asserting
+# at scheduler load / fleet startup that every enabled, script-bearing cron
+# job can actually resolve its script, and by routing any misses to
+# #critical-alerts (Discord). This is the structural complement to the existing
+# per-run error — it makes the failure LOUD on startup instead of silent.
+#
+# NOTE: this is the in-scope part of commit 50dafd6a0. The interpreter-teardown
+# guard that the same source commit also carried (t_dfd9b303) is intentionally
+# NOT ported here — it belongs to a different task and is handled elsewhere.
+# This port touches ONLY the missing-script preflight.
+# Classification mirrors the prior cron-doctor discipline: this is the
+# "missing-script" (black-hole) class — distinct from a *genuine* script
+# runtime error or a *designed* health-watchdog sentinel, which are handled
+# separately in run_job.
+# Minimum gap between repeated #critical-alerts preflight blasts so a broken
+# job does not spam the channel every 60s tick. ~6h keeps it loud without
+# noisome.
+_SCRIPT_PREFLIGHT_COOLDOWN_SECONDS = 6 * 60 * 60
+# Module-level timestamp of the last preflight blast — keyed by job id so each
+# broken job re-alerts on its own cooldown, not globally.
+_script_preflight_last_alert_at: dict[str, float] = {}
+# Whether the startup (force) preflight has fired since this scheduler process
+# loaded. The first tick that acquires the lock runs the forced assertion; all
+# later ticks use cooldown-gated re-alerts. Reset on module reload (hermes
+# update) which is exactly the startup we want to re-assert.
+_script_preflight_startup_done: bool = False
+
+
+def _resolve_script_path(script_path: str) -> tuple[bool, "Path | None", "str | None"]:
+    """Resolve a cron job ``script`` value to a concrete on-disk path.
+
+    Shared by the startup preflight (``_run_cron_script_preflight``) so both
+    validate against the *exact* same rules as the per-run executor — no
+    divergence between "does it run" and "will it run at startup".
+
+    Returns:
+        ``(ok, resolved_path, error)`` where ``ok`` is True when the path is
+        inside ``HERMES_HOME/scripts`` and exists as a regular file. On failure
+        ``error`` carries the human-readable reason (one of the
+        ``Script not found`` / ``Blocked`` / ``not a file`` messages) and
+        ``resolved_path`` is None.
+    """
+    scripts_dir = _get_hermes_home() / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir_resolved = scripts_dir.resolve()
+
+    raw = Path(script_path).expanduser()
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (scripts_dir / raw).resolve()
+
+    # Guard against path traversal, absolute path injection, and symlink
+    # escape — scripts MUST reside within HERMES_HOME/scripts/.
+    try:
+        path.relative_to(scripts_dir_resolved)
+    except ValueError:
+        return False, None, (
+            f"Blocked: script path resolves outside the scripts directory "
+            f"({scripts_dir_resolved}): {script_path!r}"
+        )
+
+    if not path.exists():
+        return False, None, f"Script not found: {path}"
+    if not path.is_file():
+        return False, None, f"Script path is not a file: {path}"
+
+    return True, path, None
+
+
+def _run_cron_script_preflight(force: bool = False) -> list[dict]:
+    """Startup assertion: every enabled, script-bearing job must resolve its script.
+
+    Scans the per-profile ``jobs.json`` (the same store ``tick`` reads) for
+    enabled jobs that declare a ``script`` which does NOT exist on disk, and
+    returns the list of failures. When ``force`` is True (scheduler load /
+    fleet startup) AND there are failures, it immediately blasts a single
+    consolidated #critical-alerts message naming each job id + missing path.
+
+    On subsequent (periodic) ticks ``force`` is False, so the blast is gated by
+    a per-job cooldown (``_SCRIPT_PREFLIGHT_COOLDOWN_SECONDS``) — a broken job
+    re-alerts ~every 6h instead of every 60s tick, while a *fresh* break at
+    startup is still loud immediately.
+
+    Returns the list of failure dicts (empty when all good) so callers/tests
+    can assert on it directly. Never raises — a preflight must not take down
+    the scheduler.
+
+    Classification (mirrors the prior cron-doctor discipline): this is the
+    "missing-script" black-hole class. A *genuine* runtime error or a
+    *designed* health-watchdog sentinel is handled in ``run_job``, not
+    here — we only assert script *existence*, which is a load-time invariant.
+    """
+    failures: list[dict] = []
+    try:
+        from cron.jobs import load_jobs
+        jobs = load_jobs()
+    except Exception as e:
+        logger.error("script-preflight: failed to load jobs.json: %s", e)
+        return failures
+
+    now = time.time()
+    for job in jobs:
+        if not job.get("enabled", True):
+            continue
+        script_path = job.get("script")
+        if not script_path:
+            continue
+        ok, _resolved, error = _resolve_script_path(script_path)
+        if ok:
+            continue
+        job_id = job.get("id", "<unknown>")
+        failures.append({
+            "job_id": job_id,
+            "name": job.get("name"),
+            "script": script_path,
+            "error": error or f"Script not found: {script_path}",
+        })
+
+    if not failures:
+        return failures
+
+    # Decide whether to blast now.
+    due: list[dict] = []
+    for f in failures:
+        last = _script_preflight_last_alert_at.get(f["job_id"])
+        if force or last is None or (now - last) >= _SCRIPT_PREFLIGHT_COOLDOWN_SECONDS:
+            due.append(f)
+
+    if due:
+        lines = [
+            "🚨 CRON STARTUP PREFLIGHT — missing script(s) (jobs will error every tick):",
+        ]
+        for f in due:
+            lines.append(
+                f"  • job_id={f['job_id']} name={f.get('name')!r} "
+                f"script={f['script']!r} → {f['error']}"
+            )
+        lines.append(
+            "Fix: restore/relink the script into the profile's scripts dir, "
+            "or disable the job."
+        )
+        message = "\n".join(lines)
+        logger.error("%s", message)
+        _alert_critical_alerts(message)
+        for f in due:
+            _script_preflight_last_alert_at[f["job_id"]] = now
+
+    return failures
 
 
 # Marker prefix stamped into the error string returned by ``run_job`` when the
@@ -5537,6 +6186,11 @@ def run_job(
                 f"**Status:** script failed\n\n"
                 f"{output}\n"
             )
+            # Dead-pin guard: a missing script (not a transient crash) must not
+            # fail silently forever. Alert #critical-alerts AND auto-pause the
+            # broken job so the operator sees it and fixes it.
+            if _is_missing_script_error(output):
+                _handle_cron_dead_pin(job, script_path, output)
             return False, doc, alert, output
 
         # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
@@ -5673,6 +6327,14 @@ def run_job(
             job, script_path, cancel_event=cancel_event,
         )
         _ran_ok, _script_output = prerun_script
+        if _is_missing_script_error(_script_output):
+            # Dead-pin guard (LLM path): the script is missing. The prompt
+            # builder will still inject a "## Script Error" block so the agent
+            # reports it, but a missing-file failure must ALSO escalate:
+            # alert #critical-alerts and auto-pause the job so it stops
+            # silently failing. We fire it once here (on the pre-check run)
+            # rather than inside _build_job_prompt to avoid double-handling.
+            _handle_cron_dead_pin(job, script_path, _script_output)
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -7831,6 +8493,31 @@ def tick(
                 sweep_stale_inflight(_sweep_jobs)
             except Exception as e:
                 logger.warning("Stale in-flight sweep failed: %s", e)
+        # Per-tick terminalizer for stale execution rows whose owner pid is
+        # provably dead (the stale source=direct class — see t_84b68726).
+        # recover_interrupted_executions() only runs at gateway restart, so a
+        # row created after the last restart would otherwise wedge forever;
+        # this sweep closes the gap on every tick, idempotent on rows still
+        # owned by a live pid.
+        try:
+            from cron.executions import terminalize_stale_executions
+            terminalize_stale_executions()
+        except Exception as e:
+            logger.warning("Stale execution terminalizer sweep failed: %s", e)
+
+        # --- Startup missing-script preflight assertion (loud, not silent) ---
+        # The first tick that acquires the lock after a scheduler/gateway load
+        # is treated as the startup assertion: it forces a #critical-alerts
+        # blast for any enabled script-bearing job whose script is missing
+        # (the black-hole class elon caught — 3 jarvis jobs errored hourly for
+        # ~2 days with no alert). Every later tick re-runs the scan but only
+        # re-alerts per broken job on its cooldown
+        # (_SCRIPT_PREFLIGHT_COOLDOWN_SECONDS), so a long-lived broken job
+        # keeps blaring ~every 6h instead of spamming every 60s or going
+        # silent. Wrapped so a preflight failure can NEVER block due jobs.
+        global _script_preflight_startup_done
+        _run_cron_script_preflight(force=not _script_preflight_startup_done)
+        _script_preflight_startup_done = True
 
         if not due_jobs:
             # Idle tick: skip config load + pool partitioning entirely
@@ -7988,12 +8675,15 @@ def tick(
                 execution = create_execution(job_id, source="builtin")
                 dispatched_job = dict(job, execution_id=execution["id"])
                 _ctx = contextvars.copy_context()
-            except Exception as execution_err:
+            except BaseException as execution_err:
                 # Init/creation failure between the claim and the submit —
                 # release the in-flight claim immediately so the next tick can
                 # retry instead of wedging on 'already running' forever (the
                 # audit requirement: every add is paired with guaranteed
-                # cleanup).
+                # cleanup). Catch BaseException so a claim taken just before
+                # interpreter shutdown is still released (never wedged); log
+                # and return None rather than re-raising so the ticker stays
+                # up and the job retries next tick (#58720, #55924).
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
                 logger.exception(
