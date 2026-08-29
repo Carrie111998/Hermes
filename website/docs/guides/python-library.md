@@ -151,10 +151,10 @@ agent = AIAgent(
 )
 
 agent.chat("Write a Python function to sort a list")
-# Saves to trajectory_samples.jsonl in ShareGPT format
+# Saves to trajectory_samples.jsonl.gz in ShareGPT format
 ```
 
-Each conversation is appended as a single JSONL line, making it easy to collect datasets from automated runs.
+Each conversation is appended as a single gzip-compressed JSONL line, making it easy to collect datasets from automated runs. Pass an explicit `.jsonl` filename to retain the legacy plain-text format.
 
 ---
 

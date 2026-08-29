@@ -12,13 +12,14 @@ Trajectories are written to files in the current working directory:
 
 | File | When |
 |------|------|
-| `trajectory_samples.jsonl` | Conversations that completed successfully (`completed=True`) |
-| `failed_trajectories.jsonl` | Conversations that failed or were interrupted (`completed=False`) |
+| `trajectory_samples.jsonl.gz` | Gzip-compressed conversations that completed successfully (`completed=True`) |
+| `failed_trajectories.jsonl.gz` | Gzip-compressed conversations that failed or were interrupted (`completed=False`) |
 
 The batch runner (`batch_runner.py`) writes to a custom output file per batch
 (e.g., `batch_001_output.jsonl`) with additional metadata fields.
 
 You can override the filename via the `filename` parameter in `save_trajectory()`.
+Explicit `.jsonl` filenames retain the legacy plain-text format.
 
 
 ## JSONL Entry Format
@@ -184,9 +185,11 @@ Trajectories are standard JSONL — load with any JSON-lines reader:
 import json
 
 def load_trajectories(path: str):
-    """Load trajectory entries from a JSONL file."""
+    """Load trajectory entries from plain or gzip-compressed JSONL."""
+    import gzip
     entries = []
-    with open(path, "r", encoding="utf-8") as f:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -194,7 +197,7 @@ def load_trajectories(path: str):
     return entries
 
 # Filter to successful completions only
-successful = [e for e in load_trajectories("trajectory_samples.jsonl")
+successful = [e for e in load_trajectories("trajectory_samples.jsonl.gz")
               if e.get("completed")]
 
 # Extract just the conversations for training
@@ -206,7 +209,7 @@ training_data = [e["conversations"] for e in successful]
 ```python
 from datasets import load_dataset
 
-ds = load_dataset("json", data_files="trajectory_samples.jsonl")
+ds = load_dataset("json", data_files="trajectory_samples.jsonl.gz")
 ```
 
 The normalized `tool_stats` schema ensures all entries have the same columns,
