@@ -6327,7 +6327,14 @@ def _fallback_entry_credential_id(
     if key_env:
         return f"key-env:{key_env.casefold()}"
     pool = str(entry.get("credential_pool") or "").strip()
-    return pool or None
+    if pool:
+        provider = str(entry.get("provider") or "").strip().lower()
+        base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+        # Pool labels are scoped by provider in auth.json, and custom pools
+        # are additionally scoped by endpoint. Keep that scope in the
+        # non-secret identity so equal labels never become one ambient route.
+        return f"pool:{provider}:{base_url}:{pool}"
+    return None
 
 
 def _backend_identity_for_entry(
@@ -6356,14 +6363,29 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
         return None, None
     base_url = str(entry.get("base_url") or "").strip() or None
     api_key = _fallback_entry_api_key(entry)
+    isolated_credentials = _fallback_entry_has_isolated_credentials(entry)
+    if isolated_credentials and not api_key:
+        # A declared key_env/api_key_env/pool is an entry-local credential
+        # contract. If it is unavailable, reject this candidate before the
+        # provider router can borrow ambient or provider-wide credentials.
+        logger.debug(
+            "Auxiliary fallback %s/%s has no usable entry-local credential",
+            provider,
+            model,
+        )
+        return None, None
     api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
-    client, resolved_model = resolve_provider_client(
-        provider,
-        model=model,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-        api_mode=api_mode,
-    )
+    resolve_kwargs = {
+        "model": model,
+        "explicit_base_url": base_url,
+        "explicit_api_key": api_key,
+        "api_mode": api_mode,
+    }
+    if isolated_credentials:
+        # Keep the ordinary provider-resolution call shape unchanged while
+        # explicitly binding isolated entries to the no-ambient-fallback mode.
+        resolve_kwargs["allow_provider_fallback"] = False
+    client, resolved_model = resolve_provider_client(provider, **resolve_kwargs)
     if client is not None:
         try:
             client._hermes_fallback_entry = dict(entry)
@@ -6860,6 +6882,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    allow_provider_fallback: bool = True,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -6883,6 +6906,8 @@ def resolve_provider_client(
             the main agent loop).
         explicit_base_url: Optional direct OpenAI-compatible endpoint.
         explicit_api_key: Optional API key paired with explicit_base_url.
+        allow_provider_fallback: If False, an explicit endpoint may use only
+            explicit_api_key; it must not borrow ambient/provider-wide keys.
         api_mode: API mode override.  One of "chat_completions",
             "codex_responses", or None (auto-detect).  When set to
             "codex_responses", the client is wrapped in
@@ -7164,12 +7189,23 @@ def resolve_provider_client(
             custom_base = _to_openai_base_url(explicit_base_url).strip()
             if api_mode == "anthropic_messages":
                 wrap_base = (explicit_base_url or "").strip().rstrip("/")
-            custom_key = (
-                (explicit_api_key or "").strip()
-                or _scoped_key_env("OPENAI_API_KEY")
-                or _read_main_api_key_if_same_host(custom_base)
-                or "no-key-required"  # local servers don't need auth
-            )
+            if explicit_api_key:
+                custom_key = explicit_api_key.strip()
+            elif allow_provider_fallback:
+                custom_key = (
+                    _scoped_key_env("OPENAI_API_KEY")
+                    or _read_main_api_key_if_same_host(custom_base)
+                    or "no-key-required"  # local servers don't need auth
+                )
+            else:
+                # An entry-local credential source was declared but did not
+                # resolve. Never substitute the process/profile-wide key or
+                # an inferred same-host main credential for that entry.
+                logger.debug(
+                    "resolve_provider_client: explicit custom endpoint has "
+                    "no usable entry-local credential"
+                )
+                return None, None
             if not custom_base:
                 logger.warning(
                     "resolve_provider_client: explicit custom endpoint requested "

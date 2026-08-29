@@ -2486,6 +2486,104 @@ class TestTopLevelFallbackIdentity:
         assert result[2] == "fallback_providers[0](custom)"
         assert resolver.call_args.args[0] == entry
 
+    def test_pool_identity_is_provider_and_endpoint_scoped(self):
+        """A pool label alone must not become a provider-wide credential identity."""
+        from agent.auxiliary_client import _backend_identity_for_entry
+        from agent.backend_identity import same_credential_surface
+
+        custom = _backend_identity_for_entry({
+            "provider": "custom",
+            "model": "model-a",
+            "base_url": "https://shared.example/v1",
+            "credential_pool": "pool-a",
+        })
+        openrouter = _backend_identity_for_entry({
+            "provider": "openrouter",
+            "model": "model-a",
+            "base_url": "https://shared.example/v1",
+            "credential_pool": "pool-a",
+        })
+
+        assert same_credential_surface(custom, openrouter) is False
+
+    def test_missing_entry_key_env_fails_closed_before_provider_resolution(self, monkeypatch):
+        """An unavailable declared key must not borrow OPENAI_API_KEY."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        monkeypatch.delenv("R3_MISSING_FALLBACK_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "provider-wide-sentinel")
+        with patch("agent.auxiliary_client._create_openai_client") as create_client:
+            result = resolve_provider_client(
+                "custom",
+                model="model-b",
+                explicit_base_url="https://tenant-b.example/v1",
+                explicit_api_key=None,
+                allow_provider_fallback=False,
+            )
+
+        assert result == (None, None)
+        create_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_top_level_skips_missing_key_before_exact_sibling(self, monkeypatch):
+        """Async top-level selection must preserve entry identity and skip ambient auth."""
+        from agent.auxiliary_client import _run_fallback_chain_async, _try_main_fallback_chain
+        from agent.backend_identity import FailureScope
+
+        monkeypatch.delenv("R3_MISSING_FALLBACK_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "provider-wide-sentinel")
+        entries = [
+            {
+                "provider": "custom",
+                "model": "model-missing",
+                "base_url": "https://tenant-a.example/v1",
+                "key_env": "R3_MISSING_FALLBACK_KEY",
+            },
+            {
+                "provider": "custom",
+                "model": "model-valid",
+                "base_url": "https://tenant-b.example/v1",
+                "api_key": "entry-key-b",
+            },
+        ]
+        config = {"fallback_providers": entries}
+        resolved = MagicMock(base_url=entries[1]["base_url"], api_key="entry-key-b")
+        async_client = MagicMock()
+        resolver_calls = []
+
+        def resolve(provider, **kwargs):
+            resolver_calls.append((provider, kwargs))
+            return resolved, kwargs["model"]
+
+        async def call_candidate(*args, **kwargs):
+            return {"selected": args[1]}
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.auxiliary_client._read_main_provider", return_value="main"),
+            patch("agent.auxiliary_client._read_main_model", return_value="main-model"),
+            patch("agent.auxiliary_client._read_main_base_url", return_value="https://main.example/v1"),
+            patch("agent.auxiliary_client._read_main_api_key", return_value="main-key"),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve),
+            patch("agent.auxiliary_client._to_async_client", return_value=(async_client, "model-valid")),
+            patch("agent.auxiliary_client._call_fallback_candidate_async", side_effect=call_candidate),
+        ):
+            result = await _run_fallback_chain_async(
+                _try_main_fallback_chain,
+                {
+                    "task": "session_search",
+                    "failed_provider": "other",
+                    "failed_model": "failed-model",
+                    "failure_scope": FailureScope.MODEL,
+                },
+                {"task": "session_search", "model": "model-valid", "messages": []},
+            )
+
+        assert result == {"selected": "model-valid"}
+        assert [kwargs["model"] for _, kwargs in resolver_calls] == ["model-valid"]
+        assert resolver_calls[0][1]["explicit_api_key"] == "entry-key-b"
+        assert resolver_calls[0][1]["allow_provider_fallback"] is False
+
 
 class TestFailureScopeFallbackEligibility:
     @staticmethod
