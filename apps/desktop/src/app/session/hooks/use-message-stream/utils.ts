@@ -56,6 +56,31 @@ export function hasSessionInfoStatePatch(patch: SessionRuntimeStatePatch): boole
   return Object.keys(patch).length > 0
 }
 
+/** Preserve the runtime-state reference when a session.info heartbeat merely
+ * restates cached values. `$sessionStates` is the rendering source for every
+ * mounted session surface, so publishing an equivalent spread makes all of
+ * them re-render at the heartbeat cadence. */
+export function applySessionInfoStatePatch(
+  state: ClientSessionState,
+  patch: SessionRuntimeStatePatch
+): ClientSessionState {
+  if (
+    (patch.branch === undefined || patch.branch === state.branch) &&
+    (patch.cwd === undefined || patch.cwd === state.cwd) &&
+    (patch.fast === undefined || patch.fast === state.fast) &&
+    (patch.model === undefined || patch.model === state.model) &&
+    (patch.personality === undefined || patch.personality === state.personality) &&
+    (patch.provider === undefined || patch.provider === state.provider) &&
+    (patch.reasoningEffort === undefined || patch.reasoningEffort === state.reasoningEffort) &&
+    (patch.serviceTier === undefined || patch.serviceTier === state.serviceTier) &&
+    (patch.yolo === undefined || patch.yolo === state.yolo)
+  ) {
+    return state
+  }
+
+  return { ...state, ...patch }
+}
+
 // Minimum gap between two assistant-text flushes during a stream. Was 16ms
 // (rAF only), which at typical LLM token rates of ~30-80 tok/sec meant every
 // token got its own React commit + Streamdown markdown re-parse, scaling
