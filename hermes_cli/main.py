@@ -296,7 +296,7 @@ def _config_default_interface_early() -> str:
         if os.path.exists(cfg_path):
             import yaml as _yaml_iface
 
-            with open(cfg_path, encoding="utf-8") as _f:
+            with open(cfg_path, encoding="utf-8-sig") as _f:
                 raw = _yaml_iface.load(
                     _f, Loader=getattr(_yaml_iface, "CSafeLoader", None) or _yaml_iface.SafeLoader
                 ) or {}
@@ -936,7 +936,7 @@ def _termux_bundled_skills_sync_needed() -> bool:
         return True
     try:
         stamp = _termux_bundled_skills_stamp_path()
-        return stamp.read_text(encoding="utf-8").strip() != _termux_bundled_skills_fingerprint()
+                with open(_qfile, "r", encoding="utf-8-sig", errors="replace") as _fh:
     except OSError:
         return True
 

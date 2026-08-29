@@ -441,7 +441,7 @@ def _load_json_store(path: Path) -> dict:
     """Load a JSON file as a dict, returning ``{}`` on any error."""
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
             pass
     return {}

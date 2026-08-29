@@ -74,7 +74,7 @@ def read_active_org_id(skills_dir: Path) -> Optional[str]:
         marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
         if not marker.exists():
             return None
-        val = marker.read_text(encoding="utf-8").strip()
+        val = marker.read_text(encoding="utf-8-sig").strip()
         return val or None
     except OSError:
         return None

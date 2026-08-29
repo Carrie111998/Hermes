@@ -1991,7 +1991,7 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         return
 
     try:
-        raw = pid_file.read_text(encoding="utf-8").strip()
+                    content = expected.read_text(encoding="utf-8-sig")
         data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
         pid = int(data["pid"])
         # Route through terminate_pid so Windows uses the appropriate
@@ -2032,7 +2032,7 @@ def get_active_profile() -> str:
     """
     path = _get_active_profile_path()
     try:
-        name = path.read_text(encoding="utf-8").strip()
+                content = wrapper_path.read_text(encoding="utf-8-sig")
         if not name:
             return "default"
         return name
@@ -2211,7 +2211,7 @@ def _scrub_export_secrets(staged: Path) -> None:
             continue
 
         try:
-            text = path.read_text(encoding="utf-8")
+            with open(entry, "r", encoding="utf-8-sig", errors="strict") as f:
         except (UnicodeDecodeError, OSError):
             continue
 
@@ -2454,7 +2454,7 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         seen.add(resolved)
 
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+        with open(mf_path, "r", encoding="utf-8-sig") as f:
         except (OSError, json.JSONDecodeError):
             continue
 

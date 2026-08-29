@@ -66,7 +66,7 @@ def _is_bot_managed(profile_dir: Path) -> bool:
     try:
         if not meta.is_file():
             return False
-        raw = meta.read_text(encoding="utf-8", errors="replace")
+        raw = meta.read_text(encoding="utf-8-sig", errors="replace")
         if "hermes-bots" not in raw:
             return False
         import yaml
@@ -113,7 +113,7 @@ def is_bot_mode_managed(home: str | os.PathLike | None = None) -> bool:
 def _soul_has_protocol(profile_dir: Path) -> bool:
     try:
         soul = profile_dir / "SOUL.md"
-        return soul.is_file() and _PROTOCOL_HEADING in soul.read_text(encoding="utf-8", errors="replace")
+        return soul.is_file() and _PROTOCOL_HEADING in soul.read_text(encoding="utf-8-sig", errors="replace")
     except Exception:
         return False
 
@@ -178,7 +178,7 @@ def _peers(root: Path) -> list[str]:
         cfg_path = root / "config.yaml"
         if not cfg_path.is_file():
             return []
-        raw = cfg_path.read_text(encoding="utf-8", errors="replace")
+        raw = cfg_path.read_text(encoding="utf-8-sig", errors="replace")
         if "bot_peers" not in raw:
             return []
         import yaml

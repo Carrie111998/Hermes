@@ -102,7 +102,7 @@ def resolve_active_host() -> str:
         try:
             path = resolve_config_path()
             if path.exists():
-                raw = json.loads(path.read_text(encoding="utf-8"))
+                raw = json.loads(path.read_text(encoding="utf-8-sig"))
                 default_host = str(raw.get("defaultHost", "")).strip()
                 if default_host:
                     return default_host
@@ -552,7 +552,7 @@ class HonchoClientConfig:
             return cls.from_env(host=resolved_host)
 
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Failed to read %s: %s, falling back to env", path, e)
             return cls.from_env(host=resolved_host)

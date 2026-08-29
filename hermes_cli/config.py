@@ -412,7 +412,7 @@ def get_managed_system() -> Optional[str]:
         # names the system that manages the install.
         if managed_marker.exists():
             try:
-                marker = managed_marker.read_text(encoding="utf-8", errors="replace").strip().lower()
+        method = (root / ".install_method").read_text(encoding="utf-8-sig").strip().lower()
             except OSError:
                 marker = ""
 
@@ -526,7 +526,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
 
     # 1. Code-scoped stamp — authoritative, immune to shared $HERMES_HOME.
     try:
-        method = (root / ".install_method").read_text(encoding="utf-8").strip().lower()
+        with open(config_path, encoding="utf-8-sig") as f:
         if method in supported_methods:
             return method
     except OSError:
@@ -539,7 +539,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     try:
         method = (
             (get_hermes_home() / ".install_method")
-            .read_text(encoding="utf-8")
+            with open(config_path, encoding="utf-8-sig") as f:
             .strip()
             .lower()
         )
@@ -571,7 +571,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     # detect git repo installs from worktrees
     if git_path.is_file():
         try:
-            content = git_path.read_text(encoding="utf-8").strip()
+        with open(config_path, encoding="utf-8-sig") as f:
             if content.startswith("gitdir:"):
                 return "git"
         except OSError:
@@ -3350,7 +3350,7 @@ def read_raw_config() -> Dict[str, Any]:
             return copy.deepcopy(cached[2])
 
         try:
-            with open(config_path, encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8-sig") as f:
                 data = fast_safe_load(f) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)

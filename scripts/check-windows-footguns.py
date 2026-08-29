@@ -153,11 +153,11 @@ FOOTGUNS: list[Footgun] = [
         message=(
             "open() without an explicit encoding= uses the platform default "
             "(UTF-8 on POSIX, cp1252/mbcs on Windows) — files round-tripped "
-            "between hosts get mojibake. Always pass encoding='utf-8' for "
+Encoding policy: READS pass encoding='utf-8-sig' (Windows tooling —
             "text files, or use open(path, 'rb')/'wb' for binary."
         ),
         fix=(
-            "open(path, 'r', encoding='utf-8')  # or 'utf-8-sig' if the "
+touches; utf-8-sig reads BOM'd and BOM-less files alike). WRITES pass
             "file may have a BOM"
         ),
         # Filter: only flag if mode is missing-or-text AND the line doesn't

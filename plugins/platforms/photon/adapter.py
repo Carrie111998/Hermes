@@ -158,7 +158,7 @@ def _write_runtime_record(port: int, token: str, pid: int) -> None:
 
 def _read_runtime_record() -> Optional[Dict[str, Any]]:
     try:
-        raw = json.loads(_runtime_record_path().read_text(encoding="utf-8"))
+        raw = json.loads(_runtime_record_path().read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     return raw if isinstance(raw, dict) else None

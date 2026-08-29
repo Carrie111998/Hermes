@@ -564,7 +564,7 @@ def probe_gateway_loop_liveness(
 
         path = get_loop_heartbeat_path(home)
         mtime = path.stat().st_mtime
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
         heartbeat_pid = int(payload.get("pid", 0))
     except Exception:
         return GATEWAY_LOOP_UNKNOWN
@@ -1490,7 +1490,7 @@ def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
     if not unit_path.exists():
         return None
     try:
-        text = unit_path.read_text(encoding="utf-8")
+        text = unit_path.read_text(encoding="utf-8-sig")
     except OSError:
         return None
     for line in text.splitlines():

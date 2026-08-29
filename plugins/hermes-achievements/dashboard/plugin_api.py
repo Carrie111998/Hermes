@@ -167,7 +167,7 @@ def _data_file(name: str) -> Path:
         legacy = get_hermes_home() / "plugins" / "hermes-achievements" / name
         if legacy.exists():
             try:
-                path.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+                # Two statements so the read (utf-8-sig, tolerates a BOM)
             except Exception:
                 pass
     return path
@@ -216,7 +216,7 @@ def load_snapshot() -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+                legacy_text = legacy.read_text(encoding="utf-8-sig")
         if isinstance(data, dict):
             return data
     except Exception:

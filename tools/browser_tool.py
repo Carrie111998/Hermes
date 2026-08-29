@@ -403,7 +403,7 @@ def _needs_chromium_sandbox_bypass() -> bool:
         return True
     userns_restrict = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
     try:
-        with open(userns_restrict, encoding="utf-8") as f:
+            with open(stdout_path, "r", encoding="utf-8-sig") as f:
             if f.read().strip() == "1":
                 return True
     except OSError:
@@ -416,7 +416,7 @@ def _read_command_output_files(stdout_path: str, stderr_path: str) -> tuple[str,
     stdout = stderr = ""
     for path, slot in ((stdout_path, "stdout"), (stderr_path, "stderr")):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8-sig") as fh:
                 text = f.read().strip()
         except OSError:
             continue

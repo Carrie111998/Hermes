@@ -91,7 +91,7 @@ def record_start_and_check_storm(
 
         existing: list[float] = []
         if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
+            for line in path.read_text(encoding="utf-8-sig").splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -680,7 +680,7 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        raw = path.read_text(encoding="utf-8").strip()
+        raw = path.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeDecodeError):
         # OSError: file vanished or permission flipped between exists() and
         # read. UnicodeDecodeError: file holds non-UTF-8 / binary garbage
@@ -705,7 +705,7 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
         return None
 
     try:
-        raw = pid_path.read_text(encoding="utf-8").strip()
+        raw = pid_path.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeDecodeError):
         # File was deleted between exists() and read_text(), permission
         # flipped, or it holds non-UTF-8 / binary garbage.
