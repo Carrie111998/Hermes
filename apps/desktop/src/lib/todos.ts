@@ -6,6 +6,14 @@ export interface TodoItem {
   status: TodoStatus
 }
 
+/** One item from a `merge: true` write. Content is optional so a status-only
+ *  patch still applies to an existing row. */
+export interface TodoPatch {
+  content?: string
+  id: string
+  status: TodoStatus
+}
+
 const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed', 'cancelled']
 
 const isRecord = (v: unknown): v is Record<string, unknown> => Boolean(v && typeof v === 'object' && !Array.isArray(v))
@@ -21,6 +29,24 @@ function parseArray(value: unknown[]): TodoItem[] {
     const content = String(item.content ?? '').trim()
 
     return id && content ? [{ content, id, status: item.status }] : []
+  })
+}
+
+function parsePatchArray(value: unknown[]): TodoPatch[] {
+  return value.flatMap(item => {
+    if (!isRecord(item) || !isStatus(item.status)) {
+      return []
+    }
+
+    const id = String(item.id ?? '').trim()
+
+    if (!id) {
+      return []
+    }
+
+    const content = String(item.content ?? '').trim()
+
+    return content ? [{ content, id, status: item.status }] : [{ id, status: item.status }]
   })
 }
 
@@ -75,6 +101,83 @@ function parseRevision(value: unknown, depth: number): null | number {
 }
 
 export const parseTodoRevision = (value: unknown): null | number => parseRevision(value, 0)
+
+function parsePatch(value: unknown, depth: number): null | TodoPatch[] {
+  if (depth > 2) {
+    return null
+  }
+
+  if (Array.isArray(value)) {
+    return parsePatchArray(value)
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      return parsePatch(JSON.parse(value), depth + 1)
+    } catch {
+      return null
+    }
+  }
+
+  if (isRecord(value) && Object.hasOwn(value, 'todos')) {
+    return parsePatch(value.todos, depth + 1)
+  }
+
+  return null
+}
+
+export const parseTodoPatch = (value: unknown): null | TodoPatch[] => parsePatch(value, 0)
+
+export const todoArgsWantMerge = (args: unknown): boolean => isRecord(args) && args.merge === true
+
+/** Same as TodoStore.write(merge=True): update by id, append new items. */
+export function mergeTodoItems(current: readonly TodoItem[], patch: readonly TodoPatch[]): TodoItem[] {
+  const next = current.map(item => ({ ...item }))
+  const indexById = new Map(next.map((item, index) => [item.id, index]))
+
+  for (const item of patch) {
+    const index = indexById.get(item.id)
+
+    if (index === undefined) {
+      next.push({ content: item.content?.trim() || '(no description)', id: item.id, status: item.status })
+      indexById.set(item.id, next.length - 1)
+
+      continue
+    }
+
+    if (item.content) {
+      next[index].content = item.content
+    }
+
+    next[index].status = item.status
+  }
+
+  return next
+}
+
+/** Live tool event to the next list. `payload.todos` / `result` is the full
+ *  store, so replace. `args` with `merge: true` patches by id so a status-only
+ *  start event does not wipe the rest of the checklist. */
+export function nextTodosFromToolEvent(
+  current: readonly TodoItem[],
+  payload: { args?: unknown; arguments?: unknown; result?: unknown; todos?: unknown }
+): null | TodoItem[] {
+  const fromResult = parseTodos(payload.todos) ?? parseTodos(payload.result)
+
+  if (fromResult) {
+    return fromResult
+  }
+
+  const args = payload.args ?? payload.arguments
+
+  if (todoArgsWantMerge(args)) {
+    const patch = parseTodoPatch(args)
+
+    return patch && patch.length > 0 ? mergeTodoItems(current, patch) : null
+  }
+
+  return parseTodos(args)
+}
 
 /** Latest parseable todo list from one message's aui content parts (tool-call
  *  parts named `todo`; live parts carry `todos`, hydrated ones args/result). */
