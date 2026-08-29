@@ -1,8 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
-import { expect, test } from './test'
-
 import {
   PACKAGED_BINARY_PATH,
   type PackagedAppFixture,
@@ -12,8 +10,9 @@ import {
   writeEnvFile,
   writeMockProviderConfig,
 } from './fixtures'
-import { FOLLOW_UP_TRIGGER, startMockServer, type MockServer } from './mock-server'
+import { FOLLOW_UP_TRIGGER, type MockServer, startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
+import { expect, test } from './test'
 import { expectVisualSnapshot } from './visual-snapshot'
 
 /**
@@ -35,12 +34,10 @@ test.beforeAll(async () => {
     `Built app binary not found: ${PACKAGED_BINARY_PATH}. Run 'npm run pack' first.`,
   )
 
-  const hermesCli = process.env.HERMES_DESKTOP_HERMES
-  if (!hermesCli || !fs.existsSync(hermesCli)) {
-    throw new Error(
-      'Packaged Follow-up E2E requires HERMES_DESKTOP_HERMES to point at an existing Hermes CLI.',
-    )
-  }
+  const hermesCliOverride = process.env.HERMES_DESKTOP_HERMES
+
+  const hermesCli =
+    hermesCliOverride && fs.existsSync(hermesCliOverride) ? hermesCliOverride : undefined
 
   const followUpSource = path.resolve(import.meta.dirname, 'fixtures', 'follow-up-plugin.js')
   mock = await startMockServer()
@@ -55,6 +52,7 @@ test.beforeAll(async () => {
       writeEnvFile(sandbox.hermesHome)
 
       const builder = await RealSessionBuilder.start(sandbox.hermesHome)
+
       try {
         await builder.createSession({
           title: 'Packaged Follow-up',
@@ -66,7 +64,7 @@ test.beforeAll(async () => {
     }
 
     fixture = await setupPackagedApp({
-      env: { HERMES_DESKTOP_HERMES: hermesCli },
+      env: hermesCli ? { HERMES_DESKTOP_HERMES: hermesCli } : undefined,
       keepSandbox: process.env.HERMES_E2E_KEEP_SANDBOX === '1',
       prepareSandbox,
     })
