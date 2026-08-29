@@ -65,12 +65,12 @@ describe('spectator roster', () => {
   it('opens only an existing persisted conversation without a profile mutation target', () => {
     expect(spectatorSessionOpenPlan(undefined)).toBeNull()
     expect(
-      spectatorSessionOpenPlan({ id: 'stored-1', message_count: 2 } as never, 'default')
+      spectatorSessionOpenPlan({ id: 'stored-1', message_count: 2 } as never)
     ).toEqual({
       sessionId: 'stored-1',
       options: {
         intent: 'main',
-        profile: 'default',
+
         awaitHydration: true,
         expectHistory: true,
         keepAllProfilesScope: false

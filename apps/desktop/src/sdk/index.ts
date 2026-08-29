@@ -54,6 +54,7 @@ import {
   retireLocalProfileGateways
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import {
   $activeGatewayProfile,
   $gatewaySwapTarget,
@@ -909,13 +910,15 @@ export const host = {
       // profile must dial through openGatewayForProfile (its established path),
       // not the registry-secondary path openGatewayForAgent takes for a 'local'
       // connection id. Behavior for a plain local open is unchanged.
-      const dial = explicitRoute
-        ? () => openGatewayForAgent(explicitRoute.connectionId, explicitRoute.profile)
-        : plan.switchWorkspace
-          ? () => ensureGatewayProfile(plan.switchWorkspace as string)
-          : plan.dialWithoutSwitching
-            ? () => openGatewayForProfile(plan.dialWithoutSwitching as string)
-            : null
+      const dial = isBrowserSpectator()
+        ? null
+        : explicitRoute
+          ? () => openGatewayForAgent(explicitRoute.connectionId, explicitRoute.profile)
+          : plan.switchWorkspace
+            ? () => ensureGatewayProfile(plan.switchWorkspace as string)
+            : plan.dialWithoutSwitching
+              ? () => openGatewayForProfile(plan.dialWithoutSwitching as string)
+              : null
 
       if (dial) {
         // Bounded only on the hydration contract, which is where a budget and a

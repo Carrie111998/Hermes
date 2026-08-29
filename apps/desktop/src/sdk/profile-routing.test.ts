@@ -197,9 +197,19 @@ afterEach(() => {
   $profiles.set([profile('cached-only')])
   setWorkspaceScope('sessions')
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+  delete (window as unknown as { __HERMES_SPECTATOR__?: boolean }).__HERMES_SPECTATOR__
 })
 
 describe('connection-aware plugin host APIs', () => {
+  it('never activates a profile when browser spectator opens a stored chat', async () => {
+    ;(window as unknown as { __HERMES_SPECTATOR__?: boolean }).__HERMES_SPECTATOR__ = true
+
+    await host.openSession('stored-bot-chat', { profile: 'hermes2' })
+
+    expect(ensureGatewayProfile).not.toHaveBeenCalled()
+    expect(openSessionCore).toHaveBeenCalledWith('stored-bot-chat', expect.any(Function), 'in-place')
+  })
+
   it('retires a profile gateway before deleting it', async () => {
     const order: string[] = []
 

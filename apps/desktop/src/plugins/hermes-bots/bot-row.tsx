@@ -85,7 +85,7 @@ interface BotRowProps {
   spectator?: boolean
 }
 
-export function spectatorSessionOpenPlan(previewSession: RosterRow['last_session'], profile?: string) {
+export function spectatorSessionOpenPlan(previewSession: RosterRow['last_session']) {
   const sessionId = previewSession?.id
 
   if (!sessionId) return null
@@ -97,7 +97,6 @@ export function spectatorSessionOpenPlan(previewSession: RosterRow['last_session
     sessionId,
     options: {
       intent: 'main' as const,
-      profile,
       awaitHydration: true,
       expectHistory: hasAuthoritativeCount ? previewSession.message_count > 0 : true,
       keepAllProfilesScope: false
@@ -231,7 +230,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
 
   // Rows and Active Now share the exact-owner open path; only that path may
   // activate a source and resolve the canonical Bot Chat.
-  const spectatorOpenPlan = spectatorSessionOpenPlan(previewSession, bot.name)
+  const spectatorOpenPlan = spectatorSessionOpenPlan(previewSession)
   const open = async () => {
     if (spectator) {
       if (!spectatorOpenPlan) {
