@@ -26,6 +26,7 @@ gateway:
   no_active_goal:   "Aucun objectif actif."
   config_read_failed: "⚠️ Impossible de lire config.yaml : {error}"
   config_save_failed: "⚠️ Impossible de sauvegarder la configuration : {error}"
+  required_prompt_handler_unavailable: "Le gestionnaire de requête requis est actuellement indisponible. Vos pièces jointes n'ont pas été envoyées à l'agent. Réessayez lorsque le gestionnaire sera disponible."
 
   model:
     error_prefix:           "Erreur : {error}"

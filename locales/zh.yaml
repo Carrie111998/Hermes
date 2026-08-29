@@ -26,6 +26,7 @@ gateway:
   no_active_goal:   "当前没有活跃的目标。"
   config_read_failed: "⚠️ 无法读取 config.yaml：{error}"
   config_save_failed: "⚠️ 无法保存配置：{error}"
+  required_prompt_handler_unavailable: "所需的提示处理程序当前不可用。您的附件未发送给智能体。请在该处理程序可用后重试。"
 
   model:
     error_prefix:           "错误：{error}"

@@ -26,6 +26,7 @@ gateway:
   no_active_goal:   "Aktif hedef yok."
   config_read_failed: "⚠️ config.yaml okunamadı: {error}"
   config_save_failed: "⚠️ Yapılandırma kaydedilemedi: {error}"
+  required_prompt_handler_unavailable: "Gerekli istem işleyicisi şu anda kullanılamıyor. Ekleriniz ajana gönderilmedi. İşleyici kullanılabilir olduğunda tekrar deneyin."
 
   model:
     error_prefix:           "Hata: {error}"

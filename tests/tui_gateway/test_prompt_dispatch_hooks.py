@@ -85,12 +85,13 @@ def test_pre_prompt_dispatch_is_a_public_plugin_hook():
     assert "pre_prompt_dispatch" in VALID_HOOKS
 
 
-def test_required_image_turn_blocks_without_matching_directive():
+def test_required_image_turn_blocks_with_generic_english_default(monkeypatch):
     """A removed or unloaded required plugin must not expose the image to the agent."""
-    from tui_gateway.prompt_dispatch_hooks import (
-        REQUIRED_HANDLER_UNAVAILABLE_TEXT,
-        resolve_prompt_dispatch_results,
-    )
+    from agent import i18n
+    from tui_gateway.prompt_dispatch_hooks import resolve_prompt_dispatch_results
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+    i18n.reset_language_cache()
 
     decision = resolve_prompt_dispatch_results(
         [],
@@ -100,8 +101,33 @@ def test_required_image_turn_blocks_without_matching_directive():
 
     assert decision.action == "block"
     assert decision.handler == "hoppe_ocr_approval"
-    assert decision.text == REQUIRED_HANDLER_UNAVAILABLE_TEXT
+    assert decision.text == (
+        "The required prompt handler is currently unavailable. "
+        "Your attachments were not sent to the agent. Please try again after "
+        "the handler is available."
+    )
     assert decision.reason == "required_prompt_handler_unavailable"
+
+
+def test_required_image_turn_uses_configured_translation(monkeypatch):
+    """Changing the UI language must localize the host-owned refusal."""
+    from agent import i18n
+    from tui_gateway.prompt_dispatch_hooks import resolve_prompt_dispatch_results
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "de")
+    i18n.reset_language_cache()
+
+    decision = resolve_prompt_dispatch_results(
+        [],
+        required_prompt_handler="any_required_handler",
+        has_images=True,
+    )
+
+    assert decision.text == (
+        "Der erforderliche Prompt-Handler ist derzeit nicht verfügbar. "
+        "Ihre Anhänge wurden nicht an den Agenten weitergegeben. Versuchen Sie "
+        "es erneut, sobald der Handler verfügbar ist."
+    )
 
 
 def test_required_image_turn_ignores_foreign_and_handlerless_directives():
@@ -317,6 +343,58 @@ def test_worker_blocks_required_image_before_agent_and_persists_response(
         "message.delta",
         "message.complete",
     ]
+    assert worker_env[-1][2]["status"] == "complete"
+    assert "usage" not in worker_env[-1][2]
+
+
+def test_worker_retries_history_commit_before_persisting(
+    monkeypatch,
+    tmp_path,
+    worker_env,
+):
+    """A concurrent history update must not drop the turn or outrun memory."""
+    from tui_gateway.prompt_dispatch_hooks import PromptDispatchDecision
+
+    image_path = tmp_path / "required.png"
+    image_path.write_bytes(b"image")
+    db = _RecordingDB()
+    agent = SimpleNamespace(
+        session_id="stored-ios",
+        _session_db=db,
+        clear_interrupt=lambda: None,
+        run_conversation=lambda *_args, **_kwargs: pytest.fail("agent must not run"),
+    )
+    session = _worker_session(agent, image_path)
+    concurrent_history = [
+        {"role": "user", "content": "Earlier turn"},
+        {"role": "assistant", "content": "Already handled"},
+    ]
+
+    def update_history_before_response(**_kwargs):
+        with session["history_lock"]:
+            session["history"] = list(concurrent_history)
+            session["history_version"] = 1
+        return PromptDispatchDecision(
+            action="respond",
+            handler="hoppe_ocr_approval",
+            text="Protected intake completed",
+        )
+
+    monkeypatch.setattr(server, "invoke_pre_prompt_dispatch", update_history_before_response)
+
+    server._run_prompt_submit("rid", "ios-ui", session, "Please review")
+
+    new_messages = [
+        {
+            "role": "user",
+            "content": f"Please review\n@image:{image_path}",
+        },
+        {"role": "assistant", "content": "Protected intake completed"},
+    ]
+    assert session["history"] == concurrent_history + new_messages
+    assert session["history_version"] == 2
+    assert db.batches == [("stored-ios", new_messages)]
+    assert worker_env[-1][0] == "message.complete"
     assert worker_env[-1][2]["status"] == "complete"
 
 

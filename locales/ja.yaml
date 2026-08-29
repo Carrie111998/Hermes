@@ -26,6 +26,7 @@ gateway:
   no_active_goal:   "アクティブな目標はありません。"
   config_read_failed: "⚠️ config.yaml を読み込めませんでした: {error}"
   config_save_failed: "⚠️ 設定を保存できませんでした: {error}"
+  required_prompt_handler_unavailable: "必須なプロンプトハンドラーは現在利用できません。添付ファイルはエージェントに送信されませんでした。ハンドラーが利用可能になってからもう一度お試しください。"
 
   model:
     error_prefix:           "エラー: {error}"

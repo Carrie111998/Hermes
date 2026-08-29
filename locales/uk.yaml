@@ -26,6 +26,7 @@ gateway:
   no_active_goal:   "Немає активної цілі."
   config_read_failed: "⚠️ Не вдалося прочитати config.yaml: {error}"
   config_save_failed: "⚠️ Не вдалося зберегти конфігурацію: {error}"
+  required_prompt_handler_unavailable: "Потрібний обробник запиту зараз недоступний. Ваші вкладення не було надіслано агенту. Спробуйте ще раз, коли обробник стане доступним."
 
   model:
     error_prefix:           "Помилка: {error}"

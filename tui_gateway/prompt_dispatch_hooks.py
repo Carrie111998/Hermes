@@ -11,13 +11,15 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Sequence
 
+from agent.i18n import t
+
 
 logger = logging.getLogger(__name__)
 
-REQUIRED_HANDLER_UNAVAILABLE_TEXT = (
-    "Das erforderliche OCR-Freigabe-Gate ist momentan nicht verfügbar. "
-    "Das Bild wurde nicht an einen Agenten weitergegeben. Bitte versuche es "
-    "nach der technischen Prüfung erneut."
+_REQUIRED_HANDLER_UNAVAILABLE_KEY = "gateway.required_prompt_handler_unavailable"
+REQUIRED_HANDLER_UNAVAILABLE_TEXT = t(
+    _REQUIRED_HANDLER_UNAVAILABLE_KEY,
+    lang="en",
 )
 
 
@@ -92,7 +94,7 @@ def resolve_prompt_dispatch_results(
         return PromptDispatchDecision(
             action="block",
             handler=required_handler,
-            text=REQUIRED_HANDLER_UNAVAILABLE_TEXT,
+            text=t(_REQUIRED_HANDLER_UNAVAILABLE_KEY),
             reason="required_prompt_handler_unavailable",
         )
     return optional_allow or PromptDispatchDecision(action="allow")

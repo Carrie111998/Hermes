@@ -30,6 +30,7 @@ gateway:
   no_active_goal:   "Níl aon sprioc ghníomhach ann."
   config_read_failed: "⚠️ Níorbh fhéidir config.yaml a léamh: {error}"
   config_save_failed: "⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}"
+  required_prompt_handler_unavailable: "Níl an láimhseálaí leide riachtanach ar fáil faoi láthair. Níor seoladh d'iatáin chuig an ngníomhaire. Bain triail eile as nuair a bheidh an láimhseálaí ar fáil."
 
   model:
     error_prefix:           "Earráid: {error}"

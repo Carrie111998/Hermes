@@ -49,6 +49,7 @@ gateway:
   no_active_goal:   "لا يوجد هدف نشط."
   config_read_failed: "⚠️ تعذّر قراءة config.yaml: {error}"
   config_save_failed: "⚠️ تعذّر حفظ الإعدادات: {error}"
+  required_prompt_handler_unavailable: "معالج الطلب المطلوب غير متاح حاليًا. لم تُرسل مرفقاتك إلى الوكيل. حاول مرة أخرى عندما يصبح المعالج متاحًا."
 
   model:
     error_prefix:           "خطأ: {error}"

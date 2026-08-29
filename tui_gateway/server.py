@@ -10505,26 +10505,31 @@ def _complete_prompt_dispatch_response(
     messages = [user_entry, assistant_entry]
 
     db = getattr(agent, "_session_db", None)
-    if db is not None:
-        db.append_messages_batch(session["session_key"], messages)
-    else:
-        with _session_db(session) as scoped_db:
-            if scoped_db is None:
-                raise RuntimeError("prompt dispatch response persistence unavailable")
-            scoped_db.append_messages_batch(session["session_key"], messages)
-
-    with session["history_lock"]:
-        if int(session.get("history_version", 0)) != history_version:
-            raise RuntimeError("history changed during prompt dispatch")
-        session["history"] = [*history, *messages]
-        session["history_version"] = history_version + 1
-        _clear_inflight_turn(session)
+    db_context = contextlib.nullcontext(db) if db is not None else _session_db(session)
+    with db_context as scoped_db:
+        if scoped_db is None:
+            raise RuntimeError("prompt dispatch response persistence unavailable")
+        while True:
+            with session["history_lock"]:
+                current_version = int(session.get("history_version", 0))
+                if current_version != history_version:
+                    # Match the compaction path's optimistic guard: discard the
+                    # stale snapshot and retry against the current history. Do
+                    # this before persistence so the DB can never get ahead of
+                    # the in-memory history on a version miss.
+                    history = list(session["history"])
+                    history_version = current_version
+                    continue
+                scoped_db.append_messages_batch(session["session_key"], messages)
+                session["history"] = [*history, *messages]
+                session["history_version"] = history_version + 1
+                _clear_inflight_turn(session)
+                break
 
     if response_text:
         _emit("message.delta", sid, {"text": response_text})
     payload = {
         "text": response_text,
-        "usage": _get_usage(agent),
         "status": "complete",
     }
     rendered = render_message(response_text, session.get("cols", 80))

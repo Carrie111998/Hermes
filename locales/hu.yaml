@@ -26,6 +26,7 @@ gateway:
   no_active_goal:   "Nincs aktív cél."
   config_read_failed: "⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}"
   config_save_failed: "⚠️ Nem sikerült menteni a konfigurációt: {error}"
+  required_prompt_handler_unavailable: "A szükséges promptkezelő jelenleg nem érhető el. A mellékleteket nem küldtük el az ügynöknek. Próbálja újra, amikor a kezelő elérhető lesz."
 
   model:
     error_prefix:           "Hiba: {error}"

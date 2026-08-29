@@ -26,6 +26,7 @@ gateway:
   no_active_goal:   "활성 목표가 없습니다."
   config_read_failed: "⚠️ config.yaml을 읽을 수 없습니다: {error}"
   config_save_failed: "⚠️ 설정을 저장할 수 없습니다: {error}"
+  required_prompt_handler_unavailable: "필수 프롬프트 처리기를 현재 사용할 수 없습니다. 첨부 파일은 에이전트로 전송되지 않았습니다. 처리기를 사용할 수 있게 되면 다시 시도하세요."
 
   model:
     error_prefix:           "오류: {error}"

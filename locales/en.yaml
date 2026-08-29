@@ -37,6 +37,7 @@ gateway:
   no_active_goal:   "No active goal."
   config_read_failed: "⚠️ Could not read config.yaml: {error}"
   config_save_failed: "⚠️ Could not save config: {error}"
+  required_prompt_handler_unavailable: "The required prompt handler is currently unavailable. Your attachments were not sent to the agent. Please try again after the handler is available."
 
   # /model command output -- shown after a model switch or when listing models.
   # Provider names, model IDs, capability strings, and cost figures are NOT

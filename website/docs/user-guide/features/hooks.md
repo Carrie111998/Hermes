@@ -1268,6 +1268,7 @@ return {
 | `None` | Decline this turn. |
 | `{"action": "allow", "handler": "example_gate"}` | Permit normal agent dispatch. A client-required image turn accepts this only from the exact required handler. |
 | `{"action": "respond", "handler": "example_gate", "text": "..."}` | Persist and deliver the text through normal TUI history/events without calling the agent. `text` must be non-empty. |
+| `{"action": "block"}` | Reserved for the host; plugin-supplied `block` directives are ignored. |
 
 All callbacks run with isolated failures. Results are resolved in registration
 order. Optional turns use the first valid response; a handlerless `allow`
