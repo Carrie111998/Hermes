@@ -13,13 +13,13 @@ import { $composerAttachments } from '@/store/composer'
 
 import { PreviewPinPanel } from './preview-pin-panel'
 
-const auxiliary = vi.fn(() => false)
-const relay = vi.fn((_attachment: unknown) => true)
+const browserWindow = vi.fn(() => false)
+const relay = vi.fn(async (_attachment: unknown) => true)
 const notified: { kind?: string; title?: string }[] = []
 
 vi.mock('@/store/windows', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  isAuxiliaryWindow: () => auxiliary()
+  isBrowserWindow: () => browserWindow()
 }))
 
 vi.mock('@/store/composer-relay', () => ({ relayComposerAttachment: (a: unknown) => relay(a) }))
@@ -131,8 +131,8 @@ beforeEach(() => {
   page.pins = {}
   page.url = HOME
   $composerAttachments.set([])
-  auxiliary.mockReturnValue(false)
-  relay.mockReturnValue(true)
+  browserWindow.mockReturnValue(false)
+  relay.mockResolvedValue(true)
   notified.length = 0
 })
 
@@ -220,7 +220,7 @@ describe('a review across pages', () => {
   it('hands the chip to the window that owns the composer', async () => {
     // A popped-out Browser window has no composer of its own: adding there is a
     // click into a void, which is exactly how this was reported.
-    auxiliary.mockReturnValue(true)
+    browserWindow.mockReturnValue(true)
     page.pins[HOME] = [pin(HOME, 'hero')]
     render(<PreviewPinPanel open url={HOME} />)
     await waitFor(() => expect(screen.getAllByText('hero').length).toBeGreaterThan(0))
@@ -232,9 +232,25 @@ describe('a review across pages', () => {
     await waitFor(() => expect(notified.at(-1)?.kind).toBe('success'))
   })
 
+  it('keeps the chip in a window that has its own composer', async () => {
+    // The regression this replaced: the guard was `isAuxiliaryWindow()`, which
+    // also covers the secondary session window and the HUD. Both render a real
+    // composer, so relaying handed the chip to the PRIMARY window — a success
+    // toast in front of the user and the attachment one window away.
+    browserWindow.mockReturnValue(false)
+    page.pins[HOME] = [pin(HOME, 'hero')]
+    render(<PreviewPinPanel open url={HOME} />)
+    await waitFor(() => expect(screen.getAllByText('hero').length).toBeGreaterThan(0))
+
+    screen.getByText('Attach to chat').click()
+
+    await waitFor(() => expect($composerAttachments.get()).toHaveLength(1))
+    expect(relay).not.toHaveBeenCalled()
+  })
+
   it('says so when there is nowhere to put it', async () => {
-    auxiliary.mockReturnValue(true)
-    relay.mockReturnValue(false)
+    browserWindow.mockReturnValue(true)
+    relay.mockResolvedValue(false)
     page.pins[HOME] = [pin(HOME, 'hero')]
     render(<PreviewPinPanel open url={HOME} />)
     await waitFor(() => expect(screen.getAllByText('hero').length).toBeGreaterThan(0))

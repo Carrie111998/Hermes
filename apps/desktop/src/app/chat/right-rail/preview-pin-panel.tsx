@@ -23,7 +23,7 @@ import { cn } from '@/lib/utils'
 import { addComposerAttachment, createComposerAttachmentOccurrenceId } from '@/store/composer'
 import { relayComposerAttachment } from '@/store/composer-relay'
 import { notify } from '@/store/notifications'
-import { isAuxiliaryWindow } from '@/store/windows'
+import { isBrowserWindow } from '@/store/windows'
 
 import {
   armPins,
@@ -149,12 +149,16 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
     /**
      * Put the chip where the composer actually is.
      *
-     * A popped-out Browser window has no composer, so adding to its own store
-     * was a click that succeeded into a void — the reported "nothing happens".
+     * The popped-out Browser is the one window with no composer, so adding to
+     * its own store was a click that succeeded into a void. Every other window
+     * — including the secondary session window and the HUD — renders a real
+     * composer, and the chip belongs in THAT one: relaying from there would
+     * hand it to the primary window, which is not the window the user is
+     * looking at.
      */
-    const deliver = (attachment: Parameters<typeof addComposerAttachment>[0]) => {
-      if (isAuxiliaryWindow()) {
-        if (relayComposerAttachment(attachment)) {delivered += 1}
+    const deliver = async (attachment: Parameters<typeof addComposerAttachment>[0]) => {
+      if (isBrowserWindow()) {
+        if (await relayComposerAttachment(attachment)) {delivered += 1}
 
         return
       }
@@ -163,7 +167,7 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
       delivered += 1
     }
 
-    deliver({
+    await deliver({
       detail: JSON.stringify(sending),
       // Derived from the pins alone: once a batch spans pages, no single url
       // identifies it.
@@ -191,7 +195,7 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
 
         if (!path) {continue}
 
-        deliver({
+        await deliver({
           detail: path,
           id: `pin-image:${shot.id}`,
           kind: 'image',
