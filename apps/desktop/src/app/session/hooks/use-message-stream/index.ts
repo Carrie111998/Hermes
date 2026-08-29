@@ -35,6 +35,14 @@ import type { ClientSessionState } from '../../../types'
 import { useGatewayEventHandler } from './gateway-event'
 import { completionErrorText, delegateTaskPayloads, MAX_STREAM_FLUSH_GAP_MS, STREAM_DELTA_FLUSH_MS } from './utils'
 
+// When a turn goes live (message.start) but the backend dies before producing
+// ANY assistant payload, no message.complete ever arrives and the gateway may
+// stop heartbeating entirely. The existing 15s pre-start grace gate only covers
+// turns that never went live; once turnLive=true, a dead backend leaves the
+// spinner pinned until the 5-min session watchdog fires. This constant bounds
+// that wait: if a live turn has produced nothing for this long, force-settle.
+export const NO_PAYLOAD_WATCHDOG_MS = 60_000
+
 interface MessageStreamOptions {
   activeGatewayProfile?: string
   activeSessionIdRef: MutableRefObject<string | null>
@@ -873,6 +881,53 @@ export function useMessageStream({
     updateSessionState,
     upsertToolCall
   })
+
+  // No-payload watchdog: a turn that went live (message.start) but whose
+  // backend died before producing any assistant text leaves turnLive=busy=true
+  // forever — no message.complete arrives, and a dead gateway stops heartbeating,
+  // so the existing session.info running=false settle never fires. The 5-min
+  // session watchdog is the only existing backstop; this bounds the wait to
+  // NO_PAYLOAD_WATCHDOG_MS. Scans the per-runtime state map on a cheap
+  // interval and force-settles any live turn that has produced nothing.
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      const now = Date.now()
+      const states = sessionStateByRuntimeIdRef.current
+
+      for (const [sid, state] of states.entries()) {
+        if (
+          !state.turnLive ||
+          state.sawAssistantPayload ||
+          !state.busy ||
+          !state.awaitingResponse ||
+          typeof state.turnStartedAt !== 'number'
+        ) {
+          continue
+        }
+
+        if (now - state.turnStartedAt > NO_PAYLOAD_WATCHDOG_MS) {
+          updateSessionState(sid, s => {
+            // Re-check under the updater — state may have advanced since scan.
+            if (!s.turnLive || s.sawAssistantPayload || !s.busy) {
+              return s
+            }
+            return {
+              ...s,
+              awaitingResponse: false,
+              busy: false,
+              pendingBranchGroup: null,
+              streamId: null,
+              turnStartedAt: null,
+              turnLive: false
+            }
+          })
+          scheduleSessionsRefresh()
+        }
+      }
+    }, 5_000)
+
+    return () => window.clearInterval(intervalId)
+  }, [scheduleSessionsRefresh, sessionStateByRuntimeIdRef, updateSessionState])
 
   return {
     appendAssistantDelta,
