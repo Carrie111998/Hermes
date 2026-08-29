@@ -41,6 +41,8 @@ from agent.tool_executor import execute_tool_calls_segmented
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
+SQLITE_NULL_SYSTEM_ERROR = "returned NULL without setting an exception"
+
 
 def _make_tool_defs(*names: str) -> list:
     return [
@@ -320,6 +322,129 @@ def test_locked_flush_waits_and_resumes_without_replaying_tool_call_turn():
     assert result["turn_exit_reason"].startswith("text_response")
     assert result["final_response"] == "done"
     assert "failure_reason" not in result
+
+
+def test_sqlite_null_retry_flushes_tool_call_without_model_or_tool_replay(
+    tmp_path, monkeypatch
+):
+    """The retry lives inside the DB write, not around model/tool execution."""
+    monkeypatch.setattr(SessionDB, "_TRANSCRIPT_WRITE_PATIENCE_S", 0.5)
+    monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MIN_S", 0.0)
+    monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MAX_S", 0.0)
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "sqlite-null-tool-call-retry"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    tool_call = _mock_tool_call(call_id="sqlite-null-tool")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="I'll inspect the repository now.",
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        ),
+        _mock_response(content="done", finish_reason="stop"),
+    ]
+
+    original_insert = SessionDB._insert_message_rows
+    failures = {"n": 0}
+
+    def _flaky_insert(self_db, conn, sid, msgs):
+        if (
+            sid == session_id
+            and failures["n"] == 0
+            and any(msg.get("role") == "assistant" and msg.get("tool_calls") for msg in msgs)
+        ):
+            failures["n"] += 1
+            raise SystemError(SQLITE_NULL_SYSTEM_ERROR)
+        return original_insert(self_db, conn, sid, msgs)
+
+    monkeypatch.setattr(SessionDB, "_insert_message_rows", _flaky_insert)
+    executed: list[str] = []
+    roles_at_execute: list[list[str]] = []
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        executed.append(assistant_message.tool_calls[0].id)
+        roles_at_execute.append(_durable_roles(db_path, session_id))
+        messages.append(
+            make_tool_result_message(
+                "web_search",
+                "search result",
+                "sqlite-null-tool",
+            )
+        )
+
+    try:
+        with (
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
+        ):
+            result = agent.run_conversation("inspect the repository")
+    finally:
+        db.close()
+
+    assert failures["n"] == 1
+    assert executed == ["sqlite-null-tool"]
+    assert roles_at_execute == [["user", "assistant"]]
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["failed"] is False
+    assert result["final_response"] == "done"
+
+    durable = _durable_messages(db_path, session_id)
+    tool_call_rows = [
+        msg for msg in durable
+        if msg.get("role") == "assistant" and msg.get("tool_calls")
+    ]
+    assert len(tool_call_rows) == 1
+    assert tool_call_rows[0]["tool_calls"][0]["id"] == "sqlite-null-tool"
+
+
+def test_sqlite_null_exhaustion_blocks_tool_side_effect_without_model_replay(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(SessionDB, "_TRANSCRIPT_WRITE_PATIENCE_S", 0.01)
+    monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MIN_S", 0.0)
+    monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MAX_S", 0.0)
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "sqlite-null-tool-call-exhausted"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    tool_call = _mock_tool_call(call_id="sqlite-null-must-not-run")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+
+    original_insert = SessionDB._insert_message_rows
+
+    def _always_fail_tool_call_insert(self_db, conn, sid, msgs):
+        if sid == session_id and any(
+            msg.get("role") == "assistant" and msg.get("tool_calls")
+            for msg in msgs
+        ):
+            raise SystemError(SQLITE_NULL_SYSTEM_ERROR)
+        return original_insert(self_db, conn, sid, msgs)
+
+    monkeypatch.setattr(SessionDB, "_insert_message_rows", _always_fail_tool_call_insert)
+
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent._execute_tool_calls = MagicMock()
+            result = agent.run_conversation("inspect the repository")
+    finally:
+        db.close()
+
+    agent._execute_tool_calls.assert_not_called()
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["failure_reason"] == "session_persistence_failed:unknown"
+    assert not any(msg.get("tool_calls") for msg in _durable_messages(db_path, session_id))
 
 
 def test_persistence_cause_resets_between_turns():
@@ -1248,4 +1373,3 @@ def test_flush_concurrent_nonblank_winner_adopts_canonical_content(tmp_path):
     assert messages[-1]["content"] == "Canonical winner answer from sibling"
     assert messages[-1]["_db_persisted"] is True
     assert messages[-1]["_row_id"] == row_id
-

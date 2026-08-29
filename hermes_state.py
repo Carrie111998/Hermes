@@ -5307,18 +5307,62 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _is_sqlite_null_system_error(exc: BaseException) -> bool:
+            return (
+                type(exc) is SystemError
+                and "returned null without setting an exception" in str(exc).lower()
+            )
+
+        null_wait_started: Optional[float] = None
+        null_wait_attempts = 0
+        null_last_stage = "unknown"
+        null_last_rollback_safety = "not_attempted"
+
         while True:
+            null_error_stage = "begin"
+            null_rollback_safety = "not_needed"
+            null_retry_safe = True
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._conn.execute("BEGIN IMMEDIATE")
+                    except BaseException:
+                        if self._conn.in_transaction:
+                            try:
+                                self._conn.rollback()
+                                null_rollback_safety = "begin_rolled_back"
+                            except Exception:
+                                null_rollback_safety = "begin_rollback_failed"
+                                null_retry_safe = False
+                            if null_retry_safe and self._conn.in_transaction:
+                                null_rollback_safety = (
+                                    "begin_rollback_left_transaction_active"
+                                )
+                                null_retry_safe = False
+                        else:
+                            null_rollback_safety = "begin_no_transaction"
+                        raise
+                    null_error_stage = "callback"
                     try:
                         result = fn(self._conn)
+                        null_error_stage = "commit"
                         self._conn.commit()
                     except BaseException:
+                        rollback_failed = False
                         try:
-                            self._conn.rollback()
+                            if self._conn.in_transaction:
+                                self._conn.rollback()
+                                null_rollback_safety = "rolled_back"
+                            else:
+                                null_rollback_safety = "no_active_transaction"
                         except Exception:
-                            pass
+                            rollback_failed = True
+                            null_rollback_safety = "rollback_failed"
+                        if not rollback_failed and self._conn.in_transaction:
+                            rollback_failed = True
+                            null_rollback_safety = "rollback_left_transaction_active"
+                        if null_error_stage == "commit" or rollback_failed:
+                            null_retry_safe = False
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 if wait_started is not None:
@@ -5327,6 +5371,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         session_id=session_id,
                         waited_s=time.monotonic() - wait_started,
                         attempts=wait_attempts,
+                    )
+                if null_wait_started is not None:
+                    self._log_sqlite_null_system_error(
+                        event="recovered",
+                        outcome="success",
+                        operation=operation,
+                        session_id=session_id,
+                        waited_s=time.monotonic() - null_wait_started,
+                        attempts=null_wait_attempts,
+                        stage=null_last_stage,
+                        rollback_safety=null_last_rollback_safety,
                     )
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -5354,6 +5409,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
                 ):
                     continue
+                raise
+            except SystemError as exc:
+                if not _is_sqlite_null_system_error(exc):
+                    raise
+                now = time.monotonic()
+                if null_wait_started is None:
+                    null_wait_started = now
+                null_wait_attempts += 1
+                null_last_stage = null_error_stage
+                null_last_rollback_safety = null_rollback_safety
+                waited_s = now - null_wait_started
+                if not null_retry_safe:
+                    reason = (
+                        "commit_stage"
+                        if null_error_stage == "commit"
+                        else "rollback_unsafe"
+                    )
+                    self._log_sqlite_null_system_error(
+                        event="fail_closed",
+                        outcome=reason,
+                        operation=operation,
+                        session_id=session_id,
+                        waited_s=waited_s,
+                        attempts=null_wait_attempts,
+                        stage=null_error_stage,
+                        rollback_safety=null_rollback_safety,
+                    )
+                    raise
+                if self._sleep_before_write_retry(deadline, patience_s):
+                    continue
+                self._log_sqlite_null_system_error(
+                    event="exhausted",
+                    outcome="exhausted",
+                    operation=operation,
+                    session_id=session_id,
+                    waited_s=time.monotonic() - null_wait_started,
+                    patience_s=patience_s,
+                    attempts=null_wait_attempts,
+                    stage=null_error_stage,
+                    rollback_safety=null_rollback_safety,
+                )
                 raise
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
@@ -5423,6 +5519,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+
+    def _log_sqlite_null_system_error(
+        self,
+        *,
+        event: str,
+        outcome: str,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        attempts: int,
+        stage: str,
+        rollback_safety: str,
+        patience_s: Optional[float] = None,
+    ) -> None:
+        level = logging.INFO if event == "recovered" else logging.ERROR
+        if patience_s is None:
+            logger.log(
+                level,
+                "SessionDB sqlite_null_system_error %s: db_path=%s "
+                "operation=%s waited=%.3fs pid=%s thread=%s session=%s "
+                "attempts=%s stage=%s rollback_safety=%s outcome=%s",
+                event,
+                str(self.db_path),
+                operation,
+                round(float(waited_s), 3),
+                os.getpid(),
+                threading.get_ident(),
+                session_id or "unknown",
+                int(attempts),
+                stage,
+                rollback_safety,
+                outcome,
+            )
+            return
+        logger.log(
+            level,
+            "SessionDB sqlite_null_system_error exhausted: db_path=%s "
+            "operation=%s waited=%.3fs patience=%.3fs pid=%s thread=%s "
+            "session=%s attempts=%s stage=%s rollback_safety=%s "
+            "outcome=%s",
+            str(self.db_path),
+            operation,
+            round(float(waited_s), 3),
+            patience_s,
+            os.getpid(),
+            threading.get_ident(),
+            session_id or "unknown",
+            int(attempts),
+            stage,
+            rollback_safety,
+            outcome,
+        )
 
     def _write_lock_log_context(
         self,
