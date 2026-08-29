@@ -28,6 +28,7 @@ import {
 
 import { avatarColor, botAppearance, BotFace } from './avatar'
 import { isBackfilledFacePng } from './avatar-image'
+import { openBotDesktopPane } from './bot-desktop-pane'
 import {
   $botChatFocused,
   $focusedBotOwner,
@@ -286,6 +287,31 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
       <ContextMenuContent>
         <ContextMenuItem onSelect={() => void openRosterBot(bot, { canonical: true })}>
           {b.bot.openBotChat}
+        </ContextMenuItem>
+        <ContextMenuItem
+          onSelect={() => {
+            void window.hermesDesktop.botDesktop.open(bot.name).then(result => {
+              if (!result.ok) {
+                host.notify({ kind: 'error', message: result.error || t.desktop.botDesktop.unavailable })
+              }
+            })
+          }}
+        >
+          {t.desktop.botDesktop.openStandalone}
+        </ContextMenuItem>
+        <ContextMenuItem
+          onSelect={() => {
+            try {
+              openBotDesktopPane(bot.name)
+            } catch (error) {
+              host.notify({
+                kind: 'error',
+                message: error instanceof Error ? error.message : String(error)
+              })
+            }
+          }}
+        >
+          {t.desktop.botDesktop.openEmbedded}
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem

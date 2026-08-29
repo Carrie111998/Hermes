@@ -47,9 +47,27 @@ const winParam = new URLSearchParams(window.location.search).get('win')
 
 if (winParam === 'hud') {
   document.title = 'Hermes HUD'
+} else if (winParam === 'bot-desktop') {
+  document.title = 'Hermes Bot Desktop'
 }
 
-if (winParam === 'overlay') {
+if (winParam === 'bot-desktop') {
+  void import('./app/bot-desktop/bot-desktop-root').then(({ BotDesktopRoot }) => {
+    createRoot(document.getElementById('root')!).render(
+      <StrictMode>
+        <RootErrorBoundary>
+          <QueryClientProvider client={queryClient}>
+            <I18nProvider>
+              <ThemeProvider>
+                <BotDesktopRoot />
+              </ThemeProvider>
+            </I18nProvider>
+          </QueryClientProvider>
+        </RootErrorBoundary>
+      </StrictMode>
+    )
+  })
+} else if (winParam === 'overlay') {
   void import('./app/pet-overlay/overlay-root').then(({ mountPetOverlay }) => mountPetOverlay())
 } else if (winParam === 'quick') {
   void import('./app/quick-entry/quick-entry-root').then(({ mountQuickEntry }) => mountQuickEntry())
