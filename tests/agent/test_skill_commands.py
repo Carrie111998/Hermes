@@ -51,12 +51,16 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
 
 
 class TestScanSkillCommands:
+    def test_skips_skills_under_underscore_archive_directory(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        _make_skill(skills_root, "active-skill")
+        _make_skill(skills_root / "_archive", "archived-skill")
 
+        with patch("tools.skills_tool.SKILLS_DIR", skills_root):
+            result = scan_skill_commands()
 
-
-
-
-
+        assert "/active-skill" in result
+        assert "/archived-skill" not in result
 
     def test_loads_skill_invocation_from_symlinked_skill_dir(self, tmp_path):
         """Slash commands should load skills symlinked under the local skills dir."""
