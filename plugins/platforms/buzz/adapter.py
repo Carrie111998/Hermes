@@ -613,7 +613,12 @@ class BuzzAdapter(BasePlatformAdapter):
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
-            args += ["--reply-to", str(reply_target)]
+            # Reply with --broadcast so the message keeps its NIP-10 reply
+            # linkage (notifications, thread summary) but renders at channel
+            # level instead of nesting into a collapsed thread. Both Buzz
+            # Desktop and Mobile treat a ["broadcast","1"] tag as a
+            # top-level timeline entry.
+            args += ["--reply-to", str(reply_target), "--broadcast"]
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
@@ -684,7 +689,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--content", "-",
             ]
             if reply_to:
-                args += ["--reply-to", str(reply_to)]
+                args += ["--reply-to", str(reply_to), "--broadcast"]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1389,7 +1394,7 @@ async def _standalone_send(
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
     if thread_id:
-        args += ["--reply-to", str(thread_id)]
+        args += ["--reply-to", str(thread_id), "--broadcast"]
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
