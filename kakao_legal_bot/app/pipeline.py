@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from urllib.parse import quote
 
 from . import intake as intake_states
 from .archive import room_label_base
@@ -138,6 +139,18 @@ class Pipeline:
             await handle_command(services, event, decision)
             return
 
+        # "사진을 보냈습니다" — 알림 기반 수신에서는 내용이 오지 않으므로,
+        # LLM 을 부르는 대신 전용 자료 접수 링크를 바로 안내합니다.
+        from .uploads import media_kind, upload_guidance
+
+        media = media_kind(event.text)
+        if media:
+            guidance = await asyncio.to_thread(
+                upload_guidance, settings, db, room_id, media
+            )
+            await services.sender.send(room_id, guidance, record_role="bot")
+            return
+
         if not self._allow(room_id):
             log.info("room %s throttled", room_id)
             return
@@ -249,6 +262,11 @@ class Pipeline:
             when=time.strftime("%Y-%m-%d %H:%M"),
             question=question[: services.settings.lawyer_alert_preview_chars],
         )
+        # 실시간 방 화면 — 변호사가 링크 하나로 대화를 생중계로 보고,
+        # 필요하면 그 화면에서 직접 발언할 수 있습니다.
+        live = services.settings.admin_url(f"/rooms/{quote(event.room_id, safe='')}")
+        if live:
+            text += f"\n실시간 보기·개입: {live}"
         self._notify_lawyer_detached(text)
         return consult_id
 

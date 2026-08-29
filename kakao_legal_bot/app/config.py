@@ -100,6 +100,8 @@ class Settings:
     # 문서 발송이 끝난 사건은 상담보고서+대화 전체+LLM 초안+변호사 최종본을
     # 한 파일(사건파일)로 묶어 raw 로 남기고, 상담사례 검색 색인에 넣습니다.
     casefile_enabled: bool = field(default_factory=lambda: _env_bool("CASEFILE_ENABLED", True))
+    # 증거 업로드 페이지(/u/<토큰>)가 받는 파일 하나의 최대 크기(MB).
+    upload_max_mb: int = field(default_factory=lambda: _env_int("UPLOAD_MAX_MB", 20))
 
     # ── Iris (KakaoTalk bridge running on the rooted emulator) ───────────
     iris_base_url: str = field(default_factory=lambda: _env("IRIS_BASE_URL").rstrip("/"))
@@ -321,6 +323,11 @@ class Settings:
     def casefile_dir(self) -> Path:
         """완결 사건의 4종 합본(사건파일) .md 가 쌓이는 raw 폴더."""
         return self.data_dir / "casefiles"
+
+    @property
+    def upload_dir(self) -> Path:
+        """상담자가 올린 증거 사진·파일의 원본이 놓이는 곳 (방별 하위 폴더)."""
+        return self.data_dir / "uploads"
 
     @property
     def wiki_graph_path(self) -> Path:

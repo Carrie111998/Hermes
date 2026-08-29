@@ -205,8 +205,10 @@ async def dashboard(
         )
         keys = row.keys()
         label = str(row["label"]) if "label" in keys and row["label"] else ""
+        live = f'/admin/rooms/{quote(str(row["room_id"]), safe="")}?token={quote(token)}'
         room_rows.append(
-            f'<li><strong>{_esc(label or row["room_name"] or row["room_id"])}</strong>'
+            f'<li><strong><a href="{live}">'
+            f'{_esc(label or row["room_name"] or row["room_id"])}</a></strong>'
             f'{" · " + " · ".join(flags) if flags else ""}'
             f'<div class="meta">{_esc(speaker)}: {_esc(last)} · {_ago(row["updated_at"])}</div></li>'
         )
@@ -372,3 +374,101 @@ async def update_draft(
 async def list_rooms(services: Services = Depends(_require_token)) -> JSONResponse:
     rooms = await asyncio.to_thread(services.db.list_rooms, 200)
     return JSONResponse([dict(row) for row in rooms])
+
+
+# ── 실시간 방 화면 — 생중계 + 변호사 직접 발언 ──────────────────────────
+@router.get("/rooms/{room_id}", response_class=HTMLResponse)
+async def show_room(
+    room_id: str, request: Request, services: Services = Depends(_require_token)
+) -> HTMLResponse:
+    """방 하나의 대화를 5초마다 새로고침으로 생중계.
+
+    변호사는 어느 기기에서든 이 화면으로 상담을 지켜보다가, 아래 입력창으로
+    그 방에 직접 발언할 수 있습니다 — 봇 계정의 입을 빌리되 [변호사] 표시가
+    붙으므로 상담자는 누가 말하는지 압니다.
+    """
+    token = request.query_params.get("token", "")
+    room = await asyncio.to_thread(services.db.get_room, room_id)
+    if room is None:
+        raise HTTPException(404, "방을 찾을 수 없습니다.")
+    label = str(room["label"]) if "label" in room.keys() and room["label"] else ""
+    turns = await asyncio.to_thread(services.db.room_archive, room_id)
+    if not turns:
+        turns = await asyncio.to_thread(services.db.recent_messages, room_id, 200)
+    uploads = await asyncio.to_thread(services.db.list_uploads, room_id, 50)
+
+    settings = services.settings
+    speaker_for = {"bot": settings.bot_name, "lawyer": "변호사", "system": "📌"}
+    lines = []
+    for turn in turns[-300:]:
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(turn.created_at))
+        speaker = turn.sender or speaker_for.get(turn.role, "상담자")
+        side = "bot" if turn.role in {"bot", "lawyer", "system"} else "user"
+        lines.append(
+            f'<div class="msg {side}"><span class="who">{_esc(speaker)}'
+            f' <small>{stamp}</small></span><br>{_esc(turn.text)}</div>'
+        )
+    files = "".join(
+        f'<li><a href="/admin/uploads/{row["id"]}?token={_esc(token)}">'
+        f'{_esc(row["filename"])}</a>'
+        f'<span class="meta"> · {int(row["size"]) // 1024}KB · {_ago(row["created_at"])}</span></li>'
+        for row in uploads
+    )
+    extra_css = """<style>
+     .msg { border-radius: 10px; padding: 8px 12px; margin: 6px 0; white-space: pre-wrap;
+            border: 1px solid rgba(128,128,128,.3); }
+     .msg.bot { background: rgba(128,128,128,.10); }
+     .msg .who { font-weight: 600; font-size: 13px; opacity: .8; }
+    </style>"""
+    body = (
+        f"{extra_css}"
+        f"<h1>{_esc(label or room['room_name'] or room_id)}</h1>"
+        f'<div class="meta">방 {_esc(room_id)} · 5초마다 자동 새로고침 · '
+        f'<a href="/admin?token={_esc(token)}">← 업무 현황</a></div>'
+        + (f'<h2>접수 자료 ({len(uploads)})</h2><ul class="plain">{files}</ul>' if uploads else "")
+        + f"<h2>대화 ({len(turns)})</h2>{''.join(lines) or '<p class=meta>아직 대화가 없습니다.</p>'}"
+        f'<form method="post" action="/admin/rooms/{quote(room_id, safe="")}/say?token={_esc(token)}">'
+        f'<p><input type="text" name="text" placeholder="이 방에 변호사로서 한마디 (즉시 전송됩니다)"></p>'
+        f"<button>보내기</button></form>"
+        # 입력 중일 때는 새로고침을 멈춰 타이핑을 지키고, 아니면 5초마다.
+        f"<script>setTimeout(function(){{var i=document.querySelector('input[name=text]');"
+        f"if(!i||!i.value)location.reload()}}, 5000)</script>"
+    )
+    return HTMLResponse(_PAGE.format(title=label or "상담방", body=body))
+
+
+@router.post("/rooms/{room_id}/say")
+async def say_in_room(
+    room_id: str,
+    request: Request,
+    services: Services = Depends(_require_token),
+    text: str = Form(""),
+) -> RedirectResponse:
+    token = request.query_params.get("token", "")
+    text = text.strip()
+    if text:
+        await services.sender.send(
+            room_id,
+            f"[{services.settings.lawyer_name}] {text}",
+            record_role="lawyer",
+        )
+    return RedirectResponse(
+        f"/admin/rooms/{quote(room_id, safe='')}?token={quote(token)}", status_code=303
+    )
+
+
+@router.get("/uploads/{upload_id}")
+async def download_upload(
+    upload_id: int, services: Services = Depends(_require_token)
+):  # noqa: ANN201
+    from fastapi.responses import FileResponse
+
+    from .uploads import stored_path
+
+    row = await asyncio.to_thread(services.db.get_upload, upload_id)
+    if row is None:
+        raise HTTPException(404, "파일을 찾을 수 없습니다.")
+    path = stored_path(services.settings, row)
+    if not path.is_file():
+        raise HTTPException(404, "파일이 디스크에 없습니다.")
+    return FileResponse(path, filename=str(row["filename"]))

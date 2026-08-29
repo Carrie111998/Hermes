@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_done"})
 
@@ -179,6 +179,20 @@ CREATE TABLE IF NOT EXISTS kv (
     value       TEXT NOT NULL,
     updated_at  REAL NOT NULL
 );
+
+-- 상담자가 업로드 페이지(/u/<토큰>)로 올린 증거 사진·파일.
+-- 카카오톡 알림으로는 파일 내용을 받을 수 없어, 카톡 밖의 우리 서버로
+-- 직접 받습니다. 원본은 DATA_DIR/uploads/<방>/ 에, 목록은 여기에.
+CREATE TABLE IF NOT EXISTS uploads (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id      TEXT NOT NULL,
+    filename     TEXT NOT NULL,                           -- 원래 파일 이름
+    stored_name  TEXT NOT NULL,                           -- 디스크의 무작위 이름
+    content_type TEXT NOT NULL DEFAULT '',
+    size         INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_uploads_room ON uploads(room_id, id DESC);
 """
 
 
@@ -918,6 +932,39 @@ class Database:
             "INSERT OR REPLACE INTO http_cache(cache_key, body, created_at) VALUES(?, ?, ?)",
             (key, body, time.time()),
         )
+
+    # ── uploads (증거 사진·파일) ─────────────────────────────────────────
+    def add_upload(
+        self,
+        room_id: str,
+        filename: str,
+        stored_name: str,
+        content_type: str = "",
+        size: int = 0,
+    ) -> int:
+        cur = self._exec(
+            "INSERT INTO uploads(room_id, filename, stored_name, content_type, size, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (room_id, filename, stored_name, content_type, size, time.time()),
+        )
+        return int(cur.lastrowid or 0)
+
+    def get_upload(self, upload_id: int) -> sqlite3.Row | None:
+        return self._query_one("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+
+    def list_uploads(self, room_id: str = "", limit: int = 100) -> list[sqlite3.Row]:
+        if room_id:
+            return self._query(
+                "SELECT * FROM uploads WHERE room_id = ? ORDER BY id DESC LIMIT ?",
+                (room_id, limit),
+            )
+        return self._query("SELECT * FROM uploads ORDER BY id DESC LIMIT ?", (limit,))
+
+    def count_uploads(self, room_id: str) -> int:
+        row = self._query_one(
+            "SELECT COUNT(*) AS n FROM uploads WHERE room_id = ?", (room_id,)
+        )
+        return int(row["n"]) if row else 0
 
     # ── kv ───────────────────────────────────────────────────────────────
     def kv_get(self, key: str, default: str = "") -> str:

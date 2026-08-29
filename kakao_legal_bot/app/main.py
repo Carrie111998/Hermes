@@ -18,7 +18,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .admin import router as admin_router
 from .config import Settings, get_settings
@@ -150,6 +150,135 @@ async def outbox_ack(request: Request, x_outbox_token: str = Header(default=""))
     ok = bool(body.get("ok", True))
     await asyncio.to_thread(services.db.ack_outbox, ids, ok, str(body.get("error") or ""))
     return JSONResponse({"ok": True, "acked": len(ids)})
+
+
+# ── 증거 사진·파일 접수 (상담자용 공개 페이지) ──────────────────────────
+_UPLOAD_PAGE = """<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>자료 올리기</title>
+<style>
+ body {{ font-family: -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+        max-width: 480px; margin: 0 auto; padding: 32px 20px; line-height: 1.6; }}
+ h1 {{ font-size: 20px; }}
+ .note {{ background: rgba(128,128,128,.12); padding: 10px 14px; border-radius: 10px;
+         font-size: 14px; }}
+ input[type=file] {{ width: 100%; padding: 14px 0; }}
+ button {{ width: 100%; padding: 14px; font-size: 16px; border-radius: 10px;
+          border: none; background: #391b1b; color: #fff; cursor: pointer; }}
+ .ok {{ border-left: 4px solid #2e7d32; }}
+</style></head><body>
+<h1>📎 상담 자료 올리기</h1>
+{banner}
+<p class="note">사진·문서·녹음 등 사건 관련 자료를 올려주세요.
+올려주시는 즉시 변호사님께 전달되어 상담에 반영됩니다.
+(파일 하나 최대 {max_mb}MB{count})</p>
+<form method="post" enctype="multipart/form-data">
+  <input type="file" name="files" multiple required>
+  <button type="submit">올리기</button>
+</form>
+</body></html>"""
+
+
+def _upload_room(services: Services, token: str) -> str:
+    from .uploads import room_for_upload_token
+
+    room_id = room_for_upload_token(services.db, token)
+    if not room_id:
+        raise HTTPException(404, "주소가 올바르지 않습니다.")
+    return room_id
+
+
+@router.get("/u/{token}", response_class=HTMLResponse)
+async def upload_page(token: str, request: Request) -> HTMLResponse:
+    services: Services = request.app.state.services
+    room_id = await asyncio.to_thread(_upload_room, services, token)
+    received = await asyncio.to_thread(services.db.count_uploads, room_id)
+    count = f" · 지금까지 {received}건 접수" if received else ""
+    return HTMLResponse(
+        _UPLOAD_PAGE.format(banner="", max_mb=services.settings.upload_max_mb, count=count)
+    )
+
+
+@router.post("/u/{token}", response_class=HTMLResponse)
+async def upload_files(token: str, request: Request) -> HTMLResponse:
+    """상담자 폰에서 바로 올라오는 증거 자료.
+
+    저장 → 변호사 카톡 📎 알림 → 대화 기록에 시스템 메시지(AI 가 자료
+    도착을 인지) → 상담방에 접수 확인, 이 네 가지가 한 번에 일어납니다.
+    """
+    services: Services = request.app.state.services
+    settings = services.settings
+    room_id = await asyncio.to_thread(_upload_room, services, token)
+
+    from .uploads import human_size, save_upload
+
+    form = await request.form()
+    limit = settings.upload_max_mb * 1024 * 1024
+    saved: list[str] = []
+    rejected: list[str] = []
+    for item in form.getlist("files"):
+        if isinstance(item, str) or not getattr(item, "filename", ""):
+            continue
+        content = await item.read()
+        if not content:
+            continue
+        if len(content) > limit:
+            rejected.append(item.filename)
+            continue
+        _, _path = await asyncio.to_thread(
+            save_upload, settings, services.db, room_id,
+            item.filename, content, item.content_type or "",
+        )
+        saved.append(f"{item.filename} ({human_size(len(content))})")
+
+    if saved:
+        listing = "\n".join(f"- {name}" for name in saved)
+        # AI 가 다음 턴에 자료 도착을 알도록 대화 기록에 남깁니다.
+        await asyncio.to_thread(
+            services.db.add_message,
+            room_id,
+            "system",
+            f"[자료 접수] 상담자가 파일 {len(saved)}건을 올렸습니다:\n{listing}",
+            "",
+            "",
+            settings.history_turns,
+            settings.archive_enabled,
+        )
+        room = await asyncio.to_thread(services.db.get_room, room_id)
+        label = str(room["label"]) if room is not None and "label" in room.keys() else ""
+        link = settings.admin_url(f"/rooms/{room_id}")
+        _spawn(
+            services.sender.notify_lawyer(
+                f"📎 자료 {len(saved)}건 접수\n방: {label or room_id}\n{listing}"
+                + (f"\n바로 보기: {link}" if link else "")
+            )
+        )
+        with contextlib.suppress(Exception):
+            await services.sender.send(
+                room_id,
+                f"자료 {len(saved)}건을 접수했습니다. 변호사님께 바로 전달드렸습니다. 📎",
+                record_role="",
+            )
+
+    banner = ""
+    if saved:
+        banner = f'<p class="note ok">✅ {len(saved)}건 접수되었습니다. 감사합니다.</p>'
+    if rejected:
+        banner += (
+            f'<p class="note">⚠ 용량 초과로 받지 못한 파일 {len(rejected)}건: '
+            f"{', '.join(rejected[:5])} — {settings.upload_max_mb}MB 이하로 나눠 올려주세요.</p>"
+        )
+    if not saved and not rejected:
+        banner = '<p class="note">파일이 선택되지 않았습니다.</p>'
+    received = await asyncio.to_thread(services.db.count_uploads, room_id)
+    return HTMLResponse(
+        _UPLOAD_PAGE.format(
+            banner=banner,
+            max_mb=settings.upload_max_mb,
+            count=f" · 지금까지 {received}건 접수" if received else "",
+        )
+    )
 
 
 def _require_worker_token(services: Services, request: Request, header_value: str) -> None:
