@@ -9968,6 +9968,64 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+def count_running_by_assignee_other_boards(
+    board: Optional[str] = None,
+) -> "dict[str, int]":
+    """``running`` task count PER ASSIGNEE across every board EXCEPT ``board``.
+
+    The per-assignee sibling of :func:`count_running_tasks_other_boards`, and it
+    exists for the same reason: ``kanban.max_in_progress_per_profile`` bounds a
+    single profile's local model / API quota / browser pool, but each board's
+    dispatch tick only sees its own DB. Counting within one board multiplies the
+    cap by the number of active boards — the exact failure the global cap's
+    cross-board term already prevents.
+
+    Observed 2026-08-29 on a 19-board host with the cap set to 2: assignee
+    ``devops`` held 3 running workers (2 on jarvis-os, 1 on sycode-trading).
+    Neither board saw a breach; the host did.
+
+    Boards are matched by resolved DB path, so the ``HERMES_KANBAN_DB`` override
+    (which pins every board to one file) naturally yields an empty mapping.
+    Fails open per board: one broken/corrupt board must not brick dispatch on
+    the healthy ones.
+    """
+    counts: "dict[str, int]" = {}
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return counts
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = connect(board=slug)
+            try:
+                for row in other.execute(
+                    "SELECT assignee, COUNT(*) AS n FROM tasks "
+                    "WHERE status = 'running' AND assignee IS NOT NULL "
+                    "GROUP BY assignee"
+                ):
+                    who = row["assignee"]
+                    counts[who] = counts.get(who, 0) + int(row["n"])
+            finally:
+                try:
+                    other.close()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return counts
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify current system memory pressure: ok/elevated/critical/unknown.
 
@@ -10280,6 +10338,14 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+        # HOST-level, not per-board. Workers are OS processes and a profile's
+        # model/API quota is shared across every board it is assigned on, so a
+        # profile already at its cap on ANOTHER board must not get another
+        # worker here. Without this the cap is silently multiplied by the number
+        # of active boards (19 on this host), which is the same defect the
+        # global max_in_progress term above already guards against.
+        for _who, _n in count_running_by_assignee_other_boards(board).items():
+            _per_profile_running[_who] = _per_profile_running.get(_who, 0) + _n
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
