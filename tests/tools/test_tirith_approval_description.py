@@ -92,3 +92,47 @@ def test_mixed_findings_use_remediation_where_available():
     assert "clean guidance A" in out
     assert "promo-laden description" not in out
     assert "plain description B" in out
+
+
+def test_empty_string_remediation_falls_back_to_description():
+    """``remediation: ""`` is falsy — the finding must keep the
+    description-based rendering, not render an empty detail."""
+    result = {
+        "action": "warn",
+        "summary": "1 warning",
+        "findings": [
+            {
+                "severity": "MEDIUM",
+                "title": "Empty remediation",
+                "description": "plain fallback text",
+                "remediation": "",
+            }
+        ],
+    }
+
+    out = _format_tirith_description(result)
+
+    assert "Empty remediation: plain fallback text" in out
+
+
+def test_non_string_remediation_falls_back_to_description():
+    """A structured (list) remediation from a future tirith version must
+    not render a Python repr into approval prompts."""
+    result = {
+        "action": "warn",
+        "summary": "1 warning",
+        "findings": [
+            {
+                "severity": "MEDIUM",
+                "title": "Structured remediation",
+                "description": "plain fallback text",
+                "remediation": ["step one", "step two"],
+            }
+        ],
+    }
+
+    out = _format_tirith_description(result)
+
+    assert "Structured remediation: plain fallback text" in out
+    assert "step one" not in out
+    assert "[" not in out.split("Structured remediation", 1)[-1]
