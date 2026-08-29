@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -19,6 +20,13 @@ if _CLASSIFIER_SPEC is None or _CLASSIFIER_SPEC.loader is None:
 _CLASSIFIER = importlib.util.module_from_spec(_CLASSIFIER_SPEC)
 _CLASSIFIER_SPEC.loader.exec_module(_CLASSIFIER)
 classify = _CLASSIFIER.classify
+
+
+def _is_valid_windows_runner(runner: object) -> bool:
+    return isinstance(runner, str) and runner in {
+        "windows-latest",
+        "windows-latest-32-core",
+    }
 
 
 def _load_workflow(name: str) -> dict:
@@ -65,12 +73,23 @@ def test_os_matrix_binds_windows_marker_to_native_runner():
 
     by_marker = {entry["marker"]: entry for entry in matrix}
     windows_runner = by_marker["windows_only"]["runner"]
-    assert isinstance(windows_runner, str)
-    assert windows_runner == "windows-latest" or windows_runner.startswith(
-        "windows-latest-"
-    )
+    assert _is_valid_windows_runner(windows_runner)
     assert by_marker["windows_only"]["name"] == "Windows-only tests"
     assert by_marker["macos_only"]["runner"] == "macos-latest"
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [
+        "windows-latest-",
+        "windows-latest-linux",
+        "windows-latest-self-hosted",
+        "windows-latest-32-core-extra",
+    ],
+)
+def test_os_matrix_rejects_malformed_windows_runner_labels(runner: str):
+    """The Windows runner contract must reject near-miss labels."""
+    assert not _is_valid_windows_runner(runner)
 
 
 def test_os_selector_fails_closed_for_empty_selection():
