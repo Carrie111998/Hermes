@@ -1120,6 +1120,34 @@ def test_browser_exec_fails_closed_when_backend_off(monkeypatch):
     assert "browser.backend is off" in out
 
 
+def test_browser_exec_kill_switch_precedes_url_blocklist(monkeypatch):
+    """When the backend is off and the code also carries a blocked URL, the
+    backend-off refusal wins: the kill switch runs first, and the reply must
+    not leak that the URL blocklist would also have fired (#94702 review)."""
+    monkeypatch.setattr(
+        bu_cli, "get_browser_backend", lambda: bu_cli.BACKEND_DISABLED
+    )
+
+    def must_not_run():
+        raise AssertionError(
+            "disabled browser_exec still tried to resolve the CLI"
+        )
+
+    monkeypatch.setattr(bu_cli, "_find_cli", must_not_run)
+
+    def blocklist_must_not_run(code):
+        raise AssertionError(
+            "URL blocklist was consulted while the kill switch had already refused"
+        )
+
+    monkeypatch.setattr(bu_cli, "_blocked_url_in_code", blocklist_must_not_run)
+
+    out = bu_cli.browser_exec('new_tab("https://definitely-blocked.example")')
+
+    assert isinstance(out, str)
+    assert "browser.backend is off" in out
+
+
 def test_browser_exec_still_runs_when_backend_enabled(monkeypatch):
     """The kill switch must not fire for an enabled backend: resolve the
     CLI path normally (the exec itself is stubbed at the subprocess seam)."""
