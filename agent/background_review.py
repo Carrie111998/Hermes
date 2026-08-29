@@ -1311,6 +1311,27 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                # Inherit the parent's overflow chain so bg-review waiters bounce
+                # to Nemotron/etc. instead of hanging on a full primary engine.
+                # mirrors tools/delegate_tool.py's parent_fallback inheritance,
+                # with the same #80450 guard: when the review runtime is ROUTED
+                # to a different provider (auxiliary.background_review.provider
+                # names a concrete engine other than the parent's), a mid-run
+                # auth/429 failure must not silently reroute the review child
+                # onto a chain built for a different provider — it should fail
+                # loudly instead of dragging across engines.
+                #
+                # Use the _routed flag, NOT the presence of a provider: _rt
+                # always carries a truthy provider (the default path sets
+                # provider=agent.provider), so keying off it would make the
+                # inheritance dead code. _routed is False for same-as-parent
+                # (inherit) and True for a real pin, matching the cache-parity
+                # gates below.
+                fallback_model=(
+                    (getattr(agent, "_fallback_chain", None) or None)
+                    if not _routed
+                    else None
+                ),
                 **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"

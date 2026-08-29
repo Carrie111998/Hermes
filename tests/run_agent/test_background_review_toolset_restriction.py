@@ -85,6 +85,55 @@ def test_background_review_matches_parent_toolset_config():
     )
 
 
+def test_background_review_inherits_fallback_chain_unless_routed():
+    """Fork receives the parent's _fallback_chain when the runtime is NOT
+    routed (same provider); None when auxiliary.background_review routes to
+    another provider. Regression for #95230 review: the guard must key off the
+    _routed flag, not the presence of a provider (which is always populated)."""
+    import run_agent
+
+    parent_chain = [
+        {"provider": "openai", "model": "gpt-4o"},
+        {"provider": "anthropic", "model": "claude-sonnet"},
+    ]
+
+    def _run(routed_map):
+        agent = _make_agent_stub(run_agent.AIAgent)
+        # Set the overflow chain directly on the __new__ stub (no __init__ runs).
+        setattr(agent, "_fallback_chain", parent_chain)
+        captured = {}
+
+        def _capture_init(self, *args, **kwargs):
+            captured["fallback_model"] = kwargs.get("fallback_model", "UNSET")
+            raise RuntimeError("stop after capturing init args")
+
+        with patch.object(run_agent.AIAgent, "__init__", _capture_init), \
+             patch("threading.Thread", _SyncThread), \
+             patch(
+                 "agent.background_review._resolve_review_runtime",
+                 return_value=routed_map,
+             ):
+            # The route map always carries a truthy provider (mirrors reality),
+            # plus the routed flag that the guard must key off.
+            agent._spawn_background_review(
+                messages_snapshot=[],
+                review_memory=True,
+                review_skills=False,
+            )
+        return captured.get("fallback_model")
+
+    # Not routed (same provider): inherit the parent's chain.
+    not_routed = _run({"provider": "openai", "routed": False})
+    assert not_routed == parent_chain, (
+        f"expected fallback_model to inherit parent chain, got {not_routed!r}"
+    )
+    # Routed to a different provider: do NOT inherit (guard fires).
+    routed = _run({"provider": "anthropic", "routed": True})
+    assert routed is None, (
+        f"expected fallback_model None when routed, got {routed!r}"
+    )
+
+
 def test_background_review_installs_thread_local_whitelist():
     """The review fork must install a memory/skills-only thread-local whitelist.
 
