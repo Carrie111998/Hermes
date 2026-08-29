@@ -150,20 +150,69 @@ def test_request_has_stable_host_owned_profile_and_conversation_scope(monkeypatc
         allow_permanent=False,
         profile_name="personal",
     )
+    other_session = ApprovalRequest.create(
+        command="echo ok",
+        description="safe",
+        pattern_key="example",
+        pattern_keys=("example",),
+        session_key="another-conversation",
+        surface="cli",
+        allow_session=False,
+        allow_permanent=False,
+        profile_name="work",
+    )
 
     assert first.profile_name == "work"
-    assert first.scope_key == second.scope_key
-    assert first.scope_key != other_profile.scope_key
-    assert "conversation-secret-looking-value" not in first.scope_key
+    assert first.conversation_scope_key == second.conversation_scope_key
+    assert first.conversation_scope_key != other_profile.conversation_scope_key
+    assert first.conversation_scope_key != other_session.conversation_scope_key
+    assert "conversation-secret-looking-value" not in first.conversation_scope_key
     assert first.digest != other_profile.digest
+    assert first.digest != other_session.digest
+
+
+def test_create_rejects_scope_override():
+    from hermes_cli.approval_transport import ApprovalRequest
+
+    creator = getattr(ApprovalRequest, "create")
+    with pytest.raises(TypeError):
+        creator(
+            command="echo ok",
+            description="safe",
+            pattern_key="example",
+            pattern_keys=("example",),
+            session_key="session-a",
+            surface="cli",
+            allow_session=False,
+            allow_permanent=False,
+            **{"scope_key": "attacker-controlled"},
+        )
+
+
+@pytest.mark.parametrize("profile_name", ["", "../escape", "not valid"])
+def test_create_rejects_empty_or_invalid_profile(profile_name):
+    from hermes_cli.approval_transport import ApprovalRequest
+
+    with pytest.raises(ValueError):
+        ApprovalRequest.create(
+            command="echo ok",
+            description="safe",
+            pattern_key="example",
+            pattern_keys=("example",),
+            session_key="session-a",
+            surface="cli",
+            allow_session=False,
+            allow_permanent=False,
+            profile_name=profile_name,
+        )
 
 
 def test_legacy_create_callers_get_explicit_compatibility_defaults():
     request = _request()
 
     assert request.profile_name == "default"
-    assert request.scope_key
-    assert request.scope_key == _request().scope_key
+    assert request.conversation_scope_key
+    assert request.conversation_scope_key == _request().conversation_scope_key
 
 
 def test_host_rejects_scope_not_offered_by_request():
@@ -451,6 +500,62 @@ def test_transport_resolution_error_does_not_log_plugin_exception(monkeypatch, c
     assert "plugin-owned-secret-value" not in caplog.text
 
 
+def test_profile_resolution_error_denies_without_invoking_transport(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    calls = []
+    _context(manager).register_approval_transport(
+        "phone", lambda request: calls.append(request) or request.respond("once")
+    )
+    _configure_manual_guard(monkeypatch, approval, manager)
+
+    def broken_profile():
+        raise RuntimeError("profile-secret")
+
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", broken_profile)
+    result = approval._present_with_selected_transport(
+        command="rm -rf /tmp/example",
+        description="dangerous",
+        pattern_key="rm_recursive",
+        pattern_keys=["rm_recursive"],
+        session_key="session-a",
+        surface="cli",
+        allow_session=True,
+        allow_permanent=True,
+    )
+
+    assert result["choice"] == "deny"
+    assert result["failure"] == "error"
+    assert calls == []
+
+
+def test_empty_profile_resolution_denies_without_invoking_transport(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    calls = []
+    _context(manager).register_approval_transport(
+        "phone", lambda request: calls.append(request) or request.respond("once")
+    )
+    _configure_manual_guard(monkeypatch, approval, manager)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "")
+    result = approval._present_with_selected_transport(
+        command="rm -rf /tmp/example",
+        description="dangerous",
+        pattern_key="rm_recursive",
+        pattern_keys=["rm_recursive"],
+        session_key="session-a",
+        surface="cli",
+        allow_session=True,
+        allow_permanent=True,
+    )
+
+    assert result["choice"] == "deny"
+    assert result["failure"] == "error"
+    assert calls == []
+
+
 def test_redaction_failure_denies_before_transport_callback(monkeypatch):
     import agent.redact
     from tools import approval
@@ -531,7 +636,7 @@ def present(request):
             "command": request.command,
             "surface": request.surface,
             "profile_name": request.profile_name,
-            "scope_key": request.scope_key,
+            "conversation_scope_key": request.conversation_scope_key,
             "timeout_seconds": request.timeout_seconds,
         }) + "\\n")
     return request.respond("once")
@@ -596,7 +701,7 @@ def register(ctx):
     assert records[0]["digest"]
     assert records[0]["surface"] == "cli"
     assert records[0]["profile_name"] == "default"
-    assert records[0]["scope_key"]
+    assert records[0]["conversation_scope_key"]
     assert records[0]["timeout_seconds"] == 2
     assert records[2]["surface"] == "gateway"
     assert hardline["approved"] is False

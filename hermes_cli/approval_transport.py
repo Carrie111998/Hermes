@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import queue
+import re
 import threading
 import time
 import uuid
@@ -65,7 +66,7 @@ class ApprovalRequest:
     pattern_keys: tuple[str, ...]
     surface: str
     profile_name: str
-    scope_key: str
+    conversation_scope_key: str
     timeout_seconds: float
     allowed_choices: tuple[ApprovalChoice, ...]
 
@@ -83,11 +84,15 @@ class ApprovalRequest:
         allow_permanent: bool,
         timeout_seconds: float = 300,
         profile_name: str = "default",
-        scope_key: str | None = None,
     ) -> "ApprovalRequest":
         request_id = uuid.uuid4().hex
-        profile_name = str(profile_name or "default").strip() or "default"
-        scope_key = scope_key or make_approval_scope(profile_name, session_key)
+        profile_name = str(profile_name).strip()
+        if not profile_name or not (
+            profile_name in {"default", "custom"}
+            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_name)
+        ):
+            raise ValueError("invalid canonical profile name")
+        conversation_scope_key = make_approval_scope(profile_name, session_key)
         choices: list[ApprovalChoice] = ["once"]
         if allow_session:
             choices.append("session")
@@ -104,7 +109,7 @@ class ApprovalRequest:
             "session_key": session_key,
             "surface": surface,
             "profile_name": profile_name,
-            "scope_key": scope_key,
+            "conversation_scope_key": conversation_scope_key,
             "timeout_seconds": timeout_seconds,
             "allowed_choices": choices,
         }
@@ -121,7 +126,7 @@ class ApprovalRequest:
             pattern_keys=pattern_keys,
             surface=surface,
             profile_name=profile_name,
-            scope_key=scope_key,
+            conversation_scope_key=conversation_scope_key,
             timeout_seconds=timeout_seconds,
             allowed_choices=tuple(choices),
         )

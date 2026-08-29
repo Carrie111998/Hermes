@@ -4266,12 +4266,9 @@ def _present_with_selected_transport(
         from agent.redact import redact_sensitive_text
         from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
 
-        try:
-            from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.profiles import get_active_profile_name
 
-            profile_name = get_active_profile_name() or "default"
-        except Exception:
-            profile_name = "default"
+        profile_name = get_active_profile_name()
 
         timeout_seconds = _get_approval_timeout()
         request = ApprovalRequest.create(
