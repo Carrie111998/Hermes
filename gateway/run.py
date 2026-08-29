@@ -3649,6 +3649,33 @@ class TurnRunner:
                 ctx.progress_queue.put(msg)
             return
 
+        # MoA reference fan-out: surface a COMPACT marker for each reference
+        # model before the aggregator acts, plus an "aggregating" line. Placed
+        # BEFORE the tool_progress_enabled gate and the tool.started-only
+        # filter so MoA turn visibility mirrors the CLI (cli.py renders
+        # moa.reference unconditionally): the markers reach chat regardless of
+        # the tool_progress setting, as long as the progress queue exists
+        # (tool_progress OR thinking_progress on).  Compact by design — the
+        # reference answer body (the ``preview`` arg) is intentionally never
+        # rendered here: the CLI shows the full reference bodies, while
+        # messenger surfaces stay terse.
+        if event_type in {"moa.reference", "moa.aggregating"}:
+            if event_type == "moa.reference":
+                _moa_label = tool_name or "reference"
+                _moa_idx = kwargs.get("moa_index")
+                _moa_cnt = kwargs.get("moa_count")
+                if _moa_idx and _moa_cnt:
+                    moa_msg = f"🧩 {_moa_label} ({_moa_idx}/{_moa_cnt})"
+                else:
+                    moa_msg = f"🧩 {_moa_label}"
+            else:  # moa.aggregating
+                _moa_agg = tool_name or ""
+                moa_msg = (
+                    f"🧩 Aggregating via {_moa_agg}…" if _moa_agg else "🧩 Aggregating…"
+                )
+            ctx.progress_queue.put(moa_msg)
+            return
+
         # If tool_progress is off, only _thinking passes through (above).
         # Regular tool calls are suppressed.
         if not ctx.tool_progress_enabled:
