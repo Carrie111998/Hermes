@@ -399,6 +399,50 @@ async def test_stale_replayed_update_does_not_replace_newer_location(
     assert record["update_id"] == "20"
 
 
+def test_equal_timestamp_without_update_id_does_not_rewrite_location(
+    monkeypatch, tmp_path
+):
+    adapter = _adapter(monkeypatch, tmp_path)
+    timestamp = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+    message = _message(live_period=3600, date=timestamp)
+    update = _update(message, update_id=None)
+
+    assert adapter._record_background_location(update, message) is True
+    write_records = Mock(wraps=adapter._write_background_location_records)
+    monkeypatch.setattr(adapter, "_write_background_location_records", write_records)
+
+    assert adapter._record_background_location(update, message) is True
+    write_records.assert_not_called()
+
+
+def test_background_location_state_cache_refreshes_deleted_file_after_ttl(
+    monkeypatch, tmp_path
+):
+    adapter = _adapter(monkeypatch, tmp_path)
+    state_path = _state_path(adapter)
+    state_path.parent.mkdir(parents=True)
+    subject_key = _subject_key(adapter)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": adapter._BACKGROUND_LOCATION_STATE_VERSION,
+                "locations": {subject_key: _active_live_record()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert subject_key in adapter._load_background_location_records()
+    state_path.unlink()
+
+    assert subject_key in adapter._load_background_location_records()
+    cached_at = adapter._background_location_records_cached_at_monotonic
+    assert cached_at is not None
+    adapter._background_location_records_cached_at_monotonic = (
+        cached_at - adapter._BACKGROUND_LOCATION_STATE_CACHE_TTL_SECONDS
+    )
+    assert adapter._load_background_location_records() == {}
+
+
 @pytest.mark.asyncio
 async def test_background_group_location_bypasses_conversational_mention_gate(
     monkeypatch, tmp_path

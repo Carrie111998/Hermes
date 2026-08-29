@@ -47,6 +47,7 @@ def _make_adapter():
     adapter._pending_messages = {}
     adapter._message_handler = AsyncMock()
     adapter.handle_message = AsyncMock()
+    adapter._background_locations_enabled = False
     # Hold-queue state (preserve inbound across reconnect)
     adapter._held_inbound_events = []
     adapter._held_inbound_redispatch_task = None
@@ -156,6 +157,7 @@ class TestTextBatching:
     @pytest.mark.asyncio
     async def test_shared_session_never_batches_different_senders_or_locations(self):
         adapter = _make_adapter()
+        adapter._background_locations_enabled = True
         adapter.config.extra["group_sessions_per_user"] = False
         first = _make_event(
             "from user A",
@@ -184,8 +186,37 @@ class TestTextBatching:
         }
 
     @pytest.mark.asyncio
+    async def test_shared_session_keeps_existing_cross_sender_batching_when_disabled(self):
+        adapter = _make_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+
+        adapter._enqueue_text_event(
+            _make_event(
+                "from user A",
+                chat_id="group-1",
+                user_id="user-a",
+                chat_type="group",
+            )
+        )
+        adapter._enqueue_text_event(
+            _make_event(
+                "from user B",
+                chat_id="group-1",
+                user_id="user-b",
+                chat_type="group",
+            )
+        )
+        await asyncio.sleep(0.2)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args.args[0]
+        assert "from user A" in dispatched.text
+        assert "from user B" in dispatched.text
+
+    @pytest.mark.asyncio
     async def test_dm_topic_batching_recovers_thread_before_sender_scoped_keying(self):
         adapter = _make_adapter()
+        adapter._background_locations_enabled = True
         adapter.set_topic_recovery_fn(
             lambda source: "222" if str(source.thread_id or "") == "1" else None
         )

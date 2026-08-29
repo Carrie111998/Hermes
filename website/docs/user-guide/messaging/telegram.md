@@ -157,6 +157,8 @@ With this option enabled:
   `$HERMES_HOME/state/telegram_background_locations/<bot-scope>.json` with exact
   coordinates, Telegram sender/chat/message/update/thread identifiers,
   timestamps, accuracy, and live-only heading/proximity/live-period metadata;
+- the gateway refreshes its in-memory state view after at most 30 seconds, so
+  deleting or editing that file takes effect without restarting the gateway;
 - a later text message or command from the same sender receives the latest live
   snapshot as ephemeral user-side context for that turn. Questions such as
   "Where am I?" or "What's nearby?" can therefore use it without changing the

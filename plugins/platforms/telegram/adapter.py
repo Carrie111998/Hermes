@@ -647,6 +647,9 @@ class TelegramAdapter(BasePlatformAdapter):
     _BACKGROUND_LOCATION_MAX_STATE_BYTES = 2 * 1024 * 1024
     _BACKGROUND_LOCATION_INDEFINITE_LIVE_PERIOD = 0x7FFFFFFF
     _BACKGROUND_LOCATION_WRITE_TIMEOUT_SECONDS = 10.0
+    # Keep privacy-sensitive state responsive to an operator deleting or
+    # editing the file without imposing a synchronous disk read on each turn.
+    _BACKGROUND_LOCATION_STATE_CACHE_TTL_SECONDS = 30.0
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -747,6 +750,7 @@ class TelegramAdapter(BasePlatformAdapter):
             / f"{self._background_location_bot_scope}.json"
         )
         self._background_location_records: Optional[Dict[str, dict]] = None
+        self._background_location_records_cached_at_monotonic: Optional[float] = None
         self._background_location_write_lock = asyncio.Lock()
         self._background_location_write_thread: Optional[threading.Thread] = None
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
@@ -9997,14 +10001,22 @@ class TelegramAdapter(BasePlatformAdapter):
         return None
 
     def _load_background_location_records(self) -> Dict[str, dict]:
-        """Load the profile-local state file once and cache valid records.
+        """Load the profile-local state file and cache valid records briefly.
 
-        Missing or malformed state starts with an empty cache. The cache avoids
-        synchronous file reads on every message; callers that remove the state
-        file for privacy must therefore stop the gateway first.
+        Missing or malformed state starts with an empty cache. The short cache
+        avoids synchronous file reads on every message while still honoring an
+        operator's deletion or edit of privacy-sensitive state without a
+        gateway restart.
         """
+        now = time.monotonic()
         cached = getattr(self, "_background_location_records", None)
-        if cached is not None:
+        cached_at = getattr(
+            self, "_background_location_records_cached_at_monotonic", None
+        )
+        if cached is not None and (
+            cached_at is None
+            or now - cached_at < self._BACKGROUND_LOCATION_STATE_CACHE_TTL_SECONDS
+        ):
             return cached
 
         path = getattr(self, "_background_location_state_path", None)
@@ -10060,6 +10072,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
         self._background_location_records = records
+        self._background_location_records_cached_at_monotonic = now
         return records
 
     @staticmethod
@@ -10190,12 +10203,18 @@ class TelegramAdapter(BasePlatformAdapter):
         candidate_timestamp = cls._parse_background_location_datetime(
             candidate.get("telegram_timestamp")
         )
+        existing_update_id = cls._coerce_nonnegative_int(existing.get("update_id"))
+        candidate_update_id = cls._coerce_nonnegative_int(candidate.get("update_id"))
         if existing_timestamp is not None and candidate_timestamp is not None:
             if candidate_timestamp != existing_timestamp:
                 return candidate_timestamp > existing_timestamp
-
-        existing_update_id = cls._coerce_nonnegative_int(existing.get("update_id"))
-        candidate_update_id = cls._coerce_nonnegative_int(candidate.get("update_id"))
+            # Telegram timestamps match on a retried delivery. An update ID
+            # can refine the ordering when the earlier record did not have
+            # one, but an equal timestamp with no newer ID is a duplicate.
+            return candidate_update_id is not None and (
+                existing_update_id is None
+                or candidate_update_id > existing_update_id
+            )
         if existing_update_id is not None and candidate_update_id is not None:
             return candidate_update_id > existing_update_id
         return True
@@ -10347,6 +10366,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return False
         self._background_location_records = records
+        self._background_location_records_cached_at_monotonic = time.monotonic()
         logger.debug("[Telegram] Updated background location state for an authorized sender")
         return True
 
@@ -10710,9 +10730,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
         Applies the installed topic-recovery hook first so DM-topic batches
         coalesce on (and dispatch to) the recovered lane rather than the
-        raw inbound ``message_thread_id`` Telegram may have attached. Sender
-        scoping is independent of downstream shared-session policy: ingress
-        chunks from different people must never share volatile user context.
+        raw inbound ``message_thread_id`` Telegram may have attached. When
+        background locations are enabled, sender-scoping prevents volatile
+        location context from crossing people in a shared group session.
         """
         from gateway.session import build_session_key
         self._apply_topic_recovery(event)
@@ -10722,6 +10742,8 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        if not getattr(self, "_background_locations_enabled", False):
+            return session_key
         sender_id = str(getattr(event.source, "user_id", "") or "").strip()
         if not sender_id:
             raw_message = getattr(event, "raw_message", None)
