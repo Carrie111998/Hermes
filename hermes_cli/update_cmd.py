@@ -4135,6 +4135,19 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             from hermes_cli.banner import _github_compare_behind
             from hermes_cli.config import recommended_update_command
 
+            # Differing tips are not proof of being behind: a carried local
+            # commit puts HEAD ahead of the fetched tip. Ask git before the
+            # compare API, which cannot see a commit that exists only here and
+            # would otherwise report a permanent, unclearable "update
+            # available" (mirrors the banner's shallow path).
+            ancestor = subprocess.run(
+                git_cmd + ["merge-base", "--is-ancestor", target_sha, "HEAD"],
+                cwd=_m().PROJECT_ROOT, capture_output=True,
+            )
+            if ancestor.returncode == 0:
+                print("✓ Already up to date.")
+                return
+
             counted = _github_compare_behind(head_sha, target_sha)
             if counted == 0:
                 # Local commits on top of the remote tip — not behind.
