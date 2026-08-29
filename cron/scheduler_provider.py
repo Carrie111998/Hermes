@@ -558,6 +558,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -585,6 +586,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_adapters=profile_adapters,
             )
             return
 
@@ -656,6 +658,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_adapters=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -664,6 +667,12 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``profile_adapters``: optional mapping of profile name → that
+        profile's live adapter map (Platform → BasePlatformAdapter), provided
+        by gateway/run.py under multiplex. Each profile's tick uses its OWN
+        adapter map so delivery rides the owning profile's bot; the shared
+        default map remains the fallback (#83182).
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -715,9 +724,23 @@ class InProcessCronScheduler(CronScheduler):
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                # Prefer the profile's own live adapters over
+                                # the shared default map so cron delivery for
+                                # this profile's jobs rides the profile's own
+                                # bot token/credentials (#83182). Falls back to
+                                # the shared map for the default profile or
+                                # when no per-profile map was supplied.
+                                profile_name = (
+                                    entry[0] if isinstance(entry, tuple) else None
+                                )
+                                tick_adapters = adapters
+                                if profile_adapters and profile_name:
+                                    tick_adapters = profile_adapters.get(
+                                        profile_name, adapters
+                                    )
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,

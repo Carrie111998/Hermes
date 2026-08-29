@@ -32201,6 +32201,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                # Per-profile adapter maps (#83182): each profile's tick must
+                # deliver through ITS OWN live adapters, not the shared
+                # default-profile map. Best-effort — absent or empty maps fall
+                # back to the shared adapters (single-profile behavior).
+                profile_adapters_by_name = getattr(runner, "_profile_adapters", None)
+                if profile_adapters_by_name:
+                    cron_start_kwargs["profile_adapters"] = dict(
+                        profile_adapters_by_name
+                    )
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),

@@ -7157,7 +7157,31 @@ def _run_one_job_body(
     # computation and the post-delivery "alerted" transition.
     incident_acked = False
     failure_incident_id = None
+    # Install the job-owning profile's secret scope for the ENTIRE
+    # execute → save → deliver → mark sequence (#83182). Previously the scope
+    # was reset in a finally right after run_job, so _deliver_result resolved
+    # TELEGRAM_BOT_TOKEN (and other platform credentials) with no scope active
+    # — falling back to os.environ of whichever multiplex process won the tick
+    # — and profile-store jobs delivered from the WRONG bot. The reset now
+    # lives in the outer finally below, after every delivery call site.
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    _scope_token = None
     try:
+        # Run the job under the profile's secret scope. get_secret() fails
+        # closed outside a scope once profile isolation is in play (multiple
+        # gateway profiles / room→profile multiplexing), and cron fires from
+        # the ticker thread where no per-turn scope is installed — so
+        # resolve_runtime_provider() raised UnscopedSecretError before model
+        # selection, breaking every cron job. Mirrors the per-turn pattern in
+        # gateway/run.py (_profile_runtime_scope).
+        _scope_token = set_secret_scope(
+            build_profile_secret_scope(_get_hermes_home())
+        )
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
         # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
@@ -7181,22 +7205,6 @@ def _run_one_job_body(
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
 
-        # Run the job under the profile's secret scope. get_secret() fails
-        # closed outside a scope once profile isolation is in play (multiple
-        # gateway profiles / room→profile multiplexing), and cron fires from
-        # the ticker thread where no per-turn scope is installed — so
-        # resolve_runtime_provider() raised UnscopedSecretError before model
-        # selection, breaking every cron job. Mirrors the per-turn pattern in
-        # gateway/run.py (_profile_runtime_scope).
-        from agent.secret_scope import (
-            build_profile_secret_scope,
-            reset_secret_scope,
-            set_secret_scope,
-        )
-
-        _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
-        )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the
@@ -7228,8 +7236,6 @@ def _run_one_job_body(
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
-        finally:
-            reset_secret_scope(_scope_token)
 
         if _fire_claim_ownership_lost():
             for _deferred_agent in _deferred_agents:
@@ -7421,6 +7427,15 @@ def _run_one_job_body(
             # their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
+            # Scope reset lives HERE, after delivery — the delivery path
+            # resolves platform credentials (TELEGRAM_BOT_TOKEN etc.) through
+            # the profile scope (#83182). Resetting it earlier made profile
+            # jobs deliver from the wrong bot under multiplex. The happy path
+            # falls through to mark/finish below; the BaseException handler
+            # below (which delivers failure alerts too) still has the scope
+            # active for its own _deliver_result call.
+            reset_secret_scope(_scope_token)
+            _scope_token = None
 
         if side_effect_ownership_lost or _fire_claim_ownership_lost():
             # Same transport-cancel distinction as the pre-side-effect path:
@@ -7617,6 +7632,13 @@ def _run_one_job_body(
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        # Safety net: the scope must never outlive this job's full lifecycle
+        # (execute → save → deliver → mark), even when an unexpected exception
+        # skips the inner finally. Best-effort — reset_secret_scope tolerates a
+        # None token.
+        if _scope_token is not None:
+            reset_secret_scope(_scope_token)
 
 
 def _notify_provider_jobs_changed() -> None:
