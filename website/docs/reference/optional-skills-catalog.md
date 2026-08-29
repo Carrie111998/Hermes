@@ -226,6 +226,13 @@ hermes skills uninstall <skill-name>
 | [**unbroker**](/docs/user-guide/skills/optional/security/security-unbroker) | Autonomously remove your info from data-broker sites. |
 | [**web-pentest**](/docs/user-guide/skills/optional/security/security-web-pentest) | Authorized web pentest: recon, proof-based exploits, report. |
 
+## seo
+
+| Skill | Description |
+|-------|-------------|
+| [**french-seo-writing**](/docs/user-guide/skills/optional/seo/seo-french-seo-writing) | Rédiger du contenu SEO en français, sans tics d'IA. |
+| [**seo-semantic-geo**](/docs/user-guide/skills/optional/seo/seo-seo-semantic-geo) | Editorial SEO audit: internal links, semantics, GEO. |
+
 ## software-development
 
 | Skill | Description |
