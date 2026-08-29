@@ -904,14 +904,31 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "MCPServer"
         channels_list tool. You can also use human-friendly channel names
         that will be resolved automatically.
 
+        Attachments: put MEDIA:<absolute path> on its own line in the
+        message. The file is uploaded as an attachment and the tag is
+        stripped from the visible text. The path must exist on the host
+        running the Hermes gateway, not on the MCP client. MEDIA: tags
+        inside code fences, inline code, or blockquotes are ignored, so
+        examples in prose never send a real file.
+
+        Delivery directives, applied to the whole message:
+            [[as_document]]     send images unmodified as documents
+                                instead of recompressed photos
+            [[audio_as_voice]]  send audio as a voice note
+
         Examples:
             target="telegram:6308981865"
             target="discord:#general"
             target="slack:#engineering"
 
+            message carrying an attachment, MEDIA: on its own line:
+                chart attached
+                MEDIA:/srv/out/chart.png
+
         Args:
             target: Platform target in "platform:identifier" format
-            message: The message text to send
+            message: The message text to send. May include MEDIA: tags and
+                delivery directives (see above).
         """
         if not target or not message:
             return json.dumps({"error": "Both target and message are required"})
