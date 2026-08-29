@@ -212,14 +212,20 @@ def test_every_registered_builtin_has_manifest_capability():
     from tools.registry import registration_origin, registry
     from tools.repo_access import BUILTIN_REPO_ACCESS
 
-    undeclared = sorted(
+    registered = {
         name for name, entry in registry._tools.items()
         if registration_origin(entry, registry) == "builtin"
-        and name not in BUILTIN_REPO_ACCESS
-    )
-    assert not undeclared, (
+    }
+    manifest_names = set(BUILTIN_REPO_ACCESS)
+    missing = sorted(registered - manifest_names)
+    stale = sorted(manifest_names - registered)
+    assert not missing, (
         "these registered built-ins have no manifest capability and will be withheld "
-        f"whenever delegate-wave routing is on: {undeclared}"
+        f"whenever delegate-wave routing is on: {missing}"
+    )
+    assert not stale, (
+        "these manifest names no longer identify a registered built-in and could "
+        f"grant stale trust if a different tool later reuses the name: {stale}"
     )
 
     inline = sorted(
