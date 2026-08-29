@@ -2303,11 +2303,18 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
     if not issues:
         return
 
-    lines = ["\033[33m⚠ Config issues detected in config.yaml:\033[0m"]
+    # Write to stderr — gate the ANSI codes on the *stderr* stream via the
+    # shared helper (NO_COLOR/TERM=dumb/TTY-aware) so raw ESC sequences
+    # don't leak as jumbled text into piped / systemd / gateway logs.
+    warn = lambda text: color(text, Colors.YELLOW, stream=sys.stderr)
+    error = lambda text: color(text, Colors.RED, stream=sys.stderr)
+    dim = lambda text: color(text, Colors.DIM, stream=sys.stderr)
+
+    lines = [warn("⚠ Config issues detected in config.yaml:")]
     for ci in issues:
-        marker = "\033[31m✗\033[0m" if ci.severity == "error" else "\033[33m⚠\033[0m"
+        marker = error("✗") if ci.severity == "error" else warn("⚠")
         lines.append(f"  {marker} {ci.message}")
-    lines.append("  \033[2mRun 'hermes doctor' for fix suggestions.\033[0m")
+    lines.append(dim("  Run 'hermes doctor' for fix suggestions."))
     sys.stderr.write("\n".join(lines) + "\n\n")
 
 
@@ -2327,17 +2334,12 @@ def warn_deprecated_cwd_env_vars() -> None:
     messaging_cwd = str(env_map.get("MESSAGING_CWD") or "").strip()
     terminal_cwd_env = str(env_map.get("TERMINAL_CWD") or "").strip()
 
-    # Only emit ANSI color codes when stderr is a color-capable terminal;
-    # otherwise the raw ESC sequences leak as jumbled text (e.g. piped
-    # stderr, dumb terminals, NO_COLOR). Per the NO_COLOR spec, the mere
-    # presence of NO_COLOR (any value, including empty) disables color.
-    # Matches _term_supports_color() elsewhere in the codebase, but checks
-    # stderr since that's the stream this warning is written to.
-    color = os.environ.get("NO_COLOR") is None and sys.stderr.isatty()
-    yellow = "\033[33m" if color else ""
-    dim = "\033[2m" if color else ""
-    reset = "\033[0m" if color else ""
-    warn_mark = f"{yellow}⚠{reset}" if color else "⚠"
+    # Write to stderr — gate the ANSI codes on the *stderr* stream via the
+    # shared helper (NO_COLOR/TERM=dumb/TTY-aware) so raw ESC sequences
+    # don't leak as jumbled text into piped / systemd / gateway logs.
+    warn = lambda text: color(text, Colors.YELLOW, stream=sys.stderr)
+    dim = lambda text: color(text, Colors.DIM, stream=sys.stderr)
+    warn_mark = warn("⚠")
 
     lines: list[str] = []
     if messaging_cwd:
@@ -2354,14 +2356,12 @@ def warn_deprecated_cwd_env_vars() -> None:
         from hermes_constants import display_hermes_home
 
         hint_path = display_hermes_home()
-        lines.insert(0, f"{yellow}⚠ Deprecated .env settings detected:{reset}")
+        lines.insert(0, warn("⚠ Deprecated .env settings detected:"))
         lines.append(
-            f"  {dim}Move to config.yaml instead:  "
-            f"terminal:\\n    cwd: /your/project/path{reset}"
+            dim("  Move to config.yaml instead:  "
+                "terminal:\\n    cwd: /your/project/path")
         )
-        lines.append(
-            f"  {dim}Then remove the old entries from {hint_path}/.env{reset}"
-        )
+        lines.append(dim(f"  Then remove the old entries from {hint_path}/.env"))
         sys.stderr.write("\n".join(lines) + "\n\n")
 
 
