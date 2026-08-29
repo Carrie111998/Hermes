@@ -32,7 +32,9 @@ import { installErrorBannerGuard } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
-const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
+const RELEASE_ROOT = process.env.HERMES_E2E_RELEASE_ROOT
+  ? path.resolve(process.env.HERMES_E2E_RELEASE_ROOT)
+  : path.join(DESKTOP_ROOT, 'release')
 
 // ─── Credential stripping (matches launch.spec.ts) ──────────────────────
 
@@ -544,7 +546,11 @@ export interface PackagedAppFixture {
  *
  * Skips if the packaged binary doesn't exist — run `npm run pack` first.
  */
-export async function setupPackagedApp(): Promise<PackagedAppFixture> {
+export async function setupPackagedApp(options: {
+  env?: Record<string, string | undefined>
+  keepSandbox?: boolean
+  prepareSandbox?: (sandbox: Sandbox) => Promise<void> | void
+} = {}): Promise<PackagedAppFixture> {
   if (!packagedBinaryExists()) {
     throw new Error(
       `Built app binary not found: ${PACKAGED_BINARY_PATH}. Run 'npm run pack' first.`,
@@ -552,20 +558,30 @@ export async function setupPackagedApp(): Promise<PackagedAppFixture> {
   }
 
   const sandbox = createSandbox('packaged')
+  await options.prepareSandbox?.(sandbox)
 
   // Build the sandbox env using the shared helpers, then add the
   // packaged-binary-specific overrides.
   const env = buildAppEnv(sandbox, {
-    // Fake boot: simulates progress steps without spawning the real backend.
+    // Fake boot: simulates progress steps without slowing a real backend launch.
     HERMES_DESKTOP_BOOT_FAKE: '1',
     HERMES_DESKTOP_BOOT_FAKE_STEP_MS: '120',
+    // Packaged tests that explicitly supply a CLI must allow backend resolution
+    // to consider it; the shared dev fixture otherwise forces bootstrap.
+    ...(options.env && Object.hasOwn(options.env, 'HERMES_DESKTOP_HERMES')
+      ? { HERMES_DESKTOP_IGNORE_EXISTING: '0' }
+      : {}),
+    ...options.env,
   })
 
-  // Clear dev-server + hermes-root overrides — the packaged binary
-  // should use its own bundled renderer, not the dev checkout.
+  // The packaged binary must use its own bundled renderer, not the dev
+  // checkout. A test may still pass HERMES_DESKTOP_HERMES explicitly to point
+  // packaged Electron at a prepared local runtime.
   delete (env as Record<string, string | undefined>).HERMES_DESKTOP_DEV_SERVER
-  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES
   delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES_ROOT
+  if (!options.env || !Object.hasOwn(options.env, 'HERMES_DESKTOP_HERMES')) {
+    delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES
+  }
 
   const app = await _electron.launch({
     executablePath: PACKAGED_BINARY_PATH,
@@ -582,7 +598,7 @@ export async function setupPackagedApp(): Promise<PackagedAppFixture> {
     sandbox,
     cleanup: async () => {
       await app.close().catch(() => undefined)
-      sandbox.cleanup()
+      if (!options.keepSandbox) sandbox.cleanup()
     },
   }
 }
