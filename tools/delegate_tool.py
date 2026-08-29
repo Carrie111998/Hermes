@@ -3040,6 +3040,14 @@ def _run_single_child(
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
+        # A terminal child result is authoritative even when its user-facing
+        # error text is carried in final_response.  Some older result builders
+        # only stamped ``error``; an explicit failed=False remains a soft
+        # outcome (for example compression_deferred), not a terminal failure.
+        terminal_failure = result.get("failed") is True or (
+            bool(result.get("error")) and result.get("failed") is not False
+        )
+
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
         # transport bug (misrouted provider, adapter returning empty
@@ -3049,6 +3057,8 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif terminal_failure:
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -3098,6 +3108,13 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif terminal_failure:
+            failure_reason = result.get("failure_reason")
+            exit_reason = (
+                failure_reason
+                if isinstance(failure_reason, str) and failure_reason
+                else "error"
+            )
         elif completed:
             exit_reason = "completed"
         else:

@@ -667,6 +667,39 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
 
+    def test_provider_failure_is_not_reported_as_iteration_exhaustion(self):
+        """A structured provider failure must outrank its error-text summary."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "upstage/solar-pro-4"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "HTTP 400: model is not a valid model ID",
+                "completed": False,
+                "failed": True,
+                "error": "HTTP 400: model is not a valid model ID",
+                "failure_reason": "model_not_found",
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test rejected provider model", parent_agent=parent)
+            )
+            entry = result["results"][0]
+
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exit_reason"], "model_not_found")
+            self.assertFalse(entry["truncated"])
+            self.assertEqual(
+                entry["error"], "HTTP 400: model is not a valid model ID"
+            )
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd
