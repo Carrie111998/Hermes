@@ -516,14 +516,23 @@ class TestS3IdleChargedFromLastProgress:
         _drain_admission_slots()
         idle = 0.4
         release = threading.Event()
+        progress_at = None
+        timeout_observations = []
 
         def worker(fence: CompressionCommitFence):
+            nonlocal progress_at
             time.sleep(0.05)
             fence.touch_progress()  # early progress, then total silence
+            progress_at = time.monotonic()
             assert release.wait(timeout=10)
             return ([], "late")
 
-        t0 = time.monotonic()
+        def on_timeout(observed_idle, waited, since_progress):
+            timeout_observations.append(
+                (time.monotonic(), observed_idle, waited, since_progress)
+            )
+
+        returned_at = None
         try:
             msgs, prompt = run_compress_context_with_progress_timeout(
                 worker=worker,
@@ -531,17 +540,25 @@ class TestS3IdleChargedFromLastProgress:
                 system_prompt_fallback="fb",
                 idle_timeout_seconds=idle,
                 total_ceiling_seconds=5.0,
+                on_timeout=on_timeout,
+                stall_fallback=False,
             )
+            returned_at = time.monotonic()
         finally:
-            elapsed = time.monotonic() - t0
             release.set()
+
         assert prompt == "fb"
-        # Old behavior waited a full interval from the CHECK (~2x idle ≈
-        # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
-        assert elapsed < idle * 1.8, (
-            f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
-        )
+        assert timeout_observations
+        assert progress_at is not None
+        callback_at, observed_idle, waited, since_progress = timeout_observations[0]
+        assert observed_idle == pytest.approx(idle)
+        assert since_progress >= idle
+        assert since_progress < idle * 1.5
+        assert callback_at - progress_at < idle * 1.5
+
+        # Liveness only; this is not the S3 idle-decision contract.
+        assert returned_at is not None
+        assert returned_at - callback_at < 1.0
         _drain_admission_slots()
 
 
