@@ -41,6 +41,7 @@ MAX_ROOM_EVENT_BYTES = 256 * 1024 * 1024
 MAX_GATEWAY_EVENT_BYTES = 1024 * 1024 * 1024
 CONTROL_EVENT_COUNT_RESERVE = 64
 CONTROL_EVENT_BYTE_RESERVE = 1024 * 1024
+_JOURNAL_MODE_LOCK_RETRIES = 8
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -67,6 +68,7 @@ _EVENT_SCHEMA_COLUMNS = frozenset({
     "payload_json",
     "created_at",
 })
+_RETIRED_ROOM_SCHEMA_COLUMNS = frozenset({"room_id", "retired_at"})
 
 _EVENT_KINDS_BY_ACTOR = {
     "user": frozenset({"message.user"}),
@@ -99,6 +101,12 @@ class HostedRoomError(ValueError):
 
 class RoomNotFoundError(HostedRoomError):
     """Raised when a room does not exist or has been disbanded."""
+
+
+class RoomHistoryExpiredError(RoomNotFoundError):
+    """Raised when a retired room remains reserved after history compaction."""
+
+    reason = "room_history_expired"
 
 
 class RoomConflictError(HostedRoomError):
@@ -282,6 +290,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id)
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_retired_ids (
+            room_id TEXT PRIMARY KEY,
+            retired_at REAL NOT NULL
+        )"""
+    )
     room_columns = {row[1] for row in conn.execute("PRAGMA table_info(hosted_rooms)")}
     if "authority_gateway_id" not in room_columns:
         conn.execute(
@@ -334,6 +348,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                       WHERE hosted_room_events.room_id=hosted_rooms.room_id
                   ), 0)"""
         )
+    # Old schemas kept the final identity tombstone in hosted_rooms itself.
+    # Copy those identities before bounded history pruning can remove their
+    # heavier room/event payloads. This compact registry is intentionally
+    # permanent: a stale coordinate must never name a different Group Chat.
+    conn.execute(
+        """INSERT OR IGNORE INTO hosted_room_retired_ids (room_id, retired_at)
+           SELECT room_id, disbanded_at FROM hosted_rooms
+            WHERE disbanded_at IS NOT NULL"""
+    )
     conn.execute(
         """CREATE INDEX IF NOT EXISTS idx_hosted_room_events_cursor
            ON hosted_room_events(room_id, seq)"""
@@ -349,9 +372,14 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     event_columns = frozenset(
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_events)")
     )
+    retired_room_columns = frozenset(
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_retired_ids)")
+    )
     if not _ROOM_SCHEMA_COLUMNS.issubset(room_columns):
         return False
     if not _EVENT_SCHEMA_COLUMNS.issubset(event_columns):
+        return False
+    if not _RETIRED_ROOM_SCHEMA_COLUMNS.issubset(retired_room_columns):
         return False
     index = conn.execute(
         """SELECT 1 FROM sqlite_master
@@ -368,7 +396,20 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
-        apply_wal_with_fallback(conn, db_label="state.db (hosted_rooms)")
+        for attempt in range(_JOURNAL_MODE_LOCK_RETRIES):
+            try:
+                apply_wal_with_fallback(conn, db_label="state.db (hosted_rooms)")
+                break
+            except sqlite3.OperationalError as exc:
+                if (
+                    str(exc).lower() != "database is locked"
+                    or attempt + 1 == _JOURNAL_MODE_LOCK_RETRIES
+                ):
+                    raise
+                # SQLite's journal-mode pragma may not honor the connection's
+                # busy timeout while another first opener initializes the DB,
+                # especially on Windows. Retry only that transient lock class.
+                time.sleep(0.01 * (2**attempt))
         conn.execute("PRAGMA foreign_keys=ON")
         if _schema_is_current(conn):
             return conn
@@ -400,6 +441,26 @@ def _transaction(
         raise
     finally:
         conn.close()
+
+
+def _raise_room_not_found(conn: sqlite3.Connection, room_id: str) -> None:
+    retained = conn.execute(
+        "SELECT 1 FROM hosted_rooms WHERE room_id=?",
+        (room_id,),
+    ).fetchone()
+    if retained is not None:
+        # A retained disband tombstone still has replayable history. The
+        # caller simply did not opt into reading disbanded rooms.
+        raise RoomNotFoundError("hosted room not found")
+    retired = conn.execute(
+        "SELECT 1 FROM hosted_room_retired_ids WHERE room_id=?",
+        (room_id,),
+    ).fetchone()
+    if retired is not None:
+        raise RoomHistoryExpiredError(
+            "Group Chat history expired; room_id remains permanently retired"
+        )
+    raise RoomNotFoundError("hosted room not found")
 
 
 def _room_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, Any]:
@@ -525,6 +586,12 @@ def _prune_disbanded_rooms_locked(
     placeholders = ",".join("?" for _ in candidates)
     room_ids = tuple(sorted(candidates))
     conn.execute(
+        f"""INSERT OR IGNORE INTO hosted_room_retired_ids (room_id, retired_at)
+            SELECT room_id, disbanded_at FROM hosted_rooms
+             WHERE room_id IN ({placeholders}) AND disbanded_at IS NOT NULL""",
+        room_ids,
+    )
+    conn.execute(
         f"DELETE FROM hosted_room_events WHERE room_id IN ({placeholders})",
         room_ids,
     )
@@ -540,7 +607,7 @@ def prune_disbanded_rooms(
     *,
     now: float | None = None,
 ) -> int:
-    """Purge only deleted Group Chats after a bounded tombstone window."""
+    """Purge deleted Group Chat payloads while reserving their identities."""
 
     timestamp = time.time() if now is None else float(now)
     with _transaction(db_path, immediate=True) as conn:
@@ -588,6 +655,11 @@ def create_room(
     now = time.time() if now is None else float(now)
 
     with _transaction(db_path, immediate=True) as conn:
+        if conn.execute(
+            "SELECT 1 FROM hosted_room_retired_ids WHERE room_id=?",
+            (room_id,),
+        ).fetchone():
+            raise RoomConflictError("room_id belongs to a disbanded room")
         existing = conn.execute(
             """SELECT room_id, name, members_json, authority_gateway_id,
                       authority_epoch, next_seq, event_bytes, revision,
@@ -846,7 +918,7 @@ def append_event(
             (room_id,),
         ).fetchone()
         if room is None:
-            raise RoomNotFoundError("hosted room not found")
+            _raise_room_not_found(conn, room_id)
         if authority_scoped and (
             room["authority_gateway_id"] != normalized_authority_gateway_id
             or int(room["authority_epoch"]) != normalized_authority_epoch
@@ -929,7 +1001,7 @@ def room_state(
             (room_id, int(include_disbanded)),
         ).fetchone()
         if row is None:
-            raise RoomNotFoundError("hosted room not found")
+            _raise_room_not_found(conn, room_id)
         claim_row = conn.execute(
             """SELECT room_id, seq, event_id, kind, actor_json, authority_epoch,
                       payload_json, created_at
@@ -1015,7 +1087,7 @@ def claim_authority(
             (room_id,),
         ).fetchone()
         if row is None:
-            raise RoomNotFoundError("hosted room not found")
+            _raise_room_not_found(conn, room_id)
         current_gateway = str(row["authority_gateway_id"])
         current_epoch = int(row["authority_epoch"])
         existing_event = conn.execute(
@@ -1135,8 +1207,24 @@ def disband_room(
             (room_id,),
         ).fetchone()
         if room is None:
-            raise RoomNotFoundError("hosted room not found")
+            retired = conn.execute(
+                "SELECT retired_at FROM hosted_room_retired_ids WHERE room_id=?",
+                (room_id,),
+            ).fetchone()
+            if retired is None:
+                raise RoomNotFoundError("hosted room not found")
+            return {
+                "room_id": room_id,
+                "disbanded_at": float(retired["retired_at"]),
+                "idempotent": True,
+                "history_expired": True,
+            }
         if room["disbanded_at"] is not None:
+            conn.execute(
+                """INSERT OR IGNORE INTO hosted_room_retired_ids
+                   (room_id, retired_at) VALUES (?, ?)""",
+                (room_id, float(room["disbanded_at"])),
+            )
             event = conn.execute(
                 """SELECT room_id, seq, event_id, kind, actor_json,
                           authority_epoch, payload_json, created_at
@@ -1200,6 +1288,11 @@ def disband_room(
         )
         if updated.rowcount != 1:
             raise RoomConflictError("hosted room disband lost its fence")
+        conn.execute(
+            """INSERT OR IGNORE INTO hosted_room_retired_ids
+               (room_id, retired_at) VALUES (?, ?)""",
+            (room_id, now),
+        )
         event = conn.execute(
             """SELECT room_id, seq, event_id, kind, actor_json,
                       authority_epoch, payload_json, created_at
@@ -1252,7 +1345,7 @@ def read_events(
             (room_id, int(include_disbanded)),
         ).fetchone()
         if room is None:
-            raise RoomNotFoundError("hosted room not found")
+            _raise_room_not_found(conn, room_id)
         latest_seq = int(room["next_seq"]) - 1
         if since_seq > latest_seq:
             raise HostedRoomError("since_seq is ahead of the hosted room log")

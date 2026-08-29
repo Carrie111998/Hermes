@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import pytest
 
 from gateway import hosted_rooms as rooms
+import hermes_state
 from hermes_state import SessionDB
 
 USER = {"kind": "user", "id": "desktop-user", "display_name": "User"}
@@ -71,6 +72,50 @@ def _create(db, room_id="room-1"):
     )
 
 
+def _assert_retired_identity_stays_reserved(db, room_id, *, fresh_id):
+    # Reopen the database to prove the reservation is durable rather than a
+    # process-local cache, while the heavier room/event payload is gone.
+    with sqlite3.connect(db) as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM hosted_rooms WHERE room_id=?", (room_id,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute(
+                "SELECT retired_at FROM hosted_room_retired_ids WHERE room_id=?",
+                (room_id,),
+            ).fetchone()
+            is not None
+        )
+
+    with pytest.raises(rooms.RoomConflictError, match="disbanded"):
+        _create(db, room_id)
+    with pytest.raises(rooms.RoomHistoryExpiredError) as send_error:
+        rooms.append_event(
+            db,
+            room_id=room_id,
+            event_id="stale-send",
+            kind="message.user",
+            actor=USER,
+            payload={"text": "stale"},
+        )
+    assert send_error.value.reason == "room_history_expired"
+    with pytest.raises(rooms.RoomHistoryExpiredError) as log_error:
+        rooms.read_events(db, room_id=room_id, include_disbanded=True)
+    assert log_error.value.reason == "room_history_expired"
+    repeated = rooms.disband_room(db, room_id=room_id, now=999)
+    assert repeated == {
+        "room_id": room_id,
+        "disbanded_at": 20.0,
+        "idempotent": True,
+        "history_expired": True,
+    }
+
+    assert _create(db, fresh_id)["room_id"] == fresh_id
+
+
 def test_create_room_is_idempotent_but_conflicts_fail_closed(tmp_path):
     db = tmp_path / "state.db"
     first = _create(db)
@@ -88,6 +133,62 @@ def test_create_room_is_idempotent_but_conflicts_fail_closed(tmp_path):
             members=[],
             authority_gateway_id="gateway-a",
         )
+
+
+def test_concurrent_first_database_open_keeps_every_room(tmp_path):
+    db = tmp_path / "state.db"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        created = list(pool.map(lambda index: _create(db, f"room-{index}"), range(16)))
+
+    assert {room["room_id"] for room in created} == {
+        f"room-{index}" for index in range(16)
+    }
+    assert len(rooms.list_rooms(db)) == 16
+
+
+def test_first_database_open_retries_only_transient_journal_lock(
+    tmp_path,
+    monkeypatch,
+):
+    original = hermes_state.apply_wal_with_fallback
+    attempts = 0
+
+    def transient_lock(conn, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return original(conn, **kwargs)
+
+    monkeypatch.setattr(hermes_state, "apply_wal_with_fallback", transient_lock)
+
+    assert _create(tmp_path / "state.db")["room_id"] == "room-1"
+    assert attempts == 3
+
+
+def test_first_database_open_does_not_retry_other_journal_errors(
+    tmp_path,
+    monkeypatch,
+):
+    attempts = 0
+
+    def configured_delete_refusal(conn, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise sqlite3.OperationalError(
+            "could not verify configured journal_mode=delete (database is locked)"
+        )
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        configured_delete_refusal,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="configured"):
+        _create(tmp_path / "state.db")
+    assert attempts == 1
 
 
 def test_room_state_exposes_authority_and_replay_cursor(tmp_path):
@@ -574,8 +675,9 @@ def test_disband_is_idempotent_and_room_id_cannot_be_reused(tmp_path):
     assert [event["kind"] for event in replay["events"]] == ["room.disbanded"]
     with pytest.raises(rooms.RoomConflictError):
         _create(db)
-    with pytest.raises(rooms.RoomNotFoundError):
+    with pytest.raises(rooms.RoomNotFoundError) as missing:
         rooms.read_events(db, room_id="room-1")
+    assert not isinstance(missing.value, rooms.RoomHistoryExpiredError)
 
 
 def test_active_rooms_and_event_storage_are_bounded(tmp_path, monkeypatch):
@@ -638,6 +740,36 @@ def test_room_listing_is_paged_and_old_tombstones_are_pruned(tmp_path, monkeypat
     ]
     with pytest.raises(rooms.RoomNotFoundError):
         rooms.room_state(db, room_id="room-0", include_disbanded=True)
+    _assert_retired_identity_stays_reserved(db, "room-0", fresh_id="room-new")
+
+
+def test_retention_pruning_keeps_retired_room_id_reserved(tmp_path):
+    db = tmp_path / "state.db"
+    _create(db, "room-old")
+    rooms.disband_room(db, room_id="room-old", now=20)
+
+    assert (
+        rooms.prune_disbanded_rooms(
+            db,
+            now=20 + rooms.DISBANDED_ROOM_RETENTION_SECONDS + 1,
+        )
+        == 1
+    )
+
+    _assert_retired_identity_stays_reserved(db, "room-old", fresh_id="room-new")
+
+
+def test_byte_pressure_pruning_keeps_retired_room_id_reserved(
+    tmp_path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    _create(db, "room-full")
+    monkeypatch.setattr(rooms, "MAX_GATEWAY_EVENT_BYTES", 0)
+
+    rooms.disband_room(db, room_id="room-full", now=20)
+
+    _assert_retired_identity_stays_reserved(db, "room-full", fresh_id="room-new")
 
 
 def test_pre_actor_draft_database_migrates_with_explicit_legacy_identity(tmp_path):
@@ -662,6 +794,24 @@ def test_pre_actor_draft_database_migrates_with_explicit_legacy_identity(tmp_pat
     assert adopted["adopted"] is True
     assert adopted["claim_event"]["seq"] == 2
     assert adopted["claim_event"]["payload"]["previous_gateway_id"] == "legacy"
+
+
+def test_migration_reserves_existing_disbanded_room_id_before_pruning(tmp_path):
+    db = tmp_path / "state.db"
+    _create_pre_actor_database(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE hosted_rooms SET disbanded_at=20 WHERE room_id='room-1'")
+        conn.commit()
+
+    assert (
+        rooms.prune_disbanded_rooms(
+            db,
+            now=20 + rooms.DISBANDED_ROOM_RETENTION_SECONDS + 1,
+        )
+        == 1
+    )
+
+    _assert_retired_identity_stays_reserved(db, "room-1", fresh_id="room-new")
 
 
 def test_draft_schema_migration_is_safe_across_processes(tmp_path):

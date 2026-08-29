@@ -17,6 +17,7 @@ _INSTALL_ID_FILENAME = "install_id"
 _INSTALL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _INSTALL_ID_CACHE: dict[str, Optional[str]] = {"root": None, "value": None}
 _INSTALL_ID_LOCK = threading.Lock()
+_INSTALL_ID_PUBLICATION_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -93,7 +94,10 @@ def read_or_create_install_id(root: Path | None = None) -> Optional[str]:
         return None
 
     try:
-        with _install_id_file_lock(root):
+        # Windows byte-range locks can report a same-process lock conflict
+        # instead of waiting for another thread. Serialize threads here, then
+        # retain the file lock as the cross-process publication fence.
+        with _INSTALL_ID_PUBLICATION_LOCK, _install_id_file_lock(root):
             try:
                 existing = path.read_text(encoding="utf-8").strip().lower()
                 if _INSTALL_ID_RE.fullmatch(existing):

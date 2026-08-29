@@ -275,3 +275,46 @@ def test_disband_tombstones_room(home):
         )
     )
     assert [event["kind"] for event in replay["events"]] == ["room.disbanded"]
+
+
+def test_pruned_room_send_and_log_report_expired_history(home, monkeypatch):
+    from gateway import hosted_rooms
+
+    _create_room()
+    monkeypatch.setattr(hosted_rooms, "MAX_DISBANDED_ROOM_TOMBSTONES", 0)
+    _result(srv._methods["groups.disband"](2, {"room_id": "room-1"}))
+    repeated = _result(
+        srv._methods["groups.disband"](3, {"room_id": "room-1"})
+    )["tombstone"]
+    assert repeated["idempotent"] is True
+    assert repeated["history_expired"] is True
+
+    sent = srv._methods["groups.send"](
+        4,
+        {
+            "room_id": "room-1",
+            "event_id": "stale-send",
+            "payload": {"text": "stale"},
+        },
+    )
+    logged = srv._methods["groups.log"](
+        5,
+        {"room_id": "room-1", "include_disbanded": True},
+    )
+
+    assert sent["error"]["data"] == {"reason": "room_history_expired"}
+    assert logged["error"]["data"] == {"reason": "room_history_expired"}
+    assert "permanently retired" in sent["error"]["message"]
+
+    recreated = srv._methods["groups.create"](
+        6,
+        {"room_id": "room-1", "name": "Replacement", "members": []},
+    )
+    assert recreated["error"]["code"] == 4110
+    created = _result(
+        srv._methods["groups.create"](
+            7,
+            {"room_id": "room-new", "name": "Fresh", "members": []},
+        )
+    )
+    assert created["room"]["room_id"] == "room-new"

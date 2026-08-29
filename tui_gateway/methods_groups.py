@@ -105,7 +105,8 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"room": room})
     except HostedRoomError as exc:
-        return _err(rid, 4110, str(exc))
+        reason = getattr(exc, "reason", None)
+        return _err(rid, 4110, str(exc), {"reason": reason} if reason else None)
     except Exception as exc:
         return _err(rid, 5111, str(exc))
 
@@ -127,7 +128,8 @@ def _(rid, params: dict) -> dict:
             },
         )
     except HostedRoomError as exc:
-        return _err(rid, 4114, str(exc))
+        reason = getattr(exc, "reason", None)
+        return _err(rid, 4114, str(exc), {"reason": reason} if reason else None)
     except Exception as exc:
         return _err(rid, 5115, str(exc))
 
@@ -161,7 +163,8 @@ def _(rid, params: dict) -> dict:
             },
         )
     except HostedRoomError as exc:
-        return _err(rid, 4111, str(exc))
+        reason = getattr(exc, "reason", None)
+        return _err(rid, 4111, str(exc), {"reason": reason} if reason else None)
     except Exception as exc:
         return _err(rid, 5112, str(exc))
 
@@ -178,7 +181,8 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"tombstone": tombstone})
     except HostedRoomError as exc:
-        return _err(rid, 4113, str(exc))
+        reason = getattr(exc, "reason", None)
+        return _err(rid, 4113, str(exc), {"reason": reason} if reason else None)
     except Exception as exc:
         return _err(rid, 5114, str(exc))
 
@@ -198,7 +202,8 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, delta)
     except HostedRoomError as exc:
-        return _err(rid, 4112, str(exc))
+        reason = getattr(exc, "reason", None)
+        return _err(rid, 4112, str(exc), {"reason": reason} if reason else None)
     except Exception as exc:
         return _err(rid, 5113, str(exc))
 
