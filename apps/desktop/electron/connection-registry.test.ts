@@ -38,6 +38,7 @@ import {
   setConnectionLaunchMode,
   setLastUsedConnection,
   setPrimaryConnection,
+  shouldCacheSshEnumeration,
   shouldDeferLocalEnumeration,
   shouldRetrySshInventory,
   uniqueLabel,
@@ -892,6 +893,13 @@ test('shouldRetrySshInventory: first try, cooldown, then retry; cache never retr
   assert.equal(shouldRetrySshInventory(false, 1_000, 30_000, 60_000), false)
   assert.equal(shouldRetrySshInventory(false, 1_000, 61_000, 60_000), true)
   assert.equal(shouldRetrySshInventory(true, 1_000, 120_000, 60_000), false)
+})
+
+test('synthetic connect-on-demand SSH seeds never become successful inventory cache', () => {
+  assert.equal(shouldCacheSshEnumeration({ error: 'connect-on-demand', profiles: ['default'] }), false)
+  assert.equal(shouldCacheSshEnumeration({ error: 'offline', profiles: ['default'] }), true)
+  assert.equal(shouldCacheSshEnumeration({ profiles: ['default', 'builder'] }), true)
+  assert.equal(shouldCacheSshEnumeration({ error: 'offline', profiles: null }), false)
 })
 
 test('parseRemoteProfileListing: Mini/Spark dirs become roster names and drop rollbacks', () => {

@@ -203,7 +203,10 @@ export function isSessionsSwitchInFlight(input: {
 }
 
 export function isSubmitDeferred(result: WorkspaceSubmitResult | boolean): boolean {
-  return typeof result === 'object' && result.ok === false && result.reason === 'switching'
+  // Every typed workspace rejection is transient routing/readiness state, not
+  // a failed queued turn. Keep the entry in place without burning bounded
+  // auto-drain attempts; a plain false remains a real submission failure.
+  return typeof result === 'object' && result.ok === false
 }
 
 export function isSubmitAccepted(result: WorkspaceSubmitResult | boolean): boolean {

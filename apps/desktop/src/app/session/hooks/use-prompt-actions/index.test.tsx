@@ -14,6 +14,7 @@ import { requestGatewayForAgent } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $busy,
   $connection,
@@ -1805,6 +1806,61 @@ describe('usePromptActions submit / queue drain semantics', () => {
       'prompt.submit',
       { session_id: 'runtime-remote', text: 'continue remotely' },
       1_800_000
+    )
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  it('routes a queued submit by the queued session owner, never the foreground selection', async () => {
+    $activeGatewayProfile.set('default')
+    $connection.set({ connectionId: 'local', mode: 'local' } as never)
+    setSessions([
+      sessionInfo({ connection_id: 'local', id: 'stored-local', profile: 'default' }),
+      sessionInfo({ connection_id: 'remote-b', id: 'stored-bot', profile: 'default' })
+    ])
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId="runtime-bot"
+        getRuntimeIdForStoredSession={storedId =>
+          storedId === 'stored-local' ? 'runtime-local' : storedId === 'stored-bot' ? 'runtime-bot' : null
+        }
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={ambientRequest}
+        runtimeIdByStoredSessionIdRef={{
+          current: new Map([
+            ['stored-local', 'runtime-local'],
+            ['stored-bot', 'runtime-bot']
+          ])
+        }}
+        storedSessionId="stored-bot"
+      />
+    )
+
+    expect(
+      await handle!.submitText('queued local turn', {
+        fromQueue: true,
+        sessionId: 'runtime-local',
+        storedSessionId: 'stored-local'
+      })
+    ).toBe(true)
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'local',
+      'default',
+      'prompt.submit',
+      { queued: true, session_id: 'runtime-local', text: 'queued local turn' },
+      1_800_000
+    )
+    expect(requestGatewayForAgent).not.toHaveBeenCalledWith(
+      'remote-b',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything()
     )
     expect(ambientRequest).not.toHaveBeenCalled()
   })

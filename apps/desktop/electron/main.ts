@@ -149,6 +149,7 @@ import {
   setConnectionLaunchMode,
   setLastUsedConnection,
   setPrimaryConnection,
+  shouldCacheSshEnumeration,
   shouldRetrySshInventory,
   updateEligibility,
   upsertConnection
@@ -13996,7 +13997,7 @@ function revalidatePool() {
     entries: backendPool.entries(),
     log: rememberLog,
     probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
-    stopBackend: stopPoolBackend,
+    stopBackend: (poolKey, expected) => poolStopper.stopIfCurrent(poolKey, expected),
     tracker: remoteLiveness
   })
 }
@@ -14032,13 +14033,20 @@ function revalidateSuspectPoolAfterResume() {
       log: rememberLog,
       probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
       rebuild: poolKey => redialPoolBackendAfterResume(poolKey),
-      retire: async poolKey => {
-        await stopPoolBackend(poolKey)
+      retire: async (poolKey, expected) => {
+        const retired = await poolStopper.stopIfCurrent(poolKey, expected)
+
+        if (!retired) {
+          return false
+        }
+
         // The pool key doubles as the SSH scope for registry SSH backends and
         // resolves through sshScopeKey() for bare-profile remotes; both
         // teardown calls no-op when the scope holds no SSH state.
         await sshBootstrapCoordinator.cancelAndWait(poolKey)
         await teardownSshConnection(poolKey)
+
+        return true
       },
       tracker: remoteLiveness
     })
@@ -14706,7 +14714,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
   // Roster-only cache: preserve accepted transient-outage behavior without
   // mutating routing, pool ownership, Sessions, API-home, or workspace state.
   for (const enumeration of enumerations) {
-    if (enumeration.profiles && enumeration.profiles.length > 0) {
+    if (shouldCacheSshEnumeration(enumeration)) {
       sshRosterCache.set(enumeration.connection.id, enumeration.profiles)
     }
   }
@@ -14730,7 +14738,7 @@ ipcMain.handle('hermes:agents:roster', async () => {
       connectionId: connection.id,
       label: connection.label,
       kind: connection.kind,
-      reachable: profiles !== null,
+      reachable: profiles !== null && !error,
       ...(installId ? { installId } : {}),
       ...(error ? { error } : {})
     }))

@@ -14,21 +14,17 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { useStoresSelector } from '@/lib/use-session-slice'
+import { useWorkspaceSendBlockedState } from '@/lib/use-workspace-send-blocked-state'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
-import { blockedWorkspaceSendState, collectWorkspaceSendInput } from '@/lib/workspace-send-gate'
 import { sessionCompacting } from '@/store/compaction'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
-import { $connectionsRegistry } from '@/store/connection-registry-state'
-import { $pendingConnectionId } from '@/store/connections'
-import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $hudMode } from '@/store/hud'
-import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { sessionBlockingPrompt } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
-import { $connection, $gatewayState } from '@/store/session'
+import { $gatewayState } from '@/store/session'
 import { $botChatSessionIds, $sessionStates, $sessionTiles, isBotChatSession } from '@/store/session-states'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
@@ -228,29 +224,7 @@ export function ChatBar({
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
 
-  // useStoresSelector is backed by useSyncExternalStore: its snapshot must be
-  // referentially stable. Select the blocked-state scalar, never a fresh
-  // verdict object, or React can enter a maximum-update-depth loop.
-  const sendBlockedState = useStoresSelector(
-    [
-      $activeGatewayProfile,
-      $botChatSessionIds,
-      $connection,
-      $connectionsRegistry,
-      $gatewayState,
-      $gatewaySwitching,
-      $pendingConnectionId,
-      $profiles,
-      $sessionStates
-    ],
-    () =>
-      blockedWorkspaceSendState(
-        collectWorkspaceSendInput({
-          sessionId,
-          storedSessionId: queueSessionKey
-        })
-      )
-  )
+  const sendBlockedState = useWorkspaceSendBlockedState(sessionId, queueSessionKey)
 
   const sendDisabled = disabled || sendBlockedState !== null
   const inputDisabled = disabled && !reconnecting
@@ -405,7 +379,6 @@ export function ChatBar({
     editorRef,
     exitQueuedEdit,
     focusInput,
-    inputDisabled,
     loadIntoComposer,
     // The submit engine's only cancel call is the Stop-button branch (busy +
     // empty composer) — an explicit halt, so it parks the queue.

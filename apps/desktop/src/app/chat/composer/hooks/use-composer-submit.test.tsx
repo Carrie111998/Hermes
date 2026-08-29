@@ -25,7 +25,7 @@ interface SubmitHarnessOptions {
   busy?: boolean
   compacting?: boolean
   disabled?: boolean
-  inputDisabled?: boolean
+
   queuedPrompts?: QueuedPromptEntry[]
   scopeTarget?: ComposerTarget
   sessionKey?: string | null
@@ -42,7 +42,7 @@ function renderSubmitHook({
   busy = false,
   compacting = false,
   disabled = false,
-  inputDisabled = false,
+
   queuedPrompts = [],
   scopeTarget = 'main',
   sessionKey = 'stored-session',
@@ -112,7 +112,7 @@ function renderSubmitHook({
         editorRef,
         exitQueuedEdit: vi.fn(() => false),
         focusInput: vi.fn(),
-        inputDisabled,
+
         loadIntoComposer: vi.fn(),
         onCancel,
         onSteer,
@@ -266,7 +266,7 @@ describe('useComposerSubmit external request routing', () => {
   })
 
   it('does not submit through a disabled composer', () => {
-    const disabled = renderSubmitHook({ inputDisabled: true })
+    const disabled = renderSubmitHook({ disabled: true })
 
     requestComposerSubmit('do not send this', { target: 'main' })
 
@@ -582,7 +582,6 @@ describe('useComposerSubmit Sessions-switch barrier', () => {
   it('leaves a foreground draft intact and never sends or queues while send is blocked', () => {
     const { clearDraft, draftRef, hook, onSubmit, queueCurrentDraft } = renderSubmitHook({
       disabled: true,
-      inputDisabled: false,
       text: 'keep this draft'
     })
 
@@ -601,7 +600,6 @@ describe('useComposerSubmit Sessions-switch barrier', () => {
 
     const { drainNextQueued, hook, onSubmit } = renderSubmitHook({
       disabled: true,
-      inputDisabled: false,
       queuedPrompts,
       text: ''
     })

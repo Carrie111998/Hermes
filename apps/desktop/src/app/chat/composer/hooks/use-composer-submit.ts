@@ -31,7 +31,6 @@ interface UseComposerSubmitArgs {
   editorRef: RefObject<HTMLDivElement | null>
   exitQueuedEdit: (action: 'cancel' | 'save') => boolean
   focusInput: () => void
-  inputDisabled: boolean
   loadIntoComposer: (text: string, attachments: ComposerAttachment[]) => void
   onCancel: ChatBarProps['onCancel']
   onSteer: ChatBarProps['onSteer']
@@ -66,7 +65,6 @@ export function useComposerSubmit({
   editorRef,
   exitQueuedEdit,
   focusInput,
-  inputDisabled,
   loadIntoComposer,
   onCancel,
   onSteer,
@@ -121,12 +119,12 @@ export function useComposerSubmit({
           surfaceId !== null &&
           requestedSurfaceId === surfaceId &&
           paneVisible &&
-          !inputDisabled
+          !disabled
         ) {
           dispatchSubmitRef.current(text, undefined, displayKind)
         }
       }),
-    [inputDisabled, paneVisible, scope.target, surfaceId]
+    [disabled, paneVisible, scope.target, surfaceId]
   )
 
   const submitDraft = () => {

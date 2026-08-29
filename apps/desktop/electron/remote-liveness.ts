@@ -158,6 +158,7 @@ function isTransientPooledRemoteDispatchProbeFailure(error: unknown): boolean {
     error && typeof error === 'object'
       ? (error as { message?: unknown; needsOauthLogin?: unknown; statusCode?: unknown })
       : null
+
   const message = record ? String(record.message || '') : ''
 
   // Explicit auth, HTTP, and endpoint-contract failures always win over
@@ -247,7 +248,7 @@ export interface RevalidatePooledRemoteBackendsOptions<TConnection extends Remot
   entries: Iterable<[string, PooledRemoteEntry<TConnection>]>
   log: (message: string) => void
   probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
-  stopBackend: (profile: string) => void
+  stopBackend: (profile: string, expected: PooledRemoteEntry<TConnection>) => boolean | Promise<boolean>
   tracker: RemoteLivenessTracker
 }
 
@@ -295,8 +296,16 @@ export async function revalidatePooledRemoteBackends<TConnection extends RemoteC
           return
         }
 
-        log(`Pooled remote backend for profile "${profile}" failed liveness probe; dropping stale descriptor.`)
-        stopBackend(profile)
+        const stopped = await stopBackend(profile, entry)
+
+        if (!stopped) {
+          tracker.recordSuccess(baseUrl)
+          log(`Pooled remote backend for profile "${profile}" was replaced during liveness probe; keeping replacement.`)
+
+          return
+        }
+
+        log(`Pooled remote backend for profile "${profile}" failed liveness probe; dropped stale descriptor.`)
         dropped.push(profile)
       }
     })
@@ -312,7 +321,7 @@ export interface RevalidateSuspectPooledRemoteBackendsOptions<TConnection extend
   /** Re-dial a retired pool key so the tunnel is rebuilt eagerly, not on the next click. */
   rebuild: (poolKey: string) => Promise<unknown>
   /** Tear down the dead descriptor (pool entry + SSH tunnel/master) for this key. */
-  retire: (poolKey: string) => Promise<void> | void
+  retire: (poolKey: string, expected: PooledRemoteEntry<TConnection>) => boolean | Promise<boolean>
   tracker: RemoteLivenessTracker
 }
 
@@ -368,7 +377,14 @@ export async function revalidateSuspectPooledRemoteBackends<TConnection extends 
       }
 
       try {
-        await retire(poolKey)
+        const didRetire = await retire(poolKey, entry)
+
+        if (!didRetire) {
+          tracker.recordSuccess(baseUrl)
+          log(`Pooled remote backend "${poolKey}" was replaced during post-resume probe; keeping replacement.`)
+
+          return
+        }
       } catch (retireError) {
         // The dead entry may still be installed; rebuilding on top of it could
         // double-dial one scope. Leave it — the dispatch-time probe retires it

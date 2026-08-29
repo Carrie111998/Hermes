@@ -193,11 +193,21 @@ describe('workspace send surface states', () => {
     expect(evaluateWorkspaceSend({ ...idle, authRequired: true }).allowed).toBe(false)
   })
 
-  it('treats a switching submit result as a deferral, not a failure', () => {
-    const deferred = { ok: false as const, reason: 'switching' as WorkspaceSendSurfaceState }
+  it('treats every typed workspace rejection as a queue deferral, not a failed turn', () => {
+    for (const reason of [
+      'switching',
+      'route_invalid',
+      'auth_required',
+      'unreachable',
+      'unsupported_build',
+      'switch_failed'
+    ] satisfies WorkspaceSendSurfaceState[]) {
+      const deferred = { ok: false as const, reason }
 
-    expect(isSubmitDeferred(deferred)).toBe(true)
-    expect(isSubmitAccepted(deferred)).toBe(false)
+      expect(isSubmitDeferred(deferred)).toBe(true)
+      expect(isSubmitAccepted(deferred)).toBe(false)
+    }
+
     expect(isSubmitAccepted(false)).toBe(false)
     expect(isSubmitAccepted(true)).toBe(true)
     expect(isSubmitAccepted({ ok: true })).toBe(true)

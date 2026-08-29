@@ -698,6 +698,13 @@ export function shouldRetrySshInventory(
   return nowMs - lastAttemptMs >= retryAfterMs
 }
 
+/** Synthetic connect-on-demand rows make an undialed SSH source clickable but
+ * are not successful inventory. Never promote that default seed into the
+ * success cache or the retry policy will treat it as authoritative forever. */
+export function shouldCacheSshEnumeration(enumeration: Pick<ConnectionAgents, 'error' | 'profiles'>): boolean {
+  return Boolean(enumeration.error !== 'connect-on-demand' && enumeration.profiles && enumeration.profiles.length > 0)
+}
+
 // Keep this aligned with hermes_cli.profiles.validate_profile_name().
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 

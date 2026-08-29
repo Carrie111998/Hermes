@@ -37,7 +37,7 @@ describe('revalidateSuspectPooledRemoteBackends (#93910)', () => {
       return { ok: true }
     })
 
-    const retire = vi.fn(async (_poolKey: string) => undefined)
+    const retire = vi.fn(async (_poolKey: string) => true)
     const rebuild = vi.fn(async (_poolKey: string) => descriptor('http://127.0.0.1:53109'))
 
     const result = await revalidateSuspectPooledRemoteBackends({
@@ -59,7 +59,7 @@ describe('revalidateSuspectPooledRemoteBackends (#93910)', () => {
     // consecutive failures before dropping a descriptor. After sleep/wake the
     // SSH master is gone for good — a suspect descriptor that fails one bounded
     // probe must be retired immediately instead of surviving two more rounds.
-    const retire = vi.fn(async () => undefined)
+    const retire = vi.fn(async () => true)
 
     const result = await revalidateSuspectPooledRemoteBackends({
       entries: [['conn:ssh-dead::default', remoteEntry('http://127.0.0.1:53101')]],
@@ -125,7 +125,7 @@ describe('revalidateSuspectPooledRemoteBackends (#93910)', () => {
       rebuild: vi.fn(async () => {
         throw new Error('ssh bootstrap failed')
       }),
-      retire: vi.fn(async () => undefined),
+      retire: vi.fn(async () => true),
       tracker: new RemoteLivenessTracker()
     })
 
@@ -154,6 +154,26 @@ describe('revalidateSuspectPooledRemoteBackends (#93910)', () => {
     expect(result).toEqual({ rebuilt: [], retired: [] })
   })
 
+  it('does not retire or rebuild a replacement that wins during the suspect probe', async () => {
+    const retire = vi.fn(async () => false)
+    const rebuild = vi.fn()
+
+    const result = await revalidateSuspectPooledRemoteBackends({
+      entries: [['conn:ssh-dead::default', remoteEntry('http://127.0.0.1:53101')]],
+      log: vi.fn(),
+      probe: vi.fn(async () => {
+        throw new Error('socket hang up')
+      }),
+      rebuild,
+      retire,
+      tracker: new RemoteLivenessTracker()
+    })
+
+    expect(retire).toHaveBeenCalledTimes(1)
+    expect(rebuild).not.toHaveBeenCalled()
+    expect(result).toEqual({ rebuilt: [], retired: [] })
+  })
+
   it('clears the shared failure streak for a retired base URL so the rebuilt tunnel starts clean', async () => {
     const tracker = new RemoteLivenessTracker()
     tracker.recordFailure('http://127.0.0.1:53101')
@@ -166,7 +186,7 @@ describe('revalidateSuspectPooledRemoteBackends (#93910)', () => {
         throw new Error('socket hang up')
       }),
       rebuild: vi.fn(async () => descriptor('http://127.0.0.1:53110')),
-      retire: vi.fn(async () => undefined),
+      retire: vi.fn(async () => true),
       tracker
     })
 
@@ -276,7 +296,7 @@ describe('main.ts wiring for #93910', () => {
 
     expect(body).toContain('remoteRevalidation.run(')
     expect(body).toContain('revalidateSuspectPooledRemoteBackends({')
-    expect(body).toContain('stopPoolBackend(')
+    expect(body).toContain('poolStopper.stopIfCurrent(')
     expect(body).toContain('sshBootstrapCoordinator.cancelAndWait(')
     expect(body).toContain('teardownSshConnection(')
     expect(body).toContain('redialPoolBackendAfterResume')

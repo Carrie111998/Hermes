@@ -6,6 +6,11 @@ import { ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
 import { useComposerVoice } from './use-composer-voice'
 
+const voiceHarness = vi.hoisted(() => ({
+  end: vi.fn(async () => undefined),
+  submit: null as null | ((text: string) => Promise<void>)
+}))
+
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
@@ -35,15 +40,19 @@ vi.mock('./use-voice-recorder', () => ({
 }))
 
 vi.mock('./use-voice-conversation', () => ({
-  useVoiceConversation: () => ({
-    end: vi.fn(async () => undefined),
-    level: 0,
-    muted: false,
-    start: vi.fn(),
-    status: 'idle',
-    stopTurn: vi.fn(),
-    toggleMute: vi.fn()
-  })
+  useVoiceConversation: ({ onSubmit }: { onSubmit: (text: string) => Promise<void> }) => {
+    voiceHarness.submit = onSubmit
+
+    return {
+      end: voiceHarness.end,
+      level: 0,
+      muted: false,
+      start: vi.fn(),
+      status: 'idle',
+      stopTurn: vi.fn(),
+      toggleMute: vi.fn()
+    }
+  }
 }))
 
 vi.mock('./use-auto-speak-replies', () => ({
@@ -56,30 +65,38 @@ vi.mock('@/lib/wake-indicator', () => ({
 }))
 
 function renderVoice(disabled: boolean) {
-  return renderHook(
-    () =>
+  const clearDraft = vi.fn()
+  const onSubmit = vi.fn(async () => true)
+
+  const hook = renderHook(
+    ({ blocked }) =>
       useComposerVoice({
         busy: false,
-        clearDraft: vi.fn(),
-        disabled,
+        clearDraft,
+        disabled: blocked,
         focusInput: vi.fn(),
         insertText: vi.fn(),
         maxRecordingSeconds: 120,
-        onSubmit: vi.fn(async () => true),
+        onSubmit,
         onTranscribeAudio: vi.fn(async () => ''),
         sessionId: 'rt-voice',
         target: 'main'
       }),
     {
+      initialProps: { blocked: disabled },
       wrapper: ({ children }) => <ComposerScopeProvider value={MAIN_COMPOSER_SCOPE}>{children}</ComposerScopeProvider>
     }
   )
+
+  return { ...hook, clearDraft, onSubmit }
 }
 
 describe('useComposerVoice workspace send gate', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    voiceHarness.end.mockClear()
+    voiceHarness.submit = null
   })
 
   it('does not start or toggle voice while send is blocked', () => {
@@ -101,5 +118,33 @@ describe('useComposerVoice workspace send gate', () => {
     })
 
     expect(result.current.voiceConversationActive).toBe(true)
+  })
+
+  it('ends an active voice conversation when the workspace send barrier closes', async () => {
+    const { rerender, result } = renderVoice(false)
+
+    act(() => {
+      result.current.startConversation()
+    })
+
+    rerender({ blocked: true })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(result.current.voiceConversationActive).toBe(false)
+    expect(voiceHarness.end).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not clear or submit a voice transcript while send is blocked', async () => {
+    const { clearDraft, onSubmit } = renderVoice(true)
+
+    await act(async () => {
+      await voiceHarness.submit?.('stay on the original workspace')
+    })
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(clearDraft).not.toHaveBeenCalled()
   })
 })
