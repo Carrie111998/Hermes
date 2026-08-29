@@ -116,6 +116,34 @@ def test_auth_add_api_key_persists_manual_entry(tmp_path, monkeypatch):
     assert entry["access_token"] == "sk-or-manual"
 
 
+def test_auth_add_anthropic_manual_key_preserves_claude_code_suppression(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "suppressed_sources": {"anthropic": ["claude_code"]},
+        },
+    )
+
+    from hermes_cli.auth import is_source_suppressed
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "anthropic"
+        auth_type = "api-key"
+        api_key = "test-anthropic-key"
+        label = "hermes-owned"
+
+    auth_add_command(_Args())
+
+    assert is_source_suppressed("anthropic", "claude_code")
+
+
 def test_auth_add_configured_provider_uses_canonical_pool_key(tmp_path, monkeypatch):
     """A keyed providers row must keep its runtime slug in the auth pool."""
     hermes_home = tmp_path / "hermes"

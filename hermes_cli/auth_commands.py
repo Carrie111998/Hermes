@@ -277,6 +277,10 @@ def auth_add_command(args) -> None:
             )
             suppressed = _load_auth_store().get("suppressed_sources", {})
             for src in list(suppressed.get(provider, []) or []):
+                # Adding a Hermes-owned Anthropic credential must not re-enable
+                # auto-discovery of Claude Code's separate rotating token.
+                if provider == "anthropic" and src == "claude_code":
+                    continue
                 unsuppress_credential_source(provider, src)
         except Exception:
             pass
