@@ -2120,14 +2120,45 @@ class SessionSearchMixin:
                 # FTS5 query syntax error despite sanitization — return empty
                 return []
             except sqlite3.DatabaseError as exc:
-                # A corrupt FTS index raises the malformed / "fts5: corrupt
-                # structure record" class on the MATCH read, the same class the
-                # write path self-heals (#66296). OperationalError (query
-                # syntax) is a subclass caught above; this arm is the corruption
-                # parent. Rebuild the index in place once — the read context
-                # holds no writer lock, so rebuild_fts() can acquire it — and
-                # retry, so search self-heals for read-only sessions (cron/CLI
-                # history search) that never trigger a write to repair it first.
+                # FTS index corruption (#97794): degrade to LIKE instead of
+                # surfacing as whole-DB corruption.  A corrupt FTS MATCH
+                # (malformed / "fts5: corrupt" / SQLITE_NOTADB) still leaves
+                # the canonical messages table healthy — the LIKE scan proves it.
+                # If LIKE also fails the damage is truly canonical and will
+                # surface as a DatabaseError there, which callers classify as
+                # "corrupt".  Otherwise we return degraded results and let a
+                # later SessionDB open rebuild the indexes (message in
+                # _enter_fts_fail_open: "Search temporarily uses LIKE ...").
+                text = str(exc).lower()
+                is_fts_related = (
+                    self._is_fts_write_corruption_error(exc)
+                    or any(m in text for m in ("messages_fts", "fts5", "malformed", "not a database", "database corruption"))
+                )
+                if is_fts_related:
+                    logger.warning(
+                        "FTS5 search hit corruption (%s); falling back to LIKE " "until a later SessionDB open rebuilds the indexes", exc
+                    )
+                    try:
+                        self._try_runtime_fts_rebuild(exc)
+                    except Exception:
+                        pass
+                    try:
+                        like_matches = self._search_messages_like_fallback(
+                            query,
+                            source_filter=source_filter,
+                            exclude_sources=exclude_sources,
+                            role_filter=role_filter,
+                            limit=limit,
+                            offset=offset,
+                            sort=sort_norm,
+                            include_inactive=include_inactive,
+                        )
+                        return self._finalize_search_matches(like_matches, result_fields=result_fields)
+                    except sqlite3.DatabaseError as like_exc:
+                        logger.warning("LIKE fallback also failed after FTS corruption: %s", like_exc)
+                        raise
+                # Not FTS-only or LIKE confirmed canonical damage: try the
+                # one-shot rebuild path for read-only sessions (#66296).
                 if not self._try_runtime_fts_rebuild(exc):
                     raise
                 with self._read_ctx() as conn:

@@ -786,8 +786,33 @@ def _discover(
             fields=_DISCOVER_SEARCH_FIELDS,
         )
     except Exception as e:
-        logging.error("FTS5 search failed: %s", e, exc_info=True)
-        return tool_error(f"Search failed: {e}", success=False)
+        # FTS-index-only corruption (#97794): degrade to LIKE instead of
+        # surfacing as whole-DB corruption / Search failed.  search_messages
+        # already falls back to LIKE for DatabaseError, so reaching here
+        # means either a non-search bug or LIKE also failed.  Try the LIKE
+        # fallback one more time at the tool layer so "file is not a
+        # database" from a stale FTS shadow table still returns results.
+        logging.warning("FTS5 search failed: %s — trying LIKE fallback", e, exc_info=True)
+        try:
+            if hasattr(db, "_search_messages_like_fallback"):
+                raw_results = db._search_messages_like_fallback(
+                    query,
+                    source_filter=None,
+                    exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                    role_filter=role_list,
+                    limit=_DISCOVER_SCAN_LIMIT,
+                    offset=0,
+                    sort=sort,
+                    include_inactive=False,
+                )
+                # synthesize minimal fields for discover ranking
+                # _search_messages_like_fallback returns dict rows with the
+                # same shape search_messages does, so dedup below still works.
+            else:
+                raise e
+        except Exception as like_exc:
+            logging.error("LIKE fallback also failed: %s", like_exc, exc_info=True)
+            return tool_error(f"Search failed: {e}", success=False)
 
     # Demote automation (cron) rows below interactive ones before dedup, so a
     # high-volume cron corpus can't starve the user's own sessions out of the
