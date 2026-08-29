@@ -3645,12 +3645,14 @@ class GatewaySlashCommandsMixin:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
-    def _save_gateway_config_key(self, key_path: str, value) -> bool:
+    def _save_gateway_config_key(
+        self, key_path: str, value, *, config_home: Optional[Path] = None
+    ) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
         and their interactive pickers)."""
         from gateway.run import _hermes_home
         from hermes_cli.config import read_user_config_raw
-        config_path = _hermes_home / "config.yaml"
+        config_path = (config_home or _hermes_home) / "config.yaml"
         try:
             # Write-back round-trip: raw read is correct (merged defaults must
             # not be persisted back to the user's file).
@@ -3674,6 +3676,7 @@ class GatewaySlashCommandsMixin:
         platform_key: str,
         value: str,
         persist_global: bool = False,
+        config_home: Optional[Path] = None,
     ) -> str:
         """Apply a /reasoning argument (typed or picked) and return the reply.
 
@@ -3689,13 +3692,17 @@ class GatewaySlashCommandsMixin:
         if value in {"show", "on"}:
             self._show_reasoning = True
             self._save_gateway_config_key(
-                f"display.platforms.{platform_key}.show_reasoning", True
+                f"display.platforms.{platform_key}.show_reasoning",
+                True,
+                config_home=config_home,
             )
             return t("gateway.reasoning.display_set_on", platform=platform_key)
         if value in {"hide", "off"}:
             self._show_reasoning = False
             self._save_gateway_config_key(
-                f"display.platforms.{platform_key}.show_reasoning", False
+                f"display.platforms.{platform_key}.show_reasoning",
+                False,
+                config_home=config_home,
             )
             return t("gateway.reasoning.display_set_off", platform=platform_key)
 
@@ -3713,7 +3720,9 @@ class GatewaySlashCommandsMixin:
 
         self._reasoning_config = parsed
         if persist_global:
-            if self._save_gateway_config_key("agent.reasoning_effort", value):
+            if self._save_gateway_config_key(
+                "agent.reasoning_effort", value, config_home=config_home
+            ):
                 self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
                 return t("gateway.reasoning.set_global", effort=value)
@@ -3806,6 +3815,9 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
+        _command_profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            _command_profile_home = self._resolve_profile_home_for_source(event.source)
         # Normalize the source (Telegram DM topic recovery) before deriving
         # the override key so storage matches the key the next message turn
         # reads — same fix as /model (#30479).
@@ -3852,12 +3864,21 @@ class GatewaySlashCommandsMixin:
             _picker_platform_key = _platform_config_key(event.source.platform)
 
             async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-                return self._apply_reasoning_selection(
-                    session_key,
-                    _picker_platform_key,
-                    value,
-                    persist_global=persist_global,
-                )
+                def _apply_choice() -> str:
+                    return self._apply_reasoning_selection(
+                        session_key,
+                        _picker_platform_key,
+                        value,
+                        persist_global=persist_global,
+                        config_home=_command_profile_home,
+                    )
+
+                if _command_profile_home is None:
+                    return _apply_choice()
+                from gateway.run import _profile_runtime_scope
+
+                with _profile_runtime_scope(_command_profile_home):
+                    return _apply_choice()
 
             picker_sent = await self._try_send_choice_picker(
                 event,
@@ -3884,7 +3905,11 @@ class GatewaySlashCommandsMixin:
         # Typed argument path — same applier the picker uses.
         platform_key = _platform_config_key(event.source.platform)
         return self._apply_reasoning_selection(
-            session_key, platform_key, args, persist_global=persist_global
+            session_key,
+            platform_key,
+            args,
+            persist_global=persist_global,
+            config_home=_command_profile_home,
         )
 
     async def _handle_memory_command(self, event: MessageEvent) -> str:
