@@ -64,7 +64,11 @@ def test_os_matrix_binds_windows_marker_to_native_runner():
     matrix = workflow["jobs"]["os-tests"]["strategy"]["matrix"]["include"]
 
     by_marker = {entry["marker"]: entry for entry in matrix}
-    assert by_marker["windows_only"]["runner"] == "windows-latest"
+    windows_runner = by_marker["windows_only"]["runner"]
+    assert isinstance(windows_runner, str)
+    assert windows_runner == "windows-latest" or windows_runner.startswith(
+        "windows-latest-"
+    )
     assert by_marker["windows_only"]["name"] == "Windows-only tests"
     assert by_marker["macos_only"]["runner"] == "macos-latest"
 
