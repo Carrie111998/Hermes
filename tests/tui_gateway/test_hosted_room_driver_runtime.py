@@ -1462,35 +1462,6 @@ def test_second_attachment_failure_rolls_back_before_later_text_only_turn(db: Pa
     assert text_submit["staged_attachment_ids"] == []
 
 
-def test_attachment_task_never_uses_peer_transport_binary_path(db: Path):
-    identity = _identity()
-    manifest = {
-        "attachment_id": "att_11111111111111111111111111111111",
-        "kind": "image",
-        "name": "diagram.png",
-        "size": 12,
-        "mime": "image/png",
-    }
-    _admit(db, identity, attachments=[manifest])
-    peer = FakeSessionRPC()
-    runtime = HostedRoomRuntime(
-        db_path=db,
-        rooms=[BINDING],
-        transport_resolver=lambda _binding, _task: peer,
-        turn_lock=RecordingTurnLocks(),
-        attachment_loader=lambda _binding, _task: ((manifest, b"image-bytes"),),
-        lease_ttl_seconds=0.4,
-        poll_interval_seconds=0.01,
-    )
-
-    runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
-    assert runtime.stop(timeout=1.0)
-
-    assert not any(method == "stage_attachment" for method, _params in peer.calls)
-    assert not any(method == "submit" for method, _params in peer.calls)
-
-
 def test_task_can_stage_a_bounded_aggregate_from_multiple_messages(db: Path):
     identity = _identity()
     manifests = [

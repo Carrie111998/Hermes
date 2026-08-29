@@ -99,6 +99,7 @@ def _append_user(
     event_id: str,
     text: str,
     thread_id: str = "thread-1",
+    attachments: list[dict] | None = None,
 ) -> dict:
     return hosted_rooms.append_event(
         db,
@@ -106,7 +107,11 @@ def _append_user(
         event_id=event_id,
         kind="message.user",
         actor={"kind": "user", "id": "local-user"},
-        payload={"text": text, "thread_id": thread_id},
+        payload={
+            "text": text,
+            "thread_id": thread_id,
+            **({"attachments": attachments} if attachments is not None else {}),
+        },
         now=time.time(),
     )
 

@@ -630,7 +630,10 @@ def _validate_event(
         raise DiscussionValidationError("event payload must be an object")
 
     if kind == "message.user":
-        payload = validate_user_payload(payload)
+        payload = validate_user_payload(
+            payload,
+            member_ids=(member.member_id for member in room.members),
+        )
         if actor.get("kind") != "user":
             raise DiscussionValidationError("message.user requires a user actor")
     elif kind == "message.member":
