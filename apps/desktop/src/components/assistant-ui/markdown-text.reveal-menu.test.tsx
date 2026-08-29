@@ -1,17 +1,20 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $connection } from '@/store/session'
+import { PRIMARY_SESSION_VIEW, SessionViewProvider } from '@/app/chat/session-view'
+import { $connection, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
 
+import { PreviewAttachment } from '../chat/preview-attachment'
 import { ZoomableImage } from '../chat/zoomable-image'
 
 import { MarkdownTextContent } from './markdown-text'
 
 // Regression: a MEDIA-delivered non-media file (pdf, zip, ...) renders as a
-// filename download link. Right-clicking it must offer
+// preview card. Right-clicking its filename must offer
 // reveal-in-file-manager + Copy Path — the transcript's "where is that file?"
 // door — so the user can find the artifact on disk without re-asking the agent.
-describe('MEDIA file fallback link context menu', () => {
+describe('MEDIA file preview card actions', () => {
   const revealPath = vi.fn().mockResolvedValue(undefined)
   const saveGatewayFile = vi.fn().mockResolvedValue({ path: '/tmp/saved-report.pdf', saved: true })
   const writeText = vi.fn().mockResolvedValue(undefined)
@@ -35,6 +38,7 @@ describe('MEDIA file fallback link context menu', () => {
 
   afterEach(() => {
     cleanup()
+    _resetSessionOwnerHintsForTests({ storage: true })
     $connection.set(null)
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
@@ -46,20 +50,22 @@ describe('MEDIA file fallback link context menu', () => {
     }
   })
 
-  it('right-clicking the filename download link reveals it in the file manager', async () => {
+  it('right-clicking the preview filename exposes working copy and reveal actions', async () => {
     render(<MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:%2Ftmp%2Freport.pdf)" />)
 
-    const link = await screen.findByRole('link', { name: 'report.pdf' })
+    const filename = await screen.findByText('report.pdf')
 
-    // The fallback anchor must be wrapped in a Radix context-menu trigger.
-    await waitFor(() => expect(link.closest('[data-hermes-context-menu-trigger]')).not.toBeNull())
+    await waitFor(() => expect(filename.closest('[data-hermes-context-menu-trigger]')).not.toBeNull())
 
-    fireEvent.contextMenu(link)
+    fireEvent.contextMenu(filename)
 
-    const revealItem = await screen.findByRole('menuitem', { name: /Open Containing Folder|Reveal in/i })
-    expect(screen.getByRole('menuitem', { name: /Copy Path/i })).toBeTruthy()
+    expect(await screen.findByRole('menuitem', { name: /Open Containing Folder|Reveal in/i })).toBeTruthy()
+    fireEvent.click(screen.getByRole('menuitem', { name: /Copy Path/i }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('/tmp/report.pdf'))
+    await waitFor(() => expect(screen.queryByRole('menuitem', { name: /Copy Path/i })).toBeNull())
 
-    fireEvent.click(revealItem)
+    fireEvent.contextMenu(filename)
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Open Containing Folder|Reveal in/i }))
 
     await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/tmp/report.pdf'))
   })
@@ -67,49 +73,74 @@ describe('MEDIA file fallback link context menu', () => {
   it('downloads a local file instead of opening it in its associated app', async () => {
     render(<MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:%2Ftmp%2Freport.pdf)" />)
 
-    const link = await screen.findByRole('link', { name: 'report.pdf' })
-
-    expect(link.getAttribute('download')).toBe('report.pdf')
-    fireEvent.click(link)
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
 
     await waitFor(() =>
       expect(saveGatewayFile).toHaveBeenCalledWith({
-        connectionId: undefined,
+        connectionId: null,
         path: '/tmp/report.pdf',
-        profile: undefined,
+        profile: null,
         suggestedName: 'report.pdf'
       })
     )
   })
 
-  it('keeps the filename downloadable while hiding local actions on a remote connection', async () => {
-    $connection.set({ connectionId: 'remote-work-connection', mode: 'remote', profile: 'remote-work' } as never)
-    render(<MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:%2Ftmp%2Freport.pdf)" />)
+  it('downloads through the viewed remote session while the ambient connection is local', async () => {
+    setSessionOwnerHint('stored-remote', {
+      connectionId: 'session-ssh',
+      mode: 'remote',
+      profile: 'desktop-name',
+      targetProfile: 'gateway-name'
+    })
+    $connection.set({ connectionId: 'ambient-local', mode: 'local', profile: 'default' } as never)
 
-    const link = await screen.findByRole('link', { name: 'report.pdf' })
-    expect(link.closest('[data-hermes-context-menu-trigger]')).toBeNull()
+    render(
+      <SessionViewProvider
+        value={{ ...PRIMARY_SESSION_VIEW, $cwd: atom('/srv/work'), $storedId: atom('stored-remote') }}
+      >
+        <MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:report.pdf)" />
+      </SessionViewProvider>
+    )
+
+    const filename = await screen.findByText('report.pdf')
+    expect(filename.closest('[data-hermes-context-menu-trigger]')).toBeNull()
     expect(screen.queryByRole('button', { name: 'File actions' })).toBeNull()
 
-    fireEvent.click(link)
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
     await waitFor(() =>
       expect(saveGatewayFile).toHaveBeenCalledWith({
-        connectionId: 'remote-work-connection',
-        path: '/tmp/report.pdf',
-        profile: 'remote-work',
+        connectionId: 'session-ssh',
+        path: '/srv/work/report.pdf',
+        profile: 'gateway-name',
         suggestedName: 'report.pdf'
       })
     )
   })
 
-  it('copies the artifact path from the keyboard-accessible actions menu', async () => {
-    render(<MarkdownTextContent isRunning={false} text="Done: [report.pdf](#media:%2Ftmp%2Freport.pdf)" />)
+  it.each([
+    ['Windows drive path', 'C:\\Users\\a\\report.pdf', 'C:\\Users\\a\\report.pdf'],
+    ['Windows file URL', 'file:///C:/Users/a/report.pdf', 'C:/Users/a/report.pdf'],
+    ['home-relative path', '~/report.pdf', '~/report.pdf']
+  ])('downloads a %s without prepending the viewed session cwd', async (_kind, target, expectedPath) => {
+    $connection.set({ connectionId: 'ambient-local', mode: 'local', profile: 'default' } as never)
 
-    const actions = await screen.findByRole('button', { name: 'File actions' })
-    fireEvent.pointerDown(actions, { button: 0, ctrlKey: false, pointerType: 'mouse' })
-    fireEvent.click(actions)
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'Copy Path' }))
+    render(
+      <SessionViewProvider
+        value={{ ...PRIMARY_SESSION_VIEW, $cwd: atom('/srv/work'), $storedId: atom<null | string>(null) }}
+      >
+        <PreviewAttachment target={target} />
+      </SessionViewProvider>
+    )
 
-    await waitFor(() => expect(writeText).toHaveBeenCalledWith('/tmp/report.pdf'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+    await waitFor(() =>
+      expect(saveGatewayFile).toHaveBeenCalledWith({
+        connectionId: 'ambient-local',
+        path: expectedPath,
+        profile: 'default',
+        suggestedName: 'report.pdf'
+      })
+    )
   })
 
   it.each([
@@ -118,9 +149,9 @@ describe('MEDIA file fallback link context menu', () => {
   ])('does not reveal a transcript-controlled %s path', async (_kind, mediaPath) => {
     render(<MarkdownTextContent isRunning={false} text={`Done: [report.pdf](#media:${mediaPath})`} />)
 
-    const link = await screen.findByRole('link', { name: 'report.pdf' })
-    fireEvent.click(link)
-    fireEvent.contextMenu(link)
+    const filename = await screen.findByText('report.pdf')
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+    fireEvent.contextMenu(filename)
     fireEvent.click(await screen.findByRole('menuitem', { name: /Open Containing Folder|Reveal in/i }))
 
     expect(revealPath).not.toHaveBeenCalled()

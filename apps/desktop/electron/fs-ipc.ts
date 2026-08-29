@@ -50,6 +50,7 @@ export function registerFsIpc({
       // trusted local `\\wsl.localhost` path for Explorer to open.
       const accessibleTarget =
         process.platform === 'win32' && target.startsWith('/') ? wslPosixToWindowsAccessible(target) : target
+
       shell.showItemInFolder(accessibleTarget)
 
       return true

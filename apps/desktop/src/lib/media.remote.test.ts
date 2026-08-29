@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $connection, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
+import { $connectionsRegistry } from '@/store/connections'
+import { $profiles } from '@/store/profile'
+import { $connection, _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } from '@/store/session'
 
 import {
   downloadGatewayMediaFile,
@@ -10,6 +12,7 @@ import {
   isRemoteGateway,
   mediaExternalUrl,
   mediaGatewayStreamUrl,
+  mediaName,
   resolveMediaDisplaySrc,
   resolveMediaPlaybackSrc
 } from './media'
@@ -42,6 +45,12 @@ describe('filePathFromMediaPath', () => {
 
   it('decodes a file:// URL with encoded characters', () => {
     expect(filePathFromMediaPath('file:///tmp/a%20b.png')).toBe('/tmp/a b.png')
+    expect(filePathFromMediaPath('file:///C:/Users/a/report.pdf')).toBe('C:/Users/a/report.pdf')
+  })
+
+  it('extracts a filename from Windows paths without treating the drive as a URL scheme', () => {
+    expect(mediaName('C:\\Users\\a\\report.pdf')).toBe('report.pdf')
+    expect(mediaName('C:/Users/a/report.pdf')).toBe('report.pdf')
   })
 })
 
@@ -238,12 +247,18 @@ describe('downloadGatewayMediaFile', () => {
   beforeEach(() => {
     saveGatewayFile.mockClear()
     vi.stubGlobal('window', { hermesDesktop: { saveGatewayFile } })
+    $connectionsRegistry.set(null)
+    $profiles.set([])
+    setSessions([])
     $connection.set({ connectionId: 'work-ssh', mode: 'remote', profile: 'docker-gw' } as never)
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    $connectionsRegistry.set(null)
+    $profiles.set([])
     _resetSessionOwnerHintsForTests({ storage: true })
+    setSessions([])
     $connection.set(null)
   })
 
@@ -276,6 +291,42 @@ describe('downloadGatewayMediaFile', () => {
       connectionId: 'session-ssh',
       path: '/srv/report.md',
       profile: 'gateway-name',
+      suggestedName: 'report.md'
+    })
+  })
+
+  it('routes a bare session owner through the legacy profile pool, not the ambient connection', async () => {
+    setSessions([{ id: 'stored-legacy', profile: 'legacy-worker' } as never])
+    $connection.set({ connectionId: 'ambient-registered', mode: 'remote', profile: 'default' } as never)
+
+    await downloadGatewayMediaFile('/srv/report.md', 'stored-legacy')
+
+    expect(saveGatewayFile).toHaveBeenCalledWith({
+      connectionId: null,
+      path: '/srv/report.md',
+      profile: 'legacy-worker',
+      suggestedName: 'report.md'
+    })
+  })
+
+  it('fails closed when a stored session owner cannot be resolved', async () => {
+    $profiles.set([{ name: 'default' }, { name: 'other' }] as never)
+
+    await expect(downloadGatewayMediaFile('/srv/report.md', 'missing-session')).rejects.toMatchObject({
+      name: 'SessionOwnerResolutionError'
+    })
+    expect(saveGatewayFile).not.toHaveBeenCalled()
+  })
+
+  it('uses ambient routing for an ownerless session only in a proven legacy single-backend topology', async () => {
+    $profiles.set([{ name: 'default' }] as never)
+
+    await downloadGatewayMediaFile('/srv/report.md', 'legacy-ownerless')
+
+    expect(saveGatewayFile).toHaveBeenCalledWith({
+      connectionId: 'work-ssh',
+      path: '/srv/report.md',
+      profile: 'docker-gw',
       suggestedName: 'report.md'
     })
   })

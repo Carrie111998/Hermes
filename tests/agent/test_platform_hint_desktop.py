@@ -70,12 +70,6 @@ class TestDesktopHintEntry:
         hint = PLATFORM_HINTS["desktop"]
         assert "markdown" in hint.lower()
 
-    def test_desktop_hint_requires_media_entries_for_file_deliverables(self):
-        hint = PLATFORM_HINTS["desktop"]
-        assert "always include one MEDIA:" in hint
-        assert "instead of only naming it" in hint
-        assert "download links" in hint
-
 
 
 

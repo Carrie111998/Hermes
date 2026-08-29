@@ -11,7 +11,6 @@ import type { code as streamdownCode } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
-import { FileDownloadLink } from '@/components/chat/file-download-link'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { RevealInFolderTrigger } from '@/components/chat/reveal-in-folder'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
@@ -145,18 +144,6 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
   )
 }
 
-function FileAttachment({ path }: { path: string }) {
-  const name = mediaName(path)
-
-  return (
-    <span className="wrap-anywhere">
-      <RevealInFolderTrigger path={path}>
-        <FileDownloadLink path={path}>{name}</FileDownloadLink>
-      </RevealInFolderTrigger>
-    </span>
-  )
-}
-
 function PlayableMediaAttachment({ kind, path }: { kind: 'audio' | 'image' | 'video'; path: string }) {
   const [src, setSrc] = useState('')
   const [failed, setFailed] = useState(false)
@@ -249,12 +236,6 @@ function PlayableMediaAttachment({ kind, path }: { kind: 'audio' | 'image' | 'vi
   )
 }
 
-function MediaAttachment({ path }: { path: string }) {
-  const kind = mediaKind(path)
-
-  return kind === 'file' ? <FileAttachment path={path} /> : <PlayableMediaAttachment kind={kind} path={path} />
-}
-
 function childrenToText(children: unknown): string {
   if (typeof children === 'string' || typeof children === 'number') {
     return String(children).trim()
@@ -271,6 +252,8 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
   const mediaPath = mediaPathFromMarkdownHref(href)
 
   if (mediaPath) {
+    const kind = mediaKind(mediaPath)
+
     // A delivered markdown document is renderable content, not an opaque
     // download: route it to the preview rail (which renders .md with a
     // rendered/source toggle) instead of the download-link fallback that
@@ -285,11 +268,11 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
     // the same file card + "Open preview" the bare-path markdown-link
     // branch below produces — so MEDIA: uniformly delivers the richest
     // rendering for every file type.
-    if (mediaKind(mediaPath) === 'file') {
+    if (kind === 'file') {
       return <PreviewAttachment source="tool-result" target={mediaPath} />
     }
 
-    return <MediaAttachment path={mediaPath} />
+    return <PlayableMediaAttachment kind={kind} path={mediaPath} />
   }
 
   const previewTarget = previewTargetFromMarkdownHref(href)
@@ -319,10 +302,12 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
     const fileHref = href && !href.startsWith('#') && isFileMediaPath(href) ? href : null
 
     if (fileHref) {
-      return mediaKind(fileHref) === 'file' ? (
+      const kind = mediaKind(fileHref)
+
+      return kind === 'file' ? (
         <PreviewAttachment source="explicit-link" target={fileHref} />
       ) : (
-        <MediaAttachment path={fileHref} />
+        <PlayableMediaAttachment kind={kind} path={fileHref} />
       )
     }
 
@@ -361,7 +346,7 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 // Generated/inline media often arrives as image markdown — `![clip](clip.mp4)`.
 // A raw <img> with a video/audio source renders a broken-image icon (the file is
 // valid, the browser just can't paint it as an image), so route those sources to
-// MediaAttachment, which picks the right <video>/<audio> element (streaming
+// PlayableMediaAttachment, which picks the right <video>/<audio> element (streaming
 // protocol + open-externally fallback) by media kind. Detection is
 // extension-based via mediaKind(); an extension-less/data/blob video URL still
 // resolves to 'file' and falls through to the image path as before.
@@ -379,7 +364,7 @@ export function MarkdownImage(props: ComponentProps<'img'> & { rawSrc?: string }
   const kind = src ? mediaKind(src) : 'file'
 
   if (kind === 'video' || kind === 'audio') {
-    return <MediaAttachment path={src} />
+    return <PlayableMediaAttachment kind={kind} path={src} />
   }
 
   const localPath = isFileMediaPath(rawSrc || src) ? rawSrc || src : undefined

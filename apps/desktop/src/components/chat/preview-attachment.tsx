@@ -7,10 +7,12 @@ import { Download, MonitorPlay } from '@/lib/icons'
 import { localPreviewTarget, normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { downloadGatewayMediaFile } from '@/lib/media'
 import { previewName } from '@/lib/preview-targets'
+import { isUnsafeRevealPath } from '@/lib/reveal-path-guard'
 import { notifyError } from '@/store/notifications'
 import { $previewTabSources, closePreviewForSource, openPreview, type PreviewRecordSource } from '@/store/preview'
 
 import { RevealInFolderTrigger } from './reveal-in-folder'
+
 export function PreviewAttachment({ source = 'manual', target }: { source?: PreviewRecordSource; target: string }) {
   const { t } = useI18n()
   // This link lives in one session's transcript; resolve it against THAT
@@ -117,6 +119,10 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         throw new Error(`Could not resolve download target: ${target}`)
       }
 
+      if (isUnsafeRevealPath(filePath)) {
+        throw new Error(`Unsafe download target: ${filePath}`)
+      }
+
       const result = await downloadGatewayMediaFile(filePath, storedSessionId)
 
       if (mountedRef.current && result.saved) {
@@ -135,7 +141,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
   }
 
   return (
-    <div className="flex w-full max-w-160 items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
+    <span className="flex w-full max-w-160 items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
       <span className="grid size-6 shrink-0 place-items-center rounded-md bg-muted/55 text-muted-foreground/85">
         <MonitorPlay className="size-3.5" />
       </span>
@@ -169,6 +175,6 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
       >
         {opening ? t.preview.opening : isActive ? t.preview.hide : t.preview.openPreview}
       </button>
-    </div>
+    </span>
   )
 }
