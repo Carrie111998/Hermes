@@ -1023,6 +1023,11 @@ The storage uses atomic file writes so interrupted writes do not leave a partial
 Cron jobs run in a completely fresh agent session. The prompt must contain everything the agent needs that is not already provided by attached skills.
 :::
 
+Global prefill messages are excluded from cron runs by default so setup or
+few-shot chat context cannot change a scheduled instruction. If a model
+deliberately requires the same prefill for unattended runs, set
+`cron.inherit_prefill_messages: true` in `config.yaml`.
+
 **BAD:** `"Check on that server issue"`
 
 **GOOD:** `"SSH into server 192.168.1.100 as user 'deploy', check if nginx is running with 'systemctl status nginx', and verify https://example.com returns HTTP 200."`

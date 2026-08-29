@@ -5993,29 +5993,35 @@ def run_job(
         # Resolution itself happens via _resolve_job_reasoning_config below
         # (per-job pin > agent.reasoning_overrides > agent.reasoning_effort).
 
-        # Prefill messages from env or config.yaml. The top-level
-        # prefill_messages_file key is canonical; agent.prefill_messages_file is
-        # retained as a legacy fallback for older CLI/godmode configs.
-        prefill_messages = None
-        agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
-        prefill_file = (
-            os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
-            or _cfg.get("prefill_messages_file", "")
-            or agent_cfg.get("prefill_messages_file", "")
-        )
-        if prefill_file:
-            pfpath = Path(prefill_file).expanduser()
-            if not pfpath.is_absolute():
-                pfpath = _get_hermes_home() / pfpath
-            if pfpath.exists():
-                try:
-                    with open(pfpath, "r", encoding="utf-8") as _pf:
-                        prefill_messages = json.load(_pf)
-                    if not isinstance(prefill_messages, list):
-                        prefill_messages = None
-                except Exception as e:
-                    logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
-                    prefill_messages = None
+        # Cron runs are isolated from chat-style prefill by default. Operators
+        # using prefill for deliberate model priming can opt back in explicitly.
+        prefill_messages: Any = None
+        _cfg_dict: Any = _cfg if isinstance(_cfg, dict) else {}
+        _raw_cron_cfg = _cfg_dict.get("cron")
+        _cron_cfg = _raw_cron_cfg if isinstance(_raw_cron_cfg, dict) else {}
+        if _cron_cfg.get("inherit_prefill_messages") is True:
+            _raw_agent_cfg = _cfg_dict.get("agent")
+            agent_cfg = _raw_agent_cfg if isinstance(_raw_agent_cfg, dict) else {}
+            prefill_file = str(
+                os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+                or _cfg_dict.get("prefill_messages_file", "")
+                or agent_cfg.get("prefill_messages_file", "")
+            )
+            if prefill_file:
+                pfpath = Path(prefill_file).expanduser()
+                if not pfpath.is_absolute():
+                    pfpath = _get_hermes_home() / pfpath
+                if pfpath.exists():
+                    try:
+                        with open(pfpath, "r", encoding="utf-8") as _pf:
+                            prefill_messages = json.load(_pf)
+                        if not isinstance(prefill_messages, list):
+                            prefill_messages = None
+                    except Exception as e:
+                        logger.warning(
+                            "Job '%s': failed to parse prefill messages file '%s': %s",
+                            job_id, pfpath, e,
+                        )
 
         # Max iterations — resolved through resolve_turn_limit() so that
         # agent.max_turns: none / unlimited → sys.maxsize sentinel, and

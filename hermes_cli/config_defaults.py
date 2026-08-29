@@ -2652,6 +2652,10 @@ DEFAULT_CONFIG = {
         # job. Interactive toolsets (messaging/clarify) stay denied in cron
         # context regardless of this setting.
         "allow_agent_scheduling": False,
+        # Keep scheduled runs isolated from global chat/few-shot prefill by
+        # default. Set true only when the same prefill is deliberately required
+        # for unattended model priming.
+        "inherit_prefill_messages": False,
         # Pre-dispatch configuration validation (T1-26): before constructing
         # any agent machinery for a job, verify the provider API key resolves
         # (unless a fallback chain is configured), attached skills are ready

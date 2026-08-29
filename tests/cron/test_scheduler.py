@@ -653,6 +653,44 @@ class TestRunJobSessionPersistence:
             "memory toolset must not be policy-denied in cron"
         )
 
+    def test_run_job_does_not_inherit_chat_prefill_messages(self, tmp_path):
+        """Scheduled runs start from the stored job prompt, not chat prefill."""
+        prefill = [{"role": "user", "content": "Create the monitor routine"}]
+        (tmp_path / "prefill.json").write_text(json.dumps(prefill), encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: test-model\nprefill_messages_file: prefill.json\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "isolated-context-job",
+            "name": "test",
+            "prompt": "Check the monitor for changes",
+        }
+
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs.get("prefill_messages") is None
+
+    def test_run_job_can_explicitly_inherit_prefill_messages(self, tmp_path):
+        """Operators can opt cron into deliberate model-priming prefill."""
+        prefill = [{"role": "assistant", "content": "Few-shot model primer"}]
+        (tmp_path / "prefill.json").write_text(
+            json.dumps(prefill), encoding="utf-8"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: test-model\n"
+            "prefill_messages_file: prefill.json\n"
+            "cron:\n  inherit_prefill_messages: true\n",
+            encoding="utf-8",
+        )
+        job = {"id": "primed-job", "name": "test", "prompt": "Run the monitor"}
+
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["prefill_messages"] == prefill
+
     def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
         """A per-job enabled_toolsets naming memory keeps it."""
         job = {
