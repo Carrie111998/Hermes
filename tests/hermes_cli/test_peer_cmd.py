@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
@@ -94,6 +95,7 @@ class _FakePeer(BaseHTTPRequestHandler):
     chats: list = []
     runs: list = []
     run_idempotency_keys: list = []
+    chat_paths: list = []
     auth_seen: list = []
 
     def _json(self, payload, status=200):
@@ -142,16 +144,28 @@ class _FakePeer(BaseHTTPRequestHandler):
             # (verified live Aug 2026 — a flat fake hid a parser bug).
             return self._json({"object": "hermes.session", "session": {"id": "bc_1", "title": body.get("title")}}, 201)
 
-        if self.path.startswith("/api/sessions/") and self.path.endswith("/chat"):
+        if self.path.startswith("/api/sessions/") and self.path.endswith("/chat/stream"):
             type(self).chats.append(body.get("message"))
-            return self._json({
-                "object": "hermes.session.chat.completion",
-                "session_id": "bc_1",
-                "message": {
-                    "role": "assistant",
-                    "content": "reply from the other machine",
-                },
-            })
+            type(self).chat_paths.append(self.path)
+            payload = json.dumps(
+                {"session_id": "bc_1", "content": "reply from the other machine"}
+            )
+            keepalive = b": keepalive\n\n"
+            events = f"event: assistant.completed\ndata: {payload}\n\nevent: done\ndata: {{}}\n\n".encode()
+            wire = keepalive + events
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(wire)))
+            self.end_headers()
+            self.wfile.write(keepalive)
+            self.wfile.flush()
+            time.sleep(0.05)
+            self.wfile.write(events)
+            self.wfile.flush()
+            return
+
+        if self.path.startswith("/api/sessions/") and self.path.endswith("/chat"):
+            return self._json({"error": {"message": "buffered chat route must not be used"}}, 500)
 
         if self.path == "/v1/runs":
             type(self).runs.append(body)
@@ -178,6 +192,7 @@ def fake_peer_server():
     _FakePeer.chats = []
     _FakePeer.runs = []
     _FakePeer.run_idempotency_keys = []
+    _FakePeer.chat_paths = []
     _FakePeer.auth_seen = []
     server = HTTPServer(("127.0.0.1", 0), _FakePeer)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -208,6 +223,7 @@ def test_dm_creates_bot_chat_then_chats(monkeypatch, capsys, fake_peer_server):
     # One Bot Chat was created (none existed), then the chat turn ran on it.
     assert _FakePeer.sessions == ["bc_1"]
     assert _FakePeer.chats == ["Message from 🤖 dixie (@dixie): disk status?"]
+    assert _FakePeer.chat_paths == ["/api/sessions/bc_1/chat/stream"]
     # Every request carried the peer key.
     assert all(a == "Bearer secret-key-123456" for a in _FakePeer.auth_seen)
 

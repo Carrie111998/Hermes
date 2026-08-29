@@ -11,8 +11,8 @@ bot on THIS machine a transport to message bots on THAT machine:
     hermes peer status spark run_abc123
 
 ``dm`` resolves the remote agent's canonical "Bot Chat" session (by title,
-creating it when missing), runs ONE synchronous agent turn over the peer's
-existing ``POST /api/sessions/{id}/chat`` endpoint, and prints the reply on
+creating it when missing), runs ONE agent turn over the peer's existing
+``POST /api/sessions/{id}/chat/stream`` endpoint, and prints the reply on
 stdout — the exact cross-machine twin of the local
 ``hermes -p <bot> chat --in ~ -c "Bot Chat" ...`` bot-messaging command, so
 the Bot Mode protocol composes over it unchanged.
@@ -121,6 +121,52 @@ def _request(
         raise RuntimeError("Peer returned a non-object JSON response")
     return parsed
 
+
+def _request_chat_stream(url: str, key: str, message: str) -> dict:
+    """Run one peer chat turn and project its terminal SSE event."""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"message": message}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "User-Agent": "hermes-peer-dm",
+        },
+    )
+    completed = None
+    event = ""
+    data_lines: list[str] = []
+
+    with urllib.request.urlopen(req, timeout=DM_TIMEOUT_S) as resp:  # noqa: S310 — user-registered peer URL
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith("event:"):
+                event = line[len("event:") :].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].lstrip())
+            elif not line:
+                if event in {"assistant.completed", "error"}:
+                    payload_text = "\n".join(data_lines)
+                    try:
+                        payload = json.loads(payload_text)
+                    except ValueError as exc:
+                        raise RuntimeError(f"Peer returned invalid {event} event: {payload_text[:200]}") from exc
+                    if not isinstance(payload, dict):
+                        raise RuntimeError(f"Peer returned a non-object {event} event")
+                    if event == "error":
+                        raise RuntimeError(str(payload.get("message") or "Peer chat failed"))
+                    completed = payload
+                event = ""
+                data_lines = []
+
+    if completed is None:
+        raise RuntimeError("Peer chat stream ended without a completed assistant response")
+    return {
+        "session_id": completed.get("session_id"),
+        "message": {"role": "assistant", "content": completed.get("content") or ""},
+    }
 
 def _base_url(peer: dict, profile: str | None) -> str:
     url = str(peer.get("url") or "").rstrip("/")
@@ -409,12 +455,14 @@ def cmd_peer(args) -> int:
 
         try:
             session_id = _ensure_bot_chat(base, key)
-            result = _request(
-                f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat",
+            # The buffered /chat route cannot send its HTTP status until the
+            # whole agent turn finishes. The streaming twin prepares headers
+            # immediately and emits keepalives, so long peer turns remain
+            # reachable through clients and network paths with idle timeouts.
+            result = _request_chat_stream(
+                f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat/stream",
                 key,
-                method="POST",
-                body={"message": message},
-                timeout=DM_TIMEOUT_S,
+                message,
             )
         except urllib.error.HTTPError as exc:
             print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}", file=sys.stderr)
