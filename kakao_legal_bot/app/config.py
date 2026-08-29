@@ -90,6 +90,13 @@ class Settings:
     history_retention_days: int = field(
         default_factory=lambda: _env_int("HISTORY_RETENTION_DAYS", 90)
     )
+    # 대화 전체 보관소. messages(문맥용, 24턴·90일)와 별개로 모든 대화를
+    # 발신자 표시이름과 함께 영구 저장합니다 — 변호사의 상담 기록이니까요.
+    # 0 은 영구 보관, 기간을 주면 그보다 오래된 보관 기록만 정리합니다.
+    archive_enabled: bool = field(default_factory=lambda: _env_bool("ARCHIVE_ENABLED", True))
+    archive_retention_days: int = field(
+        default_factory=lambda: _env_int("ARCHIVE_RETENTION_DAYS", 0)
+    )
 
     # ── Iris (KakaoTalk bridge running on the rooted emulator) ───────────
     iris_base_url: str = field(default_factory=lambda: _env("IRIS_BASE_URL").rstrip("/"))
@@ -301,6 +308,11 @@ class Settings:
     @property
     def rag_dir(self) -> Path:
         return self.rag_dir_override or (self.data_dir / "rag")
+
+    @property
+    def archive_dir(self) -> Path:
+        """내보낸 상담 기록 .md 파일이 놓이는 곳."""
+        return self.data_dir / "archive"
 
     @property
     def wiki_graph_path(self) -> Path:

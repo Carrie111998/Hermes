@@ -20,6 +20,7 @@ import logging
 import time
 
 from . import intake as intake_states
+from .archive import room_label_base
 from .commands import handle_command
 from .db import Message, pseudonymise
 from .iris import IrisEvent
@@ -92,6 +93,8 @@ class Pipeline:
             event.sender_id or event.sender_name, settings.pseudonym_salt
         )
         if event.is_text and event.text.strip():
+            # messages(문맥)에는 STORE_RAW_SENDER 정책대로, archive(상담 기록)
+            # 에는 표시이름 그대로 — 변호사가 나중에 읽는 기록이라서요.
             await asyncio.to_thread(
                 db.add_message,
                 room_id,
@@ -100,6 +103,8 @@ class Pipeline:
                 event.sender_name if settings.store_raw_sender else "",
                 sender_key,
                 settings.history_turns,
+                settings.archive_enabled,
+                event.sender_name,
             )
 
         # ── 새 상담방 온보딩 ─────────────────────────────────────────────
@@ -226,9 +231,20 @@ class Pipeline:
             log.exception("could not open a consultation for room %s", event.room_id)
             return 0
 
+        # 첫 질문 순간이 방의 보관용 이름을 짓기에 가장 좋은 때입니다 —
+        # 상담자 이름을 알면 "이름-날짜", 모르면 첫 질문에서 뽑은
+        # "핵심키워드-날짜". 한 번 지으면 바꾸지 않습니다.
+        label = ""
+        with contextlib.suppress(Exception):
+            label = await asyncio.to_thread(
+                services.db.set_room_label,
+                event.room_id,
+                room_label_base(event.sender_name, question),
+            )
+
         text = ALERT_NEW.format(
             sender=event.sender_name or "(이름 없음)",
-            room=event.room_name or event.room_id,
+            room=label or event.room_name or event.room_id,
             consult_id=consult_id,
             when=time.strftime("%Y-%m-%d %H:%M"),
             question=question[: services.settings.lawyer_alert_preview_chars],
@@ -433,13 +449,18 @@ def _report_alert(db, event: IrisEvent, action) -> str:  # noqa: ANN001
     consult_id: object = "-"
     with contextlib.suppress(Exception):
         consult_id = int(db.get_or_create_consultation(event.room_id, event.sender_name)["id"])
+    label = ""
+    with contextlib.suppress(Exception):
+        room = db.get_room(event.room_id)
+        if room is not None and "label" in room.keys():
+            label = str(room["label"])
     report = action.report.strip()
     if len(report) > 3500:
         report = report[:3500] + "\n…(길어서 줄였습니다 — 전문은 업무 현황 페이지에)"
     head = (
         f"📋 상담보고서 완성 — 접수번호 {consult_id}\n"
         f"문서: {action.doc_kind or '미정'} · 사건유형: {action.case_type or '보고서 참조'}\n"
-        f"방: {event.room_name or event.room_id}"
+        f"방: {label or event.room_name or event.room_id}"
     )
     if action.missing:
         head += f"\n미확인 사항: {action.missing}"

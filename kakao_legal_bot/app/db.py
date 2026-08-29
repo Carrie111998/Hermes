@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_done"})
 
@@ -26,6 +26,7 @@ ROOM_FLAGS = frozenset({"lawyer_takeover", "muted", "intro_sent", "first_alerts_
 # deployed bot breaks on its next query.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rooms", "first_alerts_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("rooms", "label", "TEXT NOT NULL DEFAULT ''"),
     ("drafts", "instructions", "TEXT NOT NULL DEFAULT ''"),
     ("drafts", "transcript", "TEXT NOT NULL DEFAULT ''"),
     ("drafts", "attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -44,6 +45,9 @@ CREATE TABLE IF NOT EXISTS rooms (
     muted             INTEGER NOT NULL DEFAULT 0,
     intro_sent        INTEGER NOT NULL DEFAULT 0,
     first_alerts_done INTEGER NOT NULL DEFAULT 0,
+    -- 보관용 방 이름: "상담자이름-2026-08-29" 또는 "대여금-2026-08-29".
+    -- 첫 질문 때 한 번 짓고 바꾸지 않습니다 (겹치면 -2, -3 …).
+    label             TEXT NOT NULL DEFAULT '',
     created_at        REAL NOT NULL,
     updated_at        REAL NOT NULL
 );
@@ -59,6 +63,20 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(created_at);
+
+-- 대화 전체 보관소. messages 는 프롬프트 문맥용이라 방마다 최근 24턴만
+-- 남기고 90일이면 지워지지만, 여기는 상담 기록 그 자체라 지우지 않습니다
+-- (ARCHIVE_RETENTION_DAYS 를 명시했을 때만 정리).
+CREATE TABLE IF NOT EXISTS archive (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id     TEXT NOT NULL,
+    role        TEXT NOT NULL,                            -- user | bot | lawyer | system
+    sender      TEXT NOT NULL DEFAULT '',
+    text        TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_archive_room ON archive(room_id, id);
+CREATE INDEX IF NOT EXISTS idx_archive_time ON archive(created_at);
 
 CREATE TABLE IF NOT EXISTS consultations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -322,9 +340,22 @@ class Database:
         sender: str = "",
         sender_key: str = "",
         keep_last: int = 24,
+        archive: bool = False,
+        archive_sender: str = "",
     ) -> int:
         now = time.time()
         with self._lock:
+            if archive:
+                # 보관소 사본은 트림·90일 정리의 영향을 받지 않습니다.
+                # 발신자는 표시이름 그대로 — 변호사 본인의 상담 기록이라
+                # 나중에 "누가 한 말인지"를 알아볼 수 있어야 합니다.
+                self._conn.execute(
+                    """
+                    INSERT INTO archive(room_id, role, sender, text, created_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (room_id, role, archive_sender or sender, text, now),
+                )
             cur = self._conn.execute(
                 """
                 INSERT INTO messages(room_id, sender, sender_key, role, text, created_at)
@@ -370,6 +401,69 @@ class Database:
         cutoff = time.time() - older_than_days * 86400
         cur = self._exec("DELETE FROM messages WHERE created_at < ?", (cutoff,))
         return cur.rowcount or 0
+
+    # ── conversation archive ─────────────────────────────────────────────
+    def room_archive(self, room_id: str, limit: int = 0) -> list[Message]:
+        """전체 대화, 오래된 것부터. ``limit`` 0 은 전부."""
+        sql = "SELECT role, sender, text, created_at FROM archive WHERE room_id = ? ORDER BY id"
+        params: tuple[Any, ...] = (room_id,)
+        if limit > 0:
+            sql += " LIMIT ?"
+            params = (room_id, limit)
+        return [
+            Message(
+                role=row["role"], sender=row["sender"], text=row["text"], created_at=row["created_at"]
+            )
+            for row in self._query(sql, params)
+        ]
+
+    def archive_depth(self, room_id: str = "") -> int:
+        if room_id:
+            row = self._query_one(
+                "SELECT COUNT(*) AS n FROM archive WHERE room_id = ?", (room_id,)
+            )
+        else:
+            row = self._query_one("SELECT COUNT(*) AS n FROM archive")
+        return int(row["n"]) if row else 0
+
+    def purge_old_archive(self, older_than_days: int) -> int:
+        """기본(0)은 영구 보관 — 명시적으로 기간을 준 경우에만 지웁니다."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = time.time() - older_than_days * 86400
+        cur = self._exec("DELETE FROM archive WHERE created_at < ?", (cutoff,))
+        return cur.rowcount or 0
+
+    def set_room_label(self, room_id: str, base: str) -> str:
+        """방의 보관용 이름을 짓는다 — 이미 있으면 그대로 둔다.
+
+        "홍길동-2026-08-29" 가 이미 다른 방에 쓰였으면 "-2", "-3" 을 붙여
+        방마다 유일하게 만듭니다. 파일 이름으로도 쓰이는 값이라서요.
+        """
+        base = " ".join((base or "").split()).strip("-. ") or "상담"
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT label FROM rooms WHERE room_id = ?", (room_id,)
+            ).fetchone()
+            if row is not None and str(row["label"]):
+                return str(row["label"])
+            taken = {
+                str(existing["label"])
+                for existing in self._conn.execute(
+                    "SELECT label FROM rooms WHERE label != '' AND room_id != ?", (room_id,)
+                )
+            }
+            label = base
+            counter = 2
+            while label in taken:
+                label = f"{base}-{counter}"
+                counter += 1
+            self._conn.execute(
+                "UPDATE rooms SET label = ?, updated_at = ? WHERE room_id = ?",
+                (label, time.time(), room_id),
+            )
+            self._conn.commit()
+            return label
 
     # ── consultations ────────────────────────────────────────────────────
     def get_or_create_consultation(self, room_id: str, client_alias: str = "") -> sqlite3.Row:

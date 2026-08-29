@@ -203,8 +203,10 @@ async def dashboard(
         speaker = {"user": "상담자", "bot": settings.bot_name, "lawyer": "변호사"}.get(
             str(row["last_role"] or ""), ""
         )
+        keys = row.keys()
+        label = str(row["label"]) if "label" in keys and row["label"] else ""
         room_rows.append(
-            f'<li><strong>{_esc(row["room_name"] or row["room_id"])}</strong>'
+            f'<li><strong>{_esc(label or row["room_name"] or row["room_id"])}</strong>'
             f'{" · " + " · ".join(flags) if flags else ""}'
             f'<div class="meta">{_esc(speaker)}: {_esc(last)} · {_ago(row["updated_at"])}</div></li>'
         )

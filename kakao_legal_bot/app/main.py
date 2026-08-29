@@ -305,6 +305,10 @@ async def _janitor(app: FastAPI) -> None:
             purged = await asyncio.to_thread(
                 services.db.purge_old_messages, services.settings.history_retention_days
             )
+            # 보관소는 기본 영구(0) — 기간을 명시했을 때만 정리합니다.
+            await asyncio.to_thread(
+                services.db.purge_old_archive, services.settings.archive_retention_days
+            )
             requeued = await asyncio.to_thread(services.db.requeue_stale_outbox, 300.0)
             # A worker that died mid-document must not strand the request.
             drafts = await asyncio.to_thread(

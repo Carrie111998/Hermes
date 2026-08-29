@@ -46,6 +46,7 @@ class Sender:
                 self._settings.bot_name,
                 "",
                 self._settings.history_turns,
+                self._settings.archive_enabled,
             )
         return delivered
 
