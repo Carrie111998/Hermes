@@ -161,6 +161,10 @@ class TestDetectAudioEnvironmentTermuxFallback:
     def test_inconclusive_probes_with_binary_does_not_emit_app_warning(
         self, monkeypatch
     ):
+        import hermes_constants
+
+        # Exercise Termux on Android, not the container that may host pytest.
+        monkeypatch.setattr(hermes_constants, "_container_detected", False)
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
         monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
         monkeypatch.delenv("SSH_CLIENT", raising=False)

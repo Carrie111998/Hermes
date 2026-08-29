@@ -248,6 +248,11 @@ class TestHonchoDoctorConfigDetection:
 
 
 def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+    import hermes_constants
+
+    # Exercise the explicit Vercel backend independently of whether the
+    # pytest worker itself happens to run inside a container.
+    monkeypatch.setattr(hermes_constants, "_container_detected", False)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
     monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
     monkeypatch.setenv("TERMINAL_CONTAINER_DISK", "2048")
