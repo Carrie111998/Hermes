@@ -1783,6 +1783,22 @@ def _compression_lock_holder(agent: Any) -> str:
     )
 
 
+def _compression_attempt_cancel_check(
+    commit_fence: Optional[CompressionCommitFence], hard_cancel_event: Any
+) -> Optional[Callable[[], bool]]:
+    """Combine every explicit cancellation source for one provider attempt."""
+    if commit_fence is None and hard_cancel_event is None:
+        return None
+
+    def _cancelled() -> bool:
+        return bool(
+            (hard_cancel_event is not None and hard_cancel_event.is_set())
+            or (commit_fence is not None and commit_fence.is_cancelled)
+        )
+
+    return _cancelled
+
+
 def _supported_compression_kwargs(
     compress_fn: Any,
     *,
@@ -3496,10 +3512,9 @@ def compress_context(
                 pass
 
         compress_fn = agent.context_compressor.compress
-        _fence_cancel_check = (
-            (lambda: commit_fence.is_cancelled)
-            if commit_fence is not None
-            else None
+        _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+        _attempt_cancel_check = _compression_attempt_cancel_check(
+            commit_fence, _hard_cancel_event
         )
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,
@@ -3507,7 +3522,7 @@ def compress_context(
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
-            cancel_check=_fence_cancel_check,
+            cancel_check=_attempt_cancel_check,
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(
@@ -3571,7 +3586,6 @@ def compress_context(
         # Incoming-message interrupts and active-turn redirects must not tear an
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
         # Event atomically; never infer cause from the racy message fields.
-        _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -3584,8 +3598,7 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_check=_fence_cancel_check,
-                    cancel_event=_hard_cancel_event,
+                    cancel_check=_attempt_cancel_check,
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
