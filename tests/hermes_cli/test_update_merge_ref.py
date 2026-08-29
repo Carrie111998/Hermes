@@ -93,7 +93,7 @@ def _setup(root: Path):
     return project, branch, pre_pull_sha
 
 
-def test_conflict_aborts_and_restores_pre_pull_sha(tmp_path):
+def test_conflict_aborts_and_restores_pre_pull_sha(tmp_path, capsys):
     project, branch, pre_pull_sha = _setup(tmp_path)
 
     result = _merge_upstream_ref(GIT, str(project), branch, branch, pre_pull_sha)
@@ -107,6 +107,23 @@ def test_conflict_aborts_and_restores_pre_pull_sha(tmp_path):
     assert not (project / ".git" / "MERGE_HEAD").exists()
     # The project's own version survived; upstream's change was not applied.
     assert (project / "shared.txt").read_text() == "project change\n"
+    # HEAD was already at pre_pull_sha (origin did not advance this run), so
+    # the origin-rollback note must NOT be printed.
+    assert "rolled back too" not in capsys.readouterr().out
+
+
+def test_conflict_note_when_origin_update_is_also_rolled_back(tmp_path, capsys):
+    project, branch, _project_head = _setup(tmp_path)
+    # Simulate an origin/<branch> update that advanced HEAD earlier in the same
+    # run: the pre-update SHA is the ancestor, so restoring to it also rewinds
+    # the "project change" commit — the helper must flag that to the user.
+    ancestor = _git(["rev-parse", "HEAD~1"], project).stdout.strip()
+
+    result = _merge_upstream_ref(GIT, str(project), branch, branch, ancestor)
+
+    assert result is False
+    assert _git(["rev-parse", "HEAD"], project).stdout.strip() == ancestor
+    assert "rolled back too" in capsys.readouterr().out
 
 
 def test_clean_merge_of_annotated_tag_succeeds(tmp_path):

@@ -171,7 +171,16 @@ def _merge_upstream_ref(git_cmd, project_root, merge_ref, branch, pre_pull_sha) 
     pre-update state), and the function returns ``False`` so the caller can
     abort before any install/dependency step runs. Returns ``True`` only when
     the ref merged cleanly.
+
+    Because that restore rewinds to the state before the whole update, it also
+    rolls back any ``origin/<branch>`` merge that landed earlier in the same
+    run; the conflict path says so explicitly and points the user at a re-run.
     """
+    # HEAD as it stands on entry — i.e. AFTER any origin/<branch> pull earlier
+    # in this run. If a conflict later forces a restore to pre_pull_sha,
+    # comparing against this tells us whether that restore also rolled back an
+    # origin update the user might expect to have survived.
+    head_before = _capture_head_sha(git_cmd, project_root)
     print(f"→ Fetching '{merge_ref}' from upstream...")
     merge_ref_fetch = subprocess.run(
         git_cmd + ["fetch", "upstream", merge_ref],
@@ -248,6 +257,15 @@ def _merge_upstream_ref(git_cmd, project_root, merge_ref, branch, pre_pull_sha) 
             )
             if restore_result.returncode == 0:
                 print(f"  ✓ Restored pre-update HEAD ({pre_pull_sha[:10]}).")
+                if head_before and head_before != pre_pull_sha:
+                    # The restore rewound past an origin/<branch> update that
+                    # landed earlier in this same run — tell the user so they
+                    # don't assume it survived the merge-ref abort.
+                    print(
+                        f"  Note: an origin/{branch} update pulled earlier in "
+                        "this run was rolled back too — re-run 'hermes update' "
+                        "to re-apply it."
+                    )
             else:
                 print("  ✗ Failed to restore pre-update HEAD. Recover manually with:")
                 print(f"    cd {project_root} && git reset --hard {pre_pull_sha}")
