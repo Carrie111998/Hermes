@@ -1,6 +1,7 @@
 """Tests for terminal/file tool availability in local dev environments."""
 
 import importlib
+import logging
 
 import pytest
 
@@ -94,6 +95,66 @@ class TestCheckFnTransientFailureSuppression:
         # Within grace window of the success → flake suppressed, stays True.
         assert reg._check_fn_cached(flaky) is True
         assert calls["n"] == 2  # the probe actually ran (not just cached)
+
+    def test_initial_false_is_info_not_warning(self, caplog):
+        """An optional tool absent from startup is expected, not an outage."""
+        import tools.registry as reg
+
+        def unavailable():
+            return False
+
+        with caplog.at_level(logging.INFO, logger=reg.__name__):
+            assert reg._check_fn_cached(unavailable) is False
+
+        matching = [
+            record for record in caplog.records
+            if "dependent tools will be unavailable this turn" in record.getMessage()
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.INFO
+
+    def test_initial_exception_remains_warning(self, caplog):
+        """A broken availability probe is an anomaly and stays visible."""
+        import tools.registry as reg
+
+        def broken():
+            raise RuntimeError("probe broke")
+
+        with caplog.at_level(logging.INFO, logger=reg.__name__):
+            assert reg._check_fn_cached(broken) is False
+
+        matching = [
+            record for record in caplog.records
+            if "dependent tools will be unavailable this turn" in record.getMessage()
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.WARNING
+
+    def test_failure_after_prior_success_remains_warning(self, monkeypatch, caplog):
+        """A real outage after the grace window must remain actionable."""
+        import tools.registry as reg
+
+        state = {"ok": True}
+
+        def probe():
+            return state["ok"]
+
+        t = {"now": 1000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
+        assert reg._check_fn_cached(probe) is True
+
+        state["ok"] = False
+        t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=reg.__name__):
+            assert reg._check_fn_cached(probe) is False
+
+        matching = [
+            record for record in caplog.records
+            if "dependent tools will be unavailable this turn" in record.getMessage()
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.WARNING
 
     def test_persistent_failure_after_grace_is_honored(self, monkeypatch):
         import tools.registry as reg
