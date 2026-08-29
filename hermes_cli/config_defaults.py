@@ -611,6 +611,23 @@ DEFAULT_CONFIG = {
         # retry. Still locked afterward → stays blocked, no loop, no auto-kill.
         # OFF by default. No effect on macOS/Linux (copy-while-running works).
         "real_profile_autoclose": False,
+        # Sensitive-domain exclusions for real-profile browsing (inspired by
+        # Claude Cowork's cookie import, which leaves banking / email / SSO
+        # sites unchecked by default). After each snapshot auth re-sync,
+        # cookies and saved logins whose domain matches an exclusion are
+        # DELETED from the hermes-owned copy before the browser launches on
+        # it — the user's real profile is never modified. If exclusions are
+        # configured and cannot be applied, the launch fails closed.
+        #   real_profile_exclude_sensitive: opt in to the curated built-in
+        #       list (banking/payments, webmail, SSO/identity providers).
+        #       OFF by default so consented setups relying on e.g. a Gmail
+        #       session keep working.
+        #   real_profile_cookie_excludes: your own domain list, always
+        #       applied when non-empty. Suffix-matched per label:
+        #       "example.com" also excludes "www.example.com" but never
+        #       "notexample.com".
+        "real_profile_exclude_sensitive": False,
+        "real_profile_cookie_excludes": [],
         "allow_unsafe_evaluate": False,  # Legacy override: when true, browser_console(expression=...) bypasses the restrict_evaluate denylist entirely
         "restrict_evaluate": False,  # Opt-in denylist blocking sensitive JS primitives (cookies/storage/clipboard/network/form values) in browser_console(expression=...)
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.

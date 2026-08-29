@@ -627,6 +627,177 @@ def _mirror_profile_auth(src: str, dst: str, source_profile: str) -> int:
     return failed_dbs
 
 
+# ---------------------------------------------------------------------------
+# Sensitive-domain exclusions for the real-profile snapshot
+#
+# Inspired by Claude Cowork's built-in-browser cookie import (Aug 2026):
+# "Banking, email, and single sign-on sites stay unchecked by default" when
+# logins are brought over from the user's own browser. Hermes' equivalent is
+# deterministic, not UI-driven: after the snapshot copies the auth DBs, rows
+# whose domain matches an exclusion pattern are DELETED from the copy before
+# the browser ever launches on it. The user's real profile is never touched —
+# only the hermes-owned snapshot is scrubbed.
+#
+# Two config knobs (both under ``browser:`` in config.yaml):
+#   real_profile_exclude_sensitive: opt-in curated list below (banking /
+#       payments, email, SSO/identity providers). Off by default so existing
+#       consented setups that rely on e.g. a Gmail session keep working.
+#   real_profile_cookie_excludes: user-supplied domain list, always applied
+#       when non-empty (e.g. ["mybank.example", "google.com"]).
+#
+# Matching is suffix-per-label: pattern ``chase.com`` matches ``chase.com``
+# and ``www.chase.com`` (and Chromium's leading-dot ``.chase.com`` host_key
+# form) but never ``notchase.com``. This is best-effort curation, not a
+# security boundary by itself — the enforcement property is that the scrub
+# runs at the single choke point every real-profile launch goes through
+# (snapshot_real_profile) and the launch FAILS CLOSED if the scrub cannot be
+# applied while exclusions are configured.
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_COOKIE_DOMAINS: tuple = (
+    # Banking / brokerage / payments
+    "chase.com", "bankofamerica.com", "wellsfargo.com", "citi.com",
+    "citibank.com", "capitalone.com", "usbank.com", "pnc.com", "truist.com",
+    "schwab.com", "fidelity.com", "vanguard.com", "americanexpress.com",
+    "discover.com", "paypal.com", "venmo.com", "wise.com", "revolut.com",
+    "coinbase.com", "kraken.com", "binance.com", "robinhood.com",
+    "barclays.co.uk", "hsbc.com", "lloydsbank.com", "natwest.com",
+    "santander.com", "ing.com", "bnpparibas.com", "deutschebank.de",
+    "ubs.com", "monzo.com", "starlingbank.com", "n26.com",
+    # Email providers (webmail hosts; add e.g. "google.com" yourself to cut
+    # the whole Google session — domain-wide cookies also carry other apps)
+    "mail.google.com", "outlook.live.com", "outlook.office.com",
+    "outlook.office365.com", "mail.yahoo.com", "proton.me", "protonmail.com",
+    "fastmail.com", "zoho.com", "gmx.net", "gmx.com", "web.de", "mail.ru",
+    "aol.com", "icloud.com",
+    # SSO / identity providers
+    "accounts.google.com", "login.microsoftonline.com", "login.live.com",
+    "okta.com", "onelogin.com", "auth0.com", "duosecurity.com",
+    "pingidentity.com", "jumpcloud.com", "id.me", "login.gov",
+)
+
+# Auth DBs inside the snapshot's Default/ that carry domain-scoped rows we can
+# scrub. ("Web Data" holds autofill, which is not domain-keyed the same way —
+# out of scope here.)
+_SCRUB_TARGETS: tuple = (
+    ("Cookies", "cookies"),
+    (os.path.join("Network", "Cookies"), "cookies"),
+    ("Login Data", "logins"),
+    ("Login Data For Account", "logins"),
+)
+
+
+def _cookie_exclude_patterns() -> tuple:
+    """Resolve the active exclusion patterns from config (normalized, deduped)."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(browser_cfg, dict):
+            browser_cfg = {}
+        pats: list = []
+        if browser_cfg.get("real_profile_exclude_sensitive", False):
+            pats.extend(_SENSITIVE_COOKIE_DOMAINS)
+        extra = browser_cfg.get("real_profile_cookie_excludes") or ()
+        if isinstance(extra, (list, tuple)):
+            for p in extra:
+                p = str(p).strip().lower().lstrip(".")
+                if p:
+                    pats.append(p)
+        seen: set = set()
+        out: list = []
+        for p in pats:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return tuple(out)
+    except Exception as e:  # config unreadable → treat as no exclusions
+        logger.debug("real-profile: exclude-pattern config read failed: %s", e)
+        return ()
+
+
+def _host_matches_exclude(host: str | None, patterns) -> bool:
+    """True when ``host`` equals a pattern or is a subdomain of one.
+
+    Handles Chromium's leading-dot ``host_key`` form (``.chase.com``).
+    Suffix matches are label-anchored so ``notchase.com`` never matches
+    ``chase.com``.
+    """
+    h = (host or "").strip().lower().lstrip(".")
+    if not h:
+        return False
+    for p in patterns:
+        if h == p or h.endswith("." + p):
+            return True
+    return False
+
+
+def _scrub_auth_db(db_path: str, kind: str, patterns) -> int:
+    """Delete excluded-domain rows from one snapshot auth DB. Returns rows removed.
+
+    ``kind`` is ``"cookies"`` (match ``cookies.host_key``) or ``"logins"``
+    (match the hostname of ``logins.origin_url`` / ``logins.signon_realm``).
+    Raises on any failure — the caller decides fail-closed policy.
+    """
+    if not os.path.isfile(db_path):
+        return 0
+    import sqlite3
+    from urllib.parse import urlsplit
+
+    con = sqlite3.connect(db_path, timeout=5)
+    removed = 0
+    try:
+        cur = con.cursor()
+        if kind == "cookies":
+            hosts = [r[0] for r in cur.execute("SELECT DISTINCT host_key FROM cookies")]
+            for h in hosts:
+                if _host_matches_exclude(h, patterns):
+                    cur.execute("DELETE FROM cookies WHERE host_key = ?", (h,))
+                    removed += max(cur.rowcount, 0)
+        else:
+            rows = cur.execute("SELECT id, origin_url, signon_realm FROM logins").fetchall()
+            for rid, origin, realm in rows:
+                hit = False
+                for u in (origin, realm):
+                    if not u:
+                        continue
+                    try:
+                        host = urlsplit(str(u)).hostname
+                    except ValueError:
+                        host = None
+                    if host and _host_matches_exclude(host, patterns):
+                        hit = True
+                        break
+                if hit:
+                    cur.execute("DELETE FROM logins WHERE id = ?", (rid,))
+                    removed += 1
+        con.commit()
+    finally:
+        con.close()
+    return removed
+
+
+def scrub_snapshot_auth(dst: str, patterns) -> tuple:
+    """Remove excluded-domain auth rows from the snapshot at ``dst``.
+
+    Returns ``(rows_removed, None)`` on success, ``(rows_removed, error)``
+    when any DB could not be scrubbed — callers must fail closed on error
+    (never launch a session carrying credentials the user excluded).
+    """
+    if not patterns:
+        return 0, None
+    total = 0
+    dst_default = os.path.join(dst, "Default")
+    for rel, kind in _SCRUB_TARGETS:
+        path = os.path.join(dst_default, rel)
+        try:
+            total += _scrub_auth_db(path, kind, patterns)
+        except Exception as e:
+            return total, f"could not scrub excluded domains from {rel!r}: {e}"
+    return total, None
+
+
 _SNAPSHOT_DONE_MARKER = ".hermes-snapshot-complete"
 
 # Prefix stamped on the "profile is locked" error so the calling layer can
@@ -899,6 +1070,26 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                 f"({failed_dbs} database(s) locked). Close {browser} and retry, "
                 "or turn browser.use_real_profile off."
             )
+
+        # Sensitive-domain exclusions (Cowork-inspired): scrub excluded
+        # domains' cookies/logins OUT of the copy before any launch. Runs
+        # after every auth re-sync so refreshed logins can't reintroduce an
+        # excluded domain. Fail closed: if the user configured exclusions and
+        # we cannot apply them, no session launches on this snapshot.
+        patterns = _cookie_exclude_patterns()
+        if patterns:
+            removed, scrub_err = scrub_snapshot_auth(dst, patterns)
+            if scrub_err:
+                return None, (
+                    f"real-profile snapshot for '{browser}' could not honor the "
+                    f"configured domain exclusions ({scrub_err}). Refusing to "
+                    "launch with excluded credentials present."
+                )
+            if removed:
+                logger.info(
+                    "real-profile: scrubbed %d excluded-domain auth row(s) "
+                    "from the '%s' snapshot", removed, browser,
+                )
 
         # Never carry live-instance leftovers into the copy.
         for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):

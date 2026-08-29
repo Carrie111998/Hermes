@@ -209,6 +209,37 @@ to fully quit the browser — it won't loop or kill again on its own.
 - **Supported browsers:** Chrome, Edge, Brave, Chromium (whichever is your OS
   default). A non-Chromium default (e.g. Firefox) fails closed with a clear
   message rather than guessing.
+
+### Keep sensitive sites out of the snapshot
+
+You can exclude specific domains — banking, email, single sign-on — from
+real-profile browsing while keeping everything else signed in (the same
+default posture Claude Cowork applies to its cookie import). Excluded domains'
+cookies and saved logins are **deleted from the Hermes-owned snapshot copy**
+after every auth re-sync, before the browser launches on it. Your real browser
+profile is never modified.
+
+```yaml
+# ~/.hermes/config.yaml
+browser:
+  use_real_profile: true
+  # Opt in to the curated built-in list: major banks/payment providers,
+  # webmail hosts, and SSO/identity providers (accounts.google.com,
+  # login.microsoftonline.com, okta.com, ...). Off by default.
+  real_profile_exclude_sensitive: true
+  # Your own exclusions — always applied when non-empty. "example.com"
+  # also matches "www.example.com" (never "notexample.com").
+  real_profile_cookie_excludes:
+    - mybank.example
+    - internal.corp.example
+```
+
+If exclusions are configured and the scrub can't be applied (e.g. a corrupt
+copied database), the launch **fails closed** — no session starts carrying
+credentials you excluded. Note the curated email entries target webmail hosts
+(`mail.google.com`); excluding a provider's whole session (all Google apps)
+means listing the root domain (`google.com`) yourself.
+
 - **Works on any backend.** On a local backend it's automatic once the toggle
   is on. Under a **cloud** browser backend, the agent can still open a
   real-profile local session on demand via the `browser_exec` tool's `local`
