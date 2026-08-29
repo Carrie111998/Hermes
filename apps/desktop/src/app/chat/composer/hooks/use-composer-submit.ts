@@ -3,6 +3,7 @@ import { type RefObject, useLayoutEffect, useRef } from 'react'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
+import { isSubmitAccepted } from '@/lib/workspace-send-gate'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -26,7 +27,7 @@ interface UseComposerSubmitArgs {
   clearDraft: () => void
   disabled: boolean
   draftRef: RefObject<string>
-  drainNextQueued: () => Promise<boolean>
+  drainNextQueued: () => Promise<boolean | 'deferred'>
   editorRef: RefObject<HTMLDivElement | null>
   exitQueuedEdit: (action: 'cancel' | 'save') => boolean
   focusInput: () => void
@@ -101,7 +102,7 @@ export function useComposerSubmit({
         ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
         : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
     )
-      .then(accepted => void (accepted === false ? restore() : clearSessionDraft(submittedScope)))
+      .then(accepted => void (isSubmitAccepted(accepted) ? clearSessionDraft(submittedScope) : restore()))
       .catch(restore)
   }
 

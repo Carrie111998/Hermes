@@ -13,6 +13,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
 import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
+import { isSubmitAccepted } from '@/lib/workspace-send-gate'
 import { clearClarifyRequest } from '@/store/clarify'
 import {
   $composerAttachments,
@@ -625,7 +626,7 @@ export function usePromptActions({
     resumeStoredSession,
     selectedStoredSessionIdRef,
     startFreshSessionDraft,
-    submitPromptText,
+    submitPromptText: async (...args) => isSubmitAccepted(await submitPromptText(...args)),
     updateSessionState
   })
 

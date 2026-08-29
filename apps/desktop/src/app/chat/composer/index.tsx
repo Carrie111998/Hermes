@@ -16,17 +16,19 @@ import { triggerHaptic } from '@/lib/haptics'
 import { useStoresSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
-import { isWorkspaceSendBlocked } from '@/lib/workspace-send-gate'
+import { collectWorkspaceSendInput, evaluateWorkspaceSend } from '@/lib/workspace-send-gate'
 import { sessionCompacting } from '@/store/compaction'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { $pendingConnectionId } from '@/store/connections'
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $hudMode } from '@/store/hud'
+import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { sessionBlockingPrompt } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
-import { $gatewayState } from '@/store/session'
+import { $connection, $gatewayState } from '@/store/session'
 import { $botChatSessionIds, $sessionStates, $sessionTiles, isBotChatSession } from '@/store/session-states'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
@@ -225,15 +227,30 @@ export function ChatBar({
   const { t } = useI18n()
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
-  const pendingConnectionId = useStore($pendingConnectionId)
-  const gatewaySwitching = useStore($gatewaySwitching)
 
-  const sessionsSwitchBlocked = isWorkspaceSendBlocked({
-    gatewaySwitching,
-    pendingConnectionId
-  })
+  const sendVerdict = useStoresSelector(
+    [
+      $activeGatewayProfile,
+      $botChatSessionIds,
+      $connection,
+      $connectionsRegistry,
+      $gatewayState,
+      $gatewaySwitching,
+      $pendingConnectionId,
+      $profiles,
+      $sessionStates
+    ],
+    () =>
+      evaluateWorkspaceSend(
+        collectWorkspaceSendInput({
+          sessionId,
+          storedSessionId: queueSessionKey
+        })
+      )
+  )
 
-  const sendDisabled = disabled || sessionsSwitchBlocked
+  const sessionsSwitchBlocked = sendVerdict.state === 'switching'
+  const sendDisabled = disabled || !sendVerdict.allowed
   const inputDisabled = disabled && !reconnecting
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
@@ -675,7 +692,7 @@ export function ChatBar({
     if ((event.metaKey || event.ctrlKey) && !event.altKey && event.shiftKey && event.key.toLowerCase() === 'k') {
       event.preventDefault()
 
-      if (!busy) {
+      if (!busy && !sendDisabled) {
         void drainNextQueued()
       }
 
@@ -867,7 +884,7 @@ export function ChatBar({
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
       event.preventDefault()
 
-      if (busy && !disabled) {
+      if (busy && !sendDisabled) {
         // As with plain Enter, source the just-typed content from the DOM so a
         // fast keypress cannot queue a stale draft.
         const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
@@ -895,7 +912,7 @@ export function ChatBar({
       const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
       const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
 
-      if (disabled) {
+      if (sendDisabled) {
         return
       }
 
@@ -989,7 +1006,7 @@ export function ChatBar({
   } = useComposerVoice({
     busy,
     clearDraft,
-    disabled,
+    disabled: sendDisabled,
     focusInput,
     insertText,
     maxRecordingSeconds,

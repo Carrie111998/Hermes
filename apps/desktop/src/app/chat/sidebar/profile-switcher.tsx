@@ -249,8 +249,10 @@ export function ProfileRail() {
         )
       })
       .catch((error: unknown) => {
-        notifyError(error, p.switchConnectionFailed(agent.connectionLabel))
-        setFleetSwitchStatus(p.fleet.switchFailed(agent.profile, agent.connectionLabel, previous))
+        const failure = p.fleet.switchFailed(agent.profile, agent.connectionLabel, previous)
+
+        notifyError(error, failure)
+        setFleetSwitchStatus(failure)
       })
       .finally(() => {
         if (pendingRouteRef.current === key) {
@@ -426,6 +428,7 @@ export function ProfileRail() {
                     onRecolor={color => setProfileColor(profile.name, color)}
                     onRename={() => setPendingRename(profile)}
                     onSelect={() => selectProfile(profile.name)}
+                    prewarm={!fleet}
                     remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
                   />
                 )
@@ -879,6 +882,7 @@ function ProfileDropdown({
               key={profile.name}
               label={profileLabel(profile)}
               name={profile.name}
+              prewarm={restGroups.length === 0}
             />
           ))}
         </DropdownMenuRadioGroup>
@@ -928,14 +932,24 @@ function ProfileDropdown({
 
 // One dropdown row per profile — its own component so each row can own a
 // hover-intent prewarm timer (see useProfilePrewarm).
-function ProfileDropdownItem({ color, label, name }: { color: null | string; label: string; name: string }) {
+function ProfileDropdownItem({
+  color,
+  label,
+  name,
+  prewarm = true
+}: {
+  color: null | string
+  label: string
+  name: string
+  prewarm?: boolean
+}) {
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(name)
 
   return (
     <DropdownMenuRadioItem
       className="min-w-0"
-      onPointerEnter={startPrewarm}
-      onPointerLeave={cancelPrewarm}
+      onPointerEnter={prewarm ? startPrewarm : undefined}
+      onPointerLeave={prewarm ? cancelPrewarm : undefined}
       value={name}
     >
       <span className="flex min-w-0 items-center gap-1.5">
@@ -1290,6 +1304,7 @@ interface ProfileSquareProps {
   // is superseded by the fleet rail there.
   onConnectRemote?: () => void
   onDelete: () => void
+  prewarm?: boolean
   // hostname[:port] of this profile's remote override, or null when the
   // profile runs locally. Drives the "remote" badge on the square.
   remoteHost: null | string
@@ -1316,6 +1331,7 @@ function ProfileSquare({
   onRecolor,
   onRename,
   onSelect,
+  prewarm = true,
   remoteHost
 }: ProfileSquareProps) {
   const { t } = useI18n()
@@ -1416,10 +1432,13 @@ function ProfileSquare({
                         setPickerOpen(true)
                       }, LONG_PRESS_MS)
                     }}
-                    onPointerEnter={startPrewarm}
+                    onPointerEnter={prewarm ? startPrewarm : undefined}
                     onPointerLeave={() => {
                       clearPress()
-                      cancelPrewarm()
+
+                      if (prewarm) {
+                        cancelPrewarm()
+                      }
                     }}
                     onPointerUp={clearPress}
                   >

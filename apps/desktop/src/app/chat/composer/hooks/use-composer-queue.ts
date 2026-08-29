@@ -205,7 +205,9 @@ export function useComposerQueue({
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
-    async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
+    async (
+      pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined
+    ): Promise<boolean | 'deferred'> => {
       if (drainingQueueRef.current || !activeQueueSessionKey) {
         return false
       }
@@ -231,7 +233,11 @@ export function useComposerQueue({
           })
         )
 
-        if (isSubmitDeferred(accepted) || !isSubmitAccepted(accepted)) {
+        if (isSubmitDeferred(accepted)) {
+          return 'deferred'
+        }
+
+        if (!isSubmitAccepted(accepted)) {
           return false
         }
 
@@ -372,7 +378,7 @@ export function useComposerQueue({
 
     void runDrain(() => entry)
       .then(sent => {
-        if (!sent) {
+        if (sent === false) {
           onFail()
         }
       })

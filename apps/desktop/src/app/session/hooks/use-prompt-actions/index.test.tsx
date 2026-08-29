@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import type { WorkspaceSubmitOutcome } from '@/lib/workspace-send-gate'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { requestGatewayForAgent } from '@/store/gateway'
@@ -102,8 +103,8 @@ interface HarnessHandle {
   redirectPrompt: (text: string) => Promise<boolean>
   /** @deprecated Use `redirectPrompt`. */
   steerPrompt: (text: string) => Promise<boolean>
-  submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<boolean>
-  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean>
+  submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<WorkspaceSubmitOutcome>
+  submitText: (text: string, options?: SubmitTextOptions) => Promise<WorkspaceSubmitOutcome>
 }
 
 function Harness({
@@ -231,7 +232,7 @@ function Harness({
         act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
       submitTextRaw: actions.submitText,
       submitText: (...args: Parameters<typeof actions.submitText>) =>
-        act(async () => actions.submitText(...args)) as Promise<boolean>
+        act(async () => actions.submitText(...args)) as Promise<WorkspaceSubmitOutcome>
     })
   }, [
     actions.cancelRun,
@@ -902,7 +903,7 @@ describe('usePromptActions /compress', () => {
     // helper cannot be used here: this test intentionally keeps its promise
     // pending while the user switches sessions, which would leave React's
     // async act scope open and overlap the wait below.
-    let submitted: Promise<boolean>
+    let submitted: Promise<WorkspaceSubmitOutcome>
     act(() => {
       submitted = handle!.submitTextRaw('/compress')
     })
@@ -961,7 +962,7 @@ describe('usePromptActions /compress', () => {
 
     // Keep the RPC pending while the selected stored session changes without
     // leaving an async React act scope open (see the foreground-race test).
-    let submitted: Promise<boolean>
+    let submitted: Promise<WorkspaceSubmitOutcome>
     act(() => {
       submitted = handle!.submitTextRaw('/compress')
     })
@@ -2946,7 +2947,7 @@ describe('usePromptActions file attachment sync', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<WorkspaceSubmitOutcome>
     act(() => {
       submitted = handle!.submitTextRaw('describe this')
     })
@@ -2996,7 +2997,7 @@ describe('usePromptActions file attachment sync', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<WorkspaceSubmitOutcome>
     act(() => {
       submitted = handle!.submitTextRaw('read this')
     })
@@ -5635,7 +5636,7 @@ describe('usePromptActions Sessions-switch send gate', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    expect(await handle!.submitText('hello from the composer')).toBe(false)
+    expect(await handle!.submitText('hello from the composer')).toEqual({ ok: false, reason: 'switching' })
     expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
   })
 
@@ -5649,13 +5650,11 @@ describe('usePromptActions Sessions-switch send gate', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    expect(await handle!.submitText('hello from the composer')).toBe(false)
+    expect(await handle!.submitText('hello from the composer')).toEqual({ ok: false, reason: 'switching' })
     expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
   })
 
   it('aborts before prompt.submit when a Sessions switch starts after submit began', async () => {
-    const { beginGatewaySwitch } = await import('@/store/gateway-switch')
-
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'prompt.submit') {
         throw new Error('prompt.submit must not dispatch after a Sessions switch')
@@ -5672,7 +5671,8 @@ describe('usePromptActions Sessions-switch send gate', () => {
         activeSessionId={null}
         activeSessionIdRef={activeSessionIdRef}
         createBackendSessionForSend={async () => {
-          beginGatewaySwitch()
+          const { $gatewaySwitching } = await import('@/store/gateway-switch')
+          $gatewaySwitching.set(true)
           activeSessionIdRef.current = RUNTIME_SESSION_ID
           selectedStoredSessionIdRef.current = RUNTIME_SESSION_ID
 
@@ -5686,9 +5686,44 @@ describe('usePromptActions Sessions-switch send gate', () => {
       />
     )
 
-    expect(await handle!.submitText('hello after a click')).toBe(false)
+    expect(await handle!.submitText('hello after a click')).toEqual({ ok: false, reason: 'switching' })
     expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
     expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('session.resume')
+  })
+
+  it('aborts the prompt.submit retry when a Sessions switch starts during resume recovery', async () => {
+    const { $gatewaySwitching } = await import('@/store/gateway-switch')
+    let submitAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        submitAttempts += 1
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        $gatewaySwitching.set(true)
+
+        return { session_id: 'rt-recovered-switch' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={RUNTIME_SESSION_ID}
+      />
+    )
+
+    expect(await handle!.submitText('hello after sleep')).toEqual({ ok: false, reason: 'switching' })
+    expect(submitAttempts).toBe(1)
+    expect(requestGateway.mock.calls.map(([method]) => method)).toContain('session.resume')
+    expect(requestGateway.mock.calls.filter(([method]) => method === 'prompt.submit')).toHaveLength(1)
   })
 
   it('leaves a queued drain queued and does not replay prompt.submit from the blocked attempt', async () => {
@@ -5706,7 +5741,7 @@ describe('usePromptActions Sessions-switch send gate', () => {
         sessionId: RUNTIME_SESSION_ID,
         storedSessionId: RUNTIME_SESSION_ID
       })
-    ).toBe(false)
+    ).toEqual({ ok: false, reason: 'switching' })
     expect(requestGateway.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
   })
 })

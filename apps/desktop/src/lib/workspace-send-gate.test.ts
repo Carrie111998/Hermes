@@ -1,6 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+
+import { $connectionsRegistry } from '@/store/connection-registry-state'
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching, endGatewaySwitch } from '@/store/gateway-switch'
+import { $connection, $gatewayState } from '@/store/session'
+import { clearAllSessionStates } from '@/store/session-states'
 
 import {
+  collectWorkspaceSendInput,
   evaluateWorkspaceSend,
   isSubmitAccepted,
   isSubmitDeferred,
@@ -36,7 +43,21 @@ describe('workspace send surface states', () => {
       allowed: true,
       state: 'idle_fleet'
     })
-    expect(isWorkspaceSendBlocked(idle)).toBe(false)
+  })
+
+  it('fails closed for a new chat when the ambient tuple is invalid', () => {
+    expect(
+      evaluateWorkspaceSend({
+        ...idle,
+        ambientTupleValid: false,
+        isNewChat: true
+      })
+    ).toEqual({ allowed: false, state: 'route_invalid' })
+  })
+
+  it('fails closed unless an allow-state is explicit', () => {
+    expect(evaluateWorkspaceSend(idle)).toEqual({ allowed: false, state: 'route_invalid' })
+    expect(isWorkspaceSendBlocked(idle)).toBe(true)
   })
 
   it('blocks while phase-1 dial is pending', () => {
@@ -92,7 +113,6 @@ describe('workspace send surface states', () => {
         socketOwner: { connectionId: 'local', profile: 'default' }
       })
     ).toEqual({ allowed: true, state: 'bot_talk_across' })
-    expect(isWorkspaceSendBlocked(idle)).toBe(false)
   })
 
   it('still blocks Bot Mode talk-across while a real global Sessions switch is in flight', () => {
@@ -173,6 +193,53 @@ describe('workspace send surface states', () => {
     expect(isSubmitAccepted(deferred)).toBe(false)
     expect(isSubmitAccepted(false)).toBe(false)
     expect(isSubmitAccepted(true)).toBe(true)
+    expect(isSubmitAccepted({ ok: true })).toBe(true)
     expect(isSubmitDeferred(false)).toBe(false)
+  })
+})
+
+describe('collectWorkspaceSendInput', () => {
+  afterEach(() => {
+    $pendingConnectionId.set(null)
+    endGatewaySwitch()
+    $gatewaySwitching.set(false)
+    $connection.set(null)
+    $gatewayState.set('idle')
+    $connectionsRegistry.set(null)
+    clearAllSessionStates()
+  })
+
+  it('fails closed for a new chat when registry topology leaves the ambient tuple invalid', () => {
+    $connectionsRegistry.set({ connections: [] } as never)
+    $connection.set(null)
+
+    const input = collectWorkspaceSendInput({})
+
+    expect(input.isNewChat).toBe(true)
+    expect(input.ambientTupleValid).toBe(false)
+    expect(evaluateWorkspaceSend(input)).toEqual({ allowed: false, state: 'route_invalid' })
+  })
+
+  it('fails closed for a stored session with missing owner once registry topology exists', () => {
+    $connectionsRegistry.set({ connections: [] } as never)
+    $connection.set({ connectionId: 'local', profile: 'default' } as never)
+
+    const input = collectWorkspaceSendInput({ sessionId: 'rt-unknown', storedSessionId: 'stored-unknown' })
+
+    expect(input.isNewChat).toBe(false)
+    expect(input.intendedOwner).toBeNull()
+    expect(evaluateWorkspaceSend(input)).toEqual({ allowed: false, state: 'route_invalid' })
+  })
+
+  it('fails closed when runtime readiness is unresolved', () => {
+    $gatewayState.set('connecting')
+
+    const input = collectWorkspaceSendInput({})
+
+    expect(input.readinessResolved).toBe(false)
+    expect(evaluateWorkspaceSend({ ...input, isNewChat: true, ambientTupleValid: true })).toEqual({
+      allowed: false,
+      state: 'auth_required'
+    })
   })
 })

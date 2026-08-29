@@ -1,4 +1,14 @@
 /** Existing Sessions/Bot send-surface states. Fail closed unless a state allows send. */
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
+
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching, currentGatewaySwitchGeneration } from '@/store/gateway-switch'
+import { $activeGatewayProfile } from '@/store/profile'
+import { $connection, $gatewayState } from '@/store/session'
+import { ambientGatewayOwnsEverySession } from '@/store/session-owner-resolution'
+import { isSessionOwnerRoute, type SessionOwnerScope } from '@/store/session-request-router'
+import { isBotChatSession, knownOwnerForSession } from '@/store/session-states'
+
 export const WORKSPACE_SEND_SURFACE_STATES = [
   'already_active',
   'auth_required',
@@ -43,8 +53,79 @@ export type WorkspaceSendVerdict = {
 export type WorkspaceSubmitResult =
   { ok: true; reason?: WorkspaceSendSurfaceState } | { ok: false; reason: WorkspaceSendSurfaceState }
 
+export type WorkspaceSubmitOutcome = WorkspaceSubmitResult | boolean
+
 function tuplesEqual(left?: null | WorkspaceSendTuple, right?: null | WorkspaceSendTuple): boolean {
   return Boolean(left && right && left.connectionId === right.connectionId && left.profile === right.profile)
+}
+
+function tupleFromOwner(owner: SessionOwnerScope, socketOwner: null | WorkspaceSendTuple): null | WorkspaceSendTuple {
+  if (isSessionOwnerRoute(owner)) {
+    const connectionId = owner.connectionId.trim()
+    const profile = owner.profile.trim()
+
+    return connectionId && profile ? { connectionId, profile } : null
+  }
+
+  const profile = typeof owner === 'string' ? owner.trim() : ''
+
+  if (!profile) {
+    return null
+  }
+
+  const connectionId = socketOwner?.connectionId ?? (ambientGatewayOwnsEverySession() ? LOCAL_CONNECTION_ID : '')
+
+  return connectionId ? { connectionId, profile } : null
+}
+
+/** Live Sessions/Bot send input. Fail closed when owner/tuple/readiness is missing. */
+export function collectWorkspaceSendInput(input: {
+  capturedGeneration?: number
+  sessionId?: null | string
+  storedSessionId?: null | string
+}): WorkspaceSendInput {
+  const connectionId = String($connection.get()?.connectionId ?? '').trim()
+  const profile = String($activeGatewayProfile.get() ?? '').trim()
+
+  const socketOwner: null | WorkspaceSendTuple =
+    connectionId && profile
+      ? { connectionId, profile }
+      : ambientGatewayOwnsEverySession() && profile
+        ? { connectionId: LOCAL_CONNECTION_ID, profile }
+        : null
+
+  const storedSessionId = input.storedSessionId || null
+  const sessionId = input.sessionId || null
+  const isNewChat = !storedSessionId && !sessionId
+  const owner = knownOwnerForSession(storedSessionId) ?? knownOwnerForSession(sessionId)
+  const intendedFromOwner = tupleFromOwner(owner, socketOwner)
+
+  const intendedOwner = isNewChat
+    ? undefined
+    : ambientGatewayOwnsEverySession()
+      ? socketOwner
+      : (intendedFromOwner ?? null)
+
+  const gatewayState = $gatewayState.get()
+  const botTalkAcross = Boolean(!isNewChat && (isBotChatSession(sessionId) || isBotChatSession(storedSessionId)))
+
+  return {
+    ambientTupleValid: Boolean(socketOwner?.connectionId && socketOwner?.profile),
+    botTalkAcross,
+    capturedGeneration: input.capturedGeneration,
+    currentGeneration: input.capturedGeneration === undefined ? undefined : currentGatewaySwitchGeneration(),
+    gatewaySwitching: $gatewaySwitching.get(),
+    intendedOwner,
+    isNewChat,
+    pendingConnectionId: $pendingConnectionId.get(),
+    socketOwner,
+    ...(gatewayState === 'open'
+      ? { readinessResolved: true }
+      : gatewayState === 'idle'
+        ? {}
+        : { readinessResolved: false }),
+    ...(gatewayState === 'error' ? { unreachable: true } : {})
+  }
 }
 
 export function evaluateWorkspaceSend(input: WorkspaceSendInput): WorkspaceSendVerdict {
@@ -78,7 +159,7 @@ export function evaluateWorkspaceSend(input: WorkspaceSendInput): WorkspaceSendV
     return { allowed: true, state: 'bot_talk_across' }
   }
 
-  if (input.intendedOwner === null && input.isNewChat === false) {
+  if (input.isNewChat === false && !input.intendedOwner) {
     return { allowed: false, state: 'route_invalid' }
   }
 
@@ -94,7 +175,7 @@ export function evaluateWorkspaceSend(input: WorkspaceSendInput): WorkspaceSendV
     return { allowed: true, state: 'idle_fleet' }
   }
 
-  return { allowed: true, state: 'idle_fleet' }
+  return { allowed: false, state: 'route_invalid' }
 }
 
 /** Sessions-switch send barrier plus the fail-closed existing-surface set. */

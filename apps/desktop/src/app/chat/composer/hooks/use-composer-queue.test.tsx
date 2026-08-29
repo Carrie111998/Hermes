@@ -26,8 +26,15 @@ import { useComposerQueue } from './use-composer-queue'
 
 const SESSION_KEY = 'stored-session-queue-hook'
 
-function renderQueueHook(overrides: { busy?: boolean; onCancel?: () => void; onSteer?: ChatBarProps['onSteer'] } = {}) {
-  const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
+function renderQueueHook(
+  overrides: {
+    busy?: boolean
+    onCancel?: () => void
+    onSteer?: ChatBarProps['onSteer']
+    onSubmit?: ChatBarProps['onSubmit']
+  } = {}
+) {
+  const onSubmit = vi.fn<ChatBarProps['onSubmit']>(overrides.onSubmit ?? (async () => true))
   const onCancel = overrides.onCancel ?? vi.fn()
   const onSteer = overrides.onSteer
   const queueEditRef: { current: QueueEditState | null } = { current: null }
@@ -226,5 +233,34 @@ describe('useComposerQueue park integration', () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('retains the queue and spends no failure budget when submit returns a switching deferral', async () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'hold for switch result' })
+
+    const { hook, onSubmit } = renderQueueHook({
+      onSubmit: async () => ({ ok: false, reason: 'switching' })
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      hook.rerender({ busy: true })
+      hook.rerender({ busy: false })
+      await act(async () => {
+        await Promise.resolve()
+      })
+    }
+
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+    expect($notifications.get().some(item => item.id === 'composer-queue-stuck')).toBe(false)
+
+    onSubmit.mockResolvedValue(true)
+    $pendingConnectionId.set('pop-os-hermes')
+    hook.rerender({ busy: false })
+    $pendingConnectionId.set(null)
+    hook.rerender({ busy: false })
+
+    await waitFor(() => expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0))
   })
 })

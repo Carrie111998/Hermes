@@ -267,7 +267,13 @@ export function useComposerVoice({
 
   // Explicit start/end for the on-screen conversation controls (the hotkey uses
   // the gated toggle above).
-  const startConversation = useCallback(() => setVoiceConversationActive(true), [])
+  const startConversation = useCallback(() => {
+    if (disabled) {
+      return
+    }
+
+    setVoiceConversationActive(true)
+  }, [disabled])
 
   const endConversation = useCallback(() => {
     setVoiceConversationActive(false)

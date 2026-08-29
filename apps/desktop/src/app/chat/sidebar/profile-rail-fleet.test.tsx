@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopAgentRoster, DesktopConnectionsRegistry } from '@/global'
+import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { ProfileRail } from './profile-switcher'
 
@@ -16,6 +17,8 @@ const navigate = vi.fn()
 const selectConnection = vi.fn()
 const selectProfile = vi.fn()
 const getAgentRoster = vi.fn()
+const cancelPrewarm = vi.fn()
+const startPrewarm = vi.fn()
 
 vi.mock('react-router', () => ({
   useNavigate: () => navigate
@@ -105,7 +108,7 @@ vi.mock('@/store/profile-share', () => ({
 }))
 
 vi.mock('./use-profile-prewarm', () => ({
-  useProfilePrewarm: () => ({ cancelPrewarm: vi.fn(), startPrewarm: vi.fn() })
+  useProfilePrewarm: () => ({ cancelPrewarm, startPrewarm })
 }))
 
 vi.mock('./use-profile-rail-refresh-on-active', () => ({
@@ -210,6 +213,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  clearNotifications()
   vi.clearAllMocks()
   _resetFleetRosterForTests()
   hasMultipleConnections.set(false)
@@ -327,6 +331,16 @@ describe('ProfileRail fleet mode', () => {
     expect(selectConnection).not.toHaveBeenCalled()
   })
 
+  it('does not prewarm active-gateway profiles while the fleet rail is visible', async () => {
+    armFleet()
+    await renderFleet()
+
+    fireEvent.pointerEnter(screen.getByRole('button', { name: 'scout' }))
+
+    expect(startPrewarm).not.toHaveBeenCalled()
+    expect(cancelPrewarm).not.toHaveBeenCalled()
+  })
+
   it('keeps every group in its slot when a different gateway is active', async () => {
     armFleet()
     activeConnectionId.set('local')
@@ -414,6 +428,11 @@ describe('ProfileRail fleet mode', () => {
         name: 'Could not switch to omer on This device. You’re still on default · Pandora. Nothing was sent.'
       })
     ).toBeTruthy()
+    expect($notifications.get()).toContainEqual(
+      expect.objectContaining({
+        title: 'Could not switch to omer on This device. You’re still on default · Pandora. Nothing was sent.'
+      })
+    )
     expect(globalThis.document.activeElement).toBe(omer)
   })
 

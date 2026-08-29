@@ -2,7 +2,12 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { isSessionsSwitchInFlight, isSubmitAccepted, isSubmitDeferred } from '@/lib/workspace-send-gate'
+import {
+  isSessionsSwitchInFlight,
+  isSubmitAccepted,
+  isSubmitDeferred,
+  type WorkspaceSubmitResult
+} from '@/lib/workspace-send-gate'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
@@ -21,7 +26,10 @@ import { $workingSessionIds } from '@/store/session-states'
 
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 
-type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+type SubmitQueuedPrompt = (
+  text: string,
+  options?: SubmitTextOptions
+) => Promise<WorkspaceSubmitResult | boolean> | WorkspaceSubmitResult | boolean
 
 interface BackgroundQueueDrainOptions {
   enabled: boolean
@@ -142,7 +150,11 @@ export function useBackgroundQueueDrain({
             })
           )
 
-          if (isSubmitDeferred(accepted) || !isSubmitAccepted(accepted)) {
+          if (isSubmitDeferred(accepted)) {
+            return 'deferred'
+          }
+
+          if (!isSubmitAccepted(accepted)) {
             return false
           }
 
@@ -153,7 +165,7 @@ export function useBackgroundQueueDrain({
           return true
         })
         .then(accepted => {
-          if (!accepted) {
+          if (accepted === false) {
             onFail()
           }
         })
