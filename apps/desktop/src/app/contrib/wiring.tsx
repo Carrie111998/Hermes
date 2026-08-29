@@ -72,7 +72,6 @@ import {
   $selectedStoredSessionId,
   $sessionResumeRequest,
   $sessions,
-  requestSessionResume,
   sessionMatchesStoredId,
   sessionPinId,
   setAwaitingResponse,
@@ -150,6 +149,7 @@ import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
 import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
+import { openSidebarSession } from './sidebar-session-open'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
 
@@ -993,20 +993,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     // previewing profile A and the resume dials profile B. Pin the row's own
     // (connection, profile) as the resume owner before navigating; untagged
     // rows (single-profile installs, legacy pages) keep the id-only path.
-    onResumeSession: (sessionId, session) => {
-      const rowProfile = session?.profile?.trim()
-
-      if (rowProfile) {
-        requestSessionResume(sessionId, {
-          connectionId: session?.connection_id?.trim() || 'local',
-          ...(session?.connection_id?.trim() ? {} : { mode: 'local' as const }),
-          profile: rowProfile,
-          targetProfile: rowProfile
-        })
-      }
-
-      openSession(sessionId, navigate)
-    },
+    onResumeSession: (sessionId, session) => openSidebarSession(sessionId, session, navigate),
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,
