@@ -4579,6 +4579,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
+        # Sticky fail-closed latch for generic or mixed structural corruption.
+        # Once SQLite cannot prove the damage is confined to derived FTS data,
+        # no later operation on this handle may resume canonical writes.
+        self._structural_corruption_error: Optional[str] = None
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
@@ -5278,6 +5282,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns whatever *fn* returns.
         """
+        if self._structural_corruption_error is not None:
+            raise sqlite3.DatabaseError(
+                "state.db structural corruption was detected; canonical writes "
+                f"disabled until offline repair: {self._structural_corruption_error}"
+            )
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -5366,8 +5375,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # derived indexes and retry against the canonical tables.
                 if self._try_runtime_fts_rebuild(exc):
                     continue
+                if self._structural_corruption_error is not None:
+                    raise
                 if self._enter_fts_fail_open(exc):
                     continue
+                if (
+                    is_malformed_db_error(exc)
+                    and self._structural_corruption_error is None
+                ):
+                    self._structural_corruption_error = str(exc)
+                    logger.critical(
+                        "state.db reported structural corruption (%s); canonical "
+                        "writes are disabled for this handle until offline repair.",
+                        exc,
+                    )
                 raise
             except sqlite3.Error as exc:
                 # Catch-all for builds that surface 'no more rows available'
@@ -5409,22 +5430,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
-        """True for the error class a corrupt FTS index raises on writes.
-
-        SQLite's message for a corrupt FTS index varies by version: older
-        builds raise the generic ``database disk image is malformed`` (covered
-        by :func:`is_malformed_db_error`); newer builds raise the FTS5-specific
-        ``fts5: corrupt structure record for table "messages_fts"``. Both mean
-        the same thing for the write path: the canonical rows are fine, the
-        FTS shadow tables are not.  The FTS-only rebuild and fail-open
-        detach are safe here because they only touch derived indexes; if the
-        damage is actually in a canonical B-tree, the rebuild itself fails and
-        the write propagates.
-        """
-        if is_malformed_db_error(exc):
-            return True
+        """True only when SQLite names FTS as the corrupt object."""
         msg = str(exc).lower()
         return "fts5" in msg and "corrupt" in msg
+
+    def _has_fts_corruption_evidence(self, exc: sqlite3.DatabaseError) -> bool:
+        """Confirm that a generic SQLITE_CORRUPT originates in an FTS index.
+
+        Older SQLite builds report damaged FTS shadow pages only as
+        ``database disk image is malformed``.  That message alone is not safe
+        evidence: it can equally describe a canonical table or freelist.  The
+        ``PRAGMA integrity_check`` names malformed FTS5 inverted indexes.  A
+        generic error is recoverable only when every reported defect is
+        explicitly scoped to one of Hermes' derived FTS tables; mixed or
+        unscoped diagnostics fail closed.
+        """
+        if self._is_fts_write_corruption_error(exc):
+            return True
+        if not is_malformed_db_error(exc):
+            return False
+        try:
+            with self._lock:
+                diagnostics = [
+                    str(row[0]).lower()
+                    for row in self._conn.execute("PRAGMA integrity_check").fetchall()
+                ]
+        except sqlite3.Error:
+            return False
+        if not diagnostics or diagnostics == ["ok"]:
+            return False
+        return all(
+            "fts5 table" in diagnostic
+            and any(table in diagnostic for table in self._FTS_TABLES)
+            for diagnostic in diagnostics
+        )
 
     def _foreign_state_db_holders(self) -> List[Tuple[int, str]]:
         """Return foreign processes holding this DB or its WAL sidecars.
@@ -5611,7 +5650,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         if not self._fts_enabled:
             return False
-        if not self._is_fts_write_corruption_error(exc):
+        if not self._has_fts_corruption_evidence(exc):
+            if is_malformed_db_error(exc):
+                self._structural_corruption_error = str(exc)
+                logger.critical(
+                    "state.db reported unscoped or mixed structural corruption "
+                    "(%s); canonical writes are disabled for this handle until "
+                    "offline repair.",
+                    exc,
+                )
             return False
         # Set the one-shot flag before the foreign-holder check: even when
         # the rebuild is skipped, the fail-open path that follows persists
@@ -5663,7 +5710,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rows create an index gap of unknown extent, so another process must
         never reinstall the triggers without first rebuilding every row.
         """
-        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+        if not self._fts_enabled or not self._has_fts_corruption_evidence(exc):
             return False
 
         try:

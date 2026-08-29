@@ -275,11 +275,9 @@ class TestRuntimeFtsRebuild:
         # Cleanup
         os.chmod(proc_root / "222" / "fd", 0o755)
 
-    def test_corruption_error_classification_covers_both_sqlite_messages(self):
-        """SQLite's message for a corrupt FTS index varies by version: older
-        builds raise the generic malformed-image error, newer builds raise an
-        FTS5-specific one. Both must trigger the self-heal."""
-        assert SessionDB._is_fts_write_corruption_error(
+    def test_generic_corruption_requires_fts_scoped_evidence(self):
+        """A generic malformed-image error alone cannot authorize FTS repair."""
+        assert not SessionDB._is_fts_write_corruption_error(
             sqlite3.DatabaseError("database disk image is malformed")
         )
         assert SessionDB._is_fts_write_corruption_error(
@@ -290,6 +288,40 @@ class TestRuntimeFtsRebuild:
         assert not SessionDB._is_fts_write_corruption_error(
             sqlite3.DatabaseError("no such table: nothing_fts_related")
         )
+
+    def test_generic_malformed_write_fails_closed(self, db, monkeypatch):
+        db.create_session("s1", source="test")
+        monkeypatch.setattr(
+            db, "rebuild_fts", lambda: pytest.fail("must not rebuild FTS")
+        )
+
+        def _structural_corruption(_conn):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
+            db._execute_write(_structural_corruption)
+
+        assert db._fts_runtime_rebuild_attempted is False
+        assert db._fts_enabled is True
+
+    def test_unscoped_corruption_latches_canonical_writes_closed(self, db):
+        db.create_session("s1", source="test")
+
+        def _structural_corruption(_conn):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
+            db._execute_write(_structural_corruption)
+
+        called = False
+
+        def _later_write(_conn):
+            nonlocal called
+            called = True
+
+        with pytest.raises(sqlite3.DatabaseError, match="canonical writes disabled"):
+            db._execute_write(_later_write)
+        assert called is False
 
     def test_append_self_heals_after_fts_corruption(self, db, tmp_path):
         if not db._fts_enabled:

@@ -1544,11 +1544,14 @@ class TestGatewaySessionDbRecovery:
     def test_fts_corruption_error_does_not_match_false_positives(self):
         """_is_fts_corruption_error must not match unrelated error strings
         containing 'fts' as a substring (e.g. 'shifts', 'gifts')."""
-        assert SessionStore._is_fts_corruption_error(
+        assert not SessionStore._is_fts_corruption_error(
             RuntimeError("database disk image is malformed")
         )
+        assert not SessionStore._is_fts_corruption_error(
+            RuntimeError("malformed database schema (messages_fts)")
+        )
         assert SessionStore._is_fts_corruption_error(
-            RuntimeError("no such table: messages_fts")
+            RuntimeError('fts5: corrupt structure record for table "messages_fts"')
         )
         assert not SessionStore._is_fts_corruption_error(
             RuntimeError("shifts were applied")
