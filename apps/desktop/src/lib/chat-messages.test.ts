@@ -452,6 +452,7 @@ describe('toChatMessages', () => {
 
     expect(messages).toHaveLength(1)
     expect(messages[0].role).toBe('user')
+    expect(messages[0].displayKind).toBe('delegate_wave_wake')
     expect(chatMessageText(messages[0])).toBe(wake)
   })
 

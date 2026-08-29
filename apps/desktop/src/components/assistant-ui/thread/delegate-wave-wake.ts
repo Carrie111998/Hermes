@@ -52,3 +52,9 @@ export function parseDelegateWaveWake(text: string): DelegateWaveWake | null {
 
   return null
 }
+
+/** Only a backend-typed timeline row has authority to become a wake card.
+ * The prose parser derives the subtype/detail; it never authenticates origin. */
+export function parseDelegateWaveWakeEvent(text: string, displayKind: unknown): DelegateWaveWake | null {
+  return displayKind === 'delegate_wave_wake' ? parseDelegateWaveWake(text) : null
+}

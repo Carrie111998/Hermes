@@ -3,7 +3,10 @@ import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } fro
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
-import { type DelegateWaveWake, parseDelegateWaveWake } from '@/components/assistant-ui/thread/delegate-wave-wake'
+import {
+  type DelegateWaveWake,
+  parseDelegateWaveWakeEvent
+} from '@/components/assistant-ui/thread/delegate-wave-wake'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
@@ -421,7 +424,8 @@ export const UserMessage: FC<{
 
   useResizeObserver(measureClamp, clampInnerRef)
 
-  const delegateWaveWake = parseDelegateWaveWake(messageText.trim())
+  const displayKind = useAuiState(s => s.message.metadata?.custom?.displayKind)
+  const delegateWaveWake = parseDelegateWaveWakeEvent(messageText.trim(), displayKind)
 
   if (delegateWaveWake) {
     return (

@@ -253,6 +253,17 @@ describe('toRuntimeMessage timeline metadata', () => {
 
     expect((runtime.metadata?.custom as { timelineTimestamp?: number }).timelineTimestamp).toBeUndefined()
   })
+
+  it('carries the durable Delegate Wave type to the user renderer', () => {
+    const runtime = toRuntimeMessage({
+      id: 'wake-message',
+      parts: [{ text: 'wake-shaped text', type: 'text' }],
+      role: 'user',
+      displayKind: 'delegate_wave_wake'
+    })
+
+    expect((runtime.metadata?.custom as { displayKind?: string }).displayKind).toBe('delegate_wave_wake')
+  })
 })
 
 describe('coalesceToolOnlyAssistants toolCallId uniqueness', () => {

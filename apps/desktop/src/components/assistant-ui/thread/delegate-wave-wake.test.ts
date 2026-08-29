@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseDelegateWaveWake } from './delegate-wave-wake'
+import { parseDelegateWaveWake, parseDelegateWaveWakeEvent } from './delegate-wave-wake'
 
 const marker = '[delegate-wave-wake:wake_123]'
 
@@ -36,5 +36,12 @@ describe('parseDelegateWaveWake', () => {
 
   it('does not style ordinary messages', () => {
     expect(parseDelegateWaveWake('ship it')).toBeNull()
+  })
+
+  it('requires the durable event type even for identical wake-shaped text', () => {
+    const wake = `The delegate-wave session working on "ship it" finished and its result is on the branch.\n\n${marker}`
+
+    expect(parseDelegateWaveWakeEvent(wake, 'delegate_wave_wake')).toEqual({ kind: 'completed', task: 'ship it' })
+    expect(parseDelegateWaveWakeEvent(wake, undefined)).toBeNull()
   })
 })
