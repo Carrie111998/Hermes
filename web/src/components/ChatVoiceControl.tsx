@@ -207,7 +207,7 @@ export function ChatVoiceControl({ connected, submit, onBargeIn }: ChatVoiceCont
         onClick={state === "listening" ? commit : begin}
         className="flex min-h-[42dvh] w-full touch-manipulation flex-1 flex-col items-center justify-center gap-5 overflow-hidden px-5 py-8 text-center active:bg-white/10 lg:min-h-44"
       >
-        <Mic className={state === "listening" ? "h-12 w-12 shrink-0 animate-pulse text-red-400" : "h-12 w-12 shrink-0"} />
+        <Mic className={state === "listening" ? "h-12 w-12 shrink-0 animate-pulse text-red-400 motion-reduce:animate-none" : "h-12 w-12 shrink-0"} />
         <span className="max-h-[28dvh] w-full overflow-y-auto whitespace-pre-wrap break-words text-2xl font-semibold leading-tight sm:text-3xl">
           {headline}
         </span>

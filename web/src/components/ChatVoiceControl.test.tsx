@@ -145,6 +145,14 @@ describe("ChatVoiceControl browser speech input", () => {
     expect(surface.textContent).toContain("Gboard typed fallback remains below");
   });
 
+  it("suppresses the listening pulse when reduced motion is requested", async () => {
+    const { surface } = await render();
+    await act(async () => surface.click());
+    const mic = surface.querySelector("svg");
+    expect(mic?.classList.contains("animate-pulse")).toBe(true);
+    expect(mic?.classList.contains("motion-reduce:animate-none")).toBe(true);
+  });
+
   it("refuses to start while chat is disconnected", async () => {
     const { surface } = await render(vi.fn(), false);
     await act(async () => surface.click());
