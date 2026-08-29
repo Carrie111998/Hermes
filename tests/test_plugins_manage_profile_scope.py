@@ -72,3 +72,40 @@ def test_plugins_manage_unscoped_still_lists(monkeypatch):
 
     assert "result" in resp, resp
     assert "plugins" in resp["result"]
+
+
+def test_plugins_manage_reports_bundled_backend_effective_status(
+    tmp_path, monkeypatch
+):
+    """The gateway must surface PluginManager's bundled-backend default."""
+    plugin_dir = tmp_path / "openai-codex"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: openai-codex\nkind: backend\n",
+        encoding="utf-8",
+    )
+
+    import hermes_cli.plugins_cmd as plugins_cmd
+
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_all_plugins",
+        lambda: [
+            (
+                "openai-codex",
+                "1.0.0",
+                "Codex OAuth image generation",
+                "bundled",
+                plugin_dir,
+                "image_gen/openai-codex",
+            )
+        ],
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+
+    resp = server.handle_request(
+        {"id": "4", "method": "plugins.manage", "params": {"action": "list"}}
+    )
+
+    assert resp["result"]["plugins"][0]["status"] == "enabled"

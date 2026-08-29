@@ -10,6 +10,7 @@ nested bundled plugin can actually be toggled.
 
 import sys  # noqa: F401
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -70,7 +71,9 @@ class TestResolvePluginKey:
         """Same leaf name under two categories must NOT silently pick one."""
         from hermes_cli.plugins_cmd import _resolve_plugin_key
         _make_category_plugin(tmp_path, "image_gen", "openai", {"name": "image-gen-openai"})
-        _make_category_plugin(tmp_path, "model-providers", "openai", {"name": "mp-openai"})
+        _make_category_plugin(
+            tmp_path, "observability", "openai", {"name": "observability-openai"}
+        )
         mock_user.return_value = tmp_path
         mock_bundled.return_value = tmp_path / "nonexistent"
         # Bare "openai" is ambiguous -> None; the full key still resolves.
@@ -208,7 +211,7 @@ class TestCompositeMenuWritesCanonicalKey:
     @patch("hermes_cli.plugins_cmd._save_disabled_set")
     @patch("hermes_cli.plugins_cmd._save_enabled_set")
     @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
-    def test_fallback_unchecked_plugin_disables_by_key_not_name(
+    def test_fallback_toggle_off_disables_by_key_not_name(
         self, mock_en, mock_save_en, mock_save_dis,
     ):
         from hermes_cli.plugins_cmd import _run_composite_fallback
@@ -217,16 +220,131 @@ class TestCompositeMenuWritesCanonicalKey:
         # key differs from the manifest name, mirroring web/firecrawl.
         plugin_keys = ["web/firecrawl"]
         plugin_labels = ["web-firecrawl — firecrawl [bundled]"]
-        plugin_selected = set()  # unchecked → should be disabled
+        plugin_selected = {0}
 
-        # First input() toggles nothing (blank Enter confirms immediately),
-        # second (category prompt) is skipped with blank Enter.
-        with patch("builtins.input", return_value=""):
+        # Toggle the selected plugin off, then confirm. This proves an actual
+        # user change persists the canonical key; merely opening/closing the
+        # menu is covered separately as a no-op.
+        with patch("builtins.input", side_effect=["1", ""]):
             _run_composite_fallback(
                 plugin_keys, plugin_labels, plugin_selected,
-                set(), [], Console(),
+                set(), [], Console(), ["web-firecrawl"],
             )
 
         saved_dis = mock_save_dis.call_args[0][0]
         assert "web/firecrawl" in saved_dis      # canonical key persisted
         assert "web-firecrawl" not in saved_dis   # never the bare name
+
+    def test_cmd_toggle_preselects_effective_status_and_noop_preserves_config(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import plugins_cmd
+
+        backend = _make_category_plugin(
+            tmp_path,
+            "image_gen",
+            "openai-codex",
+            {"name": "openai-codex", "kind": "backend"},
+        )
+        platform = _make_category_plugin(
+            tmp_path,
+            "platforms",
+            "telegram",
+            {"name": "telegram", "kind": "platform"},
+        )
+        standalone = _make_plugin_dir(
+            tmp_path,
+            "opt-in",
+            {"name": "opt-in", "kind": "standalone"},
+        )
+        entries = [
+            (
+                "openai-codex",
+                "1.0.0",
+                "Codex image backend",
+                "bundled",
+                backend,
+                "image_gen/openai-codex",
+            ),
+            (
+                "telegram",
+                "1.0.0",
+                "Telegram platform",
+                "bundled",
+                platform,
+                "platforms/telegram",
+            ),
+            ("opt-in", "1.0.0", "Opt-in", "bundled", standalone, "opt-in"),
+            (
+                "package-plugin",
+                "1.0.0",
+                "Entry point",
+                "entrypoint",
+                "package.module:register",
+                "package-plugin",
+            ),
+        ]
+        enabled = {"package-plugin"}
+        disabled = {"platforms/telegram"}
+        saved_enabled = []
+        saved_disabled = []
+        observed = {}
+
+        monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set(enabled))
+        monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set(disabled))
+        monkeypatch.setattr(plugins_cmd, "_get_current_memory_provider", lambda: "")
+        monkeypatch.setattr(
+            plugins_cmd, "_get_current_context_engine", lambda: "compressor"
+        )
+        monkeypatch.setattr(plugins_cmd, "_save_enabled_set", saved_enabled.append)
+        monkeypatch.setattr(plugins_cmd, "_save_disabled_set", saved_disabled.append)
+        monkeypatch.setattr(
+            plugins_cmd.sys, "stdin", SimpleNamespace(isatty=lambda: True)
+        )
+        monkeypatch.setitem(sys.modules, "curses", SimpleNamespace())
+
+        def run_fallback(
+            _curses,
+            keys,
+            labels,
+            selected,
+            disabled_set,
+            categories,
+            console,
+            names,
+        ):
+            observed["selected"] = set(selected)
+            plugins_cmd._run_composite_fallback(
+                keys,
+                labels,
+                selected,
+                disabled_set,
+                categories,
+                console,
+                names,
+            )
+
+        monkeypatch.setattr(plugins_cmd, "_run_composite_ui", run_fallback)
+
+        # Confirm both sections without changing a checkbox or provider.
+        with patch("builtins.input", side_effect=["", ""]):
+            plugins_cmd.cmd_toggle()
+
+        # Bundled backend is effectively on; explicit disable wins for the
+        # bundled platform; standalone remains opt-in; enabled entry point is on.
+        assert observed["selected"] == {0, 3}
+        assert saved_enabled == []
+        assert saved_disabled == []
+
+        # Toggle the effective default-on backend off through cmd_toggle and
+        # confirm the shared persistence path records only that explicit
+        # change while retaining the existing entry-point enable and platform
+        # disable.
+        with patch("builtins.input", side_effect=["1", "", ""]):
+            plugins_cmd.cmd_toggle()
+
+        assert saved_enabled == [{"package-plugin"}]
+        assert saved_disabled == [
+            {"image_gen/openai-codex", "platforms/telegram"}
+        ]

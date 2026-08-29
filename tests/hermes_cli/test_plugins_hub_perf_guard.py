@@ -140,6 +140,73 @@ def test_plugins_hub_short_ttl_cache_collapses_duplicate_fetches(monkeypatch):
     assert first is second
 
 
+def test_plugins_hub_endpoint_uses_effective_plugin_status(monkeypatch, tmp_path):
+    import asyncio
+
+    backend = tmp_path / "image_gen" / "openai-codex"
+    platform = tmp_path / "platforms" / "telegram"
+    standalone = tmp_path / "opt-in"
+    for plugin_dir, manifest in (
+        (backend, "name: openai-codex\nkind: backend\n"),
+        (platform, "name: telegram\nkind: platform\n"),
+        (standalone, "name: opt-in\nkind: standalone\n"),
+    ):
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(manifest, encoding="utf-8")
+
+    entries = [
+        (
+            "openai-codex",
+            "1.0.0",
+            "Codex image backend",
+            "bundled",
+            backend,
+            "image_gen/openai-codex",
+        ),
+        (
+            "telegram",
+            "1.0.0",
+            "Telegram platform",
+            "bundled",
+            platform,
+            "platforms/telegram",
+        ),
+        ("opt-in", "1.0.0", "Opt-in", "bundled", standalone, "opt-in"),
+        (
+            "package-plugin",
+            "1.0.0",
+            "Entry point",
+            "entrypoint",
+            "package.module:register",
+            "package-plugin",
+        ),
+    ]
+    _patch_minimal_hub_dependencies(
+        monkeypatch,
+        check_fn=lambda: True,
+        discover_all_plugins=lambda: entries,
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"package-plugin"})
+    monkeypatch.setattr(
+        plugins_cmd, "_get_disabled_set", lambda: {"platforms/telegram"}
+    )
+    monkeypatch.setattr(plugins_cmd, "_read_manifest", lambda _path: {})
+    monkeypatch.setattr(web_server, "_require_token", lambda _request: None)
+    web_server._invalidate_plugins_hub_cache()
+
+    payload = asyncio.run(web_server.get_plugins_hub(object()))
+    statuses = {
+        plugin["name"]: plugin["runtime_status"] for plugin in payload["plugins"]
+    }
+
+    assert statuses == {
+        "openai-codex": "enabled",
+        "telegram": "disabled",
+        "opt-in": "inactive",
+        "package-plugin": "enabled",
+    }
+
+
 def test_plugin_install_endpoint_invalidates_hub_cache(monkeypatch):
     import asyncio
 
