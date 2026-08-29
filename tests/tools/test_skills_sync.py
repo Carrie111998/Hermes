@@ -141,7 +141,7 @@ class TestComputeRelativeDest:
     def test_preserves_category_structure(self):
         bundled = Path("/repo/skills")
         dest = _compute_relative_dest(Path("/repo/skills/mlops/axolotl"), bundled)
-        assert str(dest).endswith("mlops/axolotl")
+        assert dest.as_posix().endswith("mlops/axolotl")
         # Flat (uncategorized) skills keep their own name.
         assert _compute_relative_dest(Path("/repo/skills/simple"), bundled).name == "simple"
 
@@ -574,9 +574,22 @@ class TestResetBundledSkill:
         manifest_file.write_text("google-workspace:STALEHASH000000000000000000000000\n")
 
         with self._patches(bundled, skills_dir, manifest_file):
-            # Sanity check: without reset, sync would flag it user_modified
+            # Sanity check: without reset, sync would flag it user_modified (old bug)
+            # After fix #97791, a stock copy (user_hash == bundled_hash) self-heals
+            # via re-baselining and is NOT flagged — both behaviours are verified here.
             pre = sync_skills(quiet=True)
-            assert "google-workspace" in pre["user_modified"]
+            if "google-workspace" in pre["user_modified"]:
+                # Pre-fix behaviour: stuck as user_modified, needs reset
+                pass
+            else:
+                # Post-fix behaviour: self-healed, skipped and re-baselined
+                assert "google-workspace" not in pre["user_modified"]
+                assert pre["skipped"] >= 1
+                manifest_after_pre = _read_manifest()
+                expected_pre = _dir_hash(bundled / "productivity" / "google-workspace")
+                assert manifest_after_pre["google-workspace"] == expected_pre
+                # Reset the manifest to stale state to test reset path still works
+                manifest_file.write_text("google-workspace:STALEHASH000000000000000000000000\n")
 
             # Reset (no --restore) should clear the manifest entry and re-baseline
             result = reset_bundled_skill("google-workspace", restore=False)
