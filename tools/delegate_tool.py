@@ -3049,6 +3049,14 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif result.get("failed") or result.get("error"):
+            # A structured failure (provider rejection / terminal exception)
+            # must WIN over the summary-presence heuristic below. The child's
+            # conversation loop returns the error text as final_response, so an
+            # error-shaped summary would otherwise be labeled "completed" here
+            # despite completed=False. The heuristic is only a fallback for
+            # legacy/mock results that omit the structured failure fields.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -3098,9 +3106,15 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif result.get("failed") or result.get("error"):
+            # Provider rejection / terminal failure. Do NOT report this as
+            # iteration-budget exhaustion — "max_iterations" is only truthful
+            # when the child actually hit its per-delegation iteration cap.
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
+            # Genuine budget exhaustion: completed=False with no failure.
             exit_reason = "max_iterations"
 
         # Extract token counts (safe for mock objects)
