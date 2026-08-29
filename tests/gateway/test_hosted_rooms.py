@@ -578,6 +578,68 @@ def test_disband_is_idempotent_and_room_id_cannot_be_reused(tmp_path):
         rooms.read_events(db, room_id="room-1")
 
 
+def test_active_rooms_and_event_storage_are_bounded(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    _create(db)
+    monkeypatch.setattr(rooms, "MAX_ACTIVE_ROOMS", 1)
+
+    with pytest.raises(rooms.HostedRoomError, match="too many active"):
+        _create(db, "room-2")
+
+    rooms.disband_room(db, room_id="room-1", now=20)
+    _create(db, "room-2")
+    first = rooms.append_event(
+        db,
+        room_id="room-2",
+        event_id="message-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "first"},
+    )
+    with sqlite3.connect(db) as conn:
+        current_bytes = conn.execute(
+            "SELECT event_bytes FROM hosted_rooms WHERE room_id='room-2'"
+        ).fetchone()[0]
+    monkeypatch.setattr(rooms, "MAX_ROOM_EVENT_BYTES", current_bytes)
+
+    with pytest.raises(rooms.HostedRoomError, match="storage limit"):
+        rooms.append_event(
+            db,
+            room_id="room-2",
+            event_id="message-2",
+            kind="message.user",
+            actor=USER,
+            payload={"text": "second"},
+        )
+    assert rooms.read_events(db, room_id="room-2")["events"] == [first]
+    assert rooms.disband_room(db, room_id="room-2")["event"]["kind"] == "room.disbanded"
+
+
+def test_room_listing_is_paged_and_old_tombstones_are_pruned(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(rooms, "MAX_DISBANDED_ROOM_TOMBSTONES", 1)
+    for index in range(3):
+        room_id = f"room-{index}"
+        _create(db, room_id)
+        if index < 2:
+            rooms.disband_room(db, room_id=room_id, now=20 + index)
+
+    first_page = rooms.list_rooms(db, include_disbanded=True, limit=1)
+    second_page = rooms.list_rooms(
+        db,
+        include_disbanded=True,
+        limit=1,
+        offset=1,
+    )
+
+    assert [room["room_id"] for room in first_page + second_page] == [
+        "room-1",
+        "room-2",
+    ]
+    with pytest.raises(rooms.RoomNotFoundError):
+        rooms.room_state(db, room_id="room-0", include_disbanded=True)
+
+
 def test_pre_actor_draft_database_migrates_with_explicit_legacy_identity(tmp_path):
     db = tmp_path / "state.db"
     _create_pre_actor_database(db)

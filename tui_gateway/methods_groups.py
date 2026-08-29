@@ -55,15 +55,26 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """List rooms hosted by this gateway."""
     try:
-        from gateway.hosted_rooms import default_db_path, list_rooms
+        from gateway.hosted_rooms import (
+            MAX_ROOM_LIST_LIMIT,
+            default_db_path,
+            list_rooms,
+        )
+
+        limit = params.get("limit", MAX_ROOM_LIST_LIMIT)
+        offset = params.get("offset", 0)
+        rooms = list_rooms(
+            default_db_path(),
+            include_disbanded=params.get("include_disbanded") is True,
+            limit=limit,
+            offset=offset,
+        )
 
         return _ok(
             rid,
             {
-                "rooms": list_rooms(
-                    default_db_path(),
-                    include_disbanded=params.get("include_disbanded") is True,
-                )
+                "rooms": rooms,
+                "next_offset": offset + limit if len(rooms) == limit else None,
             },
         )
     except Exception as exc:

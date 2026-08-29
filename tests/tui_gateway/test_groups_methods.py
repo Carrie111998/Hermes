@@ -91,6 +91,45 @@ def test_create_list_send_and_log_roundtrip(home):
     assert replay["events"][0]["payload"] == {"text": "hello"}
 
 
+def test_groups_list_returns_bounded_pages(home):
+    _create_room()
+    _result(
+        srv._methods["groups.create"](
+            2,
+            {
+                "room_id": "room-2",
+                "name": "Second room",
+                "members": [
+                    {
+                        "member_id": "default",
+                        "profile": "default",
+                        "handle": "hermes",
+                    },
+                    {"member_id": "ops", "profile": "ops", "handle": "ops"},
+                ],
+            },
+        )
+    )
+
+    first = _result(srv._methods["groups.list"](3, {"limit": 1}))
+    second = _result(
+        srv._methods["groups.list"](
+            4,
+            {"limit": 1, "offset": first["next_offset"]},
+        )
+    )
+
+    assert first["next_offset"] == 1
+    assert second["next_offset"] == 2
+    assert {first["rooms"][0]["room_id"], second["rooms"][0]["room_id"]} == {
+        "room-1",
+        "room-2",
+    }
+    final = _result(srv._methods["groups.list"](5, {"limit": 1, "offset": 2}))
+    assert final["rooms"] == []
+    assert final["next_offset"] is None
+
+
 def test_rpc_retry_is_idempotent_and_conflict_is_visible(home):
     _create_room()
     params = {

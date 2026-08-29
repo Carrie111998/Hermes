@@ -32,6 +32,15 @@ MAX_MEMBERS = 128
 MAX_MEMBERS_JSON_BYTES = 128 * 1024
 MAX_EVENT_JSON_BYTES = 256 * 1024
 MAX_LOG_LIMIT = 500
+MAX_ROOM_LIST_LIMIT = 500
+MAX_ACTIVE_ROOMS = 256
+MAX_DISBANDED_ROOM_TOMBSTONES = 512
+DISBANDED_ROOM_RETENTION_SECONDS = 90 * 24 * 60 * 60
+MAX_EVENTS_PER_ROOM = 50_000
+MAX_ROOM_EVENT_BYTES = 256 * 1024 * 1024
+MAX_GATEWAY_EVENT_BYTES = 1024 * 1024 * 1024
+CONTROL_EVENT_COUNT_RESERVE = 64
+CONTROL_EVENT_BYTE_RESERVE = 1024 * 1024
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -42,6 +51,7 @@ _ROOM_SCHEMA_COLUMNS = frozenset({
     "authority_gateway_id",
     "authority_epoch",
     "next_seq",
+    "event_bytes",
     "revision",
     "created_at",
     "updated_at",
@@ -250,6 +260,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             authority_gateway_id TEXT NOT NULL,
             authority_epoch INTEGER NOT NULL DEFAULT 1 CHECK (authority_epoch >= 1),
             next_seq INTEGER NOT NULL DEFAULT 1 CHECK (next_seq >= 1),
+            event_bytes INTEGER NOT NULL DEFAULT 0 CHECK (event_bytes >= 0),
             revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
@@ -282,6 +293,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             "ALTER TABLE hosted_rooms "
             "ADD COLUMN authority_epoch INTEGER NOT NULL DEFAULT 1"
         )
+    backfill_event_bytes = "event_bytes" not in room_columns
+    if backfill_event_bytes:
+        conn.execute(
+            "ALTER TABLE hosted_rooms ADD COLUMN event_bytes INTEGER NOT NULL DEFAULT 0"
+        )
 
     event_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_events)")
@@ -303,6 +319,20 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     if "authority_epoch" not in event_columns:
         conn.execute(
             "ALTER TABLE hosted_room_events ADD COLUMN authority_epoch INTEGER"
+        )
+    if backfill_event_bytes:
+        conn.execute(
+            """UPDATE hosted_rooms
+                  SET event_bytes=COALESCE((
+                      SELECT SUM(
+                          length(CAST(event_id AS BLOB)) +
+                          length(CAST(kind AS BLOB)) +
+                          length(CAST(actor_json AS BLOB)) +
+                          length(CAST(payload_json AS BLOB))
+                      )
+                      FROM hosted_room_events
+                      WHERE hosted_room_events.room_id=hosted_rooms.room_id
+                  ), 0)"""
         )
     conn.execute(
         """CREATE INDEX IF NOT EXISTS idx_hosted_room_events_cursor
@@ -391,6 +421,132 @@ def _room_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, A
     return room
 
 
+def _event_storage_bytes(
+    *, event_id: str, kind: str, actor_json: str, payload_json: str
+) -> int:
+    return len((event_id + kind + actor_json + payload_json).encode("utf-8"))
+
+
+def _assert_event_capacity(
+    conn: sqlite3.Connection,
+    *,
+    room: sqlite3.Row,
+    additional_bytes: int,
+    allow_control: bool = False,
+) -> None:
+    event_limit = MAX_EVENTS_PER_ROOM + (
+        CONTROL_EVENT_COUNT_RESERVE if allow_control else 0
+    )
+    room_byte_limit = MAX_ROOM_EVENT_BYTES + (
+        CONTROL_EVENT_BYTE_RESERVE if allow_control else 0
+    )
+    gateway_byte_limit = MAX_GATEWAY_EVENT_BYTES + (
+        CONTROL_EVENT_BYTE_RESERVE if allow_control else 0
+    )
+    if int(room["next_seq"]) - 1 >= event_limit:
+        raise HostedRoomError(
+            "This Group Chat reached its history limit. Start a new Group Chat to continue."
+        )
+    room_bytes = int(room["event_bytes"])
+    if room_bytes + additional_bytes > room_byte_limit:
+        raise HostedRoomError(
+            "This Group Chat reached its storage limit. Start a new Group Chat to continue."
+        )
+    gateway_bytes = int(
+        conn.execute(
+            "SELECT COALESCE(SUM(event_bytes), 0) FROM hosted_rooms"
+        ).fetchone()[0]
+    )
+    if gateway_bytes + additional_bytes > gateway_byte_limit:
+        _prune_disbanded_rooms_locked(
+            conn,
+            now=None,
+            max_gateway_event_bytes=max(0, gateway_byte_limit - additional_bytes),
+        )
+        gateway_bytes = int(
+            conn.execute(
+                "SELECT COALESCE(SUM(event_bytes), 0) FROM hosted_rooms"
+            ).fetchone()[0]
+        )
+    if gateway_bytes + additional_bytes > gateway_byte_limit:
+        raise HostedRoomError(
+            "Group Chat storage is full on this host. Delete an old Group Chat and try again."
+        )
+
+
+def _prune_disbanded_rooms_locked(
+    conn: sqlite3.Connection,
+    *,
+    now: float | None,
+    max_gateway_event_bytes: int | None = None,
+) -> int:
+    candidates: set[str] = set()
+    if now is not None:
+        cutoff = now - DISBANDED_ROOM_RETENTION_SECONDS
+        candidates.update(
+            str(row["room_id"])
+            for row in conn.execute(
+                """SELECT room_id FROM hosted_rooms
+                     WHERE disbanded_at IS NOT NULL AND disbanded_at<=?""",
+                (cutoff,),
+            ).fetchall()
+        )
+    candidates.update(
+        str(row["room_id"])
+        for row in conn.execute(
+            """SELECT room_id FROM hosted_rooms
+                 WHERE disbanded_at IS NOT NULL
+                 ORDER BY disbanded_at DESC, room_id ASC
+                 LIMIT -1 OFFSET ?""",
+            (MAX_DISBANDED_ROOM_TOMBSTONES,),
+        ).fetchall()
+    )
+    if max_gateway_event_bytes is not None:
+        retained_bytes = int(
+            conn.execute(
+                "SELECT COALESCE(SUM(event_bytes), 0) FROM hosted_rooms"
+            ).fetchone()[0]
+        )
+        if retained_bytes > max_gateway_event_bytes:
+            for row in conn.execute(
+                """SELECT room_id, event_bytes FROM hosted_rooms
+                     WHERE disbanded_at IS NOT NULL
+                     ORDER BY disbanded_at ASC, room_id ASC"""
+            ).fetchall():
+                room_id = str(row["room_id"])
+                if room_id not in candidates:
+                    candidates.add(room_id)
+                retained_bytes -= int(row["event_bytes"])
+                if retained_bytes <= max_gateway_event_bytes:
+                    break
+    if not candidates:
+        return 0
+
+    placeholders = ",".join("?" for _ in candidates)
+    room_ids = tuple(sorted(candidates))
+    conn.execute(
+        f"DELETE FROM hosted_room_events WHERE room_id IN ({placeholders})",
+        room_ids,
+    )
+    conn.execute(
+        f"DELETE FROM hosted_rooms WHERE room_id IN ({placeholders})",
+        room_ids,
+    )
+    return len(room_ids)
+
+
+def prune_disbanded_rooms(
+    db_path: Path | str,
+    *,
+    now: float | None = None,
+) -> int:
+    """Purge only deleted Group Chats after a bounded tombstone window."""
+
+    timestamp = time.time() if now is None else float(now)
+    with _transaction(db_path, immediate=True) as conn:
+        return _prune_disbanded_rooms_locked(conn, now=timestamp)
+
+
 def _event_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, Any]:
     return {
         "room_id": row["room_id"],
@@ -434,8 +590,8 @@ def create_room(
     with _transaction(db_path, immediate=True) as conn:
         existing = conn.execute(
             """SELECT room_id, name, members_json, authority_gateway_id,
-                      authority_epoch, next_seq, revision, created_at, updated_at,
-                      disbanded_at
+                      authority_epoch, next_seq, event_bytes, revision,
+                      created_at, updated_at, disbanded_at
                FROM hosted_rooms WHERE room_id=?""",
             (room_id,),
         ).fetchone()
@@ -464,6 +620,18 @@ def create_room(
                     label="payload",
                     max_bytes=MAX_EVENT_JSON_BYTES,
                 )
+                claim_bytes = _event_storage_bytes(
+                    event_id="system:authority-adopted",
+                    kind="authority.claimed",
+                    actor_json=claim_actor_json,
+                    payload_json=claim_payload_json,
+                )
+                _assert_event_capacity(
+                    conn,
+                    room=existing,
+                    additional_bytes=claim_bytes,
+                    allow_control=True,
+                )
                 conn.execute(
                     """INSERT INTO hosted_room_events
                        (room_id, seq, event_id, kind, actor_json,
@@ -483,13 +651,14 @@ def create_room(
                     """UPDATE hosted_rooms
                           SET authority_gateway_id=?, authority_epoch=?,
                               next_seq=next_seq+1, revision=revision+1,
-                              updated_at=?
+                              event_bytes=event_bytes+?, updated_at=?
                         WHERE room_id=? AND authority_gateway_id='legacy'
                           AND authority_epoch=? AND next_seq=?
                           AND disbanded_at IS NULL""",
                     (
                         authority_gateway_id,
                         target_epoch,
+                        claim_bytes,
                         now,
                         room_id,
                         int(existing["authority_epoch"]),
@@ -526,12 +695,22 @@ def create_room(
                 )
             return _room_from_row(existing, idempotent=True)
 
+        active_rooms = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM hosted_rooms WHERE disbanded_at IS NULL"
+            ).fetchone()[0]
+        )
+        if active_rooms >= MAX_ACTIVE_ROOMS:
+            raise HostedRoomError(
+                "This host has too many active Group Chats. Delete one and try again."
+            )
+
         conn.execute(
             """INSERT INTO hosted_rooms
                (room_id, name, members_json, authority_gateway_id,
-                authority_epoch, next_seq, revision,
+                authority_epoch, next_seq, event_bytes, revision,
                 created_at, updated_at, disbanded_at)
-               VALUES (?, ?, ?, ?, 1, 1, 1, ?, ?, NULL)""",
+               VALUES (?, ?, ?, ?, 1, 1, 0, 1, ?, ?, NULL)""",
             (room_id, name, members_json, authority_gateway_id, now, now),
         )
         row = conn.execute(
@@ -551,17 +730,29 @@ def list_rooms(
     db_path: Path | str,
     *,
     include_disbanded: bool = False,
+    limit: int = MAX_ROOM_LIST_LIMIT,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Return hosted rooms ordered by most recent change."""
-    with _transaction(db_path) as conn:
+    """Return one bounded page of rooms ordered by most recent change."""
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= MAX_ROOM_LIST_LIMIT
+    ):
+        raise HostedRoomError(f"limit must be between 1 and {MAX_ROOM_LIST_LIMIT}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise HostedRoomError("offset must be a non-negative integer")
+    with _transaction(db_path, immediate=True) as conn:
+        _prune_disbanded_rooms_locked(conn, now=None)
         rows = conn.execute(
             """SELECT room_id, name, members_json, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at,
                       disbanded_at
                FROM hosted_rooms
                WHERE disbanded_at IS NULL OR ?
-               ORDER BY updated_at DESC, room_id ASC""",
-            (int(include_disbanded),),
+               ORDER BY updated_at DESC, room_id ASC
+               LIMIT ? OFFSET ?""",
+            (int(include_disbanded), limit, offset),
         ).fetchall()
     return [_room_from_row(row) for row in rows]
 
@@ -649,7 +840,7 @@ def append_event(
             return _event_from_row(existing, idempotent=True)
 
         room = conn.execute(
-            """SELECT next_seq, authority_gateway_id, authority_epoch
+            """SELECT next_seq, event_bytes, authority_gateway_id, authority_epoch
                   FROM hosted_rooms
                WHERE room_id=? AND disbanded_at IS NULL""",
             (room_id,),
@@ -662,6 +853,23 @@ def append_event(
         ):
             raise AuthorityConflictError("stale hosted room authority")
         seq = int(room["next_seq"])
+        event_bytes = _event_storage_bytes(
+            event_id=event_id,
+            kind=kind,
+            actor_json=actor_json,
+            payload_json=payload_json,
+        )
+        _assert_event_capacity(
+            conn,
+            room=room,
+            additional_bytes=event_bytes,
+            allow_control=kind
+            in {
+                "authority.claimed",
+                "authority.lost",
+                "room.disbanded",
+            },
+        )
         conn.execute(
             """INSERT INTO hosted_room_events
                (room_id, seq, event_id, kind, actor_json, authority_epoch,
@@ -680,9 +888,9 @@ def append_event(
         )
         advanced = conn.execute(
             """UPDATE hosted_rooms
-               SET next_seq=?, updated_at=?
+               SET next_seq=?, event_bytes=event_bytes+?, updated_at=?
                WHERE room_id=? AND next_seq=?""",
-            (seq + 1, now, room_id, seq),
+            (seq + 1, event_bytes, now, room_id, seq),
         )
         if advanced.rowcount != 1:
             raise RuntimeError("hosted room sequence advance lost its write fence")
@@ -801,7 +1009,7 @@ def claim_authority(
 
     with _transaction(db_path, immediate=True) as conn:
         row = conn.execute(
-            """SELECT authority_gateway_id, authority_epoch, next_seq
+            """SELECT authority_gateway_id, authority_epoch, next_seq, event_bytes
                  FROM hosted_rooms
                 WHERE room_id=? AND disbanded_at IS NULL""",
             (room_id,),
@@ -835,6 +1043,18 @@ def claim_authority(
             raise AuthorityConflictError("hosted room authority changed")
         else:
             seq = int(row["next_seq"])
+            claim_bytes = _event_storage_bytes(
+                event_id=event_id,
+                kind="authority.claimed",
+                actor_json=claim_actor_json,
+                payload_json=claim_payload_json,
+            )
+            _assert_event_capacity(
+                conn,
+                room=row,
+                additional_bytes=claim_bytes,
+                allow_control=True,
+            )
             conn.execute(
                 """INSERT INTO hosted_room_events
                    (room_id, seq, event_id, kind, actor_json, authority_epoch,
@@ -853,11 +1073,13 @@ def claim_authority(
             updated = conn.execute(
                 """UPDATE hosted_rooms
                       SET authority_gateway_id=?, authority_epoch=authority_epoch+1,
-                          next_seq=next_seq+1, revision=revision+1, updated_at=?
+                          next_seq=next_seq+1, event_bytes=event_bytes+?,
+                          revision=revision+1, updated_at=?
                     WHERE room_id=? AND disbanded_at IS NULL
                       AND authority_gateway_id=? AND authority_epoch=?""",
                 (
                     new_gateway_id,
+                    claim_bytes,
                     now,
                     room_id,
                     expected_gateway_id,
@@ -908,7 +1130,7 @@ def disband_room(
 
     with _transaction(db_path, immediate=True) as conn:
         room = conn.execute(
-            """SELECT authority_epoch, next_seq, disbanded_at
+            """SELECT authority_epoch, next_seq, event_bytes, disbanded_at
                  FROM hosted_rooms WHERE room_id=?""",
             (room_id,),
         ).fetchone()
@@ -943,6 +1165,18 @@ def disband_room(
             label="payload",
             max_bytes=MAX_EVENT_JSON_BYTES,
         )
+        disband_bytes = _event_storage_bytes(
+            event_id="system:room-disbanded",
+            kind="room.disbanded",
+            actor_json=actor_json,
+            payload_json=payload_json,
+        )
+        _assert_event_capacity(
+            conn,
+            room=room,
+            additional_bytes=disband_bytes,
+            allow_control=True,
+        )
         conn.execute(
             """INSERT INTO hosted_room_events
                (room_id, seq, event_id, kind, actor_json, authority_epoch,
@@ -960,9 +1194,9 @@ def disband_room(
         updated = conn.execute(
             """UPDATE hosted_rooms
                SET disbanded_at=?, updated_at=?, revision=revision+1,
-                   next_seq=next_seq+1
+                   next_seq=next_seq+1, event_bytes=event_bytes+?
                WHERE room_id=? AND disbanded_at IS NULL""",
-            (now, now, room_id),
+            (now, now, disband_bytes, room_id),
         )
         if updated.rowcount != 1:
             raise RoomConflictError("hosted room disband lost its fence")
@@ -975,6 +1209,11 @@ def disband_room(
         ).fetchone()
         if event is None:  # pragma: no cover - inserted in this transaction
             raise RuntimeError("room disband event could not be reloaded")
+        _prune_disbanded_rooms_locked(
+            conn,
+            now=now,
+            max_gateway_event_bytes=MAX_GATEWAY_EVENT_BYTES,
+        )
     return {
         "room_id": room_id,
         "disbanded_at": now,
