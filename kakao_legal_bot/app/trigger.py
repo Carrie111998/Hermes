@@ -38,6 +38,8 @@ CLIENT_COMMANDS = {
     "도움말": "help",
     "help": "help",
     "이메일": "set_email",
+    # 변호사 셀프 등록 — ADMIN_TOKEN 을 아는 사람만 통과합니다.
+    "등록": "register_lawyer",
     "메일": "set_email",
     "변호사": "escalate",
     "변호사님": "escalate",
@@ -109,10 +111,18 @@ def bot_names(settings: Settings) -> list[str]:
     return [name for name in dict.fromkeys(names) if name]
 
 
-def is_lawyer(event: IrisEvent, settings: Settings) -> bool:
+def is_lawyer(
+    event: IrisEvent, settings: Settings, extra_ids: frozenset[str] | set[str] = frozenset()
+) -> bool:
+    """변호사인가 — 설정의 아이디 목록에 더해, /등록 으로 등록한 계정도.
+
+    ``extra_ids`` 는 서버가 켜진 뒤 `/등록 <토큰>` 으로 들어온 아이디입니다.
+    환경변수를 고치고 재배포하지 않아도 변호사 권한이 붙습니다.
+    """
     if settings.lawyer_room_id and event.room_id == settings.lawyer_room_id:
         return True
     ids = {value.lower() for value in settings.lawyer_kakao_ids}
+    ids.update(value.lower() for value in extra_ids)
     if not ids:
         return False
     return event.sender_id.lower() in ids or event.sender_name.lower() in ids
@@ -125,9 +135,10 @@ def decide(
     room_kind: str = "unknown",
     muted: bool = False,
     lawyer_takeover: bool = False,
+    extra_lawyer_ids: frozenset[str] | set[str] = frozenset(),
 ) -> Decision:
     names = bot_names(settings)
-    lawyer = is_lawyer(event, settings)
+    lawyer = is_lawyer(event, settings, extra_lawyer_ids)
 
     if not event.is_text:
         return Decision(Action.IGNORE, reason="non-text message")

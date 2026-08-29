@@ -66,9 +66,16 @@ class Sender:
             raise
 
     async def notify_lawyer(self, text: str) -> bool:
-        """Ping the lawyer's own room. No-op when it is not configured."""
+        """Ping the lawyer's own room. No-op when it is not configured.
+
+        방은 두 곳에서 옵니다 — 환경변수 ``LAWYER_ROOM_ID``, 또는 변호사가
+        자기 1:1 방에서 ``/등록 <토큰>`` 을 보내 kv 에 저장한 방. 후자 덕에
+        방 id 를 몰라도 등록 한 번이면 알림이 붙습니다.
+        """
         room = self._settings.lawyer_room_id
         if not room:
-            log.info("LAWYER_ROOM_ID unset — lawyer notification skipped: %s", text[:80])
+            room = await asyncio.to_thread(self._db.kv_get, "lawyer_room_id")
+        if not room:
+            log.info("변호사 방 미등록 — 알림 생략: %s", text[:80])
             return False
         return await self.send(room, text, record_role="")

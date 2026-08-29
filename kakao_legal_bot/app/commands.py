@@ -73,6 +73,33 @@ async def handle_command(services: Services, event: IrisEvent, decision: Decisio
         await reply(f"{settings.lawyer_name}님께 전달드렸습니다. 확인 후 이 방에서 직접 답변드릴 예정입니다.")
         return
 
+    if command == "register_lawyer":
+        # 변호사 셀프 등록: 변호사 본인 폰에서 봇과의 1:1 방에 "/등록 <토큰>".
+        # 이 방이 알림 방이 되고 이 계정에 변호사 권한이 붙습니다 — 방 id 를
+        # 찾아 환경변수에 넣고 재배포하는 일이 통째로 사라집니다.
+        token = args.strip()
+        if not settings.admin_token or token != settings.admin_token:
+            log.warning("register_lawyer rejected in room %s", room)
+            return  # 침묵 — 오답에 반응하면 토큰을 맞혀 보라고 알려주는 셈
+        await asyncio.to_thread(db.kv_set, "lawyer_room_id", room)
+        lawyer_id = (event.sender_id or event.sender_name).strip()
+        if lawyer_id:
+            known = {
+                value
+                for value in (await asyncio.to_thread(db.kv_get, "lawyer_kakao_id")).split(",")
+                if value.strip()
+            }
+            known.add(lawyer_id)
+            await asyncio.to_thread(db.kv_set, "lawyer_kakao_id", ",".join(sorted(known)))
+            services.extra_lawyer_ids.add(lawyer_id)
+        await asyncio.to_thread(db.set_room_flag, room, "intro_sent", 1)
+        await reply(
+            "✅ 이 방을 변호사 알림 방으로 등록했습니다.\n"
+            "새 상담 접수·상담보고서·초안이 여기로 옵니다.\n"
+            "변호사 명령: /도움말"
+        )
+        return
+
     # ── lawyer commands ──────────────────────────────────────────────────
     if not decision.is_lawyer:
         return

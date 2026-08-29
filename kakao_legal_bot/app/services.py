@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -42,6 +42,9 @@ class Services:
     # thing and an unbounded fan-out during a busy hour is how you blow
     # through a rate limit and start failing every room at once.
     semaphore: asyncio.Semaphore | None = None
+    # `/등록 <토큰>` 으로 등록된 변호사 계정. kv 에 저장되어 재시작을 견디고,
+    # 환경변수를 고치지 않아도 변호사 권한이 붙습니다.
+    extra_lawyer_ids: set[str] = field(default_factory=set)
 
     async def aclose(self) -> None:
         await self.iris.aclose()
@@ -81,8 +84,20 @@ def build_services(settings: Settings | None = None) -> Services:
     db = Database(settings.db_path)
     # One index per corpus (data/rag/*.sqlite3), with the old single file
     # picked up as a collection of its own so an upgrade needs no re-index.
-    rag = MultiRagStore.discover(settings.rag_dir, legacy=settings.data_dir / "rag.sqlite3")
-    log.info("rag collections: %s", ", ".join(rag.collections()) or "(none)")
+    # RAG_ENABLED=false 이거나 아직 아무것도 색인하지 않았으면 검색 도구를
+    # 아예 붙이지 않습니다 — 빈 색인을 뒤지느라 도구 호출을 낭비하는 대신
+    # 제미나이가 자기 법률지식으로 바로 답하게 하는 편이 낫습니다.
+    rag: MultiRagStore | None = None
+    if settings.rag_enabled:
+        store = MultiRagStore.discover(settings.rag_dir, legacy=settings.data_dir / "rag.sqlite3")
+        if store.stats().get("chunks", 0) > 0:
+            rag = store
+            log.info("rag collections: %s", ", ".join(store.collections()))
+        else:
+            store.close()
+            log.info("rag index is empty — 검색 도구 없이 (모델 자체 지식으로) 동작합니다")
+    else:
+        log.info("RAG_ENABLED=false — 검색 도구 없이 동작합니다")
 
     # 위키 그래프는 있을 때만 붙입니다. 없으면 그래프 검색 도구가 빠질 뿐,
     # 나머지 상담은 그대로 돕니다.
@@ -144,4 +159,7 @@ def build_services(settings: Settings | None = None) -> Services:
         law=law,
         llm=llm,
         semaphore=asyncio.Semaphore(max(1, settings.global_concurrency)),
+        extra_lawyer_ids={
+            value for value in db.kv_get("lawyer_kakao_id").split(",") if value.strip()
+        },
     )

@@ -95,7 +95,7 @@ class Pipeline:
             await asyncio.to_thread(
                 db.add_message,
                 room_id,
-                "lawyer" if _is_lawyer_row(event, settings) else "user",
+                "lawyer" if _is_lawyer_row(event, settings, services.extra_lawyer_ids) else "user",
                 event.text,
                 event.sender_name if settings.store_raw_sender else "",
                 sender_key,
@@ -117,6 +117,7 @@ class Pipeline:
             room_kind=str(room["kind"]),
             muted=bool(room["muted"]),
             lawyer_takeover=bool(room["lawyer_takeover"]),
+            extra_lawyer_ids=services.extra_lawyer_ids,
         )
         log.info(
             "room=%s sender=%s action=%s reason=%s",
@@ -175,7 +176,7 @@ class Pipeline:
             return False
         if event.room_id == settings.lawyer_room_id:
             return False
-        if _is_lawyer_row(event, settings):
+        if _is_lawyer_row(event, settings, self.services.extra_lawyer_ids):
             return False
         # 봇 자신의 발신 에코와 무시 목록 — 변호사가 듀얼번호 계정으로 먼저
         # 말을 건 방에 봇이 끼어들어 인사하면 안 됩니다.
@@ -368,6 +369,14 @@ class Pipeline:
             await asyncio.to_thread(
                 _apply_intake_actions, services.db, room_id, result.state.intake_actions
             )
+            # 상담보고서가 완성되면 변호사 카톡으로 전문이 갑니다 — 문서 진행
+            # 여부와 무관하게, 보고서 자체가 변호사가 기다리는 결과물입니다.
+            for action in result.state.intake_actions:
+                if action.kind == "report" and action.report.strip():
+                    self._notify_lawyer_detached(
+                        _report_alert(services.db, event, action)
+                    )
+                    break
 
         # Follow-ups. Fire-and-forget: the client already has their answer.
         if result.state.draft_request or result.state.escalation:
@@ -419,6 +428,24 @@ class Pipeline:
         return count >= cap
 
 
+def _report_alert(db, event: IrisEvent, action) -> str:  # noqa: ANN001
+    """완성된 상담보고서를 변호사 카톡용 한 통으로."""
+    consult_id: object = "-"
+    with contextlib.suppress(Exception):
+        consult_id = int(db.get_or_create_consultation(event.room_id, event.sender_name)["id"])
+    report = action.report.strip()
+    if len(report) > 3500:
+        report = report[:3500] + "\n…(길어서 줄였습니다 — 전문은 업무 현황 페이지에)"
+    head = (
+        f"📋 상담보고서 완성 — 접수번호 {consult_id}\n"
+        f"문서: {action.doc_kind or '미정'} · 사건유형: {action.case_type or '보고서 참조'}\n"
+        f"방: {event.room_name or event.room_id}"
+    )
+    if action.missing:
+        head += f"\n미확인 사항: {action.missing}"
+    return f"{head}\n———\n{report}"
+
+
 def _apply_intake_actions(db, room_id: str, actions) -> None:  # noqa: ANN001
     """Write the intake steps the model took during this turn."""
     for action in actions:
@@ -455,8 +482,9 @@ def _apply_intake_actions(db, room_id: str, actions) -> None:  # noqa: ANN001
             log.exception("could not record intake action %s in room %s", action.kind, room_id)
 
 
-def _is_lawyer_row(event: IrisEvent, settings) -> bool:  # noqa: ANN001
+def _is_lawyer_row(event: IrisEvent, settings, extra_ids=frozenset()) -> bool:  # noqa: ANN001
     ids = {value.lower() for value in settings.lawyer_kakao_ids}
+    ids.update(value.lower() for value in extra_ids)
     if not ids:
         return False
     return event.sender_id.lower() in ids or event.sender_name.lower() in ids

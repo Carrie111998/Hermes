@@ -212,6 +212,9 @@ class Settings:
 
     # ── RAG ──────────────────────────────────────────────────────────────
     corpus_dir: Path = field(default_factory=lambda: Path(_env("CORPUS_DIR", "./corpus")))
+    # false 로 두면 로컬 자료 검색 도구를 붙이지 않습니다 — 1차 가동처럼
+    # 모델 자체 지식만으로 돌릴 때. 색인이 비어 있으면 어차피 자동 생략됩니다.
+    rag_enabled: bool = field(default_factory=lambda: _env_bool("RAG_ENABLED", True))
     # One SQLite index per corpus lives here. Splitting them is what keeps
     # search at ~85ms instead of ~2s once the library passes a gigabyte.
     rag_dir_override: Path | None = field(
