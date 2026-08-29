@@ -3285,7 +3285,14 @@ def transcribe_audio_local_fallback(
     local_cfg = stt_config.get("local") or {}
     local_model = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
 
-    if _HAS_FASTER_WHISPER:
+    # This fallback is opportunistic: the user selected another provider and
+    # did not opt the long-lived gateway process into a native STT runtime.
+    # On Windows, CTranslate2/faster-whisper access violations terminate the
+    # whole process before Python can catch them. Keep explicit local-provider
+    # selection unchanged, but never enter that native stack as a cloud-failure
+    # fallback. A local command remains safe because it already runs out of
+    # process.
+    if _HAS_FASTER_WHISPER and _allow_inprocess_faster_whisper_fallback():
         return _transcribe_local(
             file_path,
             _normalize_local_model(local_model),
@@ -3295,12 +3302,27 @@ def transcribe_audio_local_fallback(
             file_path,
             _normalize_local_command_model(local_model),
         )
+    if _HAS_FASTER_WHISPER and not _allow_inprocess_faster_whisper_fallback():
+        return {
+            "success": False,
+            "transcript": "",
+            "error": (
+                "In-process faster-whisper fallback is disabled on Windows; "
+                "the configured STT provider error was preserved."
+            ),
+            "provider": "local",
+        }
     return {
         "success": False,
         "transcript": "",
         "error": "No installed local STT backend is available.",
         "provider": "local",
     }
+
+
+def _allow_inprocess_faster_whisper_fallback() -> bool:
+    """Return whether opportunistic native STT is safe in this process."""
+    return os.name != "nt"
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:

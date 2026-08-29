@@ -220,6 +220,9 @@ class TestLocalFallback:
             "tools.transcription_tools._HAS_FASTER_WHISPER",
             True,
         ), patch(
+            "tools.transcription_tools._allow_inprocess_faster_whisper_fallback",
+            return_value=True,
+        ), patch(
             "tools.transcription_tools._transcribe_local",
             return_value={"success": True, "transcript": "local result"},
         ) as mock_local:
@@ -243,6 +246,31 @@ class TestLocalFallback:
 
         assert result["success"] is False
         assert "installed local STT" in result["error"]
+
+    @pytest.mark.windows_only
+    def test_cloud_fallback_does_not_enter_faster_whisper_on_windows(self, tmp_path):
+        audio_file = tmp_path / "telegram-voice.ogg"
+        audio_file.write_bytes(b"fake audio")
+
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"provider": "openai", "local": {"model": "small"}},
+        ), patch(
+            "tools.transcription_tools._HAS_FASTER_WHISPER",
+            True,
+        ), patch(
+            "tools.transcription_tools._has_local_command",
+            return_value=False,
+        ), patch(
+            "tools.transcription_tools._transcribe_local",
+        ) as mock_local:
+            from tools.transcription_tools import transcribe_audio_local_fallback
+
+            result = transcribe_audio_local_fallback(str(audio_file))
+
+        assert result["success"] is False
+        assert result["provider"] == "local"
+        mock_local.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
