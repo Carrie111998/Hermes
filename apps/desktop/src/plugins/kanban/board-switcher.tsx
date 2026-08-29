@@ -206,12 +206,7 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
     >
       {/* Enter submits only while the scope is untouched — once a project is
           picked the choice is worth a deliberate click. */}
-      <BoardNameField
-        onChange={setName}
-        onEnter={() => slug && !project && create.mutate()}
-        slug={slug}
-        value={name}
-      />
+      <BoardNameField onChange={setName} onEnter={() => slug && !project && create.mutate()} slug={slug} value={name} />
       <ProjectPicker onChange={setProject} value={project} />
     </BoardDialog>
   )
@@ -223,6 +218,11 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
 function RenameBoardDialog({ board, onClose }: { board: BoardMeta | null; onClose: () => void }) {
   const k = useKanban()
   const [name, setName] = useState('')
+  // The dialog stays mounted while closed, so `board` is null most of the
+  // time. Resolve the slug here rather than inside the mutation: the React
+  // Compiler lifts a callback's property reads into its render-time
+  // dependency check, which would deref that null on every closed render.
+  const slug = board?.slug ?? ''
 
   useEffect(() => {
     if (board) {
@@ -230,7 +230,7 @@ function RenameBoardDialog({ board, onClose }: { board: BoardMeta | null; onClos
     }
   }, [board])
 
-  const save = useBoardWrite(() => updateBoard(board!.slug, { name: name.trim() }), onClose)
+  const save = useBoardWrite(() => updateBoard(slug, { name: name.trim() }), onClose)
   const disabled = !name.trim() || save.isPending
 
   return (
@@ -242,12 +242,7 @@ function RenameBoardDialog({ board, onClose }: { board: BoardMeta | null; onClos
       open={Boolean(board)}
       title={k.renameBoardTitle}
     >
-      <BoardNameField
-        onChange={setName}
-        onEnter={() => !disabled && save.mutate()}
-        slug={board?.slug ?? ''}
-        value={name}
-      />
+      <BoardNameField onChange={setName} onEnter={() => !disabled && save.mutate()} slug={slug} value={name} />
     </BoardDialog>
   )
 }
@@ -255,6 +250,9 @@ function RenameBoardDialog({ board, onClose }: { board: BoardMeta | null; onClos
 function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onClose: () => void }) {
   const k = useKanban()
   const [project, setProject] = useState('')
+  // Null while closed — see RenameBoardDialog on why this can't live inside
+  // the mutation callback.
+  const slug = board?.slug ?? ''
 
   useEffect(() => {
     if (board) {
@@ -264,7 +262,7 @@ function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onCl
 
   // The name lives in the rename dialog; '' clears the scope, which also
   // drops the mirrored default_workdir on the backend.
-  const save = useBoardWrite(() => updateBoard(board!.slug, { project_id: project }), onClose)
+  const save = useBoardWrite(() => updateBoard(slug, { project_id: project }), onClose)
 
   return (
     <BoardDialog
