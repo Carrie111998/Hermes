@@ -2199,6 +2199,7 @@ class PluginContext:
         description: str = "",
         args_hint: str = "",
         argument_mode: str | None = None,
+        *,
         busy_safe_subcommands: Iterable[str] = (),
     ) -> Optional[PluginRegistration]:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.

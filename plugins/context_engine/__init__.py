@@ -220,6 +220,7 @@ class _EngineCollector:
         description: str = "",
         args_hint: str = "",
         argument_mode: str | None = None,
+        *,
         busy_safe_subcommands=(),
     ) -> None:
         """Forward to the global plugin command registry."""
