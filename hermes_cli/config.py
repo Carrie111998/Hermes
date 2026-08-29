@@ -5667,7 +5667,7 @@ def _lookup_old_value(key: str):
         return None
 
 
-def _gate_redacted(value, key) -> str:
+def _gate_redacted(value, key):
     """Mask credential-shaped values so the gate notice/refusal never leaks a secret.
 
     ``_is_model_routing_key`` matches ``model.*``, which includes
@@ -5678,6 +5678,14 @@ def _gate_redacted(value, key) -> str:
     value whose leaf key is credential-shaped is redacted for display.
     """
     leaf = key.rsplit(".", 1)[-1].lower()
+    if isinstance(value, dict):
+        # Section writes (--force delegation / auxiliary) can carry nested
+        # credential-shaped leaves; sanitize recursively (Flash R2 SHOULD-FIX).
+        return {
+            k: _gate_redacted(v, f"{key}.{k}") if isinstance(v, (dict, list))
+            else (_gate_redacted(v, f"{key}.{k}") if isinstance(v, str) and v else v)
+            for k, v in value.items()
+        }
     if leaf in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
         from agent.redact import mask_secret
 
