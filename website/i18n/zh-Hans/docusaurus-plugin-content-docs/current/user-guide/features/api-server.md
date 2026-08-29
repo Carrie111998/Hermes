@@ -349,6 +349,9 @@ API 服务器提供对 hermes-agent 工具集的完整访问权限，**包括终
 | `API_SERVER_KEY` | _（无）_ | 认证用 Bearer token |
 | `API_SERVER_CORS_ORIGINS` | _（无）_ | 逗号分隔的允许浏览器来源 |
 | `API_SERVER_MODEL_NAME` | _（profile 名称）_ | `/v1/models` 上的模型名称。默认为 profile 名称，默认 profile 则为 `hermes-agent`。 |
+| `API_UPLOAD_FILES_URL` | _（无）_ | 远程文件上传端点(如 `https://api.example.com/v1/files`)。设置后,agent 技能生成的文件将被上传到此 URL。 |
+| `API_UPLOAD_FILES_KEY` | _（无）_ | `API_UPLOAD_FILES_URL` 端点的 Bearer token。 |
+| `API_UPLOAD_FILES_DOWNLOAD_URL` | _（无）_ | 包含 `{file_id}` 占位符的下载 URL 模板(如 `https://api.example.com/v1/files/{file_id}/content`)。设置后,响应中的文件链接指向此 URL,注释使用 `url_citation` 类型。 |
 
 ### config.yaml
 
@@ -433,11 +436,103 @@ hermes -p bob gateway &
 
 在 Open WebUI 中，将每个添加为单独的连接。模型下拉列表显示 `alice` 和 `bob` 作为不同模型，每个均由完全隔离的 Hermes 实例支持。详见 [Open WebUI 指南](/user-guide/messaging/open-webui#multi-user-setup-with-profiles)。
 
+## 文件交付
+
+agent 技能（powerpoint、图表生成、PDF 导出等）可能会生成需要交付给 API 客户端的文件。配置 `API_UPLOAD_FILES_URL` 后，API 服务器会自动：
+
+1. **检测文件** — 扫描 agent 响应中的 `MEDIA:/absolute/path/to/file` 标签和裸本地文件路径
+2. **上传** — 将每个文件以 `multipart/form-data` 形式 POST 到 `API_UPLOAD_FILES_URL`
+3. **替换引用** — 将响应文本中的 `MEDIA:` 标签替换为 `[filename](url)` markdown 链接,保留原始位置
+4. **添加注释** — 通过 `output_text.annotations` 在 Responses API 输出中包含结构化元数据
+
+### 示例
+
+处理前的 agent 响应:
+```
+Report generated.
+MEDIA:/tmp/report.pdf
+```
+
+处理后(配置了下载 URL):
+```json
+{
+  "type": "output_text",
+  "text": "Report generated.\n[report.pdf](https://api.example.com/v1/files/file_abc123/content)",
+  "annotations": [
+    {
+      "type": "url_citation",
+      "url": "https://api.example.com/v1/files/file_abc123/content",
+      "title": "report.pdf",
+      "start_index": 18,
+      "end_index": 84
+    }
+  ]
+}
+```
+
+未配置 `API_UPLOAD_FILES_DOWNLOAD_URL` 时,注释使用 `file_citation` 类型:
+```json
+{
+  "annotations": [
+    {
+      "type": "file_citation",
+      "file_id": "file_abc123",
+      "filename": "report.pdf",
+      "index": 0
+    }
+  ]
+}
+```
+
+### agent 如何知道使用 MEDIA:
+
+agent 的系统 prompt 指示它使用 `MEDIA:/absolute/path/to/file` 语法进行文件交付。prompt 明确告诉 agent 不要用反引号包裹路径——以纯文本形式书写,以便提取层能够检测:
+
+> 交付文件时,请在响应中包含 MEDIA:/absolute/path/to/file——文件将被上传并提供下载。重要提示:不要用反引号(`)或代码围栏包裹 MEDIA: 标签或文件路径。
+
+### 错误恢复
+
+如果文件上传失败(网络错误、文件未找到、服务器拒绝),将记录错误并在不包含该文件的情况下交付响应。MEDIA: 标签仍会从文本中剥离,因此用户永远不会看到原始标记。其他成功上传的文件不受影响。
+
+### 未配置上传时
+
+未设置 `API_UPLOAD_FILES_URL` 时,响应文本保持原样输出——MEDIA: 标签和文件路径均不做修改。不发出注释。
+
+### 配置
+
+添加到 `~/.hermes/.env`:
+
+```bash
+# 必填: 远程上传端点(如 OpenAI Files API)
+API_UPLOAD_FILES_URL=https://api.example.com/v1/files
+
+# 可选: 上传端点的 bearer token
+API_UPLOAD_FILES_KEY=sk-...
+
+# 可选: 包含 {file_id} 占位符的下载 URL 模板
+API_UPLOAD_FILES_DOWNLOAD_URL=https://api.example.com/v1/files/{file_id}/content
+```
+
+**配置后的效果:**
+
+| 行为 | 未配置 `API_UPLOAD_FILES_URL` | 已配置 `API_UPLOAD_FILES_URL` |
+|------|-------------------------------|-------------------------------|
+| agent 生成的文件 | 响应文本保持原样输出(MEDIA: 标签保留) | 文件上传到远程服务器;MEDIA: 标签替换为 `[filename](url)` markdown 链接 |
+| Responses API 注释 | 不发出注释 | 向 `output_text.annotations` 添加 `url_citation`(有下载 URL 时)或 `file_citation`(无下载 URL 时) |
+| 上传失败 | 不适用 | 记录错误并跳过该文件;MEDIA: 标签仍会被剥离;其他文件不受影响 |
+
+**约束条件:**
+
+- **上传端点契约** — 必须接受带有 `purpose` 和 `file` 字段的 `multipart/form-data` POST 请求;必须返回至少包含 `id` 字段的 JSON 对象(如 `{"id": "file_abc123", "bytes": 12345, "filename": "report.pdf"}`)。返回的文件名会经过 URL 解码后使用。
+- **大小限制** — 大于 100 MB 的文件会被跳过(读取前检查,避免内存耗尽)。
+- **安全性** — 所有文件路径都通过拒绝列表验证,阻止凭据文件、系统路径和目录遍历尝试。
+- **并发性** — 单个响应中的所有文件并发上传。
+
 ## 限制
 
-- **响应存储** — 存储的响应（用于 `previous_response_id`）持久化在 SQLite 中，gateway 重启后仍然存在。最多存储 100 个响应（LRU 淘汰）。
-- **不支持文件上传** — 两个端点（`/v1/chat/completions` 和 `/v1/responses`）均支持内联图像，但不支持通过 API 上传文件（`file`、`input_file`、`file_id`）和非图像文档输入。
-- **model 字段仅为展示用途** — 请求中的 `model` 字段会被接受，但实际使用的 LLM 模型在服务端的 config.yaml 中配置。
+- **响应存储** — 存储的响应(用于 `previous_response_id`)持久化在 SQLite 中,gateway 重启后仍然存在。最多存储 100 个响应(LRU 淘汰)。
+- **仅支持输入内联图像** — 两个端点(`/v1/chat/completions` 和 `/v1/responses`)均支持内联图像,但不支持通过 API 上传文件*输入*(`file`、`input_file`、`file_id`)和非图像文档输入。有关如何将 agent 生成的文件交付给客户端,请参阅上面的[文件交付](#文件交付)。
+- **model 字段仅为展示用途** — 请求中的 `model` 字段会被接受,但实际使用的 LLM 模型在服务端的 config.yaml 中配置。
 
 ## 代理模式
 

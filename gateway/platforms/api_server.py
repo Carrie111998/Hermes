@@ -692,6 +692,12 @@ _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
 def _resolve_media_to_data_urls(text: str) -> str:
     """Replace ``MEDIA:<path>`` image tags with inline base64 data URLs.
 
+    .. note::
+        This function is currently unused. When ``API_UPLOAD_FILES_URL`` is
+        not configured, the response text is returned as-is (MEDIA: tags
+        are preserved). When it is configured, files are uploaded to the
+        remote server and replaced with markdown links.
+
     Remote OpenAI-compatible frontends can't read local file paths, so
     ``MEDIA:`` tags referencing images on the server are useless to them.
     Inline small local images as markdown data URLs; non-image or unreadable
@@ -4892,19 +4898,15 @@ class APIServerAdapter(BasePlatformAdapter):
            link — preserving the original position.
         4. Tags that could not be uploaded are left as-is in the text.
 
-        When ``API_UPLOAD_FILES_URL`` is **not** configured, strips
-        MEDIA: tags and returns an empty file-items list.  Images are
-        NOT inlined — all files (including images) go through the
-        upload pipeline when configured.
+        When ``API_UPLOAD_FILES_URL`` is **not** configured, returns
+        the text as-is and an empty file-items list.
         """
         if not text:
             return text, []
 
-        # Fallback: no upload endpoint configured → strip MEDIA: tags,
-        # keep bare paths and non-image references as-is.
+        # Fallback: no upload endpoint configured → leave text as-is.
         if not self._upload_files_url:
-            _, cleaned = BasePlatformAdapter.extract_media(text)
-            return cleaned.strip(), []
+            return text, []
 
         # 1. Discover files — extract paths from text without modifying it.
         media_files, _ = BasePlatformAdapter.extract_media(text)

@@ -570,7 +570,37 @@ If a file upload fails (network error, file not found, server rejects), the fail
 
 ### Without upload configured
 
-When `API_UPLOAD_FILES_URL` is not set, the API server falls back to its previous behavior: MEDIA: tags are stripped from the response text, small images are inlined as base64 data URLs, and non-image file paths are left as plain text for reference. No annotations are emitted.
+When `API_UPLOAD_FILES_URL` is not set, the response text is returned as-is — MEDIA: tags and file paths are preserved verbatim. No annotations are emitted.
+
+### Configuration
+
+Add to `~/.hermes/.env`:
+
+```bash
+# Required: remote upload endpoint (e.g. OpenAI Files API)
+API_UPLOAD_FILES_URL=https://api.example.com/v1/files
+
+# Optional: bearer token for the upload endpoint
+API_UPLOAD_FILES_KEY=sk-...
+
+# Optional: download URL template with {file_id} placeholder
+API_UPLOAD_FILES_DOWNLOAD_URL=https://api.example.com/v1/files/{file_id}/content
+```
+
+**Effects when configured:**
+
+| Behavior | Without `API_UPLOAD_FILES_URL` | With `API_UPLOAD_FILES_URL` |
+|----------|-------------------------------|----------------------------|
+| Agent-generated files | Response text returned as-is (MEDIA: tags preserved) | Files are uploaded to the remote server; `MEDIA:` tags replaced with `[filename](url)` markdown links |
+| Responses API annotations | None emitted | `url_citation` (with download URL) or `file_citation` (without download URL) added to `output_text.annotations` |
+| Failed uploads | N/A | Logged and skipped; `MEDIA:` tag still stripped; other files unaffected |
+
+**Constraints:**
+
+- **Upload endpoint contract** — must accept `multipart/form-data` POST with `purpose` and `file` fields; must return a JSON object with at least an `id` field (e.g. `{"id": "file_abc123", "bytes": 12345, "filename": "report.pdf"}`). The filename in the response is URL-decoded before use.
+- **Size limit** — files larger than 100 MB are skipped (checked before reading to avoid memory exhaustion).
+- **Security** — all file paths are validated against a denylist that blocks credential files, system paths, and directory traversal attempts.
+- **Concurrency** — all files in a single response are uploaded concurrently.
 
 ## Limitations
 
