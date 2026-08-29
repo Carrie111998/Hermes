@@ -86,6 +86,22 @@ class TestGetTimezone:
         assert isinstance(tz, ZoneInfo)
         assert str(tz) == "Europe/London"
 
+    def test_invalid_timezone_falls_back_to_none(self, caplog):
+        """An unresolvable IANA name must not raise -- get_timezone() falls
+        back to None (meaning: use server-local time) and logs a warning."""
+        os.environ["HERMES_TIMEZONE"] = "Not/AZone"
+        with caplog.at_level(logging.WARNING):
+            tz = hermes_time.get_timezone()
+        assert tz is None
+        assert "Invalid timezone" in caplog.text
+
+    def test_now_falls_back_when_timezone_invalid(self):
+        """now() stays tz-aware (server-local) instead of crashing when the
+        configured timezone name is invalid."""
+        os.environ["HERMES_TIMEZONE"] = "Not/AZone"
+        result = hermes_time.now()
+        assert result.tzinfo is not None
+
 
 
 
