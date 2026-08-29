@@ -853,6 +853,19 @@ export function paneRootSide(paneId: string): null | TreeSide {
   return child ? rootChildSide(child, id => panes.find(p => p.id === id)) : null
 }
 
+/** Whether a pane owns its layout group's active tab and is available in the
+ * strip. Pure over supplied state so titlebar behavior can be tested without
+ * reading global atoms. */
+export function isPaneActiveInLayoutGroup(
+  tree: LayoutNode | null,
+  hiddenStripTabs: ReadonlySet<string>,
+  paneId: string
+): boolean {
+  const group = tree ? findGroupOfPane(tree, paneId) : null
+
+  return group?.active === paneId && !hiddenStripTabs.has(paneId)
+}
+
 /** The closer-less Close: dismiss the pane (removed + remembered; reveal
  *  intent or a layout reset un-dismisses). */
 export function dismissTreePane(paneId: string) {
