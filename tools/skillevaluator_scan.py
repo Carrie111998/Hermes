@@ -119,6 +119,28 @@ def scanner_available() -> bool:
     return shutil.which(SCANNER_BIN) is not None
 
 
+def scanner_readiness() -> dict:
+    """Describe whether the configured advisory scanner layer is usable.
+
+    This is intentionally a cheap, read-only PATH probe. It does not install
+    either optional NVIDIA scanner and does not run a skill scan. The returned
+    shape is suitable for ``hermes doctor`` and other health surfaces.
+    """
+    if not tier1_advisory_enabled():
+        return {"state": "disabled", "missing": []}
+
+    missing = []
+    if shutil.which(SCANNER_BIN) is None:
+        missing.append(SCANNER_BIN)
+    if shutil.which("skillspector") is None:
+        missing.append("skillspector")
+
+    return {
+        "state": "ready" if not missing else "incomplete",
+        "missing": missing,
+    }
+
+
 def tier1_advisory_enabled() -> bool:
     """Read skills.tier1_advisory from config (default True).
 
