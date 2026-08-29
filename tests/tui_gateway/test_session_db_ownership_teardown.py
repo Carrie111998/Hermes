@@ -17,7 +17,7 @@ gaps that survived that change:
 2.  **The other pre-transfer build paths.** ``session.resume`` was not the only
     profile-scoped open. The deferred builder (``_start_agent_build``), the
     branch handler and the compute host all open a dedicated handle, pass it to
-    ``_make_agent``, and had no close on their failure paths.
+    ``_make_agent``, and must close it when ownership is not transferred.
 
 The direction that must NOT regress is asserted everywhere: the shared launch
 handle is never closed, and a handle that WAS transferred is not closed twice.
@@ -379,11 +379,16 @@ def test_deferred_build_closes_the_handle_when_the_session_is_reaped_midbuild(
     handle has to be closed right here instead of handed over.
     """
 
+    captured = {}
+
     def _fake_make_agent(sid, key, session_db=None, **_kwargs):
         # Simulate a concurrent reap landing while the agent was being built.
         with server._sessions_lock:
             server._sessions[sid] = {"session_key": "someone-else"}
-        return types.SimpleNamespace(_session_db=session_db, _owns_session_db=False)
+        agent = types.SimpleNamespace(_session_db=session_db, _owns_session_db=False, closed=0)
+        agent.close = lambda: setattr(agent, "closed", agent.closed + 1)
+        captured["agent"] = agent
+        return agent
 
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
     sid, session = "sid-reaped", _session(build_env.profile_home)
@@ -393,7 +398,8 @@ def test_deferred_build_closes_the_handle_when_the_session_is_reaped_midbuild(
 
     db = build_env.opened[0]
     assert db.closed == 1
-    assert session["agent"]._owns_session_db is False
+    assert session.get("agent") is None
+    assert captured["agent"].closed == 1
 
 
 def test_deferred_build_never_opens_or_closes_for_the_launch_profile(

@@ -140,8 +140,8 @@ def turn_env(server, monkeypatch, tmp_path):
     return emitted
 
 
-def _turn_session(agent, session_key):
-    return {
+def _turn_session(server, agent, session_key, sid="sid"):
+    session = {
         "agent": agent,
         "session_key": session_key,
         "history": [],
@@ -156,6 +156,10 @@ def _turn_session(agent, session_key):
         "tool_progress_mode": "all",
         "inflight_turn": None,
     }
+    # A queued user prompt only preempts the goal continuation if the drain
+    # can prove this record still owns `sid` — register it like a real turn.
+    server._sessions[sid] = session
+    return session
 
 
 def _compression_failure():
@@ -284,7 +288,7 @@ def test_active_goal_retries_once_without_judging_failed_turn(
         run_conversation=run_conversation,
         clear_interrupt=lambda: None,
     )
-    session = _turn_session(agent, session_key)
+    session = _turn_session(server, agent, session_key)
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
@@ -320,7 +324,7 @@ def test_second_consecutive_exhaustion_pauses_goal_instead_of_looping(
         run_conversation=run_conversation,
         clear_interrupt=lambda: None,
     )
-    session = _turn_session(agent, session_key)
+    session = _turn_session(server, agent, session_key)
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
@@ -369,7 +373,7 @@ def test_real_queued_prompt_preempts_goal_compression_retry(
         run_conversation=run_conversation,
         clear_interrupt=lambda: None,
     )
-    session = _turn_session(agent, session_key)
+    session = _turn_session(server, agent, session_key)
     session_holder["session"] = session
 
     server._run_prompt_submit("rid", "sid", session, "initial work")

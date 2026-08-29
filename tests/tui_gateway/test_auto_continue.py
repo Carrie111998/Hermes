@@ -340,6 +340,18 @@ def test_running_session_wins_over_continuation(emits, schedule_env, marker_home
     assert "_auto_continue_prompt" not in session
 
 
+def test_closing_session_bails_before_continuation(emits, schedule_env, marker_home):
+    """A teardown claim must prevent the queued continuation from starting."""
+    record_turn_start(marker_home, "session-key", "prompt")
+    session = _session(_closing=True)
+
+    result = server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert result is not None
+    assert not schedule_env
+    assert session["_auto_continue_scheduled"] is False
+
+
 def test_double_schedule_is_guarded(emits, schedule_env, marker_home):
     record_turn_start(marker_home, "session-key", "prompt")
     session = _session()

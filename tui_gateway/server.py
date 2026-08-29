@@ -39,6 +39,20 @@ from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
+from tui_gateway.session_ownership import (
+    bind_live_session_transport,
+    commit_agent_build,
+    commit_resume_failure_state,
+    commit_resume_hydration,
+    deferred_build_effect_session,
+    forget_retired_session_id,
+    remember_retired_session_id,
+    run_live_build_effect,
+    session_is_live_for_commit,
+    session_lifecycle_lock,
+    session_record_is_authoritative,
+    was_retired_session_id,
+)
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -163,7 +177,14 @@ _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
-_session_resume_lock = threading.Lock()
+# Resume, disconnect teardown, and every client-transport rebind share this
+# lock.  Re-entrant acquisition is required because the live-payload helper is
+# called from the session.resume fast path while it already owns this lock.
+_session_resume_lock = threading.RLock()
+# Per-runtime lifecycle code follows this order when nesting locks:
+# _lifecycle_lock -> _session_resume_lock -> _sessions_lock -> history_lock.
+# Teardown acquires only _lifecycle_lock after popping the registry entry, so
+# slow finalization never holds either global registry lock.
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -880,6 +901,16 @@ def _is_gateway_owned_source(source: str) -> bool:
 
 
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
+    """Serialize the finalization chokepoint with deferred runtime setup."""
+    if not session:
+        return
+    with _session_lifecycle_lock(session):
+        _finalize_session_body(session, end_reason=end_reason)
+
+
+def _finalize_session_body(
+    session: dict | None, end_reason: str = "tui_close"
+) -> None:
     """Best-effort finalize hook + memory commit for a session.
 
     Fires ``on_session_end`` plugin hook and attempts to persist any
@@ -1084,7 +1115,19 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
         logger.debug("session.reclaimed broadcast failed", exc_info=True)
 
 
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
+    """Serialize finalization with deferred runtime setup effects."""
+    if not session:
+        return
+    with _session_lifecycle_lock(session):
+        _teardown_session_body(session, end_reason=end_reason)
+
+
+def _teardown_session_body(
+    session: dict | None, *, end_reason: str = "tui_close"
+) -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
     Shared by ``session.close`` and the orphaned-WS-session reaper. The
@@ -1149,6 +1192,7 @@ def _pop_session_by_id(sid: str) -> dict | None:
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
     session["_sid"] = sid
+    _remember_retired_session_id(sid)
     return session
 
 
@@ -1779,6 +1823,24 @@ def _transport_is_dead(transport) -> bool:
     if transport is _detached_ws_transport:
         return True
     return getattr(transport, "_closed", None) is True
+
+
+# Session ownership and deferred-build fencing live in
+# tui_gateway/session_ownership.py.  These aliases keep the handler modules'
+# rebound-globals seam intact (method_ctx.py) and preserve the existing
+# monkeypatch targets in the tests.
+_bind_live_session_transport = bind_live_session_transport
+_session_record_is_authoritative = session_record_is_authoritative
+_session_is_live_for_commit = session_is_live_for_commit
+_session_lifecycle_lock = session_lifecycle_lock
+_run_live_build_effect = run_live_build_effect
+_commit_agent_build = commit_agent_build
+_commit_resume_hydration = commit_resume_hydration
+_commit_resume_failure_state = commit_resume_failure_state
+_remember_retired_session_id = remember_retired_session_id
+_forget_retired_session_id = forget_retired_session_id
+_was_retired_session_id = was_retired_session_id
+_deferred_build_effect_session = deferred_build_effect_session
 
 
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
@@ -2496,11 +2558,32 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            from tui_gateway.event_replay import _stamp_event
+        if sid:
+            strict_session = _deferred_build_effect_session.get()
+            with _sessions_lock:
+                session = _sessions.get(sid)
+            if session is not None:
+                with _session_lifecycle_lock(session):
+                    with _sessions_lock:
+                        if (
+                            _sessions.get(sid) is not session
+                            or session.get("_closing")
+                            or session.get("_finalized")
+                            or (
+                                strict_session is not None
+                                and session is not strict_session
+                            )
+                        ):
+                            return False
+                        t = session.get("transport")
+                    if t is None:
+                        return False
+                    from tui_gateway.event_replay import _stamp_event
 
-            _stamp_event(obj)
-            return t.write(obj)
+                    _stamp_event(obj)
+                    return t.write(obj)
+            if strict_session is not None or _was_retired_session_id(sid):
+                return False
 
     from tui_gateway.event_replay import _stamp_event
 
@@ -3174,6 +3257,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         secret_token = None
         session_db = None
         owns_db = False
+        built_agent = None
+        agent_committed = False
         profile_home = current.get("profile_home")
         try:
             history_ready = current.get("resume_history_ready")
@@ -3249,6 +3334,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
                 agent = _make_agent(sid, key, **kw)
+                built_agent = agent
             finally:
                 _clear_session_context(tokens)
 
@@ -3262,10 +3348,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
-            current["config_model_seen"] = _config_model_target()
+            config_model_seen = _config_model_target()
+            if not _run_live_build_effect(
+                sid,
+                current,
+                lambda: _commit_agent_build(sid, current, agent, config_model_seen),
+            ):
+                return
+            agent_committed = True
 
             # No eager slash-worker pre-warm: slash.exec spawns one on demand
             # (its error path already relies on that respawn to recover from a
@@ -3277,62 +3369,95 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # never reaped, so with the desktop app open for days those
             # fleets accumulate until the OS refuses new process spawns.
 
-            try:
-                from tools.approval import (
-                    register_gateway_notify,
-                    load_permanent_allowlist,
-                )
+            def _register_approval() -> None:
+                nonlocal notify_registered
+                try:
+                    from tools.approval import (
+                        register_gateway_notify,
+                        load_permanent_allowlist,
+                    )
 
-                register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
-                )
-                notify_registered = True
-                load_permanent_allowlist()
-            except Exception:
-                pass
+                    register_gateway_notify(
+                        key, lambda data: _emit_approval_request(sid, data)
+                    )
+                    notify_registered = True
+                    load_permanent_allowlist()
+                except Exception:
+                    pass
 
-            _wire_callbacks(sid)
+            if not _run_live_build_effect(sid, current, _register_approval):
+                return
+
+            if not _run_live_build_effect(sid, current, lambda: _wire_callbacks(sid)):
+                return
             # Surface the self-improvement review's "💾 …" summary as an event
             # the TUI/desktop render in-transcript, honoring
             # display.memory_notifications. _init_session wires this for the
             # eager/branch paths; deferred-built sessions (session.create and the
             # default cold resume) build through here, so without this their
             # review summaries would leak to stdout instead of the chat.
-            try:
-                agent.background_review_callback = lambda message, _sid=sid: _emit(
-                    "review.summary", _sid, {"text": str(message)}
-                )
-                agent.memory_notifications = _load_memory_notifications()
-            except Exception:
-                pass
+            def _configure_agent_notifications() -> None:
+                try:
+                    agent.background_review_callback = lambda message, _sid=sid: _emit(
+                        "review.summary", _sid, {"text": str(message)}
+                    )
+                    agent.memory_notifications = _load_memory_notifications()
+                except Exception:
+                    pass
+
+            if not _run_live_build_effect(
+                sid, current, _configure_agent_notifications
+            ):
+                return
             # Hydrate credits notices at session OPEN (not just on the first
             # message), so depletion / usage-band warnings show at "ready". Runs
             # off the build thread, after the notice_callback is wired. Fail-open.
-            try:
-                from agent.credits_tracker import seed_credits_at_session_start
+            def _seed_credits() -> None:
+                try:
+                    from agent.credits_tracker import seed_credits_at_session_start
 
-                seed_credits_at_session_start(agent)
-            except Exception:
-                pass
-            with _sessions_lock:
-                if sid in _sessions:
-                    _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key, _session_source(current))
+                    seed_credits_at_session_start(agent)
+                except Exception:
+                    pass
 
-            info = _session_info(agent, current)
-            cfg_warn = _probe_config_health(_load_cfg())
-            if cfg_warn:
-                info["config_warning"] = cfg_warn
-                logger.warning(cfg_warn)
-            _emit("session.info", sid, info)
+            if not _run_live_build_effect(sid, current, _seed_credits):
+                return
+
+            def _start_poller() -> bool:
+                with _sessions_lock:
+                    if _sessions.get(sid) is not current:
+                        return False
+                    current["_notif_stop"] = _start_notification_poller(sid, current)
+                return True
+
+            if not _run_live_build_effect(sid, current, _start_poller):
+                return
+
+            def _emit_session_info() -> None:
+                _notify_session_boundary("on_session_reset", key, _session_source(current))
+                info = _session_info(agent, current)
+                cfg_warn = _probe_config_health(_load_cfg())
+                if cfg_warn:
+                    info["config_warning"] = cfg_warn
+                    logger.warning(cfg_warn)
+                _emit("session.info", sid, info)
+
+            if not _run_live_build_effect(sid, current, _emit_session_info):
+                return
             # If MCP discovery is still in flight (a server slower than the
             # bounded wait_for_mcp_discovery join in _make_agent), the agent
             # was built without those tools. Catch up once they land — see
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
-            _schedule_mcp_late_refresh(sid, agent)
+            if not _run_live_build_effect(
+                sid, current, lambda: _schedule_mcp_late_refresh(sid, agent)
+            ):
+                return
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            def _emit_build_error() -> None:
+                current["agent_error"] = str(e)
+                _emit("error", sid, {"message": f"agent init failed: {e}"})
+
+            _run_live_build_effect(sid, current, _emit_build_error)
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -3355,6 +3480,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
+            if not agent_committed and built_agent is not None:
+                try:
+                    close = getattr(built_agent, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    logger.debug("failed closing discarded late-built agent", exc_info=True)
             # Dedicated profile handle: hand it to the agent that will actually
             # be torn down, or close it here when no such agent exists. Both
             # non-transfer cases are real: the except above (build raised, so
@@ -8845,6 +8977,7 @@ def _init_session(
             "session_key": key,
             "history": history,
             "history_lock": threading.Lock(),
+            "_lifecycle_lock": threading.RLock(),
             "history_version": 0,
             "inflight_turn": None,
             "created_at": now,
@@ -8872,6 +9005,7 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        _forget_retired_session_id(sid)
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -9665,7 +9799,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             session["_auto_continue_scheduled"] = False
             return
         with session["history_lock"]:
-            if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
+            if (
+                session.get("running")
+                or session.get("_turn_cancel_requested")
+                or session.get("_closing")
+                or session.get("_finalized")
+            ):
                 # A real user prompt beat us to it — their turn wins, and its
                 # own conclusion clears the marker.
                 session["_auto_continue_scheduled"] = False
@@ -9974,6 +10113,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    queued_transport = None
+    # Ownership BEFORE the claim: the queue pop and the ``running`` latch below
+    # are mutations, and a record that a concurrent disconnect already popped
+    # has no authority to accept new work.  Checking after the claim (the old
+    # order) meant a stale record could keep a drained prompt and a stuck
+    # ``running`` flag that nothing would ever clear.
+    if not _session_record_is_authoritative(sid, session):
+        return False
     with session["history_lock"]:
         if session.get("_closing"):
             return False
@@ -9986,8 +10133,29 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        queued_transport = queued.get("transport")
+    if queued_transport is not None:
+        outcome = _bind_live_session_transport(sid, session, queued_transport)
+        if outcome.is_stale_record:
+            # A teardown claimed the record between the authority check and
+            # here.  Give the envelope back and drop the ``running`` latch so
+            # the popped record is left exactly as teardown expects it.  A
+            # merely dead queued transport is NOT terminal: the turn itself is
+            # still legitimate and its events go to whatever the session is
+            # bound to now.
+            with session["history_lock"]:
+                rest = [queued]
+                advanced = session.get("queued_prompt")
+                if advanced:
+                    rest.append(advanced)
+                rest.extend(session.get("queued_prompts") or [])
+                session["queued_prompt"] = rest[0]
+                if rest[1:]:
+                    session["queued_prompts"] = rest[1:]
+                else:
+                    session.pop("queued_prompts", None)
+                session["running"] = False
+            return False
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -10263,6 +10431,7 @@ def _deferred_session_record(
         "explicit_cwd": False,
         "history": history,
         "history_lock": threading.Lock(),
+        "_lifecycle_lock": threading.RLock(),
         "history_version": 0,
         "image_counter": 0,
         "inflight_turn": None,
@@ -10290,6 +10459,7 @@ def _claim_or_reuse_live(
     """Register ``record`` as the live session for ``session_key`` under the
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
+    park_for_reap = False
     with _session_resume_lock:
         live = _find_live_session_by_key(session_key)
         if live is not None:
@@ -10300,8 +10470,17 @@ def _claim_or_reuse_live(
             # client (storm killer — see _cancel_ws_orphan_reap).
             _cancel_ws_orphan_reap(live[0])
             return live
+        # The resume worker may have spent seconds loading history or building
+        # an agent after its request WebSocket disappeared.  Its copied
+        # ContextVar still points at that now-closed transport, so quarantine
+        # the record on the normal detached sentinel before publishing it.
+        if _transport_is_dead(record.get("transport")):
+            record["transport"] = _detached_ws_transport
+            record.pop("_client_gone_interrupt_requested", None)
+            park_for_reap = True
         with _sessions_lock:
             _sessions[sid] = record
+            _forget_retired_session_id(sid)
             _register_session_cwd(_sessions[sid])
         # A fresh runtime was minted for this stored session id: the new sid
         # has no pending reap, but a PRIOR runtime for the same stored id may
@@ -10313,6 +10492,14 @@ def _claim_or_reuse_live(
     # Slow finalization work stays OUTSIDE _session_resume_lock (see
     # _pop_session_by_id) — the stale records are already claimed above.
     _finalize_superseded_runtimes(stale)
+    if park_for_reap:
+        try:
+            _schedule_ws_orphan_reap(sid)
+        except Exception:
+            logger.exception(
+                "failed to schedule orphan reap for closed resume transport sid=%s",
+                sid,
+            )
     return None
 
 
@@ -10399,42 +10586,59 @@ def _schedule_resume_hydration(
             prefix = db.get_ancestor_display_prefix(stored_id)
             history = sanitize_replay_history(raw_history)
 
-            if _sessions.get(sid) is not session:
-                return
-            with session["history_lock"]:
-                session["history"] = history
-                session["display_history_prefix"] = prefix
-                session["resume_hydrating"] = False
-                session["resume_message_count"] = len(display_history)
-            session["resume_history_ready"].set()
-            _emit(
-                "session.resume_progress",
+            if not _commit_resume_hydration(
                 sid,
-                {
-                    "message_count": len(display_history),
-                    "phase": "history",
-                    "status": "complete",
-                },
-            )
-            _maybe_schedule_auto_continue(sid, session, stored_id)
-            _start_agent_build(sid, session)
+                session,
+                history,
+                prefix,
+                len(display_history),
+            ):
+                session["resume_history_error"] = "session resume cancelled"
+                session["resume_history_ready"].set()
+                return
+            session["resume_history_ready"].set()
+            if not _run_live_build_effect(
+                sid,
+                session,
+                lambda: _emit(
+                    "session.resume_progress",
+                    sid,
+                    {
+                        "message_count": len(display_history),
+                        "phase": "history",
+                        "status": "complete",
+                    },
+                ),
+            ):
+                return
+            if not _run_live_build_effect(
+                sid,
+                session,
+                lambda: _maybe_schedule_auto_continue(sid, session, stored_id),
+            ):
+                return
+            if not _run_live_build_effect(
+                sid,
+                session,
+                lambda: _start_agent_build(sid, session),
+            ):
+                return
         except Exception as exc:
-            if _sessions.get(sid) is not session:
-                return
             message = f"resume failed: {exc}"
-            session["resume_hydrating"] = False
-            session["resume_history_error"] = message
-            session["agent_error"] = message
-            session["resume_history_ready"].set()
-            session["agent_ready"].set()
-            _emit(
-                "session.resume_progress",
-                sid,
-                {"message": message, "phase": "history", "status": "failed"},
-            )
-            _emit("error", sid, {"message": message})
-            with _sessions_lock:
-                discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
+            if not _commit_resume_failure_state(sid, session, message):
+                return
+
+            def _emit_resume_failure() -> None:
+                _emit(
+                    "session.resume_progress",
+                    sid,
+                    {"message": message, "phase": "history", "status": "failed"},
+                )
+                _emit("error", sid, {"message": message})
+
+            if not _run_live_build_effect(sid, session, _emit_resume_failure):
+                return
+            discarded = _pop_session_by_id(sid)
             lease = (discarded or {}).get("active_session_lease")
             if lease is not None:
                 lease.release()
@@ -10646,22 +10850,11 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
+    if transport is not None:
+        _bind_live_session_transport(sid, session, transport)
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
-            # Track every transport that has shown this session (multi-window:
-            # pop-out windows each resume the same sid). The last viewer
-            # becomes the transport on the disconnect path so closing a
-            # pop-out re-binds the session to a still-open window instead of
-            # stranding it on the drop sentinel (#83716).
-            viewers = session.setdefault("viewers", {})
-            viewers[transport] = time.time()
-            if transport is not _detached_ws_transport:
-                # A live transport rebind means the client is back — any
-                # pending ws-orphan reap must not fire (storm killer).
-                _cancel_ws_orphan_reap(sid)
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
