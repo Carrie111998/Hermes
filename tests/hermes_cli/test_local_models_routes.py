@@ -214,7 +214,7 @@ def test_runtime_install_rejects_impossible_combo(client, monkeypatch):
     resolver's honest message — not a background job that dies silently.
     (win-arm64-vulkan; the old cuda case became real upstream at ~b1036x.)"""
     monkeypatch.setattr(
-        "hermes_cli.local_runtime.binaries._host_os_arch", lambda: ("win", "arm64"))
+        "pm.store.current_target", lambda: "win32-arm64")
     r = client.post("/api/local-models/runtime/install", json={"backend": "vulkan"})
     assert r.status_code == 400
     assert "arm64" in r.json()["detail"]
@@ -291,3 +291,114 @@ def test_download_tolerates_stale_catalog_size(client, monkeypatch):
             break
         time.sleep(0.05)
     assert status is not None and status["status"] == "done", status.get("error")
+
+
+# ── pause / resume ───────────────────────────────────────────
+
+
+def test_download_pause_and_resume_unknown_404(client):
+    assert client.post("/api/local-models/download/pause",
+                       json={"job_id": "deadbeef"}).status_code == 404
+    assert client.post("/api/local-models/download/resume",
+                       json={"job_id": "deadbeef"}).status_code == 404
+
+
+def test_download_finished_job_releases_handles(client, monkeypatch):
+    """A finished download drops its live download + resume handles, so the
+    job dict stays JSON-serializable and nothing lingers to pause/resume."""
+    body = b"x" * 48
+
+    class FakeResponse(io.BytesIO):
+        headers = {"Content-Length": str(len(body))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda *a, **k: FakeResponse(body))
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    budget = HardwareBudget(usable_vram_bytes=64 << 30,
+                            total_device_bytes=64 << 30,
+                            ram_available_bytes=64 << 30)
+    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
+                        lambda **kw: budget)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.bootstrap.refresh_local_runtime",
+        lambda: False)
+    from hermes_cli.local_runtime.catalog import CATALOG
+
+    r = client.post("/api/local-models/download", json={"model_id": CATALOG[0].id})
+    job_id = r.json()["job_id"]
+    deadline = time.time() + 10
+    status = None
+    while time.time() < deadline:
+        status = client.get(f"/api/local-models/jobs/{job_id}").json()
+        if status["status"] in ("done", "error"):
+            break
+        time.sleep(0.05)
+    assert status is not None and status["status"] == "done"
+
+    from hermes_cli.web_routers import local_models as lm
+
+    assert job_id not in lm._RUNNING
+
+
+def test_download_pause_reaches_paused_status(client, monkeypatch):
+    """A running download can be paused; the job lands in a 'paused' state
+    (partials preserved for resume) instead of erroring."""
+    import threading
+
+    gate = threading.Event()
+
+    class _BlockingStream:
+        headers = {"Content-Length": str(1 << 20)}  # promises 1 MiB
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, size=-1):
+            gate.wait(timeout=15)   # hold the worker until the test lets go
+            return b""
+
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda *a, **k: _BlockingStream())
+    from hermes_cli.local_runtime.catalog import CATALOG
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    budget = HardwareBudget(usable_vram_bytes=64 << 30,
+                            total_device_bytes=64 << 30,
+                            ram_available_bytes=64 << 30)
+    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
+                        lambda **kw: budget)
+
+    r = client.post("/api/local-models/download", json={"model_id": CATALOG[0].id})
+    job_id = r.json()["job_id"]
+
+    # Pause as soon as the live download handle is in place (idempotent).
+    deadline = time.time() + 10
+    paused = False
+    while time.time() < deadline:
+        pr = client.post("/api/local-models/download/pause",
+                         json={"job_id": job_id})
+        if pr.status_code == 200 and pr.json()["paused"] is True:
+            paused = True
+            break
+        time.sleep(0.05)
+    assert paused
+    gate.set()
+
+    deadline = time.time() + 10
+    status = None
+    while time.time() < deadline:
+        status = client.get(f"/api/local-models/jobs/{job_id}").json()
+        if status["status"] in ("paused", "done", "error"):
+            break
+        time.sleep(0.05)
+    assert status is not None and status["status"] == "paused"

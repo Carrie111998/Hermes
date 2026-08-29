@@ -98,6 +98,8 @@ export const zhHant = defineLocale({
       back: '返回',
       openLogs: '開啟記錄',
       repairHint: '修復會重新執行安裝程式，在新機器上可能需要幾分鐘。',
+      reinstallApp: '重新安裝應用程式',
+      bundledReinstallHint: '此應用程式包含 Hermes。請重新安裝應用程式以還原其內建執行階段。',
       remoteSignInHint: signInLabel =>
         `先登出已儲存的遠端瀏覽器工作階段，然後開啟${signInLabel}。使用本機閘道可切換至內建後端。`,
       signOutAndSignIn: '登出並重新登入',
@@ -204,6 +206,13 @@ export const zhHant = defineLocale({
     openBilling: '開啟帳單',
     addCredits: '新增額度',
     dismiss: '忽略'
+  },
+
+  externalOpenFailed: {
+    title: '無法開啟此連結',
+    message: '沒有註冊可開啟此位址的瀏覽器。請複製連結並手動開啟。',
+    copyUrl: '複製連結',
+    close: '關閉'
   },
 
   sendDiagnostics: {
@@ -695,38 +704,6 @@ export const zhHant = defineLocale({
           'Hermes 從應用程式內更新自身時，保留本機原始碼變更（stash）或丟棄（discard）。終端機更新一律會詢問。'
       }
     }),
-    about: {
-      heading: 'Hermes Desktop',
-      version: value => `版本 ${value}`,
-      versionUnavailable: '版本不可用',
-      bundleOutOfSync: '應用程式建置版本過舊',
-      bundleOutOfSyncDesc:
-        'Hermes 執行環境已更新,但桌面應用程式本身仍是舊建置——在應用程式更新之前,新的介面功能(如 Bot Mode)不會顯示。請執行下方的更新以重新建置應用程式。如果此警告仍未消除,請從最新的桌面安裝程式重新安裝。',
-      bundleOutOfSyncAction: '取得安裝程式',
-      updates: '更新',
-      checkNow: '立即檢查',
-      checking: '檢查中…',
-      seeWhatsNew: '查看新增內容',
-      updateNow: '立即更新',
-      releaseNotes: '發行說明',
-      onLatest: '你已是最新版本。',
-      installing: '正在安裝更新。',
-      cantUpdate: '此版本無法從應用程式內自行更新。',
-      cantReach: '無法連線到更新伺服器。',
-      tapCheck: '點選「立即檢查」以尋找更新。',
-      updateReady: count => `新更新已就緒（包含 ${count} 項變更）。`,
-      updateReadyUnknown: '新更新已就緒。',
-      lastChecked: age => `上次檢查：${age}`,
-      justNowSuffix: ' · 剛剛',
-      automaticUpdates: '自動更新',
-      automaticUpdatesDesc: 'Hermes 會在背景自動檢查更新，並在有可用更新時通知你。',
-      branchCommit: (branch, commit) => `分支 ${branch} · 提交 ${commit}`,
-      never: '從未',
-      justNow: '剛剛',
-      minAgo: count => `${count} 分鐘前`,
-      hoursAgo: count => `${count} 小時前`,
-      daysAgo: count => `${count} 天前`
-    },
     config: {
       none: '無',
       noneParen: '(無)',
@@ -2319,11 +2296,18 @@ export const zhHant = defineLocale({
     retryAfterRun: '我已執行 -- 重試',
     setupChoiceTitle: '設定 Hermes Desktop',
     setupChoiceDesc: '將此應用程式連線到您已執行的 Hermes 閘道，或在這台電腦上本機安裝 Hermes。',
+    setupChoiceDescLocal: '將此應用程式連線到您已執行的 Hermes 閘道，或使用這台電腦上已有的 Hermes。',
     connectExistingTitle: '連線到現有 Hermes',
     connectExistingShort: '連線現有環境',
     connectExistingDesc: '使用工作階段權杖或瀏覽器登入連線遠端後端。不會啟動本機安裝。',
     installLocalTitle: '本機安裝 Hermes',
     installLocalDesc: '下載 Hermes、建立 Python 環境，並在這台電腦上執行後端。',
+    useLocalTitle: '使用這台電腦上的 Hermes',
+    useLocalDesc: 'Hermes 已安裝在這台電腦上。立即啟動 — 不會下載任何內容。',
+    bundledLocalDesc: 'Hermes 隨此應用程式一同提供。立即啟動 — 不會下載任何內容。',
+    bundledDamagedTitle: '使用隨此應用程式提供的 Hermes',
+    bundledDamagedDesc: '此應用程式包含 Hermes，但其執行階段檔案遺失或損壞。請重新安裝 Hermes Desktop 以還原。',
+    reinstallApp: '重新安裝應用程式',
     localStartUnavailable: '無法啟動本機安裝。請重新啟動 Hermes Desktop 後再試一次。',
     remoteSetupTitle: '連線到現有 Hermes',
     remoteSetupDesc: '輸入閘道 URL。Hermes Desktop 會偵測需要權杖還是瀏覽器登入。',
@@ -2525,6 +2509,7 @@ export const zhHant = defineLocale({
       update: '更新',
       updateInProgress: '更新中',
       commitsBehind: (count, branch) => `落後 ${branch} ${count} 個提交`,
+      releaseAvailable: tag => `${tag} 已發布`,
       desktopVersion: version => `Hermes Desktop v${version}`,
       backendVersion: version => `後端 v${version}`,
       clientLabel: version => `用戶端 v${version}`,

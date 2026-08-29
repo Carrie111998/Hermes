@@ -168,6 +168,9 @@ def _data_file(name: str) -> Path:
         if legacy.exists():
             try:
                 # Two statements so the read (utf-8-sig, tolerates a BOM)
+                # and the write (utf-8, never emits one) stay distinct.
+                legacy_text = legacy.read_text(encoding="utf-8-sig")
+                path.write_text(legacy_text, encoding="utf-8")
             except Exception:
                 pass
     return path
@@ -190,7 +193,7 @@ def load_state() -> Dict[str, Any]:
     if not path.exists():
         return {"unlocks": {}}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {"unlocks": {}}
 
@@ -216,7 +219,7 @@ def load_snapshot() -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-                legacy_text = legacy.read_text(encoding="utf-8-sig")
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if isinstance(data, dict):
             return data
     except Exception:
@@ -235,7 +238,7 @@ def load_checkpoint() -> Dict[str, Any]:
     if not path.exists():
         return {"schema_version": 1, "generated_at": 0, "sessions": {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if isinstance(data, dict):
             data.setdefault("schema_version", 1)
             data.setdefault("generated_at", 0)

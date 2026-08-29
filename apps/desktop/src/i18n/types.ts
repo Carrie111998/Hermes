@@ -145,6 +145,8 @@ export interface Translations {
       back: string
       openLogs: string
       repairHint: string
+      reinstallApp: string
+      bundledReinstallHint: string
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
       remoteFailureHint: string
@@ -251,6 +253,13 @@ export interface Translations {
     openBilling: string
     addCredits: string
     dismiss: string
+  }
+
+  externalOpenFailed: {
+    title: string
+    message: string
+    copyUrl: string
+    close: string
   }
 
   sendDiagnostics: {
@@ -552,37 +561,6 @@ export interface Translations {
     }
     fieldLabels: Record<string, string>
     fieldDescriptions: Record<string, string>
-    about: {
-      heading: string
-      version: (value: string) => string
-      versionUnavailable: string
-      bundleOutOfSync: string
-      bundleOutOfSyncDesc: string
-      bundleOutOfSyncAction: string
-      updates: string
-      checkNow: string
-      checking: string
-      seeWhatsNew: string
-      updateNow: string
-      releaseNotes: string
-      onLatest: string
-      installing: string
-      cantUpdate: string
-      cantReach: string
-      tapCheck: string
-      updateReady: (count: number) => string
-      updateReadyUnknown: string
-      lastChecked: (age: string) => string
-      justNowSuffix: string
-      automaticUpdates: string
-      automaticUpdatesDesc: string
-      branchCommit: (branch: string, commit: string) => string
-      never: string
-      justNow: string
-      minAgo: (count: number) => string
-      hoursAgo: (count: number) => string
-      daysAgo: (count: number) => string
-    }
     config: {
       none: string
       noneParen: string
@@ -2281,6 +2259,41 @@ export interface Translations {
 
   updates: {
     stages: Record<string, string>
+    appName: string
+    version: (value: string) => string
+    versionUnavailable: string
+    bundleOutOfSync: string
+    bundleOutOfSyncDesc: string
+    bundleOutOfSyncAction: string
+    updatesSection: string
+    checkNow: string
+    checkingShort: string
+    seeWhatsNew: string
+    releaseNotes: string
+    installing: string
+    cantReach: string
+    tapCheck: string
+    updateReady: (count: number) => string
+    updateReadyUnknown: string
+    lastChecked: (age: string) => string
+    justNowSuffix: string
+    never: string
+    justNow: string
+    minAgo: (count: number) => string
+    hoursAgo: (count: number) => string
+    daysAgo: (count: number) => string
+    versionDetailsTitle: string
+    versionDetailsBody: string
+    versionDetailsVersion: string
+    versionDetailsCommit: string
+    versionDetailsBuildOrigin: string
+    versionDetailsDistribution: string
+    versionDetailsDistributionDesktop: string
+    versionDetailsRuntimeEmbedded: string
+    versionDetailsRuntimeExternal: string
+    versionDetailsRuntime: string
+    versionDetailsInstallId: string
+    versionDetailsUncommittedChanges: string
     checking: string
     checkFailedTitle: string
     tryAgain: string
@@ -2295,6 +2308,7 @@ export interface Translations {
     availableTitleBackend: string
     availableBodyBackend: string
     availableBodyNoChangelog: string
+    availableBodyRelease: (tag: string) => string
     updateNow: string
     maybeLater: string
     moreChanges: (count: number) => string
@@ -2355,11 +2369,18 @@ export interface Translations {
     retryAfterRun: string
     setupChoiceTitle: string
     setupChoiceDesc: string
+    setupChoiceDescLocal: string
     connectExistingTitle: string
     connectExistingShort: string
     connectExistingDesc: string
     installLocalTitle: string
     installLocalDesc: string
+    useLocalTitle: string
+    useLocalDesc: string
+    bundledLocalDesc: string
+    bundledDamagedTitle: string
+    bundledDamagedDesc: string
+    reinstallApp: string
     localStartUnavailable: string
     remoteSetupTitle: string
     remoteSetupDesc: string
@@ -2548,6 +2569,7 @@ export interface Translations {
       update: string
       updateInProgress: string
       commitsBehind: (count: number, branch: string) => string
+      releaseAvailable: (tag: string) => string
       desktopVersion: (version: string) => string
       backendVersion: (version: string) => string
       clientLabel: (version: string) => string

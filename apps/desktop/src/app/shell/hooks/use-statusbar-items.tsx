@@ -314,11 +314,15 @@ export function useStatusbarItems({
       applying,
       applyMessage: updateApply.message,
       behind: updateStatus?.behind ?? 0,
-      branch: updateStatus?.branch,
+      // The build stamp is the authority for what this binary IS; updateStatus
+      // knows what git says about the checkout. Prefer the stamp, fall back.
+      branch: desktopVersion?.branch ?? updateStatus?.branch ?? undefined,
+      channel: updateStatus?.channel === 'stable' ? 'stable' : 'main',
       copy,
+      latestTag: updateStatus?.latestTag ?? null,
       remote: connection?.mode === 'remote',
       restarting: updateApply.stage === 'restart',
-      sha: updateStatus?.currentSha?.slice(0, 7) ?? null,
+      sha: desktopVersion?.commit?.slice(0, 7) ?? updateStatus?.currentSha?.slice(0, 7) ?? null,
       target: 'client',
       updateAvailable: updateStatus?.updateAvailable,
       version: desktopVersion?.appVersion
@@ -341,6 +345,8 @@ export function useStatusbarItems({
     }
   }, [
     desktopVersion?.appVersion,
+    desktopVersion?.branch,
+    desktopVersion?.commit,
     connection?.mode,
     copy,
     updateApply.applying,
@@ -348,7 +354,9 @@ export function useStatusbarItems({
     updateApply.stage,
     updateStatus?.behind,
     updateStatus?.branch,
+    updateStatus?.channel,
     updateStatus?.currentSha,
+    updateStatus?.latestTag,
     updateStatus?.updateAvailable
   ])
 
@@ -363,7 +371,9 @@ export function useStatusbarItems({
       applying,
       applyMessage: backendUpdateApply.message,
       behind: backendUpdateStatus?.behind ?? 0,
+      channel: backendUpdateStatus?.channel === 'stable' ? 'stable' : 'main',
       copy,
+      latestTag: backendUpdateStatus?.latestTag ?? null,
       remote: true,
       restarting: backendUpdateApply.stage === 'restart',
       target: 'backend',
@@ -387,6 +397,8 @@ export function useStatusbarItems({
     connection?.mode,
     statusSnapshot?.version,
     backendUpdateStatus?.behind,
+    backendUpdateStatus?.channel,
+    backendUpdateStatus?.latestTag,
     backendUpdateStatus?.updateAvailable,
     backendUpdateApply.applying,
     backendUpdateApply.message,
