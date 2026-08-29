@@ -2079,6 +2079,12 @@ class GatewayStreamConsumer:
         like a duplicate send of the same prefix (#92063). Re-edit the sealed
         bubble with the cursor stripped and a continuation marker appended,
         so the pair reads as one continued answer.
+
+        The marker is optimistic best-effort: it is applied at every clean
+        break, so if the turn then aborts right after the boundary the sealed
+        bubble advertises a continuation that is delivered by the fallback
+        path (or never arrives). Trading that rare stale marker for never
+        leaving the cursor frozen is the intended contract.
         """
         if self.cfg.buffer_only:
             return  # uneditable platform — nothing to seal
@@ -2087,7 +2093,15 @@ class GatewayStreamConsumer:
         prefix = self._visible_prefix()
         if not prefix or not prefix.strip():
             return
-        sealed = f"{prefix.rstrip()}\n\n(continued below)"
+        marker = "\n\n(continued below)"
+        # A segment that filled close to the adapter limit has no room for
+        # the marker — an over-limit seal edit is rejected outright (limit is
+        # hard-enforced e.g. on Telegram) and the cursor stays frozen, the
+        # exact #92063 symptom resurfacing only for long segments.
+        budget = max(self._raw_message_limit() - len(marker), 0)
+        if len(prefix) > budget:
+            prefix = prefix[:budget]
+        sealed = f"{prefix.rstrip()}{marker}"
         try:
             result = await self._edit_message(
                 message_id=self._message_id,
@@ -2095,8 +2109,11 @@ class GatewayStreamConsumer:
             )
             if getattr(result, "success", False):
                 self._last_sent_text = sealed
-        except Exception:
-            pass  # best-effort — a failing seal edit must not stall the break
+        except Exception as e:
+            # best-effort — a failing seal edit must not stall the break,
+            # but leave a trace: a platform that starts rejecting these
+            # edits is invisible otherwise when debugging stuck cursors.
+            logger.debug("Seal edit failed: %s", e)
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
