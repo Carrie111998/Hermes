@@ -10414,6 +10414,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    async def _prepare_busy_active_turn_text(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        running_agent: Any,
+    ) -> Optional[str]:
+        """Prepare a busy follow-up with the normal inbound metadata pipeline."""
+        history = getattr(running_agent, "_session_messages", None) or []
+        return await self._prepare_profile_scoped_inbound_message_text(
+            event=event,
+            source=event.source,
+            history=history,
+            session_key=session_key,
+        )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -10606,7 +10621,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         steered = False
         redirected = False
         if effective_mode == "steer":
-            steer_text = await self._prepare_busy_steer_text(event)
+            await self._prepare_busy_steer_text(event)
+            steer_text = await self._prepare_busy_active_turn_text(
+                event,
+                session_key,
+                running_agent,
+            )
+            if steer_text is None:
+                return True
             # A follow-up qualifies for steering when it is plain text, OR
             # when every attachment is STT-eligible voice media whose
             # transcript was just folded into steer_text — otherwise a voice
@@ -10648,8 +10670,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and getattr(running_agent, "_supports_active_turn_redirect", False) is True
             and hasattr(running_agent, "redirect")
         ):
+            redirect_text = await self._prepare_busy_active_turn_text(
+                event,
+                session_key,
+                running_agent,
+            )
+            if redirect_text is None:
+                return True
             try:
-                redirected = bool(running_agent.redirect((event.text or "").strip()))
+                redirected = bool(running_agent.redirect(redirect_text))
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False

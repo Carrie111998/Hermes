@@ -226,6 +226,51 @@ class TestBusySessionAck:
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["steer", "interrupt"])
+    async def test_active_turn_text_uses_normal_inbound_preprocessing(
+        self, monkeypatch, mode
+    ):
+        """Successful steer/redirect must retain sender and reply context."""
+        import gateway.run as _gr
+
+        monkeypatch.delenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", raising=False)
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = mode
+        adapter = _make_adapter()
+        event = _make_event(text="also check the tests")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        prepared = '[Alice] [Replying to: "the failing test"]\n\nalso check the tests'
+        runner._prepare_profile_scoped_inbound_message_text = AsyncMock(
+            return_value=prepared
+        )
+
+        agent = MagicMock()
+        agent._session_messages = [{"role": "user", "content": "original"}]
+        agent._supports_active_turn_redirect = True
+        agent.steer.return_value = True
+        agent.redirect.return_value = True
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        runner._prepare_profile_scoped_inbound_message_text.assert_awaited_once_with(
+            event=event,
+            source=event.source,
+            history=agent._session_messages,
+            session_key=sk,
+        )
+        if mode == "steer":
+            agent.steer.assert_called_once_with(prepared)
+            agent.redirect.assert_not_called()
+        else:
+            agent.redirect.assert_called_once_with(prepared)
+            agent.steer.assert_not_called()
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
     async def test_steer_mode_transcribes_voice_before_injection(self, monkeypatch):
         """A busy voice follow-up is transcribed and steered, never queued."""
         import gateway.run as _gr
