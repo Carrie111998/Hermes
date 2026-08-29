@@ -836,28 +836,60 @@ def _looks_like_ollama_base_url(base_url: str) -> bool:
     return "ollama" in host.split(".")
 
 
+def _looks_like_lmstudio_base_url(base_url: str) -> bool:
+    """True when ``base_url`` is LM Studio's default listener (port 1234)."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    try:
+        return parsed.port == 1234
+    except ValueError:
+        return False
+
+
+def _should_fingerprint_local_server(base_url: str = "", provider: str = "") -> bool:
+    """Whether ``fetch_endpoint_model_metadata`` may run ``detect_local_server_type``.
+
+    LM Studio's native ``/api/v1/models`` is a separate path from Ollama
+    ``/api/show``. Fingerprint local LM Studio (port 1234 / provider) and
+    Ollama; do not fingerprint LiteLLM or other OpenAI-compat proxies on
+    loopback (#26489).
+    """
+    if _should_probe_ollama_native(base_url, provider):
+        return True
+    provider_l = (provider or "").strip().lower().replace("_", "-")
+    if provider_l in {"lmstudio", "lm-studio"}:
+        return True
+    return _looks_like_lmstudio_base_url(base_url)
+
+
 def _should_probe_ollama_native(base_url: str = "", provider: str = "") -> bool:
-    """Whether to fingerprint the endpoint as a local inference server.
+    """Whether to fingerprint the endpoint as an Ollama-native server.
 
-    Ollama (and LM Studio / llama.cpp / vLLM) expose native routes such as
-    ``POST /api/show`` and ``GET /api/tags``. OpenAI-compatible custom
-    gateways do not. Those probes are synchronous HTTP and commonly run on
-    the messaging gateway's asyncio thread during first-turn context
-    resolution — a slow or hanging ``/api/show`` stalls Slack/Discord ACKs.
+    Ollama exposes ``POST /api/show`` and ``GET /api/tags``. OpenAI-compatible
+    relays (LiteLLM, vLLM, corporate proxies, named ``custom:*`` gateways)
+    do not. Those probes are synchronous HTTP and commonly run on the
+    messaging gateway's asyncio thread during first-turn context
+    resolution — a slow or hanging ``/api/show`` stalls Slack/Discord ACKs
+    (#26489, #27331).
 
-    Probe when the configured or inferred provider is Ollama, or the URL
-    looks like Ollama (port 11434 / ``ollama`` host), or the endpoint is
-    local *and* is not a named ``custom:*`` provider.
+    Probe only on a *positive Ollama signal*:
+    - ``provider`` is ``ollama`` / ``ollama-cloud`` / similar
+    - URL is port 11434, ``ollama.com``, or has ``ollama`` as a host label
+
+    Do **not** use ``detect_local_server_type`` as this predicate — that
+    detector *is* the local waterfall. Loopback is not enough: LiteLLM and
+    other OpenAI-compat proxies listen on localhost too (#26489).
 
     Skip when:
-    - provider is a named custom OpenAI-compat relay (``custom:acme``),
-      including loopback reverse proxies in front of one
+    - provider is a named custom OpenAI-compat relay (``custom:acme``)
     - the host is a known non-Ollama provider
-    - the host is a remote unknown URL (HTTPS custom gateway)
+    - the host is a remote unknown URL
+    - the host is local but has no Ollama signal (LiteLLM, vLLM, reverse proxy)
 
-    Bare ``provider=custom`` on localhost still probes — that is the
-    documented local-Ollama / vLLM path. Same class of gate as
-    ``agent.image_routing._should_probe_ollama_vision`` (#89863).
+    Same class of gate as ``agent.image_routing._should_probe_ollama_vision``
+    (#89863).
     """
     provider_l = (provider or "").strip().lower()
     if provider_l.startswith("ollama"):
@@ -866,14 +898,6 @@ def _should_probe_ollama_native(base_url: str = "", provider: str = "") -> bool:
         return True
     inferred = _infer_provider_from_url(base_url) if base_url else None
     if inferred and "ollama" in inferred:
-        return True
-    if inferred:
-        return False
-    # Named custom providers are OpenAI-compat relays even on loopback.
-    # Bare "custom" remains the local-runtime profile and still probes.
-    if provider_l.startswith("custom:"):
-        return False
-    if base_url and is_local_endpoint(base_url):
         return True
     return False
 
@@ -1451,7 +1475,7 @@ def fetch_endpoint_model_metadata(
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_error: Optional[Exception] = None
 
-    if is_local_endpoint(normalized) and _should_probe_ollama_native(
+    if is_local_endpoint(normalized) and _should_fingerprint_local_server(
         normalized, provider
     ):
         try:
@@ -3312,10 +3336,13 @@ def get_model_context_length(
             # prefers num_ctx from Modelfile, while _query_ollama_api_show
             # returns the GGUF training max first which can be larger and
             # would create a false-safe window for compression (#63122).
-            # Remote OpenAI-compat gateways and named custom:* relays are
-            # not Ollama — POSTing /api/show at them is a synchronous stall
-            # (often on the messaging asyncio thread). Skip unless the URL
-            # actually looks like Ollama.
+            # Remote OpenAI-compat gateways, named custom:* relays, and local
+            # OpenAI-compat proxies (LiteLLM, vLLM) are not Ollama — POSTing
+            # /api/show at them is a synchronous stall (often on the
+            # messaging asyncio thread). Probe only on a positive Ollama
+            # signal (port 11434 / ollama.com / provider=ollama). Do not
+            # call detect_local_server_type to decide — that waterfall is
+            # the hang (#26489, #27331).
             if _should_probe_ollama_native(base_url, provider):
                 if is_local_endpoint(base_url):
                     local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
