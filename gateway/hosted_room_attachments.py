@@ -623,6 +623,30 @@ class HostedRoomAttachmentStore:
         retention_seconds: float | None = None,
         hold_until_event: bool = False,
     ) -> list[dict[str, Any]]:
+        normalized, _transitioned = self.commit_message_with_receipt(
+            room_id=room_id,
+            event_id=event_id,
+            manifest=manifest,
+            recipient_member_ids=recipient_member_ids,
+            viewer_access=viewer_access,
+            retention_seconds=retention_seconds,
+            hold_until_event=hold_until_event,
+        )
+        return normalized
+
+    def commit_message_with_receipt(
+        self,
+        *,
+        room_id: Any,
+        event_id: Any,
+        manifest: Any,
+        recipient_member_ids: Sequence[str],
+        viewer_access: bool = False,
+        retention_seconds: float | None = None,
+        hold_until_event: bool = False,
+    ) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+        """Commit a manifest and report only rows transitioned by this call."""
+
         room_id = _identifier(room_id, label="room_id")
         event_id = _identifier(event_id, label="event_id")
         normalized = validate_manifest(manifest)
@@ -644,6 +668,7 @@ class HostedRoomAttachmentStore:
             else now + float(retention_seconds)
         )
 
+        transitioned: list[str] = []
         with self._lock, self._transaction(immediate=True) as conn:
             for entry in normalized:
                 row = conn.execute(
@@ -669,21 +694,26 @@ class HostedRoomAttachmentStore:
                 if state == "committed" and (
                     str(row["event_id"] or "") != event_id
                     or str(row["recipient_member_ids_json"]) != recipients_json
+                    or bool(row["viewer_access"]) != bool(viewer_access)
                 ):
                     raise AttachmentConflictError(
                         "attachment is already owned by a different room event"
                     )
+                if state == "uploaded":
+                    transitioned.append(entry["attachment_id"])
                 self._read_blob(
                     blob_id=str(row["blob_id"]),
                     size=int(row["size"]),
                     sha256=str(row["sha256"]),
                 )
             for entry in normalized:
-                conn.execute(
+                if entry["attachment_id"] not in transitioned:
+                    continue
+                updated = conn.execute(
                     """UPDATE hosted_room_attachments
                           SET event_id=?, recipient_member_ids_json=?, viewer_access=?, state='committed',
                               updated_at=?, expires_at=?
-                        WHERE attachment_id=?""",
+                        WHERE attachment_id=? AND state='uploaded'""",
                     (
                         event_id,
                         recipients_json,
@@ -693,20 +723,24 @@ class HostedRoomAttachmentStore:
                         entry["attachment_id"],
                     ),
                 )
-        return normalized
+                if updated.rowcount != 1:
+                    raise AttachmentConflictError(
+                        "attachment changed during message commitment"
+                    )
+        return normalized, tuple(transitioned)
 
     def abort_message_commit(
         self,
         *,
         room_id: Any,
         event_id: Any,
-        manifest: Any,
+        attachment_ids: Sequence[str],
     ) -> int:
         """Return a failed pre-event commitment to its bounded upload state."""
 
         room_id = _identifier(room_id, label="room_id")
         event_id = _identifier(event_id, label="event_id")
-        attachment_ids = [entry["attachment_id"] for entry in validate_manifest(manifest)]
+        attachment_ids = [_attachment_id(value) for value in attachment_ids]
         if not attachment_ids:
             return 0
         placeholders = ",".join("?" for _ in attachment_ids)

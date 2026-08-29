@@ -328,6 +328,51 @@ def test_conflicting_event_id_releases_an_invisible_attachment_commit(tmp_path: 
     assert expires_at is not None
 
 
+def test_conflicting_replay_preserves_the_original_events_attachment(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    stored = service.put_attachment(
+        room_id="room-1",
+        upload_id="upload-original",
+        kind="file",
+        name="notes.txt",
+        mime="text/plain",
+        data=b"release notes",
+    )
+    manifest = [{
+        key: stored[key]
+        for key in ("attachment_id", "kind", "name", "size", "mime")
+    }]
+    service.send(
+        room_id="room-1",
+        event_id="same-event",
+        payload={"text": "original", "thread_id": "thread-1", "attachments": manifest},
+    )
+
+    with pytest.raises(hosted_rooms.EventConflictError):
+        service.send(
+            room_id="room-1",
+            event_id="same-event",
+            payload={"text": "changed", "thread_id": "thread-1", "attachments": manifest},
+        )
+
+    assert service.read_attachment(
+        room_id="room-1",
+        attachment_id=stored["attachment_id"],
+        recipient_member_id="default",
+        event_id="same-event",
+    ).data == b"release notes"
+
+
 def test_viewer_access_does_not_collide_with_a_bot_named_viewer(tmp_path: Path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)

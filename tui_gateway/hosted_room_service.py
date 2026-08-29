@@ -412,14 +412,17 @@ class HostedRoomService:
             payload,
             member_ids=member_ids,
         )
+        transitioned_attachment_ids: tuple[str, ...] = ()
         if normalized.get("attachments"):
-            normalized["attachments"] = self.attachments.commit_message(
-                room_id=room_id,
-                event_id=event_id,
-                manifest=normalized["attachments"],
-                recipient_member_ids=member_ids,
-                viewer_access=True,
-                hold_until_event=True,
+            normalized["attachments"], transitioned_attachment_ids = (
+                self.attachments.commit_message_with_receipt(
+                    room_id=room_id,
+                    event_id=event_id,
+                    manifest=normalized["attachments"],
+                    recipient_member_ids=member_ids,
+                    viewer_access=True,
+                    hold_until_event=True,
+                )
             )
         try:
             event = hosted_rooms.append_event(
@@ -431,11 +434,11 @@ class HostedRoomService:
                 payload=normalized,
             )
         except Exception:
-            if normalized.get("attachments"):
+            if transitioned_attachment_ids:
                 self.attachments.abort_message_commit(
                     room_id=room_id,
                     event_id=event_id,
-                    manifest=normalized["attachments"],
+                    attachment_ids=transitioned_attachment_ids,
                 )
             raise
         if normalized.get("attachments"):
