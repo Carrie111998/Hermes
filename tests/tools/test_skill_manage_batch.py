@@ -176,6 +176,38 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertNotIn("Step A.", content)
         self.assertFalse(os.path.exists(os.path.join(self.home, "skills", "beta")))
 
+    def test_child_op_exception_rolls_back_instead_of_escaping(self):
+        """A child op that RAISES (I/O error, unexpected bug) must trigger
+        the same rollback as a clean op failure. It used to propagate past
+        the loop, the finally deleted the snapshots, and earlier ops
+        stayed applied with no recovery and no error payload."""
+        from unittest.mock import patch as _patch
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        real_skill_manage = self.smt.skill_manage
+
+        def crashing_skill_manage(*args, **kwargs):
+            if kwargs.get("action") == "write_file":
+                raise OSError("disk blew up")
+            return real_skill_manage(*args, **kwargs)
+
+        with _patch.object(self.smt, "skill_manage",
+                           side_effect=crashing_skill_manage):
+            r = self._call("probe", [
+                {"action": "patch",
+                 "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file",
+                 "file_path": "references/late.md", "file_content": "x"},
+            ])
+        self.assertFalse(r["success"], r)
+        self.assertEqual(r["failed_index"], 1)
+        self.assertIn("OSError", r["error"])
+        self.assertIn("rolled back", r["error"])
+        # The patch from op 0 was undone by the rollback.
+        content = open(os.path.join(self.home, "skills", "probe", "SKILL.md")).read()
+        self.assertIn("Step 1.", content)
+        self.assertNotIn("Step ONE.", content)
+
     def test_single_op_path_unchanged(self):
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
         raw = self.smt.skill_manage(

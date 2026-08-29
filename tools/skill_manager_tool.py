@@ -1706,19 +1706,40 @@ def _skill_manage_batch(
     token = _skill_gate_bypass.set(True)
     try:
         for i, op in enumerate(operations):
-            raw = skill_manage(
-                action=op["action"],
-                name=names[i],
-                content=op.get("content"),
-                category=op.get("category"),
-                file_path=op.get("file_path"),
-                file_content=op.get("file_content"),
-                old_string=op.get("old_string"),
-                new_string=op.get("new_string"),
-                replace_all=op.get("replace_all", False),
-                task_id=task_id,
-                session_id=session_id,
-            )
+            try:
+                raw = skill_manage(
+                    action=op["action"],
+                    name=names[i],
+                    content=op.get("content"),
+                    category=op.get("category"),
+                    file_path=op.get("file_path"),
+                    file_content=op.get("file_content"),
+                    old_string=op.get("old_string"),
+                    new_string=op.get("new_string"),
+                    replace_all=op.get("replace_all", False),
+                    task_id=task_id,
+                    session_id=session_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — a raised op is a failed op
+                # An exception from an op (I/O error, unexpected bug) is as
+                # much a mid-batch failure as a clean error result. Rolling
+                # back here is the only chance: the finally below deletes
+                # the snapshots, so letting it propagate would leave earlier
+                # ops applied with no recovery path.
+                note = _rollback()
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"operations[{i}] ({op['action']} on '{names[i]}') "
+                            f"raised {type(exc).__name__}: {exc}. "
+                            f"Batch aborted, {note}."
+                        ),
+                        "failed_index": i,
+                        "completed_before_failure": i,
+                    },
+                    ensure_ascii=False,
+                )
             try:
                 parsed = json.loads(raw)
             except Exception:  # noqa: BLE001
