@@ -673,7 +673,7 @@ class TestPrefetchServerRetainVisibility:
         )
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
-        assert "op-async-1" in provider._pending_retain_ops
+        assert ("test-bank", "op-async-1") in provider._pending_retain_ops
 
     def test_tracks_multiple_operation_ids(self, provider):
         provider._client.aretain_batch = AsyncMock(
@@ -683,7 +683,7 @@ class TestPrefetchServerRetainVisibility:
         )
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
-        assert {"op-a", "op-b"} <= provider._pending_retain_ops
+        assert {("test-bank", "op-a"), ("test-bank", "op-b")} <= provider._pending_retain_ops
 
     def test_sync_retain_tracks_no_ops(self, provider_with_config):
         p = provider_with_config(retain_async=False)
@@ -709,7 +709,8 @@ class TestPrefetchServerRetainVisibility:
 
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
-        assert "op-1" in provider._pending_retain_ops
+        # ops are tracked as (bank_id, op_id) tuples
+        assert any(op_id == "op-1" for _bid, op_id in provider._pending_retain_ops)
 
         provider.queue_prefetch("next turn query")
         if provider._prefetch_thread:
@@ -1380,6 +1381,305 @@ class TestBankIdTemplate:
         )
         assert p._bank_id == "hermes-coder"
         assert p._bank_id_template == "hermes-{profile}"
+
+
+# ---------------------------------------------------------------------------
+# Per-project bank discovery (.hindsight/config.toml walk-up) + precedence
+# ---------------------------------------------------------------------------
+
+
+class TestCwdBankDiscovery:
+    def _write_toml(self, directory, bank_id, extra=""):
+        d = directory / ".hindsight"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.toml").write_text(f'bank_id = "{bank_id}"\n{extra}')
+
+    def test_no_config_anywhere_returns_none(self, tmp_path):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        assert _discover_cwd_bank_id(start_dir=str(tmp_path)) is None
+
+    def test_finds_config_in_start_dir(self, tmp_path):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        self._write_toml(tmp_path, "acme")
+        assert _discover_cwd_bank_id(start_dir=str(tmp_path)) == "acme"
+
+    def test_walks_up_to_parent(self, tmp_path):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        parent = tmp_path / "a" / "b" / "c"
+        parent.mkdir(parents=True)
+        self._write_toml(tmp_path, "project-root")
+        # No config in the deep child; nearest ancestor config wins.
+        assert _discover_cwd_bank_id(start_dir=str(parent)) == "project-root"
+
+    def test_closest_config_wins(self, tmp_path):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        self._write_toml(tmp_path, "root-bank")
+        child = tmp_path / "sub"
+        child.mkdir()
+        self._write_toml(child, "child-bank")
+        assert _discover_cwd_bank_id(start_dir=str(child)) == "child-bank"
+
+    def test_ignores_other_keys(self, tmp_path):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        self._write_toml(
+            tmp_path, "acme",
+            extra='mission = "whatever"\nbudget = "high"\n',
+        )
+        assert _discover_cwd_bank_id(start_dir=str(tmp_path)) == "acme"
+
+    def test_empty_bank_id_falls_through_to_parent(self, tmp_path):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        child = tmp_path / "sub"
+        child.mkdir()
+        self._write_toml(child, "   ")  # whitespace-only bank_id
+        self._write_toml(tmp_path, "root-bank")
+        assert _discover_cwd_bank_id(start_dir=str(child)) == "root-bank"
+
+    def test_malformed_toml_skipped_not_fatal(self, tmp_path, caplog):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        import logging
+        d = tmp_path / ".hindsight"
+        d.mkdir(parents=True)
+        (d / "config.toml").write_text("bank_id = [unclosed")
+        with caplog.at_level(logging.WARNING):
+            assert _discover_cwd_bank_id(start_dir=str(tmp_path)) is None
+        assert any("malformed" in r.getMessage() for r in caplog.records)
+
+    def test_malformed_child_does_not_mask_valid_parent(self, tmp_path, caplog):
+        from plugins.memory.hindsight import _discover_cwd_bank_id
+        import logging
+        child = tmp_path / "sub"
+        child.mkdir()
+        d = child / ".hindsight"
+        d.mkdir(parents=True)
+        (d / "config.toml").write_text("not = [valid")
+        self._write_toml(tmp_path, "root-bank")
+        with caplog.at_level(logging.WARNING):
+            assert _discover_cwd_bank_id(start_dir=str(child)) == "root-bank"
+
+
+class TestBankPrecedence:
+    def _provider_with_config(self, tmp_path, monkeypatch, config):
+        config.setdefault("mode", "cloud")
+        config.setdefault("apiKey", "k")
+        config.setdefault("api_url", "http://x")
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="cli",
+            agent_identity="coder",
+            agent_workspace="hermes",
+        )
+        return p
+
+    def test_static_bank_id_unchanged_without_toml_or_flag(self, tmp_path, monkeypatch):
+        from plugins.memory.hindsight import _HINDSIGHT_BANK_OVERRIDE_ENV
+        monkeypatch.delenv(_HINDSIGHT_BANK_OVERRIDE_ENV, raising=False)
+        p = self._provider_with_config(tmp_path, monkeypatch, {"bank_id": "design"})
+        assert p._bank_id == "design"
+
+    def test_toml_beats_static_bank_id(self, tmp_path, monkeypatch):
+        from plugins.memory.hindsight import _HINDSIGHT_BANK_OVERRIDE_ENV
+        monkeypatch.delenv(_HINDSIGHT_BANK_OVERRIDE_ENV, raising=False)
+        d = tmp_path / "project" / "nested"
+        d.mkdir(parents=True)
+        (d.parent / ".hindsight" / "config.toml").parent.mkdir(parents=True)
+        (d.parent / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n')
+        monkeypatch.chdir(d)
+        p = self._provider_with_config(tmp_path, monkeypatch, {"bank_id": "design"})
+        assert p._bank_id == "acme"
+
+    def test_toml_beats_bank_id_template(self, tmp_path, monkeypatch):
+        from plugins.memory.hindsight import _HINDSIGHT_BANK_OVERRIDE_ENV
+        monkeypatch.delenv(_HINDSIGHT_BANK_OVERRIDE_ENV, raising=False)
+        d = tmp_path / "project"
+        d.mkdir()
+        (d / ".hindsight" / "config.toml").parent.mkdir(parents=True)
+        (d / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n')
+        monkeypatch.chdir(d)
+        p = self._provider_with_config(
+            tmp_path, monkeypatch,
+            {"bank_id": "fallback-bank", "bank_id_template": "hermes-{profile}"},
+        )
+        assert p._bank_id == "acme"
+
+    def test_cli_flag_beats_toml(self, tmp_path, monkeypatch):
+        from plugins.memory.hindsight import _HINDSIGHT_BANK_OVERRIDE_ENV
+        monkeypatch.setenv(_HINDSIGHT_BANK_OVERRIDE_ENV, "forced-bank")
+        d = tmp_path / "project"
+        d.mkdir()
+        (d / ".hindsight" / "config.toml").parent.mkdir(parents=True)
+        (d / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n')
+        monkeypatch.chdir(d)
+        p = self._provider_with_config(tmp_path, monkeypatch, {"bank_id": "design"})
+        assert p._bank_id == "forced-bank"
+
+    def test_cli_flag_beats_template(self, tmp_path, monkeypatch):
+        from plugins.memory.hindsight import _HINDSIGHT_BANK_OVERRIDE_ENV
+        monkeypatch.setenv(_HINDSIGHT_BANK_OVERRIDE_ENV, "forced-bank")
+        p = self._provider_with_config(
+            tmp_path, monkeypatch,
+            {"bank_id": "fallback-bank", "bank_id_template": "hermes-{profile}"},
+        )
+        assert p._bank_id == "forced-bank"
+
+    def test_blank_env_flag_ignored(self, tmp_path, monkeypatch):
+        from plugins.memory.hindsight import _HINDSIGHT_BANK_OVERRIDE_ENV
+        monkeypatch.setenv(_HINDSIGHT_BANK_OVERRIDE_ENV, "   ")
+        d = tmp_path / "project"
+        d.mkdir()
+        (d / ".hindsight" / "config.toml").parent.mkdir(parents=True)
+        (d / ".hindsight" / "config.toml").write_text('bank_id = "acme"\n')
+        monkeypatch.chdir(d)
+        p = self._provider_with_config(tmp_path, monkeypatch, {"bank_id": "design"})
+        assert p._bank_id == "acme"
+
+
+# ---------------------------------------------------------------------------
+# Multi-bank write set (mirror_to_own_bank + additional_banks)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiBank:
+    def _provider(self, tmp_path, monkeypatch, config):
+        config.setdefault("mode", "cloud")
+        config.setdefault("apiKey", "k")
+        config.setdefault("api_url", "http://x")
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="cli",
+            agent_identity="coder",
+            agent_workspace="acme",
+        )
+        return p
+
+    def test_no_extra_config_is_single_bank(self, tmp_path, monkeypatch):
+        p = self._provider(tmp_path, monkeypatch, {"bank_id": "lead"})
+        assert p._write_bank_ids == ["lead"]
+
+    def test_mirror_to_own_bank_when_primary_differs(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead", "bank_id_template": "{workspace}",
+             "mirror_to_own_bank": True},
+        )
+        # primary = acme (workspace won), mirror keeps own bank
+        assert p._write_bank_ids == ["acme", "lead"]
+
+    def test_mirror_off_defaults_to_single_bank(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead", "bank_id_template": "{workspace}"},
+        )
+        # mirror_to_own_bank default false → only the workspace primary
+        assert p._write_bank_ids == ["acme"]
+
+    def test_mirror_noop_when_primary_equals_own(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead", "mirror_to_own_bank": True},
+        )
+        # no template/TOML → primary == own bank, no duplicate
+        assert p._write_bank_ids == ["lead"]
+
+    def test_additional_banks_appended_in_order(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead",
+             "additional_banks": ["acme", "shared"]},
+        )
+        assert p._write_bank_ids == ["lead", "acme", "shared"]
+
+    def test_additional_banks_deduplicated(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead",
+             "additional_banks": ["acme", "shared", "acme", "lead"]},
+        )
+        # duplicates (incl. one equal to primary) collapse
+        assert p._write_bank_ids == ["lead", "acme", "shared"]
+
+    def test_comma_separated_string_accepted(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead",
+             "additional_banks": "acme, shared"},
+        )
+        assert p._write_bank_ids == ["lead", "acme", "shared"]
+
+    def test_full_bank_set_mirror_plus_additional(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead", "bank_id_template": "{workspace}",
+             "mirror_to_own_bank": True,
+             "additional_banks": ["shared", "acme"]},
+        )
+        # primary(acme) -> own(lead) -> additional(shared); acme dup dropped
+        assert p._write_bank_ids == ["acme", "lead", "shared"]
+
+    def test_retain_fans_out_to_all_banks(self, tmp_path, monkeypatch):
+        """sync_turn must dispatch one aretain_batch per bank in order."""
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead", "bank_id_template": "{workspace}",
+             "mirror_to_own_bank": True, "additional_banks": ["shared"]},
+        )
+        calls = []
+        from types import SimpleNamespace as _SN
+
+        async def _fake_aretain_batch(**kwargs):
+            calls.append(kwargs["bank_id"])
+            return _SN(ok=True, operation_id=None, operation_ids=None)
+
+        p._client = _make_mock_client()
+        p._retain_async = False
+        p._client.aretain_batch = AsyncMock(side_effect=_fake_aretain_batch)
+        p.sync_turn("hello", "world")
+        p._retain_queue.join()
+        assert calls == ["acme", "lead", "shared"]
+
+    def test_recall_merges_primary_first_deduped(self, tmp_path, monkeypatch):
+        p = self._provider(
+            tmp_path, monkeypatch,
+            {"bank_id": "lead", "bank_id_template": "{workspace}",
+             "mirror_to_own_bank": True, "additional_banks": ["shared"]},
+        )
+        from types import SimpleNamespace as _SN
+        seen_banks = []
+
+        async def _fake_arecall(**kwargs):
+            seen_banks.append(kwargs["bank_id"])
+            # Duplicate text across banks must dedupe; primary result ranks first.
+            if kwargs["bank_id"] == "acme":
+                return _SN(results=[_SN(text="workspace-memory"), _SN(text="shared")])
+            if kwargs["bank_id"] == "lead":
+                return _SN(results=[_SN(text="own-memory"), _SN(text="shared")])
+            return _SN(results=[_SN(text="mentat-memory")])
+
+        p._client = _make_mock_client()
+        p._client.arecall = AsyncMock(side_effect=_fake_arecall)
+        p._prefetch_method = "recall"
+        result = p._do_recall("query")
+        assert seen_banks == ["acme", "lead", "shared"]
+        lines = [ln for ln in result.text.split("\n") if ln]
+        assert lines[0] == "- workspace-memory"
+        assert lines[1] == "- shared"
+        assert "- own-memory" in lines
+        assert lines[-1] == "- mentat-memory"
+        # "shared" appears exactly once (deduped)
+        assert sum(1 for ln in lines if ln == "- shared") == 1
+        assert result.count == len(lines)
 
 
 # ---------------------------------------------------------------------------
