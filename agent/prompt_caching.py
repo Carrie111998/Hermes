@@ -63,20 +63,22 @@ def _apply_cache_marker(msg: dict, cache_marker: dict, native_anthropic: bool = 
         if role == "user":
             stable_prefix = find_stable_prefix(content)
             if stable_prefix is not None:
-                # Builder-declared boundary (#81867): the scaffold carries the
-                # breakpoint, the volatile invocation tail rides unmarked so a
-                # changed ticket ID or timestamp no longer invalidates the
-                # whole skill body. Request-local only — the canonical session
-                # message stays a plain string.
-                msg["content"] = [
-                    {
-                        "type": "text",
-                        "text": stable_prefix,
-                        "cache_control": cache_marker,
-                    },
-                    {"type": "text", "text": content[len(stable_prefix):]},
-                ]
-                return
+                suffix = content[len(stable_prefix):]
+                if suffix.strip():
+                    # Builder-declared boundary (#81867): the scaffold carries the
+                    # breakpoint, the volatile invocation tail rides unmarked so a
+                    # changed ticket ID or timestamp no longer invalidates the
+                    # whole skill body. Request-local only — the canonical session
+                    # message stays a plain string.
+                    msg["content"] = [
+                        {
+                            "type": "text",
+                            "text": stable_prefix,
+                            "cache_control": cache_marker,
+                        },
+                        {"type": "text", "text": suffix},
+                    ]
+                    return
         msg["content"] = [
             {"type": "text", "text": content, "cache_control": cache_marker}
         ]
@@ -204,7 +206,7 @@ def _apply_system_cache_markers(
         and content.startswith(static_system_prefix)
     ):
         suffix = content[len(static_system_prefix):]
-        if suffix:
+        if suffix.strip():
             suffix_part: dict = {"type": "text", "text": suffix}
             if mark_suffix:
                 suffix_part["cache_control"] = cache_marker
@@ -217,7 +219,7 @@ def _apply_system_cache_markers(
                 suffix_part,
             ]
             return 2 if mark_suffix else 1
-        # Empty suffix: the stored prompt IS the static prefix. Mark it as
+        # Empty/whitespace-only suffix: the stored prompt IS the static prefix. Mark it as
         # one whole block — a [marked-prefix, ""] split would put an empty
         # text block on the wire (HTTP 400 on native Anthropic).
         _apply_cache_marker(message, cache_marker, native_anthropic=native_anthropic)
@@ -445,6 +447,14 @@ def apply_anthropic_cache_control(
     non-system messages. Without that prefix, the legacy system-and-3 layout
     is retained.
 
+    Idempotent: pre-existing ``cache_control`` markers are stripped from a
+    per-message copy before new ones are placed, so calling this twice (or
+    handing it messages a prior call already marked) can never accumulate
+    past 4 markers. Only messages that already carry a marker pay the copy
+    cost — a shallow top-level copy suffices because
+    :func:`strip_anthropic_cache_control` is copy-on-write on content parts —
+    and the rest of the copy-on-write contract is unchanged (#90971).
+
     Returns:
         Shallow copy of message list with selective deep copies of modified messages.
     """
@@ -453,6 +463,20 @@ def apply_anthropic_cache_control(
 
     messages = list(api_messages)
     marker = _build_marker(cache_ttl)
+
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        has_marker = "cache_control" in msg or (
+            isinstance(content, list)
+            and any(isinstance(part, dict) and "cache_control" in part for part in content)
+        )
+        if has_marker:
+            # Shallow top-level copy is enough: strip pops the top-level key
+            # and rebuilds content lists/part dicts copy-on-write, so the
+            # caller's message (and any aliased parts) are never mutated.
+            messages[i] = strip_anthropic_cache_control([dict(msg)])[0]
 
     breakpoints_used = 0
 
