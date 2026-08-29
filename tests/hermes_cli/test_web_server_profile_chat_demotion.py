@@ -71,18 +71,51 @@ class TestProfileChatDemotion:
             "HOME": "/home/hermes-echo",
             "USER": "hermes-echo",
             "LOGNAME": "hermes-echo",
+            # Root's session handles are marked for stripping (None), not
+            # inherited — the demoted child must not reach root's
+            # ssh-agent or runtime bus.
+            "SSH_AUTH_SOCK": None,
+            "SSH_AGENT_PID": None,
+            "XDG_RUNTIME_DIR": None,
+            "DBUS_SESSION_BUS_ADDRESS": None,
         }
-        # The preexec performs the ordered drop: groups → gid → uid.
+        # The preexec performs the ordered drop: initgroups → gid → uid.
         import hermes_cli.web_server as fresh_ws
 
         calls = []
+        monkeypatch.setattr(os, "initgroups", lambda u, g: calls.append(("initgroups", u, g)), raising=False)
         monkeypatch.setattr(os, "setgroups", lambda g: calls.append(("groups", g)))
         monkeypatch.setattr(os, "setgid", lambda g: calls.append(("gid", g)))
         monkeypatch.setattr(os, "setuid", lambda u: calls.append(("uid", u)))
         # Re-resolve so the closure binds the patched os functions.
         preexec, _, _ = fresh_ws._profile_chat_demotion("echo")
         preexec()
-        assert calls == [("groups", [300]), ("gid", 300), ("uid", 985)]
+        assert calls == [("initgroups", "hermes-echo", 300), ("gid", 300), ("uid", 985)]
+
+    def test_failed_supplementary_group_drop_kills_child(
+        self, profile_dir, monkeypatch
+    ):
+        # A swallowed setgroups failure would leave root's supplementary
+        # groups attached to the demoted child — the OSError must propagate
+        # so ptyprocess terminates the forked child before the target
+        # program starts (#94847 fail-closed).
+        _as_root(monkeypatch)
+        monkeypatch.setattr(os, "stat", lambda p: _Stat(985, 300))
+        import pwd
+
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+
+        def _boom(groups):
+            raise PermissionError("setgroups denied")
+
+        import hermes_cli.web_server as fresh_ws
+
+        monkeypatch.setattr(os, "setgroups", _boom)
+        monkeypatch.setattr(os, "setgid", lambda g: None)
+        monkeypatch.setattr(os, "setuid", lambda u: None)
+        preexec, _, _ = fresh_ws._profile_chat_demotion("echo")
+        with pytest.raises(OSError):
+            preexec()
 
     def test_owner_missing_from_passwd_still_drops_by_dir_ids(
         self, profile_dir, monkeypatch
@@ -95,7 +128,14 @@ class TestProfileChatDemotion:
         preexec, overrides, err = ws_mod._profile_chat_demotion("echo")
         assert err is None
         assert preexec is not None
-        assert overrides == {}  # no HOME/USER data — ids alone still drop
+        # no HOME/USER data — ids alone still drop, and root's session
+        # handles are still stripped.
+        assert overrides == {
+            "SSH_AUTH_SOCK": None,
+            "SSH_AGENT_PID": None,
+            "XDG_RUNTIME_DIR": None,
+            "DBUS_SESSION_BUS_ADDRESS": None,
+        }
 
     def test_stat_failure_fails_closed_with_error(self, profile_dir, monkeypatch):
         _as_root(monkeypatch)

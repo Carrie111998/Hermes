@@ -16746,11 +16746,19 @@ def _profile_chat_demotion(profile: Optional[str]):
 
     def _drop_to_profile_owner() -> None:
         # Order matters: drop supplementary groups, then gid, then uid —
-        # each step retains the privilege needed for the next one.
-        try:
+        # each step retains the privilege needed for the next one. A failed
+        # supplementary-group drop must kill the child before exec: letting
+        # it continue would leave root's supplementary groups (docker, disk,
+        # …) attached to the demoted process, keeping group-reachable
+        # privileged files open — so the OSError propagates, ptyprocess
+        # _exit(1)s the child before exec, and the ws handler reports the
+        # refused spawn (#94847). With a passwd entry, initgroups keeps the
+        # owner's own legitimate group memberships instead of collapsing to
+        # the single primary gid.
+        if username is not None:
+            os.initgroups(username, target_gid)
+        else:
             os.setgroups([target_gid])
-        except OSError:
-            pass  # best-effort: primary gid drop below is the hard floor
         os.setgid(target_gid)
         os.setuid(target_uid)
 
@@ -16760,6 +16768,16 @@ def _profile_chat_demotion(profile: Optional[str]):
     if username:
         env_overrides["USER"] = username
         env_overrides["LOGNAME"] = username
+    # Root's own session handles must not survive the drop: the demoted
+    # child runs as another OS user and must not reach root's ssh-agent or
+    # runtime-bus sockets. None marks "strip this variable" for the caller.
+    for _session_var in (
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ):
+        env_overrides[_session_var] = None
     return _drop_to_profile_owner, env_overrides, None
 
 
@@ -17581,7 +17599,13 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
     if demote_env:
-        env.update(demote_env)
+        # None-valued entries strip the variable (root's session handles);
+        # everything else overrides it.
+        for _k, _v in demote_env.items():
+            if _v is None:
+                env.pop(_k, None)
+            else:
+                env[_k] = _v
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env, preexec_fn=demote_preexec)
