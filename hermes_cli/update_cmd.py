@@ -3749,13 +3749,27 @@ def _run_pending_fleet_restart() -> bool:
         return False
 
 
-def _apply_pending_fleet_restart_catchup() -> None:
+def _apply_pending_fleet_restart_catchup(*, respect_no_gateway_restart: bool = False, no_gateway_restart: bool = False) -> None:
     """On an already-up-to-date ``hermes update``, finish a skipped restart.
 
     No-op when nothing is pending. Exits 1 when the catch-up restart is
     incomplete so automation does not treat the fleet as healthy.
+
+    When called from a cron's ``--no-gateway-restart`` flow, the caller
+    passes ``respect_no_gateway_restart=True``. In that case the pending
+    fleet restart is deferred — the update stays healthy and the marker is
+    kept so a later out-of-cron update (or ``hermes gateway restart``)
+    finishes it. This prevents a cron that runs ``hermes update --yes
+    --no-gateway-restart`` twice in the same window from killing its own
+    gateway mid-flight (#95294 vs #cron-self-kill 2026-08-29).
     """
     if not _pending_fleet_restart_needed():
+        return
+    if respect_no_gateway_restart and no_gateway_restart:
+        print()
+        _warn_pending_fleet_restart()
+        print("  (fleet restart deferred — --no-gateway-restart; marker kept)")
+        print("  Restart separately: `hermes gateway restart` or next non-cron update.")
         return
     print()
     _warn_pending_fleet_restart()
@@ -9011,24 +9025,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Git is current, but a prior pull may still owe the fleet a
             # restart (#95294). Catch up even on the "Already up to date"
             # path — that early return is what left the gateway on stale
-            # code for two days. Runs BEFORE the runtime-verification exit
-            # gate below: a vulnerable SQLite runtime demotes the outcome to
-            # partial, but must not strand the fleet on stale code (#91277
-            # fleet contract — the pending-restart check always executes).
-            _apply_pending_fleet_restart_catchup()
-            if not current_checkout_complete:
-                if gateway_mode:
-                    _write_gateway_update_exit_code(False)
-                try:
-                    from hermes_cli.update_receipt import finalize_update_receipt
-
-                    finalize_update_receipt("partial")
-                except Exception as _receipt_exc:
-                    logger.debug(
-                        "Update receipt finalize (current checkout) failed: %s",
-                        _receipt_exc,
-                    )
-                sys.exit(1)
+            # code for two days. When invoked with --no-gateway-restart
+            # (cron inside gateway), defer instead of self-killing (2026-08-29).
+            # Runs BEFORE the runtime-verification exit gate below: a vulnerable
+            # SQLite runtime demotes the outcome to partial, but must not strand
+            # the fleet on stale code (#91277 fleet contract — the pending-restart
+            # check always executes).
+            _apply_pending_fleet_restart_catchup(
+                respect_no_gateway_restart=True,
+                no_gateway_restart=bool(getattr(args, "no_gateway_restart", False)),
+            )
             return
 
         if commit_count > 0:
