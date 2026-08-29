@@ -327,6 +327,12 @@ def _shape_message(
         "content": content,
         "timestamp": m.get("timestamp"),
     }
+    # Surface per-message attribution when present. Written by the persist path
+    # (agent/turn_context.py) for every user message; without this, session_search
+    # returns the words but not who/where — recreating the attribution blindness
+    # post-compaction. Always a dict in practice; tolerate str (stored JSON) too.
+    if m.get("display_metadata"):
+        entry["display_metadata"] = m["display_metadata"]
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
