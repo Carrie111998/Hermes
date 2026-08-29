@@ -171,6 +171,66 @@ def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypa
         ws._oauth_sessions.pop(session_id, None)
 
 
+def test_oauth_start_stores_requested_account_label(tmp_path, monkeypatch):
+    from hermes_cli import web_server as ws
+
+    _make_profile_home(tmp_path, monkeypatch)
+
+    def fake_start(profile=None):
+        session_id, _ = ws._new_oauth_session(
+            "anthropic", "pkce", profile=profile
+        )
+        return {
+            "session_id": session_id,
+            "flow": "pkce",
+            "auth_url": "https://claude.ai/oauth/authorize",
+            "expires_in": 600,
+        }
+
+    monkeypatch.setattr(ws, "_start_anthropic_pkce", fake_start)
+
+    response = client.post(
+        "/api/providers/oauth/anthropic/start?profile=coder",
+        headers=HEADERS,
+        json={"label": "Client Claude"},
+    )
+
+    assert response.status_code == 200, response.text
+    session_id = response.json()["session_id"]
+    try:
+        assert ws._oauth_sessions[session_id]["profile"] == "coder"
+        assert ws._oauth_sessions[session_id]["label"] == "Client Claude"
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_dashboard_oauth_pool_entries_are_distinct_named_subscriptions(
+    _isolate_hermes_home,
+):
+    from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
+    from hermes_cli import web_server as ws
+
+    first = ws._save_dashboard_oauth_pool_entry(
+        provider="openai-codex",
+        access_token="token-a",
+        refresh_token="refresh-a",
+        label="Personal Codex",
+    )
+    second = ws._save_dashboard_oauth_pool_entry(
+        provider="openai-codex",
+        access_token="token-b",
+        refresh_token="refresh-b",
+        label="Work Codex",
+    )
+
+    assert first.id != second.id
+    entries = load_pool("openai-codex").entries()
+    assert [(entry.label, entry.auth_type) for entry in entries] == [
+        ("Personal Codex", AUTH_TYPE_OAUTH),
+        ("Work Codex", AUTH_TYPE_OAUTH),
+    ]
+
+
 
 
 def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
@@ -354,7 +414,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     delete_started = threading.Event()
     delete_finished = threading.Event()
 
-    def fake_save(tokens):
+    def fake_save(**tokens):
         # We are inside the worker's critical section right now (holding
         # _oauth_sessions_lock). Fire a real DELETE from another thread and
         # prove it cannot complete until this section releases the lock.
@@ -372,7 +432,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
         client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
         delete_finished.set()
 
-    monkeypatch.setattr(auth_mod, "_save_codex_tokens", fake_save)
+    monkeypatch.setattr(ws, "_save_dashboard_oauth_pool_entry", fake_save)
     monkeypatch.setattr(ws.time, "sleep", lambda *_a, **_k: None)
 
     sid, _ = ws._new_oauth_session("openai-codex", "device_code", profile="coder")
@@ -385,7 +445,12 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
 
     assert len(saved) == 1
     tokens, delete_was_still_blocked_during_save = saved[0]
-    assert tokens == {"access_token": "at", "refresh_token": "rt"}
+    assert tokens == {
+        "provider": "openai-codex",
+        "access_token": "at",
+        "refresh_token": "rt",
+        "label": None,
+    }
     assert delete_was_still_blocked_during_save, (
         "DELETE must block until the worker's check+save critical section "
         "finishes, not slip in between the check and the save"
@@ -488,6 +553,18 @@ def test_xai_oauth_listed_as_device_code_flow():
     assert "xai-oauth" in providers
     assert providers["xai-oauth"]["flow"] == "device_code"
     assert "grok" in providers["xai-oauth"]["name"].lower()
+
+
+def test_oauth_catalog_advertises_multiple_subscriptions_only_when_dashboard_persists_them():
+    resp = client.get("/api/providers/oauth", headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    providers = {p["id"]: p for p in resp.json()["providers"]}
+
+    assert providers["openai-codex"]["supports_multiple_subscriptions"] is True
+    assert providers["anthropic"]["supports_multiple_subscriptions"] is False
+    assert providers["minimax-oauth"]["supports_multiple_subscriptions"] is False
+    assert providers["nous"]["supports_multiple_subscriptions"] is False
+    assert providers["xai-oauth"]["supports_multiple_subscriptions"] is False
 
 
 def test_accounts_offers_every_oauth_provider_from_catalog():

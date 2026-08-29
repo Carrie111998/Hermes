@@ -5357,6 +5357,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         provider = billing_provider
     base_url = str(model_config.get("base_url") or "").strip()
     api_mode = str(model_config.get("api_mode") or "").strip()
+    credential_id = str(model_config.get("credential_id") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
 
@@ -5413,6 +5414,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             "base_url": base_url or None,
             "api_mode": api_mode or None,
         }
+        if credential_id:
+            overrides["model_override"]["credential_id"] = credential_id
     if provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
@@ -5447,6 +5450,9 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     provider = str(getattr(agent, "provider", "") or "").strip()
     base_url = str(getattr(agent, "base_url", "") or "").strip()
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
+    credential_id = str(
+        getattr(agent, "_pinned_credential_pool_entry_id", "") or ""
+    ).strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
 
@@ -5494,6 +5500,13 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["api_mode"] = api_mode
     else:
         config.pop("api_mode", None)
+    if credential_id:
+        # Entry IDs identify a pool record, not a credential secret. Persisting
+        # the selected ID lets a resumed session resolve the same subscription
+        # and fail closed if it was removed, instead of rotating to a sibling.
+        config["credential_id"] = credential_id
+    else:
+        config.pop("credential_id", None)
     if isinstance(reasoning_config, dict):
         config["reasoning_config"] = reasoning_config
     else:
@@ -6195,6 +6208,7 @@ def _apply_model_switch(
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,
     persist_override: bool | None = None,
+    credential_id: str = "",
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_switch_args,
@@ -6286,6 +6300,7 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        credential_id=credential_id,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
@@ -6347,6 +6362,7 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
             )
+            agent._pinned_credential_pool_entry_id = getattr(result, "credential_id", "") or None
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
             # model/client and re-raised.  Abort the commit: do NOT restart the
@@ -6392,6 +6408,7 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
+            "credential_id": getattr(result, "credential_id", ""),
         }
     if persist_global:
         _persist_model_switch(result)
@@ -6862,6 +6879,7 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
             session,
             pending["raw"],
             confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
+            credential_id=str(pending.get("credential_id") or ""),
         )
         # A queued pick is a deliberate user action; honour the expensive-model
         # confirm by NOT applying it silently — surface the warning and drop the
@@ -8604,6 +8622,11 @@ def _resolve_runtime_with_fallback(
             False,
         )
     except AuthError as primary_exc:
+        if str(kwargs.get("credential_id") or "").strip():
+            # A session-selected pool entry is an explicit security boundary.
+            # Its absence must surface as an error, never fall through to a
+            # provider fallback (which could select a sibling credential).
+            raise primary_exc
         fb_chain = _load_fallback_model() or []
         for entry in fb_chain:
             if not isinstance(entry, dict):
@@ -8746,6 +8769,9 @@ def _make_agent(
                 resolve_kwargs["explicit_base_url"] = override_base_url
         resolve_kwargs["requested"] = requested_provider
         resolve_kwargs["target_model"] = model or None
+        credential_id = str(model_override.get("credential_id") or "").strip()
+        if credential_id:
+            resolve_kwargs["credential_id"] = credential_id
         resolution = _resolve_runtime_with_fallback(resolve_kwargs)
         runtime = resolution.runtime
         if resolution.used_fallback:
@@ -8778,7 +8804,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -8825,6 +8851,8 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    agent._pinned_credential_pool_entry_id = runtime.get("credential_pool_entry_id")
+    return agent
 
 
 def _init_session(
@@ -13773,6 +13801,7 @@ def _(rid, params: dict) -> dict:
                         # instead of blipping back to the still-live old model.
                         "display_model": pending_model,
                         "display_provider": pending_provider,
+                        "credential_id": str(params.get("credential_id") or ""),
                     }
                     return _ok(
                         rid,
@@ -13831,6 +13860,7 @@ def _(rid, params: dict) -> dict:
                             params.get("confirm_expensive_model", False)
                         ),
                         parsed_flags=parsed_flags,
+                        credential_id=str(params.get("credential_id") or ""),
                     )
                 if failed_agent_init and not result.get("confirm_required"):
                     _restart_completed_failed_agent_build(

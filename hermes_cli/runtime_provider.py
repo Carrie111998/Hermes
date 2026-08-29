@@ -1837,6 +1837,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    credential_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1871,7 +1872,7 @@ def resolve_runtime_provider(
                 f"(providers.{requested_provider}.enabled: false)"
             )
 
-    if requested_provider == "moa":
+    if requested_provider == "moa" and not credential_id:
         return {
             "provider": "moa",
             "api_mode": "chat_completions",
@@ -1886,7 +1887,11 @@ def resolve_runtime_provider(
     # return provider="custom" with chat_completions api_mode and no valid key).
     # Instead, use the Azure key directly with anthropic_messages api_mode.
     _eff_base = (explicit_base_url or "").strip()
-    if requested_provider == "anthropic" and base_url_host_matches(_eff_base, "azure.com"):
+    if (
+        not credential_id
+        and requested_provider == "anthropic"
+        and base_url_host_matches(_eff_base, "azure.com")
+    ):
         _azure_key = (
             (explicit_api_key or "").strip()
             or _getenv("AZURE_ANTHROPIC_KEY", "").strip()
@@ -1906,7 +1911,7 @@ def resolve_runtime_provider(
     # Resolve before the custom-runtime / pool / generic paths so Azure
     # config is always picked up from model.base_url + model.api_mode,
     # regardless of whether the caller passed explicit_* args.
-    if requested_provider == "azure-foundry":
+    if requested_provider == "azure-foundry" and not credential_id:
         azure_runtime = _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
             model_cfg=_get_model_config(),
@@ -1926,7 +1931,10 @@ def resolve_runtime_provider(
     # the project ID + region. The token is re-minted per call (5-min refresh
     # margin) by get_vertex_config(); mid-session expiry is additionally
     # recovered on 401 by run_agent._try_refresh_vertex_client_credentials().
-    if requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
+    if (
+        not credential_id
+        and requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai")
+    ):
         from agent.vertex_adapter import get_vertex_config
 
         token, base_url = get_vertex_config()
@@ -1949,12 +1957,14 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
-    custom_runtime = _resolve_named_custom_runtime(
-        requested_provider=requested_provider,
-        explicit_api_key=explicit_api_key,
-        explicit_base_url=explicit_base_url,
-        target_model=target_model,
-    )
+    custom_runtime = None
+    if not credential_id:
+        custom_runtime = _resolve_named_custom_runtime(
+            requested_provider=requested_provider,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
@@ -1964,7 +1974,7 @@ def resolve_runtime_provider(
     # route through the OpenAI-compatible resolver instead of letting
     # resolve_provider() pick up an ANTHROPIC_API_KEY or OPENAI_API_KEY from
     # the environment and send the request to a cloud API. Fixes #3846.
-    if not explicit_base_url and not explicit_api_key:
+    if not credential_id and not explicit_base_url and not explicit_api_key:
         model_cfg = _get_model_config()
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
@@ -2014,7 +2024,7 @@ def resolve_runtime_provider(
         opencode_provider_family as _oc_family_fn,
         opencode_zen_free_runtime as _oc_free_runtime_fn,
     )
-    if _oc_family_fn(provider) is not None:
+    if not credential_id and _oc_family_fn(provider) is not None:
         _oc_model = str(
             target_model or model_cfg.get("default") or model_cfg.get("model") or ""
         ).strip()
@@ -2022,6 +2032,24 @@ def resolve_runtime_provider(
         if _free_runtime is not None:
             _free_runtime["requested_provider"] = requested_provider
             return _free_runtime
+
+    pinned_pool = None
+    if credential_id:
+        # A pin is an account boundary, not merely a pool-selection hint. Check
+        # the requested entry before explicit key/base-url resolution so a
+        # removed subscription cannot silently run on another credential.
+        try:
+            pinned_pool = load_pool(provider)
+        except Exception:
+            pinned_pool = None
+        if pinned_pool is None or not pinned_pool.has_credentials():
+            raise AuthError(
+                f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+            )
+        if pinned_pool.select_matching_id(credential_id) is None:
+            raise AuthError(
+                f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+            )
 
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,
@@ -2031,10 +2059,10 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
         target_model=target_model,
     )
-    if explicit_runtime:
+    if explicit_runtime and not credential_id:
         return explicit_runtime
 
-    should_use_pool = provider != "openrouter"
+    should_use_pool = provider != "openrouter" or bool(credential_id)
     if provider == "openrouter":
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
@@ -2055,11 +2083,19 @@ def resolve_runtime_provider(
         )
 
     try:
-        pool = load_pool(provider) if should_use_pool else None
+        pool = pinned_pool if credential_id else (load_pool(provider) if should_use_pool else None)
     except Exception:
         pool = None
+    if credential_id and (pool is None or not pool.has_credentials()):
+        raise AuthError(
+            f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+        )
     if pool and pool.has_credentials():
-        entry = pool.select()
+        entry = pool.select_matching_id(credential_id) if credential_id else pool.select()
+        if credential_id and entry is None:
+            raise AuthError(
+                f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+            )
         pool_api_key = ""
         if entry is not None:
             pool_api_key = (
@@ -2113,7 +2149,7 @@ def resolve_runtime_provider(
                 ),
             )
         ):
-            return _resolve_runtime_from_pool_entry(
+            runtime = _resolve_runtime_from_pool_entry(
                 provider=provider,
                 entry=entry,
                 requested_provider=requested_provider,
@@ -2121,6 +2157,15 @@ def resolve_runtime_provider(
                 pool=pool,
                 target_model=target_model,
             )
+            if credential_id:
+                runtime["credential_pool_entry_id"] = entry.id
+                runtime["credential_pool_pinned"] = True
+            return runtime
+
+    if credential_id:
+        raise AuthError(
+            f"Pinned credential {credential_id!r} is unavailable for provider {provider!r}."
+        )
 
     if provider == "nous":
         try:

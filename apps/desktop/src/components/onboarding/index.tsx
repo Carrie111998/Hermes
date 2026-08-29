@@ -21,6 +21,8 @@ import {
   dismissFirstRunOnboarding,
   type OnboardingContext,
   peekPendingProviderOAuth,
+  peekPendingProviderOAuthLabel,
+  peekPendingProviderOAuthProfile,
   refreshOnboarding,
   saveOnboardingApiKey,
   setOnboardingMode,
@@ -250,8 +252,10 @@ export function DesktopOnboardingOverlay({
     if (provider) {
       // Only clear once we've committed to launching it, so a failed/empty
       // provider fetch doesn't silently drop the hand-off.
+      const profile = peekPendingProviderOAuthProfile() ?? ctx.profile
+      const label = peekPendingProviderOAuthLabel() ?? undefined
       clearPendingProviderOAuth()
-      void startProviderOAuth(provider, ctx)
+      void startProviderOAuth(provider, { ...ctx, profile }, label)
     } else if (onboarding.providers.length > 0) {
       // The list loaded but the id isn't a real provider — drop the stale
       // hand-off. An empty list means the fetch isn't ready yet, so keep it

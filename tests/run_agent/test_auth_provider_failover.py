@@ -98,6 +98,16 @@ class TestAuthFailoverActivation:
         assert advanced is True
         assert agent._fallback_index == 1
 
+    def test_pinned_subscription_never_activates_provider_fallback(self):
+        agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])
+        agent._pinned_credential_pool_entry_id = "work-openai"
+
+        with patch("agent.auxiliary_client.resolve_provider_client") as resolve:
+            assert agent._try_activate_fallback(FailoverReason.rate_limit) is False
+
+        resolve.assert_not_called()
+        assert agent._fallback_index == 0
+
     def test_no_failover_without_chain(self):
         """A user with no fallback configured (the common case for the
         original incident) does NOT failover — falls through to the

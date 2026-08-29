@@ -19,6 +19,7 @@ depend on:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -627,6 +628,43 @@ def test_build_models_payload_no_max_models_returns_full_list():
     assert len(kilo_row["models"]) == 100
 
 
+def test_build_models_payload_keeps_provider_row_for_one_pooled_subscription():
+    ctx = _empty_ctx()
+    pool = SimpleNamespace(entries=lambda: [SimpleNamespace(id="personal", label="Personal")])
+    with (
+        _list_auth_returning([
+            {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5"]}
+        ]),
+        patch("agent.credential_pool.load_pool", return_value=pool),
+    ):
+        payload = build_models_payload(ctx)
+
+    rows = [row for row in payload["providers"] if row["slug"] == "openai-codex"]
+    assert rows == [{"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5"]}]
+
+
+def test_build_models_payload_replaces_multi_subscription_pool_with_pinned_picker_rows():
+    ctx = _empty_ctx()
+    pool = SimpleNamespace(entries=lambda: [
+        SimpleNamespace(id="work", label="Codex Work"),
+        SimpleNamespace(id="private", label="Codex Private"),
+    ])
+    with (
+        _list_auth_returning([
+            {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5"]}
+        ]),
+        patch("agent.credential_pool.load_pool", return_value=pool),
+    ):
+        payload = build_models_payload(ctx)
+
+    rows = [row for row in payload["providers"] if row["slug"].startswith("credential-pool:openai-codex:")]
+    assert [row["name"] for row in rows] == ["Codex Work", "Codex Private"]
+    assert [row["selection_provider"] for row in rows] == ["openai-codex", "openai-codex"]
+    assert [row["credential_id"] for row in rows] == ["work", "private"]
+    assert all(row["models"] == ["gpt-5"] for row in rows)
+    assert not any(row["slug"] == "openai-codex" for row in payload["providers"])
+
+
 # ─── refresh flag (cache-bust) ─────────────────────────────────────────
 
 
@@ -681,7 +719,6 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
 
 
 

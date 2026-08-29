@@ -627,6 +627,7 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    credential_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1446,6 +1447,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    credential_id: str = "",
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1887,6 +1889,7 @@ def switch_model(
                     explicit_api_key=_ukey or None,
                     explicit_base_url=_user_pdef.base_url,
                     target_model=new_model,
+                    credential_id=credential_id or None,
                 )
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
@@ -1905,6 +1908,7 @@ def switch_model(
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
                     target_model=new_model,
+                    credential_id=credential_id or None,
                 )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
@@ -1965,6 +1969,7 @@ def switch_model(
                 runtime = resolve_runtime_provider(
                     requested=current_provider,
                     target_model=new_model,
+                    credential_id=credential_id or None,
                 )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
@@ -2198,6 +2203,7 @@ def switch_model(
         capabilities=capabilities,
         model_info=model_info,
         is_global=is_global,
+        credential_id=credential_id,
     )
 
 

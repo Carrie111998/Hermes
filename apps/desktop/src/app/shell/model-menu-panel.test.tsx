@@ -52,6 +52,13 @@ const GOOGLE_PROVIDER = {
 }
 
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
+const POOL_SUBSCRIPTION_PROVIDER = {
+  credential_id: 'work-openai',
+  models: ['gpt-5-codex', 'gpt-5.1-codex', 'o3'],
+  name: 'WORK — ChatGPT / Codex',
+  selection_provider: 'openai-codex',
+  slug: 'credential-pool:openai-codex:work-openai'
+}
 
 beforeEach(() => {
   $activeSessionId.set('runtime-1')
@@ -456,6 +463,42 @@ describe('ModelMenuPanel provider collapse', () => {
       expect(getGlobalModelOptions).toHaveBeenCalledTimes(2)
     })
     expect(onSelectModel).not.toHaveBeenCalled()
+  })
+})
+
+describe('ModelMenuPanel pooled subscriptions', () => {
+  it('renders a pooled subscription as its own provider group, separate from other providers', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [DEEPSEEK_PROVIDER, POOL_SUBSCRIPTION_PROVIDER]
+    })
+
+    const { content } = renderPanel()
+    const { findByText } = content
+
+    expect(await findByText('WORK — ChatGPT / Codex')).toBeTruthy()
+    expect(await findByText('DeepSeek')).toBeTruthy()
+    const subscriptionGroup = screen.getByText('WORK — ChatGPT / Codex').closest('[role="group"]')
+    const deepseekGroup = screen.getByText('DeepSeek').closest('[role="group"]')
+    expect(subscriptionGroup).not.toBe(deepseekGroup)
+  })
+
+  it('commits a pooled subscription with its canonical provider and credential pin', async () => {
+    getGlobalModelOptions.mockResolvedValue({ providers: [POOL_SUBSCRIPTION_PROVIDER] })
+    const { content, onSelectModel } = renderPanel()
+
+    await content.findByText('WORK — ChatGPT / Codex')
+    const input = screen.getByRole('textbox', { name: 'Search models' })
+    fireEvent.change(input, { target: { value: 'gpt-5-codex' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await vi.waitFor(() => {
+      expect(onSelectModel).toHaveBeenCalledWith({
+        credentialId: 'work-openai',
+        model: 'gpt-5-codex',
+        provider: 'openai-codex',
+        sessionId: 'runtime-1'
+      })
+    })
   })
 })
 

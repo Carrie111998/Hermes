@@ -279,6 +279,7 @@ def build_models_payload(
     if featured:
         _apply_featured(rows)
     _apply_custom_aliases(rows)
+    rows = _expand_pooled_subscription_rows(rows)
 
     return {
         "providers": rows,
@@ -319,6 +320,40 @@ def build_model_options_payload(
         probe_current_custom_provider=not refresh,
     )
 
+
+def _expand_pooled_subscription_rows(rows: list[dict]) -> list[dict]:
+    """Expose named pool entries as picker groups without creating config routes.
+
+    A provider with exactly one credential keeps its normal picker row. When a
+    provider has multiple named credentials, each subscription replaces the
+    ambiguous pool row and carries the provider plus the non-secret credential
+    id needed to pin a later model switch.
+    """
+    from agent.credential_pool import load_pool
+
+    expanded: list[dict] = []
+    for source in rows:
+        provider = str(source.get("slug") or "").strip()
+        if not provider:
+            expanded.append(source)
+            continue
+        try:
+            entries = [entry for entry in load_pool(provider).entries() if entry.id]
+        except Exception:
+            entries = []
+        if len(entries) < 2:
+            expanded.append(source)
+            continue
+        for index, entry in enumerate(entries, start=1):
+            row = dict(source)
+            row.update({
+                "slug": f"credential-pool:{provider}:{entry.id}",
+                "name": str(entry.label or f"{source.get('name') or provider} {index}"),
+                "selection_provider": provider,
+                "credential_id": entry.id,
+            })
+            expanded.append(row)
+    return expanded
 
 # ─── Public: auxiliary-task pickers ─────────────────────────────────────
 

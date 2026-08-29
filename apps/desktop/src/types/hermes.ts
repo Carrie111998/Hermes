@@ -62,11 +62,31 @@ export interface OAuthProvider {
   flow: 'device_code' | 'external' | 'pkce'
   id: string
   name: string
+  /** True only when the dashboard OAuth flow persists each login independently. */
+  supports_multiple_subscriptions?: boolean
   status: OAuthProviderStatus
 }
 
 export interface OAuthProvidersResponse {
   providers: OAuthProvider[]
+}
+
+export interface CredentialPoolEntry {
+  auth_type: null | string
+  has_refresh: boolean
+  id: null | string
+  index: number
+  label: null | string
+  last_status: null | string
+  priority: number
+  request_count: number
+  source: null | string
+  token_preview: string
+}
+
+export interface CredentialPoolResponse {
+  providers: Array<{ entries: CredentialPoolEntry[]; provider: string }>
+  strategies?: Record<string, string>
 }
 
 export type OAuthStartResponse =
@@ -386,6 +406,10 @@ export interface ModelOptionProvider {
   models?: string[]
   name: string
   slug: string
+  /** Canonical provider selected by a virtual pool-subscription row. */
+  selection_provider?: string
+  /** Non-secret pool-entry id for an explicit subscription selection. */
+  credential_id?: string
   total_models?: number
   warning?: string
   /** Curated shortlist (one flagship per lab) the picker shows by default for

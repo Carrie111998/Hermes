@@ -109,7 +109,7 @@ from utils import env_var_enabled
 
 try:
     from fastapi import (
-        FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
+        Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -125,7 +125,7 @@ except ImportError:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import (
-            FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
+            Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
@@ -1725,6 +1725,7 @@ from hermes_cli.web_models import (  # noqa: F401
     DebugShareRequest,
     TTSSpeakRequest,
     OAuthSubmitBody,
+    OAuthStartBody,
     BulkDeleteSessions,
     SessionImport,
     SessionRename,
@@ -1741,6 +1742,8 @@ from hermes_cli.web_models import (  # noqa: F401
     WebhookCreate,
     WebhookEnabledToggle,
     CredentialPoolAdd,
+    CredentialPoolRename,
+    CredentialPoolStrategy,
     MemoryProviderSelect,
     MemoryReset,
     BackupRequest,
@@ -10950,6 +10953,10 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "id": "openai-codex",
         "name": "ChatGPT or Codex Subscription",
         "flow": "device_code",
+        # The dashboard worker persists every successful login as an
+        # independent manual pool entry, so a second login cannot replace the
+        # first account's refresh chain.
+        "supports_multiple_subscriptions": True,
         "cli_command": "hermes auth add openai-codex",
         "docs_url": "https://platform.openai.com/docs",
         "status_fn": None,  # dispatched via auth.get_codex_auth_status
@@ -11234,6 +11241,9 @@ async def list_oauth_providers(profile: Optional[str] = None):
                     "id": p["id"],
                     "name": p["name"],
                     "flow": p["flow"],
+                    "supports_multiple_subscriptions": bool(
+                        p.get("supports_multiple_subscriptions")
+                    ),
                     "cli_command": p["cli_command"],
                     "docs_url": p["docs_url"],
                     "disconnect_hint": disconnect_hint,
@@ -11430,61 +11440,64 @@ def _oauth_session_profile(
     return profile or _oauth_profile_name(fallback)
 
 
-def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
-    """Persist Anthropic PKCE creds to both Hermes file AND credential pool.
+def _save_anthropic_oauth_creds(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    label: Optional[str] = None,
+) -> None:
+    """Persist a dashboard Anthropic PKCE login as one owned pool entry.
 
-    Mirrors what auth_commands.add_command does so the dashboard flow leaves
-    the system in the same state as ``hermes auth add anthropic``.
+    ``hermes auth add anthropic`` is already pool-only.  Writing the legacy
+    ``hermes_pkce`` singleton as well would make the newest dashboard account
+    appear twice when pool seeding reads that file, with the same rotating
+    refresh token in two entries.
     """
-    from agent.anthropic_adapter import _get_hermes_oauth_file
-    oauth_file = _get_hermes_oauth_file()
-    payload = {
-        "accessToken": access_token,
-        "refreshToken": refresh_token,
-        "expiresAt": expires_at_ms,
-    }
-    # atomic_json_write creates the temp with mode 0o600 (via mkstemp) *before*
-    # any content is written, then fsyncs and atomically replaces the target.
-    # The previous os.replace + post-hoc chmod left a TOCTOU window in which the
-    # OAuth token file was world-readable at the default umask (0o644 on most
-    # hosts) between the rename and the chmod. atomic_json_write also preserves
-    # the existing file's owner and cleans up its temp on failure.
-    from utils import atomic_json_write
-
-    atomic_json_write(oauth_file, payload, indent=2, mode=0o600)
-    # Best-effort credential-pool insert. Failure here doesn't invalidate
-    # the file write — pool registration only matters for the rotation
-    # strategy, not for runtime credential resolution.
     try:
-        from agent.credential_pool import (
-            PooledCredential,
-            load_pool,
-            AUTH_TYPE_OAUTH,
-            SOURCE_MANUAL,
-        )
-        import uuid
-        pool = load_pool("anthropic")
-        # Avoid duplicate entries: delete any prior dashboard-issued OAuth entry
-        existing = [e for e in pool.entries() if getattr(e, "source", "").startswith(f"{SOURCE_MANUAL}:dashboard_pkce")]
-        for e in existing:
-            try:
-                pool.remove_entry(getattr(e, "id", ""))
-            except Exception:
-                pass
-        entry = PooledCredential(
+        _save_dashboard_oauth_pool_entry(
             provider="anthropic",
-            id=uuid.uuid4().hex[:6],
-            label="dashboard PKCE",
-            auth_type=AUTH_TYPE_OAUTH,
-            priority=0,
-            source=f"{SOURCE_MANUAL}:dashboard_pkce",
             access_token=access_token,
             refresh_token=refresh_token,
+            label=label,
             expires_at_ms=expires_at_ms,
+            source_suffix="dashboard_pkce",
         )
-        pool.add_entry(entry)
     except Exception as e:
         _log.warning("anthropic pool add (dashboard) failed: %s", e)
+
+
+def _save_dashboard_oauth_pool_entry(
+    *,
+    provider: str,
+    access_token: str,
+    refresh_token: str,
+    label: Optional[str] = None,
+    expires_at_ms: Optional[int] = None,
+    source_suffix: str = "device_code",
+):
+    import uuid
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH,
+        PooledCredential,
+        SOURCE_MANUAL,
+        label_from_token,
+        load_pool,
+    )
+
+    pool = load_pool(provider)
+    fallback = f"{provider}-oauth-{len(pool.entries()) + 1}"
+    entry = PooledCredential(
+        provider=provider,
+        id=uuid.uuid4().hex[:6],
+        label=(label or "").strip() or label_from_token(access_token, fallback),
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source=f"{SOURCE_MANUAL}:{source_suffix}",
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at_ms=expires_at_ms,
+    )
+    return pool.add_entry(entry)
 
 
 def _start_anthropic_pkce(profile: Optional[str] = None) -> Dict[str, Any]:
@@ -11582,7 +11595,7 @@ def _submit_anthropic_pkce(
     expires_at_ms = int(time.time() * 1000) + (expires_in * 1000)
     try:
         with _profile_scope(_oauth_session_profile(session_id, profile)):
-            _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms)
+            _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms, sess.get("label"))
     except Exception as e:
         with _oauth_sessions_lock:
             sess["status"] = "error"
@@ -11597,6 +11610,7 @@ def _submit_anthropic_pkce(
 async def _start_device_code_flow(
     provider_id: str,
     profile: Optional[str] = None,
+    label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Initiate a device-code flow (Nous, OpenAI Codex, MiniMax, or xAI).
 
@@ -11658,7 +11672,8 @@ async def _start_device_code_flow(
 
     if provider_id == "openai-codex":
         # Codex uses fixed OpenAI device-auth endpoints; reuse the helper.
-        sid, _ = _new_oauth_session("openai-codex", "device_code", profile=profile)
+        sid, sess = _new_oauth_session("openai-codex", "device_code", profile=profile)
+        sess["label"] = (label or "").strip()
         # Use the helper but in a thread because it polls inline.
         # We can't extract just the start step without refactoring auth.py,
         # so we run the full helper in a worker and proxy the user_code +
@@ -12186,7 +12201,7 @@ def _codex_full_login_worker(session_id: str) -> None:
         if not access_token:
             raise RuntimeError("token exchange did not return access_token")
 
-        from hermes_cli.auth import _save_codex_tokens
+        from hermes_cli.auth import mark_provider_active_if_unset
 
         # The cancellation check and the save must be one atomic critical
         # section under the same lock cancel_oauth_session() uses. Checking
@@ -12201,10 +12216,17 @@ def _codex_full_login_worker(session_id: str) -> None:
                 _log.info("oauth/device: openai-codex login cancelled before token save (session=%s)", session_id)
                 return
             with _profile_scope(session_profile):
-                _save_codex_tokens({
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                })
+                from agent.credential_pool import load_pool
+                pool = load_pool("openai-codex")
+                first_credential = not pool.entries()
+                _save_dashboard_oauth_pool_entry(
+                    provider="openai-codex",
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    label=sess.get("label"),
+                )
+                if first_credential:
+                    mark_provider_active_if_unset("openai-codex")
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:
@@ -12220,6 +12242,7 @@ def _codex_full_login_worker(session_id: str) -> None:
 async def start_oauth_login(
     provider_id: str,
     request: Request,
+    body: OAuthStartBody = Body(default_factory=OAuthStartBody),
     profile: Optional[str] = None,
 ):
     """Initiate an OAuth login flow. Token-protected."""
@@ -12243,9 +12266,12 @@ async def start_oauth_login(
         # change for MiniMax). New PKCE providers must add their own
         # start function and an explicit branch here.
         if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
-            return _start_anthropic_pkce(profile=profile)
+            result = _start_anthropic_pkce(profile=profile)
+            with _oauth_sessions_lock:
+                _oauth_sessions[result["session_id"]]["label"] = (body.label or "").strip()
+            return result
         if catalog_entry["flow"] == "device_code":
-            return await _start_device_code_flow(provider_id, profile=profile)
+            return await _start_device_code_flow(provider_id, profile=profile, label=body.label)
     except HTTPException:
         raise
     except Exception as e:
@@ -14239,10 +14265,7 @@ async def stop_gateway(profile: Optional[str] = None):
 
 
 def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
-    """Redacted, display-safe view of one PooledCredential.
-
-    ``index`` is 1-based to match CredentialPool.remove_index().
-    """
+    """Redacted, display-safe view of one PooledCredential."""
     token = getattr(entry, "access_token", "") or ""
     return {
         "index": index,
@@ -14259,30 +14282,97 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
 
 
 @app.get("/api/credentials/pool")
-async def list_credential_pool():
-    from agent.credential_pool import load_pool
+async def list_credential_pool(profile: Optional[str] = None):
+    from agent.credential_pool import get_pool_strategy, load_pool
     from hermes_cli.auth import read_credential_pool
 
+    _validate_oauth_profile(profile)
     providers = []
-    # read_credential_pool(None) lists every provider that has pooled entries;
-    # load_pool() then gives us the rich PooledCredential objects per provider.
-    raw_pool = read_credential_pool()
+    strategies = {}
+    with _profile_scope(_oauth_profile_name(profile)):
+        raw_pool = read_credential_pool()
     for provider_id in sorted(raw_pool.keys()):
         try:
-            pool = load_pool(provider_id)
+            with _profile_scope(_oauth_profile_name(profile)):
+                pool = load_pool(provider_id)
         except Exception:
             _log.exception("load_pool(%s) failed", provider_id)
             continue
         entries = pool.entries()
         if not entries:
             continue
+        strategies[provider_id] = get_pool_strategy(provider_id)
         providers.append({
             "provider": provider_id,
             "entries": [
-                _pool_entry_summary(e, i) for i, e in enumerate(entries, start=1)
+                _pool_entry_summary(e, i)
+                for i, e in enumerate(entries, start=1)
             ],
         })
-    return {"providers": providers}
+    return {"providers": providers, "strategies": strategies}
+
+
+@app.put("/api/credentials/pool/{provider}/strategy")
+async def set_credential_pool_strategy(
+    provider: str,
+    body: CredentialPoolStrategy,
+    profile: Optional[str] = None,
+):
+    from agent.credential_pool import SUPPORTED_POOL_STRATEGIES
+    from hermes_cli.config import load_config, save_config
+
+    provider = provider.strip().lower()
+    strategy = body.strategy.strip().lower()
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider is required")
+    if strategy not in SUPPORTED_POOL_STRATEGIES:
+        raise HTTPException(status_code=400, detail="Unsupported pool strategy")
+    _validate_oauth_profile(profile)
+    with _profile_scope(_oauth_profile_name(profile)):
+        config = load_config()
+        strategies = config.get("credential_pool_strategies")
+        if not isinstance(strategies, dict):
+            strategies = {}
+        strategies[provider] = strategy
+        config["credential_pool_strategies"] = strategies
+        save_config(config)
+    return {"ok": True, "provider": provider, "strategy": strategy}
+
+
+@app.patch("/api/credentials/pool/{provider}/{credential_id}")
+async def rename_credential_pool_entry(
+    provider: str,
+    credential_id: str,
+    body: CredentialPoolRename,
+    profile: Optional[str] = None,
+):
+    label = body.label.strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label is required")
+    _validate_oauth_profile(profile)
+    with _profile_scope(_oauth_profile_name(profile)):
+        from agent.credential_pool import load_pool
+        renamed = load_pool(provider).rename_entry(credential_id, label)
+        if renamed is None:
+            raise HTTPException(status_code=404, detail="Credential not found")
+    return {"ok": True, "provider": provider, "id": credential_id, "label": label}
+
+
+@app.delete("/api/credentials/pool/{provider}/id/{credential_id}")
+async def remove_credential_pool_entry_by_id(
+    provider: str,
+    credential_id: str,
+    profile: Optional[str] = None,
+):
+    _validate_oauth_profile(profile)
+    with _profile_scope(_oauth_profile_name(profile)):
+        from agent.credential_pool import load_pool
+        pool = load_pool(provider)
+        removed = pool.remove_entry(credential_id)
+        if removed is None:
+            raise HTTPException(status_code=404, detail="Credential not found")
+        count = len(pool.entries())
+    return {"ok": True, "provider": provider, "id": credential_id, "count": count}
 
 
 @app.post("/api/credentials/pool")

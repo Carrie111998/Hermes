@@ -261,13 +261,14 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       //  - MoA (mixture-of-agents) presets: a transient orchestration choice
       //    that must never become the persisted global gateway default.
       const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
-      const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
+      const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset && !selection.credentialId
       const scope = persistsAsDefault ? '--global' : '--session'
 
       const requestSwitch = (confirmExpensiveModel = false) =>
         requestGateway<ModelSwitchResponse>('config.set', {
           session_id: liveSessionId,
           key: 'model',
+          credential_id: selection.credentialId,
           value: `${selection.model} --provider ${selection.provider} ${scope}`,
           ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {})
         })

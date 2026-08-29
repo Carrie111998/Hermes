@@ -107,11 +107,13 @@ SOURCE_MANUAL = "manual"
 SOURCE_MANUAL_DEVICE_CODE = f"{SOURCE_MANUAL}:device_code"
 
 STRATEGY_FILL_FIRST = "fill_first"
+STRATEGY_NO_FAILOVER = "no_failover"
 STRATEGY_ROUND_ROBIN = "round_robin"
 STRATEGY_RANDOM = "random"
 STRATEGY_LEAST_USED = "least_used"
 SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_FILL_FIRST,
+    STRATEGY_NO_FAILOVER,
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
     STRATEGY_LEAST_USED,
@@ -752,6 +754,9 @@ class CredentialPool:
         # rotation and tear ``self._entries`` or double-write auth.json.
         with self._lock:
             available, _pending = self._available_entries()
+            if self._strategy == STRATEGY_NO_FAILOVER and self._entries:
+                primary_id = self._entries[0].id
+                return any(entry.id == primary_id for entry in available)
             return bool(available)
 
     def next_available_at(self) -> Optional[float]:
@@ -2062,6 +2067,9 @@ class CredentialPool:
         single-use-token entries that must be refreshed outside the lock.
         """
         available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
+        if self._strategy == STRATEGY_NO_FAILOVER and self._entries:
+            primary_id = self._entries[0].id
+            available = [entry for entry in available if entry.id == primary_id]
         if not available:
             self._current_id = None
             self._log_no_available_entries()
@@ -2098,6 +2106,32 @@ class CredentialPool:
         self._current_id = entry.id
         return entry, pending_refresh
 
+    def select_matching_id(self, credential_id: str) -> Optional[PooledCredential]:
+        """Select one exact available credential without pool-strategy fallback."""
+        target_id = str(credential_id or "").strip()
+        if not target_id:
+            return None
+        with self._lock:
+            available, pending_refresh = self._available_entries(clear_expired=True)
+            entry = next((candidate for candidate in available if candidate.id == target_id), None)
+            pending_refresh = [
+                pending for pending in pending_refresh if pending[0].id == target_id
+            ]
+            if entry is not None:
+                self._current_id = entry.id
+                self._unmatched_rotation_streak = 0
+                return entry
+        if pending_refresh:
+            self._refresh_pending_entries(pending_refresh)
+            with self._lock:
+                available, _ = self._available_entries(clear_expired=True)
+                entry = next((candidate for candidate in available if candidate.id == target_id), None)
+                if entry is not None:
+                    self._current_id = entry.id
+                    self._unmatched_rotation_streak = 0
+                return entry
+        return None
+
     def peek(self) -> Optional[PooledCredential]:
         # Single lock acquisition for the whole read; call the unlocked
         # helpers so we don't re-enter the non-reentrant ``self._lock``.
@@ -2116,6 +2150,7 @@ class CredentialPool:
         api_key_hint: Optional[str] = None,
         credential_id: Optional[str] = None,
         failure_reason: Optional[str] = None,
+        allow_failover: bool = True,
     ) -> Optional[PooledCredential]:
         with self._lock:
             entry = None
@@ -2240,7 +2275,7 @@ class CredentialPool:
             # Mark every entry sharing the failed key so the pool can reach the
             # "no available entries" state and let the error propagate.
             failed_runtime_key = getattr(entry, "runtime_api_key", None)
-            if identity_supplied and failed_runtime_key:
+            if allow_failover and identity_supplied and failed_runtime_key:
                 siblings_marked = False
                 for sibling in self._entries:
                     if sibling.id == entry.id:
@@ -2272,6 +2307,13 @@ class CredentialPool:
                     _label, status_code,
                 )
             self._current_id = None
+            if not allow_failover or self._strategy == STRATEGY_NO_FAILOVER:
+                logger.info(
+                    "credential pool: %s is configured for no failover; "
+                    "surfacing the error without selecting a sibling credential",
+                    self.provider,
+                )
+                return None
             next_entry, _pending = self._select_unlocked(refresh=False)
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
@@ -2433,6 +2475,23 @@ class CredentialPool:
             if self._current_id == removed.id:
                 self._current_id = None
             return removed
+
+    def rename_entry(self, credential_id: str, label: str) -> Optional[PooledCredential]:
+        with self._lock:
+            for index, entry in enumerate(self._entries):
+                if entry.id == credential_id:
+                    renamed = replace(entry, label=label)
+                    self._entries[index] = renamed
+                    self._persist()
+                    return renamed
+            return None
+
+    def remove_entry(self, credential_id: str) -> Optional[PooledCredential]:
+        with self._lock:
+            for index, entry in enumerate(self._entries, start=1):
+                if entry.id == credential_id:
+                    return self.remove_index(index)
+            return None
 
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
