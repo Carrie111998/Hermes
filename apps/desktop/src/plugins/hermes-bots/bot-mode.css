@@ -179,6 +179,7 @@
   min-height: 2.25rem;
   border: 0;
   background: transparent;
+  padding-block: 0.75rem 0.25rem;
   box-shadow: none;
   resize: none;
 }
