@@ -4290,23 +4290,24 @@ def looks_like_codex_intermediate_ack(
     # explicit transition cue such as "now", "via acpx", "actual log", or
     # "then launching". Completed reports and questions stay final.
     action_clause_pattern = re.compile(
-        r"(?:^|[.!…—–]\s+|\n+\s*|,\s+)(?:(?P<transition>then)\s+)?"
+        r"(?:^|[.!…—–]\s+|\n+\s*|,\s+then\s+)"
+        r"(?:(?P<transition>then)\s+)?"
         r"(?P<action>(?:re)?launching|(?:re)?starting|creating|"
         r"checking|running|writing|opening|reading|inspecting|reviewing|"
         r"testing|debugging|searching|fixing)\b"
     )
     list_item_prefix_pattern = re.compile(r"(?:^|\n)\s*(?:[-*+]|\d+[.)])\s*$")
-    inline_list_prefix_pattern = re.compile(
-        r"\b(?:options?|ideas?|choices?|steps)\b.*\b\d+[.)]\s*$"
-    )
+    numbered_item_pattern = re.compile(r"(?:^|\s)(\d+)[.)](?=\s)")
     question_pattern = re.compile(r"\?(?=\s|$|[\"'’”)\]])")
     sentence_boundary_pattern = re.compile(
         r"(?:[.!…](?=\s|$)|\?(?=\s|$|[\"'’”)\]])|\n+)"
     )
-    trailing_final_pattern = re.compile(
-        r"\b(?:completed|finished|succeeded|failed|passed|complete|done|successful)\b|"
-        r"\b(?:everything|all|the\s+(?:job|session|result|total))\s+"
-        r"(?:is|are|was|were|looks?|seems?)\b"
+    allowed_trailing_action_pattern = re.compile(
+        r"\s*(?:will\s+report\s+back|"
+        r"then\s+(?:launching|relaunching|starting|restarting|creating)\s+"
+        r"(?:it|(?:the\s+)?(?:session|worker|agent|job|process))|"
+        r"(?:checking|reading|opening|inspecting)\s+(?:the\s+)?(?:log|output))"
+        r"\s*[.!…]?\s*$"
     )
     launch_now_tail_pattern = re.compile(
         r"\s+(?:(?:it|(?:the\s+)?(?:session|worker|agent|job|process)|"
@@ -4341,12 +4342,14 @@ def looks_like_codex_intermediate_ack(
         r"globals?\s+before\s+(?:the\s+)?agent\s+name)\s*$"
     )
     has_pronounless_action = False
+    numbered_markers = {
+        match.group(1) for match in numbered_item_pattern.finditer(assistant_text)
+    }
+    has_numbered_list = {"1", "2"}.issubset(numbered_markers)
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
             action_prefix = assistant_text[: action_match.start("action")]
-            if list_item_prefix_pattern.search(
-                action_prefix
-            ) or inline_list_prefix_pattern.search(action_prefix):
+            if has_numbered_list or list_item_prefix_pattern.search(action_prefix):
                 continue
             raw_clause_tail = assistant_text[action_match.end() :]
             boundary_match = sentence_boundary_pattern.search(raw_clause_tail)
@@ -4356,7 +4359,9 @@ def looks_like_codex_intermediate_ack(
             else:
                 clause_tail = raw_clause_tail
                 remaining_text = ""
-            if trailing_final_pattern.search(remaining_text):
+            if remaining_text.strip() and not allowed_trailing_action_pattern.fullmatch(
+                remaining_text
+            ):
                 continue
             action_word = action_match.group("action")
             is_launch_action = action_word in {

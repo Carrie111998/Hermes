@@ -225,6 +225,9 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Creating the index speeds queries now.",
         "Running the suite works on Copilot.",
         "Testing happens via acpx.",
+        "Checking the actual log. The error was a missing token.",
+        "Checking the log now. The build is green.",
+        "Launching it now. The deployment is live.",
         "Reviewing the diff. Everything looks fine.",
         "Testing the parser.\n\nAll 42 tests pass.",
         "Running the numbers. The total is 42.",
@@ -235,6 +238,12 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Two options. 1. Pinning the dependency. 2. Running the suite locally.",
         "Two options. 1. Checking the actual log. 2. Bumping the timeout.",
         "Two options. 1. Relaunching with corrected arguments. 2. Pinning the dep.",
+        "Two approaches. 1. Checking the actual log. 2. Bumping the timeout.",
+        "Two approaches. 1. Pinning the dependency. 2. Checking the actual log.",
+        "Two ways. 1. Creating the session now. 2. Pinning the dep.",
+        "Possible fixes. 1. Checking the actual log. 2. Bumping the timeout.",
+        "Two options: pinning the dep, checking the actual log.",
+        "Two fixes: bumping the timeout, relaunching with corrected arguments.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(
