@@ -3879,6 +3879,27 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Per-dispatch model/provider override (#97653): the per-task value
+        # beats delegation config, which itself beats parent inheritance.
+        # Resolve by merging the override into a copy of the delegation
+        # config and re-running the same runtime-provider resolution, so an
+        # invalid override fails THIS dispatch with a clear error. Never
+        # persisted: only _load_config (read-only) is consulted — there is no
+        # config write anywhere in this path. Tasks with no override keep the
+        # batch-level `creds` (no redundant re-resolution).
+        task_creds = creds
+        task_model_override = str(t.get("model") or "").strip() or None
+        task_provider_override = str(t.get("provider") or "").strip() or None
+        if task_model_override or task_provider_override:
+            per_task_cfg = dict(cfg)
+            if task_model_override:
+                per_task_cfg["model"] = task_model_override
+            if task_provider_override:
+                per_task_cfg["provider"] = task_provider_override
+            try:
+                task_creds = _resolve_delegation_credentials(per_task_cfg, parent_agent)
+            except ValueError as exc:
+                return tool_error(f"Task {i} model/provider override failed: {exc}")
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3887,18 +3908,18 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
         except ValueError as exc:
@@ -4829,6 +4850,25 @@ DELEGATE_TASK_SCHEMA = {
                                 "schema_valid, plus schema_errors on "
                                 "failure). Keep it forgiving — require only "
                                 "fields you will read."
+                            ),
+                        },
+                        # Per-dispatch model/provider override (#97653).
+                        # Optional; resolved to runtime creds and applied to
+                        # THIS child only. Never persisted — config unchanged.
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional model override for this subagent "
+                                "only. Never persisted; empty inherits "
+                                "delegation.model."
+                            ),
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Optional provider override for this subagent "
+                                "only. Never persisted; empty inherits "
+                                "delegation.provider."
                             ),
                         },
                     },
