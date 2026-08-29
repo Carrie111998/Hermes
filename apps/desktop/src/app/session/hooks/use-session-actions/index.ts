@@ -2152,7 +2152,14 @@ export function useSessionActions({
 
       const stored =
         explicitProfile !== undefined
-          ? await resolveStoredSession(storedSessionId, explicitProfile)
+          ? (await resolveStoredSession(storedSessionId, explicitProfile)) ??
+            // An explicit profile equal to the ACTIVE gateway profile is not a
+            // cross-profile claim — a miss there must not discard the cached
+            // row (launch/default rows are now stamped, so a by-id miss would
+            // otherwise drop the branch's cwd/parent; #67603 follow-up).
+            (normalizeProfileKey(explicitProfile) === normalizeProfileKey($activeGatewayProfile.get())
+              ? cached
+              : undefined)
           : cached?.profile?.trim()
             ? cached
             : ((await resolveStoredSession(storedSessionId)) ?? cached)
