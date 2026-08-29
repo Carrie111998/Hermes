@@ -1,13 +1,13 @@
 """Regression: leaked approval callbacks must not poison later tests.
 
-``tools.computer_use.tool._approval_callback`` and the per-session unlock
-stores are module-globals. Without the autouse reset fixture in
-``tests/conftest.py``, a test that installs a callback and "forgets" it
-changes the behavior of every later computer-use test in the process:
-a raising callback becomes ``verdict = "deny"`` (dispatch tests see an
-empty backend call list), a blocking callback hangs the run. The pair
-below simulates the forgetful test and asserts the next test still sees
-the pristine fail-closed denial.
+``tools.computer_use.tool`` keeps the approval callback in a ContextVar
+plus the per-session unlock stores as module-globals. Without the autouse
+reset fixture in ``tests/conftest.py``, a test that installs a callback
+and "forgets" it changes the behavior of every later computer-use test in
+the same context: a raising callback becomes ``verdict = "deny"``
+(dispatch tests see an empty backend call list), a blocking callback
+hangs the run. The pair below simulates the forgetful test and asserts
+the next test still sees the pristine fail-closed denial.
 """
 
 import json
