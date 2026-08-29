@@ -3207,6 +3207,7 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._deferred_question_service = None
         # Owning profile for a multiplexed secondary adapter, installed by
         # ``GatewayRunner._configure_profile_adapter``. Adapter-level session
         # keys must carry the profile namespace, but ``source.profile`` is only
@@ -3810,6 +3811,19 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+        from gateway.deferred_questions import get_deferred_question_service
+
+        self.set_deferred_question_service(get_deferred_question_service())
+
+    def set_deferred_question_service(self, service: Any) -> None:
+        """Bind the host's durable question service to this adapter."""
+        self._deferred_question_service = service
+        platform_name = getattr(self.platform, "value", str(self.platform))
+        service.bind_adapter(platform_name, self)
+
+    def is_session_active(self, session_key: str) -> bool:
+        """Return whether this adapter currently owns a run for ``session_key``."""
+        return session_key in self._active_sessions
 
     def set_platform_event_handler(
         self,
@@ -6252,6 +6266,44 @@ class BasePlatformAdapter(ABC):
                 session_key,
             )
             return
+
+        # A deferred question owns the next non-command reply in this session.
+        # Resolve it before the active-session guard so an answer cannot become
+        # an out-of-band correction to unrelated work that started after the
+        # question was delivered. Slash commands remain commands and leave the
+        # question pending.
+        deferred_service = getattr(self, "_deferred_question_service", None)
+        if deferred_service is not None and not event.get_command():
+            try:
+                deferred_result = await deferred_service.handle_response(
+                    session_key, event.text or ""
+                )
+            except Exception:
+                logger.error(
+                    "[%s] Deferred-question handler failed for %s",
+                    self.name,
+                    session_key,
+                    exc_info=True,
+                )
+                return
+            if deferred_result is not None:
+                deferred_reply = (
+                    deferred_result.reply
+                    if deferred_result.resolved
+                    else deferred_result.question
+                )
+                if deferred_reply:
+                    await self._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=deferred_reply,
+                        reply_to=_reply_anchor_for_event(event),
+                        metadata=_mark_notify_metadata(
+                            _thread_metadata_for_source(
+                                event.source, _reply_anchor_for_event(event)
+                            )
+                        ),
+                    )
+                return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
