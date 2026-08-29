@@ -2705,6 +2705,8 @@ def _merge_loaded_config_snapshot(base: Any, requested: Any, current: Any) -> An
         return _CONFIG_MISSING
 
     if base is not _CONFIG_MISSING and requested == base:
+        if current is _CONFIG_MISSING:
+            return _CONFIG_MISSING
         return copy.deepcopy(current)
 
     if (

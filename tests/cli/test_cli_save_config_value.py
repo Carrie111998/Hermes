@@ -133,6 +133,26 @@ class TestSaveConfigValueAtomic:
         assert saved["approvals"]["destructive_slash_confirm"] is False
         assert saved["agent"]["max_turns"] == 42
 
+    def test_stale_snapshot_preserves_concurrent_nested_deletion(self, config_env):
+        """A stale sibling edit must not restore a concurrently deleted key."""
+        from hermes_cli.config import load_config, save_config
+
+        initial = yaml.safe_load(config_env.read_text())
+        initial["custom"] = {"keep": "before", "delete_me": True}
+        config_env.write_text(yaml.safe_dump(initial))
+
+        deleting_snapshot = load_config()
+        stale_snapshot = load_config()
+
+        del deleting_snapshot["custom"]["delete_me"]
+        save_config(deleting_snapshot)
+
+        stale_snapshot["custom"]["keep"] = "after"
+        save_config(stale_snapshot)
+
+        saved = yaml.safe_load(config_env.read_text())
+        assert saved["custom"] == {"keep": "after"}
+
     def test_loaded_config_remains_safe_yaml_serializable(self, config_env):
         """The tracked mapping preserves the former plain-dict YAML contract."""
         from hermes_cli.config import load_config
