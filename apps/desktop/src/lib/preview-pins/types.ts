@@ -44,6 +44,9 @@ export interface PinEngineReport {
    *  navigation resets it, and the panel would otherwise show a toggle that no
    *  longer reflects the page. */
   armed: boolean
+  /** Markers are painted out and the page is fully released. Set while the
+   *  panel is closed, so a reopen knows to repaint rather than re-place. */
+  hidden: boolean
   pins: PreviewPin[]
   url: string
 }

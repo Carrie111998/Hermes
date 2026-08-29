@@ -97,6 +97,9 @@ export async function pinVerb(command: PinCommand, seed: PreviewPin[] | null = n
 
 export const armPins = (seed: PreviewPin[] | null = null) => pinVerb({ verb: 'arm' }, seed)
 export const disarmPins = () => pinVerb({ verb: 'disarm' })
+/** Closing the panel: disarm AND unpaint, so the page is fully the user's again. */
+export const hidePins = () => pinVerb({ verb: 'hide' })
+export const showPins = (seed: PreviewPin[] | null = null) => pinVerb({ verb: 'show' }, seed)
 export const readPins = () => pinVerb({ verb: 'state' })
 export const reattachPins = (seed: PreviewPin[] | null = null) => pinVerb({ verb: 'reattach' }, seed)
 export const commentPin = (id: string, comment: string) => pinVerb({ comment, id, verb: 'comment' })

@@ -35,6 +35,10 @@ function placePin(selector: string, comment = '') {
 }
 
 beforeEach(() => {
+  // jsdom hands every test the same `document`, so an engine left armed by the
+  // previous one is still on the capture listeners and still swallowing
+  // gestures. Retire it before dropping the holder that owns its handlers.
+  if (holder) {pinEngineCore(document, holder, { verb: 'hide' }, anchorKit(document))}
   holder = {}
   document.body.innerHTML = '<div id="panel"><button id="save">Save</button><p id="note">A note</p></div>'
 })
@@ -64,6 +68,63 @@ describe('arming', () => {
     run({ verb: 'disarm' })
     const style = document.getElementById('hermes-pin-host')!.getAttribute('style') ?? ''
     expect(style).toContain('pointer-events:none')
+  })
+})
+
+describe('hiding — closing the panel gives the page back', () => {
+  it('disarms, so the next click on a link is the page\'s again', () => {
+    placePin('#save', 'note')
+    run({ verb: 'arm' })
+    expect(run({ verb: 'hide' }).armed).toBe(false)
+
+    const target = document.querySelector('#save')!
+    let pageSawClick = false
+    target.addEventListener('click', () => { pageSawClick = true })
+    document.elementFromPoint = () => target
+    document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 1, clientY: 1 }))
+    const up = new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: 1, clientY: 1 })
+    document.dispatchEvent(up)
+    target.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+
+    // The whole reported bug: a hidden panel that still swallows navigation.
+    expect(up.defaultPrevented).toBe(false)
+    expect(pageSawClick).toBe(true)
+  })
+
+  it('takes the markers down with it', () => {
+    placePin('#save')
+    expect(document.getElementById('hermes-pin-host')!.shadowRoot!.querySelectorAll('.pin')).toHaveLength(1)
+    run({ verb: 'hide' })
+    expect(document.getElementById('hermes-pin-host')!.shadowRoot!.querySelectorAll('.pin')).toHaveLength(0)
+  })
+
+  it('keeps every pin and puts them back on show', () => {
+    placePin('#save', 'still here')
+    run({ verb: 'hide' })
+    const hidden = run({ verb: 'state' })
+    expect(hidden.hidden).toBe(true)
+    expect(hidden.pins).toHaveLength(1)
+
+    const shown = run({ verb: 'show' })
+    expect(shown.hidden).toBe(false)
+    expect(shown.pins[0].comment).toBe('still here')
+    expect(document.getElementById('hermes-pin-host')!.shadowRoot!.querySelectorAll('.pin')).toHaveLength(1)
+  })
+
+  it('unhides when armed again, so the toggle is never a dead button', () => {
+    placePin('#save')
+    run({ verb: 'hide' })
+    const armed = run({ verb: 'arm' })
+    expect(armed.hidden).toBe(false)
+    expect(document.getElementById('hermes-pin-host')!.shadowRoot!.querySelectorAll('.pin')).toHaveLength(1)
+  })
+
+  it('stays quiet while hidden even if the page rebuilds under it', () => {
+    placePin('#save', 'note')
+    run({ verb: 'hide' })
+    document.body.innerHTML = '<div id="panel"><button id="save">Save</button></div>'
+    run({ verb: 'reattach' })
+    expect(document.getElementById('hermes-pin-host')!.shadowRoot!.querySelectorAll('.pin')).toHaveLength(0)
   })
 })
 

@@ -23,6 +23,8 @@ import { anchorKit, type AnchorKit } from './anchor'
 export type PinVerb =
   | 'arm'
   | 'disarm'
+  | 'hide'
+  | 'show'
   | 'state'
   | 'reattach'
   | 'comment'
@@ -50,6 +52,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   const state = (holder[STATE_KEY] as Record<string, unknown> | undefined) ?? {
     armed: false,
     drag: null,
+    hidden: false,
     pins: [],
     seq: 0
   }
@@ -124,6 +127,10 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   /** Redraw every pin marker where its element currently is. */
   const paint = () => {
     clearLayer('.pin')
+
+    // Hidden means hidden. The user closed the panel to get their page back,
+    // and leaving markers floating over it is the same complaint again.
+    if (state.hidden) {return}
     const root = shadow()
     pins.forEach((pin, index) => {
       const marker = doc.createElement('div')
@@ -342,6 +349,8 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   const arm = () => {
     if (state.armed) {return}
     state.armed = true
+    // Arming is a request to see what you are annotating.
+    state.hidden = false
     host().setAttribute(
       'style',
       'position:fixed;inset:0;z-index:2147483646;pointer-events:none;cursor:crosshair;'
@@ -390,6 +399,26 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   }
 
   /**
+   * Put the page back the way the user found it, without losing anything.
+   *
+   * Closing the panel has to be a full retreat: disarmed, no markers, no
+   * highlight, cursor back to normal. Anything less and the next click on a
+   * link is swallowed by a review overlay the user believes they dismissed —
+   * which is exactly the trap they hit.
+   */
+  const hide = () => {
+    disarm()
+    state.hidden = true
+    clearLayer('.pin')
+    closeBubble()
+  }
+
+  const show = () => {
+    state.hidden = false
+    paint()
+  }
+
+  /**
    * Re-run the ladder over every pin.
    *
    * Called after a navigation or reload. A pin whose element is gone is marked
@@ -428,6 +457,16 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
     case 'disarm':
       disarm()
+
+      break
+
+    case 'hide':
+      hide()
+
+      break
+
+    case 'show':
+      show()
 
       break
 
@@ -476,6 +515,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
   return {
     armed: state.armed === true,
+    hidden: state.hidden === true,
     pins: JSON.parse(JSON.stringify(pins)),
     url: doc.location ? doc.location.href : ''
   }

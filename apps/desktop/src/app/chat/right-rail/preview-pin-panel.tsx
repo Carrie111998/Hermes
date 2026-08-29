@@ -24,9 +24,11 @@ import {
   armPins,
   clearPins,
   disarmPins,
+  hidePins,
   readPins,
   reattachPins,
   removePin,
+  showPins,
   togglePinResolved
 } from './preview-pins'
 
@@ -65,9 +67,22 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
     return () => clearInterval(timer)
   }, [armed, open, sync])
 
+  // Closing the panel hands the page back. Without this the engine stays armed
+  // behind a UI that is no longer on screen: the next click on a link is eaten
+  // by the review overlay instead of navigating, and nothing visible explains
+  // why. Opening repaints what the page is still holding.
   useEffect(() => {
-    if (open) {void readPins().then(sync)}
+    if (!open) {
+      void hidePins()
+
+      return
+    }
+
+    void showPins(held.current).then(sync)
   }, [open, sync])
+
+  // A pane teardown is a close the effect above never sees.
+  useEffect(() => () => void hidePins(), [])
 
   // A navigation destroys the engine and every pin with it. Seed the new one
   // from what the panel is holding, then re-run the ladder over it.
