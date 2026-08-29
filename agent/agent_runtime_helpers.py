@@ -4352,23 +4352,13 @@ def looks_like_codex_intermediate_ack(
             status_match.group("number")
         )
     has_status_sequence = any(
-        {"1", "2"}.issubset(numbers)
-        for numbers in status_numbers_by_label.values()
+        {"1", "2"}.issubset(numbers) for numbers in status_numbers_by_label.values()
     )
-    has_enumeration_intro = bool(
-        re.search(r"\b(?:options?|ideas?|approaches?|ways|fixes)\b", assistant_text)
-    )
-    numbering_text = (
-        assistant_text
-        if has_enumeration_intro
-        else status_number_pattern.sub("", assistant_text)
-    )
+    numbering_text = status_number_pattern.sub("", assistant_text)
     numbered_markers = {
         match.group(1) for match in numbered_item_pattern.finditer(numbering_text)
     }
-    has_numbered_list = has_status_sequence or {"1", "2"}.issubset(
-        numbered_markers
-    )
+    has_numbered_list = has_status_sequence or {"1", "2"}.issubset(numbered_markers)
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
             action_prefix = assistant_text[: action_match.start("action")]
