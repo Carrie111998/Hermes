@@ -13,7 +13,6 @@ import inspect
 import json
 import logging
 import queue
-import re
 import threading
 import time
 import uuid
@@ -66,6 +65,9 @@ class ApprovalRequest:
     pattern_keys: tuple[str, ...]
     surface: str
     profile_name: str
+    # Compatibility field retained for lifecycle/plugin consumers. It is the
+    # opaque scope key, never the raw host session key.
+    session_key: str
     conversation_scope_key: str
     timeout_seconds: float
     allowed_choices: tuple[ApprovalChoice, ...]
@@ -85,13 +87,17 @@ class ApprovalRequest:
         timeout_seconds: float = 300,
         profile_name: str = "default",
     ) -> "ApprovalRequest":
+        """Create a request with an opaque conversation scope.
+
+        The raw session key is host-internal input used only to derive the
+        scope. If request construction fails, the selected transport path
+        must deny rather than fall back to the built-in prompt or raw data.
+        """
         request_id = uuid.uuid4().hex
-        profile_name = str(profile_name).strip()
-        if not profile_name or not (
-            profile_name in {"default", "custom"}
-            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_name)
-        ):
-            raise ValueError("invalid canonical profile name")
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        profile_name = normalize_profile_name(profile_name)
+        validate_profile_name(profile_name)
         conversation_scope_key = make_approval_scope(profile_name, session_key)
         choices: list[ApprovalChoice] = ["once"]
         if allow_session:
@@ -106,7 +112,7 @@ class ApprovalRequest:
             "description": description,
             "pattern_key": pattern_key,
             "pattern_keys": list(pattern_keys),
-            "session_key": session_key,
+            "session_key": conversation_scope_key,
             "surface": surface,
             "profile_name": profile_name,
             "conversation_scope_key": conversation_scope_key,
@@ -126,6 +132,7 @@ class ApprovalRequest:
             pattern_keys=pattern_keys,
             surface=surface,
             profile_name=profile_name,
+            session_key=conversation_scope_key,
             conversation_scope_key=conversation_scope_key,
             timeout_seconds=timeout_seconds,
             allowed_choices=tuple(choices),

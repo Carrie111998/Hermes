@@ -189,7 +189,10 @@ def test_create_rejects_scope_override():
         )
 
 
-@pytest.mark.parametrize("profile_name", ["", "../escape", "not valid"])
+@pytest.mark.parametrize(
+    "profile_name",
+    ["", "../escape", "not valid", "root", "hermes", "tmp", "sudo"],
+)
 def test_create_rejects_empty_or_invalid_profile(profile_name):
     from hermes_cli.approval_transport import ApprovalRequest
 
@@ -205,6 +208,28 @@ def test_create_rejects_empty_or_invalid_profile(profile_name):
             allow_permanent=False,
             profile_name=profile_name,
         )
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "expected"),
+    [("default", "default"), ("Default", "default"), ("custom", "custom"), ("Custom", "custom"), ("work_2", "work_2")],
+)
+def test_create_accepts_canonical_profile_names(profile_name, expected):
+    from hermes_cli.approval_transport import ApprovalRequest
+
+    request = ApprovalRequest.create(
+        command="echo ok",
+        description="safe",
+        pattern_key="example",
+        pattern_keys=("example",),
+        session_key="session-a",
+        surface="cli",
+        allow_session=False,
+        allow_permanent=False,
+        profile_name=profile_name,
+    )
+
+    assert request.profile_name == expected
 
 
 def test_legacy_create_callers_get_explicit_compatibility_defaults():
@@ -402,6 +427,36 @@ def test_cli_selected_transport_replaces_builtin_prompt(monkeypatch):
     assert len(seen) == 1
     assert seen[0].command == "rm -rf /tmp/example"
     assert seen[0].allowed_choices == ("once", "session", "always", "deny")
+
+
+def test_selected_transport_hooks_expose_opaque_scope_not_raw_session(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    _context(manager).register_approval_transport(
+        "phone", lambda request: request.respond("once")
+    )
+    _configure_manual_guard(monkeypatch, approval, manager)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "work")
+    captured = []
+
+    def capture(hook_name, **kwargs):
+        captured.append((hook_name, kwargs))
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", capture)
+
+    result = approval.check_all_command_guards("rm -rf /tmp/example", "local")
+
+    assert result["approved"] is True
+    assert [name for name, _ in captured] == [
+        "pre_approval_request",
+        "post_approval_response",
+    ]
+    for _, kwargs in captured:
+        assert kwargs["session_key"] != "session-a"
+        assert len(kwargs["session_key"]) == 64
+        assert kwargs["conversation_scope_key"] == kwargs["session_key"]
+        assert "session-a" not in repr(kwargs)
 
 
 def test_gateway_selected_transport_does_not_require_gateway_notifier(monkeypatch):
