@@ -210,6 +210,35 @@ class TestMarkdownStripPatch:
         assert "line3" in text
         assert "```" not in text
 
+    def test_code_block_hash_comment_not_treated_as_heading(self):
+        """A Python comment inside a fenced block must not be read as a
+        Markdown heading: the "#" must survive and no BOLD span applies."""
+        md = "```python\n# a comment\nx = 1\n```"
+        text, styles = _m2s(md)
+        assert "# a comment" in text
+        assert not _find_style(styles, "BOLD")
+        assert len(_find_style(styles, "MONOSPACE")) == 1
+
+    def test_code_block_underscores_not_treated_as_italic(self):
+        """Underscore-wrapped code inside a fenced block must not be read as
+        Markdown italics: the underscores must survive intact."""
+        md = "```\n_still_code_\n```"
+        text, styles = _m2s(md)
+        assert "_still_code_" in text
+        assert not _find_style(styles, "ITALIC")
+
+    def test_heading_before_code_block_preserves_monospace_style(self):
+        """A heading earlier in the message must not shift the code block's
+        MONOSPACE span out of range and silently drop it."""
+        md = "# Heading\n\n```\ncode here\n```"
+        text, styles = _m2s(md)
+        assert text == "Heading\n\ncode here"
+        mono = _find_style(styles, "MONOSPACE")
+        assert len(mono) == 1
+        start, length, _ = mono[0].split(":")
+        start, length = int(start), int(length)
+        assert text[start : start + length] == "code here"
+
     def test_links_preserved(self):
         """[text](url) links are kept as-is — Signal auto-linkifies."""
         md = "Check [this link](https://example.com) for details"
