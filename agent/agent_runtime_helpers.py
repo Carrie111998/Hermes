@@ -812,6 +812,14 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # id. display_kind never reaches providers (stripped from
                 # every outgoing copy), so the merged turn's wire payload
                 # is unchanged.
+                #
+                # Deliberate scope: when both rows carry display_kind (two
+                # consecutive model-switch markers) the pair keeps the first
+                # marker's classification and id — no plain row is swallowed
+                # there, so no addressable turn is lost. prev.pop() relies on
+                # prev being the live object already held in merged (never
+                # copied); a refactor that appends a copy instead would
+                # silently drop the repair.
                 if prev.get("display_kind") and not msg.get("display_kind"):
                     prev.pop("display_kind", None)
                     if msg.get("_row_id") is not None:
