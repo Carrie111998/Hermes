@@ -2660,6 +2660,36 @@ def _items_by_unique_name(items):
     return indexed
 
 
+def _is_unresolved_secret_ref(raw: str) -> bool:
+    """True when *raw* references a credential var that is NOT in os.environ.
+
+    This is the narrow condition behind the DAN-3143 leak. ``load_config``
+    expands env refs, but a secret can also reach the config already expanded
+    from a source ``os.environ`` never saw -- ``~/.hermes/.env`` loaded by the
+    daemon, Keychain, 1Password. In that case every expansion-based check in
+    ``_preserve_env_ref_templates`` compares against a literal ``${VAR}``
+    (``_expand_env_vars`` leaves unresolved refs verbatim), so none of them can
+    match the real secret and the plaintext gets persisted.
+
+    Crucially this returns False when the variable IS set: a user pasting a
+    replacement key through the UI is a deliberate edit and must still win
+    (``test_save_config_allows_intentional_secret_value_change``). It only
+    guards the case where we cannot possibly have produced the new value by
+    expanding the template, AND the reference names a credential.
+    """
+    names = re.findall(r"\${([^}]+)}", raw)
+    if not names:
+        return False
+    secretish = re.compile(
+        r"(TOKEN|SECRET|KEY|PASSWORD|PASSWD|CREDENTIAL|BEARER|AUTH)", re.IGNORECASE
+    )
+    for name in names:
+        var = name[4:] if name.startswith("env:") else name
+        if secretish.search(var) and os.environ.get(var) is None:
+            return True
+    return False
+
+
 def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
     """Restore raw ``${VAR}`` templates when a value is otherwise unchanged.
 
@@ -2680,6 +2710,21 @@ def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
         if isinstance(loaded_expanded, str) and current == loaded_expanded:
             return raw
         if _expand_env_vars(raw) == current:
+            return raw
+        # The three checks above all compare against an expansion of `raw`.
+        # Every one of them fails when the referenced variable is NOT in
+        # os.environ but the value reached us expanded from somewhere else
+        # (Keychain, 1Password, a sourced .env): `_expand_env_vars` leaves an
+        # unresolved `${VAR}` verbatim, so it can never equal the real secret.
+        # Falling through then persists that secret as plaintext into
+        # config.yaml -- which is exactly how a live unified-gateway bearer
+        # token ended up on disk in a world-readable file on mfc1 (DAN-3143).
+        #
+        # Only guard the case we could not have produced ourselves: the
+        # referenced credential var is unset, so no expansion of `raw` could
+        # ever equal `current`. When the var IS set, replacing the template is
+        # a deliberate edit (pasting a new API key) and still wins.
+        if current.strip() and not re.search(r"\${[^}]+}", current) and _is_unresolved_secret_ref(raw):
             return raw
         return current
 
