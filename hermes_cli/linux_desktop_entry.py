@@ -326,6 +326,14 @@ def _resolve_hermes_bin_for_desktop_entry(
         probe = _known_wrapper_candidates()
         for candidate in probe:
             if candidate.is_file() and os.access(candidate, os.X_OK):
+                if not _wrapper_shebang_safe(candidate):
+                    # The wrapper targets this checkout but its own shebang
+                    # would die in the DE context (e.g. `#!/usr/bin/env
+                    # python3` resolving past the venv): skip it the same
+                    # way a foreign-install wrapper is skipped. Idea
+                    # credited to autumn8's #92122 rung-2 safety check;
+                    # implemented on our ownership machinery.
+                    continue
                 if _wrapper_targets_checkout(
                     candidate, checkout_root
                 ) or _wrapper_targets_checkout(candidate, module_lexical_root):
@@ -338,6 +346,54 @@ def _resolve_hermes_bin_for_desktop_entry(
         # module fallback.
         return None
     return primary
+
+
+def _wrapper_shebang_safe(wrapper: Path) -> bool:
+    """Whether an executable wrapper can actually run in the DE context.
+
+    A wrapper whose own shebang escapes the venv (``#!/usr/bin/env
+    python3`` or a bare interpreter name) would die exactly like the
+    broken entry this module exists to fix — the checkout reference in
+    its body does not save it. Native binaries and shell launchers are
+    safe by construction (they exec the right interpreter themselves).
+    A python-shebang wrapper is safe only when its interpreter resolves
+    to the RUNNING venv's interpreter directory.
+    """
+    try:
+        with open(wrapper, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    if head[:4] == b"\x7fELF" or head.startswith(b"MZ"):
+        return True
+    if not head.startswith(b"#!"):
+        # No shebang: the kernel cannot exec it directly either — but it
+        # may be sourced or exec'd via `sh` by DE-specific glue. Fail
+        # safe toward the module fallback.
+        return False
+    shebang = head.decode("utf-8", errors="replace").splitlines()[0]
+    tokens = shebang[2:].strip().split()
+    if not tokens:
+        return False
+    interp = Path(tokens[0])
+    # `#!/usr/bin/env bash` (the installer's own launcher form): `env`
+    # here is the standard trick to find bash on PATH, and the script
+    # itself execs the right interpreter. Only python-flavored `env`
+    # shebangs are the escape hazard.
+    if interp.name == "env":
+        target = Path(tokens[1]) if len(tokens) > 1 else Path("")
+        if target.name in ("bash", "sh", "dash", "zsh", "ksh"):
+            return True
+        return not _shebang_escapes_running_env(shebang)
+    if interp.name in ("bash", "sh", "dash", "zsh", "ksh"):
+        # A shell launcher execs the right interpreter itself.
+        return True
+    if "python" not in interp.name.lower():
+        # Not a python interpreter either — fail safe toward the module
+        # fallback rather than trusting an unknown interpreter.
+        return False
+    # Python wrapper: its shebang must stay inside the RUNNING venv.
+    return not _shebang_escapes_running_env(shebang)
 
 
 def _wrapper_targets_checkout(wrapper: Path, checkout_root: Path) -> bool:
@@ -562,6 +618,26 @@ def _run_quiet(cmd: "list[str]") -> bool:
     return result.returncode == 0
 
 
+def _install_icon_to_hicolor(icon: Path) -> bool:
+    """Copy the app icon into the user's hicolor icon theme tree.
+
+    The freedesktop icon lookup finds an installed ``apps/hermes.png``
+    by the unqualified name ``hermes``, so the entry can reference the
+    icon without an absolute checkout path. Returns True when the icon
+    is installed (or already up to date); False when it cannot be —
+    the caller then falls back to the absolute path.
+    """
+    dest = _xdg_data_home() / "icons" / "hicolor" / "256x256" / "apps" / "hermes.png"
+    try:
+        if dest.is_file() and dest.read_bytes() == icon.read_bytes():
+            return True
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(icon, dest)
+        return True
+    except OSError:
+        return False
+
+
 def install_desktop_entry(project_root: Path) -> Optional[Path]:
     """Write (or refresh) the Hermes desktop entry. Return its path.
 
@@ -573,9 +649,15 @@ def install_desktop_entry(project_root: Path) -> Optional[Path]:
 
     entry_path = desktop_entry_path()
     icon = icon_path(project_root)
-    # Use the themed name when the checkout has no icon (a lite or
-    # packaged install). A broken absolute path renders as no icon.
+    # Prefer the themed name: the icon is COPIED into the user's hicolor
+    # tree, so the entry outlives the checkout (moving/archiving the
+    # checkout would break an absolute Icon= path — the same
+    # durability class the Exec line was fixed for). Fall back to the
+    # absolute path only when the copy is impossible (read-only tree),
+    # and to the themed name when the checkout has no icon at all.
     icon_value = str(icon) if icon.is_file() else "hermes"
+    if icon.is_file() and _install_icon_to_hicolor(icon):
+        icon_value = "hermes"
     contents = render_desktop_entry(resolve_exec_command(project_root), icon_value)
 
     try:

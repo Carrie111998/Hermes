@@ -51,6 +51,9 @@ def test_install_writes_entry_with_absolute_exec_and_icon(
         "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
     )
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+    # Keep the icon install out of the way: this test pins the
+    # absolute-path FALLBACK (copy impossible / not attempted here).
+    monkeypatch.setattr(lde, "_install_icon_to_hicolor", lambda _icon: False)
 
     entry = lde.install_desktop_entry(root)
 
@@ -66,7 +69,58 @@ def test_install_writes_entry_with_absolute_exec_and_icon(
     icon_path = Path(values["Icon"])
     assert icon_path.is_absolute()
     assert icon_path == lde.icon_path(root)
-    assert icon_path.read_bytes() == b"\x89PNG fake"
+
+
+def test_install_prefers_themed_icon_from_hicolor(tmp_path, xdg_home, monkeypatch):
+    """When the icon installs into hicolor, the entry uses the themed name.
+
+    The themed name survives a moved/archived checkout; an absolute
+    Icon= path does not (the same durability class the Exec line was
+    fixed for).
+    """
+    root = _make_project(tmp_path)
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+
+    values = _parse(entry.read_text(encoding="utf-8"))
+    assert values["Icon"] == "hermes"
+
+    # And the icon really landed in the hicolor tree.
+    dest = xdg_home / "icons" / "hicolor" / "256x256" / "apps" / "hermes.png"
+    assert dest.is_file()
+    assert dest.read_bytes() == lde.icon_path(root).read_bytes()
+
+
+def test_install_icon_copy_failure_falls_back_to_absolute(
+    tmp_path, xdg_home, monkeypatch
+):
+    """An impossible icon copy keeps the absolute path (never breaks)."""
+    root = _make_project(tmp_path)
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    def _boom(src, dst):
+        raise OSError("read-only tree")
+
+    monkeypatch.setattr(lde.shutil, "copyfile", _boom)
+
+    entry = lde.install_desktop_entry(root)
+    values = _parse(entry.read_text(encoding="utf-8"))
+    # The real helper catches the copy OSError and returns False, so the
+    # caller falls back to the absolute path without raising.
+    assert values["Icon"] == str(lde.icon_path(root))
 
     assert values["Type"] == "Application"
     assert values["Name"] == "Hermes"
@@ -829,3 +883,79 @@ def test_needs_interpreter_env_shebang_always_escapes(tmp_path, monkeypatch):
         f"#!/usr/bin/env -S {interp}\nimport hermes_cli\n", encoding="utf-8"
     )
     assert lde._needs_interpreter(env_abs) is False
+
+
+def test_probe_skips_wrapper_with_escaping_python_shebang(
+    tmp_path, xdg_home, monkeypatch
+):
+    """A checkout-referencing wrapper with an env shebang is skipped.
+
+    Ownership alone would accept it (the body references this checkout),
+    but its `#!/usr/bin/env python3` shebang dies in the DE context.
+    The shebang-safety gate skips it; the module fallback wins. Idea
+    credited to autumn8's #92122 rung-2 check.
+    """
+    import sys as _s
+
+    root = _make_project(tmp_path)
+    repo_script = root / "hermes"
+    repo_script.write_text(
+        "#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
+    repo_script.chmod(0o755)
+
+    # A wrapper that targets this checkout but cannot run itself.
+    broken_wrapper = xdg_home / ".local" / "bin" / "hermes"
+    broken_wrapper.parent.mkdir(parents=True)
+    broken_wrapper.write_text(
+        f"#!/usr/bin/env python3\n# launcher for {root}\nimport hermes_cli\n",
+        encoding="utf-8",
+    )
+    broken_wrapper.chmod(0o755)
+    monkeypatch.setenv("HOME", str(xdg_home))
+    _argv0_context(monkeypatch, str(repo_script))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    def fake_resolve():
+        return sys.argv[0] if sys.argv[0] else None
+
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", fake_resolve)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert str(broken_wrapper) not in exec_line
+    assert exec_line.endswith("-m hermes_cli.main desktop")
+
+
+def test_probe_accepts_shell_launcher_wrapper(tmp_path, xdg_home, monkeypatch):
+    """A bash launcher is safe by construction and still wins the probe."""
+    root = _make_project(tmp_path)
+    repo_script = root / "hermes"
+    repo_script.write_text(
+        "#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8"
+    )
+    repo_script.chmod(0o755)
+
+    good_wrapper = xdg_home / ".local" / "bin" / "hermes"
+    good_wrapper.parent.mkdir(parents=True)
+    good_wrapper.write_text(
+        f"#!/bin/bash\nexec {root / 'venv' / 'bin' / 'python'} "
+        f'{root / "hermes"} "$@"\n',
+        encoding="utf-8",
+    )
+    good_wrapper.chmod(0o755)
+    monkeypatch.setenv("HOME", str(xdg_home))
+    _argv0_context(monkeypatch, str(repo_script))
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    def fake_resolve():
+        return sys.argv[0] if sys.argv[0] else None
+
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", fake_resolve)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+    assert exec_line == f"{good_wrapper} desktop"
