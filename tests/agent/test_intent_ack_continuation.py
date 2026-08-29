@@ -218,6 +218,13 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Relaunching with corrected arguments improves reliability.",
         "Checking whether the service is healthy improves reliability.",
         "Then launching the worker improves reliability.",
+        "Running the suite now. 42 passed, 0 failed.",
+        "Checking the log now. Testing completed successfully.",
+        "Checking the actual log. The job failed because the token expired.",
+        "Running the suite locally works now.",
+        "Creating the index speeds queries now.",
+        "Running the suite works on Copilot.",
+        "Testing happens via acpx.",
         "Reviewing the diff. Everything looks fine.",
         "Testing the parser.\n\nAll 42 tests pass.",
         "Running the numbers. The total is 42.",
@@ -226,6 +233,8 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Options:\n1. Running the suite locally.",
         "Two options. 1. Running the suite locally. 2. Pinning the dependency.",
         "Two options. 1. Pinning the dependency. 2. Running the suite locally.",
+        "Two options. 1. Checking the actual log. 2. Bumping the timeout.",
+        "Two options. 1. Relaunching with corrected arguments. 2. Pinning the dep.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(

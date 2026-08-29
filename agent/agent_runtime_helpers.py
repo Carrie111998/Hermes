@@ -4290,46 +4290,53 @@ def looks_like_codex_intermediate_ack(
     # explicit transition cue such as "now", "via acpx", "actual log", or
     # "then launching". Completed reports and questions stay final.
     action_clause_pattern = re.compile(
-        r"(?:^|[.!…—–]\s+|\n+\s*)(?:(?P<transition>then)\s+)?"
+        r"(?:^|[.!…—–]\s+|\n+\s*|,\s+)(?:(?P<transition>then)\s+)?"
         r"(?P<action>(?:re)?launching|(?:re)?starting|creating|"
         r"checking|running|writing|opening|reading|inspecting|reviewing|"
         r"testing|debugging|searching|fixing)\b"
     )
     list_item_prefix_pattern = re.compile(r"(?:^|\n)\s*(?:[-*+]|\d+[.)])\s*$")
-    completion_predicate_pattern = re.compile(
-        r"\b(?:completed|finished|succeeded|failed|passed|complete|done|successful)\b"
-        r"(?=\s*(?:$|[)\],;:])|\s+(?:successfully|with|without|due|because|"
-        r"after|before|in|at|and|but|while|when|so|as|on|during|by|for|from|"
-        r"over|under|all|every|today|yesterday|already)\b|\s+\d)"
-    )
-    declarative_predicate_pattern = re.compile(
-        r"\b(?:is|are|was|were|would|could|should|can|will|tells?|shows?|helps?|"
-        r"costs?|means?|takes?|requires?|seems?|appears?|fails?|gives?|"
-        r"reproduces?|adds?|generates?|consumes?|explains?|confirms?|breaks?|"
-        r"produces?|triggers?|ships?|prints?|parses?|builds?|reveals?|improves?|"
-        r"gave|found|made|"
-        r"reproduced|revealed|surfaced)\b"
+    inline_list_prefix_pattern = re.compile(
+        r"\b(?:options?|ideas?|choices?|steps)\b.*\b\d+[.)]\s*$"
     )
     question_pattern = re.compile(r"\?(?=\s|$|[\"'’”)\]])")
     sentence_boundary_pattern = re.compile(
         r"(?:[.!…](?=\s|$)|\?(?=\s|$|[\"'’”)\]])|\n+)"
     )
-    terminal_now_pattern = re.compile(
-        r"(?:\bnow\b\s*(?:\([^)]*\))?\s*$|"
-        r"\bnow\b\s*[—–-]\s*see\s+https?://\S+"
-        r"(?:\s+for\s+progress)?\s*$)"
+    trailing_final_pattern = re.compile(
+        r"\b(?:completed|finished|succeeded|failed|passed|complete|done|successful)\b|"
+        r"\b(?:everything|all|the\s+(?:job|session|result|total))\s+"
+        r"(?:is|are|was|were|looks?|seems?)\b"
     )
-    provider_transition_pattern = re.compile(
-        r"\b(?:via\s+(?:copilot|acpx|codex|claude)|"
-        r"on\s+(?:copilot|acpx|codex|claude)"
-        r"(?:\s+via\s+\S+)?)\s*$"
+    launch_now_tail_pattern = re.compile(
+        r"\s+(?:(?:it|(?:the\s+)?(?:session|worker|agent|job|process)|"
+        r"(?:the\s+)?migration\s+file\s+in\s+the\s+repo)\s+)?"
+        r"now(?:\s*\([^)]*\))?\s*$"
     )
-    explicit_action_detail_pattern = re.compile(
-        r"\bactual\s+(?:log|output)\s*$|"
-        r"\bwhether\b.*\b(?:healthy|ready|running|available|reachable|working)\s*$"
+    run_now_tail_pattern = re.compile(
+        r"\s+(?:(?:it|(?:the\s+)?(?:(?:repo\s+)?suite|tests?|job|process|"
+        r"server|service))\s+)?now(?:\s*\([^)]*\))?\s*$"
+    )
+    check_now_tail_pattern = re.compile(
+        r"\s+(?:the\s+)?(?:log|output|status|service|session|job)\s+"
+        r"now(?:\s*\([^)]*\))?\s*$"
+    )
+    launch_url_tail_pattern = re.compile(
+        r"\s+now\s*[—–-]\s*see\s+https?://\S+"
+        r"(?:\s+for\s+progress)?\s*$"
+    )
+    provider_tail_pattern = re.compile(
+        r"\s+(?:it|(?:the\s+)?(?:session|worker|agent|job|process))\s+"
+        r"on\s+copilot(?:\s+via\s+acpx)?\s*$"
+    )
+    actual_log_tail_pattern = re.compile(
+        r"\s+(?:the\s+)?actual\s+(?:log|output)\s*$"
+    )
+    health_check_tail_pattern = re.compile(
+        r"\s+whether\b.*\b(?:healthy|ready|running|available|reachable|working)\s*$"
     )
     launch_with_pattern = re.compile(
-        r"\bwith\s+(?:(?:corrected|updated|new)\s+"
+        r"\s+with\s+(?:(?:corrected|updated|new)\s+"
         r"(?:arguments?|args?|options?|flags?|parameters?)|"
         r"globals?\s+before\s+(?:the\s+)?agent\s+name)\s*$"
     )
@@ -4337,41 +4344,48 @@ def looks_like_codex_intermediate_ack(
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
             action_prefix = assistant_text[: action_match.start("action")]
-            if list_item_prefix_pattern.search(action_prefix):
+            if list_item_prefix_pattern.search(
+                action_prefix
+            ) or inline_list_prefix_pattern.search(action_prefix):
                 continue
-            clause_tail = assistant_text[action_match.end() :]
-            boundary_match = sentence_boundary_pattern.search(clause_tail)
+            raw_clause_tail = assistant_text[action_match.end() :]
+            boundary_match = sentence_boundary_pattern.search(raw_clause_tail)
             if boundary_match:
-                clause_tail = clause_tail[: boundary_match.start()]
+                clause_tail = raw_clause_tail[: boundary_match.start()]
+                remaining_text = raw_clause_tail[boundary_match.end() :]
+            else:
+                clause_tail = raw_clause_tail
+                remaining_text = ""
+            if trailing_final_pattern.search(remaining_text):
+                continue
             action_word = action_match.group("action")
+            is_launch_action = action_word in {
+                "launching",
+                "relaunching",
+                "starting",
+                "restarting",
+                "creating",
+            }
             has_transition_cue = bool(
-                terminal_now_pattern.search(clause_tail)
-                or provider_transition_pattern.search(clause_tail)
-                or explicit_action_detail_pattern.search(clause_tail)
+                (is_launch_action and launch_now_tail_pattern.fullmatch(clause_tail))
+                or (action_word == "running" and run_now_tail_pattern.fullmatch(clause_tail))
                 or (
-                    action_word.startswith(("launch", "relaunch", "start", "restart"))
-                    and launch_with_pattern.search(clause_tail)
+                    action_word == "checking"
+                    and check_now_tail_pattern.fullmatch(clause_tail)
                 )
+                or (is_launch_action and launch_url_tail_pattern.fullmatch(clause_tail))
+                or (is_launch_action and provider_tail_pattern.fullmatch(clause_tail))
+                or (
+                    action_word in {"checking", "reading", "opening", "inspecting"}
+                    and actual_log_tail_pattern.fullmatch(clause_tail)
+                )
+                or (
+                    action_word == "checking"
+                    and health_check_tail_pattern.fullmatch(clause_tail)
+                )
+                or (is_launch_action and launch_with_pattern.fullmatch(clause_tail))
             )
             if not has_transition_cue:
-                continue
-            predicate_matches = [
-                ("completion", match)
-                for match in completion_predicate_pattern.finditer(clause_tail)
-            ]
-            predicate_matches.extend(
-                ("declarative", match)
-                for match in declarative_predicate_pattern.finditer(clause_tail)
-            )
-            has_main_predicate = False
-            for predicate_kind, predicate_match in predicate_matches:
-                if predicate_kind == "declarative" and re.search(
-                    r"\b(?:if|whether)\b", clause_tail[: predicate_match.start()]
-                ):
-                    continue
-                has_main_predicate = True
-                break
-            if has_main_predicate:
                 continue
             has_pronounless_action = True
             break
