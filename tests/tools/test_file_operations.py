@@ -898,3 +898,97 @@ class TestEscapeNativeToolArg:
         assert node_cmds, f"no node command captured in: {commands}"
         assert "'C:/Users/alice/app/main.js'" in node_cmds[0]
         assert "/c/Users" not in node_cmds[0]
+
+
+class TestSearchPatternIsNotAPath:
+    r"""Regression: a regex pattern must never go through the path translator.
+
+    Live failure (Windows, Aug 2026): `_search_with_rg` / `_search_with_grep`
+    escaped the PATTERN with `_escape_shell_arg`, which calls `_bash_safe_path`
+    — a *path* translator that rewrites every backslash to a forward slash on
+    Windows. Every regex escape was destroyed on the way to the binary:
+
+        setInterval\(   -> setInterval/(    -> rg: unclosed group
+        session\.resume -> session/.resume  -> matches the wrong thing
+        \bfoo\b        -> /bfoo/b          -> matches nothing
+
+    189 searches died this way in one week. A pattern's backslashes are regex
+    escapes, not path separators, so they must survive untouched.
+    """
+
+    def _ops(self, mock_env):
+        return ShellFileOperations(mock_env)
+
+    def _capture(self, mock_env):
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        return commands
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [r"setInterval\(", r"session\.resume", r"\bfoo\b", r"\d+", r"toBe\(.*\)"],
+    )
+    def test_escape_shell_literal_preserves_regex_escapes(
+        self, mock_env, monkeypatch, pattern
+    ):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = self._ops(mock_env)
+        assert ops._escape_shell_literal(pattern) == "'" + pattern + "'"
+
+    def test_escape_shell_literal_still_quotes_single_quotes(self, mock_env):
+        ops = self._ops(mock_env)
+        assert ops._escape_shell_literal("it's") == "'it'\"'\"'s'"
+
+    @pytest.mark.parametrize("pattern", [r"setInterval\(", r"\bfoo\b", r"\d+"])
+    def test_rg_content_search_keeps_pattern_backslashes(
+        self, mock_env, monkeypatch, pattern
+    ):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = self._capture(mock_env)
+        ops = self._ops(mock_env)
+        ops._search_with_rg(pattern, r"C:\repo", None, 50, 0, "content", 0)
+        rg_cmds = [c for c in commands if "rg " in c]
+        assert rg_cmds, f"no rg command captured in: {commands}"
+        assert any(pattern in c for c in rg_cmds), rg_cmds
+
+    @pytest.mark.parametrize("pattern", [r"setInterval\(", r"\bfoo\b", r"\d+"])
+    def test_grep_content_search_keeps_pattern_backslashes(
+        self, mock_env, monkeypatch, pattern
+    ):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = self._capture(mock_env)
+        ops = self._ops(mock_env)
+        ops._search_with_grep(pattern, r"C:\repo", None, 50, 0, "content", 0)
+        grep_cmds = [c for c in commands if "grep " in c]
+        assert grep_cmds, f"no grep command captured in: {commands}"
+        assert any(pattern in c for c in grep_cmds), grep_cmds
+
+    def test_path_argument_still_gets_native_translation(
+        self, mock_env, monkeypatch
+    ):
+        """The pattern fix must not disturb the path argument: rg still needs
+        the native ``C:/`` form (see TestEscapeNativeToolArg)."""
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = self._capture(mock_env)
+        ops = self._ops(mock_env)
+        ops._search_with_rg(r"\bfoo\b", r"C:\Users\alice\project", None, 50, 0, "content", 0)
+        rg_cmds = [c for c in commands if "rg " in c]
+        assert any("'C:/Users/alice/project'" in c for c in rg_cmds), rg_cmds
+        assert all("/c/Users" not in c for c in rg_cmds), rg_cmds

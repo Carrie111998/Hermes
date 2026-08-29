@@ -1192,6 +1192,29 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    def _escape_shell_literal(self, arg: str) -> str:
+        r"""Quote a NON-PATH argument for the shell. No path translation.
+
+        ``_escape_shell_arg`` runs its input through ``_bash_safe_path``,
+        which rewrites every backslash to a forward slash on Windows so bash
+        does not eat ``\U`` in a drive path. That is correct for PATHS and
+        catastrophic for REGEX PATTERNS: a pattern's backslashes are escapes,
+        not separators. Routing a pattern through it produced
+
+            setInterval\(   -> setInterval/(    -> rg: unclosed group
+            session\.resume -> session/.resume  -> silently wrong matches
+            \bfoo\b         -> /bfoo/b          -> no matches at all
+
+        i.e. every regex carrying an escape either died or lied on Windows
+        (189 such failures in one week, Aug 2026 — the agent could not search
+        its own codebase). Search patterns therefore use this quote-only
+        escaper; PATHS keep ``_escape_shell_arg`` / ``_escape_native_tool_arg``.
+
+        Identical to the quoting half of ``_escape_shell_arg`` on every
+        platform, so POSIX behavior is unchanged.
+        """
+        return "'" + arg.replace("'", "'\"'\"'") + "'"
+
     def _escape_native_tool_arg(self, arg: str) -> str:
         """Escape a path argument destined for a NATIVE Windows binary.
 
@@ -2990,7 +3013,7 @@ class ShellFileOperations(FileOperations):
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_literal(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -3007,7 +3030,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_literal(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -3021,7 +3044,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+                f"{self._escape_shell_literal(pattern)} {self._escape_native_tool_arg(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -3258,7 +3281,7 @@ class ShellFileOperations(FileOperations):
             cmd_parts.append("-c")  # Count per file
         
         # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        cmd_parts.append(self._escape_shell_literal(pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
         # it needs the C:/... path form, not the MSYS /c/... form (which
         # nothing converts back — Hermes sets MSYS_NO_PATHCONV for its bash).
@@ -3418,7 +3441,7 @@ class ShellFileOperations(FileOperations):
         # ``.*`` to exclude the entire search. Anchor relative paths at the
         # shell's live cwd; quoting $PWD separately keeps user paths escaped
         # while working across local, container, and remote backends.
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        cmd_parts.append(self._escape_shell_literal(pattern))
         is_absolute = path.startswith(("/", "\\\\")) or bool(
             re.match(r"^[A-Za-z]:[\\/]", path)
         )
@@ -3467,7 +3490,7 @@ class ShellFileOperations(FileOperations):
             grep_parts.append("-l")
         elif output_mode == "count":
             grep_parts.append("-c")
-        grep_parts.append(self._escape_shell_arg(pattern))
+        grep_parts.append(self._escape_shell_literal(pattern))
 
         prune_terms = " -o ".join(
             f"-path {self._escape_shell_arg(item)}" for item in protected_paths
