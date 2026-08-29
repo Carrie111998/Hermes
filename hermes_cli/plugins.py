@@ -394,8 +394,15 @@ VALID_HOOKS: Set[str] = {
     #   background_review_message  — kwargs: context, message (observer-only);
     #                               per assistant message from the fork.
     #   background_review_finished — kwargs: context, messages (list[dict]),
-    #                               status ("finished"|"failed"), error (str|None);
-    #                               fires once, including exception paths.
+    #                               status ("finished"|"failed"|"cancelled"),
+    #                               error (str|None); fires exactly once on
+    #                               EVERY exit — success, exception, and both
+    #                               cancellation windows (#84423), so
+    #                               started == finished + failed + cancelled.
+    #                               "cancelled" carries an empty (startup
+    #                               fence) or truncated (mid-flight interrupt)
+    #                               transcript: do not treat it as a complete
+    #                               review.
     "background_review_started",
     "background_review_message",
     "background_review_finished",

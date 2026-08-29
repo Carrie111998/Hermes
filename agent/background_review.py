@@ -202,7 +202,13 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
 
 #: Bump on any change to ``ReviewExecutionContext`` fields or the
 #: ``background_review_started`` / ``_message`` / ``_finished`` contracts.
-HOOK_CONTRACT_VERSION = 1
+#:
+#: v2 — ``background_review_finished`` gained ``status="cancelled"`` and now
+#: fires on the #84423 startup-fence path too (v1 could report a cancelled
+#: fork as ``"finished"``, and emitted nothing at all when the fence tripped).
+#: A v1 consumer still works: it sees an unknown status string, and the
+#: started/terminal counts still balance.
+HOOK_CONTRACT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -1454,11 +1460,55 @@ def _run_review_in_thread(
     via ``review_agent._execution_kind``/``_execution_id`` so plugins can
     tell fork turns from live turns without prompt-text or turn-id
     heuristics. ``background_review_message`` fires per assistant message
-    and ``background_review_finished`` fires exactly once (success or
-    failure) with the full review_messages, replacing the summarizer-wrap
-    extraction seam.
+    and ``background_review_finished`` fires exactly once — on EVERY exit,
+    including the two #84423 cancellation windows below — with the review
+    messages accumulated so far, replacing the summarizer-wrap extraction
+    seam.
+
+    Contract v2: ``status`` is ``"finished" | "failed" | "cancelled"``.
+    ``"cancelled"`` is reported whenever ``review_run.cancel_requested`` is
+    set, because a cancelled fork's transcript is EMPTY (startup fence) or
+    TRUNCATED (mid-flight interrupt) — a consumer that treats it as
+    ``"finished"`` would commit a partial extraction as if it were the
+    fork's whole output.
     """
+    # P2.1 + #84423: the one-shot terminal helper is defined BEFORE the
+    # startup fence below, because that fence returns without ever reaching
+    # the body. background_review_started has already fired on the foreground
+    # thread by then, so returning without a terminal event would break the
+    # counter invariant (started == finished + failed + cancelled) for every
+    # review a live turn outraces.
+    _terminal_emitted = {"done": False}
+
+    def _emit_terminal(status: str, error: Optional[str], msgs: List[Dict]) -> None:
+        if context is None or _terminal_emitted["done"]:
+            return
+        _terminal_emitted["done"] = True
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "background_review_finished",
+                context=context, messages=msgs,
+                status=status, error=error,
+            )
+        except Exception:
+            logger.warning("background_review_finished hook dispatch failed",
+                           exc_info=True)
+
+    def _terminal_status(default: str) -> str:
+        """``"cancelled"`` wins over a nominal success.
+
+        ``interrupt()`` is cooperative: ``run_conversation`` returns normally
+        after a mid-flight cancel, so the success path is reached with a
+        truncated transcript and cannot be distinguished by control flow —
+        only by the run token.
+        """
+        if review_run is not None and review_run.cancel_requested.is_set():
+            return "cancelled"
+        return default
+
     if review_run is not None and review_run.cancel_requested.is_set():
+        _emit_terminal("cancelled", None, [])
         finish_background_review_run(agent, review_run)
         return
 
@@ -1537,31 +1587,6 @@ def _run_review_in_thread(
     def _finish_request_phase(agent_ref) -> None:
         _unregister_review_agent(agent_ref)
         finish_background_review_run(agent, review_run)
-
-    # P2.1: terminal dispatch must be structurally exactly-once. The success
-    # branch fires background_review_finished(status="finished") BEFORE the
-    # summary/output code below (so a plugin can extract its own structured
-    # output from the full transcript and commit on this daemon thread). If
-    # that post-emit output later raises, the outer except must NOT emit a
-    # second terminal event — otherwise the plugin's counters double-count
-    # (fork_started must equal fork_finished + fork_failed). Centralize both
-    # paths through this one-shot helper so the invariant holds structurally.
-    _terminal_emitted = {"done": False}
-
-    def _emit_terminal(status: str, error: Optional[str], msgs: List[Dict]) -> None:
-        if context is None or _terminal_emitted["done"]:
-            return
-        _terminal_emitted["done"] = True
-        try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
-                "background_review_finished",
-                context=context, messages=msgs,
-                status=status, error=error,
-            )
-        except Exception:
-            logger.warning("background_review_finished hook dispatch failed",
-                           exc_info=True)
 
     try:
         # Silence stdout/stderr for THIS worker thread only.  A process-global
@@ -1717,7 +1742,15 @@ def _run_review_in_thread(
         # monkey-patch seam. Fired exactly once per fork (see _emit_terminal):
         # on the success path here, on the failure path in the except below —
         # never both.
-        _emit_terminal("finished", None, review_messages)
+        #
+        # #84423 window B: this line is ALSO reached when the review was
+        # cancelled — begin_request() refused admission (run_conversation never
+        # ran, review_messages is empty), or a live turn interrupted the fork
+        # mid-flight (interrupt() is cooperative, so run_conversation returned
+        # normally and review_messages is truncated). Neither is a finished
+        # review, and neither is distinguishable by control flow here; ask the
+        # run token instead.
+        _emit_terminal(_terminal_status("finished"), None, review_messages)
 
         # Scan the review agent's messages for successful tool actions
         # and surface a compact summary to the user. Tool messages
@@ -1774,6 +1807,11 @@ def _run_review_in_thread(
         # the success path already emitted a terminal event (an exception raised
         # by the post-"finished" summary/output code lands here — it must not
         # reclassify an already-finished fork as failed).
+        #
+        # Deliberately NOT _terminal_status(): a real exception outranks a
+        # pending cancel. "cancelled" would drop the error string, and a crash
+        # is what the operator needs to see even if a live turn happened to
+        # supersede this fork on the way out.
         _emit_terminal("failed", str(e), list(review_messages))
         logger.warning("Background memory/skill review failed: %s", e)
         if review_usage:

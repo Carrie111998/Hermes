@@ -3,11 +3,12 @@
 These pin the *observable contract* the hook surface promises, independent of
 what any plugin does with it:
 
-* ``HOOK_CONTRACT_VERSION`` is importable and equals 1.
+* ``HOOK_CONTRACT_VERSION`` is importable and equals 2.
 * The three ``background_review_*`` hooks are registered in ``VALID_HOOKS``.
 * ``background_review_started`` can append a ``prompt_suffix``.
-* ``background_review_finished`` fires **exactly once** per fork — on both the
-  success path and the exception path — carrying the fork's provenance.
+* ``background_review_finished`` fires **exactly once** per fork — on the
+  success path, the exception path, and both #84423 cancellation windows —
+  carrying the fork's provenance.
 
 They drive the real ``_run_review_in_thread`` synchronously via the same
 ``ImmediateThread`` + ``FakeReviewAgent`` harness as ``test_background_review``.
@@ -84,10 +85,10 @@ def _install(monkeypatch, recorder, review_agent_cls):
     monkeypatch.setattr(plugins_module, "invoke_hook", recorder)
 
 
-def test_hook_contract_version_is_one():
+def test_hook_contract_version_is_two():
     from agent.background_review import HOOK_CONTRACT_VERSION
 
-    assert HOOK_CONTRACT_VERSION == 1
+    assert HOOK_CONTRACT_VERSION == 2
 
 
 def test_background_review_hooks_registered():
@@ -247,3 +248,186 @@ def test_background_review_started_prompt_suffix_appended(monkeypatch):
     # review prompt handed to the fork.
     assert "EXTRA-INSTRUCTION" in seen["user_message"]
     assert recorder.names().count("background_review_started") == 1
+
+
+# ── #84423 cancellation windows ──────────────────────────────────────────────
+#
+# main gained a per-review cancel token (``_BackgroundReviewRun``) so a new live
+# turn can fence out or interrupt an in-flight review. That created two exits
+# the v1 contract did not describe:
+#
+#   A. startup fence — ``_run_review_in_thread`` returns before the body, so a
+#      v1 host emitted background_review_started with NO terminal event at all.
+#   B. cancelled-but-nominally-successful — ``begin_request()`` refuses
+#      admission (transcript empty), or a live turn interrupts mid-flight
+#      (``interrupt()`` is cooperative, so ``run_conversation`` returns
+#      normally and the transcript is truncated). Both land on the success
+#      path, which a v1 host reported as ``status="finished"``.
+#
+# Both break the counter invariant a consumer relies on:
+#     started == finished + failed + cancelled
+
+
+class _PassiveReviewAgent:
+    """Fork stand-in that records nothing and never raises."""
+
+    def __init__(self, **kwargs):
+        self._session_messages = []
+
+    def run_conversation(self, **kwargs):
+        self._session_messages = [{"role": "assistant", "content": "did a thing"}]
+
+    def shutdown_memory_provider(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _capture_run(monkeypatch):
+    """Hand the test the real run token the spawn path builds."""
+    import agent.background_review as bg
+
+    box = {}
+    real = bg.prepare_background_review_run
+
+    def _capturing(agent_obj):
+        run = real(agent_obj)
+        box["run"] = run
+        return run
+
+    monkeypatch.setattr(bg, "prepare_background_review_run", _capturing)
+    return box
+
+
+def test_startup_fence_still_emits_a_terminal_event(monkeypatch):
+    """Window A: cancelled before the daemon body runs.
+
+    background_review_started has already fired on the foreground thread, so
+    returning at the fence without a terminal event strands the fork's counter
+    open forever.
+    """
+    import agent.background_review as bg
+
+    recorder = _HookRecorder()
+
+    def _already_cancelled(agent_obj):
+        run = bg._BackgroundReviewRun()
+        run.cancel()
+        return run
+
+    monkeypatch.setattr(bg, "prepare_background_review_run", _already_cancelled)
+    _install(monkeypatch, recorder, _PassiveReviewAgent)
+
+    AIAgent._spawn_background_review(
+        _bare_agent(),
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    started = recorder.of("background_review_started")
+    finished = recorder.of("background_review_finished")
+    assert len(started) == 1
+    assert len(finished) == 1, "the fence must not strand the started event"
+    assert finished[0]["status"] == "cancelled"
+    assert finished[0]["error"] is None
+    assert finished[0]["messages"] == []
+
+
+def test_refused_admission_reports_cancelled_not_finished(monkeypatch):
+    """Window B, first half: a live turn cancels after the fork is constructed
+    but before its first provider call, so ``begin_request()`` refuses and
+    ``run_conversation`` never runs. The transcript is empty — reporting that as
+    'finished' would let a consumer commit an empty extraction as the fork's
+    whole output."""
+    box = _capture_run(monkeypatch)
+    recorder = _HookRecorder()
+
+    class CancellingOnConstruct:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            box["run"].cancel()
+
+        def run_conversation(self, **kwargs):
+            raise AssertionError("must not be admitted after cancel")
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    _install(monkeypatch, recorder, CancellingOnConstruct)
+
+    AIAgent._spawn_background_review(
+        _bare_agent(),
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    finished = recorder.of("background_review_finished")
+    assert len(finished) == 1
+    assert finished[0]["status"] == "cancelled"
+    assert finished[0]["messages"] == []
+
+
+def test_midflight_interrupt_reports_cancelled_not_finished(monkeypatch):
+    """Window B, second half: the fork was admitted and produced part of a
+    transcript, then a live turn interrupted it. ``interrupt()`` is cooperative
+    — ``run_conversation`` returns normally — so control flow alone cannot tell
+    this from success. Only the run token can."""
+    box = _capture_run(monkeypatch)
+    recorder = _HookRecorder()
+
+    class InterruptedMidFlight:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            # Partial work, then a live turn supersedes this review.
+            self._session_messages = [
+                {"role": "assistant", "content": "half a thought"}
+            ]
+            box["run"].cancel()
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    _install(monkeypatch, recorder, InterruptedMidFlight)
+
+    AIAgent._spawn_background_review(
+        _bare_agent(),
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    finished = recorder.of("background_review_finished")
+    assert len(finished) == 1
+    assert finished[0]["status"] == "cancelled", (
+        "a truncated transcript must not be reported as a finished review"
+    )
+    # The partial transcript is still handed over — a consumer may want it,
+    # it just must not mistake it for the whole review.
+    assert finished[0]["messages"] == [
+        {"role": "assistant", "content": "half a thought"}
+    ]
+
+
+def test_uncancelled_success_still_reports_finished(monkeypatch):
+    """Control: the cancelled status must not leak onto the ordinary path."""
+    _capture_run(monkeypatch)
+    recorder = _HookRecorder()
+    _install(monkeypatch, recorder, _PassiveReviewAgent)
+
+    AIAgent._spawn_background_review(
+        _bare_agent(),
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    finished = recorder.of("background_review_finished")
+    assert len(finished) == 1
+    assert finished[0]["status"] == "finished"
