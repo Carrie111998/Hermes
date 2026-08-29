@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -32,10 +33,16 @@ import pytest
 
 
 # Both tests share the same handoff file: the leaker writes here, the
-# verifier reads here. We park it in $TMPDIR with a unique-per-run name
-# so concurrent invocations of the suite don't clobber each other.
-_HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
-_HANDOFF_DIR.mkdir(exist_ok=True)
+# verifier reads here. We park it in the system temp dir with a
+# unique-per-run name so concurrent invocations of the suite don't
+# clobber each other.
+#
+# tempfile.gettempdir() already honours TMPDIR on POSIX and TEMP/TMP on
+# Windows. The previous hardcoded /tmp fallback resolved to \tmp on the
+# current drive on Windows, which does not exist, so this mkdir raised
+# at import time and aborted collection for the entire suite.
+_HANDOFF_DIR = Path(tempfile.gettempdir()) / "hermes-isolation-probe"
+_HANDOFF_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _handoff_path_for(nonce: str) -> Path:
