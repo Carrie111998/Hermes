@@ -180,29 +180,51 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     assert get_active_subagent_parent() is None
 
 
-def test_launch_rejects_toolsets_in_parent_disabled_toolsets():
-    """Requesting toolsets that are disabled on the parent must raise SubagentLifecycleError."""
+def test_launch_rejects_toolsets_in_parent_disabled_toolsets(monkeypatch):
+    """Requesting toolsets disabled on the parent raises SubagentLifecycleError before child construction."""
     parent = SimpleNamespace(
         session_id="parent-sec",
         enabled_toolsets=None,
         disabled_toolsets=["terminal", "web"],
     )
     service = SubagentLifecycleService(lambda: parent)
-    with pytest.raises(SubagentLifecycleError, match="Requested toolsets would broaden parent permissions"):
+
+    captured_builds = []
+
+    def mock_build_child(**kwargs):
+        captured_builds.append(kwargs)
+        return FakeChild("sa-sec-test")
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools",
+        mock_build_child,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+
+    # Denied: toolset in parent's disabled_toolsets -> fails fast before child builder
+    with pytest.raises(
+        SubagentLifecycleError, match="Requested toolsets would broaden parent permissions"
+    ):
         service.launch(
             SubagentLaunchRequest(
                 goal="do something",
                 allowed_toolsets=("terminal", "file"),
             )
         )
+    assert len(captured_builds) == 0, "Child builder must not be invoked when validation fails"
 
-    # Allowed when requested toolsets are disjoint from disabled_toolsets
-    # (will proceed past validation to child agent build)
-    with pytest.raises(Exception) as exc_info:
-        service.launch(
-            SubagentLaunchRequest(
-                goal="do something",
-                allowed_toolsets=("file",),
-            )
+    # Allowed: toolset disjoint from parent's disabled_toolsets -> reaches child builder
+    handle = service.launch(
+        SubagentLaunchRequest(
+            goal="do something safe",
+            allowed_toolsets=("file",),
         )
-    assert not isinstance(exc_info.value, SubagentLifecycleError) or "broaden" not in str(exc_info.value)
+    )
+    assert len(captured_builds) == 1
+    assert captured_builds[0]["toolsets"] == ["file"]
+    assert captured_builds[0]["parent_agent"] is parent
+    assert handle.subagent_id == "sa-sec-test"
+
