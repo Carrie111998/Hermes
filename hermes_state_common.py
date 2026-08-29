@@ -326,7 +326,75 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
+TURN_FENCE_GENERATION = 27
+
+TURN_FENCE_GOVERNED_TABLES = (
+    "messages",
+    "sessions",
+    "system_prompts",
+    "session_model_usage",
+    "session_turn_leases",
+    "compression_locks",
+    "gateway_routing",
+    "async_delegations",
+)
+TURN_FENCE_OPERATIONS = ("INSERT", "UPDATE", "DELETE")
+
+
+def register_turn_fence_generation(conn) -> None:
+    """Register the package generation scalar on one SQLite connection."""
+    conn.create_function(
+        "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION
+    )
+
+
+def turn_fence_trigger_name(table: str, operation: str) -> str:
+    return f"turn_fence_{table}_{operation.lower()}"
+
+
+def turn_fence_trigger_sql(table: str, operation: str) -> str:
+    """Build one governed-table generation trigger with a literal barrier."""
+    name = turn_fence_trigger_name(table, operation)
+    return (
+        f"CREATE TRIGGER {name} BEFORE {operation} ON {table} "
+        "BEGIN "
+        "SELECT CASE "
+        "WHEN typeof(hermes_turn_fence_generation()) != 'integer' "
+        f"OR hermes_turn_fence_generation() != {TURN_FENCE_GENERATION} "
+        "THEN RAISE(ABORT, 'state DB generation incompatible') "
+        "END; "
+        "END"
+    )
+
+
+def turn_fence_trigger_definitions() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            turn_fence_trigger_name(table, operation),
+            turn_fence_trigger_sql(table, operation),
+        )
+        for table in TURN_FENCE_GOVERNED_TABLES
+        for operation in TURN_FENCE_OPERATIONS
+    )
+
+
+#: Back-compat views over the declaration above, for the offline rollback tool
+#: (hermes_cli/session_fence_rollback*.py) and its tests: they read the fence
+#: surface as (table, operation) pairs / trigger names rather than the
+#: table-list x operation-list split above. Derived, not duplicated — moving
+#: TURN_FENCE_GOVERNED_TABLES or TURN_FENCE_OPERATIONS moves these with it.
+TURN_FENCE_SURFACE = tuple(
+    (table, operation)
+    for table in TURN_FENCE_GOVERNED_TABLES
+    for operation in TURN_FENCE_OPERATIONS
+)
+TURN_FENCE_TRIGGERS = tuple(name for name, _sql in turn_fence_trigger_definitions())
+
+#: The scalar function name each trigger body calls (see
+#: :func:`register_turn_fence_generation` / :func:`turn_fence_trigger_sql`),
+#: named so callers do not re-embed the literal.
+TURN_FENCE_FUNCTION_NAME = "hermes_turn_fence_generation"
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the

@@ -87,11 +87,13 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    TURN_FENCE_GENERATION,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    register_turn_fence_generation,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -175,6 +177,16 @@ class SessionExportTooLargeError(ValueError):
             f"session '{session_id}' has at least {message_count} active messages; "
             f"safe in-memory export limit is {limit}"
         )
+
+
+class IncompatibleSchemaError(RuntimeError):
+    """The on-disk session state cannot be safely opened by this version."""
+
+    __slots__ = ("code",)
+
+    def __init__(self):
+        super().__init__("Session state is incompatible with this Hermes version.")
+        self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
 
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -1815,6 +1827,96 @@ def is_malformed_schema_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
 
 
+def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
+    """Validate the one canonical, SQLite-typed schema-version scalar."""
+    rows = conn.execute(
+        "SELECT version, typeof(version) FROM schema_version"
+    ).fetchall()
+    if len(rows) != 1:
+        raise IncompatibleSchemaError()
+    version, value_type = rows[0]
+    if (
+        value_type != "integer"
+        or type(version) is not int
+        or version < 0
+        or version > (2**63 - 1)
+        or version > SCHEMA_VERSION
+    ):
+        raise IncompatibleSchemaError()
+    return version
+
+
+def _validate_connection_schema(
+    conn: sqlite3.Connection, *, allow_uninitialized_schema: bool = False
+) -> Optional[int]:
+    """SELECT-only compatibility check for a package-owned connection."""
+    try:
+        has_schema_version = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone() is not None
+        if not has_schema_version:
+            if not allow_uninitialized_schema:
+                raise IncompatibleSchemaError()
+            version = None
+        else:
+            version = _validate_schema_version_scalar(conn)
+        generation, generation_type = conn.execute(
+            "SELECT hermes_turn_fence_generation(), "
+            "typeof(hermes_turn_fence_generation())"
+        ).fetchone()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError:
+        raise IncompatibleSchemaError() from None
+    if (
+        generation_type != "integer"
+        or type(generation) is not int
+        or generation != TURN_FENCE_GENERATION
+    ):
+        raise IncompatibleSchemaError()
+    return version
+
+
+def _probe_existing_state_db_schema(
+    db_path: Path, *, allow_malformed_repair: bool
+) -> int:
+    """Read and validate an existing DB before any package write path opens it."""
+    def probe() -> int:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            return _validate_schema_version_scalar(conn)
+        finally:
+            conn.close()
+
+    try:
+        return probe()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        if not (
+            allow_malformed_repair
+            and is_malformed_schema_error(exc)
+        ):
+            raise IncompatibleSchemaError() from None
+        if not _claim_repair_attempt(db_path):
+            raise
+        report = repair_state_db_schema(db_path)
+        if not report.get("repaired"):
+            raise
+
+    try:
+        return probe()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError:
+        raise IncompatibleSchemaError() from None
+
+
 # Markers that mean the host filesystem cannot accept another write. Kept as
 # plain substrings so OSError, sqlite3.OperationalError, and wrapped RPC
 # error strings all match the same helper.
@@ -2854,6 +2956,7 @@ def _connect_repair_durable(
     schema parses again, which is the point at which the pragmas can stick.
     """
     conn = sqlite3.connect(str(db_path), timeout=timeout, isolation_level=None)
+    register_turn_fence_generation(conn)
     _reapply_durability_barriers(conn)
     return conn
 
@@ -3890,6 +3993,169 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class _SerializedCursor(sqlite3.Cursor):
+    """Cursor whose every SQLite entry runs under the connection's RLock.
+
+    See :class:`_SerializedConnectionMixin` for why this exists. Fetches are
+    wrapped too, not just execute: ``fetchone``/``fetchall`` step the VM and
+    build row objects while HOLDING the GIL, which takes the connection mutex
+    — exactly the GIL-held-mutex-wait leg of the deadlock.
+    """
+
+    def _serial(self):
+        return self.connection._hermes_serial_lock
+
+    def execute(self, *args, **kwargs):
+        with self._serial():
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._serial():
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._serial():
+            return super().executescript(*args, **kwargs)
+
+    def fetchone(self):
+        with self._serial():
+            return super().fetchone()
+
+    def fetchmany(self, *args, **kwargs):
+        with self._serial():
+            return super().fetchmany(*args, **kwargs)
+
+    def fetchall(self):
+        with self._serial():
+            return super().fetchall()
+
+    def __next__(self):
+        with self._serial():
+            return super().__next__()
+
+    def close(self):
+        with self._serial():
+            return super().close()
+
+
+class _SerializedConnectionMixin:
+    """Serialize every SQLite entry on one connection behind an RLock.
+
+    2026-08-25: the gateway froze solid for 80+ minutes in a textbook ABBA
+    deadlock (thread sample in the incident record). The two legs:
+
+    - thread A inside ``sqlite3_step`` (connection mutex HELD, GIL released)
+      hit a turn-fence trigger, whose ``hermes_turn_fence_generation()`` UDF
+      re-enters Python and must WAIT for the GIL;
+    - thread B HOLDING the GIL called into the same shared connection
+      (``check_same_thread=False``) — cursor-description/bind/fetch paths keep
+      the GIL while taking the connection mutex — and blocked on the mutex A
+      holds.
+
+    Neither can proceed; the whole process (event loop included) stops. The
+    same unsynchronized sharing also segfaults outright under load (repro in
+    the incident record exits SIGSEGV without this lock).
+
+    The fix: at most one thread inside SQLite per connection, enforced here at
+    the connection-factory choke point rather than at call sites — 70+ call
+    sites touch ``self._conn`` and at least one (``clear_session_activity_
+    labels``) provably bypassed the writer lock. Waiting on THIS RLock releases
+    the GIL, so the UDF thread can always finish its callback and release the
+    connection mutex: the cycle cannot form, per-connection locks are
+    sufficient, and the turn-fence semantics stay exactly as shipped.
+
+    ``interrupt()`` is deliberately NOT wrapped: it exists to cancel another
+    thread's in-flight statement, so serializing it behind the very statement
+    it should cancel would defeat it (sqlite3_interrupt is safe without the
+    mutex by design).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._hermes_serial_lock = threading.RLock()
+        super().__init__(*args, **kwargs)
+
+    def cursor(self, factory=None):
+        with self._hermes_serial_lock:
+            return super().cursor(factory or _SerializedCursor)
+
+    # execute/executemany/executescript are implemented HERE in Python, routed
+    # through self.cursor(), instead of delegating to the C shortcuts: on
+    # Python 3.11 the C implementations build a PLAIN Cursor directly (they do
+    # not call the overridden cursor()), so ``conn.execute(...).fetchall()``
+    # would fetch on an unserialized cursor — the exact GIL-held mutex wait
+    # this mixin exists to prevent. Verified empirically: 3.9 routes through
+    # cursor(), 3.11 does not.
+
+    def execute(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().executescript(*args, **kwargs)
+
+    def commit(self):
+        with self._hermes_serial_lock:
+            return super().commit()
+
+    def rollback(self):
+        with self._hermes_serial_lock:
+            return super().rollback()
+
+    def close(self):
+        with self._hermes_serial_lock:
+            return super().close()
+
+    def __exit__(self, *exc_info):
+        # ``with conn:`` commits/rolls back on exit — an SQLite entry.
+        with self._hermes_serial_lock:
+            return super().__exit__(*exc_info)
+
+    def create_function(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_function(*args, **kwargs)
+
+    def create_collation(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_collation(*args, **kwargs)
+
+    def create_aggregate(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_aggregate(*args, **kwargs)
+
+    def backup(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().backup(*args, **kwargs)
+
+
+class _SerializedConnection(_SerializedConnectionMixin, sqlite3.Connection):
+    pass
+
+
+_serialized_factory_cache: dict = {}
+
+
+def _serialized_connection_factory(factory: type) -> type:
+    """Mix serialization into *factory* (mirrors ``_tracking_factory``)."""
+    if factory is sqlite3.Connection:
+        return _SerializedConnection
+    if issubclass(factory, _SerializedConnectionMixin):
+        return factory
+    cached = _serialized_factory_cache.get(factory)
+    if cached is None:
+        cached = type(
+            f"Serialized{factory.__name__}",
+            (_SerializedConnectionMixin, factory),
+            {},
+        )
+        _serialized_factory_cache[factory] = cached
+    return cached
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -3904,6 +4170,13 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     connect would disable the guard for the lifetime of that connection,
     which is precisely the failure mode this module exists to prevent.
     """
+    # Serialize every connection this package opens (see
+    # _SerializedConnectionMixin): the turn-fence UDF re-enters Python from
+    # inside sqlite3_step, and an unsynchronized shared connection turns that
+    # into a GIL/connection-mutex ABBA deadlock or a segfault.
+    kwargs["factory"] = _serialized_connection_factory(
+        kwargs.get("factory", sqlite3.Connection)
+    )
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:
@@ -4513,6 +4786,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
+        path_existed_before_connect = self.db_path.exists()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
@@ -4613,6 +4887,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                if path_existed_before_connect:
+                    _probe_existing_state_db_schema(
+                        self.db_path, allow_malformed_repair=False
+                    )
                 self._conn = _connect_tracked_db(
                     f"file:{self.db_path}?mode=ro",
                     tracking_path=self.db_path,
@@ -4622,6 +4900,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                register_turn_fence_generation(self._conn)
+                _validate_connection_schema(self._conn)
                 # FTS capability flags normally come from writable schema
                 # initialisation. Probe existing virtual tables with SELECTs
                 # only so read-only search keeps its FTS and trigram paths.
@@ -4693,6 +4973,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # opaquely or risk further damage). Raise with the clear message.
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
+                if qpath is not None:
+                    path_existed_before_connect = False
+
+            if path_existed_before_connect:
+                _probe_existing_state_db_schema(
+                    self.db_path, allow_malformed_repair=True
+                )
 
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
@@ -4708,6 +4995,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                register_turn_fence_generation(self._conn)
+                _validate_connection_schema(
+                    self._conn,
+                    allow_uninitialized_schema=not path_existed_before_connect,
+                )
                 self._wal_active = (
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
                 )
@@ -4754,31 +5046,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                         )
 
-            try:
-                _connect_and_init_with_lock_patience()
-            except sqlite3.DatabaseError as exc:
-                # The malformed-schema class (e.g. a duplicate sqlite_master
-                # row for messages_fts) fails on the very first statement —
-                # before _init_schema can run — so it can't be caught at the
-                # FTS-rebuild layer. Recover by repairing sqlite_master in
-                # place (backup first; canonical sessions/messages preserved),
-                # then reopen once. This is what lets Desktop/Dashboard
-                # self-heal instead of silently showing "no sessions".
-                if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
-                    raise
-                logger.error(
-                    "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
-                )
-                try:
-                    if self._conn is not None:
-                        self._conn.close()
-                except Exception:
-                    pass
-                report = repair_state_db_schema(self.db_path)
-                if not report.get("repaired"):
-                    raise
-                _connect_and_init_with_lock_patience()
+            _connect_and_init_with_lock_patience()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -4788,6 +5056,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
             initialization_complete = True
+        except IncompatibleSchemaError:
+            _set_last_init_error(
+                "STATE_DB_SCHEMA_INCOMPATIBLE: "
+                "Session state is incompatible with this Hermes version."
+            )
+            raise
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -4807,6 +5081,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+
+    def ensure_compatible_schema(self) -> None:
+        """Recheck this open connection without repairing or mutating state."""
+        if self._conn is None:
+            raise IncompatibleSchemaError()
+        _validate_connection_schema(self._conn)
 
     # ── Read-path split ──
 
@@ -6112,6 +6392,200 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def create_session_strict(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        session_key: Optional[str] = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        git_repo_root: str = None,
+        origin_json: str = None,
+        display_name: str = None,
+    ) -> bool:
+        """Create a session row iff ``session_id`` is not already taken.
+
+        Same column set as :meth:`create_session`, but a PK collision is
+        refused rather than an opportunity to enrich the existing row — NOT
+        A SINGLE COLUMN on a pre-existing row (foreign or otherwise) is ever
+        written, not even a NULL-only backfill. :meth:`create_session`'s
+        ``ON CONFLICT ... DO UPDATE`` fills NULL routing/origin columns
+        (``session_key``/``chat_id``/``chat_type``/...) on ANY row already
+        occupying the id — including one this caller has no relationship to
+        — before any provenance check downstream ever runs. Callers whose
+        id is only *probabilistically* unique (gateway ``/branch``'s
+        timestamp+random id) must use this instead, so a collision is
+        refused untouched rather than silently repointed.
+
+        Returns ``True`` when the row is freshly created, ``False`` when
+        ``session_id`` is already taken. Everything else raises.
+
+        The precondition rule: whether the id is taken is decided by a
+        ``SELECT`` that runs BEFORE any write this method makes — before
+        ``_store_system_prompt`` and before the ``INSERT`` — inside the same
+        ``BEGIN IMMEDIATE`` transaction ``_execute_write`` holds under
+        ``self._lock``. That exclusive write lock is held for the entire
+        call, so no other writer can claim the id between the SELECT and
+        the INSERT. So ``False`` means nothing of ours was written, and any
+        ``sqlite3.IntegrityError`` the INSERT itself raises afterward — a
+        foreign-key violation, a turn-fence trigger's ``RAISE(ABORT)``, a
+        UNIQUE violation on some other column — is a genuine failure, not a
+        collision on this id, and propagates untouched.
+        """
+        def _do(conn):
+            # Must be the first statement in _do, before every other write
+            # (including _store_system_prompt): see precondition rule above.
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is not None:
+                return False
+            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   model, model_config, system_prompt, system_prompt_hash,
+                   parent_session_id, cwd, profile_name, git_repo_root,
+                   origin_json, display_name, started_at
+                )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    source,
+                    user_id,
+                    session_key,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    system_prompt_hash,
+                    parent_session_id,
+                    cwd,
+                    profile_name,
+                    git_repo_root,
+                    origin_json,
+                    display_name,
+                    time.time(),
+                ),
+            )
+            if system_prompt_hash is not None:
+                self._delete_unreferenced_system_prompts(conn)
+            if parent_session_id:
+                # Backfill from the parent — same shape as
+                # _insert_session_row, but this UPDATE only ever touches the
+                # row we just INSERTed (WHERE id = ? on our own fresh id), so
+                # it can never reach across into an existing/foreign row.
+                conn.execute(
+                    """UPDATE sessions
+                       SET cwd = COALESCE(sessions.cwd,
+                                 (SELECT p.cwd FROM sessions p
+                                   WHERE p.id = sessions.parent_session_id)),
+                           git_repo_root = COALESCE(sessions.git_repo_root,
+                                           (SELECT p.git_repo_root FROM sessions p
+                                             WHERE p.id = sessions.parent_session_id)),
+                           git_branch = COALESCE(sessions.git_branch,
+                                        (SELECT p.git_branch FROM sessions p
+                                          WHERE p.id = sessions.parent_session_id)),
+                           profile_name = COALESCE(sessions.profile_name,
+                                          (SELECT p.profile_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL""",
+                    (session_id,),
+                )
+                conn.execute(
+                    """UPDATE sessions
+                       SET user_id = COALESCE(sessions.user_id,
+                                     (SELECT p.user_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           session_key = COALESCE(sessions.session_key,
+                                         (SELECT p.session_key FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id)),
+                           chat_id = COALESCE(sessions.chat_id,
+                                     (SELECT p.chat_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           chat_type = COALESCE(sessions.chat_type,
+                                       (SELECT p.chat_type FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           thread_id = COALESCE(sessions.thread_id,
+                                       (SELECT p.thread_id FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           display_name = COALESCE(sessions.display_name,
+                                          (SELECT p.display_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id)),
+                           origin_json = COALESCE(sessions.origin_json,
+                                         (SELECT p.origin_json FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM sessions p
+                           WHERE p.id = sessions.parent_session_id
+                             AND p.end_reason = 'compression'
+                       )""",
+                    (session_id,),
+                )
+            return True
+
+        return bool(
+            self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        )
+
+    def create_imported_session(
+        self,
+        session_id: str,
+        source: str,
+        messages: List[Dict[str, Any]],
+        *,
+        cwd: str = None,
+        origin_json: str = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> str:
+        """Create a new imported session and its transcript atomically.
+
+        Foreign imports must not expose a prefix transcript: the session row,
+        every parsed message, and their counters either commit together or are
+        all rolled back.  Unlike :meth:`create_session`, an occupied id is an
+        error rather than an opportunity to enrich an existing session.
+        """
+        def _do(conn):
+            # Imports acquire against an absent id before creating its session
+            # row, so the admission check has to precede the strict insert.
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            conn.execute(
+                """INSERT INTO sessions (id, source, cwd, origin_json, started_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, cwd, origin_json, time.time()),
+            )
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, messages
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = ?, tool_call_count = ?
+                   WHERE id = ?""",
+                (inserted, tool_calls_total, session_id),
+            )
+            return session_id
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
     def record_gateway_session_peer(
         self,
         session_id: str,
@@ -7050,9 +7524,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
-        The parent closure, child row, and compacted handoff become visible in
-        one transaction. Readers can therefore observe either the live parent or
-        a complete child, never an ended parent with a missing/empty child.
+        The parent closure, child row, compacted handoff, and any carried title
+        with its provenance become visible in one transaction. Readers can
+        therefore observe either the live parent or a complete child, never an
+        ended parent with a missing/empty child or split title identity.
 
         Concurrent-append safety (#75316): when *watermark* is provided (the
         parent's :meth:`get_active_message_watermark` captured at compression
@@ -7085,7 +7560,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, title, title_source, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -7179,6 +7654,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            if parent["title"] is not None:
+                cleared = conn.execute(
+                    "UPDATE sessions SET title = NULL, title_source = NULL "
+                    "WHERE id = ? AND title IS ? AND title_source IS ?",
+                    (
+                        parent_session_id,
+                        parent["title"],
+                        parent["title_source"],
+                    ),
+                )
+                if cleared.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression parent title changed during publication: "
+                        f"{parent_session_id}"
+                    )
+                assigned = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ? "
+                    "WHERE id = ? AND title IS NULL AND title_source IS NULL",
+                    (
+                        parent["title"],
+                        parent["title_source"],
+                        child_session_id,
+                    ),
+                )
+                if assigned.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression child title changed during publication: "
+                        f"{child_session_id}"
+                    )
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -7984,16 +8488,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (conversation_id, current_holder),
                     )
             conn.execute(
-                "INSERT OR IGNORE INTO session_turn_leases "
+                "INSERT INTO session_turn_leases "
                 "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO NOTHING",
                 (conversation_id, holder, now, expires_at),
             )
             owner = conn.execute(
                 "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
-            return owner is not None and owner["holder"] == holder
+            if owner is None:
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_ACQUIRE_INSERT_MISSING"
+                )
+            return owner["holder"] == holder
 
         return bool(self._execute_write(_do, patience_s=patience_s))
 
@@ -9827,6 +10336,143 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
             raise ValueError(f"invalid automatic title source: {source!r}")
         return self._set_session_title(session_id, title, source=source)
+
+    def set_auto_title_for_attempt(
+        self,
+        originating_session_id: str,
+        title: str,
+        *,
+        source: str,
+        expected_title: Optional[str],
+        expected_source: Optional[str],
+    ) -> bool:
+        """Conditionally persist a background title on its live attempt target.
+
+        An automatic title worker can outlive compression of the segment that
+        started it.  Resolve that segment's live compression continuation and
+        require the derived title captured by the originating attempt in the
+        SAME transaction as the LLM upgrade.  This leaves a worker that races a
+        manual title, another LLM result, or a non-compression close with no
+        target it may safely mutate.
+        """
+        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        if expected_title is None:
+            if expected_source is not None:
+                return False
+        elif expected_source != self.TITLE_SOURCE_DERIVED:
+            return False
+
+        def _resolve_live_target(conn) -> Optional[str]:
+            current = originating_session_id
+            seen = {current} if current else set()
+            for _ in range(100):
+                row = conn.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["ended_at"] is None:
+                    return current
+                if row["end_reason"] != "compression":
+                    return None
+                children = conn.execute(
+                    """
+                    SELECT child.id
+                    FROM sessions AS parent
+                    JOIN sessions AS child ON child.parent_session_id = parent.id
+                    WHERE parent.id = ?
+                      AND parent.end_reason = 'compression'
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._branched_from'), '') != ?
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._delegate_from'), '') != ?
+                      AND COALESCE(child.source, '') != 'tool'
+                    ORDER BY child.started_at ASC, child.id ASC
+                    LIMIT 2
+                    """,
+                    (current, current, current),
+                ).fetchall()
+                if len(children) != 1:
+                    return None
+                child_id = children[0]["id"]
+                if not child_id or child_id in seen:
+                    return None
+                seen.add(child_id)
+                current = child_id
+            return None
+
+        def _do(conn):
+            target_id = _resolve_live_target(conn)
+            if target_id is None:
+                return 0
+            current = conn.execute(
+                "SELECT title, title_source, ended_at FROM sessions WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+            if current is None or current["ended_at"] is not None:
+                return 0
+            if expected_title is None:
+                # A collision-declined instant title can still title an active
+                # origin later, but it has no derived identity to carry across
+                # a compression boundary.
+                if (
+                    target_id != originating_session_id
+                    or current["title"] is not None
+                    or current["title_source"] is not None
+                ):
+                    return 0
+            elif (
+                current["title"] != expected_title
+                or current["title_source"] != expected_source
+            ):
+                return 0
+
+            if (
+                current["title"] is not None
+                and self._title_rank(current["title_source"])
+                >= self._title_rank(source)
+            ):
+                return 0
+
+            conflict = conn.execute(
+                "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                (title, target_id),
+            ).fetchone()
+            if conflict:
+                conflict_id = conflict["id"]
+                if self._is_compression_ancestor(
+                    conn, ancestor_id=conflict_id, descendant_id=target_id
+                ):
+                    conn.execute(
+                        "UPDATE sessions SET title = NULL, title_source = NULL "
+                        "WHERE id = ?",
+                        (conflict_id,),
+                    )
+                else:
+                    raise ValueError(
+                        f"Title '{title}' is already in use by session {conflict_id}"
+                    )
+
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND ended_at IS NULL AND title IS ? "
+                "AND title_source IS ?",
+                (
+                    title,
+                    source,
+                    target_id,
+                    current["title"],
+                    current["title_source"],
+                ),
+            )
+            return cursor.rowcount
+
+        return bool(self._execute_write(_do))
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
         """Back-compat shim: set an LLM title only if nothing better exists.

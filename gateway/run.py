@@ -2754,6 +2754,7 @@ from gateway.turn_lease import (
     DEFAULT_LEASE_WAIT,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
+    TurnLeaseToken,
 )
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
@@ -18957,6 +18958,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        event._gateway_turn_lease_token = None
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
@@ -18989,32 +18991,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
-            # Normal completion/exception/interrupt owns and clears this exact
-            # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
-            # the next unclean startup's recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
-            # Turn lease (#64934): release THIS turn's lease token — keyed by
-            # (routing key, run generation) so this unwind can only ever free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # MoA one-shot restore must run on EVERY exit path, not just
+                # success. The restore data lives on the per-turn event object
+                # (_moa_restore_override), which is discarded once the event goes
+                # out of scope — so if _handle_message_with_agent raises, a restore
+                # in the try block would be skipped and the MoA override would leak
+                # permanently (every later message silently fans out through MoA).
+                # Putting it in finally guarantees the revert on success, exception,
+                # and interrupt alike.
+                self._restore_moa_one_shot(event, _quick_key)
+                self._restore_pending_one_turn_model_override(_quick_key)
+                try:
+                    # Normal completion/exception/interrupt owns and clears this exact
+                    # durable marker. SIGKILL/OOM skips finally, leaving the marker for
+                    # the next unclean startup's recovery pass.
+                    await self._clear_durable_active_turn(event)
+                finally:
+                    # _release_running_agent_state is synchronous and idempotent.
+                    self._release_running_agent_state(_quick_key)
+            finally:
+                # This synchronous, event-owned release has no await boundary, so a
+                # repeated cancellation during durable cleanup cannot skip it.
+                self._release_turn_lease(
+                    _quick_key,
+                    _run_generation,
+                    token=getattr(event, "_gateway_turn_lease_token", None),
+                )
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -19763,6 +19766,163 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _is_canonical_outward_callback_attribute(name: str) -> bool:
+        """Return whether a cached agent attribute can emit beyond this request."""
+        return (
+            name == "callback"
+            or name.endswith("_callback")
+            or name == "_on_session_title"
+        )
+
+    @staticmethod
+    def _select_canonical_turn_result(
+        result: Any,
+        *,
+        binding_name: str,
+        history_boundary: int,
+        expected_session_id: str,
+    ) -> Any:
+        """Select exactly one physical current-turn assistant terminal."""
+        from gateway.canonical_surface import CanonicalTurnResult
+
+        if (
+            not isinstance(result, dict)
+            or result.get("completed") is not True
+            or result.get("session_id", expected_session_id) != expected_session_id
+            or not isinstance(result.get("final_response"), str)
+            or not result["final_response"].strip()
+            or not isinstance(result.get("messages"), list)
+            or isinstance(history_boundary, bool)
+            or not isinstance(history_boundary, int)
+        ):
+            raise ValueError("canonical_turn_refused")
+        messages = result["messages"]
+        if history_boundary < 0 or history_boundary >= len(messages):
+            raise ValueError("canonical_turn_refused")
+        suffix = messages[history_boundary:]
+        if len(suffix) < 2:
+            raise ValueError("canonical_turn_refused")
+        user = suffix[0]
+        if (
+            not isinstance(user, dict)
+            or user.get("role") != "user"
+            or not isinstance(user.get("content"), str)
+            or not user["content"].strip()
+        ):
+            raise ValueError("canonical_turn_refused")
+
+        expect_tool = False
+        expected_tool_call_id: Optional[str] = None
+        terminal: Optional[str] = None
+        for index, row in enumerate(suffix[1:], start=1):
+            if not isinstance(row, dict) or not isinstance(row.get("role"), str):
+                raise ValueError("canonical_turn_refused")
+            role = row["role"]
+            if expect_tool:
+                if (
+                    role != "tool"
+                    or row.get("tool_call_id") != expected_tool_call_id
+                    or not isinstance(row.get("content"), str)
+                    or not row["content"].strip()
+                ):
+                    raise ValueError("canonical_turn_refused")
+                expect_tool = False
+                expected_tool_call_id = None
+                continue
+
+            if role != "assistant":
+                raise ValueError("canonical_turn_refused")
+            if "tool_calls" in row:
+                tool_calls = row["tool_calls"]
+                if (
+                    not isinstance(tool_calls, list)
+                    or len(tool_calls) != 1
+                    or not isinstance(tool_calls[0], dict)
+                    or not isinstance(tool_calls[0].get("id"), str)
+                    or not tool_calls[0]["id"].strip()
+                ):
+                    raise ValueError("canonical_turn_refused")
+                expected_tool_call_id = tool_calls[0]["id"]
+                expect_tool = True
+                continue
+
+            content = row.get("content")
+            if (
+                not isinstance(content, str)
+                or not content.strip()
+                or content != result["final_response"]
+                or index != len(suffix) - 1
+            ):
+                raise ValueError("canonical_turn_refused")
+            terminal = content
+
+        if expect_tool or terminal is None:
+            raise ValueError("canonical_turn_refused")
+        return CanonicalTurnResult(binding_name=binding_name, terminal_text=terminal)
+
+    async def run_bound_existing_turn(
+        self, binding: Any, event: Any, entry: Any, *, reply_sink: Any = None
+    ) -> Any:
+        """Run only an exact pre-existing cached session for canonical ingress."""
+        from gateway.canonical_surface import require_request_local_reply_sink
+
+        require_request_local_reply_sink(reply_sink)
+        if entry.session_key != binding.session_key or entry.session_id != binding.session_id:
+            raise ValueError("canonical_binding_stale")
+        with self._agent_cache_lock:
+            cached = self._agent_cache.get(entry.session_key)
+            if not cached:
+                raise ValueError("canonical_agent_missing")
+            agent = cached[0] if isinstance(cached, tuple) else cached
+            cached_session_id = cached[3] if isinstance(cached, tuple) and len(cached) > 3 else getattr(agent, "session_id", None)
+            if cached_session_id != entry.session_id or getattr(agent, "session_id", None) != entry.session_id:
+                raise ValueError("canonical_agent_missing")
+
+        generation = self._begin_session_run_generation(entry.session_key)
+        try:
+            lease = await self._turn_leases.acquire(
+                entry.session_id,
+                owner_key=f"canonical:{id(event)}",
+                generation=generation,
+            )
+        except Exception:
+            raise ValueError("canonical_turn_busy") from None
+        try:
+            if not bool(getattr(agent, "compression_in_place", True)):
+                raise ValueError("canonical_turn_refused")
+            outward_callbacks = {
+                name: value
+                for name, value in vars(agent).items()
+                if self._is_canonical_outward_callback_attribute(name)
+            }
+            for name in outward_callbacks:
+                setattr(agent, name, None)
+            try:
+                history = await self.async_session_store.load_transcript(entry.session_id)
+                agent_history, _ = _build_gateway_agent_history(history)
+                self._init_cached_agent_for_turn(agent, 0)
+                result = await asyncio.to_thread(
+                    agent.run_conversation,
+                    event.text,
+                    conversation_history=agent_history,
+                    task_id=entry.session_id,
+                )
+                boundary = getattr(agent, "_persist_user_message_idx", None)
+                if isinstance(boundary, bool) or not isinstance(boundary, int):
+                    raise ValueError("canonical_turn_refused")
+                return self._select_canonical_turn_result(
+                    result,
+                    binding_name=binding.name,
+                    history_boundary=boundary,
+                    expected_session_id=entry.session_id,
+                )
+            finally:
+                for name, value in outward_callbacks.items():
+                    setattr(agent, name, value)
+        finally:
+            self._turn_leases.release(lease)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -20137,6 +20297,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._clear_session_env(_session_env_tokens)
                 raise
             if _lease_token is not None:
+                # The event is the per-turn authority. Capture its exact token
+                # before publishing the mutable shared compatibility slot.
+                event._gateway_turn_lease_token = _lease_token
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
@@ -20629,15 +20792,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _idle < _hyg_timeout_seconds
                                                     and _hyg_waited < _hyg_total_ceiling_seconds
                                                 ):
-                                                    logger.info(
-                                                        "Session hygiene compression for "
-                                                        "session %s still streaming after "
-                                                        "%.0fs (last progress %.1fs ago) — "
-                                                        "extending wait (ceiling %.0fs)",
-                                                        session_entry.session_id,
-                                                        _hyg_waited, _idle,
-                                                        _hyg_total_ceiling_seconds,
-                                                    )
                                                     continue
                                                 raise
                                     except HygieneTurnHoldExceeded:
@@ -20925,7 +21079,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # the fresh child still serializes
                                             # against this turn (#64934).
                                             self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
+                                                _quick_key,
+                                                run_generation,
+                                                _hyg_new_sid,
+                                                token=getattr(
+                                                    event,
+                                                    "_gateway_turn_lease_token",
+                                                    None,
+                                                ),
                                             )
                                             await self.async_session_store._save()
                                             await asyncio.to_thread(
@@ -21443,7 +21604,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # serialization boundary must move with it or an alias
                     # key resolving the fresh child could interleave (#64934).
                     self._rebind_turn_lease(
-                        _quick_key, run_generation, session_entry.session_id
+                        _quick_key,
+                        run_generation,
+                        session_entry.session_id,
+                        token=getattr(event, "_gateway_turn_lease_token", None),
                     )
                     await self.async_session_store._save()
                     await self.async_session_store._record_gateway_session_peer(
@@ -27583,60 +27747,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         return True
 
-    def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
+    def _release_turn_lease(
+        self,
+        session_key: str,
+        run_generation: int,
+        *,
+        token: Optional[TurnLeaseToken] = None,
+    ) -> bool:
         """Release the turn lease acquired by (``session_key``, ``run_generation``).
 
         Companion to the acquisition in ``_handle_message_with_agent``
-        (#64934). The token map is keyed by (routing key, run generation), so
-        this can only ever free the lease its own turn acquired — a stale
-        unwind whose generation was bumped by /stop or /new pops ITS token,
-        and the registry's identity check refuses it if a newer turn already
-        holds the lease. Idempotent and safe for bare test runners built via
+        (#64934). ``state.turn.lease_token``/``lease_generation`` is a SINGLE
+        shared slot per routing key — a second concurrent turn on the same
+        key (a stale unwind, or a fresh turn after /new landing on the same
+        key before the first turn unwound) overwrites it unconditionally.
+        When that happens the first turn's own token is gone from the slot,
+        and looking it up there would either release the WRONG (newer)
+        lease or, with the old generation guard, silently orphan the first
+        turn's own lease forever (no TTL ever reclaims it).
+
+        ``token``, when given, is this call's own lease token — stashed on
+        the per-turn event at acquire time, so it is never shared and can
+        never be clobbered by another turn. It is released directly via
+        ``registry.release()``, which is itself identity-checked (only frees
+        the lease if this token is still its current holder). The shared
+        slot is cleared too, but ONLY if it still points at this same token —
+        never a newer turn's.
+
+        With no ``token``, falls back to the previous generation-checked
+        shared-slot lookup unchanged, for any caller that has no event to
+        stash a token on.
+
+        Idempotent and safe for bare test runners built via
         ``object.__new__`` (getattr defaults).
         """
         if not session_key:
             return False
         registry = getattr(self, "_turn_leases", None)
+        if registry is None:
+            return False
+        if token is not None:
+            if token.owner_key != session_key or token.generation != run_generation:
+                return False
+            state = self._peek_session_state(session_key)
+            try:
+                released = registry.release(token)
+            except Exception:
+                logger.debug("Failed to release turn lease", exc_info=True)
+                return False
+            if not released:
+                return False
+            if state is not None:
+                turn = state.turn
+                if turn.lease_token is token:
+                    turn.lease_token = None
+                    turn.lease_generation = None
+            return True
+
         state = self._peek_session_state(session_key)
-        if state is None or registry is None:
+        if state is not None:
+            turn = state.turn
+            if turn.lease_token is None or turn.lease_generation != run_generation:
+                return False
+            resolved_token = turn.lease_token
+            try:
+                released = registry.release(resolved_token)
+            except Exception:
+                logger.debug("Failed to release turn lease", exc_info=True)
+                return False
+            if not released:
+                return False
+            if turn.lease_token is resolved_token:
+                turn.lease_token = None
+                turn.lease_generation = None
+            return True
+
+        legacy_tokens = getattr(self, "_turn_lease_tokens", None)
+        if not isinstance(legacy_tokens, dict):
             return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
+        legacy_key = (session_key, run_generation)
+        resolved_token = legacy_tokens.get(legacy_key)
+        if resolved_token is None:
             return False
-        token = turn.lease_token
-        turn.lease_token = None
-        turn.lease_generation = None
         try:
-            return registry.release(token)
+            released = registry.release(resolved_token)
         except Exception:
             logger.debug("Failed to release turn lease", exc_info=True)
             return False
+        if not released:
+            return False
+        if legacy_tokens.get(legacy_key) is resolved_token:
+            legacy_tokens.pop(legacy_key, None)
+        return True
 
     def _rebind_turn_lease(
-        self, session_key: str, run_generation: int, new_session_id: str
+        self,
+        session_key: str,
+        run_generation: int,
+        new_session_id: str,
+        *,
+        token: Optional[TurnLeaseToken],
     ) -> bool:
-        """Follow a mid-turn session_id rotation with the held turn lease.
-
-        Compression (session-hygiene pre-compression or the agent's own
-        compressor) can rotate ``session_entry.session_id`` while this turn
-        is in flight. The turn's flush targets the NEW id, so the
-        serialization boundary must follow it — otherwise an alias routing
-        key resolving the new id (topic tip-walk onto the fresh child) could
-        start a concurrent turn the lease never sees (#64934 rotation-alias
-        window). Call at every site that reassigns session_entry.session_id
-        mid-turn. Fail-open no-op when there is no held token.
-        """
-        if not session_key or not new_session_id:
+        """Follow a mid-turn session_id rotation with this event's held lease."""
+        if (
+            not session_key
+            or not new_session_id
+            or token is None
+            or token.released
+            or token.owner_key != session_key
+            or token.generation != run_generation
+        ):
             return False
         registry = getattr(self, "_turn_leases", None)
-        state = self._peek_session_state(session_key)
-        if state is None or registry is None:
-            return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
+        if registry is None:
             return False
         try:
-            return registry.rebind(turn.lease_token, new_session_id)
+            return registry.rebind(token, new_session_id)
         except Exception:
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False

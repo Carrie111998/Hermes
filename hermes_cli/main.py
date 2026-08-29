@@ -1840,6 +1840,52 @@ def _create_titled_session(title: str) -> Optional[str]:
                 pass
 
 
+def _gateway_routed_session_owner(session_id: str):
+    """Return the live gateway pid serving *session_id*, else ``None``."""
+    try:
+        import json as _json
+        import re as _re
+        import sqlite3 as _sq
+        import subprocess as _sp
+
+        out = _sp.run(
+            ["launchctl", "list", "ai.hermes.gateway"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = _re.search(r'"PID"\s*=\s*(\d+)', out)
+        if not m:
+            return None
+        pid = int(m.group(1))
+        os.kill(pid, 0)
+
+        db = get_hermes_home() / "state.db"
+        if not db.exists():
+            return None
+        conn = _sq.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            rows = conn.execute("SELECT entry_json FROM gateway_routing").fetchall()
+        finally:
+            conn.close()
+        for (entry,) in rows:
+            try:
+                if _json.loads(entry).get("session_id") == session_id:
+                    return pid
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _refuse_gateway_routed_session_attach(session_id: str) -> None:
+    if _gateway_routed_session_owner(session_id) is not None:
+        print(
+            "Refusing to attach to a session currently served by the gateway.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+
 def _resolve_continue_arg(args, *, use_tui: bool) -> None:
     """Resolve ``-c/--continue`` into ``args.resume``.
 
@@ -3173,6 +3219,10 @@ def cmd_chat(args):
 
     # Resolve --continue into --resume with the latest session or by name
     _resolve_continue_arg(args, use_tui=use_tui)
+
+    _resume_target = getattr(args, "resume", None)
+    if _resume_target:
+        _refuse_gateway_routed_session_attach(_resume_target)
 
     # --resume @claude / --resume @codex: import a foreign session (Claude
     # Code / Codex CLI) and resume the newly created Hermes session.
@@ -14448,6 +14498,14 @@ def main():
         type=Path,
         help="JSON report path (defaults to <output>.recovery.json)",
     )
+
+    # The one operator path back off the turn-fence generation barrier. Its
+    # arguments live with the command rather than here so that "the target is
+    # required and never defaulted" is a property of a function a test can
+    # build a parser around.
+    from hermes_cli.session_fence_rollback_cmd import add_fence_rollback_parser
+
+    add_fence_rollback_parser(sessions_subparsers)
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
