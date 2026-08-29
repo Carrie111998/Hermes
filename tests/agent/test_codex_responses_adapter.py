@@ -625,3 +625,644 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #97427: GPT-5.6 Responses rejects replayed assistant message when
+# Hermes strips its required reasoning item ID.
+# Tests for reasoning/message identity preservation and symmetric degradation.
+# ---------------------------------------------------------------------------
+
+
+def test_happy_path_paired_ids_preserved_in_correct_order():
+    """Happy path: reasoning and message items preserve their IDs and maintain
+    strict sequence: user -> reasoning -> message -> function_call -> function_call_output (#97427)."""
+    messages = [
+        {"role": "user", "content": "run ls"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_100", "encrypted_content": "enc_blob_1"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_200",
+                    "phase": "commentary",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "Listing directory..."}],
+                }
+            ],
+            "tool_calls": [
+                {
+                    "call_id": "call_300",
+                    "function": {"name": "terminal", "arguments": '{"command":"ls"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_300", "content": "file1.txt\nfile2.txt"},
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert [item.get("type", item.get("role")) for item in items] == [
+        "user",
+        "reasoning",
+        "message",
+        "function_call",
+        "function_call_output",
+    ]
+
+    reasoning = items[1]
+    message = items[2]
+    call = items[3]
+    output = items[4]
+
+    assert reasoning["id"] == "rs_100"
+    assert reasoning["encrypted_content"] == "enc_blob_1"
+    assert message["id"] == "msg_200"
+    assert message["phase"] == "commentary"
+    assert call["call_id"] == "call_300"
+    assert output["call_id"] == "call_300"
+
+
+def test_minimal_repro_missing_reasoning_id_strips_message_id():
+    """Issue #97427 minimal repro: when reasoning exists but lacks an ID, the
+    assistant message item must be anonymized (id stripped) to prevent orphaned
+    reasoning 400 error."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "encrypted_content": "enc_blob_legacy"},  # No 'id'
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_legacy_1",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert len(items) == 2
+    reasoning = items[0]
+    message = items[1]
+
+    assert reasoning["type"] == "reasoning"
+    assert "id" not in reasoning
+    assert message["type"] == "message"
+    assert "id" not in message
+    assert message["content"] == [{"type": "output_text", "text": "done"}]
+
+
+def test_multi_reasoning_partial_missing_id_strips_all_message_ids_in_turn():
+    """When a turn has multiple reasoning items and any ordinary reasoning item
+    lacks a valid ID, all message items in that turn are anonymized."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_valid_1", "encrypted_content": "blob1"},
+                {"type": "reasoning", "id": "", "encrypted_content": "blob2"},  # Empty ID
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_part_1",
+                    "content": [{"type": "output_text", "text": "chunk1"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_part_2",
+                    "content": [{"type": "output_text", "text": "chunk2"}],
+                },
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    reasoning_items = [i for i in items if i.get("type") == "reasoning"]
+    message_items = [i for i in items if i.get("type") == "message"]
+
+    assert len(reasoning_items) == 2
+    assert reasoning_items[0]["id"] == "rs_valid_1"
+    assert "id" not in reasoning_items[1]
+
+    assert len(message_items) == 2
+    assert "id" not in message_items[0]
+    assert "id" not in message_items[1]
+
+
+def test_multi_reasoning_all_valid_preserves_all_ids():
+    """When all reasoning items have valid IDs, both reasoning and message items
+    preserve their IDs."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "blob1"},
+                {"type": "reasoning", "id": "rs_2", "encrypted_content": "blob2"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_1",
+                    "content": [{"type": "output_text", "text": "thought part 1"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_2",
+                    "content": [{"type": "output_text", "text": "thought part 2"}],
+                },
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    reasoning_items = [i for i in items if i.get("type") == "reasoning"]
+    message_items = [i for i in items if i.get("type") == "message"]
+
+    assert len(reasoning_items) == 2
+    assert reasoning_items[0]["id"] == "rs_1"
+    assert reasoning_items[1]["id"] == "rs_2"
+
+    assert len(message_items) == 2
+    assert message_items[0]["id"] == "msg_1"
+    assert message_items[1]["id"] == "msg_2"
+
+
+def test_cross_issuer_mismatch_drops_reasoning_and_strips_message_id():
+    """When reasoning is dropped due to cross-issuer mismatch, message content/phase
+    is preserved but its id is stripped to avoid orphaned ID errors."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_xai_1",
+                    "encrypted_content": "blob_xai",
+                    "_issuer_kind": "xai_responses",
+                }
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_xai_1",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "analysis from grok"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        current_issuer_kind="codex_backend",
+    )
+
+    reasoning_items = [i for i in items if i.get("type") == "reasoning"]
+    message_items = [i for i in items if i.get("type") == "message"]
+
+    # Reasoning item dropped
+    assert len(reasoning_items) == 0
+
+    # Message item kept with content and phase, but no id
+    assert len(message_items) == 1
+    assert "id" not in message_items[0]
+    assert message_items[0]["phase"] == "commentary"
+    assert message_items[0]["content"] == [{"type": "output_text", "text": "analysis from grok"}]
+
+
+def test_oversized_reasoning_id_triggers_symmetric_message_id_strip():
+    """An oversized reasoning ID (>64 chars) is stripped, which in turn symmetrically
+    strips the assistant message ID."""
+    oversized_rs_id = "rs_" + "a" * 80
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": oversized_rs_id, "encrypted_content": "blob"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_valid_1",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    reasoning = next(i for i in items if i.get("type") == "reasoning")
+    message = next(i for i in items if i.get("type") == "message")
+
+    assert "id" not in reasoning
+    assert "id" not in message
+
+
+def test_oversized_message_id_alone_strips_message_id_only():
+    """When reasoning ID is valid but message ID is oversized (>64 chars), reasoning ID
+    is preserved while message ID alone is stripped."""
+    oversized_msg_id = "msg_" + "b" * 80
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_valid_1", "encrypted_content": "blob"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": oversized_msg_id,
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    reasoning = next(i for i in items if i.get("type") == "reasoning")
+    message = next(i for i in items if i.get("type") == "message")
+
+    assert reasoning["id"] == "rs_valid_1"
+    assert "id" not in message
+
+
+def test_replay_kill_switch_strips_reasoning_and_message_id():
+    """When replay_encrypted_reasoning=False (kill switch active), reasoning is not
+    replayed and assistant message ID is symmetrically stripped."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "blob"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_1",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        replay_encrypted_reasoning=False,
+    )
+
+    reasoning_items = [i for i in items if i.get("type") == "reasoning"]
+    message_items = [i for i in items if i.get("type") == "message"]
+
+    assert len(reasoning_items) == 0
+    assert len(message_items) == 1
+    assert "id" not in message_items[0]
+
+
+def test_text_only_turn_without_stored_reasoning_preserves_message_id():
+    """A text-only assistant turn with no stored reasoning dependency retains its
+    message ID for prompt caching."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Hello world",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_text_only",
+                    "content": [{"type": "output_text", "text": "Hello world"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    message = items[0]
+    assert message["type"] == "message"
+    assert message["id"] == "msg_text_only"
+
+
+def test_github_copilot_strips_both_reasoning_and_message_ids():
+    """On GitHub Copilot (is_github_responses=True), connection-bound IDs are
+    stripped from both reasoning and message items."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_gh_1", "encrypted_content": "blob"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_gh_1",
+                    "content": [{"type": "output_text", "text": "copilot reply"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages, is_github_responses=True)
+
+    reasoning = next(i for i in items if i.get("type") == "reasoning")
+    message = next(i for i in items if i.get("type") == "message")
+
+    assert "id" not in reasoning
+    assert "id" not in message
+
+
+def test_compaction_item_does_not_affect_ordinary_reasoning_identity():
+    """A compaction checkpoint in codex_reasoning_items does not count as a missing
+    reasoning identity and does not strip message ID."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "compaction", "encrypted_content": "chk_blob"},  # Compaction checkpoint (no id)
+                {"type": "reasoning", "id": "rs_normal_1", "encrypted_content": "blob"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_normal_1",
+                    "content": [{"type": "output_text", "text": "after compaction"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        native_compaction_eligible=True,
+    )
+
+    reasoning_items = [i for i in items if i.get("type") == "reasoning"]
+    message_items = [i for i in items if i.get("type") == "message"]
+
+    assert len(reasoning_items) == 1
+    assert reasoning_items[0]["id"] == "rs_normal_1"
+    assert len(message_items) == 1
+    assert message_items[0]["id"] == "msg_normal_1"
+
+
+def test_compaction_item_with_id_does_not_break_message_identity():
+    """A compaction checkpoint carrying an ID (e.g. from upstream/custom schemas)
+    has its ID stripped per Responses compaction schema, but does NOT count as a broken
+    ordinary reasoning dependency, preserving subsequent message ID."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "compaction", "id": "cp_chk_1", "encrypted_content": "chk_blob"},
+                {"type": "reasoning", "id": "rs_normal_1", "encrypted_content": "blob"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_normal_1",
+                    "content": [{"type": "output_text", "text": "after compaction"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        native_compaction_eligible=True,
+    )
+
+    compaction_items = [i for i in items if i.get("type") == "compaction"]
+    reasoning_items = [i for i in items if i.get("type") == "reasoning"]
+    message_items = [i for i in items if i.get("type") == "message"]
+
+    # Compaction checkpoint emitted without 'id' as compaction schema is self-contained checkpoint
+    assert len(compaction_items) == 1
+    assert "id" not in compaction_items[0]
+    assert compaction_items[0]["encrypted_content"] == "chk_blob"
+
+    assert len(reasoning_items) == 1
+    assert reasoning_items[0]["id"] == "rs_normal_1"
+
+    assert len(message_items) == 1
+    assert message_items[0]["id"] == "msg_normal_1"
+
+
+def test_turn_with_only_compaction_and_message_preserves_message_id():
+    """When a turn has only a compaction checkpoint (no ordinary reasoning),
+    there is no ordinary reasoning dependency, so the message ID is preserved."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "compaction", "id": "cp_chk_2", "encrypted_content": "chk_blob_only"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_compaction_only_1",
+                    "content": [{"type": "output_text", "text": "compaction turn response"}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        native_compaction_eligible=True,
+    )
+
+    compaction_items = [i for i in items if i.get("type") == "compaction"]
+    message_items = [i for i in items if i.get("type") == "message"]
+
+    assert len(compaction_items) == 1
+    assert "id" not in compaction_items[0]
+    assert len(message_items) == 1
+    assert message_items[0]["id"] == "msg_compaction_only_1"
+
+
+def test_converter_to_preflight_end_to_end_pipeline():
+    """End-to-end converter -> preflight pipeline preserves paired IDs on happy path
+    and preserves symmetric degradation on degraded path."""
+    # 1. Happy path: both IDs survive through preflight
+    happy_messages = [
+        {"role": "user", "content": "ping"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_e2e_1", "encrypted_content": "blob1"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_e2e_1",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "pong"}],
+                }
+            ],
+        },
+    ]
+    raw_happy = _chat_messages_to_responses_input(happy_messages)
+    preflight_happy = _preflight_codex_input_items(raw_happy)
+
+    assert [item.get("type", item.get("role")) for item in preflight_happy] == [
+        "user",
+        "reasoning",
+        "message",
+    ]
+    assert preflight_happy[1]["id"] == "rs_e2e_1"
+    assert preflight_happy[2]["id"] == "msg_e2e_1"
+
+    # 2. Degraded path: reasoning lacks ID -> message ID stripped by converter -> survives preflight
+    degraded_messages = [
+        {"role": "user", "content": "ping"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "encrypted_content": "blob1"},  # No ID
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_e2e_2",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "pong"}],
+                }
+            ],
+        },
+    ]
+    raw_degraded = _chat_messages_to_responses_input(degraded_messages)
+    preflight_degraded = _preflight_codex_input_items(raw_degraded)
+
+    assert "id" not in preflight_degraded[1]
+    assert "id" not in preflight_degraded[2]
+
+
+def test_seen_item_ids_dedup_skips_reasoning_and_strips_subsequent_message_id():
+    """When a reasoning item is skipped by seen_item_ids deduplication in a subsequent
+    turn, that turn did not output its own reasoning identity -> its message ID must
+    be stripped to prevent orphaned reasoning errors (#97427)."""
+    messages = [
+        # Turn 1
+        {"role": "user", "content": "question 1"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_shared_1", "encrypted_content": "blob1"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_turn_1",
+                    "content": [{"type": "output_text", "text": "answer 1"}],
+                }
+            ],
+        },
+        # Turn 2 (repeats rs_shared_1 in sidecar, but introduces new msg_turn_2)
+        {"role": "user", "content": "question 2"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_shared_1", "encrypted_content": "blob1"},
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_turn_2",
+                    "content": [{"type": "output_text", "text": "answer 2"}],
+                }
+            ],
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    # Sequence of items:
+    # 0: user (question 1)
+    # 1: reasoning (rs_shared_1, id preserved)
+    # 2: message (msg_turn_1, id preserved)
+    # 3: user (question 2)
+    # 4: message (msg_turn_2, id stripped because rs_shared_1 was deduplicated!)
+    assert [item.get("type", item.get("role")) for item in items] == [
+        "user",
+        "reasoning",
+        "message",
+        "user",
+        "message",
+    ]
+
+    reasoning_turn_1 = items[1]
+    message_turn_1 = items[2]
+    message_turn_2 = items[4]
+
+    assert reasoning_turn_1["id"] == "rs_shared_1"
+    assert message_turn_1["id"] == "msg_turn_1"
+    assert "id" not in message_turn_2
+    assert message_turn_2["content"] == [{"type": "output_text", "text": "answer 2"}]
+
+
+def test_preflight_direct_reasoning_id_handling():
+    """Direct testing of _preflight_codex_input_items on raw reasoning items."""
+    # 1. Valid ID preserved
+    items_valid = _preflight_codex_input_items([
+        {"type": "reasoning", "id": "rs_direct_1", "encrypted_content": "blob"},
+    ])
+    assert items_valid[0]["id"] == "rs_direct_1"
+
+    # 2. Stripped when is_github_responses=True
+    items_gh = _preflight_codex_input_items(
+        [{"type": "reasoning", "id": "rs_direct_1", "encrypted_content": "blob"}],
+        is_github_responses=True,
+    )
+    assert "id" not in items_gh[0]
+
+    # 3. Stripped when oversized (> 64 chars)
+    items_oversized = _preflight_codex_input_items([
+        {"type": "reasoning", "id": "rs_" + "x" * 70, "encrypted_content": "blob"},
+    ])
+    assert "id" not in items_oversized[0]

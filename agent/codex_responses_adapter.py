@@ -459,9 +459,23 @@ _RESPONSE_MESSAGE_STATUSES = {"completed", "incomplete", "in_progress"}
 # The Responses API rejects input[].id longer than this with a non-retryable
 # HTTP 400 ("string too long"). Codex-issued assistant message ids are
 # server-assigned base64 blobs that can run 400+ chars, while Hermes-minted
-# ids (msg_...) stay well under this cap and are worth keeping for
+# ids (msg_... / rs_...) stay well under this cap and are worth keeping for
 # prefix-cache hits. Drop only the oversized ones on replay.
 _MAX_RESPONSES_ITEM_ID_LENGTH = 64
+
+
+def _normalize_replayed_item_id(item_id: Any) -> Optional[str]:
+    """Normalize and validate an item ID for Responses API replay.
+
+    Returns the stripped ID string if non-empty and <= 64 characters,
+    or None if invalid, whitespace-only, non-string, or oversized.
+    """
+    if not isinstance(item_id, str):
+        return None
+    stripped = item_id.strip()
+    if not stripped or len(stripped) > _MAX_RESPONSES_ITEM_ID_LENGTH:
+        return None
+    return stripped
 
 
 def _normalize_responses_message_status(value: Any, *, default: str = "completed") -> str:
@@ -583,71 +597,103 @@ def _chat_messages_to_responses_input(
                 # This applies to every Responses transport including
                 # xAI — see _chat_messages_to_responses_input docstring
                 # for the May 2026 reversal of the earlier xAI gate.
-                codex_reasoning = (
-                    msg.get("codex_reasoning_items")
-                    if replay_encrypted_reasoning
-                    else None
-                )
+                raw_sidecar_items = msg.get("codex_reasoning_items")
+                if not isinstance(raw_sidecar_items, list):
+                    raw_sidecar_items = []
+
+                # Classify items in codex_reasoning_items sidecar:
+                # 1. ordinary reasoning items: dict with encrypted_content and type == "reasoning" (or unset)
+                # 2. native compaction items: dict with encrypted_content and type == "compaction"
+                ordinary_reasoning_items: List[Dict[str, Any]] = []
+                for ri in raw_sidecar_items:
+                    if isinstance(ri, dict) and ri.get("encrypted_content"):
+                        ptype = ri.get("type")
+                        if ptype == "reasoning" or ptype is None:
+                            ordinary_reasoning_items.append(ri)
+
+                stored_reasoning_exists = bool(ordinary_reasoning_items)
+                ordinary_reasoning_replayed_with_valid_id_count = 0
                 has_codex_reasoning = False
-                if isinstance(codex_reasoning, list):
-                    for ri in codex_reasoning:
-                        if isinstance(ri, dict) and ri.get("encrypted_content"):
-                            item_id = ri.get("id")
-                            if item_id and item_id in seen_item_ids:
-                                continue
-                            # Native-compaction gate: a checkpoint is only
-                            # meaningful to the endpoint/model that minted it
-                            # AND only while this request still asks for
-                            # server-side compaction. Once the gate closes
-                            # (model swapped out of the gpt-5.6 family,
-                            # compression disabled, rejection kill switch),
-                            # the persisted checkpoint must not be replayed —
-                            # replaying it is what makes the wire restructure
-                            # below erase pre-checkpoint history forever.
-                            if (
-                                ri.get("type") == "compaction"
-                                and not native_compaction_eligible
-                            ):
-                                continue
-                            # Cross-issuer guard: drop reasoning blocks that
-                            # were minted by a different Responses endpoint.
-                            # The current endpoint cannot decrypt foreign
-                            # encrypted_content and would reject the whole
-                            # request with HTTP 400 invalid_encrypted_content.
-                            # Unstamped (legacy) items pass through.
-                            item_issuer = ri.get("_issuer_kind")
-                            if (
-                                current_issuer_kind is not None
-                                and item_issuer is not None
-                                and item_issuer != current_issuer_kind
-                            ):
-                                global _CROSS_ISSUER_WARN_EMITTED
-                                if not _CROSS_ISSUER_WARN_EMITTED:
-                                    logger.warning(
-                                        "Dropping reasoning item minted by %s while "
-                                        "calling %s — encrypted_content is sealed to "
-                                        "its issuer. This happens when a session "
-                                        "switches model providers mid-conversation.",
-                                        item_issuer, current_issuer_kind,
-                                    )
-                                    _CROSS_ISSUER_WARN_EMITTED = True
-                                continue
-                            # Strip the "id" field — with store=False the
-                            # Responses API cannot look up items by ID and
-                            # returns 404.  The encrypted_content blob is
-                            # self-contained for reasoning chain continuity.
-                            # Also strip the internal "_issuer_kind" stamp;
-                            # it is a Hermes-side metadata key and not part
-                            # of the Responses API schema.
-                            replay_item = {
-                                k: v for k, v in ri.items()
-                                if k not in ("id", "_issuer_kind")
-                            }
-                            items.append(replay_item)
-                            item_sources.append(msg)
-                            if item_id:
-                                seen_item_ids.add(item_id)
-                            has_codex_reasoning = True
+
+                if replay_encrypted_reasoning:
+                    for ri in raw_sidecar_items:
+                        if not isinstance(ri, dict) or not ri.get("encrypted_content"):
+                            continue
+                        item_id = ri.get("id")
+                        if item_id and item_id in seen_item_ids:
+                            continue
+
+                        # Native-compaction gate: a checkpoint is only
+                        # meaningful to the endpoint/model that minted it
+                        # AND only while this request still asks for
+                        # server-side compaction. Once the gate closes
+                        # (model swapped out of the gpt-5.6 family,
+                        # compression disabled, rejection kill switch),
+                        # the persisted checkpoint must not be replayed —
+                        # replaying it is what makes the wire restructure
+                        # below erase pre-checkpoint history forever.
+                        if (
+                            ri.get("type") == "compaction"
+                            and not native_compaction_eligible
+                        ):
+                            continue
+
+                        # Cross-issuer guard: drop reasoning blocks that
+                        # were minted by a different Responses endpoint.
+                        # The current endpoint cannot decrypt foreign
+                        # encrypted_content and would reject the whole
+                        # request with HTTP 400 invalid_encrypted_content.
+                        # Unstamped (legacy) items pass through.
+                        item_issuer = ri.get("_issuer_kind")
+                        if (
+                            current_issuer_kind is not None
+                            and item_issuer is not None
+                            and item_issuer != current_issuer_kind
+                        ):
+                            global _CROSS_ISSUER_WARN_EMITTED
+                            if not _CROSS_ISSUER_WARN_EMITTED:
+                                logger.warning(
+                                    "Dropping reasoning item minted by %s while "
+                                    "calling %s — encrypted_content is sealed to "
+                                    "its issuer. This happens when a session "
+                                    "switches model providers mid-conversation.",
+                                    item_issuer, current_issuer_kind,
+                                )
+                                _CROSS_ISSUER_WARN_EMITTED = True
+                            continue
+
+                        # Strip internal metadata stamps
+                        replay_item = {
+                            k: v for k, v in ri.items()
+                            if k not in ("id", "_issuer_kind")
+                        }
+
+                        # Replay reasoning item ID when present (<= 64 chars) and
+                        # not on GitHub Copilot to maintain identity graph pairing
+                        # with assistant message items for prompt caching (#97427).
+                        is_ordinary = ri.get("type") == "reasoning" or ri.get("type") is None
+                        norm_id = _normalize_replayed_item_id(item_id)
+                        if is_ordinary and norm_id is not None:
+                            ordinary_reasoning_replayed_with_valid_id_count += 1
+                            if not is_github_responses:
+                                replay_item["id"] = norm_id
+
+                        items.append(replay_item)
+                        item_sources.append(msg)
+                        if item_id:
+                            seen_item_ids.add(item_id)
+                        has_codex_reasoning = True
+
+                # Compute reasoning_identity_intact for this turn:
+                # - None: this turn has no stored ordinary reasoning dependency (e.g. text-only turn).
+                # - True: every stored ordinary reasoning item was successfully replayed in this turn
+                #         with a valid non-empty ID <= 64 chars (no deduplication skip, no cross-issuer drop).
+                # - False: reasoning was expected but could not be fully replayed with valid IDs in this turn.
+                reasoning_identity_intact: Optional[bool] = None
+                if stored_reasoning_exists:
+                    reasoning_identity_intact = (
+                        ordinary_reasoning_replayed_with_valid_id_count == len(ordinary_reasoning_items)
+                    )
 
                 # Replay exact assistant message items (with id/phase) from
                 # previous turns so the API can maintain prefix-cache hits.
@@ -689,14 +735,23 @@ def _chat_messages_to_responses_input(
                             "content": normalized_content_parts,
                         }
                         item_id = raw_item.get("id")
+                        norm_msg_id = _normalize_replayed_item_id(item_id)
+
+                        # Keep message ID only when:
+                        # 1. not on GitHub Copilot (which invalidates replayed connection-bound IDs);
+                        # 2. norm_msg_id is valid (non-empty, <= 64 chars);
+                        # 3. reasoning identity chain is intact (reasoning_identity_intact is True) or
+                        #    this turn has no reasoning dependency (reasoning_identity_intact is None).
+                        # If reasoning was present but lost its identity (kill-switch, cross-issuer,
+                        # seen_item_ids dedup skip, missing/oversized ID), the message item must be
+                        # anonymized (id stripped) to prevent orphaned reasoning errors (#97427).
                         if (
                             not is_github_responses
-                            and isinstance(item_id, str)
-                            and item_id.strip()
+                            and norm_msg_id is not None
+                            and (reasoning_identity_intact is True or reasoning_identity_intact is None)
                         ):
-                            stripped_id = item_id.strip()
-                            if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
-                                replay_item["id"] = stripped_id
+                            replay_item["id"] = norm_msg_id
+
                         phase = raw_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
                             replay_item["phase"] = phase.strip()
@@ -704,22 +759,21 @@ def _chat_messages_to_responses_input(
                         item_sources.append(msg)
                         replayed_message_items += 1
 
-                if replayed_message_items > 0:
-                    pass
-                elif content_parts:
-                    items.append({"role": "assistant", "content": content_parts})
-                    item_sources.append(msg)
-                elif content_text.strip():
-                    items.append({"role": "assistant", "content": content_text})
-                    item_sources.append(msg)
-                elif has_codex_reasoning:
-                    # The Responses API requires a following item after each
-                    # reasoning item (otherwise: missing_following_item error).
-                    # When the assistant produced only reasoning with no visible
-                    # content, emit an empty assistant message as the required
-                    # following item.
-                    items.append({"role": "assistant", "content": ""})
-                    item_sources.append(msg)
+                if replayed_message_items == 0:
+                    if content_parts:
+                        items.append({"role": "assistant", "content": content_parts})
+                        item_sources.append(msg)
+                    elif content_text.strip():
+                        items.append({"role": "assistant", "content": content_text})
+                        item_sources.append(msg)
+                    elif has_codex_reasoning:
+                        # The Responses API requires a following item after each
+                        # reasoning item (otherwise: missing_following_item error).
+                        # When the assistant produced only reasoning with no visible
+                        # content, emit an empty assistant message as the required
+                        # following item.
+                        items.append({"role": "assistant", "content": ""})
+                        item_sources.append(msg)
 
                 tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
@@ -966,6 +1020,18 @@ def _preflight_codex_input_items(
     is_github_responses: bool = False,
     sanitize_harmony_tokens: bool = False,
 ) -> List[Dict[str, Any]]:
+    """Validate, sanitize, and normalize raw Responses API input items.
+
+    This function operates as a per-item structural normalizer on outgoing
+    items produced by ``_chat_messages_to_responses_input``:
+    - Validates item shapes and content part types;
+    - Sanitizes Harmony tokens and tool names;
+    - Clamps replayed item IDs (<= 64 chars) and drops IDs for GitHub Copilot.
+
+    Note: Cross-turn reasoning-to-message identity dependencies and symmetric
+    degradation are established in ``_chat_messages_to_responses_input``.
+    This preflight layer does not re-infer identity graphs across items.
+    """
     if not isinstance(raw_items, list):
         raise ValueError("Codex Responses input must be a list of input items.")
 
@@ -1069,10 +1135,13 @@ def _preflight_codex_input_items(
                     "type": "reasoning",
                     "encrypted_content": encrypted,
                 }
-                # Do NOT include the "id" in the outgoing item — with
-                # store=False (our default) the API tries to resolve the
-                # id server-side and returns 404.  The id is still used
-                # above for local deduplication via seen_ids.
+                # Preserve valid replayed reasoning ID (matching message item contract)
+                # unless on GitHub Copilot which strips replayed IDs (#97427).
+                if not is_github_responses:
+                    norm_id = _normalize_replayed_item_id(item_id)
+                    if norm_id is not None:
+                        reasoning_item["id"] = norm_id
+
                 summary = item.get("summary")
                 if isinstance(summary, list):
                     reasoning_item["summary"] = (
@@ -1129,14 +1198,10 @@ def _preflight_codex_input_items(
                 "content": normalized_content,
             }
             item_id = item.get("id")
-            if (
-                not is_github_responses
-                and isinstance(item_id, str)
-                and item_id.strip()
-            ):
-                stripped_id = item_id.strip()
-                if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
-                    normalized_item["id"] = stripped_id
+            if not is_github_responses:
+                norm_msg_id = _normalize_replayed_item_id(item_id)
+                if norm_msg_id is not None:
+                    normalized_item["id"] = norm_msg_id
             phase = item.get("phase")
             if isinstance(phase, str) and phase.strip():
                 normalized_item["phase"] = phase.strip()

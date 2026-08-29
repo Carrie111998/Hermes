@@ -863,10 +863,7 @@ class TestCodexReasoningPreflight:
         reasoning_items = [i for i in normalized if i.get("type") == "reasoning"]
         assert len(reasoning_items) == 1
         assert reasoning_items[0]["encrypted_content"] == "abc123encrypted"
-        # Note: "id" is intentionally excluded from normalized output —
-        # with store=False the API returns 404 on server-side id resolution.
-        # The id is only used for local deduplication via seen_ids.
-        assert "id" not in reasoning_items[0]
+        assert reasoning_items[0]["id"] == "r_001"
         assert reasoning_items[0]["summary"] == [{"type": "summary_text", "text": "Thinking about it"}]
 
     def test_reasoning_item_without_id(self, monkeypatch):
@@ -882,7 +879,7 @@ class TestCodexReasoningPreflight:
 
 
     def test_reasoning_items_replayed_from_history(self, monkeypatch):
-        """Reasoning items stored in codex_reasoning_items get replayed."""
+        """Reasoning items stored in codex_reasoning_items get replayed with ID."""
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
         messages = [
@@ -900,6 +897,7 @@ class TestCodexReasoningPreflight:
         reasoning_items = [i for i in items if isinstance(i, dict) and i.get("type") == "reasoning"]
         assert len(reasoning_items) == 1
         assert reasoning_items[0]["encrypted_content"] == "enc123"
+        assert reasoning_items[0]["id"] == "r_1"
 
 
 # ── Reasoning effort consistency tests ───────────────────────────────────────
