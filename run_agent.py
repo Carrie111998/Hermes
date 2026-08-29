@@ -523,6 +523,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        session_write_policy=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -613,6 +614,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            session_write_policy=session_write_policy,
         )
 
     def _get_session_db_for_recall(self):
@@ -8962,7 +8964,33 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            from agent.session_write_policy import (
+                require_turn_policy,
+                session_write_policy_scope,
+            )
+            from agent.self_improvement_decision_context import (
+                require_retained_self_improvement_decision,
+                self_improvement_decision_scope,
+            )
+
+            turn_policy = require_turn_policy(
+                getattr(self, "session_write_policy", None),
+                protected=bool(getattr(self, "_session_write_policy_protected", False)),
+                session_id=session_id,
+            )
+            if turn_policy is None:
+                raise RuntimeError(
+                    "Protected session write policy is missing or invalid; refusing turn dispatch"
+                )
+            turn_self_improvement_decision = require_retained_self_improvement_decision(
+                getattr(self, "self_improvement_decision", None)
+            )
+            with (
+                session_write_policy_scope(turn_policy),
+                self_improvement_decision_scope(turn_self_improvement_decision),
+                bind_subagent_parent(self),
+                scoped_runtime_main({}),
+            ):
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:

@@ -39,6 +39,8 @@ from typing import Any, Dict, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
+from agent.self_improvement_decision_context import get_self_improvement_decision
+from tools.skill_provenance import is_background_review
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,38 @@ VALID_SOURCES = frozenset({"catalog", "blueprint", "usage", "integration"})
 _STATUS_PENDING = "pending"
 _STATUS_ACCEPTED = "accepted"
 _STATUS_DISMISSED = "dismissed"
+
+
+def _background_review_suggestions_guard(action: str, target: str = "") -> bool:
+    """Return whether a background-review suggestion mutation is denied.
+
+    A provenance lookup failure means the operation origin is unknown. It is
+    therefore denied before a captured ALLOW decision may authorize a write.
+    """
+    try:
+        background_review = is_background_review()
+    except Exception:
+        logger.warning(
+            "suggestion mutation denied: background-review provenance lookup failed "
+            "action=%s target=%s",
+            action,
+            target,
+            exc_info=True,
+        )
+        return True
+    if not background_review:
+        return False
+    decision = get_self_improvement_decision()
+    if not getattr(decision, "allow", False):
+        logger.warning(
+            "suggestion mutation denied by captured self-improvement decision "
+            "action=%s target=%s reason=%s",
+            action,
+            target,
+            getattr(decision, "reason", "deny"),
+        )
+        return True
+    return False
 
 
 def _secure_file(path: Path) -> None:
@@ -146,6 +180,8 @@ def add_suggestion(
         raise ValueError(f"unknown suggestion source: {source!r}")
     if not title.strip() or not dedup_key.strip():
         raise ValueError("title and dedup_key are required")
+    if _background_review_suggestions_guard("add", dedup_key):
+        return None
 
     with _suggestions_lock:
         suggestions = _load_raw().get("suggestions", [])
@@ -200,6 +236,8 @@ def get_suggestion(ref: str) -> Optional[Dict[str, Any]]:
 
 
 def _set_status(suggestion_id: str, status: str) -> bool:
+    if _background_review_suggestions_guard("set_status", suggestion_id):
+        return False
     with _suggestions_lock:
         suggestions = _load_raw().get("suggestions", [])
         changed = False
@@ -233,6 +271,8 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     s = get_suggestion(ref)
     if not s or s.get("status") != _STATUS_PENDING:
         return None
+    if _background_review_suggestions_guard("accept", str(s.get("id", ref))):
+        return None
 
     from cron.scheduler import (
         CronSchedulerRegistrationError,
@@ -262,6 +302,8 @@ def clear_resolved() -> int:
     their dedup_key (so they aren't re-offered). This only prunes ACCEPTED
     records, which have served their purpose once the job exists.
     """
+    if _background_review_suggestions_guard("clear_resolved"):
+        return 0
     with _suggestions_lock:
         suggestions = _load_raw().get("suggestions", [])
         kept = [s for s in suggestions if s.get("status") != _STATUS_ACCEPTED]

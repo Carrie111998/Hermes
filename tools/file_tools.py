@@ -2228,6 +2228,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     the schema — the mirror rejection error teaches it. The cross-PROFILE
     guard this flag was named for is removed (profiles are not isolated).
     """
+    # Session policy is an ambient turn authority.  A protected DENY policy
+    # must stop here, before path resolution or any file-operations call.
+    try:
+        from agent.session_write_policy import get_current_session_write_policy
+
+        policy = get_current_session_write_policy()
+        if policy.denies_mutations:
+            return tool_error("Session write policy denied file mutation")
+    except Exception:
+        return tool_error("Session write policy evaluation failed; mutation denied")
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2318,6 +2328,17 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    # Patch has two physical mutation engines (replace and V4A) and must not
+    # let either reach filesystem/path processing under a retained DENY.
+    # Evaluate before every mode-specific dispatch and fail closed on a broken
+    # ambient authority; later path/approval checks remain unchanged.
+    try:
+        from agent.session_write_policy import get_current_session_write_policy
+
+        if get_current_session_write_policy().denies_mutations:
+            return tool_error("Session write policy denied file mutation")
+    except Exception:
+        return tool_error("Session write policy evaluation failed; mutation denied")
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     # Paths whose CONTENT will be text-written (Update/Add + explicit path).

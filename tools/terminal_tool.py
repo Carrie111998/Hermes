@@ -667,6 +667,32 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
     except Exception:
         return f"<{type(command).__name__}>"
 
+
+def _is_provably_read_only_command(command: str) -> bool:
+    """Return whether a protected-turn shell command is in the read-only subset.
+
+    This is deliberately an allow-list rather than a best-effort mutation
+    detector: syntax beyond one simple command is mutation-capable until
+    proven otherwise. Shell syntax is rejected before ``shlex`` tokenization
+    so redirects, compound expressions, substitution, and pipelines cannot
+    hide behind an initially safe command word.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    if any(marker in command for marker in (">", "<", "|", "&", ";", "`", "$", "\n", "\r", "(", ")", "{", "}")):
+        return False
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not words:
+        return False
+    if words[0] in {"cat", "diff", "grep", "ls", "pwd", "rg", "stat"}:
+        return True
+    return len(words) >= 2 and words[0] == "git" and words[1] in {
+        "diff", "log", "show", "status",
+    }
+
 def _looks_like_env_assignment(token: str) -> bool:
     """Return True when *token* is a leading shell environment assignment."""
     if "=" not in token or token.startswith("="):
@@ -2871,6 +2897,28 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        # Consult the session-scoped authority before environment selection or
+        # command execution. DENY_ALL intentionally permits only a narrow,
+        # explicitly read-only shell subset; unknown commands fail closed.
+        try:
+            from agent.session_write_policy import get_current_session_write_policy
+
+            policy = get_current_session_write_policy()
+            if policy.denies_mutations and not _is_provably_read_only_command(command):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "Session write policy denied terminal mutation",
+                    "status": "blocked",
+                }, ensure_ascii=False)
+        except Exception:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "Session write policy evaluation failed; terminal mutation denied",
+                "status": "blocked",
             }, ensure_ascii=False)
 
         # Get configuration
