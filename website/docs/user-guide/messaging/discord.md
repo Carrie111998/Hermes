@@ -327,11 +327,12 @@ Wiring multiple Hermes profiles to reply to one another in a shared channel — 
 
 ### Config File (`config.yaml`)
 
-The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Config.yaml settings are applied as defaults — if the equivalent env var is already set, the env var wins.
+The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Config.yaml settings are applied as defaults — if the equivalent env var is already set, the env var normally wins. Security ownership settings such as `discord.allow_dms` are config-first so one profile cannot inherit another profile's process-level policy.
 
 ```yaml
 # Discord-specific settings
 discord:
+  allow_dms: true                  # Set false to keep DMs out of the LLM path
   require_mention: true           # Require @mention in server channels
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
@@ -364,7 +365,15 @@ group_sessions_per_user: true     # Isolate sessions per user in shared channels
 
 **Type:** boolean — **Default:** `true`
 
-When enabled, the bot only responds in server channels when directly `@mentioned`. DMs always get a response regardless of this setting.
+When enabled, the bot only responds in server channels when directly `@mentioned`. DMs are independent of mention gating and are controlled by `discord.allow_dms`.
+
+#### `discord.allow_dms`
+
+**Type:** boolean — **Default:** `true`
+
+When `false`, Discord DMs are rejected before entering the LLM conversation path. Guild-channel admission and slash-command authorization are unaffected. Use this for a restricted profile whose privileged DM commands are handled by a separate deterministic broker rather than by the agent.
+
+An explicit profile value takes precedence over the legacy `DISCORD_ALLOW_DMS` environment bridge, which remains supported for migration compatibility.
 
 #### `discord.thread_require_mention`
 
