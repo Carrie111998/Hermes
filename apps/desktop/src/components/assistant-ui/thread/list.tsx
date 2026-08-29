@@ -17,6 +17,7 @@ import {
 } from 'react'
 import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 
+import { type PaneLifecycle } from '@/components/pane-shell/pane-lifecycle'
 import { usePaneLifecycle } from '@/components/pane-shell/pane-visibility'
 import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
@@ -123,6 +124,21 @@ export const transcriptBackfillFrameCount = (
   step = BACKFILL_STEP,
   budget = RENDER_BUDGET
 ): number => Math.ceil(Math.max(0, budget - firstPaint) / step)
+
+/** A tab round-trip keeps the transcript mounted (`hot-hidden` → `visible`)
+ *  without changing `sessionKey`, so the session-switch settle loop never
+ *  re-arms. The hide path also clamps the DOM to the live tail, which can
+ *  leave `scrollTop` at 0 on a still-scrollable tail. Coming back then
+ *  prepends older turns while treating that 0 as a chosen reading position —
+ *  the thread "scrolls up" onto old messages. */
+export const shouldResettleTranscript = (previous: PaneLifecycle, next: PaneLifecycle): boolean =>
+  previous === 'hot-hidden' && next === 'visible'
+
+/** Distance from the bottom to restore after older turns are prepended.
+ *  Mid-load (and a reveal that just unset settled) must not treat scrollTop 0
+ *  as a chosen position — that is how a switch-back lands on old turns. */
+export const prependAnchorFromBottom = (loadSettled: boolean, scrollHeight: number, scrollTop: number): number =>
+  loadSettled ? scrollHeight - scrollTop : 0
 
 // Browsers may quantize a requested scrollTop to a nearby device-pixel
 // boundary. use-stick-to-bottom otherwise compares the lower actual value to
@@ -421,6 +437,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   const mountedPanes = useStore($mountedTranscriptPanes)
   const paneLifecycle = usePaneLifecycle()
+  const previousLifecycleRef = useRef(paneLifecycle)
   // Hidden panes retain only a live-tail budget. Visible panes share the normal
   // screen budget; a reveal backfills older rows in bounded transition steps.
   const paneBudget = transcriptPaneBudget(mountedPanes, paneLifecycle === 'hot-hidden')
@@ -477,7 +494,9 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const anchorBeforePrepend = useCallback(() => {
     const el = scrollRef.current
 
-    restoreFromBottomRef.current = el && loadSettledRef.current ? el.scrollHeight - el.scrollTop : 0
+    restoreFromBottomRef.current = el
+      ? prependAnchorFromBottom(loadSettledRef.current, el.scrollHeight, el.scrollTop)
+      : 0
   }, [scrollRef])
 
   // Backfill from FIRST_PAINT_BUDGET to the full budget after the small
@@ -692,6 +711,45 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
     return () => cancelAnimationFrame(rafId)
   }, [hasGroups, scrollRef, scrollToBottom, sessionKey, stopScroll])
+
+  // The hide clamp unmounts older turns from the top. Pin the remaining tail
+  // to its latest line so a `visibility: hidden` scroll reset cannot leave
+  // scrollTop at 0 on a still-scrollable tail.
+  useLayoutEffect(() => {
+    if (paneLifecycle !== 'hot-hidden') {
+      return
+    }
+
+    const el = scrollRef.current
+
+    if (el) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [paneLifecycle, renderBudget, scrollRef])
+
+  // Tab return does not change sessionKey, so the settle loop above does not
+  // run. The hide clamp can leave scrollTop at 0; unset settled so the
+  // backfill prepends onto the bottom instead of restoring that 0.
+  useLayoutEffect(() => {
+    const previous = previousLifecycleRef.current
+    previousLifecycleRef.current = paneLifecycle
+
+    if (!shouldResettleTranscript(previous, paneLifecycle)) {
+      return
+    }
+
+    const el = scrollRef.current
+
+    loadSettledRef.current = false
+    restoreFromBottomRef.current = 0
+
+    if (!el) {
+      return
+    }
+
+    stopScroll()
+    el.scrollTop = el.scrollHeight
+  }, [paneLifecycle, scrollRef, stopScroll])
 
   // Prepend an older page while preserving the on-screen position. The user is
   // scrolled up (reading history) so the stick-to-bottom lock is escaped and

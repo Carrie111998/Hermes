@@ -8,8 +8,10 @@ import {
   LIVE_TAIL_PARTS,
   liveTailStart,
   type MessageGroup,
+  prependAnchorFromBottom,
   resolveThreadScrollTarget,
   shouldClampTranscriptBudget,
+  shouldResettleTranscript,
   subscribeToThreadForeground,
   transcriptBackfillFrameCount,
   transcriptPaneBudget
@@ -327,5 +329,28 @@ describe('liveTailStart', () => {
 describe('transcriptBackfillFrameCount', () => {
   it('settles a full pane in at most three prepend commits', () => {
     expect(transcriptBackfillFrameCount()).toBeLessThanOrEqual(3)
+  })
+})
+
+describe('shouldResettleTranscript', () => {
+  it('re-settles only when a hot-hidden pane becomes visible again', () => {
+    expect(shouldResettleTranscript('hot-hidden', 'visible')).toBe(true)
+    expect(shouldResettleTranscript('visible', 'hot-hidden')).toBe(false)
+    expect(shouldResettleTranscript('visible', 'visible')).toBe(false)
+    expect(shouldResettleTranscript('parked', 'visible')).toBe(false)
+  })
+})
+
+describe('prependAnchorFromBottom', () => {
+  it('pins to the bottom while a load or tab-reveal has not settled', () => {
+    // The switch-back bug: hide clamp left scrollTop 0 on a 4k-px tail.
+    // Treating that as settled restored 4000px from the bottom after the
+    // 11k-px prepend — old turns, not the latest.
+    expect(prependAnchorFromBottom(false, 4000, 0)).toBe(0)
+  })
+
+  it('preserves a settled reading position through a prepend', () => {
+    expect(prependAnchorFromBottom(true, 800, 200)).toBe(600)
+    expect(prependAnchorFromBottom(true, 800, 0)).toBe(800)
   })
 })
