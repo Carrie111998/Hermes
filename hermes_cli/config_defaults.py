@@ -1628,6 +1628,16 @@ DEFAULT_CONFIG = {
             # independently of scale.
             "unicode_cols": 0,
         },
+        # Classic CLI status bar fields (prompt_toolkit bar — CLI and TUI share it).
+        # Controls which segments appear in the wide bar (≥76 cols). Removing a
+        # name hides that segment. Unknown names are ignored. Order is fixed
+        # in code; this list only filters.
+        "tui_statusbar_fields": [
+            "model", "ctx", "ctx_bar", "cache_hit", "latency", "tps",
+            "compressions", "bg_tasks", "bg_processes", "bg_subagents",
+            "goal", "duration", "prompt", "idle", "focus", "yolo",
+            "stash", "battery", "title",
+        ],
     },
 
     # Web dashboard settings

@@ -5680,6 +5680,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
 
+        # Cache-hit ratio baseline — reset on model switch and on
+        # context compression so the bar reflects the *current* cache
+        # regime, not a lifetime average that survives invalidation.
+        self._cache_hit_baseline_prompt = 0
+        self._cache_hit_baseline_read = 0
+        self._cache_hit_baseline_model: Optional[str] = None
+        self._cache_hit_baseline_compressions = 0
+
     def _claim_active_session(self, surface: str = "cli", *, stderr: bool = False) -> bool:
         """Claim a global active-session slot for this CLI process."""
         if self._active_session_lease is not None:
@@ -6178,6 +6186,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "class:status-bar-warn"
         return "class:status-bar-good"
 
+    def _cache_hit_style(self, pct: Optional[int]) -> str:
+        """Style for cache-hit ratio: high hit = good (green)."""
+        if pct is None:
+            return "class:status-bar-dim"
+        if pct >= 90:
+            return "class:status-bar-good"
+        if pct >= 60:
+            return "class:status-bar-warn"
+        if pct >= 30:
+            return "class:status-bar-dim"
+        return "class:status-bar-bad"
+
+    def _tui_statusbar_fields(self) -> set:
+        """Return enabled status-bar fields from config.
+
+        ``display.tui_statusbar_fields`` is a list of segment keys. Unknown
+        names are ignored. Missing/null → all enabled (backward compat).
+        Order is fixed in the renderers; this only filters.
+        """
+        try:
+            # CLI_CONFIG lives in this module (cli.py), not hermes_cli.config
+            import cli as _cli_mod
+            _cfg = getattr(_cli_mod, "CLI_CONFIG", None)
+            if _cfg is None:
+                from hermes_cli.config import CLI_CONFIG as _cfg2
+                _cfg = _cfg2
+            disp = _cfg.get("display", {}) if isinstance(_cfg, dict) else {}
+            fields = disp.get("tui_statusbar_fields")
+            if fields is None:
+                return {"model","ctx","ctx_bar","cache_hit","latency","tps","compressions","bg_tasks","bg_processes","bg_subagents","goal","duration","prompt","idle","focus","yolo","stash","battery","title"}
+            if not isinstance(fields, (list, tuple, set)):
+                return {"model","ctx","ctx_bar","cache_hit","latency","tps","compressions","bg_tasks","bg_processes","bg_subagents","goal","duration","prompt","idle","focus","yolo","stash","battery","title"}
+            cleaned = {str(x).strip() for x in fields if str(x).strip()}
+            # Empty list means hide all optional segments (keep minimal chrome).
+            return cleaned
+        except Exception:
+            return {"model","ctx","ctx_bar","cache_hit","latency","tps","compressions","bg_tasks","bg_processes","bg_subagents","goal","duration","prompt","idle","focus","yolo","stash","battery","title"}
+
     @staticmethod
     def _battery_status_style(category: str) -> str:
         """Map a battery colour category to a status-bar style class."""
@@ -6472,6 +6518,96 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
+
+        # -- Cache-hit ratio (delta since last reset) --
+        # Reset baseline on model switch and on compression — both invalidate
+        # the prompt cache. Formula verified against live logs:
+        #   hit = cache_read / prompt_tokens  (prompt = input+cache_read+cache_write)
+        #   see agent/conversation_loop.py:4314  cache=read/prompt (87%)
+        #   and CanonicalUsage.prompt_tokens = input+read+write
+        try:
+            base_model = getattr(self, "_cache_hit_baseline_model", None)
+            base_prompt = int(getattr(self, "_cache_hit_baseline_prompt", 0) or 0)
+            base_read = int(getattr(self, "_cache_hit_baseline_read", 0) or 0)
+            base_comps = int(getattr(self, "_cache_hit_baseline_compressions", 0) or 0)
+            cur_model = snapshot.get("model_name") or model_name
+            cur_comps = int(snapshot.get("compressions", 0) or 0)
+            cur_prompt = int(snapshot.get("session_prompt_tokens", 0) or 0)
+            cur_read = int(snapshot.get("session_cache_read_tokens", 0) or 0)
+            if base_model is None:
+                self._cache_hit_baseline_model = cur_model
+                self._cache_hit_baseline_compressions = cur_comps
+                base_model = cur_model
+                base_comps = cur_comps
+            if cur_model != base_model:
+                self._cache_hit_baseline_model = cur_model
+                self._cache_hit_baseline_prompt = cur_prompt
+                self._cache_hit_baseline_read = cur_read
+                self._cache_hit_baseline_compressions = cur_comps
+                base_prompt = cur_prompt
+                base_read = cur_read
+                base_comps = cur_comps
+            if cur_comps != base_comps:
+                self._cache_hit_baseline_compressions = cur_comps
+                self._cache_hit_baseline_prompt = cur_prompt
+                self._cache_hit_baseline_read = cur_read
+                base_prompt = cur_prompt
+                base_read = cur_read
+            delta_prompt = cur_prompt - base_prompt
+            delta_read = cur_read - base_read
+            if delta_prompt > 0 and delta_read >= 0:
+                pct = int(round((delta_read / delta_prompt) * 100))
+                pct = max(0, min(100, pct))
+                snapshot["cache_hit_pct"] = pct
+                snapshot["cache_hit_label"] = f"{pct}%"
+            elif cur_prompt > 0 and cur_read >= 0 and base_prompt == 0 and base_read == 0:
+                pct = int(round((cur_read / cur_prompt) * 100)) if cur_prompt else 0
+                pct = max(0, min(100, pct))
+                snapshot["cache_hit_pct"] = pct
+                snapshot["cache_hit_label"] = f"{pct}%"
+            else:
+                snapshot["cache_hit_pct"] = None
+                snapshot["cache_hit_label"] = ""
+        except Exception:
+            snapshot["cache_hit_pct"] = None
+            snapshot["cache_hit_label"] = ""
+
+        # -- Rolling avg latency / velocity (last 10 calls) --
+        # Reads the deque maintained in agent/conversation_loop.py (and
+        # agent_init). Codex app-server has no latency, so it stays hidden there.
+        try:
+            agent_obj = getattr(self, "agent", None)
+            lhist = list(getattr(agent_obj, "_api_latency_history", []) or []) if agent_obj else []
+            ohist = list(getattr(agent_obj, "_api_output_history", []) or []) if agent_obj else []
+            # Keep the two histories aligned (they are appended together).
+            n = min(len(lhist), len(ohist))
+            if n:
+                lhist = lhist[-n:]
+                ohist = ohist[-n:]
+                # Simple mean for latency; sum/sum for velocity (true throughput, not mean of ratios).
+                avg_lat = sum(lhist) / len(lhist) if lhist else None
+                total_out = sum(ohist)
+                total_lat = sum(lhist)
+                avg_vel = (total_out / total_lat) if total_lat > 0 else None
+                # Guard against NaN / inf from weird provider timings (e.g. -0.8s in logs).
+                if avg_lat is not None and (avg_lat != avg_lat or avg_lat < 0 or avg_lat > 1e6):
+                    avg_lat = None
+                if avg_vel is not None and (avg_vel != avg_vel or avg_vel < 0 or avg_vel > 1e6):
+                    avg_vel = None
+                snapshot["avg_latency"] = float(avg_lat) if avg_lat is not None else None
+                snapshot["avg_latency_label"] = f"{avg_lat:.1f}s" if avg_lat is not None else ""
+                snapshot["avg_velocity"] = float(avg_vel) if avg_vel is not None else None
+                snapshot["avg_velocity_label"] = f"{avg_vel:.0f} t/s" if avg_vel is not None else ""
+            else:
+                snapshot["avg_latency"] = None
+                snapshot["avg_latency_label"] = ""
+                snapshot["avg_velocity"] = None
+                snapshot["avg_velocity_label"] = ""
+        except Exception:
+            snapshot["avg_latency"] = None
+            snapshot["avg_latency_label"] = ""
+            snapshot["avg_velocity"] = None
+            snapshot["avg_velocity_label"] = ""
 
         return snapshot
 
@@ -7186,39 +7322,60 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
+            fields = self._tui_statusbar_fields()
+            # title filtering — hide right badge if not enabled
+            if "title" not in fields:
+                session_title = ""
             if width < 52:
-                text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
-                if goal_segment:
-                    text += f" · {goal_segment}"
-                if focus_label:
-                    text += f" · {focus_label}"
-                if yolo_active:
-                    text += " · ⚠ YOLO"
+                # Narrow: model + duration are minimal chrome
+                parts_n = []
+                if "battery" in fields and battery_label:
+                    parts_n.append(battery_label)
+                if "model" in fields:
+                    parts_n.append(f"⚕ {snapshot['model_short']}")
+                else:
+                    parts_n.append("⚕")
+                if "duration" in fields:
+                    parts_n.append(duration_label)
+                if "goal" in fields and goal_segment:
+                    parts_n.append(goal_segment)
+                if "focus" in fields and focus_label:
+                    parts_n.append(focus_label)
+                if "yolo" in fields and yolo_active:
+                    parts_n.append("⚠ YOLO")
+                # stash is not shown in _build_status_bar_text narrow (fragments only)
+                text = " · ".join(parts_n) if parts_n else duration_label
+                # Preserve battery prefix compat: if battery was first, it already included
                 return self._right_align_status_title(text, session_title, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
-                if battery_label:
-                    parts.insert(0, battery_label)
+                parts = []
+                if "battery" in fields and battery_label:
+                    parts.append(battery_label)
+                if "model" in fields:
+                    parts.append(f"⚕ {snapshot['model_short']}")
+                if "ctx_bar" in fields:
+                    parts.append(percent_label)
                 compressions = snapshot.get("compressions", 0)
-                if compressions:
+                if "compressions" in fields and compressions:
                     parts.append(f"🗜️ {compressions}")
                 bg_count = snapshot.get("active_background_tasks", 0)
-                if bg_count:
+                if "bg_tasks" in fields and bg_count:
                     parts.append(f"▶ {bg_count}")
                 bg_proc_count = snapshot.get("active_background_processes", 0)
-                if bg_proc_count:
+                if "bg_processes" in fields and bg_proc_count:
                     parts.append(f"⚙ {bg_proc_count}")
                 bg_subagent_count = snapshot.get("active_background_subagents", 0)
-                if bg_subagent_count:
+                if "bg_subagents" in fields and bg_subagent_count:
                     parts.append(f"⛓ {bg_subagent_count}")
-                if goal_segment:
+                if "goal" in fields and goal_segment:
                     parts.append(goal_segment)
-                parts.append(duration_label)
-                if focus_label:
+                if "duration" in fields:
+                    parts.append(duration_label)
+                if "focus" in fields and focus_label:
                     parts.append(focus_label)
-                if yolo_active:
+                if "yolo" in fields and yolo_active:
                     parts.append("⚠ YOLO")
-                return self._right_align_status_title(" · ".join(parts), session_title, width)
+                return self._right_align_status_title(" · ".join(parts) if parts else duration_label, session_title, width)
 
             if snapshot["context_length"]:
                 ctx_total = _format_context_length(snapshot["context_length"])
@@ -7228,33 +7385,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
-            if battery_label:
-                parts.insert(0, battery_label)
-            if compressions:
+            # Wide bar: respect tui_statusbar_fields
+            fields_w = self._tui_statusbar_fields() if 'fields' not in locals() else fields
+            parts = []
+            if "battery" in fields_w and battery_label:
+                parts.append(battery_label)
+            if "model" in fields_w:
+                parts.append(f"⚕ {snapshot['model_short']}")
+            if "ctx" in fields_w:
+                parts.append(context_label)
+            if "ctx_bar" in fields_w:
+                parts.append(percent_label)
+            # Cache-hit ratio (wide bar only). Delta since last model/compression reset.
+            _ch_pct = snapshot.get("cache_hit_pct")
+            _ch_label = snapshot.get("cache_hit_label") or ""
+            if "cache_hit" in fields_w and _ch_pct is not None:
+                parts.append(f"◈ {_ch_label}")
+            # Rolling averages (last 10, wide bar only).
+            _avg_lat = snapshot.get("avg_latency_label") or ""
+            if "latency" in fields_w and _avg_lat:
+                parts.append(f"◷ {_avg_lat}")
+            _avg_vel = snapshot.get("avg_velocity_label") or ""
+            if "tps" in fields_w and _avg_vel:
+                parts.append(f"↑ {_avg_vel}")
+            if "compressions" in fields_w and compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
-            if bg_count:
+            if "bg_tasks" in fields_w and bg_count:
                 parts.append(f"▶ {bg_count}")
             bg_proc_count = snapshot.get("active_background_processes", 0)
-            if bg_proc_count:
+            if "bg_processes" in fields_w and bg_proc_count:
                 parts.append(f"⚙ {bg_proc_count}")
             bg_subagent_count = snapshot.get("active_background_subagents", 0)
-            if bg_subagent_count:
+            if "bg_subagents" in fields_w and bg_subagent_count:
                 parts.append(f"⛓ {bg_subagent_count}")
-            if goal_segment:
+            if "goal" in fields_w and goal_segment:
                 parts.append(goal_segment)
-            parts.append(duration_label)
+            if "duration" in fields_w:
+                parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
-            if prompt_elapsed:
+            if "prompt" in fields_w and prompt_elapsed:
                 parts.append(prompt_elapsed)
             idle_since = snapshot.get("idle_since")
-            if idle_since:
+            if "idle" in fields_w and idle_since:
                 parts.append(idle_since)
-            if focus_label:
+            if "focus" in fields_w and focus_label:
                 parts.append(focus_label)
-            if yolo_active:
+            if "yolo" in fields_w and yolo_active:
                 parts.append("⚠ YOLO")
+            # Fallback: at least show model if everything filtered
+            if not parts:
+                parts = [f"⚕ {snapshot['model_short']}"]
             return self._right_align_status_title(" │ ".join(parts), session_title, width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -7277,21 +7458,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
+            fields = self._tui_statusbar_fields()
+            if "title" not in fields:
+                session_title = ""
 
             if width < 52:
-                frags = [
-                    ("class:status-bar", " ⚕ "),
-                    ("class:status-bar-strong", snapshot["model_short"]),
-                    ("class:status-bar-dim", " · "),
-                    ("class:status-bar-dim", duration_label),
-                ]
-                if goal_segment:
+                frags = []
+                if "model" in fields:
+                    frags.extend([
+                        ("class:status-bar", " ⚕ "),
+                        ("class:status-bar-strong", snapshot["model_short"]),
+                    ])
+                else:
+                    frags.append(("class:status-bar", " ⚕ "))
+                if "duration" in fields:
+                    if frags and frags[-1][1] != " ⚕ ":
+                        frags.append(("class:status-bar-dim", " · "))
+                    elif frags:
+                        frags.append(("class:status-bar-dim", ""))
+                    frags.append(("class:status-bar-dim", duration_label))
+                if "goal" in fields and goal_segment:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-strong", goal_segment))
-                if focus_label:
+                if "focus" in fields and focus_label:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-strong", focus_label))
-                if yolo_active:
+                if "yolo" in fields and yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
                 frags.append(("class:status-bar", " "))
@@ -7303,35 +7495,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
-                    frags = [
-                        ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
-                        ("class:status-bar-dim", " · "),
-                        (self._status_bar_context_style(percent), percent_label),
-                    ]
-                    if compressions:
+                    frags = []
+                    if "model" in fields:
+                        frags.extend([
+                            ("class:status-bar", " ⚕ "),
+                            ("class:status-bar-strong", snapshot["model_short"]),
+                        ])
+                    else:
+                        frags.append(("class:status-bar", " ⚕ "))
+                    # ctx_bar controls percent in medium bar
+                    if "ctx_bar" in fields:
+                        if len(frags) > 1 or frags[0][1] != " ⚕ ":
+                            frags.append(("class:status-bar-dim", " · "))
+                        frags.append((self._status_bar_context_style(percent), percent_label))
+                    if "compressions" in fields and compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
-                    if bg_count:
+                    if "bg_tasks" in fields and bg_count:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", f"▶ {bg_count}"))
-                    if bg_proc_count:
+                    if "bg_processes" in fields and bg_proc_count:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
-                    if bg_subagent_count:
+                    if "bg_subagents" in fields and bg_subagent_count:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
-                    if goal_segment:
+                    if "goal" in fields and goal_segment:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", goal_segment))
-                    frags.extend([
-                        ("class:status-bar-dim", " · "),
-                        ("class:status-bar-dim", duration_label),
-                    ])
-                    if focus_label:
+                    if "duration" in fields:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-dim", duration_label))
+                    if "focus" in fields and focus_label:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", focus_label))
-                    if yolo_active:
+                    if "yolo" in fields and yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
                     frags.append(("class:status-bar", " "))
@@ -7348,51 +7546,73 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
-                    frags = [
-                        ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
-                        ("class:status-bar-dim", " │ "),
-                        ("class:status-bar-dim", context_label),
-                        ("class:status-bar-dim", " │ "),
-                        (bar_style, self._build_context_bar(percent)),
-                        ("class:status-bar-dim", " "),
-                        (bar_style, percent_label),
-                    ]
-                    if compressions:
+                    frags = []
+                    if "model" in fields:
+                        frags.extend([
+                            ("class:status-bar", " ⚕ "),
+                            ("class:status-bar-strong", snapshot["model_short"]),
+                        ])
+                    else:
+                        frags.append(("class:status-bar", " ⚕ "))
+                    if "ctx" in fields:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", context_label))
+                    if "ctx_bar" in fields:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append((bar_style, self._build_context_bar(percent)))
+                        frags.append(("class:status-bar-dim", " "))
+                        frags.append((bar_style, percent_label))
+                    # Cache-hit ratio — styled by hit (high=good). Wide tier only.
+                    _ch_pct = snapshot.get("cache_hit_pct")
+                    _ch_label = snapshot.get("cache_hit_label") or ""
+                    if "cache_hit" in fields and _ch_pct is not None:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append((self._cache_hit_style(_ch_pct), f"◈ {_ch_label}"))
+                    # Rolling averages — wide tier only, dim style (trend, not alert).
+                    _avg_lat = snapshot.get("avg_latency_label") or ""
+                    if "latency" in fields and _avg_lat:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", f"◷ {_avg_lat}"))
+                    _avg_vel = snapshot.get("avg_velocity_label") or ""
+                    if "tps" in fields and _avg_vel:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", f"↑ {_avg_vel}"))
+                    if "compressions" in fields and compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
-                    if bg_count:
+                    if "bg_tasks" in fields and bg_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"▶ {bg_count}"))
-                    if bg_proc_count:
+                    if "bg_processes" in fields and bg_proc_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
-                    if bg_subagent_count:
+                    if "bg_subagents" in fields and bg_subagent_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
-                    if goal_segment:
+                    if "goal" in fields and goal_segment:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", goal_segment))
-                    frags.extend([
-                        ("class:status-bar-dim", " │ "),
-                        ("class:status-bar-dim", duration_label),
-                    ])
+                    if "duration" in fields:
+                        frags.extend([
+                            ("class:status-bar-dim", " │ "),
+                            ("class:status-bar-dim", duration_label),
+                        ])
                     # Position 7: per-prompt elapsed timer (live or frozen)
                     prompt_elapsed = snapshot.get("prompt_elapsed")
-                    if prompt_elapsed:
+                    if "prompt" in fields and prompt_elapsed:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-dim", prompt_elapsed))
                     # Position 8: idle time since the last final agent response
                     idle_since = snapshot.get("idle_since")
-                    if idle_since:
+                    if "idle" in fields and idle_since:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-dim", idle_since))
                     # Persistent focus-view badge — so the reduced-output mode
                     # is never invisible (mirrors the YOLO badge convention).
-                    if focus_label:
+                    if "focus" in fields and focus_label:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", focus_label))
-                    if yolo_active:
+                    if "yolo" in fields and yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
                     frags.append(("class:status-bar", " "))
@@ -7406,7 +7626,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 stash_indicator = self._prompt_stash.indicator()
             except Exception:
                 stash_indicator = ""
-            if stash_indicator:
+            if "stash" in fields and stash_indicator:
                 # Insert before the trailing pad fragment so the bar keeps its
                 # one-cell right margin.
                 if frags and frags[-1] == ("class:status-bar", " "):
@@ -7420,7 +7640,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Battery is the first status-bar element when enabled: prepend it
             # ahead of the leading ⚕ marker in whichever width tier ran above.
-            if battery_label:
+            if "battery" in fields and battery_label:
                 frags[0:0] = [
                     ("class:status-bar", " "),
                     (battery_style, battery_label),
