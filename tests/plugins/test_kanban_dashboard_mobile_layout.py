@@ -13,6 +13,11 @@ import pytest
 
 
 LANES = ["Triage", "Todo", "Ready", "In Progress", "Blocked", "Review", "Done", "scheduled"]
+MOBILE_ACCEPTANCE_WIDTHS = (320, 375, 390, 430)
+
+
+def test_mobile_acceptance_widths_match_issue_contract():
+    assert MOBILE_ACCEPTANCE_WIDTHS == (320, 375, 390, 430)
 
 
 def _task(task_id: str, status: str, *, assignee: str = "alpha", tenant: str = "acme") -> dict[str, Any]:
@@ -267,7 +272,7 @@ def _run_browser(
     return json.loads(result.stdout)
 
 
-@pytest.mark.parametrize("width", [320, 360, 390, 430])
+@pytest.mark.parametrize("width", MOBILE_ACCEPTANCE_WIDTHS)
 def test_real_app_exposes_and_activates_every_mobile_lane(app_fixture: Path, width: int):
     screenshot_dir = os.environ.get("KANBAN_SCREENSHOT_DIR")
     screenshot = Path(screenshot_dir) / f"kanban-mobile-{width}.png" if screenshot_dir else None
