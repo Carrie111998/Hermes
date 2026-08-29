@@ -182,37 +182,36 @@ HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS = (
     "fetch web content)."
 )
 
+# Memory guidance (#95681, consolidated): ONE builder, three variants by
+# config state — both stores on / notes-only impossible split kept simple:
+#   both or memory-only  -> "persistent memory"  (covers notes + profile)
+#   profile-only          -> adds the never-target='memory' restriction
+# The shared spine (form rule, staleness routing, capacity posture) is
+# written ONCE; variants differ only in their opening frame. WHAT belongs
+# in memory is the memory tool schema's job — never re-taught here.
+
+_MEMORY_GUIDANCE_SPINE = (
+    "Write entries as declarative facts, not instructions to yourself: "
+    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
+    "Imperative phrasing gets re-read as a directive in later sessions and "
+    "can override the user's current request. If a fact will be stale "
+    "within a week it belongs in session history, not memory; procedures "
+    "and workflows belong in skills. Storage has a hard character budget: "
+    "save proactively, and when it fills, replace or consolidate stale "
+    "entries in the same batch rather than skipping the save."
+)
+
 MEMORY_GUIDANCE = (
-    # Dieted (#95681, maintainer-directed): the memory tool's schema already
-    # teaches WHAT belongs in memory (save-worthy categories, the SKIP list,
-    # priorities) on every call — this block keeps only what the schema
-    # does NOT carry: the declarative-not-imperative form rule and the
-    # staleness/skills routing, stated once.
     "You have persistent memory across sessions, injected into every turn; "
-    "the memory tool's schema defines what belongs there. Write entries as "
-    "declarative facts, not instructions to yourself: 'User prefers concise "
-    "responses' ✓ — 'Always respond concisely' ✗. Imperative "
-    "phrasing gets re-read as a directive in later sessions and can override "
-    "the user's current request. If a fact will be stale within a week it "
-    "belongs in session history, not memory; procedures and workflows belong "
-    "in skills. Memory has a hard character budget: save proactively, and "
-    "when it fills, replace or consolidate stale entries in the same batch "
-    "rather than skipping the save."
+    "the memory tool's schema defines what belongs there. "
+    + _MEMORY_GUIDANCE_SPINE
 )
 
 USER_PROFILE_GUIDANCE = (
-    # Same diet as MEMORY_GUIDANCE: schema teaches what belongs; this block
-    # keeps the target restriction + the form rule.
-    "You have a persistent user profile across sessions, injected into every "
-    "turn; save durable facts about the user with the memory tool "
+    "You have a persistent user profile across sessions, injected into "
+    "every turn; save durable facts about the user with the memory tool "
     "(target='user') — the built-in notes store is disabled, so never "
-    "target='memory'. Write entries as declarative facts, not instructions "
-    "to yourself: 'User prefers concise responses' ✓ — 'Always "
-    "respond concisely' ✗. Imperative phrasing gets re-read as a "
-    "directive in later sessions and can override the user's current request. "
-    "The profile has a hard character budget: save proactively, and when it "
-    "fills, replace or consolidate stale entries in the same batch rather "
-    "than skipping the save."
+    "target='memory'. " + _MEMORY_GUIDANCE_SPINE
 )
 
 SESSION_SEARCH_GUIDANCE = (
