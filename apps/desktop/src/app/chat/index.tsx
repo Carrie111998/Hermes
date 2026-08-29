@@ -83,6 +83,7 @@ import { advanceTranscriptWindow, type TranscriptWindowState } from './transcrip
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
+  reasoningMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
   onCancel: () => Promise<void> | void
@@ -359,6 +360,7 @@ const ChatViewContent = memo(function ChatViewContent({
   className,
   gateway,
   modelMenuContent,
+  reasoningMenuContent,
   onToggleSelectedPin,
   onDeleteSelectedSession,
   onCancel,
@@ -413,6 +415,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const currentCwd = useStore(view.$cwd)
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
+  const currentReasoningEffort = useStore(view.$reasoningEffort)
   // A pet anywhere (in-window or popped out) owns the hearts; composer only when none.
   const petActive = useStore($petActive)
   const petOverlayActive = useStore($petOverlayActive)
@@ -548,6 +551,12 @@ const ChatViewContent = memo(function ChatViewContent({
     [currentModel, currentProvider, modelOptionsQuery.data]
   )
 
+  const currentProviderOptions = modelOptionsQuery.data?.providers?.find(
+    provider => provider.slug === currentProvider || (provider.aliases?.includes(currentProvider) ?? false)
+  )
+
+  const supportsReasoning = currentProviderOptions?.capabilities?.[currentModel]?.reasoning ?? true
+
   const chatBarState = useMemo<ChatBarState>(
     () => ({
       model: {
@@ -556,7 +565,10 @@ const ChatViewContent = memo(function ChatViewContent({
         canSwitch: gatewayOpen,
         loading: !gatewayOpen || (!currentModel && !currentProvider),
         modelMenuContent,
-        quickModels
+        quickModels,
+        reasoningEffort: currentReasoningEffort,
+        reasoningMenuContent,
+        supportsReasoning
       },
       tools: {
         enabled: true,
@@ -568,7 +580,17 @@ const ChatViewContent = memo(function ChatViewContent({
         active: false
       }
     }),
-    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels]
+    [
+      contextSuggestions,
+      currentModel,
+      currentProvider,
+      currentReasoningEffort,
+      gatewayOpen,
+      modelMenuContent,
+      quickModels,
+      reasoningMenuContent,
+      supportsReasoning
+    ]
   )
 
   // Drop files anywhere in the conversation area, not just on the composer
