@@ -167,6 +167,40 @@ class TestRealProfileCdpLaunch:
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
 
+    def test_launch_env_includes_managed_node_dir(self, tmp_path):
+        import tools.browser_tool as bt
+        self._reset()
+        proc = Mock(returncode=0, stdout="", stderr="")
+        base_path = r"C:\Windows\System32"
+        managed_path = os.pathsep.join(
+            [r"C:\Users\test\AppData\Local\hermes\node", base_path]
+        )
+        captured = {}
+
+        def fake_run(_argv, **kwargs):
+            captured.update(kwargs)
+            return proc
+
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
+             patch.object(bt, "_agent_browser_get_cdp",
+                          side_effect=[None, "http://127.0.0.1:41000"]), \
+             patch.object(bt, "_find_agent_browser", return_value=r"C:\hermes\node\npx.CMD"), \
+             patch("tools.environments.local.hermes_subprocess_env",
+                   return_value={"PATH": base_path, "SCRUBBED": "1"}), \
+             patch.object(bt, "_merge_browser_path", return_value=managed_path) as merge_path, \
+             patch.object(bt.subprocess, "run", side_effect=fake_run), \
+             patch.object(bt, "_is_headed_mode", return_value=False):
+            cdp, err = bt._real_profile_cdp()
+
+        assert err is None
+        assert cdp == "http://127.0.0.1:41000"
+        merge_path.assert_called_once_with(base_path)
+        assert captured["env"]["PATH"] == managed_path
+        assert captured["env"]["SCRUBBED"] == "1"
+        self._reset()
+
     def test_launch_never_passes_headless(self, tmp_path):
         """--headless would use a separate cookie store → 0 real cookies."""
         import tools.browser_tool as bt
