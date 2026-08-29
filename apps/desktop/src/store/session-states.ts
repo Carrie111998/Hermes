@@ -82,10 +82,17 @@ export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 // ---------------------------------------------------------------------------
 
 const sessionScopeByRuntimeId = new Map<string, string>()
+// Exact owner evidence from an inbound registry event. Keep this separately
+// from the liveness scope string so session-scoped RPCs can route an orphan
+// runtime through the socket that actually delivered its approval request.
+const sessionOwnerByRuntimeId = new Map<string, SessionOwnerRoute>()
 
 export function recordSessionEventScope(event: { connectionId?: string; profile?: string; session_id?: string }): void {
   if (event.session_id && event.connectionId) {
-    sessionScopeByRuntimeId.set(event.session_id, registryBackendScopeKey(event.connectionId, event.profile))
+    const connectionId = event.connectionId.trim()
+    const profile = normalizeProfileKey(event.profile)
+    sessionScopeByRuntimeId.set(event.session_id, registryBackendScopeKey(connectionId, profile))
+    sessionOwnerByRuntimeId.set(event.session_id, { connectionId, profile })
   }
 }
 
@@ -506,6 +513,7 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
   clearSessionProviderWait(runtimeId)
   sessionScopeByRuntimeId.delete(runtimeId)
+  sessionOwnerByRuntimeId.delete(runtimeId)
 
   const current = $sessionStates.get()
   setSessionStalled(current[runtimeId]?.storedSessionId, false)
@@ -532,6 +540,7 @@ export function clearAllSessionStates() {
   settledExpiry.clear()
   clearAllProviderWaits()
   sessionScopeByRuntimeId.clear()
+  sessionOwnerByRuntimeId.clear()
   $stalledSessionIds.set([])
   $sessionStates.set({})
 }
@@ -980,11 +989,15 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
 
   const storedSessionId = storedSessionIdForRuntimeId(sessionId) ?? sessionId
 
-  return (
+  const durableOwner =
     sessionTileOwnerRoute(storedSessionId) ??
     getSessionOwnerHint(storedSessionId) ??
     knownSessionOwner(ownerLookupSessionRows(), storedSessionId)
-  )
+
+  // The inbound event's owner is exact even when the runtime/stored binding
+  // has not reached the session ledger yet. Durable tile/hint/row identity
+  // outranks it, so a stale runtime id can never override a stored collision.
+  return durableOwner ?? sessionOwnerByRuntimeId.get(sessionId)
 }
 
 /**

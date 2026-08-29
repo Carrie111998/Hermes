@@ -9,6 +9,7 @@ import {
   clearAllSessionStates,
   knownOwnerForSession,
   publishSessionState,
+  recordSessionEventScope,
   requestForOwnedSession,
   storedSessionIdForRuntimeId
 } from '@/store/session-states'
@@ -107,6 +108,19 @@ describe('knownOwnerForSession / requestForOwnedSession', () => {
 
     setSessions([makeSessionInfo({ id: 'stored-main', profile: 'coder' })])
     expect(knownOwnerForSession('rt-main')).toBe('coder')
+  })
+
+  it('uses the exact inbound event owner when the runtime has no durable row yet', () => {
+    recordSessionEventScope({ connectionId: 'conn-approval', profile: 'work', session_id: 'rt-orphan' })
+
+    expect(knownOwnerForSession('rt-orphan')).toEqual({ connectionId: 'conn-approval', profile: 'work' })
+  })
+
+  it('keeps durable stored-session ownership ahead of a colliding runtime event', () => {
+    recordSessionEventScope({ connectionId: 'stale-source', profile: 'default', session_id: 'collision' })
+    setSessions([{ connection_id: 'durable-source', id: 'collision', profile: 'default' } as never])
+
+    expect(knownOwnerForSession('collision')).toEqual({ connectionId: 'durable-source', profile: 'default' })
   })
 
   it('fails closed with an explicit owner-resolution error instead of the ambient socket', async () => {
