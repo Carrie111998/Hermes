@@ -122,7 +122,10 @@ export function fitScale(viewport: { height: number; width: number }, available:
 
   const scale = Math.min(1, width / Math.max(1, viewport.width), height / Math.max(1, viewport.height))
 
-  return Math.max(0.05, Math.round(scale * 1000) / 1000)
+  // Floored, never rounded: rounding UP produced a frame one pixel taller than
+  // the pane (a 820x1180 tablet in 500x560 gave 390x561), which is a scrollbar
+  // on a preview that is supposed to fit. Caught in a real Electron guest.
+  return Math.max(0.05, Math.floor(scale * 1000) / 1000)
 }
 
 /** The element size that makes the emulated page fill it exactly. */

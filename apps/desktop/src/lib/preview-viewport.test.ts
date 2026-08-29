@@ -73,6 +73,24 @@ describe('viewportFit', () => {
     expect(frame.width).toBeLessThanOrEqual(500)
   })
 
+  it('never overflows the pane it was asked to fit', () => {
+    // Rounding the scale up put a 820x1180 tablet at 390x561 inside a 500x560
+    // pane — one pixel of overflow is a scrollbar. Found in a real guest, so
+    // check every preset against a few awkward pane sizes rather than one.
+    for (const preset of VIEWPORT_PRESETS) {
+      for (const pane of [
+        { height: 560, width: 500 },
+        { height: 337, width: 1201 },
+        { height: 999, width: 333 },
+        { height: 2000, width: 2000 }
+      ]) {
+        const { frame } = viewportFit(preset, pane)
+        expect(frame.width, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.width)
+        expect(frame.height, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.height)
+      }
+    }
+  })
+
   it('leaves a fitting page at its own size', () => {
     expect(viewportFit(PHONE, { height: 1000, width: 800 })).toEqual({ frame: PHONE, scale: 1 })
   })
