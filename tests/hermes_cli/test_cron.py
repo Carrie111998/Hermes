@@ -131,19 +131,122 @@ class TestCronCommandLifecycle:
 
 
 class TestGatewayNotRunningWarning:
-    """`cron create` / `cron list` must warn when the gateway (and thus the
-    cron ticker) isn't running, since jobs only fire inside the gateway.
+    """`cron create` / `cron list` must warn when neither the gateway nor the
+    Desktop backend is hosting the built-in cron ticker.
     Regression guard for #51038 — the most common cron 'jobs never fired'
-    report was simply a gateway that was never started.
+    report was simply a scheduler host that was never started.
     """
 
 
     def test_list_warns_when_gateway_absent(self, tmp_cron_dir, capsys, monkeypatch):
         create_job(prompt="Daily report", schedule="0 11 * * *")
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: None)
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
-        assert "Gateway is not running" in out
+        assert "No built-in cron scheduler is running" in out
+
+    def test_list_silent_when_desktop_ticker_heartbeat_is_fresh(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        create_job(prompt="Daily report", schedule="0 11 * * *")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda: False)
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 5.0)
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        assert "No built-in cron scheduler is running" not in capsys.readouterr().out
+
+    def test_list_warns_when_desktop_ticker_heartbeat_is_stale(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        create_job(prompt="Daily report", schedule="0 11 * * *")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda: False)
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 201.0)
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        assert "No built-in cron scheduler is running" in capsys.readouterr().out
+
+    def test_status_reports_desktop_ticker_without_gateway_pid(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        create_job(prompt="Daily report", schedule="0 11 * * *")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda: False)
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 5.0)
+        monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: 5.0)
+
+        cron_command(Namespace(cron_command="status"))
+
+        out = capsys.readouterr().out
+        assert "Cron ticker is running" in out
+        assert "jobs will fire" in out
+        assert "will NOT fire" not in out
+
+    def test_status_does_not_claim_healthy_without_success_marker(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        create_job(prompt="Daily report", schedule="0 11 * * *")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda: False)
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 5.0)
+        monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: None)
+
+        cron_command(Namespace(cron_command="status"))
+
+        out = capsys.readouterr().out
+        assert "no successful tick" in out.lower()
+        assert "jobs will fire automatically" not in out
+
+    def test_status_does_not_claim_healthy_without_ticker_heartbeat(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        create_job(prompt="Daily report", schedule="0 11 * * *")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [12345])
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda: False)
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: None)
+        monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: None)
+
+        cron_command(Namespace(cron_command="status"))
+
+        out = capsys.readouterr().out
+        assert "no cron ticker heartbeat" in out.lower()
+        assert "jobs will fire automatically" not in out
+
+    def test_status_stale_desktop_heartbeat_uses_desktop_remediation(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        create_job(prompt="Daily report", schedule="0 11 * * *")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda: False)
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 201.0)
+        monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: 5.0)
+
+        cron_command(Namespace(cron_command="status"))
+
+        out = capsys.readouterr().out
+        assert "Desktop cron ticker looks STALLED" in out
+        assert "Restart Hermes Desktop" in out
+        assert "gateway restart" not in out
+
+    def test_status_desktop_tick_failure_uses_desktop_log_remediation(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        create_job(prompt="Daily report", schedule="0 11 * * *")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda: False)
+        monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 5.0)
+        monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: 201.0)
+        monkeypatch.setattr("cron.jobs.get_ticker_last_error", lambda: None)
+
+        cron_command(Namespace(cron_command="status"))
+
+        out = capsys.readouterr().out
+        assert "Check the Desktop backend log for 'Cron tick error'" in out
+        assert "gateway log" not in out
 
 
 class TestExternalCronProviderStatus:
@@ -171,7 +274,7 @@ class TestExternalCronProviderStatus:
         assert "managed scheduler" in out
         assert "not firing" not in out.lower()
         assert "STALLED" not in out
-        assert "Gateway is not running" not in out
+        assert "No built-in cron scheduler is running" not in out
         # Still surfaces the active-job summary.
         assert "active job(s)" in out
 
@@ -202,7 +305,7 @@ class TestExternalCronProviderStatus:
         )
         out = capsys.readouterr().out
         assert "Created job" in out
-        assert "Gateway is not running" not in out
+        assert "No built-in cron scheduler is running" not in out
 
 
 def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
@@ -226,7 +329,7 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
     cron_cli.cron_list()
 
     out = capsys.readouterr().out
-    assert "Gateway is not running" in out
+    assert "No built-in cron scheduler is running" in out
     assert "Nightly docs" in out
 
 

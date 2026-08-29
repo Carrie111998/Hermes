@@ -83,6 +83,22 @@ class TestCreateSurfacesGatewayLiveness:
         )
         assert "gateway" in warning.lower()
 
+    def test_create_with_desktop_ticker_heartbeat_has_no_warning(self, hermes_env):
+        with patch_liveness(provider="builtin", pids=[], heartbeat_age=5.0):
+            result = _create_job()
+
+        assert result["success"] is True
+        assert result["gateway_running"] is True
+        assert "warning" not in result
+
+    def test_create_with_stale_desktop_ticker_heartbeat_warns(self, hermes_env):
+        with patch_liveness(provider="builtin", pids=[], heartbeat_age=201.0):
+            result = _create_job()
+
+        assert result["success"] is True
+        assert result["gateway_running"] is False
+        assert "will NOT fire" in result.get("warning", "")
+
     def test_non_builtin_provider_is_exempt(self, hermes_env):
         """External schedulers (e.g. Chronos) fire without the gateway —
         no false alarm may be raised for them."""
@@ -172,10 +188,11 @@ class _LivenessPatches:
     to exercise the lock-first path itself.
     """
 
-    def __init__(self, *, provider, pids, lock_active=False):
+    def __init__(self, *, provider, pids, lock_active=False, heartbeat_age=None):
         self._provider = provider
         self._pids = pids
         self._lock_active = lock_active
+        self._heartbeat_age = heartbeat_age
 
     def __enter__(self):
         from unittest.mock import patch
@@ -205,14 +222,25 @@ class _LivenessPatches:
                 return_value=self._lock_active,
             )
         )
+        self._stack.enter_context(
+            patch(
+                "cron.jobs.get_ticker_heartbeat_age",
+                return_value=self._heartbeat_age,
+            )
+        )
         return self
 
     def __exit__(self, *exc):
         return self._stack.__exit__(*exc)
 
 
-def patch_liveness(*, provider, pids, lock_active=False):
-    return _LivenessPatches(provider=provider, pids=pids, lock_active=lock_active)
+def patch_liveness(*, provider, pids, lock_active=False, heartbeat_age=None):
+    return _LivenessPatches(
+        provider=provider,
+        pids=pids,
+        lock_active=lock_active,
+        heartbeat_age=heartbeat_age,
+    )
 
 
 class TestRuntimeLockFirstLiveness:
@@ -260,6 +288,22 @@ class TestRuntimeLockFirstLiveness:
             patch("hermes_cli.gateway.find_gateway_pids", return_value=[]),
         ):
             assert cron_cli._builtin_gateway_liveness() is False
+
+    def test_pid_probe_failure_still_uses_fresh_desktop_heartbeat(self):
+        from unittest.mock import patch
+
+        import hermes_cli.cron as cron_cli
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch("gateway.status.is_gateway_runtime_lock_active", return_value=False),
+            patch(
+                "hermes_cli.gateway.find_gateway_pids",
+                side_effect=OSError("pid probe failed"),
+            ),
+            patch("cron.jobs.get_ticker_heartbeat_age", return_value=5.0),
+        ):
+            assert cron_cli._builtin_gateway_liveness() is True
 
     def test_lock_probe_failure_still_falls_back(self):
         """A crashing lock probe must not poison the tri-state helper —

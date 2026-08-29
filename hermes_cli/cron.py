@@ -64,20 +64,43 @@ def _active_cron_provider_name() -> str:
         return "builtin"
 
 
+def _builtin_ticker_heartbeat_state() -> tuple[Optional[bool], Optional[float]]:
+    """Return ``(alive, age)`` for the built-in ticker heartbeat.
+
+    A fresh heartbeat proves that a scheduler loop is active regardless of
+    whether it is hosted by ``gateway run`` or the Desktop ``hermes serve``
+    backend. ``None`` liveness means the probe itself failed.
+    """
+    try:
+        from cron.jobs import get_ticker_heartbeat_age, TICKER_INTERVAL_SECONDS
+
+        age = get_ticker_heartbeat_age()
+        stale_after = TICKER_INTERVAL_SECONDS * 3 + 20
+        return (age is not None and age <= stale_after), age
+    except Exception:
+        return None, None
+
+
 def _builtin_gateway_liveness() -> Optional[bool]:
     """Tri-state liveness of the builtin cron scheduler's trigger.
 
     Single source of truth shared by the CLI (``_warn_if_gateway_not_running``)
-    and the ``cronjob`` model tool (#87033): the builtin ticker only runs
-    inside the gateway process, so a scheduled job with no live gateway can
-    never fire. Non-builtin providers (e.g. Chronos) fire through their own
-    machinery and are deliberately exempt — a missing gateway process means
-    nothing for them, so they report active. ``None`` = probe failed; callers
-    must not claim either way.
+    and the ``cronjob`` model tool (#87033). The built-in ticker may run inside
+    either the gateway or the Desktop backend, so process liveness and a fresh
+    ticker heartbeat are independent positive signals. Non-builtin providers
+    (e.g. Chronos) fire through their own machinery and are deliberately exempt.
+    ``None`` = probe failed; callers must not claim either way.
     """
     try:
         if _active_cron_provider_name() != "builtin":
             return True  # external provider fires jobs without the gateway
+    except Exception:
+        return None
+
+    # Probe each built-in scheduler host independently. A failed PID scan must
+    # not hide a fresh Desktop heartbeat, and a failed heartbeat read must not
+    # hide a live gateway process.
+    try:
         # The gateway runtime lock is held for exactly the gateway's lifetime, so it
         # is a more reliable "is the ticker's process alive" signal than PID scanning
         # — and inside the gateway process it short-circuits to True, so the in-gateway
@@ -89,30 +112,38 @@ def _builtin_gateway_liveness() -> Optional[bool]:
             if is_gateway_runtime_lock_active():
                 return True
         except Exception:
-            # A crashing lock probe is "unknown", not "dead" — let the pid
-            # scan below still decide instead of collapsing the whole
-            # tri-state to None.
+            # A crashing lock probe must not prevent the independent PID and
+            # heartbeat probes below from deciding liveness.
             pass
         from hermes_cli.gateway import find_gateway_pids
 
-        return bool(find_gateway_pids())
+        try:
+            pid_alive: Optional[bool] = bool(find_gateway_pids())
+        except Exception:
+            pid_alive = None
     except Exception:
-        return None
+        pid_alive = None
+
+    heartbeat_alive, _age = _builtin_ticker_heartbeat_state()
+    if pid_alive is True or heartbeat_alive is True:
+        return True
+    if pid_alive is False and heartbeat_alive is False:
+        return False
+    return None
 
 
 def _warn_if_gateway_not_running() -> None:
-    """Warn that scheduled jobs won't fire unless the gateway is running.
+    """Warn when no built-in scheduler host appears to be running.
 
-    The cron ticker only runs inside the gateway (``_start_cron_ticker`` in
-    gateway/run.py); there is no standalone cron daemon. Without a running
-    gateway, ``next_run_at`` passes but jobs never fire and ``last_run_at``
+    The ticker can run in either the gateway or the Desktop backend. Without
+    either host, ``next_run_at`` passes but jobs never fire and ``last_run_at``
     stays null — the most common cron support report (#51038). Surfacing this
     at create/list time, when the user is right there, prevents it.
 
     An external provider (e.g. Chronos) fires jobs via a NAS-mediated webhook,
     NOT the in-process ticker, so a momentarily-absent gateway process does not
     mean jobs won't fire — the warning would be a false alarm. Stay quiet for
-    any non-builtin provider; the gateway-process heuristic only speaks to the
+    any non-builtin provider; these local liveness signals only speak to the
     built-in ticker's trigger.
     """
     # _builtin_gateway_liveness never raises (it maps probe failures to None),
@@ -120,8 +151,9 @@ def _warn_if_gateway_not_running() -> None:
     if _builtin_gateway_liveness() is not False:
         return
 
-    print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
-    print(color("     Start it with: hermes gateway install", Colors.DIM))
+    print(color("  ⚠  No built-in cron scheduler is running — jobs won't fire automatically.", Colors.YELLOW))
+    print(color("     Open Hermes Desktop, or start the gateway with:", Colors.DIM))
+    print(color("                    hermes gateway install", Colors.DIM))
     print(color("                    sudo hermes gateway install --system  # Linux servers", Colors.DIM))
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
@@ -403,7 +435,11 @@ def cron_status():
         print()
         return
 
-    pids = find_gateway_pids()
+    pids: list[object]
+    try:
+        pids = list(find_gateway_pids())
+    except Exception:
+        pids = []
     gateway_alive_via_lock = False
     if not pids:
         # Same false-alarm class the cronjob tool fixed (#95947): the pid scan
@@ -421,14 +457,16 @@ def cron_status():
                     pids = [lock_pid]
         except Exception:
             pass
-    if pids or gateway_alive_via_lock:
-        # The gateway PROCESS is alive — but the cron ticker THREAD inside it
-        # can die silently, or stay alive while every tick fails. Check both
-        # the liveness heartbeat and the last-successful-tick marker so we
-        # don't report "will fire" when the ticker is dead or failing
+    _, heartbeat_age = _builtin_ticker_heartbeat_state()
+    gateway_alive = bool(pids) or gateway_alive_via_lock
+    desktop_ticker = not gateway_alive and heartbeat_age is not None
+    scheduler_detected = gateway_alive or heartbeat_age is not None
+    if scheduler_detected:
+        # A scheduler host can remain alive while its ticker thread dies, or
+        # while every tick fails. Require both the heartbeat and the
+        # last-successful-tick marker before claiming jobs will fire
         # (#32612, #32895).
         from cron.jobs import (
-            get_ticker_heartbeat_age,
             get_ticker_last_error,
             get_ticker_success_age,
             TICKER_INTERVAL_SECONDS,
@@ -439,29 +477,56 @@ def cron_status():
         # trouble. Derived from the shared interval constant so this threshold
         # tracks the ticker cadence instead of assuming a hardcoded 60s.
         STALE_AFTER = TICKER_INTERVAL_SECONDS * 3 + 20  # = 200s at the 60s default
-        hb_age = get_ticker_heartbeat_age()
+        hb_age = heartbeat_age
         ok_age = get_ticker_success_age()
+        host_name = "Desktop" if desktop_ticker else "Gateway"
+        ticker_subject = (
+            "Desktop cron ticker"
+            if desktop_ticker
+            else "Gateway and cron ticker"
+        )
 
-        if hb_age is not None and hb_age > STALE_AFTER:
-            # No heartbeat at all → the ticker thread is gone.
+        if hb_age is None:
             print(color(
-                "⚠ Gateway is running but the cron ticker looks STALLED — "
+                f"⚠ {host_name} is running, but no cron ticker heartbeat has "
+                "been recorded — jobs may NOT be firing.",
+                Colors.YELLOW,
+            ))
+            if pids:
+                print(f"  PID: {', '.join(str(pid) for pid in pids)}")
+            print("  Check the gateway log for 'Cron tick error'.")
+        elif hb_age > STALE_AFTER:
+            # A stale heartbeat means the ticker thread has stopped advancing.
+            print(color(
+                f"⚠ {ticker_subject} looks STALLED — "
                 f"no heartbeat for {int(hb_age)}s (expected every ~60s).",
                 Colors.YELLOW,
             ))
             if pids:
-                print(f"  PID: {', '.join(map(str, pids))}")
-            print("  Cron jobs may NOT be firing. Restart: hermes gateway restart")
-        elif hb_age is not None and ok_age is not None and ok_age > STALE_AFTER:
-            # Loop is alive (fresh heartbeat) but no tick has SUCCEEDED in a
-            # long time → ticks are failing every iteration.
+                print(f"  PID: {', '.join(str(pid) for pid in pids)}")
+            if desktop_ticker:
+                print("  Cron jobs may NOT be firing. Restart Hermes Desktop.")
+            else:
+                print("  Cron jobs may NOT be firing. Restart: hermes gateway restart")
+        elif ok_age is None or ok_age > STALE_AFTER:
+            # The loop is alive, but it has never succeeded or has failed for
+            # several iterations. Neither case is evidence that jobs will fire.
+            subject = (
+                "Desktop cron ticker is running"
+                if desktop_ticker
+                else "Gateway and cron ticker are running"
+            )
+            if ok_age is None:
+                success_detail = "no successful tick has been recorded"
+            else:
+                success_detail = f"no tick has succeeded in {int(ok_age)}s"
             print(color(
-                "⚠ Gateway and cron ticker are running, but no tick has "
-                f"succeeded in {int(ok_age)}s — ticks may be failing.",
+                f"⚠ {subject}, but {success_detail} — "
+                "ticks may be failing.",
                 Colors.YELLOW,
             ))
             if pids:
-                print(f"  PID: {', '.join(map(str, pids))}")
+                print(f"  PID: {', '.join(str(pid) for pid in pids)}")
             last_error = get_ticker_last_error()
             if last_error:
                 # Show WHY ticks fail — e.g. a root-rewritten jobs.json
@@ -475,28 +540,41 @@ def cron_status():
                         "  Hint: jobs.json may be owned by another user "
                         "(e.g. rewritten by a root `docker exec hermes "
                         "hermes cron ...`). Fix ownership to match the "
-                        "gateway user, and prefer `docker exec -u <uid>:<gid>`.",
+                        "scheduler user, and prefer `docker exec -u <uid>:<gid>`.",
                         Colors.YELLOW,
                     ))
                 elif _cron_is_fd_exhaustion_text(last_error):
+                    restart_target = (
+                        "restart Hermes Desktop"
+                        if desktop_ticker
+                        else "restart the gateway"
+                    )
                     print(color(
                         "  Hint: the ticker hit file-descriptor exhaustion "
                         "(EMFILE). The scheduler now retries with backoff and "
                         "attempts fd reclamation, but if the leak persists, "
-                        "restart the gateway to recover scheduling.",
+                        f"{restart_target} to recover scheduling.",
                         Colors.YELLOW,
                     ))
-            print("  Check the gateway log for 'Cron tick error'.")
+            if desktop_ticker:
+                print("  Check the Desktop backend log for 'Cron tick error'.")
+            else:
+                print("  Check the gateway log for 'Cron tick error'.")
         else:
-            print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
+            if desktop_ticker:
+                message = "✓ Cron ticker is running — jobs will fire automatically"
+            else:
+                message = "✓ Gateway is running — cron jobs will fire automatically"
+            print(color(message, Colors.GREEN))
             if pids:
-                print(f"  PID: {', '.join(map(str, pids))}")
+                print(f"  PID: {', '.join(str(pid) for pid in pids)}")
             if hb_age is not None:
                 print(f"  Ticker heartbeat: {int(hb_age)}s ago")
     else:
-        print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
+        print(color("✗ No built-in cron scheduler is running — cron jobs will NOT fire", Colors.RED))
         print()
         print("  To enable automatic execution:")
+        print("    Open Hermes Desktop       # Its backend hosts the cron ticker")
         print("    hermes gateway install    # Install as a user service")
         print("    sudo hermes gateway install --system  # Linux servers: boot-time system service")
         print("    hermes gateway            # Or run in foreground")
