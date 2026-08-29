@@ -149,6 +149,31 @@ class TodoStore:
 
         return "\n".join(lines)
 
+    def format_for_display(self) -> Optional[str]:
+        """Render the whole list for a user-facing surface such as ``/todo``.
+
+        Unlike ``format_for_injection``, this keeps completed and cancelled
+        items so the reader sees progress, and it omits the compression
+        header. Returns ``None`` when the list is empty.
+        """
+        if not self._items:
+            return None
+
+        markers = {
+            "completed": "[x]",
+            "in_progress": "[>]",
+            "pending": "[ ]",
+            "cancelled": "[~]",
+        }
+        lines = []
+        for item in self._items:
+            marker = markers.get(item["status"], "[?]")
+            lines.append(f"{marker} {item['content']}")
+
+        done = sum(1 for i in self._items if i["status"] == "completed")
+        lines.append(f"\n{done}/{len(self._items)} done")
+        return "\n".join(lines)
+
     @staticmethod
     def _cap_content(content: str) -> str:
         """Truncate oversized todo content to MAX_TODO_CONTENT_CHARS.
