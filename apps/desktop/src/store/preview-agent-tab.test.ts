@@ -12,7 +12,14 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { selectRightRailTab } from './layout'
-import { $previewTabs, closeRightRail, newBrowserTab, openBrowserTab, openPreview } from './preview'
+import {
+  $previewTabs,
+  closeRightRail,
+  decodePreviewTabs,
+  newBrowserTab,
+  openBrowserTab,
+  openPreview
+} from './preview'
 
 const url = (host: string) => ({
   kind: 'url' as const,
@@ -103,6 +110,33 @@ describe('agent browser tabs', () => {
     expect(tabs).toHaveLength(1)
     expect(tabs[0]?.target.url).toBe('https://two.com')
     expect(tabs[0]?.agent).toBeFalsy()
+  })
+
+  // Ownership is persisted, and the restore path validates tabs field by
+  // field. If the flag were dropped on the way back in, the agent would come
+  // up after a restart believing it owned nothing — and take the first browser
+  // tab it found, which is the original bug wearing a hat.
+  it('still owns its tab after a restart', () => {
+    openPreview(url('agent.com'), 'tool-result')
+    newBrowserTab()
+
+    const saved = JSON.stringify($previewTabs.get())
+    const restored = decodePreviewTabs(saved)
+
+    expect(restored).toHaveLength(2)
+    expect(restored[0]?.agent).toBe(true)
+    expect(restored[1]?.agent).toBeFalsy()
+
+    // And the rule still holds against the restored list.
+    $previewTabs.set(restored)
+    selectRightRailTab(restored[1]!.id)
+    openPreview(url('after-restart.com'), 'tool-result')
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(2)
+    expect(tabs[0]?.target.url).toBe('https://after-restart.com')
+    expect(tabs[1]?.target.url).toBe('about:blank')
   })
 
   // `openBrowserTab` is the hotkey: "show me the browser". With only the
