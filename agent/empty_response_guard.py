@@ -234,20 +234,21 @@ def record_empty_attempt(agent: Any, *, finish_reason: str, response: Any) -> No
 def deterministic_empty(agent: Any) -> bool:
     """True when the current streak looks deterministic.
 
-    Requires >= 2 consecutive attempts, ALL with usage present, zero
-    output tokens, and an identical (model, provider, finish_reason)
-    signature. Any attempt with missing usage or non-zero output keeps
-    this False (fail open — transients deserve their retries).
+    Requires >= 2 consecutive attempts, with the trailing attempts ALL having
+    usage present, zero output tokens, and an identical
+    (model, provider, finish_reason) signature. Any trailing attempt with
+    missing usage or non-zero output keeps this False (fail open — transients
+    deserve their retries).
     """
     if not guard_enabled(agent):
         return False
     attempts = getattr(agent, _ATTEMPTS_ATTR, None) or []
     if len(attempts) < 2:
         return False
-    first = attempts[0]
-    return all(
-        a.usage_present and a.zero_output and a.signature == first.signature
-        for a in attempts
+    last_two = attempts[-2:]
+    return (
+        all(a.usage_present and a.zero_output for a in last_two)
+        and last_two[0].signature == last_two[1].signature
     )
 
 
