@@ -350,6 +350,34 @@ def test_public_url_aware_gate_preserves_local_only_mode(monkeypatch):
     assert should_require_dashboard_auth("127.0.0.1") is False
 
 
+def test_headless_loopback_ignores_external_dashboard_public_url(monkeypatch):
+    """Desktop's private serve child must keep ephemeral-token auth.
+
+    ``dashboard.public_url`` describes a browser-facing reverse-proxy
+    deployment.  It must not turn a loopback-only, headless control plane into
+    gated browser mode, where the Desktop's freshly minted WebSocket token is
+    rejected in favour of an OAuth ticket.
+    """
+    from hermes_cli.web_server import should_require_dashboard_auth
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    assert should_require_dashboard_auth("127.0.0.1", headless=True) is False
+
+
+def test_headless_non_loopback_bind_still_requires_auth(monkeypatch):
+    """Headless mode never weakens the non-loopback security boundary."""
+    from hermes_cli.web_server import should_require_dashboard_auth
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    assert should_require_dashboard_auth("100.64.0.1", headless=True) is True
+
+
 def test_start_server_loopback_public_url_enables_gate(monkeypatch):
     """A declared external URL turns a loopback reverse proxy into gated mode."""
     from hermes_cli.dashboard_auth import clear_providers, register_provider
@@ -382,6 +410,39 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()
+
+
+def test_start_server_headless_loopback_public_url_keeps_token_mode(monkeypatch):
+    """The real start path must preserve Desktop token auth on loopback."""
+    from hermes_cli.dashboard_auth import clear_providers
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=9119,
+        open_browser=False,
+        allow_public=False,
+        headless=True,
+    )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset(
+        {"dashboard.example.test"}
+    )
+    assert captured["kwargs"].get("proxy_headers") is False
 
 
 def test_start_server_loopback_public_url_without_provider_fails_closed(monkeypatch):

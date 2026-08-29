@@ -17,11 +17,9 @@ import { TextTab } from '@/components/ui/text-tab'
 import { Textarea } from '@/components/ui/textarea'
 import { Tip } from '@/components/ui/tooltip'
 import {
-  authMcpServer,
   getActionStatus,
   getLogs,
   getMcpCatalog,
-  getMcpOAuthFlow,
   getUsageAnalytics,
   type HermesGateway,
   installMcpCatalogEntry,
@@ -36,8 +34,8 @@ import { type Translations, useI18n } from '@/i18n'
 import { compactNumber } from '@/lib/format'
 import { brandFor } from '@/lib/mcp-brands'
 import { estimateServerTokens, serverUsageCount } from '@/lib/mcp-cost'
-import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
 import { type McpImportEntry, parseMcpImport } from '@/lib/mcp-import'
+import { completeRoutedMcpDesktopOAuth } from '@/lib/mcp-oauth-routing'
 import { NEEDS_AUTH_RE, PROBE_TTL_MS, probeCache, probeKey, serverFingerprint } from '@/lib/mcp-probe-cache'
 import { getServers, isServerShape, type McpServers, normalizeEntry } from '@/lib/mcp-servers'
 import { countEnabledTools, isToolEnabled, toggleToolInServer } from '@/lib/mcp-tool-filter'
@@ -609,10 +607,9 @@ export function McpTab({ gateway, profile }: { gateway: HermesGateway | null; pr
     setProbes(current => ({ ...current, [serverName]: 'probing' }))
 
     try {
-      const flow = await completeMcpDesktopOAuth({
+      const flow = await completeRoutedMcpDesktopOAuth({
         serverName,
-        start: name => authMcpServer(name, profile ?? undefined),
-        status: flowId => getMcpOAuthFlow(flowId, profile ?? undefined),
+        scope: profile ?? undefined,
         openExternal: url => window.hermesDesktop.openExternal(url)
       })
 

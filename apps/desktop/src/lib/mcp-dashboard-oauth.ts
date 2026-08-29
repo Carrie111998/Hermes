@@ -45,52 +45,63 @@ export async function completeMcpDesktopOAuth({
   maxPollFailures = 3
 }: CompleteOptions): Promise<McpOAuthFlow> {
   const started = await start(serverName)
+  let cleanedUp = false
 
-  if (started.status === 'error') {
-    throw new Error(started.error || 'OAuth failed to start')
+  const cleanup = async () => {
+    if (cleanedUp) {return}
+    cleanedUp = true
+    await cancel?.(started.flow_id).catch(() => {})
   }
 
-  if (!started.authorization_url) {
-    throw new Error('OAuth server did not provide an authorization URL')
-  }
-
-  await openExternal(started.authorization_url)
-
-  let pollFailures = 0
-
-  for (;;) {
-    if (cancelled?.()) {
-      // Free the backend slot before rejecting; best-effort — the flow also
-      // dies on its own timeout if this request is lost.
-      await cancel?.(started.flow_id).catch(() => {})
-      throw new McpOAuthCancelled()
+  try {
+    if (started.status === 'error') {
+      throw new Error(started.error || 'OAuth failed to start')
     }
 
-    let current: McpOAuthFlow
+    if (!started.authorization_url) {
+      throw new Error('OAuth server did not provide an authorization URL')
+    }
 
-    try {
-      current = await status(started.flow_id)
-      pollFailures = 0
-    } catch (error) {
-      pollFailures += 1
+    await openExternal(started.authorization_url)
+    let pollFailures = 0
 
-      if (pollFailures >= maxPollFailures) {
-        throw error
+    for (;;) {
+      if (cancelled?.()) {
+        await cleanup()
+        throw new McpOAuthCancelled()
+      }
+
+      let current: McpOAuthFlow
+
+      try {
+        current = await status(started.flow_id)
+        pollFailures = 0
+      } catch (error) {
+        pollFailures += 1
+
+        if (pollFailures >= maxPollFailures) {
+          throw error
+        }
+
+        await sleep(1000)
+
+        continue
+      }
+
+      if (current.status === 'approved') {
+        cleanedUp = true
+
+        return current
+      }
+
+      if (current.status === 'error') {
+        throw new Error(current.error || 'OAuth authorization failed')
       }
 
       await sleep(1000)
-
-      continue
     }
-
-    if (current.status === 'approved') {
-      return current
-    }
-
-    if (current.status === 'error') {
-      throw new Error(current.error || 'OAuth authorization failed')
-    }
-
-    await sleep(1000)
+  } catch (error) {
+    await cleanup()
+    throw error
   }
 }

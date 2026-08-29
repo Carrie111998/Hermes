@@ -1064,8 +1064,9 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
         ``tool_result`` blocks accept ``image`` content blocks.
       * OpenAI Chat Completions: tool messages accept array content with
         ``image_url`` parts.
-      * OpenAI Responses (``openai-codex``): ``function_call_output.output``
-        accepts an array of ``input_text``/``input_image`` items.
+      * The public OpenAI APIs accept multimodal content. The ChatGPT-account
+        Codex backend does not accept base64 ``input_image`` values inside
+        ``function_call_output``; it must use the auxiliary vision path.
       * Gemini 3 (and proxied via aggregators): supports multimodal tool
         results. Older Gemini does NOT.
 
@@ -1094,8 +1095,10 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
     if p in {"anthropic", "claude", "anthropic-direct"}:
         return True
 
-    # OpenAI Chat Completions and Responses
-    if p in {"openai", "openai-chat", "openai-codex", "azure-openai"}:
+    # OpenAI Chat Completions. Keep the ChatGPT-account Codex backend out of
+    # this allowlist: it rejects data:image/... values inside function output
+    # with HTTP 400 even though it supports image input on user messages.
+    if p in {"openai", "openai-chat", "azure-openai"}:
         return True
 
     # Gemini — gate on model name; older Gemini variants did not support
@@ -1145,6 +1148,11 @@ def _should_use_native_vision_fast_path() -> bool:
         model = _read_main_model()
         cfg = load_config()
         if decide_image_input_mode(provider, model, cfg) != "native":
+            return False
+        # The ChatGPT-account Codex endpoint supports images on user turns but
+        # rejects base64 images nested in function-call outputs. A generic
+        # supports_vision model override must not bypass that wire constraint.
+        if (provider or "").strip().lower() == "openai-codex":
             return False
         return (
             _supports_media_in_tool_results(provider, model)

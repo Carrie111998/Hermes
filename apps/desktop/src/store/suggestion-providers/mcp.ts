@@ -1,15 +1,13 @@
 import {
   addMcpServer,
-  authMcpServer,
-  cancelMcpOAuthFlow,
   getMcpCatalog,
-  getMcpOAuthFlow,
   listMcpServers,
   removeMcpServer
 } from '@/hermes'
 import { translateNow } from '@/i18n'
-import { completeMcpDesktopOAuth, McpOAuthCancelled } from '@/lib/mcp-dashboard-oauth'
+import { McpOAuthCancelled } from '@/lib/mcp-dashboard-oauth'
 import { MCP_DIRECTORY } from '@/lib/mcp-directory'
+import { completeRoutedMcpDesktopOAuth } from '@/lib/mcp-oauth-routing'
 import { prettyName } from '@/lib/text'
 import { type ComposerSuggestion, registerDraftProvider } from '@/store/composer-suggestions'
 import { $gateway } from '@/store/gateway'
@@ -194,12 +192,9 @@ async function connect(known: SuggestibleServer, sessionId: string | null, cance
     await addMcpServer({ name: known.server, url: known.url })
 
     try {
-      await completeMcpDesktopOAuth({
+      await completeRoutedMcpDesktopOAuth({
         serverName: known.server,
-        start: authMcpServer,
-        status: getMcpOAuthFlow,
         cancelled,
-        cancel: cancelMcpOAuthFlow,
         openExternal: url => window.hermesDesktop.openExternal(url)
       })
     } catch (error) {

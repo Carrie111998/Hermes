@@ -151,6 +151,20 @@ class TestToolResultContentShortCircuit:
         assert "data:image" not in out
         assert "image_url" not in out
 
+    def test_codex_account_backend_downgrades_tool_images(self, monkeypatch):
+        """ChatGPT Codex accepts user images but not images in tool output."""
+        agent = _make_agent(provider="openai-codex", model="gpt-5.6-sol")
+        agent._no_list_tool_content_models = set()
+        monkeypatch.setattr(agent, "_model_supports_vision", lambda: True)
+
+        out = agent._tool_result_content_for_active_model(
+            "computer_use", self._multimodal_result()
+        )
+
+        assert isinstance(out, str)
+        assert "data:image" not in out
+        assert "image_url" not in out
+
 
 
     def test_missing_cache_attribute_falls_through(self, monkeypatch):

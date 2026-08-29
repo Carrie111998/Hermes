@@ -7234,6 +7234,10 @@ class AIAgent:
         try:
             from providers import get_provider_profile
             provider = (getattr(self, "provider", "") or "").strip()
+            # The ChatGPT-account Codex endpoint supports images on user turns
+            # but rejects base64 input_image parts nested in function output.
+            if provider.lower() == "openai-codex":
+                return False
             profile = get_provider_profile(provider)
             if profile is not None:
                 return getattr(profile, "supports_vision_tool_messages", True)

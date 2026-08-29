@@ -337,3 +337,24 @@ def poll_flow(session_id: str, server_name: str) -> Dict[str, Any]:
     if status == "approved":
         out["tools"] = list(getattr(flow, "tools", []) or [])
     return out
+
+
+def cancel_flow(session_id: str, server_name: str) -> Dict[str, Any]:
+    """Cancel one loopback OAuth flow and release its listener immediately."""
+    with _sessions_lock:
+        rec = _sessions.get(session_id)
+        if rec is None:
+            return {
+                "status": "error",
+                "error_message": "OAuth session not found or expired",
+            }
+        if rec["server_name"] != server_name:
+            return {
+                "status": "error",
+                "error_message": "server name mismatch for session",
+            }
+        _sessions.pop(session_id, None)
+
+    rec["flow"].mark_error("OAuth cancelled by user")
+    _shutdown_listener(rec)
+    return {"status": "error", "error_message": "OAuth cancelled by user"}
