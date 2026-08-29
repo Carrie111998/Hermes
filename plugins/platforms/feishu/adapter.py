@@ -102,6 +102,8 @@ try:
         ReplyMessageRequestBody,
         UpdateMessageRequest,
         UpdateMessageRequestBody,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
     )
     from lark_oapi.core import AccessTokenType, HttpMethod
     from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
@@ -229,6 +231,9 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+
+_CARD_CONTENT_MAX = 25000
+_CARD_TOOL_DISPLAY_MAX = 8
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
@@ -395,6 +400,8 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    reply_mode: str = "post"  # "card" | "post" | "text"
+    show_tool_calls: bool = False
 
 
 @dataclass
@@ -1364,6 +1371,7 @@ def check_feishu_requirements() -> bool:
             P2ImMessageMessageReadV1,
             ReplyMessageRequest, ReplyMessageRequestBody,
             UpdateMessageRequest, UpdateMessageRequestBody,
+            PatchMessageRequest, PatchMessageRequestBody,
         )
         from lark_oapi.core import AccessTokenType, HttpMethod
         from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
@@ -1390,6 +1398,8 @@ def check_feishu_requirements() -> bool:
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
             "UpdateMessageRequestBody": UpdateMessageRequestBody,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "AccessTokenType": AccessTokenType,
             "HttpMethod": HttpMethod,
             "FEISHU_DOMAIN": FEISHU_DOMAIN,
@@ -1576,6 +1586,8 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            reply_mode=str(extra.get("reply_mode") or os.getenv("FEISHU_REPLY_MODE", "post")).strip().lower(),
+            show_tool_calls=_to_boolean(extra.get("show_tool_calls", os.getenv("FEISHU_SHOW_TOOL_CALLS", "false"))),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1608,6 +1620,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._reply_mode = settings.reply_mode
+        self._show_tool_calls = settings.show_tool_calls
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1837,13 +1851,35 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu text/post/interactive message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
         try:
             msg_type, payload = self._build_outbound_payload(content)
+
+            # Interactive cards use PATCH API (PatchMessageRequest) which
+            # accepts card JSON directly as content, unlike the Update API
+            # which only supports text/post msg_types.
+            if msg_type == "interactive":
+                body = (
+                    PatchMessageRequestBody.builder()
+                    .content(payload)
+                    .build()
+                )
+                request = (
+                    PatchMessageRequest.builder()
+                    .message_id(message_id)
+                    .request_body(body)
+                    .build()
+                )
+                response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+                result = self._finalize_send_result(response, "card patch failed")
+                if result.success:
+                    result.message_id = message_id
+                return result
+
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await asyncio.to_thread(self._client.im.v1.message.update, request)
@@ -4374,7 +4410,55 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
+    @staticmethod
+    def _build_interactive_card_payload(
+        content: str,
+        *,
+        tools: Optional[List[str]] = None,
+        is_streaming: bool = False,
+        show_tool_calls: bool = False,
+    ) -> str:
+        """Build a Feishu interactive card JSON with markdown content.
+
+        Uses v1 card schema (config + elements) which is universally supported
+        and already proven in send_exec_approval().  Opt-in via
+        ``FEISHU_REPLY_MODE=card`` or ``feishu.extra.reply_mode: card``.
+        """
+        elements: List[Dict[str, Any]] = []
+
+        # Tool call summary at top (showToolCalls)
+        if tools and show_tool_calls:
+            visible_tools = tools[-_CARD_TOOL_DISPLAY_MAX:]
+            tool_lines = []
+            for t in visible_tools:
+                tool_lines.append(f"> ✅ {t}")
+            if len(tools) > _CARD_TOOL_DISPLAY_MAX:
+                tool_lines.insert(0, f"> ... +{len(tools) - _CARD_TOOL_DISPLAY_MAX} more")
+            elements.append({"tag": "markdown", "content": "\n".join(tool_lines)})
+            elements.append({"tag": "hr"})
+
+        # Main content as markdown element
+        display_content = content or ""
+        if len(display_content) > _CARD_CONTENT_MAX:
+            display_content = display_content[:_CARD_CONTENT_MAX] + "\n\n... [truncated]"
+        if is_streaming:
+            display_content = (display_content or "⏳ Thinking...") + " ▍"
+        elif not display_content:
+            display_content = "⏳ Thinking..."
+
+        elements.append({"tag": "markdown", "content": display_content})
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": elements,
+        }
+        return json.dumps(card, ensure_ascii=False)
+
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        if self._reply_mode == "card":
+            return "interactive", self._build_interactive_card_payload(
+                content, show_tool_calls=self._show_tool_calls,
+            )
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
         # Force plain text for anything that looks like a markdown table.
