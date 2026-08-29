@@ -246,17 +246,29 @@ def _(rid, params: dict) -> dict:
 @method("groups.disband")
 def _(rid, params: dict) -> dict:
     """Permanently tombstone a hosted room id."""
-    from gateway.hosted_rooms import HostedRoomError, disband_room, room_state
+    from gateway.hosted_rooms import (
+        HostedRoomError,
+        RoomHistoryExpiredError,
+        disband_room,
+        room_state,
+    )
 
     try:
         service = get_hosted_room_service()
         if service is None:
             return _err(rid, 4123, _WORKER_UNAVAILABLE)
-        existing = room_state(
-            service.db_path,
-            room_id=params.get("room_id"),
-            include_disbanded=True,
-        )
+        try:
+            existing = room_state(
+                service.db_path,
+                room_id=params.get("room_id"),
+                include_disbanded=True,
+            )
+        except RoomHistoryExpiredError:
+            tombstone = disband_room(
+                service.db_path,
+                room_id=params.get("room_id"),
+            )
+            return _ok(rid, {"tombstone": tombstone})
         if existing.get("disbanded_at") is not None:
             tombstone = disband_room(
                 service.db_path,

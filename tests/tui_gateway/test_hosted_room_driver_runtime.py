@@ -396,7 +396,9 @@ def test_waiting_room_does_not_block_an_independent_local_room(tmp_path: Path):
 
     runtime.start()
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
+    _wait_for(lambda: state.get_task(db, identities[0])["status"] == "running")
     assert state.get_task(db, identities[0])["status"] == "running"
+    _wait_for(lambda: len(runtime.status()["current_tasks"]) == 1)
     assert len(runtime.status()["current_tasks"]) == 1
     assert runtime.stop(timeout=1.0)
 
@@ -946,12 +948,14 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     runtime = _runtime(db, rpc)
     original_interrupt = rpc.interrupt
     attempts = 0
+    retry_allowed = threading.Event()
 
     def flaky_interrupt(**kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("temporary stop transport failure")
+        assert retry_allowed.wait(1.0)
         return original_interrupt(**kwargs)
 
     rpc.interrupt = flaky_interrupt
@@ -960,6 +964,7 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     stopping = runtime.cancel(identity, cancel_id="cancel-retry")
     assert stopping["status"] == "stopping"
     assert state.get_task(db, identity)["status"] == "stopping"
+    retry_allowed.set()
     runtime.wakeup()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
     assert attempts >= 2

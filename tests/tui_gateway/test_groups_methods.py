@@ -422,6 +422,10 @@ def test_disband_tombstones_room(home):
 def test_pruned_room_send_and_log_report_expired_history(home, monkeypatch):
     from gateway import hosted_rooms
 
+    members = [
+        {"member_id": "default", "profile": "default", "handle": "hermes"},
+        {"member_id": "ops", "profile": "ops", "handle": "ops"},
+    ]
     _create_room()
     monkeypatch.setattr(hosted_rooms, "MAX_DISBANDED_ROOM_TOMBSTONES", 0)
     _result(srv._methods["groups.disband"](2, {"room_id": "room-1"}))
@@ -436,7 +440,7 @@ def test_pruned_room_send_and_log_report_expired_history(home, monkeypatch):
         {
             "room_id": "room-1",
             "event_id": "stale-send",
-            "payload": {"text": "stale"},
+            "payload": {"text": "stale", "thread_id": "thread-1"},
         },
     )
     logged = srv._methods["groups.log"](
@@ -444,19 +448,21 @@ def test_pruned_room_send_and_log_report_expired_history(home, monkeypatch):
         {"room_id": "room-1", "include_disbanded": True},
     )
 
+    assert sent["error"]["code"] == 4111, sent
+    assert logged["error"]["code"] == 4112, logged
     assert sent["error"]["data"] == {"reason": "room_history_expired"}
     assert logged["error"]["data"] == {"reason": "room_history_expired"}
     assert "permanently retired" in sent["error"]["message"]
 
     recreated = srv._methods["groups.create"](
         6,
-        {"room_id": "room-1", "name": "Replacement", "members": []},
+        {"room_id": "room-1", "name": "Replacement", "members": members},
     )
     assert recreated["error"]["code"] == 4110
     created = _result(
         srv._methods["groups.create"](
             7,
-            {"room_id": "room-new", "name": "Fresh", "members": []},
+            {"room_id": "room-new", "name": "Fresh", "members": members},
         )
     )
     assert created["room"]["room_id"] == "room-new"
