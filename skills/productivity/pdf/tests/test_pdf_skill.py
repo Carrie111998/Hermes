@@ -463,3 +463,83 @@ def test_attachments_survive_encrypt_decrypt(workdir: Path):
     )
     meta = json.loads(run("pdf_read.py", str(decrypted), "--meta").stdout)["metadata"]
     assert meta.get("Title") == "Secure Doc"
+
+
+XMP_PACKET = (
+    b'<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+    b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+    b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    b'<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+    b'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">XMPTitle</rdf:li>'
+    b'</rdf:Alt></dc:title></rdf:Description>'
+    b'</rdf:RDF></x:xmpmeta>\n<?xpacket end="w"?>'
+)
+
+
+def _write_pdf_with_xmp_and_dup_attachments(path):
+    """Build a source PDF carrying an XMP packet plus two payloads sharing
+    one attachment name — both shapes that writer.append() drops."""
+    import io
+
+    pypdf = pytest.importorskip("pypdf")
+    from pypdf.generic import NameObject, StreamObject
+    w = pypdf.PdfWriter()
+    w.add_blank_page(200, 200)
+    w.add_metadata({"/Title": "InfoTitle"})
+    stream = StreamObject()
+    stream.set_data(XMP_PACKET)
+    stream.update({
+        NameObject("/Type"): NameObject("/Metadata"),
+        NameObject("/Subtype"): NameObject("/XML"),
+    })
+    w._root_object[NameObject("/Metadata")] = stream
+    w.add_attachment("dup.bin", b"one")
+    w.add_attachment("dup.bin", b"two")
+    buf = io.BytesIO()
+    w.write(buf)
+    Path(path).write_bytes(buf.getvalue())
+
+
+def test_set_meta_preserves_xmp_and_all_same_name_attachments(workdir: Path):
+    """#94870 review: the preserve block must also carry the catalog's XMP
+    metadata stream and *every* payload under a shared attachment name —
+    writer.append() drops both."""
+    pypdf = pytest.importorskip("pypdf")
+    src = workdir / "xmp_src.pdf"
+    _write_pdf_with_xmp_and_dup_attachments(src)
+
+    out = workdir / "xmp_kept.pdf"
+    run("pdf_meta.py", str(src), "--set-meta", "--title", "New", "-o", str(out))
+
+    r = pypdf.PdfReader(str(out))
+    assert r.xmp_metadata is not None, "XMP packet dropped by --set-meta"
+    assert "XMPTitle" in (r.xmp_metadata.dc_title or {}).values()
+    payloads = r.attachments.get("dup.bin")
+    assert sorted(bytes(p) for p in payloads) == [b"one", b"two"], (
+        "same-name attachment payloads truncated"
+    )
+    assert (r.metadata or {}).get("/Title") == "New"
+
+
+def test_xmp_and_same_name_attachments_survive_encrypt_decrypt(workdir: Path):
+    """#94870 review: pdf_secure rebuilds via append() too — the XMP packet
+    and every payload under a shared name must survive the round trip."""
+    pypdf = pytest.importorskip("pypdf")
+    pytest.importorskip("cryptography")
+    src = workdir / "xmp_secure_src.pdf"
+    _write_pdf_with_xmp_and_dup_attachments(src)
+
+    encrypted = workdir / "xmp_enc.pdf"
+    run("pdf_secure.py", str(src), "--encrypt", "--user-password", "pw",
+        "-o", str(encrypted))
+    decrypted = workdir / "xmp_dec.pdf"
+    run("pdf_secure.py", str(encrypted), "--decrypt", "--password", "pw",
+        "-o", str(decrypted))
+
+    r = pypdf.PdfReader(str(decrypted))
+    assert r.xmp_metadata is not None, "XMP packet dropped by encrypt/decrypt"
+    assert "XMPTitle" in (r.xmp_metadata.dc_title or {}).values()
+    payloads = r.attachments.get("dup.bin")
+    assert sorted(bytes(p) for p in payloads) == [b"one", b"two"], (
+        "same-name attachment payloads truncated across encrypt/decrypt"
+    )
