@@ -411,6 +411,13 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        # Write/recall scope for this manager's agent. Captured from the
+        # agent_context label at initialize_all() time. Any value other than
+        # "primary" (subagent/cron/flush) is a fork/system context whose turn
+        # writes must NOT reach the user's memory — see
+        # _suppress_nonprimary_writes(). Defaults to "primary" so the legacy
+        # construction path (no initialize_all) keeps writing.
+        self._agent_context: str = "primary"
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
             if external_prefetch_timeout is None
@@ -561,12 +568,27 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
+    def _suppress_nonprimary_writes(self) -> bool:
+        """Whether ordinary turn writes/recall must be skipped for this agent.
+
+        A fork or system context (agent_context != "primary") reuses the
+        provider only for the checkpoint contract (initialize + on_pre_compress).
+        Its per-turn sync/prefetch/on_turn_start fan-outs would leak the fork's
+        harness prompt and output into the user's real memory — the old
+        skip_memory=True guard existed to stop exactly that. Enforced here on
+        the host so it does not depend on each provider honouring agent_context.
+        The checkpoint path (on_pre_compress) is deliberately excluded.
+        """
+        return self._agent_context != "primary"
+
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        if self._suppress_nonprimary_writes():
+            return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -677,6 +699,8 @@ class MemoryManager:
         wedged provider can never block the caller. See ``sync_all`` for
         the full rationale (agent stuck "running" minutes after a turn).
         """
+        if self._suppress_nonprimary_writes():
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -736,6 +760,8 @@ class MemoryManager:
         before turn N+1; provider implementations don't need their own
         ordering guarantees.
         """
+        if self._suppress_nonprimary_writes():
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -942,6 +968,8 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        if self._suppress_nonprimary_writes():
+            return
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
@@ -1103,6 +1131,12 @@ class MemoryManager:
         advertising the requested checkpoint API must return successfully;
         its exception is propagated so the caller can preserve the
         uncompressed transcript.
+
+        Unlike the per-turn write/recall fan-outs, this path is NOT gated by
+        ``_suppress_nonprimary_writes()``: the checkpoint contract must run in a
+        fork (agent_context="subagent") too — that is the whole point of arming
+        the gate. A conforming v2 provider must therefore save on
+        ``on_pre_compress`` regardless of its non-primary write scope.
         """
         parts = []
         checkpoint_succeeded = False
@@ -1383,6 +1417,11 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+        # Capture the write/recall scope so the host can suppress fork writes
+        # regardless of whether each provider honours the flag. Empty or
+        # non-str falls back to the historical "primary".
+        _ctx = kwargs.get("agent_context")
+        self._agent_context = _ctx if isinstance(_ctx, str) and _ctx.strip() else "primary"
         for provider in self._providers:
             try:
                 provider.initialize(session_id=session_id, **kwargs)

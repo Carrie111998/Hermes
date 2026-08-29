@@ -322,6 +322,12 @@ def _process_single_prompt(
         
         # Initialize agent with sampled toolsets and log prefix for identification
         log_prefix = f"[B{batch_num}:P{prompt_index}]"
+        # Under compression.checkpoint_required the batch agent inherits the
+        # provider it must checkpoint with (see checkpoint_required_from_config
+        # in agent/agent_init.py). Gate off: skip_memory=True as before.
+        from agent.agent_init import checkpoint_required_from_config
+
+        _checkpoint_required = checkpoint_required_from_config()
         agent = AIAgent(
             base_url=config.get("base_url"),
             api_key=config.get("api_key"),
@@ -342,7 +348,8 @@ def _process_single_prompt(
             reasoning_config=config.get("reasoning_config"),
             prefill_messages=config.get("prefill_messages"),
             skip_context_files=True,  # Don't pollute trajectories with SOUL.md/AGENTS.md
-            skip_memory=True,  # Don't use persistent memory in batch runs
+            skip_memory=not _checkpoint_required,  # no persistent memory unless the gate is armed
+            memory_agent_context="subagent",
         )
 
         # Run the agent with task_id to ensure each task gets its own isolated VM

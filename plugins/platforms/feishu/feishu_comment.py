@@ -1071,6 +1071,12 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             logger.info("[Feishu-Comment] _run_comment_agent: loaded %d history messages from session %s",
                         len(history), session_key)
 
+        # Under compression.checkpoint_required the fork inherits the provider
+        # it must checkpoint with (see checkpoint_required_from_config in
+        # agent/agent_init.py). Gate off: skip_memory=True as before.
+        from agent.agent_init import checkpoint_required_from_config
+
+        _checkpoint_required = checkpoint_required_from_config()
         agent = AIAgent(
             model=model,
             base_url=runtime_kwargs.get("base_url"),
@@ -1080,7 +1086,8 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             credential_pool=runtime_kwargs.get("credential_pool"),
             quiet_mode=True,
             skip_context_files=True,
-            skip_memory=True,
+            skip_memory=not _checkpoint_required,
+            memory_agent_context="subagent",
             max_iterations=15,
             enabled_toolsets=["feishu_doc", "feishu_drive"],
         )

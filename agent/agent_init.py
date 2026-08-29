@@ -533,6 +533,65 @@ def _refuse_checkpoint_required_on_codex_app_server(
         )
 
 
+def _refuse_checkpoint_required_on_plugin_context_engine(
+    checkpoint_required: bool, engine: Any
+) -> None:
+    """Fail closed at init when a context engine may compact where no
+    pre-compress checkpoint runs.
+
+    ``compress()`` is dispatched right after ``on_pre_compress()``; an engine
+    compacting from ``on_turn_complete()`` or its own scheduler never crosses
+    that seam. Refused at init rather than at the first compaction so the
+    operator sees the incompatibility before a turn exists.
+    ``checkpoint_required`` must be the LOCAL config value —
+    ``agent.compression_checkpoint_required`` is not assigned yet at this slot.
+    """
+    if checkpoint_required is not True:
+        return
+
+    from agent.context_engine import engine_compacts_outside_compress
+
+    unsafe, reason = engine_compacts_outside_compress(engine)
+    if not unsafe:
+        return
+
+    # Class name, not ``engine.name``: ``name`` is an abstract property on an
+    # object the resolver just declined to trust; a raising getter would
+    # replace the diagnosis.
+    raise RuntimeError(
+        "BLOCKED_MISSING_PREREQUISITE: compression.checkpoint_required is "
+        "incompatible with context engine "
+        f"'{type(engine).__name__}': {reason}. An engine whose only lossy "
+        "authority is compress() may declare compacts_outside_compress = "
+        "False; otherwise disable compression.checkpoint_required or use the "
+        "built-in compressor."
+    )
+
+
+def checkpoint_required_from_config() -> bool:
+    """Report whether ``compression.checkpoint_required`` is armed in config.
+
+    For call sites that decide before an agent exists (the fork sites);
+    callers holding a live agent read ``agent.compression_checkpoint_required``.
+    Reads ``load_config_readonly()`` — the same call ``init_agent`` uses to arm
+    the gate on the child. An unreadable config reads as "not armed", matching
+    ``init_agent``.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _cfg = load_config_readonly() or {}
+        _compression = _cfg.get("compression") or {}
+    except Exception:
+        return False
+    if not isinstance(_compression, dict):
+        return False
+    return (
+        is_truthy_value(_compression.get("checkpoint_required"), default=False)
+        is True
+    )
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -600,6 +659,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    memory_agent_context: str = "primary",
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -1923,7 +1983,14 @@ def init_agent(
                         "session_id": agent.session_id,
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
+                        # Providers scope writes by this label; empty or
+                        # non-str falls back to the historical "primary".
+                        "agent_context": (
+                            memory_agent_context
+                            if isinstance(memory_agent_context, str)
+                            and memory_agent_context.strip()
+                            else "primary"
+                        ),
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
@@ -1937,6 +2004,12 @@ def init_agent(
                                 _init_kwargs["session_title"] = _st
                         except Exception:
                             pass
+                    # Thread the parent's session_id so a provider can tell the
+                    # fork shapes apart (documented in the provider-plugin API).
+                    # Every provider.initialize() takes **kwargs, so this is a
+                    # no-op for providers that ignore it.
+                    if agent._parent_session_id:
+                        _init_kwargs["parent_session_id"] = agent._parent_session_id
                     # Thread gateway user identity for per-user memory scoping
                     if agent._user_id:
                         _init_kwargs["user_id"] = agent._user_id
@@ -2733,6 +2806,12 @@ def init_agent(
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
     if _selected_engine is not None:
+        # Before the slot assignment and before update_model()/threshold wiring
+        # touch the engine. First argument is the LOCAL config value — the agent
+        # attribute is not assigned yet here.
+        _refuse_checkpoint_required_on_plugin_context_engine(
+            compression_checkpoint_required, _selected_engine
+        )
         agent.context_compressor = _selected_engine
         # External engines own compaction policy: the host compression
         # threshold (including the Codex gpt-5.5 autoraise above) only

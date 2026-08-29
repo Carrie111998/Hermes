@@ -128,6 +128,15 @@ class ContextEngine(ABC):
     # warnings, errors, and explicit manual commands should still surface.
     emit_automatic_compaction_status: bool = True
 
+    # Declared compaction authority under ``compression.checkpoint_required``.
+    # None: undeclared, the host infers it via engine_compacts_outside_compress().
+    # False: compress() is the only lossy authority, covered by the pre-compress
+    # checkpoint; on_turn_complete() may still be overridden for observation.
+    # True: compacts outside compress(); refused at init while the gate is armed.
+    # Only the True/False singletons count as a declaration — plugin engines and
+    # test doubles answer getattr with truthy auto-attributes.
+    compacts_outside_compress: "bool | None" = None
+
     # -- Core interface ----------------------------------------------------
 
     @abstractmethod
@@ -487,3 +496,48 @@ class ContextEngine(ABC):
         )
         self.threshold_percent = self._base_threshold_percent
         self.threshold_tokens = int(context_length * self.threshold_percent)
+
+
+#: Hooks whose override hands an engine a lossy authority the host cannot
+#: intercept. Not in the set: ``prune_tool_results_only`` (the host gates its
+#: call site), ``select_context`` (request-only), ``on_session_end`` (session
+#: boundary only, return value discarded).
+_UNINTERCEPTABLE_COMPACTION_HOOKS = ("on_turn_complete",)
+
+
+def engine_compacts_outside_compress(engine: Any) -> "tuple[bool, str]":
+    """Whether ``engine`` may compact where no pre-compress checkpoint can run.
+
+    Returns ``(verdict, reason)``; ``reason`` is user-facing error text. An
+    explicit ``compacts_outside_compress`` declaration wins; otherwise the
+    verdict is inferred from the overridden hooks by ``__func__`` identity
+    against the ABC default. Anything not positively proven safe is ``True``.
+    """
+    if engine is None:
+        return False, "no context engine installed"
+
+    declared = getattr(engine, "compacts_outside_compress", None)
+    if declared is True:
+        return True, "the engine declares compaction outside compress()"
+    if declared is False:
+        return False, "the engine declares compress() as its only lossy authority"
+
+    # The directory loader installs whatever register(ctx) returned without an
+    # isinstance gate; hook inference on a non-ContextEngine object would read a
+    # contract it never signed.
+    if not isinstance(engine, ContextEngine):
+        return True, (
+            "the installed engine does not inherit from ContextEngine, so its "
+            "compaction authority cannot be determined"
+        )
+
+    for hook_name in _UNINTERCEPTABLE_COMPACTION_HOOKS:
+        hook = getattr(engine, hook_name, None)
+        base = getattr(ContextEngine, hook_name, None)
+        if base is None or getattr(hook, "__func__", None) is not base:
+            return True, (
+                f"the engine overrides {hook_name}() without declaring "
+                "compacts_outside_compress"
+            )
+
+    return False, "the engine overrides no uninterceptable compaction hook"
