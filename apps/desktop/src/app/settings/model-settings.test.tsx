@@ -409,6 +409,20 @@ describe('ModelSettings', () => {
     // Banner present on load, no switch required.
     expect(await screen.findByText(/still run on/)).toBeTruthy()
   })
+
+  it('does not warn when an aux slot uses the main alias', async () => {
+    getAuxiliaryModels.mockResolvedValueOnce({
+      main: { provider: 'nous', model: 'hermes-4' },
+      tasks: [{ task: 'vision', provider: 'main', model: 'kimi-k3', base_url: '' }]
+    })
+
+    await renderModelSettings()
+    await screen.findByRole('button', { name: 'Apply' })
+
+    // 'main' is a backend-supported alias that tracks the active main provider
+    // (auxiliary_client._normalize_aux_provider) — it can never be a stale pin.
+    expect(screen.queryByText(/still run on/)).toBeNull()
+  })
 })
 
 describe('ModelSettings MoA preset editor', () => {
