@@ -515,7 +515,13 @@ class TestExecute:
         assert replacement.stop_calls == []
         cmd, args, kwargs = original.run_command_calls[-1]
         assert cmd == "bash"
-        assert args == ["-c", "echo done"]
+        # _run_bash prefixes the command with the agent-initiated marker
+        # (#97652) so a nested `hermes config set` in the sandbox shell is
+        # gated by approvals.model_config_confirm.
+        from tools.environments.base import AGENT_INITIATED_ENV
+
+        assert args[0] == "-c"
+        assert args[1] == f"export {AGENT_INITIATED_ENV}=1; echo done"
         assert kwargs["cwd"] == "/vercel/sandbox"
 
 
