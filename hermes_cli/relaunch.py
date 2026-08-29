@@ -139,7 +139,26 @@ def build_relaunch_argv(
     bin_path = resolve_hermes_bin()
 
     if bin_path:
-        argv = [bin_path]
+        # If the resolved entry point is itself a Python script (detected
+        # via its shebang, since it may have no file extension -- e.g. the
+        # "hermes" console entry point), invoke it explicitly via
+        # sys.executable rather than relying on its shebang line.
+        # A generic shebang (e.g. #!/usr/bin/env python3) can silently
+        # resolve to a different interpreter than the one currently
+        # running (e.g. system Python instead of a project venv),
+        # dropping dependencies installed only in the venv.
+        is_python_script = False
+        try:
+            with open(bin_path, "rb") as bf:
+                first_line = bf.readline(256)
+            if first_line.startswith(b"#!") and b"python" in first_line:
+                is_python_script = True
+        except OSError:
+            pass
+        if is_python_script:
+            argv = [sys.executable, bin_path]
+        else:
+            argv = [bin_path]
     else:
         argv = [sys.executable, "-m", "hermes_cli.main"]
 
