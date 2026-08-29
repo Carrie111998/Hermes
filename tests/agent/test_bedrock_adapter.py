@@ -1472,9 +1472,17 @@ class TestClaudeOpus5ContextTable:
         mismatched = []
         with patch("agent.bedrock_adapter.probe_bedrock_context_length") as mock_probe:
             for name, expected in DEFAULT_CONTEXT_LENGTHS.items():
-                if not name.startswith("claude-") or expected < 1_000_000 or "." in name:
+                if not name.startswith("claude-") or expected < 1_000_000:
                     continue
-                actual = get_bedrock_context_length(f"anthropic.{name}", probe=False)
+                # DEFAULT_CONTEXT_LENGTHS carries dotted direct-API aliases
+                # (claude-opus-4.8), while Bedrock model IDs spell the same
+                # revision with hyphens (claude-opus-4-8). Normalize instead
+                # of skipping dotted names so a future dotted 1M model cannot
+                # silently escape this cross-table invariant.
+                bedrock_name = name.replace(".", "-")
+                actual = get_bedrock_context_length(
+                    f"anthropic.{bedrock_name}", probe=False
+                )
                 if actual != expected:
                     mismatched.append((name, expected, actual))
             mock_probe.assert_not_called()
