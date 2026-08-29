@@ -301,6 +301,26 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _stat_fingerprint(directory: Path) -> Optional[Tuple[int, int]]:
+    """Cheap (file count, total size) fingerprint of a directory tree.
+
+    Unlike :func:`_dir_hash` this never reads file contents, so it is safe to
+    run on every sync as a fast-path guard. Returns ``None`` when the tree
+    cannot be scanned — callers treat that as "fingerprints disagree" and
+    fall back to the full content hash.
+    """
+    count = 0
+    total = 0
+    try:
+        for fpath in directory.rglob("*"):
+            if fpath.is_file():
+                count += 1
+                total += fpath.stat().st_size
+    except (OSError, IOError):
+        return None
+    return (count, total)
+
+
 def _safe_rel_install_path(path: Path, base: Path) -> str:
     """Return a normalized relative POSIX path, rejecting traversal/absolute paths."""
     rel = path.relative_to(base)
@@ -884,12 +904,18 @@ def sync_skills(quiet: bool = False) -> dict:
 
             # If the bundled source still matches the version recorded when
             # it was installed, there is no update to apply. Avoid recursively
-            # hashing the user's copy just to rediscover that fact; when the
-            # bundled source changes, the normal user-modification check below
-            # still protects local edits before any overwrite.
+            # hashing the user's copy just to rediscover that fact — but only
+            # after a cheap stat fingerprint confirms the copy is structurally
+            # intact. The manifest is a claim, not the truth: a destination
+            # that drifted while the source was unchanged (curator restore,
+            # partial install, interrupted sync, hand-copied older version)
+            # would otherwise stay masked as "up to date" forever (#97791).
+            # When the bundled source changes, the normal user-modification
+            # check below still protects local edits before any overwrite.
             if origin_hash and bundled_hash == origin_hash:
-                skipped += 1
-                continue
+                if _stat_fingerprint(dest) == _stat_fingerprint(skill_src):
+                    skipped += 1
+                    continue
 
             user_hash = _dir_hash(dest)
 
@@ -902,6 +928,16 @@ def sync_skills(quiet: bool = False) -> dict:
                 else:
                     # Can't tell if user modified or bundled changed — be safe
                     skipped += 1
+                continue
+
+            if user_hash == bundled_hash:
+                # Stock copy under a stale origin hash: the destination is
+                # byte-identical to the current bundled version (e.g. repaired
+                # by hand or restored from a backup), so there is nothing to
+                # update and nothing to protect. Re-baseline the manifest
+                # instead of reporting it as user-modified on every sync.
+                manifest[skill_name] = bundled_hash
+                skipped += 1
                 continue
 
             if _is_tracked_user_modification(origin_hash, user_hash):
