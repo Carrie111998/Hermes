@@ -737,7 +737,11 @@ def cmd_mcp_list(args=None):
             if include_n:
                 tools_str = f"{include_n} selected"
             elif exclude_n:
-                tools_str = f"-{exclude_n} excluded"
+                # Offline list has no served tool list, so this counts
+                # configured patterns, not tools actually blocked — say
+                # "patterns" so the number can't be read as an effect
+                # count (#98067).
+                tools_str = f"{exclude_n} pattern{'s' if exclude_n != 1 else ''}"
             else:
                 tools_str = "all"
         else:
