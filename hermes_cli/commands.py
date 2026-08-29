@@ -153,6 +153,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
+    CommandDef("autoreset", "Manage automatic reset for this thread", "Session",
+               gateway_only=True,
+               args_hint="[status|on|daily HH:MM|off|inherit]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True, desktop="terminal"),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
@@ -1411,7 +1414,26 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - autoreset: typed as !autoreset in Slack threads; no native slash slot.
+_SLACK_VIA_HERMES_ONLY = frozenset(
+    {
+        "topup",
+        "moa",
+        "debug",
+        "egress",
+        "init",
+        "version",
+        "diff",
+        "update",
+        "heartbeat",
+        "refine",
+        "review",
+        "pause",
+        "whoami",
+        "platform",
+        "autoreset",
+    }
+)
 
 
 def _sanitize_slack_name(raw: str) -> str:
