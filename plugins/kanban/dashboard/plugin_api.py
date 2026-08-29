@@ -59,8 +59,16 @@ router = APIRouter()
 
 
 def register_owner_token_routes() -> None:
-    register_token_route("/api/plugins/kanban/owner-snapshot")
-    register_token_route("/api/plugins/kanban/owner-events")
+    register_token_route(
+        "/api/plugins/kanban/owner-snapshot",
+        allow_internal=True,
+        internal_scopes=("kanban:owner:read",),
+    )
+    register_token_route(
+        "/api/plugins/kanban/owner-events",
+        allow_internal=True,
+        internal_scopes=("kanban:owner:read",),
+    )
 
 
 register_owner_token_routes()
@@ -69,9 +77,8 @@ router.add_event_handler("startup", register_owner_token_routes)
 
 def _require_owner_read(request: Request) -> None:
     principal = getattr(request.state, "token_principal", None)
-    if principal is not None and (
-        getattr(principal, "provider", None) == "dashboard-internal"
-        or _OWNER_READ_SCOPE in set(getattr(principal, "scopes", ()))
+    if principal is not None and _OWNER_READ_SCOPE in set(
+        getattr(principal, "scopes", ())
     ):
         return
     raise HTTPException(status_code=403, detail="owner-read scope required")
@@ -222,12 +229,12 @@ def _owner_identity(board: Optional[str]) -> tuple[str, str]:
 
 
 def _owner_event_cursor(conn: sqlite3.Connection) -> int:
-    """Return the monotonic task-event sequence, including deleted rows."""
+    """Return the monotonic durable owner-event sequence."""
     sequence = conn.execute(
-        "SELECT seq FROM sqlite_sequence WHERE name = 'task_events'"
+        "SELECT seq FROM sqlite_sequence WHERE name = 'owner_events'"
     ).fetchone()
     maximum = conn.execute(
-        "SELECT COALESCE(MAX(id), 0) FROM task_events"
+        "SELECT COALESCE(MAX(id), 0) FROM owner_events"
     ).fetchone()
     return max(int(sequence[0]) if sequence is not None else 0, int(maximum[0]))
 
@@ -240,7 +247,6 @@ def _owner_task(row: sqlite3.Row) -> dict[str, Any]:
     if (
         not isinstance(task_id, str) or not task_id
         or not isinstance(title, str) or not title.strip()
-        or not isinstance(created_by, str) or not created_by.strip()
         or type(created_at) is not int or created_at < 0
     ):
         raise HTTPException(
@@ -250,7 +256,11 @@ def _owner_task(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": task_id,
         "title": title,
-        "created_by": created_by,
+        "created_by": (
+            created_by.strip()
+            if isinstance(created_by, str) and created_by.strip()
+            else None
+        ),
         "created_at": created_at,
     }
 
@@ -263,11 +273,6 @@ def _owner_event(row: sqlite3.Row) -> dict[str, Any]:
             status_code=409,
             detail="Kanban creation provenance payload is malformed",
         ) from exc
-    if row["kind"] == "created" and not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=409,
-            detail="Kanban creation provenance payload is malformed",
-        )
     return {
         "id": int(row["event_id"]),
         "kind": row["kind"],
@@ -486,9 +491,8 @@ def owner_snapshot(
             status_code=400,
             detail=f"limit must be 1..{_OWNER_SNAPSHOT_MAX_LIMIT}",
         )
-    board = _resolve_board(board)
-    profile_id, board_id = _owner_identity(board)
-    conn = _conn(board=board)
+    profile_id, board_id = _owner_identity(_resolve_board(board))
+    conn = _conn(board=board_id)
     try:
         conn.execute("BEGIN")
         task_rows = conn.execute(
@@ -507,7 +511,7 @@ def owner_snapshot(
             placeholders = ",".join("?" for _ in task_ids)
             event_rows = conn.execute(
                 "SELECT id AS event_id, task_id, kind, payload, "
-                "created_at AS event_created_at FROM task_events "
+                "created_at AS event_created_at FROM owner_events "
                 f"WHERE kind = 'created' AND task_id IN ({placeholders}) "
                 "ORDER BY id ASC",
                 tuple(task_ids),
@@ -524,9 +528,15 @@ def owner_snapshot(
                     status_code=409,
                     detail=f"Kanban task {task_id} does not have exactly one creation receipt",
                 )
+            task = _owner_task(task_row)
+            created_event = _owner_event(creation_rows[0])
             receipts.append({
-                "task": _owner_task(task_row),
-                "created_event": _owner_event(creation_rows[0]),
+                "task": task,
+                "created_event": created_event,
+                "provenance_complete": (
+                    task["created_by"] is not None
+                    and isinstance(created_event["payload"], dict)
+                ),
                 "archived": task_row["status"] == "archived",
             })
         return {
@@ -560,9 +570,8 @@ def owner_events(
             status_code=400,
             detail=f"limit must be 1..{_OWNER_EVENTS_MAX_LIMIT}",
         )
-    board = _resolve_board(board)
-    profile_id, board_id = _owner_identity(board)
-    conn = _conn(board=board)
+    profile_id, board_id = _owner_identity(_resolve_board(board))
+    conn = _conn(board=board_id)
     try:
         conn.execute("BEGIN")
         latest_cursor = _owner_event_cursor(conn)
@@ -572,31 +581,23 @@ def owner_events(
                 detail="owner event cursor is ahead of the authoritative stream",
             )
         rows = conn.execute(
-            "SELECT e.id AS event_id, e.task_id, e.kind, e.payload, "
-            "e.created_at AS event_created_at, "
-            "t.id, t.title, t.created_by, t.created_at "
-            "FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
-            "WHERE e.id > ? ORDER BY e.id ASC LIMIT ?",
+            "SELECT id AS event_id, task_id AS id, kind, payload, "
+            "created_at AS event_created_at, title, created_by, "
+            "task_created_at AS created_at, archived "
+            "FROM owner_events WHERE owner_events.id > ? "
+            "ORDER BY owner_events.id ASC LIMIT ?",
             (after, limit + 1),
         ).fetchall()
         has_more = len(rows) > limit
         scanned = rows[:limit]
-        events = []
-        for row in scanned:
-            if row["kind"] not in {"created", "archived", "edited"}:
-                continue
-            if row["id"] is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Kanban materialization event references a missing task",
-                )
-            event = {
+        events = [
+            {
                 **_owner_event(row),
                 "task": _owner_task(row),
+                "archived": bool(row["archived"]),
             }
-            if row["kind"] == "edited":
-                event["kind"] = "updated"
-            events.append(event)
+            for row in scanned
+        ]
         next_cursor = (
             int(scanned[-1]["event_id"])
             if has_more
@@ -1280,11 +1281,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 conn.execute(
                     f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
                 )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+                kanban_db._append_event(conn, task_id, "edited")
             # Mutation-boundary observer (RFC #58548), post-commit. Field
             # names only — values never leave the DB via this payload.
             kanban_db.notify_task_updated(
@@ -1457,6 +1454,13 @@ def _set_status_direct(
                 int(time.time()),
             ),
         )
+        if prev["status"] == "archived" and effective_status != "archived":
+            kanban_db._append_owner_event(
+                conn,
+                task_id,
+                "updated",
+                {"status": effective_status},
+            )
         if reopening_satisfied_parent:
             _invalidate_descendants_for_parent_reopen(
                 conn,

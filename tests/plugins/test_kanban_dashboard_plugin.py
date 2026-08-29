@@ -65,7 +65,7 @@ def client(kanban_home):
         request.state.token_principal = TokenPrincipal(
             principal="dashboard-internal",
             provider="dashboard-internal",
-            scopes=("dashboard-internal",),
+            scopes=("kanban:owner:read",),
         )
         request.state.token_authenticated = True
         return await call_next(request)
@@ -304,6 +304,28 @@ def test_owner_contract_rejects_an_unrelated_provider_scope(kanban_home):
     assert response.status_code == 403
 
 
+def test_owner_contract_rejects_spoofed_internal_provider_without_scope(kanban_home):
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def spoofed_internal_principal(request, call_next):
+        request.state.token_principal = TokenPrincipal(
+            principal="external-service",
+            provider="dashboard-internal",
+            scopes=("unrelated",),
+        )
+        request.state.token_authenticated = True
+        return await call_next(request)
+
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+
+    response = TestClient(app).get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    )
+
+    assert response.status_code == 403
+
+
 def test_owner_contract_accepts_the_exact_owner_read_scope(kanban_home):
     app = FastAPI()
 
@@ -376,7 +398,7 @@ def test_owner_events_advance_stable_cursor_and_emit_only_materialization_receip
     assert payload["has_more"] is False
     assert [(event["kind"], event["task"]["id"]) for event in payload["events"]] == [
         ("created", child_id), ("archived", created["id"]),
-    ]
+    ], payload["events"]
     assert payload["events"][0]["payload"]["parents"] == []
 
 
@@ -394,7 +416,7 @@ def test_owner_events_reject_a_cursor_ahead_of_the_authoritative_stream(client):
     assert "cursor" in response.json()["detail"]
 
 
-def test_owner_cursor_never_regresses_when_the_latest_task_is_hard_deleted(client):
+def test_owner_events_emit_a_durable_tombstone_after_hard_delete(client):
     created = client.post(
         "/api/plugins/kanban/tasks", json={"title": "temporary"},
     ).json()["task"]
@@ -411,48 +433,96 @@ def test_owner_cursor_never_regresses_when_the_latest_task_is_hard_deleted(clien
         "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
     ).json()
     assert after_delete["task_count"] == 0
-    assert after_delete["event_cursor"] == before
+    assert after_delete["event_cursor"] > before
     deleted_gap = client.get(
-        "/api/plugins/kanban/owner-events?board=default&after=0&limit=20"
+        f"/api/plugins/kanban/owner-events?board=default&after={before}&limit=20"
     ).json()
-    assert deleted_gap["events"] == []
-    assert deleted_gap["next_cursor"] == before
+    assert [(event["kind"], event["task"]["id"]) for event in deleted_gap["events"]] == [
+        ("deleted", created["id"]),
+    ]
+    assert deleted_gap["events"][0]["task"]["title"] == "temporary"
+    assert deleted_gap["next_cursor"] == after_delete["event_cursor"]
 
     next_task = client.post(
         "/api/plugins/kanban/tasks", json={"title": "next"},
     ).json()["task"]
     events = client.get(
-        f"/api/plugins/kanban/owner-events?board=default&after={before}&limit=20"
+        f"/api/plugins/kanban/owner-events?board=default&after={after_delete['event_cursor']}&limit=20"
     ).json()
-    assert events["next_cursor"] > before
+    assert events["next_cursor"] > after_delete["event_cursor"]
     assert [(event["kind"], event["task"]["id"]) for event in events["events"]] == [
         ("created", next_task["id"]),
     ]
 
 
-def test_owner_cursor_crosses_a_trailing_deleted_gap_after_a_surviving_event(client):
-    kept = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "kept"},
+def test_owner_events_emit_a_durable_tombstone_after_archived_delete(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "archived temporary"},
     ).json()["task"]
-    doomed = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "doomed"},
-    ).json()["task"]
-    latest = client.get(
-        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
-    ).json()["event_cursor"]
     conn = kb.connect()
     try:
-        assert kb.delete_task(conn, doomed["id"])
+        assert kb.archive_task(conn, task["id"])
+        cursor = client.get(
+            "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+        ).json()["event_cursor"]
+        assert kb.delete_archived_task(conn, task["id"])
     finally:
         conn.close()
 
-    response = client.get(
-        "/api/plugins/kanban/owner-events?board=default&after=0&limit=20"
+    payload = client.get(
+        f"/api/plugins/kanban/owner-events?board=default&after={cursor}&limit=20"
     ).json()
 
-    assert [event["task"]["id"] for event in response["events"]] == [kept["id"]]
-    assert response["next_cursor"] == latest
-    assert response["has_more"] is False
+    assert [(event["kind"], event["task"]["id"]) for event in payload["events"]] == [
+        ("deleted", task["id"]),
+    ]
+
+
+def test_owner_snapshot_represents_unknown_legacy_provenance(kanban_home, client):
+    conn = kb.connect()
+    try:
+        legacy_id = kb.create_task(conn, title="legacy", created_by=None)
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (legacy_id,))
+            conn.execute("DELETE FROM owner_events WHERE task_id = ?", (legacy_id,))
+            kb._backfill_owner_events(conn)
+    finally:
+        conn.close()
+
+    response = client.get("/api/plugins/kanban/owner-snapshot?board=default&limit=10")
+
+    assert response.status_code == 200, response.text
+    receipt = next(
+        row for row in response.json()["receipts"] if row["task"]["id"] == legacy_id
+    )
+    assert receipt["task"]["created_by"] is None
+    assert receipt["created_event"]["payload"] is None
+    assert receipt["provenance_complete"] is False
+
+
+def test_owner_snapshot_collapses_duplicate_legacy_creation_events(kanban_home, client):
+    conn = kb.connect()
+    try:
+        legacy_id = kb.create_task(conn, title="legacy duplicate", created_by="importer")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'created', ?, ?)",
+                (legacy_id, json.dumps({"by": "duplicate"}), int(time.time())),
+            )
+            conn.execute("DELETE FROM owner_events WHERE task_id = ?", (legacy_id,))
+            kb._backfill_owner_events(conn)
+    finally:
+        conn.close()
+
+    response = client.get("/api/plugins/kanban/owner-snapshot?board=default&limit=10")
+
+    assert response.status_code == 200, response.text
+    receipt = next(
+        row for row in response.json()["receipts"] if row["task"]["id"] == legacy_id
+    )
+    assert receipt["task"]["created_by"] == "importer"
+    assert receipt["created_event"]["payload"] != {"by": "duplicate"}
 
 
 def test_owner_events_publish_current_title_updates_without_rewriting_creation(client):
@@ -473,6 +543,60 @@ def test_owner_events_publish_current_title_updates_without_rewriting_creation(c
 
     assert [(event["kind"], event["task"]["title"]) for event in payload["events"]] == [
         ("updated", "Renamed"),
+    ]
+
+
+def test_owner_events_publish_title_changes_from_triage_specification(client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="Draft", triage=True, created_by="agent:main",
+        )
+    finally:
+        conn.close()
+    cursor = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    ).json()["event_cursor"]
+
+    conn = kb.connect()
+    try:
+        assert kb.specify_triage_task(conn, task_id, title="Specified")
+    finally:
+        conn.close()
+
+    payload = client.get(
+        f"/api/plugins/kanban/owner-events?board=default&after={cursor}&limit=20"
+    ).json()
+
+    assert [(event["kind"], event["task"]["title"]) for event in payload["events"]] == [
+        ("updated", "Specified"),
+    ]
+
+
+def test_owner_events_publish_restoration_after_unarchive(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Restore me"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, task["id"])
+    finally:
+        conn.close()
+    cursor = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    ).json()["event_cursor"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"},
+    )
+    assert response.status_code == 200, response.text
+
+    payload = client.get(
+        f"/api/plugins/kanban/owner-events?board=default&after={cursor}&limit=20"
+    ).json()
+
+    assert [(event["kind"], event["archived"]) for event in payload["events"]] == [
+        ("updated", False),
     ]
 
 
