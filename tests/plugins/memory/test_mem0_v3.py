@@ -281,6 +281,52 @@ class TestMem0ModeSwitch:
         assert provider._mode == "platform"
         assert provider._user_id == "old-user"
 
+    def test_oss_mode_rejects_whitespace_user_id(self, monkeypatch, tmp_path):
+        """#97922: ids with internal whitespace fail at init, not at the
+        first mem0ai operation."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mem0.json").write_text(
+            '{"mode": "oss", "user_id": "user alpha", "agent_id": "hermes"}'
+        )
+        provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
+        with pytest.raises(ValueError, match="cannot contain whitespace"):
+            provider.initialize("test")
+
+    def test_oss_mode_rejects_whitespace_agent_id(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mem0.json").write_text(
+            '{"mode": "oss", "user_id": "u1", "agent_id": "agent\\talpha"}'
+        )
+        provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
+        with pytest.raises(ValueError, match="cannot contain whitespace"):
+            provider.initialize("test")
+
+    def test_oss_mode_valid_ids_initialize(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mem0.json").write_text(
+            '{"mode": "oss", "user_id": "u1", "agent_id": "hermes"}'
+        )
+        provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
+        provider.initialize("test")
+        assert provider._user_id == "u1"
+        assert provider._agent_id == "hermes"
+
+    def test_platform_mode_keeps_server_side_id_contract(self, monkeypatch, tmp_path):
+        """Non-OSS backends never run mem0ai's local entity validator, so a
+        whitespace id stays a server-side concern there (#97922)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mem0.json").write_text(
+            '{"mode": "platform", "user_id": "user alpha"}'
+        )
+        monkeypatch.setenv("MEM0_API_KEY", "test-key")
+        provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
+        provider.initialize("test")
+        assert provider._user_id == "user alpha"
+
     def test_is_available_platform_needs_key(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("MEM0_API_KEY", raising=False)
