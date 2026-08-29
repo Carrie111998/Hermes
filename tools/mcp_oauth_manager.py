@@ -7,6 +7,9 @@ instances and coordinates:
 - **Cross-process token reload** via mtime-based disk watch. When an external
   process (e.g. a user cron job) refreshes tokens on disk, the next auth flow
   picks them up without requiring a process restart.
+- **Cross-process refresh serialization** via a per-server file lease. OAuth
+  providers that rotate single-use refresh tokens see exactly one consumer;
+  waiters reload the replacement from disk before deciding to refresh.
 - **401 deduplication** via in-flight futures. When N concurrent tool calls
   all hit 401 with the same access_token, only one recovery attempt fires;
   the rest await the same result.
@@ -38,6 +41,7 @@ import asyncio
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -110,9 +114,15 @@ def _make_hermes_provider_class() -> Optional[type]:
     MCP SDK's OAuth module is unavailable (e.g. older mcp versions).
     """
     try:
-        from mcp.client.auth.oauth2 import OAuthClientProvider
+        from mcp.client.auth.oauth2 import OAuthClientProvider, OAuthTokenError
     except ImportError:  # pragma: no cover — SDK required in CI
         return None
+
+    class _PeerRefreshCompleted(Exception):
+        """Restart the SDK flow after another process refreshed on disk."""
+
+    class _ExplicitReauthorizationRequired(OAuthTokenError):
+        """Fail closed instead of opening an implicit browser auth flow."""
 
     class HermesMCPOAuthProvider(OAuthClientProvider):
         """OAuthClientProvider with pre-flow disk-mtime reload.
@@ -149,6 +159,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             # oauth.user_agent — stamped onto token-endpoint requests only;
             # some authorization servers/WAFs reject httpx's default (#75576).
             self._hermes_token_user_agent = token_user_agent
+            self._hermes_refresh_lease = None
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -179,15 +190,101 @@ def _make_hermes_provider_class() -> Optional[type]:
             data["token_endpoint_auth_method"] = "client_secret_post"
             self.context.client_info = OAuthClientInformationFull.model_validate(data)
 
+        def _seed_token_expiry(self, tokens) -> None:
+            """Seed SDK expiry state, treating a zero TTL as already expired."""
+            self.context.token_expiry_time = None
+            if tokens is None or tokens.expires_in is None:
+                return
+            self.context.update_token_expiry(tokens)
+            try:
+                expired = int(tokens.expires_in) <= 0
+            except (TypeError, ValueError):
+                expired = False
+            if expired:
+                # On Windows, wall-clock resolution can make two consecutive
+                # time.time() calls equal. The SDK's <= comparison can then
+                # briefly classify expires_in=0 as valid and send a stale
+                # bearer token. Backdate explicitly to remove that ambiguity.
+                self.context.token_expiry_time = time.time() - 1
+
         async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
             self._coerce_client_secret_post()
             request = await super()._exchange_token_authorization_code(*args, **kwargs)
             return self._stamp_token_user_agent(request)
 
         async def _refresh_token(self):
+            """Claim one rotating refresh generation while the SDK lock is held."""
+            from tools.mcp_oauth import HermesTokenStorage
+
             self._coerce_client_secret_post()
-            request = await super()._refresh_token()
+            storage = self.context.storage
+            if (
+                not isinstance(storage, HermesTokenStorage)
+                or not self.context.lock.locked()
+            ):
+                # Direct request-builder callers (including compatibility
+                # tests) do not run inside the SDK auth-flow lock and cannot
+                # participate in cross-process refresh ownership.
+                request = await super()._refresh_token()
+                return self._stamp_token_user_agent(request)
+
+            lease = storage.refresh_lock()
+            await lease.acquire()
+            self._hermes_refresh_lease = lease
+
+            # The SDK invokes this hook while holding context.lock. Reload only
+            # after acquiring the process lease: a peer may have rotated the
+            # token while this process was waiting.
+            latest = await storage.get_tokens()
+            self.context.current_tokens = latest
+            self._seed_token_expiry(latest)
+            if self.context.is_token_valid():
+                await self._release_refresh_lease()
+                raise _PeerRefreshCompleted
+
+            refresh_token = getattr(latest, "refresh_token", None)
+            if not refresh_token:
+                await self._release_refresh_lease()
+                raise _ExplicitReauthorizationRequired(
+                    "OAuth refresh credentials are unavailable; explicit reauthorization is required"
+                )
+            refresh_token = str(refresh_token)
+            if not storage.claim_refresh_token(refresh_token):
+                await self._release_refresh_lease()
+                raise _ExplicitReauthorizationRequired(
+                    "OAuth refresh state is uncertain; explicit reauthorization is required"
+                )
+
+            try:
+                request = await super()._refresh_token()
+            except BaseException:
+                # No request was yielded, so this generation was not sent.
+                try:
+                    storage.complete_refresh_token(refresh_token)
+                except OSError as exc:
+                    logger.warning(
+                        "MCP OAuth '%s': could not clear an unsent refresh claim: %s",
+                        self._hermes_server_name,
+                        exc,
+                    )
+                finally:
+                    await self._release_refresh_lease()
+                raise
             return self._stamp_token_user_agent(request)
+
+        async def _release_refresh_lease(self) -> None:
+            lease = getattr(self, "_hermes_refresh_lease", None)
+            self._hermes_refresh_lease = None
+            if lease is not None:
+                await lease.release()
+
+        def _retain_failed_refresh_generation(self, prior) -> None:
+            """Keep the expired generation so the marker gates later flows."""
+            if prior is not None and getattr(prior, "refresh_token", None):
+                self.context.current_tokens = prior
+                self._seed_token_expiry(prior)
+            else:
+                self.context.clear_tokens()
 
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
@@ -201,8 +298,14 @@ def _make_hermes_provider_class() -> Optional[type]:
                 except (HTTPError, OAuthTokenError):
                     raise OAuthTokenError("Invalid token response") from None
                 self.context.current_tokens = token_response
-                self.context.update_token_expiry(token_response)
+                self._seed_token_expiry(token_response)
                 await self.context.storage.set_tokens(token_response)
+                from tools.mcp_oauth import HermesTokenStorage
+
+                if isinstance(self.context.storage, HermesTokenStorage):
+                    self.context.storage.complete_refresh_token(
+                        token_response.refresh_token
+                    )
                 return
 
             from mcp.client.auth.oauth2 import OAuthTokenError
@@ -210,27 +313,51 @@ def _make_hermes_provider_class() -> Optional[type]:
             raise OAuthTokenError(f"Token exchange failed ({response.status_code})")
 
         async def _handle_refresh_response(self, response) -> bool:
-            """Accept any 2xx refresh response and avoid logging token bodies."""
-            if not (200 <= response.status_code < 300):
-                logger.warning("Token refresh failed: %s", response.status_code)
-                self.context.clear_tokens()
-                return False
-
-            from mcp.shared.auth import OAuthToken
-            from httpx import HTTPError
-            from pydantic import ValidationError
-
+            """Persist a rotation atomically or fail closed without browser auth."""
+            from tools.mcp_oauth import HermesTokenStorage
+            prior = self.context.current_tokens
             try:
-                content = await response.aread()
-                token_response = OAuthToken.model_validate_json(content)
+                if not (200 <= response.status_code < 300):
+                    logger.warning("Token refresh failed: %s", response.status_code)
+                    self._retain_failed_refresh_generation(prior)
+                    raise _ExplicitReauthorizationRequired(
+                        "OAuth token refresh failed; explicit reauthorization is required"
+                    )
+
+                from mcp.shared.auth import OAuthToken
+                from httpx import HTTPError
+                from pydantic import ValidationError
+
+                try:
+                    content = await response.aread()
+                    token_response = OAuthToken.model_validate_json(content)
+                except (HTTPError, ValidationError):
+                    self._retain_failed_refresh_generation(prior)
+                    raise _ExplicitReauthorizationRequired(
+                        "OAuth refresh response was invalid; explicit reauthorization is required"
+                    ) from None
+
+                # RFC 6749 §6: omitted scope and refresh_token remain unchanged.
+                if token_response.scope is None and prior is not None:
+                    token_response.scope = prior.scope
+                if token_response.refresh_token is None and prior is not None:
+                    token_response.refresh_token = prior.refresh_token
+
                 self.context.current_tokens = token_response
-                self.context.update_token_expiry(token_response)
-                await self.context.storage.set_tokens(token_response)
+                self._seed_token_expiry(token_response)
+                storage = self.context.storage
+                try:
+                    await storage.set_tokens(token_response)
+                    if isinstance(storage, HermesTokenStorage):
+                        storage.complete_refresh_token(token_response.refresh_token)
+                except Exception:
+                    self._retain_failed_refresh_generation(prior)
+                    raise _ExplicitReauthorizationRequired(
+                        "OAuth refresh could not be persisted; explicit reauthorization is required"
+                    ) from None
                 return True
-            except (HTTPError, ValidationError):
-                logger.warning("Invalid refresh response: %s", response.status_code)
-                self.context.clear_tokens()
-                return False
+            finally:
+                await self._release_refresh_lease()
 
         async def _initialize(self) -> None:
             """Load stored tokens + client info AND seed token_expiry_time.
@@ -266,8 +393,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             """
             await super()._initialize()
             tokens = self.context.current_tokens
-            if tokens is not None and tokens.expires_in is not None:
-                self.context.update_token_expiry(tokens)
+            self._seed_token_expiry(tokens)
 
             # Cold-load: restore OAuth server metadata from disk before any
             # refresh attempt. Without this, a restarted process with cached
@@ -530,19 +656,42 @@ def _make_hermes_provider_class() -> Optional[type]:
             # generator via inner.asend(incoming), preserving the bidirectional
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
-            inner = super().async_auth_flow(request)
-            try:
-                outgoing = await inner.__anext__()
-                while True:
-                    incoming = yield outgoing
-                    # Sniff the response for a dead-client-registration signal
-                    # before handing it back to the SDK (best-effort, GH#36767).
-                    await self._maybe_flag_poisoned_client(incoming)
-                    outgoing = await inner.asend(incoming)
-            except StopAsyncIteration:
-                # Persist any metadata the SDK discovered lazily during the
-                # 401 branch so a subsequent cold-load skips discovery.
-                self._persist_oauth_metadata_if_changed()
+            while True:
+                inner = super().async_auth_flow(request)
+                restart_after_peer_refresh = False
+                try:
+                    outgoing = await inner.__anext__()
+                    while True:
+                        incoming = yield outgoing
+                        # Sniff the response for a dead-client-registration
+                        # signal before handing it back to the SDK (best-effort,
+                        # GH#36767).
+                        await self._maybe_flag_poisoned_client(incoming)
+                        outgoing = await inner.asend(incoming)
+                except _PeerRefreshCompleted:
+                    # _refresh_token reloaded a fresh token while holding the
+                    # SDK context lock. Restart so the base flow re-evaluates
+                    # token validity and adds the new Authorization header.
+                    restart_after_peer_refresh = True
+                except StopAsyncIteration:
+                    # Persist metadata discovered lazily during the 401 branch
+                    # so a subsequent cold-load skips discovery.
+                    self._persist_oauth_metadata_if_changed()
+                    return
+                finally:
+                    # The base generator owns context.lock across yields. Close
+                    # it explicitly in the same task before releasing the file
+                    # lease; GC finalization from another task can strand the
+                    # AnyIO lock and hang all later flows.
+                    try:
+                        await inner.aclose()
+                    finally:
+                        # Lease cleanup is total: a close failure or cancellation
+                        # must not retain the OS lock and strand every process.
+                        await self._release_refresh_lease()
+
+                if restart_after_peer_refresh:
+                    continue
                 return
 
     return HermesMCPOAuthProvider
@@ -786,10 +935,17 @@ class MCPOAuthManager:
             if mtime_ns != entry.last_mtime_ns:
                 old = entry.last_mtime_ns
                 entry.last_mtime_ns = mtime_ns
-                # Force the SDK's OAuthClientProvider to reload from storage
-                # on its next auth flow. `_initialized` is private API but
-                # stable across the MCP SDK versions we pin (>=1.26.0).
-                if hasattr(entry.provider, "_initialized"):
+                # Synchronize mutation with the SDK auth generator, which owns
+                # context.lock across request/response yields. Reloading shared
+                # context outside this lock can corrupt an in-flight flow.
+                context = getattr(entry.provider, "context", None)
+                context_lock = getattr(context, "lock", None)
+                if context_lock is not None:
+                    async with context_lock:
+                        if hasattr(entry.provider, "_initialized"):
+                            entry.provider._initialized = False  # noqa: SLF001
+                elif hasattr(entry.provider, "_initialized"):
+                    # Compatibility doubles may not expose an SDK context.
                     entry.provider._initialized = False  # noqa: SLF001
                 logger.info(
                     "MCP OAuth '%s': tokens file changed (mtime %d -> %d), "

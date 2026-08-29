@@ -293,10 +293,10 @@ class TestBuildOAuthAuth:
         response = httpx.Response(
             201, content=b'{"refresh_token": "refresh-secret"}'
         )
-        with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth"):
-            result = await provider._handle_refresh_response(response)
+        with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth"), \
+             pytest.raises(Exception, match="explicit reauthorization"):
+            await provider._handle_refresh_response(response)
 
-        assert result is False
         assert provider.context.current_tokens is None
         assert "refresh-secret" not in caplog.text
 
@@ -316,9 +316,9 @@ class TestBuildOAuthAuth:
             async def aread(self):
                 raise httpx.ReadError("body read failed")
 
-        result = await provider._handle_refresh_response(_ReadErrorResponse())
+        with pytest.raises(Exception, match="explicit reauthorization"):
+            await provider._handle_refresh_response(_ReadErrorResponse())
 
-        assert result is False
         assert provider.context.current_tokens is None
 
 
@@ -892,7 +892,7 @@ def test_resolve_redirect_uri(cfg, expected):
     assert _resolve_redirect_uri(cfg, 1234) == expected
 
 
-def test_build_oauth_auth_preserves_server_url_path():
+def test_build_oauth_auth_preserves_server_url_path(tmp_path, monkeypatch):
     """server_url with path is forwarded to OAuthClientProvider unmodified.
 
     Regression for #16015: previously ``_parse_base_url`` stripped the path,
@@ -902,27 +902,20 @@ def test_build_oauth_auth_preserves_server_url_path():
     itself for authorization-server discovery via
     ``OAuthContext.get_authorization_base_url``; Hermes must not pre-strip.
     """
-    from tools import mcp_oauth
+    from tools.mcp_oauth_manager import reset_manager_for_tests
 
-    captured: dict = {}
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    reset_manager_for_tests()
 
-    class _FakeProvider:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
+    provider = build_oauth_auth(
+        server_name="notion",
+        server_url="https://mcp.notion.com/mcp",
+        oauth_config={},
+    )
 
-    with patch.object(mcp_oauth, "_OAUTH_AVAILABLE", True), \
-         patch.object(mcp_oauth, "HermesOAuthClientProvider", _FakeProvider), \
-         patch.object(mcp_oauth, "_is_interactive", return_value=True), \
-         patch.object(mcp_oauth, "_maybe_preregister_client"), \
-         patch.object(mcp_oauth, "HermesTokenStorage") as mock_storage_cls:
-        mock_storage_cls.return_value = MagicMock(has_cached_tokens=lambda: True)
-        build_oauth_auth(
-            server_name="notion",
-            server_url="https://mcp.notion.com/mcp",
-            oauth_config={},
-        )
-
-    assert captured["server_url"] == "https://mcp.notion.com/mcp"
+    assert provider is not None
+    assert str(provider.context.server_url) == "https://mcp.notion.com/mcp"
 
 
 class TestPasteCallbackReader:

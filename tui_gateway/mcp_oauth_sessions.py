@@ -155,11 +155,15 @@ def _worker(session_id: str, hermes_home: str, server_name: str, cfg: dict, reco
         home_token = set_hermes_home_override(hermes_home)
         secret_token = set_secret_scope(build_profile_secret_scope(Path(hermes_home)))
         try:
-            with force_interactive_oauth(), dashboard_oauth_flow(flow):
-                from tools.mcp_oauth import HermesTokenStorage
+            from tools.mcp_oauth import HermesTokenStorage
 
-                manager = get_manager()
-                storage = HermesTokenStorage(server_name)
+            manager = get_manager()
+            storage = HermesTokenStorage(server_name)
+            with (
+                storage.refresh_lock(),
+                force_interactive_oauth(),
+                dashboard_oauth_flow(flow),
+            ):
                 backup = storage.snapshot()
                 previous_entry = None
                 try:

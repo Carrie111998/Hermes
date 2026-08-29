@@ -447,6 +447,7 @@ async def test_manager_malformed_201_refresh_response_clears_tokens(
     tmp_path, monkeypatch, caplog
 ):
     import logging
+    from mcp.client.auth.oauth2 import OAuthTokenError
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
@@ -460,9 +461,9 @@ async def test_manager_malformed_201_refresh_response_clears_tokens(
         b'{"refresh_token": "refresh-secret"}',
     )
     with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth_manager"):
-        result = await provider._handle_refresh_response(response)
+        with pytest.raises(OAuthTokenError, match="explicit reauthorization"):
+            await provider._handle_refresh_response(response)
 
-    assert result is False
     assert provider.context.current_tokens is None
     assert "refresh-secret" not in caplog.text
 
@@ -470,6 +471,7 @@ async def test_manager_malformed_201_refresh_response_clears_tokens(
 @pytest.mark.asyncio
 async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
     import httpx
+    from mcp.client.auth.oauth2 import OAuthTokenError
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
@@ -483,7 +485,7 @@ async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
         async def aread(self):
             raise httpx.ReadError("body read failed")
 
-    result = await provider._handle_refresh_response(_ReadErrorResponse())
+    with pytest.raises(OAuthTokenError, match="explicit reauthorization"):
+        await provider._handle_refresh_response(_ReadErrorResponse())
 
-    assert result is False
     assert provider.context.current_tokens is None

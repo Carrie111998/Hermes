@@ -44,6 +44,8 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import errno
+import hashlib
 import json
 import logging
 import os
@@ -449,6 +451,105 @@ def _write_json(path: Path, data: dict) -> None:
         raise
 
 
+class _CrossProcessRefreshLock:
+    """Advisory per-server lock for rotating OAuth refresh tokens.
+
+    The lock is polled non-blockingly so waiting never stalls the asyncio
+    event loop. The operating system releases it automatically if the owning
+    process exits, including an unclean exit.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._fh = None
+
+    def _open_handle(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        secure_parent_dir(self._path)
+        # Both msvcrt byte-range locks and POSIX flock support empty files.
+        # Avoid a marker-write protocol: a crash between create and seed would
+        # otherwise leave an empty file that strands all future contenders.
+        fd = os.open(
+            str(self._path),
+            os.O_RDWR | os.O_CREAT,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        self._fh = os.fdopen(fd, "r+b", buffering=0)
+
+    async def acquire(self) -> None:
+        self._open_handle()
+
+        try:
+            while True:
+                try:
+                    self._try_acquire()
+                    return
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    await asyncio.sleep(0.05)
+        except BaseException:
+            self._fh.close()
+            self._fh = None
+            raise
+
+    def _try_acquire(self) -> None:
+        assert self._fh is not None
+        self._fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def acquire_blocking(self) -> None:
+        """Acquire the lease from synchronous reauthorization workers."""
+        self._open_handle()
+        try:
+            while True:
+                try:
+                    self._try_acquire()
+                    return
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.05)
+        except BaseException:
+            self._fh.close()
+            self._fh = None
+            raise
+
+    def __enter__(self):
+        self.acquire_blocking()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._release_sync()
+
+    async def release(self) -> None:
+        self._release_sync()
+
+    def _release_sync(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+
 # ---------------------------------------------------------------------------
 # HermesTokenStorage -- persistent token/client-info on disk
 # ---------------------------------------------------------------------------
@@ -463,6 +564,8 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
         HERMES_HOME/mcp-tokens/<server_name>.cimd-off      -- CIMD refused here
+        HERMES_HOME/mcp-tokens/<server_name>.refresh.lock  -- refresh lease
+        HERMES_HOME/mcp-tokens/<server_name>.refresh.json  -- consumed generation
     """
 
     def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
@@ -480,6 +583,85 @@ class HermesTokenStorage:
 
     def _cimd_rejected_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.cimd-off"
+
+    def _refresh_state_path(self) -> Path:
+        return _get_token_dir(self._hermes_home) / f"{self._server_name}.refresh.json"
+
+    def refresh_lock(self) -> _CrossProcessRefreshLock:
+        """Return this server's cross-process refresh-token lease."""
+        path = _get_token_dir(self._hermes_home) / f"{self._server_name}.refresh.lock"
+        return _CrossProcessRefreshLock(path)
+
+    @staticmethod
+    def _refresh_token_fingerprint(refresh_token: str) -> str:
+        return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+
+    def claim_refresh_token(self, refresh_token: str) -> bool:
+        """Mark one token generation consumed before sending it.
+
+        Must be called while holding :meth:`refresh_lock`. A surviving
+        ``in_flight`` marker is deliberately fail-closed: the prior process
+        may have reached the authorization server and crashed before it could
+        persist the rotated replacement.
+        """
+        fingerprint = self._refresh_token_fingerprint(refresh_token)
+        state_path = self._refresh_state_path()
+        state = _read_json(state_path)
+        if state_path.exists():
+            marker_valid = (
+                isinstance(state, dict)
+                and type(state.get("version")) is int
+                and state.get("version") == 1
+                and isinstance(state.get("status"), str)
+                and state.get("status") in {"in_flight", "complete"}
+                and isinstance(state.get("refresh_token_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", state["refresh_token_sha256"])
+                is not None
+            )
+            if not marker_valid:
+                logger.error(
+                    "Invalid OAuth refresh claim marker for '%s'; refusing token reuse",
+                    self._server_name,
+                )
+                return False
+        state = state or {}
+        if state.get("status") == "in_flight" and secrets.compare_digest(
+            str(state.get("refresh_token_sha256", "")), fingerprint
+        ):
+            return False
+        _write_json(
+            self._refresh_state_path(),
+            {
+                "version": 1,
+                "status": "in_flight",
+                "refresh_token_sha256": fingerprint,
+            },
+        )
+        return True
+
+    def complete_refresh_token(self, refresh_token: str | None) -> None:
+        """Clear the consumed-generation marker after durable token storage."""
+        path = self._refresh_state_path()
+        if refresh_token:
+            # Write a non-blocking terminal state before unlinking. If unlink
+            # fails, a future refresh still knows this generation completed.
+            _write_json(
+                path,
+                {
+                    "version": 1,
+                    "status": "complete",
+                    "refresh_token_sha256": self._refresh_token_fingerprint(
+                        refresh_token
+                    ),
+                },
+            )
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug(
+                "Could not remove completed OAuth refresh marker for %s",
+                self._server_name,
+            )
 
     # -- tokens ------------------------------------------------------------
 
@@ -636,18 +818,24 @@ class HermesTokenStorage:
             self._client_info_path(),
             self._meta_path(),
             self._cimd_rejected_path(),
+            self._refresh_state_path(),
         ):
             p.unlink(missing_ok=True)
 
     def snapshot(self) -> dict[str, bytes]:
         """Capture on-disk OAuth state so a failed re-auth can restore it.
 
-        Maps filename -> bytes for whichever of the three state files exist.
+        Maps filename -> bytes for whichever persisted state files exist.
         Feed back to ``restore()`` to undo an intervening ``remove()`` when a
         re-authentication attempt fails, so a still-valid token isn't destroyed.
         """
         snap: dict[str, bytes] = {}
-        for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
+        for p in (
+            self._tokens_path(),
+            self._client_info_path(),
+            self._meta_path(),
+            self._refresh_state_path(),
+        ):
             try:
                 snap[p.name] = p.read_bytes()
             except OSError:
@@ -658,7 +846,12 @@ class HermesTokenStorage:
         """Revert to a snapshot without overwriting a concurrent successful write."""
         if only_if_absent and any(
             path.exists()
-            for path in (self._tokens_path(), self._client_info_path(), self._meta_path())
+            for path in (
+                self._tokens_path(),
+                self._client_info_path(),
+                self._meta_path(),
+                self._refresh_state_path(),
+            )
         ):
             logger.info(
                 "Skipping OAuth rollback for %s because newer state exists",
@@ -1907,51 +2100,14 @@ def build_oauth_auth(
         )
         return None
 
-    cfg = dict(oauth_config or {})  # copy — we mutate _resolved_port
-    apply_oauth_provider_defaults(
-        cfg, server_name=server_name, server_url=server_url
-    )
-    storage = HermesTokenStorage(server_name)
+    # Backwards-compatible callers must use the same provider cache and
+    # cross-process refresh protocol as runtime MCP discovery. Returning the
+    # legacy local subclass here would share token files while bypassing the
+    # single-consumer lease and fail-closed generation marker.
+    from tools.mcp_oauth_manager import get_manager
 
-    if not _is_interactive() and not storage.has_cached_tokens():
-        raise OAuthNonInteractiveError(
-            "MCP OAuth for "
-            f"'{server_name}': non-interactive environment and no cached tokens "
-            "found. The OAuth flow requires browser authorization. Run "
-            f"`hermes mcp login {server_name}` interactively first to complete "
-            "initial authorization, then cached tokens will be reused."
-        )
-
-    _configure_callback_port(cfg, storage)
-    client_metadata = _build_client_metadata(cfg)
-    _maybe_preregister_client(storage, cfg, client_metadata)
-
-    # Use closure factories to avoid global state pollution (#44588, #34260).
-    resolved_port = cfg.get("_resolved_port", _oauth_port)
-    redirect_handler = _make_redirect_handler(
-        resolved_port, redirect_uri=cfg.get("redirect_uri") or None
-    )
-    callback_handler = _make_callback_waiter(
-        resolved_port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))
-    )
-
-    provider_class = _get_hermes_oauth_provider_class()
-    if provider_class is None:
-        logger.warning(
-            "MCP OAuth requested for '%s' but the provider class is unavailable",
-            server_name,
-        )
-        return None
-
-    return provider_class(
-        server_url=server_url,
-        client_metadata=client_metadata,
-        storage=storage,
-        redirect_handler=redirect_handler,
-        # mcp 2.0 removed the provider's own `timeout` argument; the configured
-        # `oauth.timeout` is applied inside the callback waiter above, which is
-        # where the browser round-trip is actually awaited.
-        callback_handler=callback_handler,
-        token_user_agent=token_request_user_agent(cfg),
-        **cimd_provider_kwargs(cfg),
+    return get_manager().get_or_build_provider(
+        server_name,
+        server_url,
+        oauth_config,
     )

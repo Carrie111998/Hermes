@@ -808,6 +808,15 @@ def cmd_mcp_test(args):
 # ─── hermes mcp login ────────────────────────────────────────────────────────
 
 def _reauth_oauth_server(name: str, server_config: dict) -> bool:
+    """Serialize explicit reauthorization against background token refresh."""
+    from tools.mcp_oauth import HermesTokenStorage
+
+    storage = HermesTokenStorage(name)
+    with storage.refresh_lock():
+        return _reauth_oauth_server_under_lock(name, server_config)
+
+
+def _reauth_oauth_server_under_lock(name: str, server_config: dict) -> bool:
     """Force a fresh OAuth flow for one server. Returns True on success.
 
     Wipes cached OAuth state (disk + in-process MCPOAuthManager cache),

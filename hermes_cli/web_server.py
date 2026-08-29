@@ -13858,9 +13858,14 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         secret_token = set_secret_scope(build_profile_secret_scope(Path(flow.hermes_home)))
         try:
             transaction = _mcp_oauth_transaction(flow)
-            with transaction, force_interactive_oauth(), dashboard_oauth_flow(flow):
-                manager = get_manager()
-                storage = HermesTokenStorage(flow.server_name)
+            manager = get_manager()
+            storage = HermesTokenStorage(flow.server_name)
+            with (
+                transaction,
+                storage.refresh_lock(),
+                force_interactive_oauth(),
+                dashboard_oauth_flow(flow),
+            ):
                 backup = storage.snapshot()
                 previous_entry = None
                 try:
