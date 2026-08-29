@@ -119,6 +119,17 @@ class TestLowContextWarning:
         generic_hints = [c for c in calls if "config.yaml" in c]
         assert len(generic_hints) == 1
 
+    def test_wide_banner_defers_output_through_runtime_safe_console(self, cli_obj):
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((120, 40))), \
+             patch("cli.get_tool_definitions", return_value=[]), \
+             patch("hermes_cli.banner.load_banner_snapshot", return_value=None), \
+             patch("hermes_cli.banner.compute_toolset_availability", return_value={}), \
+             patch("hermes_cli.banner.save_banner_snapshot"), \
+             patch.object(cli_obj, "_show_tool_availability_warnings"), \
+             patch("cli.build_welcome_banner") as build_banner:
+            cli_obj.show_banner()
+
+        assert build_banner.call_args.kwargs["deferred_print"] == cli_obj._console_print
 
     def test_compact_banner_does_not_crash_on_narrow_terminal(self, cli_obj):
         """Compact mode should still have ctx_len defined for warning logic."""

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 # rich and prompt_toolkit are imported lazily (inside the functions that use
 # them) rather than at module level.  Importing this module is on the TUI
@@ -747,7 +747,11 @@ def _format_update_notice(behind: int) -> str:
 _deferred_update_notice_started = False
 
 
-def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
+def _defer_update_notice(
+    console: "Console",
+    max_wait: float = 30.0,
+    print_fn: Optional[Callable[[str], None]] = None,
+) -> None:
     """Print the update warning once the prefetched check completes.
 
     Used when the banner rendered before the update prefetch finished so
@@ -757,6 +761,7 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
     if _deferred_update_notice_started:
         return
     _deferred_update_notice_started = True
+    emit = print_fn or console.print
 
     def _wait_and_print() -> None:
         try:
@@ -765,7 +770,7 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
             behind = _update_result
             if behind is None or behind == 0:
                 return
-            console.print(_format_update_notice(behind))
+            emit(_format_update_notice(behind))
         except Exception:
             pass  # never break the session over an update notice
 
@@ -965,7 +970,8 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
                          context_length: int = None,
                          provider: str = None,
                          availability: Dict[str, Any] = None,
-                         skills_by_category: Dict[str, List[str]] = None):
+                         skills_by_category: Optional[Dict[str, List[str]]] = None,
+                         deferred_print: Optional[Callable[[str], None]] = None):
     """Build and print a welcome banner with caduceus on left and info on right.
 
     Args:
@@ -984,6 +990,8 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             ``compute_toolset_availability`` (e.g. replayed from the banner
             snapshot). When provided together with ``get_toolset_for_tool``,
             this function performs no ``model_tools`` import at all.
+        deferred_print: Optional prompt-toolkit-safe callback for notices that
+            may be emitted after the interactive input application starts.
     """
     from rich.panel import Panel
     from rich.table import Table
@@ -1268,7 +1276,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     try:
         behind = get_update_result(timeout=0.05)
         if behind is None and not _update_check_done.is_set():
-            _defer_update_notice(console)
+            _defer_update_notice(console, print_fn=deferred_print)
         elif behind is not None and behind != 0:
             right_lines.append(_format_update_notice(behind))
     except Exception:

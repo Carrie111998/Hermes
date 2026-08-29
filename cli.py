@@ -8596,6 +8596,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     provider=self.provider,
                     availability=snapshot["availability"],
                     skills_by_category=snapshot.get("skills_by_category"),
+                    deferred_print=self._console_print,
                 )
 
                 def _refresh_banner_snapshot() -> None:
@@ -8642,6 +8643,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     context_length=ctx_len,
                     provider=self.provider,
                     availability=availability,
+                    deferred_print=self._console_print,
                 )
                 try:
                     tmap = {

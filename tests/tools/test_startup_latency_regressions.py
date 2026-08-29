@@ -192,6 +192,30 @@ class TestBannerUpdateCheckNonBlocking:
         assert printed, "deferred update notice never printed"
         assert "3 commits behind" in printed[0]
 
+    def test_deferred_notice_uses_supplied_output_adapter(self):
+        import hermes_cli.banner as banner
+
+        printed = []
+
+        class _UnsafeConsole:
+            def print(self, *_args, **_kwargs):
+                raise AssertionError("raw Rich console must not handle deferred output")
+
+        done = threading.Event()
+        with patch.object(banner, "_update_check_done", done), \
+             patch.object(banner, "_update_result", None), \
+             patch.object(banner, "_deferred_update_notice_started", False):
+            banner._defer_update_notice(
+                _UnsafeConsole(), max_wait=5.0, print_fn=printed.append
+            )
+            banner._update_result = 3
+            done.set()
+            deadline = time.time() + 5
+            while not printed and time.time() < deadline:
+                time.sleep(0.02)
+        assert printed, "deferred update notice never reached the output adapter"
+        assert "3 commits behind" in printed[0]
+
     def test_deferred_notice_silent_when_up_to_date(self):
         import hermes_cli.banner as banner
 
