@@ -67,6 +67,22 @@ def _make_sa_config(
     return cfg
 
 
+def _sa_cache_path(server_name: str, home, cfg: dict | None = None):
+    """Cache path for *server_name* under *home*, bound to *cfg*'s identity.
+
+    Filenames carry an identity digest (token_url/client_id/username/scope/…),
+    so a test that wants "the cache file this config writes" must supply the
+    same config the provider was built with.
+    """
+    from tools.mcp_service_account import (
+        _get_sa_token_path,
+        sa_identity_fingerprint,
+    )
+
+    cfg = _make_sa_config() if cfg is None else cfg
+    return _get_sa_token_path(server_name, home, sa_identity_fingerprint(cfg))
+
+
 def _fake_token_response(
     access_token: str = "ACCESS",
     expires_in: int = 3600,
@@ -213,7 +229,7 @@ class TestTokenEndpointIsTheCredentialBoundary:
         from tools.mcp_service_account import _post_token_request
 
         client = _FakeHttpxClient([_FakeResponse(200, _fake_token_response())])
-        with pytest.raises(ValueError, match="non-https"):
+        with pytest.raises(ValueError, match="plaintext non-loopback"):
             await _post_token_request(
                 client,
                 "http://idp.example/token/",
@@ -221,6 +237,60 @@ class TestTokenEndpointIsTheCredentialBoundary:
                 "srv",
             )
         assert client.calls == [], "No request may be issued to a plaintext endpoint"
+
+    @pytest.mark.asyncio
+    async def test_loopback_plaintext_http_is_allowed(self):
+        """Local development IdPs stay usable; the network case does not.
+
+        http:// on loopback never reaches a network, so there is no path on
+        which the password could be observed (cf. RFC 8252 §8.3). Any other
+        host must still be https://.
+        """
+        from tools.mcp_service_account import _post_token_request
+
+        for url in (
+            "http://localhost:9000/token/",
+            "http://127.0.0.1:9000/token/",
+            "http://[::1]:9000/token/",
+        ):
+            client = _FakeHttpxClient([_FakeResponse(200, _fake_token_response())])
+            body = await _post_token_request(
+                client, url, {"password": "hunter2"}, "srv"
+            )
+            assert body["access_token"] == "ACCESS"
+            assert len(client.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_loopback_lookalike_hosts_are_still_refused(self):
+        """A hostname that merely *contains* localhost is not loopback."""
+        from tools.mcp_service_account import _post_token_request
+
+        for url in (
+            "http://localhost.evil.example/token/",
+            "http://127.0.0.1.evil.example/token/",
+            "http://notlocalhost/token/",
+        ):
+            client = _FakeHttpxClient([_FakeResponse(200, _fake_token_response())])
+            with pytest.raises(ValueError, match="plaintext non-loopback"):
+                await _post_token_request(
+                    client, url, {"password": "hunter2"}, "srv"
+                )
+            assert client.calls == []
+
+    @pytest.mark.asyncio
+    async def test_redirect_is_refused_on_loopback_too(self):
+        """The redirect ban is not conditional on the scheme."""
+        from tools.mcp_service_account import _post_token_request
+
+        client = _FakeHttpxClient([_FakeResponse(307, {})])
+        with pytest.raises(ValueError, match="redirect"):
+            await _post_token_request(
+                client,
+                "http://localhost:9000/token/",
+                {"password": "hunter2"},
+                "srv",
+            )
+        assert len(client.calls) == 1
 
     @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
     @pytest.mark.asyncio
@@ -674,7 +744,7 @@ class TestTokenCaching:
             except StopAsyncIteration:
                 pass
 
-        cache_path = _get_sa_token_path("srv", tmp_path)
+        cache_path = _sa_cache_path("srv", tmp_path)
         assert cache_path.exists()
         data = json.loads(cache_path.read_text())
         assert data["access_token"] == "DISK_TOK"
@@ -697,13 +767,18 @@ class TestTokenCaching:
 
         _clear_refresh_locks_for_tests()
 
-        # Write a valid token cache manually
-        cache_path = _get_sa_token_path("srv", tmp_path)
+        # Write a valid token cache manually. The identity must match the
+        # config the provider is built with — a cached token is bound to the
+        # token_url/client_id/username/scope that minted it.
+        from tools.mcp_service_account import sa_identity_fingerprint
+
+        cache_path = _sa_cache_path("srv", tmp_path)
         _write_token_cache(
             cache_path,
             {
                 "access_token": "COLD_TOK",
                 "expires_at": time.time() + 3600,
+                "identity": sa_identity_fingerprint(_make_sa_config()),
             },
         )
 
@@ -1168,8 +1243,8 @@ class TestProfileIsolation:
                     pass
 
         # Each profile has its own cache file
-        path_a = _get_sa_token_path("srv", home_a)
-        path_b = _get_sa_token_path("srv", home_b)
+        path_a = _sa_cache_path("srv", home_a)
+        path_b = _sa_cache_path("srv", home_b)
         assert path_a.exists()
         assert path_b.exists()
         assert path_a != path_b
@@ -1256,7 +1331,7 @@ class TestTokenCacheFilePermissions:
             except StopAsyncIteration:
                 pass
 
-        cache_path = _get_sa_token_path("srv", tmp_path)
+        cache_path = _sa_cache_path("srv", tmp_path)
         mode = cache_path.stat().st_mode & 0o777
         assert mode == 0o600, f"Expected 0600, got {oct(mode)}"
 
@@ -1466,8 +1541,8 @@ class TestProfileSecretScopeIsolation:
                 except StopAsyncIteration:
                     pass
 
-        path_a = _get_sa_token_path("srv", home_a)
-        path_b = _get_sa_token_path("srv", home_b)
+        path_a = _sa_cache_path("srv", home_a)
+        path_b = _sa_cache_path("srv", home_b)
         assert path_a.exists() and path_b.exists()
         assert path_a != path_b
         import json as _json
