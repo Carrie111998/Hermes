@@ -2242,7 +2242,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
-        elif function_name == "preview":
+        elif function_name == "desktop_preview":
             def _execute(next_args: dict) -> Any:
                 if (next_args.get("action") or "").strip() == "read":
                     from tools.read_preview_tool import read_preview_tool as _read_preview_tool
@@ -2265,7 +2265,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('preview', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('desktop_preview', function_args, tool_duration, result=function_result)}")
         elif function_name == "drive_preview":
             def _execute(next_args: dict) -> Any:
                 from tools.drive_preview_tool import drive_preview_tool as _drive_preview_tool

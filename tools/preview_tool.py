@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The `preview` tool — the preview pane beside the chat, as ONE tool.
+"""The `desktop_preview` tool — the preview pane beside the chat, as ONE tool.
 
 Consolidation (#95681, maintainer-directed): open_preview, close_preview,
 and read_preview each re-taught "the preview pane beside the chat" world;
@@ -48,7 +48,7 @@ def _handle_preview(args, **kw):
 
 
 PREVIEW_SCHEMA = {
-    "name": "preview",
+    "name": "desktop_preview",
     "description": (
         "The preview pane beside the chat in the Hermes desktop app. open: show "
         "a web URL (bare domains fine), a localhost dev server, or a file path "
@@ -77,7 +77,7 @@ PREVIEW_SCHEMA = {
 
 
 registry.register(
-    name="preview",
+    name="desktop_preview",
     toolset="desktop_ui",
     schema=PREVIEW_SCHEMA,
     handler=_handle_preview,

@@ -132,7 +132,7 @@ ACT_PREVIEW_SCHEMA = {
     # doesn't know them re-reads pages or loops strobe.
     "description": (
         "Use the web page open in the desktop preview pane (the one "
-        "`preview` opens): log in, fill forms, click through flows. ALWAYS "
+        "`desktop_preview` opens): log in, fill forms, click through flows. ALWAYS "
         "start with action='elements' — it inventories clickable/typable "
         "things as refs ('btn-sign-in') with role/label/value; act by ref, "
         "not guessed selectors. Refs survive re-renders and only die on "
@@ -147,7 +147,7 @@ ACT_PREVIEW_SCHEMA = {
         "also presses Enter), scroll, press, strobe (visual flourish only — "
         "one call runs a multi-second burst; never loop it), back/forward/"
         "reload. Moves draw live and fade; annotate_preview leaves a lasting "
-        "mark. Page text only: preview action=read. Separate automated "
+        "mark. Page text only: desktop_preview action=read. Separate automated "
         "browser: browser_* tools."
     ),
     "parameters": {

@@ -155,10 +155,10 @@ def _handle_project(args, **kw):
 # re-taught "desktop Projects (named workspaces)"; one action enum says it
 # once (244 -> ~145 tok).
 registry.register(
-    name="project",
+    name="desktop_project",
     toolset="project",
     schema={
-        "name": "project",
+        "name": "desktop_project",
         "description": (
             "Desktop Projects (named workspaces). create: make one and switch "
             "this chat into it — pass path to anchor it to a repo/folder (the "

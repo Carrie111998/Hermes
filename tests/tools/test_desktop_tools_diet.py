@@ -19,11 +19,11 @@ class TestConsolidatedToolsets(unittest.TestCase):
         from toolsets import TOOLSETS
 
         ui = TOOLSETS["desktop_ui"]["tools"]
-        self.assertIn("preview", ui)
+        self.assertIn("desktop_preview", ui)
         for dead in ("open_preview", "close_preview", "read_preview"):
             self.assertNotIn(dead, ui)
         proj = TOOLSETS["project"]["tools"]
-        self.assertEqual(proj, ["project"])
+        self.assertEqual(proj, ["desktop_project"])
 
     def test_registry_serves_only_new_names(self):
         from model_tools import get_tool_definitions
@@ -34,8 +34,8 @@ class TestConsolidatedToolsets(unittest.TestCase):
                 quiet_mode=True, enabled_toolsets=["desktop_ui", "project"]
             )
         }
-        self.assertIn("preview", names)
-        self.assertIn("project", names)
+        self.assertIn("desktop_preview", names)
+        self.assertIn("desktop_project", names)
         for dead in (
             "open_preview", "close_preview", "read_preview",
             "project_create", "project_switch", "project_list",
@@ -98,7 +98,7 @@ class TestDietBudget(unittest.TestCase):
 
         targets = {
             "drive_preview", "tour", "annotate_preview", "setup_mcp", "tip",
-            "preview", "project", "read_window_below", "apply_layout",
+            "desktop_preview", "desktop_project", "read_window_below", "apply_layout",
             "read_terminal", "focus_pane",
         }
         total = 0

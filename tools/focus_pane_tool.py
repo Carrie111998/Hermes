@@ -38,7 +38,7 @@ FOCUS_PANE_SCHEMA = {
     "description": (
         "Reveal and focus a Hermes desktop pane when the user asks to see it: "
         "chat, files, terminal, review (git diff), or sessions. For URLs/"
-        "files use the preview tool instead."
+        "files use the desktop_preview tool instead."
     ),
     "parameters": {
         "type": "object",
