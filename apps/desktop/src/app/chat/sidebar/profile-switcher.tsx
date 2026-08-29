@@ -19,7 +19,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
 import type { ProfileScope } from '@/api/client'
@@ -180,23 +180,6 @@ export function ProfileRail() {
 
   useFleetRoster(multipleConnections)
 
-  useEffect(() => {
-    if (!focusRouteKey) {
-      return
-    }
-
-    const target = Array.from(globalThis.document.querySelectorAll<HTMLElement>('[data-route-key]')).find(
-      element => element.dataset.routeKey === focusRouteKey
-    )
-
-    if (!target) {
-      return
-    }
-
-    target.focus()
-    setFocusRouteKey(null)
-  }, [activeConnectionId, focusRouteKey, gatewayProfile])
-
   const connections = registry?.connections
 
   const restGroups = useMemo(
@@ -246,6 +229,38 @@ export function ProfileRail() {
   // The threshold counts the whole fleet: fourteen squares are fourteen
   // squares wherever they live.
   const condensed = profiles.length + countRestAgents(restGroups) > PROFILE_DROPDOWN_THRESHOLD
+
+  useLayoutEffect(() => {
+    if (!focusRouteKey) {
+      return
+    }
+
+    const rail = scrollRef.current
+    const activeElement = globalThis.document.activeElement
+
+    const focusMovedOutsideRail = Boolean(
+      activeElement && activeElement !== globalThis.document.body && !rail?.contains(activeElement)
+    )
+
+    // The condensed menu owns its own focus return. If the user moved into the
+    // composer while a dial was pending, their newer focus decision wins.
+    if (!rail || condensed || focusMovedOutsideRail) {
+      setFocusRouteKey(null)
+
+      return
+    }
+
+    const target = Array.from(rail.querySelectorAll<HTMLElement>('[data-route-key]')).find(
+      element => element.dataset.routeKey === focusRouteKey
+    )
+
+    if (target) {
+      target.focus({ preventScroll: true })
+    }
+
+    // Never leave a sticky request that could steal focus after a later switch.
+    setFocusRouteKey(null)
+  }, [activeConnectionId, condensed, focusRouteKey, gatewayProfile])
 
   const switchToRest = (agent: FleetAgent) => {
     if (pendingRouteRef.current) {
@@ -1056,19 +1071,21 @@ function FleetActiveTuple({
   routeKey?: string
 }) {
   return (
-    <Tip label={label}>
-      <span
-        aria-label={label}
-        className="inline-flex size-6 shrink-0 items-center justify-center rounded-[4px] bg-(--ui-control-active-background) text-foreground"
-        data-connection-id={connectionId}
-        data-route-key={routeKey}
-        data-slot="profile-rail-active-tuple"
-        role="status"
-        tabIndex={-1}
-      >
-        <Codicon name={glyph} size="0.875rem" />
-      </span>
-    </Tip>
+    <span
+      aria-label={label}
+      className="inline-flex size-6 shrink-0 items-center justify-center rounded-[4px] bg-(--ui-control-active-background) text-foreground"
+      data-connection-id={connectionId}
+      data-route-key={routeKey}
+      data-slot="profile-rail-active-tuple"
+      role="status"
+      tabIndex={-1}
+    >
+      <Tip label={label}>
+        <span aria-hidden="true" className="inline-flex size-full items-center justify-center">
+          <Codicon name={glyph} size="0.875rem" />
+        </span>
+      </Tip>
+    </span>
   )
 }
 
@@ -1088,24 +1105,26 @@ function FleetActiveNamedSquare({
   const hue = color ?? 'var(--ui-text-quaternary)'
 
   return (
-    <Tip label={label}>
-      <span
-        aria-label={label}
-        className="relative grid size-5 shrink-0 select-none place-items-center rounded-[3px] text-[0.5625rem] font-semibold uppercase leading-none"
-        data-connection-id={connectionId}
-        data-route-key={routeKey}
-        data-slot="profile-rail-active-tuple"
-        role="status"
-        style={{
-          backgroundColor: profileColorSoft(hue, 30),
-          boxShadow: `inset 0 0 0 1.5px ${hue}`,
-          color: color ?? undefined
-        }}
-        tabIndex={-1}
-      >
-        {name.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
-      </span>
-    </Tip>
+    <span
+      aria-label={label}
+      className="relative grid size-5 shrink-0 select-none place-items-center rounded-[3px] text-[0.5625rem] font-semibold uppercase leading-none"
+      data-connection-id={connectionId}
+      data-route-key={routeKey}
+      data-slot="profile-rail-active-tuple"
+      role="status"
+      style={{
+        backgroundColor: profileColorSoft(hue, 30),
+        boxShadow: `inset 0 0 0 1.5px ${hue}`,
+        color: color ?? undefined
+      }}
+      tabIndex={-1}
+    >
+      <Tip label={label}>
+        <span aria-hidden="true" className="grid size-full place-items-center">
+          {name.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
+        </span>
+      </Tip>
+    </span>
   )
 }
 

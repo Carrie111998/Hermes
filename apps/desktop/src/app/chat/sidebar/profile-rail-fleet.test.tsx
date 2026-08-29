@@ -484,6 +484,41 @@ describe('ProfileRail fleet mode', () => {
     expect(globalThis.document.activeElement).toBe(screen.getByRole('status', { name: 'default · This device' }))
   })
 
+  it('does not steal focus when the user moves to the composer while a gateway switch is pending', async () => {
+    armFleet()
+    await renderFleet()
+
+    let settleSwitch: () => void = () => undefined
+    selectConnection.mockImplementationOnce(
+      () =>
+        new Promise<void>(resolve => {
+          settleSwitch = () => {
+            activeConnectionId.set('local')
+            gatewayProfile.set('omer')
+            profiles.set([
+              { is_default: true, name: 'default' },
+              { is_default: false, name: 'omer' }
+            ])
+            resolve()
+          }
+        })
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to omer on This device' }))
+
+    const composer = globalThis.document.createElement('textarea')
+    globalThis.document.body.append(composer)
+    composer.focus()
+
+    await act(async () => {
+      settleSwitch()
+      await Promise.resolve()
+    })
+
+    expect(globalThis.document.activeElement).toBe(composer)
+    composer.remove()
+  })
+
   it('treats a named active exact tuple as status, including mac-cockpit', async () => {
     armFleet()
     activeConnectionId.set('local')
