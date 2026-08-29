@@ -2318,6 +2318,11 @@ class ContextCompressor(ContextEngine):
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        self._automatic_timeout_terminal = False
+        self._automatic_timeout_terminal_turn_id = None
+        self._compression_terminal_outcome = None
+        self._compression_attempt_id = None
+        self._compression_attempt_turn_id = None
         self._proactive_prune_rearm_tokens = 0
 
         # Micro-compaction state reset
@@ -2623,6 +2628,11 @@ class ContextCompressor(ContextEngine):
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        self._automatic_timeout_terminal = False
+        self._automatic_timeout_terminal_turn_id = None
+        self._compression_terminal_outcome = None
+        self._compression_attempt_id = None
+        self._compression_attempt_turn_id = None
         self._proactive_prune_rearm_tokens = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
@@ -2638,6 +2648,11 @@ class ContextCompressor(ContextEngine):
         self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         self._structural_no_op_backoff_until = 0.0
+        self._automatic_timeout_terminal = False
+        self._automatic_timeout_terminal_turn_id = None
+        self._compression_terminal_outcome = None
+        self._compression_attempt_id = None
+        self._compression_attempt_turn_id = None
         self._proactive_prune_rearm_tokens = 0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
@@ -4756,11 +4771,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
         digests: list[str] = []
         for ci in range(n_chunks):
+            self._raise_if_compression_cancelled()
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]
             if not segment.strip():
                 continue
             try:
-                from agent.auxiliary_client import call_llm
 
                 # During a stall-fallback retry, follow the summary onto the
                 # pinned healthy route (non-consuming read) instead of
@@ -4774,6 +4789,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     max_tokens=_LEAN_DIGEST_MAX_TOKENS,
                     **attempt_summary_route_kwargs(),
                 )
+                self._raise_if_compression_cancelled()
                 body = (
                     resp.choices[0].message.content
                     if hasattr(resp, "choices") else str(resp)
@@ -4803,6 +4819,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         """
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
+        self._raise_if_compression_cancelled()
         if _LEAN_ANCHOR_HEADING not in summary:
             summary += _redact_compaction_text(
                 _build_anchor_index(turns_to_summarize)
@@ -4811,6 +4828,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary += _redact_compaction_text(
                 self._build_chunk_digests(turns_to_summarize)
             )
+        self._raise_if_compression_cancelled()
         if _LEAN_USER_MESSAGES_HEADING not in summary:
             summary += _redact_compaction_text(
                 _build_verbatim_user_section(turns_to_summarize)
@@ -4886,6 +4904,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _raise_if_compression_cancelled(self) -> None:
+        check = getattr(self, "_compression_cancelled_check", None)
+        if callable(check) and check():
+            raise AuxiliaryExplicitCancellation()
+
     def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
@@ -4909,6 +4932,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
+        self._raise_if_compression_cancelled()
         prompt_started_at = time.monotonic()
         now = prompt_started_at
         if now < self._summary_failure_cooldown_until:
@@ -5268,6 +5292,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # exists, not that it's an object with ``.content``. Some
             # OpenAI-compatible proxies / local backends return a dict- or
             # str-shaped message; coerce defensively instead of crashing.
+            self._raise_if_compression_cancelled()
             if isinstance(response, dict):
                 choices = response.get("choices") or [{}]
                 message = choices[0].get("message") if isinstance(choices[0], dict) else getattr(choices[0], "message", None)
@@ -5313,7 +5338,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             # [SKILL_PRUNED: ...] marker the summarizer paraphrased away.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+            self._raise_if_compression_cancelled()
             summary = self._augment_summary_lean(summary, turns_to_summarize)
+            self._raise_if_compression_cancelled()
             self._validate_summary_user_provenance(summary, has_user_turn)
             # Store for iterative updates on next compaction
             self._previous_summary = summary
@@ -5436,6 +5463,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     _reason = "closed stream prematurely"
                 else:
                     _reason = "timed out"
+                self._raise_if_compression_cancelled()
                 self._fallback_to_main_for_compression(e, _reason)
                 return self._generate_summary(
                     turns_to_summarize,
@@ -5457,6 +5485,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
+                self._raise_if_compression_cancelled()
                 self._fallback_to_main_for_compression(e, "failed")
                 return self._generate_summary(
                     turns_to_summarize,

@@ -533,3 +533,69 @@ class TestCompressContextForwarderOwnsTimeout:
         assert seen["fence"] is fence
         assert prompt == "sys"
         assert msgs[0]["content"] == "ok"
+
+
+def test_timeout_cancellation_is_terminal_for_same_turn_automatic_retry(monkeypatch):
+    """Same-turn timeout is terminal; a later turn and force can retry."""
+    from run_agent import AIAgent
+    from agent.context_compressor import ContextCompressor
+
+    agent = object.__new__(AIAgent)
+    agent.session_id = "same-turn-timeout"
+    agent._current_turn_id = "turn-1"
+    agent._cached_system_prompt = "sys"
+    agent._emit_warning = MagicMock()
+    agent._touch_activity = MagicMock()
+    agent._conversation_root_id = MagicMock(return_value=None)
+    agent.context_compressor = MagicMock()
+    agent.context_compressor._consecutive_timeout_failures = 0
+    agent.context_compressor._record_compression_failure_cooldown = MagicMock()
+    agent.context_compressor.record_timeout_failure = ContextCompressor.record_timeout_failure.__get__(
+        agent.context_compressor, MagicMock
+    )
+    release = threading.Event()
+    automatic_calls = []
+    force_calls = []
+
+    def fake_compress(agent_obj, messages, system_message, **kwargs):
+        if kwargs.get("force"):
+            force_calls.append(kwargs)
+            return messages, "forced"
+        automatic_calls.append(kwargs)
+        if len(automatic_calls) == 1:
+            release.wait(timeout=2)
+        return messages, "sys"
+
+    monkeypatch.setattr("agent.conversation_compression.compress_context", fake_compress)
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        lambda compression_cfg=None: (0.05, 0.1),
+    )
+    monkeypatch.setattr("agent.portal_tags.get_conversation_context", lambda: object())
+    original = [{"role": "user", "content": "unchanged"}]
+
+    first = AIAgent._compress_context(agent, original, "sys")
+    assert first[0] is original
+    assert len(automatic_calls) == 1
+    assert agent.context_compressor._record_compression_failure_cooldown.call_count == 1
+    release.set()
+
+    # The same logical turn remains suppressed even after its cooldown timer
+    # has expired; this is the turn-scoped terminal latch, not a time sleep.
+    agent.context_compressor._summary_failure_cooldown_until = time.monotonic() - 1
+    second = AIAgent._compress_context(agent, original, "sys")
+    assert second[0] is original
+    assert len(automatic_calls) == 1
+
+    # The authoritative next turn is admitted once the prior cooldown expires.
+    agent.context_compressor._summary_failure_cooldown_until = time.monotonic() - 1
+    agent._current_turn_id = "turn-2"
+    third = AIAgent._compress_context(agent, original, "sys")
+    assert third[0] is original
+    assert len(automatic_calls) == 2
+    assert agent.context_compressor._record_compression_failure_cooldown.call_count == 1
+
+    forced = AIAgent._compress_context(agent, original, "sys", force=True)
+    assert forced[0] is original
+    assert forced[1] == "forced"
+    assert len(force_calls) == 1

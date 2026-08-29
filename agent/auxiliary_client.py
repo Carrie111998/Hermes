@@ -325,6 +325,93 @@ class AuxiliaryExplicitCancellation(BaseException):
         super().__init__("auxiliary request explicitly cancelled by host")
 
 
+class AuxiliaryCancellationToken:
+    """Monotonic attempt-local cancellation and dispatch admission fence."""
+
+    def __init__(self, source_check: Callable[[], Any]) -> None:
+        self._source_check = source_check
+        self._lock = threading.Lock()
+        self._state = "OPEN"
+        self._cancelled = False
+        self._callbacks: list[Callable[[], None]] = []
+
+    def _source_requested(self) -> bool:
+        try:
+            return bool(self._source_check())
+        except Exception:
+            logger.debug("auxiliary cancellation source check failed", exc_info=True)
+            return False
+
+    def _observe_locked(self) -> list[Callable[[], None]]:
+        if not self._cancelled and self._source_requested():
+            self._cancelled = True
+            if self._state == "OPEN":
+                self._state = "CANCELLED"
+            callbacks = self._callbacks
+            self._callbacks = []
+            return callbacks
+        return []
+
+    @staticmethod
+    def _run_callbacks(callbacks: list[Callable[[], None]]) -> None:
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.debug("auxiliary cancellation cleanup failed", exc_info=True)
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            callbacks = self._observe_locked()
+            cancelled = self._cancelled
+        self._run_callbacks(callbacks)
+        return cancelled
+
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancelled():
+            raise AuxiliaryExplicitCancellation()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            if self._state == "OPEN":
+                self._state = "CANCELLED"
+            callbacks = self._callbacks
+            self._callbacks = []
+        self._run_callbacks(callbacks)
+
+    def claim_dispatch(self) -> None:
+        """Linearize OPEN -> ADMITTED without holding the lock over RPC."""
+        with self._lock:
+            callbacks = self._observe_locked()
+            admitted = not self._cancelled and self._state != "CANCELLED"
+            if admitted:
+                self._state = "ADMITTED"
+        self._run_callbacks(callbacks)
+        if not admitted:
+            raise AuxiliaryExplicitCancellation()
+
+    def register_cancel_callback(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            callbacks = self._observe_locked()
+            if not self._cancelled:
+                self._callbacks.append(callback)
+                callbacks = []
+            else:
+                # Registration can lose the acquire -> register race after
+                # cancellation has already won. Deliver the late callback
+                # immediately, but only after leaving the token lock below.
+                callbacks.append(callback)
+        self._run_callbacks(callbacks)
+
+    def unregister_cancel_callback(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            try:
+                self._callbacks.remove(callback)
+            except ValueError:
+                pass
+
+
 def _aux_interrupt_protected() -> bool:
     return bool(getattr(_aux_interrupt_protection, "active", False))
 
@@ -353,6 +440,7 @@ def aux_interrupt_protection(
     active: bool = True,
     cancel_check=None,
     cancel_event=None,
+    cancellation_token: Optional[AuxiliaryCancellationToken] = None,
 ):
     """Mark the current thread's auxiliary LLM call as interrupt-protected.
 
@@ -365,17 +453,32 @@ def aux_interrupt_protection(
     prev = getattr(_aux_interrupt_protection, "active", False)
     prev_cancel_check = getattr(_aux_interrupt_protection, "cancel_check", None)
     prev_cancel_event = getattr(_aux_interrupt_protection, "cancel_event", None)
+    prev_token = getattr(_aux_interrupt_protection, "cancellation_token", None)
     _aux_interrupt_protection.active = active
     if callable(cancel_check):
         _aux_interrupt_protection.cancel_check = cancel_check
     if cancel_event is not None and callable(getattr(cancel_event, "is_set", None)):
         _aux_interrupt_protection.cancel_event = cancel_event
+    source = None
+    if cancel_event is not None and callable(getattr(cancel_event, "is_set", None)):
+        source = cancel_event.is_set
+    elif callable(cancel_check) and cancellation_token is None:
+        source = cancel_check
+    token = cancellation_token or prev_token
+    if cancellation_token is None and prev_token is not None and callable(source):
+        token = AuxiliaryCancellationToken(
+            lambda: bool(prev_token.is_cancelled() or source())
+        )
+    elif token is None and callable(source):
+        token = AuxiliaryCancellationToken(source)
+    _aux_interrupt_protection.cancellation_token = token
     try:
         yield
     finally:
         _aux_interrupt_protection.active = prev
         _aux_interrupt_protection.cancel_check = prev_cancel_check
         _aux_interrupt_protection.cancel_event = prev_cancel_event
+        _aux_interrupt_protection.cancellation_token = prev_token
 
 
 def _capture_aux_cancel_check() -> Optional[Callable[[], Any]]:
@@ -390,6 +493,11 @@ def _capture_aux_cancel_check() -> Optional[Callable[[], Any]]:
         # methods such as begin_timeout_cleanup() when captured by adapters.
         return check
     return None
+
+
+def _capture_aux_cancellation_token() -> Optional[AuxiliaryCancellationToken]:
+    token = getattr(_aux_interrupt_protection, "cancellation_token", None)
+    return token if isinstance(token, AuxiliaryCancellationToken) else None
 
 
 def _captured_aux_cancel_requested(cancel_check: Callable[[], Any]) -> bool:
@@ -460,6 +568,9 @@ def _notify_aux_progress() -> None:
 
 def _notify_aux_dispatch() -> None:
     """Record an actual provider dispatch without claiming response progress."""
+    token = _capture_aux_cancellation_token()
+    if token is not None:
+        token.claim_dispatch()
     hook = getattr(_aux_dispatch, "hook", None)
     if hook is not None:
         try:
@@ -595,13 +706,18 @@ def _run_protected_sync_provider_call(
     retain the historical direct synchronous path with no extra thread.
     """
     source_cancel_check = _capture_aux_cancel_check()
-    if not _aux_interrupt_protected() or not callable(source_cancel_check):
+    attempt_token = _capture_aux_cancellation_token()
+    if not _aux_interrupt_protected() or (
+        not callable(source_cancel_check) and attempt_token is None
+    ):
         return callback(kwargs)
 
     # Freeze one linearized outcome for this isolated attempt. The host Event is
     # reused and cleared on a later turn, while the Codex timeout Timer may race
     # owner polling. Both paths must decide under the same attempt-local lock.
-    cancel_check = _AuxiliaryCancellationDecision(source_cancel_check)
+    if attempt_token is None:
+        attempt_token = AuxiliaryCancellationToken(source_cancel_check)
+    cancel_check = _AuxiliaryCancellationDecision(attempt_token.is_cancelled)
 
     if cancel_check():
         raise AuxiliaryExplicitCancellation()
@@ -624,7 +740,10 @@ def _run_protected_sync_provider_call(
                 aux_progress_hook(progress_hook),
                 _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
                 _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
-                aux_interrupt_protection(cancel_check=cancel_check),
+                aux_interrupt_protection(
+                    cancel_check=cancel_check,
+                    cancellation_token=attempt_token,
+                ),
             ):
                 outcome["result"] = callback(kwargs)
         except BaseException as exc:
@@ -644,10 +763,12 @@ def _run_protected_sync_provider_call(
         # wins whenever result publication and the host Event become visible in
         # the same polling interval.
         if _captured_aux_cancel_requested(cancel_check):
+            attempt_token.cancel()
             raise AuxiliaryExplicitCancellation()
         if not done.wait(0.02):
             continue
         if _captured_aux_cancel_requested(cancel_check):
+            attempt_token.cancel()
             raise AuxiliaryExplicitCancellation()
         exception = outcome.get("exception")
         if exception is not None:
@@ -3547,6 +3668,34 @@ def _relay_auxiliary_metadata(
     }
 
 
+def _fenced_sync_provider_call(client: Any, kwargs: dict[str, Any]) -> Any:
+    """Claim one physical sync provider handoff before invoking the client."""
+    _notify_aux_dispatch()
+    return client.chat.completions.create(**kwargs)
+
+
+async def _fenced_async_provider_call(client: Any, kwargs: dict[str, Any]) -> Any:
+    """Claim one physical async provider handoff before invoking the client."""
+    _notify_aux_dispatch()
+    return await client.chat.completions.create(**kwargs)
+
+
+def _wait_for_aux_retry(
+    delay_seconds: float,
+    *,
+    cancellation_token: Optional[AuxiliaryCancellationToken] = None,
+) -> None:
+    """Wait for retry backoff while polling the attempt cancellation token."""
+    deadline = time.monotonic() + max(0.0, float(delay_seconds))
+    while True:
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.02, remaining))
+
+
 def _relay_sync_completion(
     client: Any,
     kwargs: dict[str, Any],
@@ -3555,7 +3704,7 @@ def _relay_sync_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    callback = create or (lambda request: client.chat.completions.create(**request))
+    callback = create or (lambda request: _fenced_sync_provider_call(client, request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
@@ -3583,7 +3732,7 @@ async def _relay_async_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    callback = create or (lambda request: client.chat.completions.create(**request))
+    callback = create or (lambda request: _fenced_async_provider_call(client, request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -3609,13 +3758,13 @@ def _relay_sync_stream(
 ) -> Any:
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return _fenced_sync_provider_call(client, kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
         kwargs,
-        lambda request: client.chat.completions.create(**request),
+        lambda request: _fenced_sync_provider_call(client, request),
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         finalizer=dict,
@@ -9440,10 +9589,9 @@ def _create_with_progress(
     stream-only provider rejects the plain call by definition, so the
     original error is surfaced to the normal recovery chains instead.
     """
-    _notify_aux_dispatch()
     _notify_aux_progress()  # Preserve the watchdog's historical dispatch tick.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        response = client.chat.completions.create(**kwargs)
+        response = _fenced_sync_provider_call(client, kwargs)
         if not _client_streams_internally(client):
             _notify_aux_provider_response()
         return response
@@ -9453,7 +9601,7 @@ def _create_with_progress(
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        chunks = _fenced_sync_provider_call(client, stream_kwargs)
     except Exception as exc:
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
@@ -9475,8 +9623,7 @@ def _create_with_progress(
             "Auxiliary %s: streamed request failed (%s); retrying "
             "non-streaming", task or "call", exc,
         )
-        _notify_aux_dispatch()
-        response = client.chat.completions.create(**kwargs)
+        response = _fenced_sync_provider_call(client, kwargs)
         _notify_aux_provider_response()
         return response
 
@@ -9678,7 +9825,7 @@ async def _acreate_with_stream(
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
-    chunks = await client.chat.completions.create(**stream_kwargs)
+    chunks = await _fenced_async_provider_call(client, stream_kwargs)
     # Defensive: shims may hand back a complete response despite stream=True.
     if hasattr(chunks, "choices"):
         return chunks
@@ -9713,8 +9860,15 @@ def call_llm(
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
+    cancellation_token = _capture_aux_cancellation_token()
+    semaphore_acquired = False
     if semaphore is not None:
-        semaphore.acquire()
+        while True:
+            if cancellation_token is not None:
+                cancellation_token.raise_if_cancelled()
+            if semaphore.acquire(timeout=0.02):
+                semaphore_acquired = True
+                break
     request_started_at = time.monotonic()
     if latency_info is not None:
         latency_info["queue_wait_ms"] = max(
@@ -9733,6 +9887,20 @@ def call_llm(
             latency_info["provider_dispatch_ms"] = max(
                 0, int((time.monotonic() - request_started_at) * 1000)
             )
+
+    release_guard = threading.Lock()
+    permit_released = False
+
+    def _release_permit_once() -> None:
+        nonlocal permit_released
+        with release_guard:
+            if permit_released or semaphore is None or not semaphore_acquired:
+                return
+            permit_released = True
+        semaphore.release()
+
+    if cancellation_token is not None and semaphore_acquired:
+        cancellation_token.register_cancel_callback(_release_permit_once)
 
     try:
         with (
@@ -9774,8 +9942,9 @@ def call_llm(
             latency_info["summary_generation_ms"] = max(
                 0, int((time.monotonic() - request_started_at) * 1000)
             )
-        if semaphore is not None:
-            semaphore.release()
+        if cancellation_token is not None and semaphore_acquired:
+            cancellation_token.unregister_cancel_callback(_release_permit_once)
+        _release_permit_once()
 
 
 def _release_sync_semaphore_after_stream(
@@ -10024,7 +10193,7 @@ def _call_llm_impl(
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
             # boundary.
-            return client.chat.completions.create(**kwargs)
+            return _fenced_sync_provider_call(client, kwargs)
         return _relay_sync_stream(
             client,
             kwargs,
@@ -10097,7 +10266,10 @@ def _call_llm_impl(
                     task or "call", _attempt, _max_transient_retries, _backoff,
                     _last_transient,
                 )
-                time.sleep(_backoff)
+                _wait_for_aux_retry(
+                    _backoff,
+                    cancellation_token=_capture_aux_cancellation_token(),
+                )
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -10831,7 +11003,7 @@ async def _async_call_llm_impl(
         async def _acreate(_kwargs: Dict[str, Any]) -> Any:
             if _force_stream_async:
                 return await _acreate_with_stream(client, _kwargs, task)
-            return await client.chat.completions.create(**_kwargs)
+            return await _fenced_async_provider_call(client, _kwargs)
 
         try:
             return _validate_llm_response(

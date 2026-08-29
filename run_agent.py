@@ -8029,6 +8029,7 @@ class AIAgent:
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
+            _publish_compression_timeout_outcome,
             compress_context,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
@@ -8057,6 +8058,33 @@ class AIAgent:
             root = self._conversation_root_id()
             if root:
                 token = set_conversation_context(root)
+        # The timeout is terminal for automatic compression retries in this
+        # logical turn. Bind the latch to the turn id that turn_context stamped;
+        # a cached agent must not carry a prior turn's bool forever.
+        _timeout_compressor = getattr(self, "context_compressor", None)
+        _current_turn_id = getattr(self, "_current_turn_id", None)
+        _terminal_turn_id = (
+            getattr(_timeout_compressor, "_automatic_timeout_terminal_turn_id", None)
+            if _timeout_compressor is not None
+            else None
+        )
+        if force:
+            if _timeout_compressor is not None:
+                _timeout_compressor._automatic_timeout_terminal = False
+                _timeout_compressor._automatic_timeout_terminal_turn_id = None
+        elif (
+            _timeout_compressor is not None
+            and getattr(_timeout_compressor, "_automatic_timeout_terminal", False) is True
+            and isinstance(_current_turn_id, str)
+            and _terminal_turn_id == _current_turn_id
+        ):
+            existing_prompt = getattr(self, "_cached_system_prompt", None)
+            if not existing_prompt:
+                existing_prompt = self._build_system_prompt(system_message)
+            if token is not None:
+                reset_conversation_context(token)
+            return messages, existing_prompt
+
         # Every AIAgent compression has a fence, including ordinary in-turn and
         # manual paths. hard_interrupt() uses this exact instance to serialize
         # cancel admission against begin_commit().
@@ -8164,10 +8192,18 @@ class AIAgent:
                                 "compress_context timeout activity touch failed",
                                 exc_info=True,
                             )
-                    # Same timeout cooldown ladder as summary-LLM timeouts
-                    # (#62452): avoid re-burning the full idle budget every turn.
+                    # The fence owns the terminal outcome before the cooldown
+                    # write. This gate is idempotent if a wrapper/caller invokes
+                    # the timeout callback more than once.
+                    _timeout_outcome, _timeout_record_won = (
+                        _publish_compression_timeout_outcome(
+                            self,
+                            active_fence,
+                            latch_automatic_timeout=not force,
+                        )
+                    )
                     compressor = getattr(self, "context_compressor", None)
-                    if compressor is not None:
+                    if compressor is not None and _timeout_record_won:
                         record = getattr(compressor, "record_timeout_failure", None)
                         if callable(record):
                             try:
@@ -8181,6 +8217,7 @@ class AIAgent:
                                     "cooldown",
                                     exc_info=True,
                                 )
+
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
                         emit(

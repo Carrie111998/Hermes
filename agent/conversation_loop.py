@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -1513,6 +1514,75 @@ def _compression_deferred_result(
     }
 
 
+def _terminal_compression_overflow_result(
+    agent, messages: List[Dict], api_call_count: int, reason: str,
+) -> Dict[str, Any]:
+    """Fail closed when a blocked terminal compression no-op cannot fit."""
+    compressor = getattr(agent, "context_compressor", None)
+    context_length = int(getattr(compressor, "context_length", 0) or 0)
+    message = (
+        "Context compression is unavailable after a terminal "
+        f"{reason} outcome; the assembled request exceeds the model context "
+        f"window ({context_length:,} tokens). Retry compression manually or "
+        "start a new session."
+    )
+    try:
+        agent._emit_warning(f"⚠ {message}")
+    except Exception:
+        pass
+    try:
+        # Persistence is a sink, not an owner of the live transcript. Pass a
+        # structural snapshot so terminal warning/readback cannot mutate nested
+        # message blocks while the host returns the original request unchanged.
+        agent._persist_session(copy.deepcopy(messages), None)
+    except Exception:
+        pass
+    error = f"retryable_compression_context_overflow:{reason}"
+    return {
+        "final_response": message,
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": False,
+        "failed": True,
+        "partial": True,
+        "retryable": True,
+        "compression_context_overflow": True,
+        "compression_failure_class": reason,
+        "compression_attempt_id": getattr(agent, "_compression_attempt_id", ""),
+        "compression_turn_id": getattr(agent, "_current_turn_id", ""),
+        "error": error,
+    }
+
+
+def _compression_terminal_noop_reason(agent, cooldown) -> Optional[str]:
+    """Return only a current-attempt terminal compression provenance."""
+    del cooldown  # terminal state is authoritative; a generic cooldown is not
+    compressor = getattr(agent, "context_compressor", None)
+    attempt_id = getattr(agent, "_compression_attempt_id", None)
+    turn_id = getattr(agent, "_current_turn_id", None)
+    if not isinstance(attempt_id, str) or not isinstance(turn_id, str):
+        return None
+    for owner in (agent, compressor):
+        if owner is None:
+            continue
+        try:
+            outcome = copy.deepcopy(
+                getattr(owner, "_compression_terminal_outcome", None)
+            )
+        except Exception:
+            continue
+        if not isinstance(outcome, dict):
+            continue
+        if outcome.get("attempt_id") != attempt_id:
+            continue
+        if outcome.get("turn_id") != turn_id:
+            continue
+        failure = outcome.get("failure_class")
+        if failure in {"host_timeout", "pool_saturated"}:
+            return str(failure)
+    return None
+
+
 def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool:
     """Rewrite a cache-decorated system message in place, keeping its blocks.
 
@@ -1891,6 +1961,7 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    compressor = getattr(agent, "context_compressor", None)
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
@@ -2651,6 +2722,29 @@ def run_conversation(
                 pass
             break
 
+        _early_ctx_len = getattr(
+            getattr(agent, "context_compressor", None), "context_length", None
+        )
+        _early_cooldown = getattr(
+            getattr(agent, "context_compressor", None),
+            "get_active_compression_failure_cooldown",
+            lambda: None,
+        )()
+        _early_reason = _compression_terminal_noop_reason(agent, _early_cooldown)
+        if (
+            agent.compression_enabled
+            and isinstance(_early_ctx_len, int)
+            and _early_ctx_len > 0
+            and request_pressure_tokens > _early_ctx_len
+            and _early_reason
+        ):
+            return _terminal_compression_overflow_result(
+                agent,
+                messages,
+                api_call_count,
+                _early_reason,
+            )
+
         # Pre-API pressure check. The turn-prologue preflight only saw the
         # incoming user message; a single turn can then grow by many large
         # tool results and leave no output budget before the NEXT call (the
@@ -2878,6 +2972,24 @@ def run_conversation(
                 )
                 if callable(_warn_fn):
                     _warn_fn(request_pressure_tokens, _ctx_len)
+
+        _ctx_len = getattr(_compressor, "context_length", None)
+        _terminal_reason = _compression_terminal_noop_reason(
+            agent, _compression_cooldown
+        )
+        if (
+            agent.compression_enabled
+            and isinstance(_ctx_len, int)
+            and _ctx_len > 0
+            and request_pressure_tokens > _ctx_len
+            and _terminal_reason
+        ):
+            return _terminal_compression_overflow_result(
+                agent,
+                messages,
+                api_call_count,
+                _terminal_reason,
+            )
 
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None

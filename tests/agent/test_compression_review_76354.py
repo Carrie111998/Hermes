@@ -242,6 +242,62 @@ class TestF2HostUnwindRevokesAdmission:
         )
         _drain_admission_slots()
 
+    def test_keyboard_interrupt_keeps_running_future_admission_until_done(
+        self, monkeypatch
+    ):
+        """A host unwind cannot release a slot owned by a running future."""
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        _drain_admission_slots()
+        previous_limit = cc._COMPRESS_EXECUTOR_MAX_WORKERS
+        cc._COMPRESS_EXECUTOR_MAX_WORKERS = 1
+        executor = DaemonThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="c1-fix3-keyboard"
+        )
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def worker(_fence):
+            started.set()
+            assert release.wait(timeout=10)
+            finished.set()
+            return ([], "done")
+
+        monkeypatch.setattr(
+            cc,
+            "_get_compress_timeout_executor",
+            lambda: _InjectingExecutor(
+                executor, KeyboardInterrupt(), gate=started
+            ),
+        )
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                run_compress_context_with_progress_timeout(
+                    worker=worker,
+                    messages=[{"role": "user", "content": "keep"}],
+                    system_prompt_fallback="fallback",
+                    idle_timeout_seconds=5.0,
+                    total_ceiling_seconds=5.0,
+                )
+
+            assert started.wait(timeout=2)
+            assert not finished.is_set()
+            with cc._compress_admission_lock:
+                assert cc._compress_admitted_count == 1
+
+            release.set()
+            assert finished.wait(timeout=5)
+            _drain_admission_slots()
+            with cc._compress_admission_lock:
+                assert cc._compress_admitted_count == 0
+        finally:
+            release.set()
+            _drain_admission_slots()
+            executor.shutdown(wait=True)
+            cc._COMPRESS_EXECUTOR_MAX_WORKERS = previous_limit
+            _drain_admission_slots()
+
 
 class TestF4CooldownClearOrdering:
     def test_cancelled_attempt_cannot_clear_failure_cooldown(self):
@@ -307,7 +363,8 @@ class TestF6ExecutorSaturation:
                 t.join(timeout=5)  # hosts time out; workers stay wedged
                 assert not t.is_alive()
 
-            # All 4 slots still admitted (workers blocked).
+            # Admission is owned by the future, not by the host timeout. The
+            # four non-cooperative futures remain bounded while detached.
             with cc._compress_admission_lock:
                 assert cc._compress_admitted_count == 4
 
@@ -362,8 +419,8 @@ class TestF6ExecutorSaturation:
                 cc.logger.removeHandler(capture)
                 cc.logger.setLevel(_prev_level)
             elapsed = time.monotonic() - t0
-            # ── Assert while the 4 workers are STILL wedged ───────────────
-            assert not release.is_set()
+            # The pool is still saturated while the original workers are
+            # blocked, so the fifth submission must refuse immediately.
             assert elapsed < 1.0, (
                 f"saturated submission must fail fast, took {elapsed:.2f}s"
             )
@@ -374,22 +431,18 @@ class TestF6ExecutorSaturation:
                 p for p in capture.payloads
                 if p.get("failure_class") == "pool_saturated"
             ]
-            assert saturated, (
-                "fail-fast admission refusal must emit compression-attempt "
-                "telemetry with failure_class='pool_saturated'"
-            )
+            assert saturated
             assert saturated[0]["commit_status"] == "aborted"
             assert saturated[0]["session_id"] == "SATURATED_SESSION"
         finally:
             release.set()
 
-        # Worker recovery: slots free, and the refused fifth job never runs.
+        # Worker recovery: slots free after the owner futures finish.
         _drain_admission_slots()
-        time.sleep(0.1)
         assert not fifth_ran.is_set(), (
-            "recovered workers must not run the refused stale job"
+            "saturated submission must not run later after recovery"
         )
-        # Recovery restores service: a new submission is admitted and runs.
+        # Recovery restores service: a NEW submission is admitted and runs.
         msgs, prompt = run_compress_context_with_progress_timeout(
             worker=lambda fence: ([{"role": "user", "content": "ok"}], "ok"),
             messages=[{"role": "user", "content": "after"}],
@@ -454,6 +507,7 @@ class TestF6ExecutorSaturation:
             assert returned is messages
             # The cancelled attempt must not leave the durable lock held.
             assert db.get_compression_lock_holder(session_id) is None
+            db.close()
 
 
 class TestS3IdleChargedFromLastProgress:
@@ -597,3 +651,182 @@ class TestRound2MidCommitLeaseRelease:
             session_id, "pid:second:contender", ttl_seconds=60
         )
         db.release_compression_lock(session_id, "pid:second:contender")
+
+
+def test_host_timeout_wins_late_same_generation_cooldown_rollback(tmp_path):
+    """Host timeout writes once and late same-generation rollback is inert."""
+    from unittest.mock import patch
+
+    from hermes_state import SessionDB
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        _claim_compressor_attempt,
+        _publish_compression_terminal_outcome,
+        _restore_compressor_attempt_state,
+        _snapshot_compressor_attempt_state,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "R2_HOST_TIMEOUT_WINNER"
+    db.create_session(session_id, source="cli")
+    compressor = ContextCompressor(
+        "test/model", quiet_mode=True, config_context_length=1000
+    )
+    compressor.bind_session_state(db, session_id)
+    agent = type(
+        "_Agent",
+        (),
+        {
+            "context_compressor": compressor,
+            "session_id": session_id,
+            "_current_turn_id": "turn-timeout",
+        },
+    )()
+    fence = CompressionCommitFence()
+    generation = _claim_compressor_attempt(compressor)
+    fence.bind_attempt(generation, "turn-timeout")
+    snapshot = _snapshot_compressor_attempt_state(compressor)
+    durable_before = db.get_compression_failure_cooldown_row(session_id)
+    record = db.record_compression_failure_cooldown
+
+    with patch.object(db, "record_compression_failure_cooldown", wraps=record) as recorded:
+        _publish_compression_terminal_outcome(agent, fence, "host_timeout")
+        assert fence.claim_host_timeout_record("turn-timeout") is True
+        compressor.record_timeout_failure("host compress_context timeout (no summary progress)")
+        first_state = {
+            "cooldown": db.get_compression_failure_cooldown_row(session_id),
+            "deadline": compressor._summary_failure_cooldown_until,
+            "error": compressor._last_summary_error,
+            "streak": compressor._consecutive_timeout_failures,
+        }
+        assert recorded.call_count == 1
+
+        # Simulate the late same-generation worker unwind after the host record.
+        _restore_compressor_attempt_state(
+            compressor,
+            snapshot,
+            durable_cooldown_authoritative=True,
+            durable_cooldown_state=durable_before,
+            attempt_generation=generation,
+            attempt_fence=fence,
+        )
+
+    assert db.get_compression_failure_cooldown_row(session_id) == first_state["cooldown"]
+    assert compressor._summary_failure_cooldown_until == first_state["deadline"]
+    assert compressor._last_summary_error == first_state["error"]
+    assert compressor._consecutive_timeout_failures == first_state["streak"]
+    assert fence.claim_host_timeout_record("turn-timeout") is False
+    db.close()
+
+
+def test_host_timeout_releases_compression_pool_slot_before_provider_returns(monkeypatch):
+    """A timed-out owner frees admission while its provider callback remains detached."""
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    _drain_admission_slots()
+    previous_limit = cc._COMPRESS_EXECUTOR_MAX_WORKERS
+    cc._COMPRESS_EXECUTOR_MAX_WORKERS = 1
+    executor = DaemonThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="c1-fix2-fresh"
+    )
+    monkeypatch.setattr(cc, "_get_compress_timeout_executor", lambda: executor)
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+    provider_calls = []
+
+    def _create(**kwargs):
+        provider_calls.append(kwargs)
+        provider_started.set()
+        assert release_provider.wait(timeout=5)
+        return SimpleNamespace(choices=[])
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_create))
+    )
+
+    def _blocked_worker(_fence):
+        return aux._relay_sync_completion(
+            client, {"model": "compression", "messages": [], "timeout": 1}
+        )
+
+    try:
+        result = run_compress_context_with_progress_timeout(
+            worker=_blocked_worker,
+            messages=[{"role": "user", "content": "keep"}],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.05,
+            total_ceiling_seconds=0.05,
+        )
+        assert provider_started.wait(timeout=1)
+        assert result[0] is not None
+        with cc._compress_admission_lock:
+            assert cc._compress_admitted_count == 0
+        admitted = threading.Event()
+        fresh = run_compress_context_with_progress_timeout(
+            worker=lambda _fence: (admitted.set() or ([], "new")),
+            messages=[{"role": "user", "content": "new"}],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=1,
+            total_ceiling_seconds=1,
+        )
+        assert admitted.is_set()
+        assert fresh == ([], "new")
+        assert provider_calls
+    finally:
+        release_provider.set()
+        cc._COMPRESS_EXECUTOR_MAX_WORKERS = previous_limit
+        _drain_admission_slots()
+        executor.shutdown(wait=True)
+
+
+def test_noncooperative_compression_owner_keeps_admission_bounded(monkeypatch):
+    """A legacy worker keeps its owner slot until its future really finishes."""
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    _drain_admission_slots()
+    previous_limit = cc._COMPRESS_EXECUTOR_MAX_WORKERS
+    cc._COMPRESS_EXECUTOR_MAX_WORKERS = 1
+    executor = DaemonThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="c1-fix2-noncooperative"
+    )
+    monkeypatch.setattr(cc, "_get_compress_timeout_executor", lambda: executor)
+    started = threading.Event()
+    release = threading.Event()
+    second_ran = threading.Event()
+
+    def noncooperative(_fence):
+        started.set()
+        assert release.wait(timeout=5)
+        return ([], "late")
+
+    try:
+        result = run_compress_context_with_progress_timeout(
+            worker=noncooperative,
+            messages=[{"role": "user", "content": "keep"}],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.05,
+            total_ceiling_seconds=0.05,
+        )
+        assert result[0] is not None
+        assert started.wait(timeout=1)
+        with cc._compress_admission_lock:
+            assert cc._compress_admitted_count == 1
+        second = run_compress_context_with_progress_timeout(
+            worker=lambda _fence: (second_ran.set() or ([], "second")),
+            messages=[{"role": "user", "content": "second"}],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.05,
+            total_ceiling_seconds=0.05,
+        )
+        assert second == ([{"role": "user", "content": "second"}], "fallback")
+        assert not second_ran.is_set()
+        with cc._compress_admission_lock:
+            assert cc._compress_admitted_count == 1
+    finally:
+        release.set()
+        _drain_admission_slots()
+        executor.shutdown(wait=True)
+        cc._COMPRESS_EXECUTOR_MAX_WORKERS = previous_limit

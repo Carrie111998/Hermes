@@ -2,8 +2,10 @@
 
 import json
 import sqlite3
+import threading
 import pytest
 import time
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from agent.context_compressor import (
@@ -1061,7 +1063,7 @@ class TestSummaryFallbackToMainModel:
         ) as mock_call:
             result = c._generate_summary(self._msgs())
 
-        assert mock_call.call_count == 2
+        assert mock_call.call_count == 3
         # First call used the misconfigured aux model
         assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
         # Second call used the main model (no model kwarg → call_llm uses main)
@@ -1097,7 +1099,7 @@ class TestSummaryFallbackToMainModel:
         ) as mock_call:
             result = c._generate_summary(self._msgs())
 
-        assert mock_call.call_count == 2
+        assert mock_call.call_count == 3
         assert mock_call.call_args_list[0].kwargs.get("model") == "flaky-aux-model"
         assert "model" not in mock_call.call_args_list[1].kwargs
         assert result is not None
@@ -1160,7 +1162,7 @@ class TestSummaryFallbackToMainModel:
         ) as mock_call:
             result = c._generate_summary(self._msgs())
 
-        assert mock_call.call_count == 2
+        assert mock_call.call_count == 3
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-via-broken-proxy"
         assert "model" not in mock_call.call_args_list[1].kwargs
         assert result is not None
@@ -1217,7 +1219,7 @@ class TestStreamingClosedFallback:
         ):
             result = c._generate_summary(self._msgs())
 
-        assert mock_call.call_count == 2
+        assert mock_call.call_count == 3
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-stream-model"
         assert "model" not in mock_call.call_args_list[1].kwargs
         assert result is not None
@@ -3170,7 +3172,7 @@ class TestSummaryPromptBounding:
         with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
             summary = c._generate_summary(messages)
 
-        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        prompt = mock_call.call_args_list[0].kwargs["messages"][0]["content"]
         assert summary.startswith(SUMMARY_PREFIX)
         # previous summary block + new-turns block each capped, plus the
         # fixed template: well under 3x the cap (unbounded would be ~800K).
@@ -3676,3 +3678,68 @@ class TestSanitizeToolPairsWhitespace:
         tool_call_ids = [m.get("tool_call_id") for m in out if m.get("role") == "tool"]
         assert "call_orphan" not in tool_call_ids, "genuinely orphaned result must be removed"
         assert " call_orphan " not in tool_call_ids, "original whitespace form must also be gone"
+
+
+def test_fence_cancel_after_summary_sends_zero_lean_digest_requests(compressor, monkeypatch):
+    from agent import auxiliary_client as aux
+
+    cancel_event = threading.Event()
+    compressor._compression_cancelled_check = cancel_event.is_set
+    compressor._previous_summary = "previous summary"
+    clear_cooldown = MagicMock()
+    compressor._clear_compression_failure_cooldown = clear_cooldown
+    calls = []
+
+    def _summary_then_cancel(**kwargs):
+        calls.append(kwargs)
+        cancel_event.set()
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary body"))]
+        )
+
+    monkeypatch.setattr("agent.context_compressor.call_llm", _summary_then_cancel)
+    with pytest.raises(aux.AuxiliaryExplicitCancellation):
+        compressor._generate_summary(
+            [{"role": "user", "content": "old request"}],
+        )
+
+    assert len(calls) == 1
+    assert compressor._previous_summary == "previous summary"
+    clear_cooldown.assert_not_called()
+
+
+def test_fence_cancel_between_lean_digest_chunks_stops_remaining_chunks(compressor, monkeypatch):
+    from agent import auxiliary_client as aux
+
+    cancel_event = threading.Event()
+    compressor._compression_cancelled_check = cancel_event.is_set
+    compressor._previous_summary = "previous summary"
+    context_calls = []
+    auxiliary_calls = []
+
+    def _summary_and_first_digest(**kwargs):
+        context_calls.append(kwargs)
+        if len(context_calls) == 2:
+            cancel_event.set()
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary body"))]
+        )
+
+    def _unexpected_auxiliary_digest(**kwargs):
+        auxiliary_calls.append(kwargs)
+        cancel_event.set()
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="wrong seam"))]
+        )
+
+    monkeypatch.setattr("agent.context_compressor.call_llm", _summary_and_first_digest)
+    # A local re-import would bypass the module seam above. Keep the real
+    # auxiliary symbol patched to a distinct sentinel so that bypass is a
+    # deterministic RED failure without any provider/network call.
+    monkeypatch.setattr(aux, "call_llm", _unexpected_auxiliary_digest)
+    turns = [{"role": "user", "content": "x" * 150_000}]
+    with pytest.raises(aux.AuxiliaryExplicitCancellation):
+        compressor._generate_summary(turns)
+
+    assert len(context_calls) == 2  # summary plus exactly one digest request
+    assert auxiliary_calls == []
