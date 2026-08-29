@@ -765,6 +765,17 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
 # message representation stays consistent ("system" everywhere).
 DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 
+_LOCAL_CRON_DELIVERY_NOTE = (
+    "Cron jobs scheduled from this session are LOCAL-ONLY: their output "
+    "is saved (viewable via cronjob action='list') but is NOT delivered "
+    "back into this session — there is no live-delivery channel here. "
+    "If the user wants to be notified when a job runs, the job's "
+    "`deliver` must target a gateway-connected messaging platform "
+    "(e.g. deliver='telegram' or 'all'). Do not promise that a "
+    "deliver='origin' or default-deliver cron job will message them "
+    "in this session."
+)
+
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
@@ -806,12 +817,19 @@ PLATFORM_HINTS = {
         "Prefer bullet lists and labeled key:value pairs for structured data. "
         "You can send media files natively: to deliver a file to the user, "
         "include MEDIA:/absolute/path/to/file in your response. Images "
-        "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
-        "bubbles, and videos (.mp4) play inline. You can also include image "
+        "(.png, .jpg, .webp) appear as photos and videos (.mp4) play inline. "
+        "Audio: put [[audio_as_voice]] on its own line in the same response "
+        "to send ANY audio file as a native voice bubble (non-Opus formats "
+        "are transcoded automatically); without the directive, .mp3/.m4a "
+        "arrive as playable audio files and other formats as documents. "
+        "You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as native photos."
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
+        "Discord renders standard markdown natively (bold, italic, code "
+        "blocks, links); tables are NOT supported — use bullet lists or "
+        "labeled lines. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "
@@ -819,6 +837,9 @@ PLATFORM_HINTS = {
     ),
     "slack": (
         "You are in a Slack workspace communicating with your user. "
+        "Standard markdown is auto-converted to Slack formatting (bold, "
+        "headers, links, code); tables are NOT supported — use bullet lists "
+        "or labeled lines. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are uploaded as photo "
         "attachments, audio as file attachments. You can also include image URLs "
@@ -853,64 +874,60 @@ PLATFORM_HINTS = {
         "destination — put the primary content directly in your response."
     ),
     "cli": (
-        "You are a CLI AI Agent. Try not to use markdown but simple text "
-        "renderable inside a terminal. "
-        "File delivery: there is no attachment channel — the user reads your "
-        "response directly in their terminal. Do NOT emit MEDIA:/path tags "
-        "(those are only intercepted on messaging platforms like Telegram, "
-        "Discord, Slack, etc.; on the CLI they render as literal text). "
-        "When referring to a file you created or changed, just state its "
-        "absolute path in plain text; the user can open it from there. "
-        "Cron jobs scheduled from this session are LOCAL-ONLY: their output is "
-        "saved (viewable via cronjob action='list') but is NOT delivered back "
-        "into this terminal — there is no live-delivery channel here. If the "
-        "user wants to be notified when a job runs, the job's `deliver` must "
-        "target a gateway-connected messaging platform (e.g. deliver='telegram' "
-        "or 'all'). Do not promise the user that a deliver='origin' or "
-        "default-deliver cron job will message them in this session."
+        # Maintainer-verified 2026-08-29 (live screenshot): the CLI prints
+        # raw text — markdown control characters render literally.
+        "You are in a plain terminal (CLI). Markdown does NOT render — "
+        "asterisks, headers, and fences appear as literal characters, so "
+        "write plain text (indentation and blank lines are your only "
+        "layout tools). Files: there is no attachment channel and "
+        "MEDIA:/path tags are NOT intercepted here (they print as "
+        "literal text) — deliver a file by stating its absolute path or "
+        "URL in plain text; the user opens it themselves. "
+        + _LOCAL_CRON_DELIVERY_NOTE
     ),
     "tui": (
-        "You are running in the Hermes terminal UI (TUI). "
-        "Cron jobs scheduled from this session are LOCAL-ONLY: their output is "
-        "saved (viewable via cronjob action='list') but is NOT delivered back "
-        "into this TUI session — there is no live-delivery channel here. If the "
-        "user wants to be notified when a job runs, the job's `deliver` must "
-        "target a gateway-connected messaging platform (e.g. deliver='telegram' "
-        "or 'all'). Do not promise the user that a deliver='origin' or "
-        "default-deliver cron job will message them in this session."
+        # Same file-delivery reality as the CLI (maintainer-confirmed):
+        # no MEDIA: interception in tui/ — tags would print literally.
+        "You are in the Hermes terminal UI (TUI). Files: there is no "
+        "attachment channel and MEDIA:/path tags are NOT intercepted "
+        "here (they print as literal text) — deliver a file by stating "
+        "its absolute path or URL in plain text. "
+        + _LOCAL_CRON_DELIVERY_NOTE
     ),
     "desktop": (
-        "You are chatting inside the Hermes desktop app — a graphical chat "
-        "surface, not a terminal. Use markdown freely: it renders with full "
-        "GitHub flavor (tables, code blocks with syntax highlighting, math "
-        "via $...$, task lists, blockquote callouts). "
-        "You can deliver files natively — include MEDIA:/absolute/path/to/file "
-        "in your response. Images (.png, .jpg, .webp) appear inline, audio and "
-        "video play inline, and other files arrive as download links. You can "
-        "also include image URLs in markdown format ![alt](url) and they "
-        "render inline as photos. "
-        "To show an HTML file you wrote as a LIVE inline page right in your "
-        "message, put ::preview{file=\"path/to/file.html\"} alone on its own "
-        "line — desktop plugins can register more ::name{...} directives like "
-        "it. When the user asks for an inline widget, chart, or visualization "
-        "(anything living IN the chat rather than a standalone page), design "
-        "it as a native piece of the app by default: transparent background, "
-        "colors from the provided theme tokens — var(--foreground), "
-        "var(--muted-foreground), var(--accent), var(--border), var(--card) — "
-        "the inherited app font, no body padding or margin, content flush "
-        "left and filling the viewport width, no centering wrappers, decorative "
-        "backdrops, or page chrome. The frame auto-sizes to the content. "
-        "Widgets can talk back: window.hermes.send(\"prompt\") — or a "
-        "data-hermes-send=\"prompt\" attribute on any clickable element — sends "
-        "that prompt to you as a hidden user turn (no chat bubble), so give "
-        "interactive widgets buttons whose clicks mean something and answer "
-        "them by updating the widget's file, not with prose. Only "
-        "a standalone PAGE (a mockup, a poster, a game) should bring its own "
-        "background and layout. "
-        "When the user asks to add, enable, or authorize an MCP server (or a "
-        "task clearly needs one that is missing), use the setup_mcp tool if "
-        "it is available — it shows an inline consent card right in the chat; "
-        "never hand-edit mcp_servers config for them."
+        # Dieted (#95681, maintainer-directed) after a live premise battery
+        # verified every claim against the shipping renderer. Widget section
+        # rewritten recipe-first: the old text listed style commandments
+        # without ever saying HOW (an inline widget IS a ::preview'd HTML
+        # file) or WHY (the frame injects the theme prelude FIRST — the
+        # widget's job is to not override it; width adopts the content's
+        # first measured span — a centering wrapper measures full-bleed).
+        # Mechanics cited from inline-preview-directive.tsx. The setup_mcp
+        # sentence moved out entirely — its tool schema teaches the same
+        # trigger + consent-card + never-hand-edit rule on every call.
+        "You are chatting inside the Hermes desktop app, a graphical chat "
+        "surface. Markdown renders with full GitHub flavor (tables, "
+        "syntax-highlighted code, math via $...$, task lists, callouts). "
+        "Deliver files by writing MEDIA:/absolute/path/to/file — any file "
+        "type: images/audio/video render inline, everything else becomes a "
+        "card with Download and preview buttons. Remote image URLs render "
+        "via ![alt](url); local files ONLY via MEDIA: (local markdown "
+        "images are blocked). "
+        "Inline widget/chart (living IN the chat): write an HTML file, then "
+        "put ::preview{file=\"path.html\"} alone on its own line (plugins "
+        "can register more ::name{...} directives). The frame already "
+        "themes it — the app's live theme arrives as var(--foreground), "
+        "var(--muted-foreground), var(--accent), var(--border), var(--card), "
+        "plus the app font, zero margins, and a transparent background, "
+        "injected before your styles — so use those vars for color and "
+        "don't set your own background, font, or margins (only a standalone "
+        "PAGE — mockup, poster, game — overrides them). The frame sizes "
+        "itself to your content: height live, width from the content's "
+        "first measured span — lay content flush left with no centering "
+        "wrappers or it measures full-bleed. Widgets talk back: "
+        "data-hermes-send=\"prompt\" on any clickable element (or "
+        "window.hermes.send(\"prompt\")) sends that prompt as a hidden user "
+        "turn — answer it by updating the widget's file, not with prose."
     ),
     "sms": (
         "You are communicating via SMS. Keep responses concise and use plain text "
@@ -959,7 +976,9 @@ PLATFORM_HINTS = {
         "links are supported. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
-        "inline, audio files as voice messages, and other files as attachments."
+        "inline, audio files as native voice messages (non-Opus formats are "
+        "transcoded automatically; without ffmpeg they fall back to file "
+        "attachments), and other files as attachments."
     ),
     "weixin": (
         "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
@@ -1023,18 +1042,15 @@ PLATFORM_HINTS = {
         "a raw host filesystem path. For those cases, state the plain file path "
         "in your response text instead of a MEDIA: tag."
     ),
-    "webui": (
-        "You are in the Hermes WebUI, a browser-based chat interface. "
-        "Full Markdown rendering is supported — headings, bold, italic, code "
-        "blocks, tables, math (LaTeX), and Mermaid diagrams all render natively. "
-        "To display local or remote media/files inline, include "
-        "MEDIA:/absolute/path/to/file or MEDIA:https://... in your response. "
-        "Local file paths must be absolute. Images, audio (with playback speed "
-        "controls), video, PDFs, HTML, CSV, diffs/patches, and Excalidraw files "
-        "render as rich previews. Do not use Markdown image syntax like "
-        "![alt](/path) for local files; local paths are not served that way. "
-        "Use MEDIA:/absolute/path instead."
-    ),
+    # NOTE: a "webui" hint lived here until 2026-08-29. It was a ghost
+    # (verified in the all-platform hint audit, PR #97873): no code path
+    # constructs platform="webui" — the dashboard chat resolves to
+    # 'desktop' or 'tui' (tui_gateway/server.py:_resolve_session_platform),
+    # and the browser chat tab is an xterm.js PTY hosting the TUI, not an
+    # HTML chat renderer. Its content (tables/LaTeX/Mermaid, MEDIA: rich
+    # previews incl. Excalidraw) described a renderer that does not exist
+    # anywhere in web/. If a real WebUI chat surface ships, write a hint
+    # from its actual renderer — do not resurrect this text.
 }
 
 # Telegram rich-messages extension — only injected when the user has opted in
