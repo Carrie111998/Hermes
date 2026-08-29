@@ -7288,6 +7288,37 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
         return None
 
 
+def _load_peak_windows() -> dict | None:
+    """Read the opt-in ``display.peak_windows`` status-bar block from config.
+
+    Fully opt-in: returns ``None`` (the default) when the block is missing or
+    malformed, so the TUI hides the cost-window segment entirely. The windows
+    are pushed verbatim to the client; the client owns the UTC/day-of-week
+    matching, so no provider-specific hours are hardcoded here.
+    """
+    try:
+        pw = (_load_cfg().get("display") or {}).get("peak_windows")
+    except Exception:
+        return None
+    if not isinstance(pw, dict):
+        return None
+    label_active = str(pw.get("label_active") or "").strip()
+    label_idle = str(pw.get("label_idle") or "").strip()
+    color = str(pw.get("color") or "").strip()
+    # Optional; defaults to weekdays so weekends are off-peak without config.
+    days = str(pw.get("days") or "").strip() or "1-5"
+    windows_utc = pw.get("windows_utc")
+    if not (label_active and label_idle and color and isinstance(windows_utc, list) and windows_utc):
+        return None
+    return {
+        "label_active": label_active,
+        "label_idle": label_idle,
+        "color": color,
+        "days": days,
+        "windows_utc": windows_utc,
+    }
+
+
 def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
         for candidate in _sessions.values():
@@ -7375,6 +7406,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "update_behind": None,
         "update_command": "",
         "usage": _session_usage_snapshot(session),
+        "cost_window": _load_peak_windows(),
         "profile_name": _response_profile_name(
             Path(session["profile_home"]).name
             if isinstance(session, dict) and session.get("profile_home")

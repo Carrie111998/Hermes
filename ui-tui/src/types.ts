@@ -182,8 +182,17 @@ export interface ProjectInfo {
   slug: string
 }
 
+export interface CostWindowConfig {
+  label_active: string
+  label_idle: string
+  color: string
+  days: string
+  windows_utc: { from: string; to: string }[]
+}
+
 export interface SessionInfo {
   cwd?: string
+  cost_window?: CostWindowConfig | null
   fast?: boolean
   install_warning?: string
   lazy?: boolean

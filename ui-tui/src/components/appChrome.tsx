@@ -15,8 +15,8 @@ import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
-import type { Theme } from '../theme.js'
-import type { Msg, Usage } from '../types.js'
+import type { Theme, ThemeColors } from '../theme.js'
+import type { CostWindowConfig, Msg, Usage } from '../types.js'
 
 import { scrollbarColors } from './overlayPrimitives.js'
 
@@ -463,11 +463,109 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   return <Text color={color}>♥</Text>
 }
 
+// True when `d`'s UTC time is inside one of the configured peak windows on a
+// day matching `days` (cron-style: "0"/"7" = Sunday … "6" = Saturday; comma
+// lists and ranges "0,6", "1-5,7" supported). `from`/`to` are "HH:MM" UTC; v1
+// assumes from < to (no overnight wraparound — a window spanning midnight is
+// a no-op).
+export function isInPeakWindow(
+  d: Date,
+  days: string,
+  windows: CostWindowConfig['windows_utc'],
+): boolean {
+  if (!cronDaysMatch(d.getUTCDay(), days)) {
+    return false
+  }
+
+  const nowMin = d.getUTCHours() * 60 + d.getUTCMinutes()
+
+  for (const w of windows) {
+    const from = parseHhMm(w.from)
+    const to = parseHhMm(w.to)
+
+    if (from === null || to === null || to <= from) {
+      continue
+    }
+
+    if (nowMin >= from && nowMin < to) {
+      return true
+    }
+  }
+
+  return false
+}
+
+const parseHhMm = (value: string): number | null => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim())
+
+  if (!m) {
+    return null
+  }
+
+  const h = Number(m[1])
+  const min = Number(m[2])
+
+  if (h > 23 || min > 59) {
+    return null
+  }
+
+  return h * 60 + min
+}
+
+const cronDaysMatch = (day: number, days: string): boolean => {
+  for (const part of String(days || '').split(',')) {
+    const p = part.trim()
+    const m = /^(\d)(?:-(\d))?$/.exec(p)
+
+    if (!m) {
+      continue
+    }
+
+    let lo = Number(m[1])
+    let hi = m[2] !== undefined ? Number(m[2]) : lo
+
+    // Normalize "7" → Sunday (0) so both spellings match getUTCDay().
+    if (lo === 7) {
+      lo = 0
+    }
+
+    if (hi === 7) {
+      hi = 0
+    }
+
+    if (lo <= hi) {
+      if (lo <= day && day <= hi) {
+        return true
+      }
+    } else if (day >= lo || day <= hi) {
+      // Wraparound range (e.g. "5-7" = Fri..Sun): matches the late days and
+      // the early days after the week rolls over.
+      return true
+    }
+  }
+
+  return false
+}
+
+// Peak/off-peak pill. `active` is derived fresh on every render — the status
+// chrome re-renders on each session update, so no timer is needed and the label
+// is correct whenever the model is actually generating. Rendered in the theme
+// tone named by the config (`color`), falling back to `warn` when the tone
+// doesn't exist — never a hardcoded hex.
+function CostWindow({ config, t }: { config: CostWindowConfig; t: Theme }) {
+  const active = isInPeakWindow(new Date(), config.days, config.windows_utc)
+  const tone = config.color as keyof ThemeColors
+  const color = tone in t.color ? t.color[tone] : t.color.warn
+
+  return <Text color={color}>{active ? config.label_active : config.label_idle}</Text>
+}
+
 export function StatusRule({
   battery,
   focusView,
   cwdLabel,
   cols,
+  costWindow,
   busy,
   status,
   statusColor,
@@ -600,6 +698,16 @@ export function StatusRule({
     subagentCount === 1 ? '↩ resumes when subagent finishes' : `↩ resumes when ${subagentCount} subagents finish`
 
   const showResumeHint = !busy && subagentCount > 0 && fits(SEP + stringWidth(resumeHintText))
+
+  // Opt-in cost/peak window pill. Budgets for the LONGER of the two labels so
+  // the short one never overflows when it flips. Hidden entirely when the
+  // gateway doesn't configure it (costWindow == null).
+  const costWindowLabel =
+    costWindow != null && stringWidth(costWindow.label_idle) > stringWidth(costWindow.label_active)
+      ? costWindow.label_idle
+      : costWindow?.label_active ?? ''
+
+  const showCostWindow = !!costWindow && fits(SEP + stringWidth(costWindowLabel))
   // Dev-gated readout (HERMES_DEV_CREDITS), lowest priority,
   // so it consumes tail budget LAST and drops first on a narrow terminal.
   const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
@@ -734,6 +842,12 @@ export function StatusRule({
             {resumeHintText}
           </Text>
         ) : null}
+        {showCostWindow ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            <CostWindow config={costWindow!} t={t} />
+          </Text>
+        ) : null}
         {showDevCredits ? (
           <Text color={t.color.accent} wrap="truncate-end">
             {' │ '}
@@ -863,6 +977,7 @@ interface StatusRuleProps {
   liveSessionCount: number
   busy: boolean
   cols: number
+  costWindow?: CostWindowConfig | null
   cwdLabel: string
   model: string
   modelFast?: boolean
