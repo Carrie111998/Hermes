@@ -14,6 +14,7 @@ import time
 from typing import Iterator
 
 from agent.conversation_worktree_policy import ConversationWorktreePolicy
+from hermes_cli.worktree_environment import bootstrap_worktree_environments
 from hermes_cli._subprocess_compat import (
     IS_WINDOWS,
     kill_process_tree,
@@ -514,6 +515,11 @@ class ConversationWorktreeManager:
             ],
             "create",
         )
+        # Provision the source repository's own runtime before this new
+        # conversation worktree can be bound to an agent.  This is additive:
+        # an existing destination is never replaced, and a missing source
+        # environment is left for the configured project bootstrap policy.
+        bootstrap_worktree_environments(source, path, environment_names=(".venv",))
         self._validate_new_worktree(record)
 
     def _validate_new_worktree(self, record: ConversationWorktreeRecord) -> None:
