@@ -37,6 +37,53 @@ def _dispatch_sync(req: dict, transport=None) -> dict | None:
         reset_transport(token)
 
 
+def test_external_wake_commits_uncertain_state_before_dispatch(monkeypatch, tmp_path):
+    """A launched wake can never remain a dead CLAIMED row eligible for replay."""
+    from tools.session_external_turns import (
+        STARTED,
+        enqueue_external_turn,
+        get_external_turn,
+        pending_external_turns,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    enqueue_external_turn(
+        event_id="wake_1",
+        target_session_key="stored-session",
+        body='The delegate-wave session working on "ship it" finished.\n\n'
+        "[delegate-wave-wake:wake_1]",
+        source="delegate-wave",
+    )
+    session = {
+        "session_key": "stored-session",
+        "running": False,
+        "_finalized": False,
+        "history_lock": threading.RLock(),
+    }
+    observed = {}
+
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+
+    def dispatch(_rid, _sid, _session, _body, **kwargs):
+        row = get_external_turn("wake_1")
+        observed["state_at_dispatch"] = row["state"]
+        observed["display_kind"] = kwargs.get("display_kind")
+        observed["display_metadata"] = kwargs.get("display_metadata")
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", dispatch)
+    server._maybe_consume_external_turn("runtime-session", session)
+
+    assert observed == {
+        "state_at_dispatch": STARTED,
+        "display_kind": "delegate_wave_wake",
+        "display_metadata": {"event_id": "wake_1", "source": "delegate-wave"},
+    }
+    assert pending_external_turns("stored-session") == []
+    assert session["_external_turn_in_flight"][0] == "wake_1"
+
+
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.
@@ -2898,6 +2945,33 @@ def test_history_to_messages_drops_display_hidden_scaffolding():
     ]
     # Server-only sidecar never crosses the wire.
     assert all("api_content" not in m for m in projected)
+
+
+def test_history_to_messages_projects_durable_delegate_wave_wake():
+    """A machine activation rehydrates as a typed event, not human speech."""
+    wake = (
+        'The delegate-wave session working on "ship it" finished.\n\n'
+        "[delegate-wave-wake:wake_1]"
+    )
+    metadata = {"event_id": "wake_1", "source": "delegate-wave"}
+
+    assert server._history_to_messages(
+        [
+            {
+                "role": "user",
+                "content": wake,
+                "display_kind": "delegate_wave_wake",
+                "display_metadata": metadata,
+            }
+        ]
+    ) == [
+        {
+            "role": "user",
+            "text": wake,
+            "display_kind": "delegate_wave_wake",
+            "display_metadata": metadata,
+        }
+    ]
 
 
 def test_history_to_messages_projects_a_skill_turn_to_its_invocation():

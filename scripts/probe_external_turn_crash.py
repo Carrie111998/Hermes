@@ -5,11 +5,12 @@ whether a producer can trust the lifecycle at all:
 
     CAN A ROW SAY "STARTED" WHILE THE TRANSCRIPT HOLDS NO MARKER?
 
-It can, and the reason is structural rather than unlucky. ``_run_prompt_submit``
-returns as soon as the turn THREAD is running, and that thread persists the user
-row afterwards, so between the poller writing STARTED and the marker becoming
-durable there is a real window. A process killed inside it leaves a row claiming
-a turn began and a conversation containing no evidence of one.
+It can, and the reason is structural rather than unlucky. The poller commits
+STARTED before ``_run_prompt_submit`` launches the turn thread, and that thread
+persists the user row afterwards. A process killed inside that window leaves a
+row claiming a turn may have begun and a conversation containing no evidence of
+one. Crucially, it can no longer leave CLAIMED with a marker: CLAIMED is the one
+dead state another consumer may recover automatically.
 
 That state cannot be resolved by the inbox. Deciding whether the event landed
 means reading canonical history, which is the producer's authority. So the
@@ -122,14 +123,20 @@ def main() -> int:
         shutil.rmtree(home, ignore_errors=True)
 
     started_without_marker = [d for d, st, m in observed if st == "STARTED" and m == 0]
+    claimed_with_marker = [d for d, st, m in observed if st == "CLAIMED" and m > 0]
+    check(
+        "no automatically recoverable CLAIMED row contains a durable marker",
+        not claimed_with_marker,
+        str(claimed_with_marker),
+    )
     print()
     if started_without_marker:
         print(f"  OBSERVED: STARTED with no marker at delays {started_without_marker}")
         print("            -> the producer MUST have a recovery path for this state")
     else:
         print("  NOT OBSERVED in this run: STARTED with no marker.")
-        print("            -> structurally reachable (the turn thread persists the")
-        print("               marker after dispatch returns); do not treat as impossible")
+        print("            -> structurally reachable (STARTED is committed before")
+        print("               dispatch launches the turn thread); do not treat as impossible")
 
     # ── recovery of a dead STARTED with NO marker ────────────────────────
     # The killed owner must leave the transcript empty for this event, because
@@ -187,7 +194,8 @@ def main() -> int:
 
     # ── closing the session racing the dispatch that hosts its event ─────
     # The consumer registers _external_turn_in_flight only AFTER dispatch
-    # returns and STARTED is written. If a close lands inside that gap the
+    # returns; STARTED is already durable before dispatch. If a close lands
+    # inside that gap the
     # poller exits without ever closing the lifecycle, and the row would be left
     # CLAIMED or STARTED under a gateway process that is STILL ALIVE -- which no
     # other process may recover, because a live holder is exactly what

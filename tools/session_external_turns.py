@@ -317,13 +317,17 @@ def claim_external_turn(event_id: str) -> Optional[str]:
 
 
 def mark_external_turn_started(event_id: str, claim_id: str) -> bool:
-    """A turn actually launched for this event.
+    """Commit this claim to the uncertain dispatch boundary.
 
-    Recorded only once dispatch is CONFIRMED. ``_run_prompt_submit`` returns
-    False from its early exits without persisting anything, and marking
-    optimistically turned a refused dispatch into a silently swallowed event: the
-    row said delivered, the transcript held nothing, and the producer had been
-    told to stop retrying.
+    This transition must be durable BEFORE ``_run_prompt_submit`` launches the
+    turn thread.  Once dispatch begins, a wake marker can reach canonical
+    history at any instant; leaving the row CLAIMED until afterwards would make
+    a crash look like "never dispatched" and allow another process to replay a
+    wake that was already recorded.
+
+    A refused dispatch is rolled back by ``release_external_turn``.  A crash
+    after this transition deliberately leaves STARTED for producer-side
+    canonical-history reconciliation.
     """
     with _transaction() as conn:
         cur = conn.execute(
@@ -353,13 +357,20 @@ def mark_external_turn_finished(event_id: str, claim_id: str, outcome: str = "co
 
 
 def release_external_turn(event_id: str, claim_id: str, error: str = "") -> bool:
-    """Put a claimed row back, because this process could not run it after all."""
+    """Put this process's un-dispatched claim back.
+
+    STARTED is accepted because consumers commit that state immediately before
+    attempting dispatch.  Callers must use this only when dispatch returned
+    False or raised before launching; claim-id CAS prevents any other owner from
+    rolling the row back.
+    """
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE session_external_turns
                SET state = 'PENDING', claim_id = NULL, owner_pid = NULL,
-                   owner_started_at = NULL, claimed_at = NULL, last_error = ?
-               WHERE event_id = ? AND state = 'CLAIMED' AND claim_id = ?""",
+                   owner_started_at = NULL, claimed_at = NULL, started_at = NULL,
+                   last_error = ?
+               WHERE event_id = ? AND state IN ('CLAIMED', 'STARTED') AND claim_id = ?""",
             (str(error)[:500] or None, str(event_id), str(claim_id)),
         )
         return bool(cur.rowcount)
@@ -369,9 +380,10 @@ def reopen_external_turn(event_id: str, reason: str = "") -> bool:
     """Make a dead STARTED event deliverable again. The PRODUCER decides this.
 
     There is a real window in which STARTED is durable and the marker is not:
-    _run_prompt_submit returns as soon as the turn thread is running, and that
-    thread persists the user row afterwards. A process killed in between leaves a
-    row saying a turn started and a transcript containing no evidence of it.
+    the consumer commits STARTED immediately before calling _run_prompt_submit,
+    and the launched thread persists the user row afterwards. A process killed
+    in between leaves a row saying dispatch may have started and a transcript
+    containing no evidence of it.
 
     The inbox cannot resolve that on its own, and must not try -- deciding
     whether the event landed means reading canonical history, which is the

@@ -11937,10 +11937,10 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
     3. The row must be claimed durably, so two Hermes processes that both pass
        gates 1 and 2 in the same instant cannot both run it.
 
-    The turn is submitted HIDDEN. The row is real and persists for the
-    producer's own reconciliation, but a machine activation is not something the
-    person typed, and rendering it as their speech would be a lie about who said
-    what.
+    The turn is submitted as a typed Delegate Wave timeline event. The row is
+    real model input and persists for producer reconciliation, but its display
+    kind and metadata let clients render a durable event card rather than lie
+    that the person typed it.
     """
     _finish_external_turn_if_idle(session)
 
@@ -11993,16 +11993,15 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
         release_external_turn(event_id, claim_id, "session became busy before dispatch")
         return
 
-    # Marked STARTED only once a turn ACTUALLY launched. _run_prompt_submit
-    # returns False from its early exits -- a closing session, a superseded
-    # queued generation, a session no longer registered -- without persisting
-    # anything, and marking beforehand turned that into a silently swallowed
-    # event: the row said delivered, the transcript held nothing, and the
-    # producer had been told to stop retrying.
-    #
-    # It returns as soon as the turn THREAD is running, not when the turn ends,
-    # which is exactly the STARTED boundary. FINISHED is recorded later, by this
-    # poller, when it next sees the session idle.
+    # Commit the uncertain state BEFORE launching the thread. From the first
+    # instruction of that thread onward, its marker may be durable; a crash must
+    # therefore leave STARTED (producer reconciles canonical history), never a
+    # dead CLAIMED row that another consumer automatically replays.
+    if not mark_external_turn_started(event_id, claim_id):
+        with session["history_lock"]:
+            session["running"] = False
+        return
+
     dispatched = False
     try:
         _emit("message.start", sid)
@@ -12012,7 +12011,11 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
                 sid,
                 session,
                 str(row.get("body") or ""),
-                display_kind="hidden",
+                display_kind="delegate_wave_wake",
+                display_metadata={
+                    "event_id": event_id,
+                    "source": str(row.get("source") or "external"),
+                },
             )
         )
     except Exception as exc:
@@ -12021,15 +12024,14 @@ def _maybe_consume_external_turn(sid: str, session: dict) -> None:
         release_external_turn(event_id, claim_id, f"dispatch raised: {type(exc).__name__}")
         raise
     if dispatched:
-        mark_external_turn_started(event_id, claim_id)
         # Remembered so this poller can close the lifecycle when the turn ends.
         # If this process dies first the row stays STARTED with a dead owner,
         # which is the producer's signal to reconcile against history rather
         # than wait forever or read it as a partial delivery.
         session["_external_turn_in_flight"] = (event_id, claim_id)
     else:
-        # Every early exit resets ``running`` itself; the row goes back so a
-        # later pass can try again.
+        # Every early exit resets ``running`` itself. Roll back the pre-dispatch
+        # STARTED commit so a later pass can try again.
         release_external_turn(event_id, claim_id, "dispatch did not start a turn")
 
 

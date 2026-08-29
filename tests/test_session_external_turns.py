@@ -150,6 +150,19 @@ def test_a_released_row_becomes_available_again():
     assert claim_external_turn("E1")
 
 
+def test_a_pre_dispatch_started_row_can_be_released_if_dispatch_refuses():
+    """STARTED closes the crash window without swallowing a refused launch."""
+    enqueue()
+    claim = claim_external_turn("E1")
+    assert mark_external_turn_started("E1", claim) is True
+
+    assert release_external_turn("E1", claim, "dispatch refused") is True
+    row = pending_external_turns("S")[0]
+    assert row["state"] == PENDING
+    assert row["started_at"] is None
+    assert row["last_error"] == "dispatch refused"
+
+
 def test_a_dead_claimer_does_not_take_the_event_with_it():
     """A process killed between claiming and dispatching must not strand it.
 
@@ -209,6 +222,22 @@ def test_a_dead_started_turn_is_never_re_dispatched():
 
     assert pending_external_turns("S") == []
     assert claim_external_turn("E1") is None
+
+
+def test_a_dead_state_eligible_for_redelivery_cannot_be_the_dispatch_state():
+    """The consumer commits STARTED before any durable wake marker is possible.
+
+    STARTED is intentionally excluded from automatic recovery.  This pins the
+    structural invariant behind crash safety: after dispatch begins, owner death
+    can only hand control to producer reconciliation, never another consumer.
+    """
+    enqueue(body="completion\n\n[delegate-wave-wake:wake_1]")
+    claim = claim_external_turn("E1")
+    assert mark_external_turn_started("E1", claim) is True
+    kill_holder("E1")
+
+    assert get_external_turn("E1")["state"] == STARTED
+    assert pending_external_turns("S") == []
 
 
 def test_finishing_a_turn_makes_the_transcript_final():
