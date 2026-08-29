@@ -9682,6 +9682,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
+        if chat_id_str in self._telegram_strict_mention_chats():
+            return self._message_mentions_bot(message)
         sender_id = self._telegram_sender_id(message)
         if sender_id in self._telegram_free_response_users():
             return True
@@ -9691,8 +9693,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if self._telegram_is_free_response_topic(message):
             return True
-        if chat_id_str in self._telegram_strict_mention_chats():
-            return self._message_mentions_bot(message)
         if chat_id_str not in self._telegram_require_mention_chats() and not self._telegram_require_mention():
             return True
         if self._is_reply_to_bot(message):

@@ -382,6 +382,43 @@ def test_strict_mention_chats_reject_reply_and_pattern_fallbacks():
     ) is True
 
 
+def test_strict_mention_chat_overrides_free_response_chat():
+    adapter = _make_adapter(
+        require_mention=False,
+        strict_mention_chats=["-200"],
+        free_response_chats=["-200"],
+    )
+
+    assert adapter._should_process_message(_group_message("ordinary message", chat_id=-200)) is False
+
+    text = "@hermes_bot direct request"
+    assert adapter._should_process_message(
+        _group_message(text, chat_id=-200, entities=[_mention_entity(text)])
+    ) is True
+
+
+def test_strict_mention_chat_overrides_free_response_user():
+    adapter = _make_adapter(
+        require_mention=False,
+        strict_mention_chats=["-200"],
+        free_response_users=["222"],
+    )
+
+    assert adapter._should_process_message(
+        _group_message("ordinary message", chat_id=-200, from_user_id=222)
+    ) is False
+
+    text = "@hermes_bot direct request"
+    assert adapter._should_process_message(
+        _group_message(
+            text,
+            chat_id=-200,
+            from_user_id=222,
+            entities=[_mention_entity(text)],
+        )
+    ) is True
+
+
 def test_unmentioned_group_messages_can_be_observed_for_require_mention_chat():
     async def _run():
         adapter = _make_adapter(

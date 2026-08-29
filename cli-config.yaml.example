@@ -1213,7 +1213,8 @@ platform_toolsets:
 #     guest_mode: false
 #     # allowed_chats: ["-1001234567890"]
 #     # require_mention_chats applies require_mention-style gating only in selected chats.
-#     # strict_mention_chats accepts only explicit @bot mentions in selected chats.
+#     # strict_mention_chats accepts only explicit @bot mentions in selected chats,
+#     # overriding free_response_chats and free_response_users for those chats.
 #     # require_mention_chats: ["-1001234567890"]
 #     # strict_mention_chats: ["-1001234567890"]
 #     # free_response_users lets these Telegram user IDs bypass require_mention in groups.

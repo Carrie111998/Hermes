@@ -535,7 +535,7 @@ Hermes Agent works in Telegram group chats with a few considerations:
 - `TELEGRAM_ALLOWED_USERS` still applies — only authorized users can trigger the bot, even in groups
 - You can keep the bot from responding to ordinary group chatter with `telegram.require_mention: true`
 - Use `telegram.require_mention_chats` to apply mention gating to specific chat IDs without changing the default for every Telegram group this profile can see.
-- Use `telegram.strict_mention_chats` when a specific chat must require explicit `@botusername` mentions; replies to the bot and `mention_patterns` do not wake the bot in those chats.
+- Use `telegram.strict_mention_chats` when a specific chat must require explicit `@botusername` mentions; replies to the bot and `mention_patterns` do not wake the bot in those chats. This setting takes precedence over `telegram.free_response_chats` and `telegram.free_response_users`, so every message in a strict chat still needs a direct bot mention. `telegram.strict_mention_users` continues to require direct mentions for its configured users outside strict chats.
 - With `telegram.require_mention: true`, group messages are accepted when they are:
   - replies to one of the bot's messages
   - `@botusername` mentions
