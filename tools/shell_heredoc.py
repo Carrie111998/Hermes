@@ -40,17 +40,23 @@ from __future__ import annotations
 
 import re
 
-# Non-shell interpreters whose (quoted, inert) heredoc bodies are safe to
-# mask: the body is program text or plain data for THAT interpreter, not
-# shell syntax executed by this command line. Optional VAR=... assignments,
-# an ``env`` prefix, and a path prefix are allowed. Deliberately narrow:
-# anything not matched keeps its body visible (fail-closed).
-_INERT_HEREDOC_CONSUMER_RE = re.compile(
+# Shared opener prefix for every allowlisted heredoc consumer. Keep assignment,
+# ``env``, and executable-path handling in one place so the general and
+# data-sink-only policies cannot drift apart.
+_HEREDOC_CONSUMER_PREFIX = (
     r"^\s*"
     r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
     r"(?:env\s+)?"
     r"(?:[A-Za-z0-9_./-]+/)?"
-    r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
+)
+
+# Non-shell interpreters whose (quoted, inert) heredoc bodies are safe to
+# mask: the body is program text or plain data for THAT interpreter, not
+# shell syntax executed by this command line. Deliberately narrow: anything
+# not matched keeps its body visible (fail-closed).
+_INERT_HEREDOC_CONSUMER_RE = re.compile(
+    _HEREDOC_CONSUMER_PREFIX
+    + r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
     re.IGNORECASE,
 )
 
@@ -59,11 +65,7 @@ _INERT_HEREDOC_CONSUMER_RE = re.compile(
 # shell, but they can still launch shell commands; plain ``cat`` only consumes
 # its stdin as data during this command.
 _INERT_DATA_SINK_HEREDOC_CONSUMER_RE = re.compile(
-    r"^\s*"
-    r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
-    r"(?:env\s+)?"
-    r"(?:[A-Za-z0-9_./-]+/)?"
-    r"cat(?=\s|$)",
+    _HEREDOC_CONSUMER_PREFIX + r"cat(?=\s|$)",
     re.IGNORECASE,
 )
 
