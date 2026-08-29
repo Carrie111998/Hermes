@@ -15,7 +15,10 @@ Behaviour contract asserted here:
   * two concurrent turns → exactly one startStream each, no cross-sealing
   * each turn's final send seals its OWN stream, no chat.postMessage
   * a same-turn draft_id bump still seals the superseded segment
-  * a sibling turn's stream survives that hand-off
+  * a sibling turn's stream survives that hand-off, including one sharing
+    the same thread anchor that started later (higher ``draft_id``)
+  * a turn that never finalizes is swept by age, so per-turn keys cannot
+    accumulate stale entries or leave a live-typing indicator up
 """
 
 import asyncio
@@ -151,3 +154,87 @@ class TestSameTurnSegmentHandoff:
         )
         sealed = [c.kwargs["ts"] for c in client.chat_stopStream.await_args_list]
         assert sibling_ts not in sealed
+
+    @pytest.mark.asyncio
+    async def test_handoff_does_not_seal_a_newer_same_thread_turn(self):
+        """A same-thread sibling that started LATER must survive the hand-off.
+
+        The thread anchor alone cannot separate two turns under one parent
+        (an interactive reply and a scheduled turn), so the anchor match used
+        to seal the sibling and reproduce the split-answer symptom narrowly.
+        ``draft_id`` ordering closes that direction: only a provably older
+        segment can be this turn's predecessor.
+        """
+        adapter, client = _make_adapter()
+
+        # Same thread anchor, higher draft_id => a turn that started after us.
+        await adapter.send_draft("C1", 9, "newer same-thread turn", metadata=TURN_A)
+        newer_ts = adapter._active_streams[("C1", 9)]["ts"]
+
+        await adapter.send_draft("C1", 7, "our segment one", metadata=TURN_A)
+        await adapter.send_draft("C1", 8, "our segment two", metadata=TURN_A)
+
+        assert ("C1", 9) in adapter._active_streams, (
+            "a hand-off sealed a same-thread turn that started later"
+        )
+        sealed = [c.kwargs["ts"] for c in client.chat_stopStream.await_args_list]
+        assert newer_ts not in sealed
+        # Our own predecessor is still handed off.
+        assert ("C1", 7) not in adapter._active_streams
+
+
+class TestAbandonedStreamReaper:
+    """Per-turn keys are no longer displaced by the next turn, so a turn that
+    never finalizes would hold a live-typing indicator open forever."""
+
+    @pytest.mark.asyncio
+    async def test_abandoned_stream_is_sealed_and_evicted(self):
+        adapter, client = _make_adapter()
+
+        await adapter.send_draft("C1", 1, "turn that dies here", metadata=TURN_B)
+        stale = adapter._active_streams[("C1", 1)]
+        stale_ts = stale["ts"]
+        # Age it past the threshold rather than sleeping.
+        stale["started"] -= adapter._STREAM_ABANDON_SECONDS + 1
+
+        await adapter.send_draft("C1", 2, "a later turn", metadata=TURN_A)
+
+        assert ("C1", 1) not in adapter._active_streams, (
+            "abandoned stream survived the sweep; the map is unbounded"
+        )
+        sealed = [c.kwargs["ts"] for c in client.chat_stopStream.await_args_list]
+        assert stale_ts in sealed, "abandoned stream evicted without sealing"
+
+    @pytest.mark.asyncio
+    async def test_reaper_leaves_live_streams_alone(self):
+        adapter, client = _make_adapter()
+
+        await adapter.send_draft("C1", 1, "live sibling", metadata=TURN_B)
+        await adapter.send_draft("C1", 2, "our turn", metadata=TURN_A)
+
+        assert ("C1", 1) in adapter._active_streams
+        assert ("C1", 2) in adapter._active_streams
+        client.chat_stopStream.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sweep_precedes_the_slot_read_so_no_append_hits_a_dead_ts(self):
+        """The sweep runs before this turn's slot is read.
+
+        Order matters: reading the slot first would hand back an entry the
+        sweep then seals, and the append would target a stopped ``ts``.  A
+        turn aged past the threshold is instead reopened as a fresh stream.
+        """
+        adapter, client = _make_adapter()
+
+        await adapter.send_draft("C1", 1, "long turn", metadata=TURN_A)
+        adapter._active_streams[("C1", 1)]["started"] -= (
+            adapter._STREAM_ABANDON_SECONDS + 1
+        )
+
+        result = await adapter.send_draft("C1", 1, "long turn continues", metadata=TURN_A)
+
+        assert result.success
+        # Reaped, then reopened as a fresh stream for the same turn — the
+        # invariant that matters is that no append targets a dead ts.
+        assert ("C1", 1) in adapter._active_streams
+        client.chat_appendStream.assert_not_awaited()

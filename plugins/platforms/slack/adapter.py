@@ -3360,6 +3360,22 @@ class SlackAdapter(BasePlatformAdapter):
     # append deltas because the streaming API is append-only.
     _STREAM_CURSOR_GLYPHS = ("\u2589", "▍", "▌", "…")
 
+    # Per-turn keying removed the old single-slot self-limiting: a per-chat
+    # slot was evicted by the next turn, so an interrupted turn's stream could
+    # not outlive one response. Now every turn owns its own key and an
+    # abandoned entry (agent interrupted, process killed mid-turn, a final
+    # `send()` whose text fails the prefix match) would survive until
+    # `disconnect()`, holding a live-typing indicator open. Streams older than
+    # this are sealed and evicted on the next `send_draft`, which bounds the
+    # map without touching the concurrency fix. Well above any real turn
+    # duration so a slow-but-live turn is never reaped.
+    _STREAM_ABANDON_SECONDS = 1800.0
+
+    # A superseded same-turn segment always carries a LOWER draft_id than the
+    # segment replacing it (the stream consumer's counter is monotonic), so a
+    # higher-id stream belongs to a turn that started after us and is never
+    # ours. See `_seal_superseded_segment` for the residual same-thread case.
+
     def supports_draft_streaming(
         self,
         chat_type: Optional[str] = None,
@@ -3405,6 +3421,12 @@ class SlackAdapter(BasePlatformAdapter):
         text = self._strip_stream_cursor(content)
         client = self._get_client(chat_id)
         key = (chat_id, draft_id)
+
+        # Bound the (now per-turn) map: collect streams whose turn never
+        # reached a finalize, so an interrupted turn cannot hold a live-typing
+        # indicator open for the life of the process.  Runs before this turn's
+        # slot is read so a reaped entry is never appended to afterwards.
+        await self._reap_abandoned_streams()
         stream = self._active_streams.get(key)
 
         try:
@@ -3556,17 +3578,60 @@ class SlackAdapter(BasePlatformAdapter):
         Without an anchor to compare, nothing is sealed: leaving a stream open
         costs a stale indicator, while sealing a live sibling turn splits its
         answer into two messages, which is the bug this keying fixes.
+
+        The anchor alone separates turns in *different* threads.  Two turns in
+        the SAME thread (an interactive reply and a scheduled/background turn
+        under one parent) share it, so ``draft_id`` ordering narrows the
+        residual case: the stream consumer's counter is monotonic, so a
+        superseded segment of THIS turn always carries a *lower* id.  A stream
+        with a higher id belongs to a turn that started after us and is never
+        ours — previously any different id was sealed.
+
+        That is a narrowing, not an identity: a same-thread sibling that
+        started *before* us and is still live can still be sealed here, because
+        ``draft_id`` is the only turn identity this layer receives.  Closing
+        the gap needs the gateway to stamp a stable per-turn id on draft
+        metadata — the same missing contract noted in
+        ``_find_stream_for_final``.  Until then this errs towards sealing only
+        what is provably older, and ``_reap_abandoned_streams`` collects the
+        indicators left behind by the seals we skip.
         """
         anchor = self._resolve_thread_ts(None, metadata)
         if not anchor:
             return
         for other_key, other in list(self._active_streams.items()):
-            if other_key[0] != chat_id or other_key[1] == draft_id:
+            if other_key[0] != chat_id or other_key[1] >= draft_id:
                 continue
             if other.get("thread_ts") != anchor:
                 continue
             await self._seal_stream(chat_id, other)
             self._active_streams.pop(other_key, None)
+
+    async def _reap_abandoned_streams(self) -> None:
+        """Seal and evict streams whose turn never reached a finalize.
+
+        Per-turn keying means an entry is no longer displaced by the next
+        turn in the chat, so a turn that opens a stream and then dies
+        (interrupt, process exit, a final ``send()`` that fails the prefix
+        match) leaves a live-typing indicator up indefinitely.  Sweeping by
+        age on each ``send_draft`` bounds the map and clears the indicator
+        without any per-turn bookkeeping; the threshold is far above a real
+        turn, so a slow live turn is never touched.
+        """
+        now = time.time()
+        for key, stream in list(self._active_streams.items()):
+            started = stream.get("started")
+            if not isinstance(started, (int, float)):
+                continue
+            if now - started < self._STREAM_ABANDON_SECONDS:
+                continue
+            if self._active_streams.pop(key, None) is None:
+                continue
+            logger.debug(
+                "[Slack] Reaping abandoned native stream %s/%s (age %.0fs)",
+                key[0], stream.get("ts"), now - started,
+            )
+            await self._seal_stream(key[0], stream)
 
     def _find_stream_for_final(
         self,
@@ -3580,6 +3645,17 @@ class SlackAdapter(BasePlatformAdapter):
         When several turns are open in the same channel, the longest matching
         ``sent`` prefix wins — a short prefix could match a sibling turn whose
         answer happens to start the same way.
+
+        Longest-prefix is a heuristic, not an identity, and it can still
+        mis-attribute when one turn's streamed text nests inside another's:
+        turn A streams ``"The"``, turn B streams ``"The answer"``, and A
+        finalizes with ``"The answer is 42"`` — B's longer prefix wins, so A's
+        final seals B's stream and A's own entry dangles (until the reaper
+        collects it).  This is strictly better than the previous single-slot
+        behavior, where *every* concurrent pair mis-attributed, and it is the
+        floor for content-based matching: ``send()`` has no turn identity to
+        offer.  Removing it needs a ``draft_id`` (or equivalent) on the final
+        send, which is a gateway-side contract change.
 
         Returns ``(key, stream)`` or ``None`` when no open stream claims it.
         """
