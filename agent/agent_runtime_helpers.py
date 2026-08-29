@@ -1351,11 +1351,23 @@ def anthropic_prompt_cache_policy(
         return True, False
 
     # Custom OpenAI-compatible endpoint serving a Claude model (e.g. LiteLLM
-    # proxying to Anthropic or Bedrock).  The model name contains "claude" so
-    # we know caching is supported; use envelope layout since we're on the
-    # OpenAI wire format, not the native Anthropic messages API.
+    # proxying to Anthropic or Bedrock).  Sending cache_control on the
+    # OpenAI wire format can break strict providers that reject unknown
+    # keys (#9621), so this is OFF by default.  Users who know their proxy
+    # forwards cache_control can opt in via config.yaml:
+    #
+    #   prompt_caching:
+    #     custom_provider: true
+    #
     if provider_lower == "custom" and is_claude:
-        return True, False
+        try:
+            from hermes_cli.config import load_config as _load_cc_cfg
+
+            _pc = (_load_cc_cfg().get("prompt_caching") or {})
+            if _pc.get("custom_provider") is True:
+                return True, False
+        except Exception:
+            pass
 
     return False, False
 

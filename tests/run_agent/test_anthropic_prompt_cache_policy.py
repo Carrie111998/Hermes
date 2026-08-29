@@ -330,3 +330,53 @@ class TestExplicitOverrides:
 # Long-lived prefix cache policy (cross-session 1h tier)
 # ─────────────────────────────────────────────────────────────────────
 
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Custom provider + Claude: config-gated opt-in (#50946)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCustomProviderOptIn:
+    """Custom OpenAI-wire + Claude model: OFF by default, ON with config opt-in.
+
+    Sending cache_control on the OpenAI wire format can break strict proxies
+    that reject unknown keys (#9621), so it defaults to OFF. Users who know
+    their proxy (e.g. LiteLLM) forwards cache_control to Anthropic can set
+    ``prompt_caching.custom_provider: true`` in config.yaml.
+    """
+
+    def test_custom_claude_defaults_off(self):
+        agent = _make_agent(
+            provider="custom",
+            base_url="https://my-litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="claude-sonnet-4",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_custom_claude_enabled_via_config(self, monkeypatch):
+        agent = _make_agent(
+            provider="custom",
+            base_url="https://my-litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="claude-sonnet-4",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"prompt_caching": {"custom_provider": True}},
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+
+    def test_custom_non_claude_stays_off_even_with_config(self, monkeypatch):
+        agent = _make_agent(
+            provider="custom",
+            base_url="https://my-litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="gpt-4o",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"prompt_caching": {"custom_provider": True}},
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)

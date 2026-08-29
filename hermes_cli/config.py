@@ -1330,6 +1330,12 @@ DEFAULT_CONFIG = {
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {
         "cache_ttl": "5m",
+        # Enable prompt caching for custom OpenAI-compatible endpoints serving
+        # Claude models (e.g. LiteLLM proxying to Anthropic/Bedrock).  Off by
+        # default because some strict proxies reject the extra cache_control
+        # field in the OpenAI wire format.  Set to true when your proxy
+        # forwards cache_control to the upstream Anthropic backend.
+        "custom_provider": False,
     },
 
     # OpenRouter-specific settings.
