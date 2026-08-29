@@ -3603,9 +3603,17 @@ class SessionStore:
             try:
                 target_row = db.get_session(target_session_id)
             except Exception:
-                logger.debug(
-                    "switch_session subagent pre-check failed for %s",
-                    target_session_id, exc_info=True,
+                # Fail OPEN: a SQLite hiccup must not break /resume or CLI
+                # handoff for every user. But this is precisely the shape that
+                # silently reintroduces #92859 — the lookup fails, the row
+                # reads as non-subagent, and the bind proceeds — so it is
+                # logged at warning, not debug, to leave a trace in the record
+                # when a hijack slips through this path.
+                logger.warning(
+                    "switch_session subagent pre-check failed for %s; "
+                    "allowing the bind (fail-open). A delegate row could be "
+                    "bound to routing key %s if this recurs (#92859).",
+                    target_session_id, session_key, exc_info=True,
                 )
                 target_row = None
             if is_internal_subagent_row(target_row):

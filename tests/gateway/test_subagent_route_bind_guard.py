@@ -218,6 +218,88 @@ class TestIsInternalSubagentRow:
         assert is_internal_subagent_row(row) is False
 
 
+class TestDetectorHalvesAgree:
+    """The Python guard and the SQL fence must answer identically (#93208 review).
+
+    Subagent-ness has two homes: ``is_internal_subagent_row`` gates
+    ``switch_session``, and ``_NOT_SUBAGENT_ROW_SQL`` fences restart recovery.
+    The prior revision disagreed on a blank ``_delegate_from``: Python treated
+    ``""`` as absent (``.strip()``) while the SQL used a bare ``IS NULL``,
+    under which an empty string is NOT null. The same row was therefore
+    refused a route bind but still returned by recovery — one invariant with
+    two answers, and the residual case the per-half tests cannot catch because
+    each only pins its own side.
+
+    These cases drive BOTH halves over the same rows and assert they agree.
+    """
+
+    @pytest.mark.parametrize(
+        "marker,is_subagent",
+        [
+            ("real_parent", True),   # a genuine delegate marker
+            ("", False),             # blank -> not a delegate, both halves
+            ("   ", False),          # whitespace-only -> .strip() / TRIM
+        ],
+    )
+    def test_blank_marker_treated_identically_by_both_halves(
+        self, store_and_db, marker, is_subagent
+    ):
+        store, db = store_and_db
+        key = "agent:main:discord:dm:1540910309580214372"
+
+        db.create_session(
+            "probe", source="discord", session_key=key,
+            user_id="user-1", chat_id="1540910309580214372", chat_type="dm",
+            model_config={"_delegate_from": marker},
+        )
+        db.append_message(session_id="probe", role="user", content="hi")
+
+        # Half 1 — the Python detector used by switch_session().
+        python_says = is_internal_subagent_row(db.get_session("probe"))
+
+        # Half 2 — the SQL fence used by restart recovery. A row it considers
+        # a subagent is excluded, so "not recovered" == "SQL says subagent".
+        recovered = db.find_latest_gateway_session_for_peer(
+            source="discord", session_key=key, user_id="user-1",
+            chat_id="1540910309580214372", chat_type="dm",
+        )
+        sql_says = recovered is None
+
+        assert python_says is is_subagent
+        assert sql_says is is_subagent
+        assert python_says == sql_says, (
+            "the Python guard and the SQL fence disagree on "
+            f"_delegate_from={marker!r}: switch_session and restart recovery "
+            "would classify the same row differently"
+        )
+
+
+class TestResumeRefusalIsExplained:
+    """A refused bind must not read as a transient failure (#93208 review).
+
+    ``switch_session`` returning ``None`` is surfaced by /resume as the generic
+    "Failed to switch session." For a user who pastes a subagent id explicitly
+    that is misleading — nothing failed, the target is simply not a
+    conversation. All four other callers tolerate ``None`` correctly (CLI
+    handoff raises, async-completion pinning logs and drops the injection,
+    Telegram topic rebinding keeps the incumbent entry), so /resume is the one
+    path that needed a specific message.
+    """
+
+    def test_locale_string_exists_and_names_the_reason(self):
+        import yaml
+        from pathlib import Path
+
+        locales = Path(__file__).resolve().parents[2] / "locales" / "en.yaml"
+        data = yaml.safe_load(locales.read_text(encoding="utf-8"))
+        msg = data["gateway"]["resume"]["blocked_subagent"]
+
+        assert "{name}" in msg, "must interpolate the requested target"
+        # It has to tell the user WHY, not just that something failed.
+        assert "subagent" in msg.lower()
+        assert msg != data["gateway"]["resume"]["switch_failed"]
+
+
 class TestGuardSurvivesSessionGenerationChanges:
     """The #92872 review's case 1: a compression rotation must not reopen this.
 

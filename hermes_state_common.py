@@ -196,9 +196,20 @@ _COMPRESSION_CHILD_SQL = (
 # overwritten with the platform name by ``record_gateway_session_peer``.
 # Interpolated (not bound) so it can be embedded in the peer-recovery
 # queries alongside the other f-string predicates in this module.
+#
+# ``NULLIF(TRIM(...), '')`` keeps this predicate equivalent to the Python
+# detector ``gateway.session.is_internal_subagent_row``, which treats a blank
+# marker as absent via ``str(...).strip()``. TRIM matches ``.strip()`` for the
+# whitespace-only case and NULLIF collapses the empty result to NULL. Without
+# both, a row carrying ``_delegate_from: ""`` (or ``"  "``) would be refused a
+# route bind by the Python guard yet still be returned by restart recovery
+# here — one invariant, two answers. Nothing writes a blank marker today; this
+# keeps the halves from drifting if anything ever does.
 _NOT_SUBAGENT_ROW_SQL = (
     "(COALESCE({a}.source, '') != 'subagent'"
-    " AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._delegate_from')"
+    " AND NULLIF(TRIM("
+    "COALESCE(json_extract(COALESCE({a}.model_config, '{{}}'),"
+    " '$._delegate_from'), '')), '')"
     " IS NULL)"
 )
 
