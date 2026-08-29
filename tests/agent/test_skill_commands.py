@@ -82,6 +82,23 @@ class TestScanSkillCommands:
         assert message is not None
         assert "Apply impeccable design craft." in message
 
+    def test_post_walk_guard_uses_authoritative_exclusion_set(self, tmp_path):
+        """The post-walk exclusion guard must share the authoritative set.
+
+        ``tools/skills_tool.py`` checks every produced ``SKILL.md`` path
+        against ``agent.skill_utils.EXCLUDED_SKILL_DIRS``. The slash-command
+        scan used a drifted inline subset of that set, so a skills root whose
+        own path crosses an excluded dir (e.g. a venv) registered slash
+        commands for skills the skills tool already refuses to list.
+        """
+        skills_root = tmp_path / "venv" / "skills"
+        _make_skill(skills_root, "probe-skill")
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_root):
+            result = scan_skill_commands()
+
+        assert "/probe-skill" not in result
+
     def test_get_skill_commands_rescans_when_platform_scope_changes(self, tmp_path):
         """Platform-specific disabled-skill caches must not leak across platforms.
 
