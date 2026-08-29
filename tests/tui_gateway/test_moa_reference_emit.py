@@ -70,3 +70,55 @@ def test_moa_reference_relayed_with_label_and_index(server, emits):
     assert payload["count"] == 2
 
 
+def test_moa_progress_preserves_stable_slot_and_terminal_status(server, emits):
+    server._on_tool_progress(
+        "sid-1",
+        "moa.progress",
+        "openrouter:model-b",
+        None,
+        None,
+        moa_refs_done=1,
+        moa_refs_total=3,
+        moa_index=2,
+        moa_status="failed",
+    )
+
+    assert emits == [
+        (
+            "moa.progress",
+            "sid-1",
+            {
+                "label": "openrouter:model-b",
+                "refs_done": 1,
+                "refs_total": 3,
+                "index": 2,
+                "status": "failed",
+            },
+        )
+    ]
+
+
+def test_moa_reference_phase_relays_complete_roster(server, emits):
+    server._on_tool_progress(
+        "sid-1",
+        "moa.phase",
+        "openrouter:aggregator",
+        None,
+        None,
+        moa_phase="reference",
+        moa_refs_done=0,
+        moa_refs_total=10,
+        moa_advisors=[f"openrouter:model-{index}" for index in range(10)],
+        moa_concurrency=8,
+        moa_fanout="every_n:3",
+        moa_guidance_reused=False,
+    )
+
+    event, sid, payload = emits[0]
+    assert (event, sid) == ("moa.phase", "sid-1")
+    assert payload["advisors"] == [f"openrouter:model-{index}" for index in range(10)]
+    assert payload["concurrency"] == 8
+    assert payload["fanout"] == "every_n:3"
+    assert payload["guidance_reused"] is False
+
+
