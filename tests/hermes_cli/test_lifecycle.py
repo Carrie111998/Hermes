@@ -4,6 +4,14 @@ from agent import relay_runtime
 from hermes_cli import lifecycle, observability, plugins
 
 
+def test_cortex_plugin_producer_contract_is_explicit_and_complete():
+    assert set(lifecycle.CORTEX_PLUGIN_PRODUCER_CONTRACT) == {
+        "pre_llm.authoritative_workspace.v1",
+        "pre_llm.desktop_session_workspace.v1",
+        "session_reset.explicit_edge.v1",
+    }
+
+
 def test_invoke_hook_notifies_builtin_observers_before_plugins(monkeypatch):
     calls = []
     manager = SimpleNamespace(

@@ -67,6 +67,23 @@ class TestSessionCwdOverride:
         finally:
             rt._SESSION_CWD.reset(token)
 
+    def test_authoritative_session_cwd_never_uses_global_fallbacks(
+        self, monkeypatch, tmp_path
+    ):
+        bound = tmp_path / "bound"
+        bound.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        clear_session_cwd()
+
+        assert rt.authoritative_session_cwd() == ""
+
+        token = set_session_cwd(str(bound))
+        try:
+            assert rt.authoritative_session_cwd() == str(bound)
+        finally:
+            rt._SESSION_CWD.reset(token)
+
 
     def test_clear_session_cwd_restores_terminal_cwd(self, monkeypatch, tmp_path):
         other = tmp_path / "other"

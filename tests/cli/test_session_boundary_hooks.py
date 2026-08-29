@@ -19,6 +19,7 @@ def test_session_finalize_on_reset(mock_finalize_session, mock_invoke_hook):
     """Verify on_session_finalize fires when /new or /reset is used."""
     cli = HermesCLI()
     cli.agent = MagicMock()
+    cli.session_id = "test-session-id"
     cli.agent.session_id = "test-session-id"
 
     # Simulate /new command which triggers on_session_finalize for the old session
@@ -36,6 +37,9 @@ def test_session_finalize_on_reset(mock_finalize_session, mock_invoke_hook):
         c.args == ("on_session_reset",)
         and c.kwargs["session_id"] == cli.session_id
         and c.kwargs["platform"] == "cli"
+        and c.kwargs["reason"] == "new_session"
+        and c.kwargs["old_session_id"] == "test-session-id"
+        and c.kwargs["new_session_id"] == cli.session_id
         for c in mock_invoke_hook.call_args_list
     )
 

@@ -37,7 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any, Iterator
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -58,6 +58,15 @@ _UNSET: Any = object()
 # os.environ fallback is preserved (no concurrency to leak across). Monotonic
 # latch — once any host binds a session, the process stays engaged for life.
 _session_context_engaged: bool = False
+
+
+class _SessionContextTokens(list):
+    """Backward-compatible token list with nested-scope restoration metadata."""
+
+    def __init__(self, tokens: list, *, cwd_token: Any, restore_outer: bool):
+        super().__init__(tokens)
+        self.cwd_token = cwd_token
+        self.restore_outer = restore_outer
 
 
 def session_context_engaged() -> bool:
@@ -246,10 +255,9 @@ def set_session_vars(
     """Set all session context variables and return reset tokens.
 
     Call ``clear_session_vars(tokens)`` in a ``finally`` block when the handler
-    exits. Note ``clear_session_vars`` resets every var to ``""`` (to suppress
-    the ``os.environ`` fallback) rather than restoring prior values — these
-    helpers are not nestable/stack-safe, and the returned tokens are accepted
-    only for API compatibility.
+    exits. Nested cleanup restores a concrete outer binding. Top-level cleanup
+    resets every variable explicitly so stale ``os.environ`` fallback cannot
+    reappear after the turn.
 
     ``cwd`` pins the logical working directory for this context.
 
@@ -288,27 +296,32 @@ def set_session_vars(
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
+    cwd_token = None
     try:
         from agent.runtime_cwd import set_session_cwd
 
-        set_session_cwd(cwd)
+        cwd_token = set_session_cwd(cwd)
     except Exception:
         pass
-    return tokens
+    prior_values = [token.old_value for token in tokens]
+    if cwd_token is not None:
+        prior_values.append(cwd_token.old_value)
+    restore_outer = any(
+        value not in (Token.MISSING, _UNSET, "") for value in prior_values
+    )
+    return _SessionContextTokens(
+        tokens, cwd_token=cwd_token, restore_outer=restore_outer
+    )
 
 
 def clear_session_vars(tokens: list) -> None:
-    """Mark session context variables as explicitly cleared.
+    """Restore a nested scope or explicitly clear a top-level scope.
 
-    Sets all variables to ``""`` so that ``get_session_env`` returns an empty
-    string instead of falling back to (potentially stale) ``os.environ``
-    values.  The *tokens* argument is accepted for API compatibility with
-    callers that saved the return value of ``set_session_vars``, but the
-    actual clearing uses ``var.set("")`` rather than ``var.reset(token)``
-    to ensure the "explicitly cleared" state is distinguishable from
-    "never set" (which holds the ``_UNSET`` sentinel).
+    Nested cleanup resets the tokens returned by ``set_session_vars``.
+    Top-level cleanup writes explicit empty values so ``get_session_env``
+    cannot fall back to potentially stale ``os.environ`` values.
     """
-    for var in (
+    token_vars = (
         _SESSION_PLATFORM,
         _SESSION_SOURCE,
         _SESSION_CHAT_ID,
@@ -327,7 +340,21 @@ def clear_session_vars(tokens: list) -> None:
         _BROWSER_CONTROL_PRINCIPAL,
         _BROWSER_CONTROL_TRANSPORT_FAMILY,
         _CRON_SESSION,
-    ):
+        _SESSION_ASYNC_DELIVERY,
+    )
+    if isinstance(tokens, _SessionContextTokens) and tokens.restore_outer:
+        for var, token in reversed(list(zip(token_vars, tokens))):
+            var.reset(token)
+        if tokens.cwd_token is not None:
+            try:
+                from agent.runtime_cwd import reset_session_cwd
+
+                reset_session_cwd(tokens.cwd_token)
+            except Exception:
+                pass
+        return
+
+    for var in token_vars[:-1]:
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
     # falsy value: a cleared context should fall back to the default-supported
