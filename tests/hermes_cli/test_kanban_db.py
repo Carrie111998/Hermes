@@ -10,6 +10,7 @@ import sys
 import time
 import types
 import unittest.mock
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1255,6 +1256,42 @@ def _make_task(**overrides) -> "kb.Task":
     )
     defaults.update(overrides)
     return kb.Task(**defaults)
+
+
+def test_corrupt_iso_timestamps_are_coerced_at_read_boundaries(kanban_home):
+    """Legacy ISO values must not make card detail rendering crash."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="timestamp recovery")
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, started_at, ended_at) VALUES (?, ?, ?, ?)",
+            (task_id, "done", "2026-08-28T14:35:22+00:00", "2026-08-28T16:35:22Z"),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, "tester", "comment", "2026-08-28T16:35:22.613Z"),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)",
+            (task_id, "completed", "2026-08-28T16:35:22.613Z"),
+        )
+        conn.commit()
+
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task is not None
+    assert runs[0].started_at == int(
+        datetime.fromisoformat("2026-08-28T14:35:22+00:00").timestamp()
+    )
+    assert runs[0].ended_at == int(
+        datetime.fromisoformat("2026-08-28T16:35:22+00:00").timestamp()
+    )
+    completed_event = next(event for event in events if event.kind == "completed")
+    assert comments[0].created_at == completed_event.created_at
 
 
 
