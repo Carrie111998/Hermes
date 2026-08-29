@@ -70,3 +70,43 @@ def test_gateway_routed_session_owner_reads_state_db_from_hermes_home(
     monkeypatch.setattr(main_mod.os, "kill", lambda pid, signal: None)
 
     assert main_mod._gateway_routed_session_owner("routed-session") == 4242
+
+
+def test_main_sessions_stats_help_builds_full_parser_without_rollback_module(monkeypatch):
+    import os
+    import site
+    import sys
+
+    import hermes_cli.main as main_mod
+
+    source_root = os.path.dirname(os.path.dirname(main_mod.__file__))
+    script = """
+import sys
+import hermes_cli.main as main_mod
+
+sys.argv = ["hermes", "sessions", "stats", "--help"]
+main_mod._set_process_title = lambda: None
+main_mod._advertise_agent_env = lambda: None
+main_mod._cleanup_quarantined_exes = lambda: None
+main_mod._sweep_stale_bytecode_if_checkout_changed = lambda: None
+main_mod._recover_from_interrupted_install = lambda: None
+main_mod._warn_pending_fleet_restart_on_startup = lambda: None
+main_mod._try_termux_fast_tui_launch = lambda: False
+main_mod._try_termux_fast_cli_launch = lambda: False
+main_mod._try_fast_chat_launch = lambda: False
+main_mod.main()
+"""
+    env = os.environ | {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": os.pathsep.join([source_root, *site.getsitepackages()]),
+    }
+
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "usage: hermes sessions stats" in result.stdout
