@@ -125,7 +125,7 @@ def _source(chat_id=TEXT_CH):
         platform=Platform.DISCORD,
         chat_id=chat_id,
         user_id="900000000000000003",
-        user_name="marc",
+        user_name="tester",
         chat_type="channel",
     )
 
