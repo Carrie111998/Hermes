@@ -192,3 +192,99 @@ class TestStatusPlatformWriterIdentity:
         assert data["gateway_running"] is False
         assert data["gateway_state"] == "stopped"
         assert data["gateway_platforms"] == {}
+
+
+class TestStatusSourceLabelInvariant:
+    """Diagnostic liveness labels must not select product behavior."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        import hermes_cli.web_server as web_server
+
+        home = get_hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"platforms": {"discord": {"enabled": True}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+        monkeypatch.setattr(
+            web_server, "_load_configured_gateway_platforms", lambda: {"discord"}
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_collect_profile_gateway_topology_cached",
+            lambda: {
+                "profile_platforms": {},
+                "profiles": ["default"],
+                "gateway_mode": "single",
+                "gateways": [],
+            },
+        )
+
+        self.web_server = web_server
+        self.client = TestClient(web_server.app)
+        self.client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+
+    def _platforms_for_source(self, monkeypatch, source):
+        from gateway.status import GatewayLiveness
+
+        runtime = {
+            "gateway_state": "running",
+            "pid": 4242,
+            "start_time": 111.0,
+            "platforms": {"discord": {"state": "connected"}},
+            "exit_reason": None,
+            "updated_at": "2026-08-28T00:00:00+00:00",
+        }
+        monkeypatch.setattr(
+            self.web_server, "read_runtime_status", lambda *args, **kwargs: runtime
+        )
+        monkeypatch.setattr(
+            self.web_server,
+            "resolve_gateway_liveness",
+            lambda *args, **kwargs: GatewayLiveness(
+                running=True,
+                pid=9999,
+                source=source,
+                health_body=None,
+            ),
+        )
+
+        return self.client.get("/api/status").json()["gateway_platforms"]
+
+    def test_remote_authority_is_invariant_across_diagnostic_sources(self, monkeypatch):
+        sources = (
+            "pid",
+            "health",
+            "runtime_status",
+            "none",
+            "remote_registry",
+            "future_remote_mesh",
+        )
+
+        platforms_by_source = {
+            source: self._platforms_for_source(monkeypatch, source)
+            for source in sources
+        }
+
+        assert platforms_by_source == {
+            source: {"discord": {"state": "connected"}} for source in sources
+        }
+
+    def test_source_invariant_text_remains_in_status_module(self):
+        from pathlib import Path
+
+        import gateway.status as status_module
+
+        text = Path(status_module.__file__).read_text(encoding="utf-8")
+        assert "never branch product behavior on it" in text

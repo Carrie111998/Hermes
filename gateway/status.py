@@ -1343,7 +1343,8 @@ class GatewayLiveness:
     """Resolved gateway liveness for one dashboard surface.
 
     ``source`` records which rung of the ladder answered, purely for logging
-    and tests — never branch product behavior on it.
+    and tests — never branch product behavior on it. Use ``pid_is_local`` when
+    behavior depends on whether ``pid`` is authoritative for this host.
 
     ``probe_error`` is True when a rung raised instead of answering. Callers
     that must distinguish "the gateway is down" from "we could not tell"
@@ -1357,6 +1358,7 @@ class GatewayLiveness:
     source: str
     health_body: Optional[dict[str, Any]] = None
     probe_error: bool = False
+    pid_is_local: bool = False
 
 
 def resolve_gateway_liveness(
@@ -1424,7 +1426,12 @@ def resolve_gateway_liveness(
         pid = None
         probe_error = True
     if pid is not None:
-        return GatewayLiveness(running=True, pid=pid, source="pid")
+        return GatewayLiveness(
+            running=True,
+            pid=pid,
+            source="pid",
+            pid_is_local=True,
+        )
 
     health_body: Optional[dict[str, Any]] = None
     if health_probe is not None:
@@ -1441,6 +1448,7 @@ def resolve_gateway_liveness(
                 pid=remote_pid,
                 source="health",
                 health_body=health_body,
+                pid_is_local=False,
             )
 
     if runtime is _UNSET:
@@ -1468,6 +1476,7 @@ def resolve_gateway_liveness(
             pid=runtime_pid,
             source="runtime_status",
             health_body=health_body,
+            pid_is_local=True,
         )
 
     return GatewayLiveness(
@@ -1476,6 +1485,7 @@ def resolve_gateway_liveness(
         source="none",
         health_body=health_body,
         probe_error=probe_error,
+        pid_is_local=False,
     )
 
 

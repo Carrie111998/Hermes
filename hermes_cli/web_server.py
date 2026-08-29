@@ -3859,7 +3859,7 @@ async def get_status(profile: Optional[str] = None):
             # another host, so comparing it to a local PID is meaningless.
             if (
                 runtime is local_runtime
-                and liveness.source != "health"
+                and liveness.pid_is_local
                 and gateway_pid is not None
             ):
                 # ``_pid_from_record`` is the repo-wide coercion for a
