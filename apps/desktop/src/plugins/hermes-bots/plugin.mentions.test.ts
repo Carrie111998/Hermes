@@ -257,7 +257,7 @@ describe('the mention middleware', () => {
     const { handler } = await contributions()
     const result = await handler({ text: 'ping @default-vera' })
 
-    expect(result.text).toMatch(/message_agent target: "default-vera@vera"/)
+    expect(result.text).toMatch(/message_agent target: "hermes@vera"/)
     expect(result.text).toMatch(/on Vera/)
   })
 

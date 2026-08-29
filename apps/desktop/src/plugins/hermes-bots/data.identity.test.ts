@@ -19,6 +19,7 @@ import {
   botHandle,
   botMentionTag,
   botMetaKey,
+  botRelayTarget,
   botRosterKey,
   botSelectionKey,
   clearBotAttention,
@@ -78,6 +79,27 @@ describe('the @handle a bot answers to', () => {
 
   it('prefers a precomputed multi-source handle over the bare name', () => {
     expect(botHandle('default', row({ handle: 'default-vera', name: 'default' }))).toBe('default-vera')
+  })
+})
+
+describe('the canonical message_agent relay target', () => {
+  it('resolves remote targets using the canonical profile handle, not the UI alias', () => {
+    expect(
+      botRelayTarget(row({ name: 'default', connectionId: 'vera', remoteSource: true, handle: 'default-vera' }))
+    ).toBe('hermes@vera')
+    expect(
+      botRelayTarget(row({ name: 'ops', connectionId: 'vera', remoteSource: true, handle: 'ops-vera' }))
+    ).toBe('ops@vera')
+  })
+
+  it('keeps local targets bare without connection suffix', () => {
+    expect(botRelayTarget(row({ name: 'default' }))).toBe('hermes')
+    expect(botRelayTarget(row({ name: 'ops' }))).toBe('ops')
+  })
+
+  it('handles null or empty rows safely', () => {
+    expect(botRelayTarget(null)).toBe('')
+    expect(botRelayTarget(undefined)).toBe('')
   })
 })
 

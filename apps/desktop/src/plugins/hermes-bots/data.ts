@@ -962,6 +962,21 @@ export function botHandle(name: string, bot?: Partial<RosterRow> | null): string
   return (name || '').trim().toLowerCase() === 'default' ? 'hermes' : name
 }
 
+/** The canonical message_agent target identity for relaying to a bot.
+ *  Remote bots carry their connection-qualified target (${handle}@${connectionId}),
+ *  resolving to the remote profile's canonical relay handle or profile name,
+ *  rather than the UI-facing disambiguated multi-source handle. */
+export function botRelayTarget(bot: Partial<RosterRow> | null | undefined): string {
+  if (!bot) {
+    return ''
+  }
+
+  const profile = bot.targetProfile || bot.name || ''
+  const canonicalHandle = profile.trim().toLowerCase() === 'default' ? 'hermes' : profile
+
+  return bot.remoteSource && bot.connectionId ? `${canonicalHandle}@${bot.connectionId}` : canonicalHandle
+}
+
 /** Taggable @-forms derived from a bot's friendly names — the core profile
  *  display name (`hermes profile rename`) and the Bot Mode title. Free text
  *  reduces to the mention charset two ways: slugified ("Research Buddy" →
