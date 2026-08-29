@@ -126,3 +126,68 @@ def test_unlock_floor_survives_lost_aggregate(monkeypatch, tmp_path):
     assert flat, "achievement missing from computed payload"
     assert flat["unlocked"] is True, "recorded unlock rolled back when aggregate lost its backing"
     assert flat.get("tier") == first_tier
+
+
+def test_merge_bool_branch_only_when_both_sides_are_bool():
+    """Type drift between analyzer versions must not collapse a count to True."""
+    pa = load_plugin()
+    assert pa._merge_stats_monotonic({"tool_calls": 400}, {"tool_calls": True})["tool_calls"] == 400
+    assert pa._merge_stats_monotonic({"used_git": True}, {"used_git": 400})["used_git"] == 400
+    assert pa._merge_stats_monotonic({"used_git": True}, {"used_git": False})["used_git"] is True
+    assert pa._merge_stats_monotonic({"used_git": False}, {"used_git": False})["used_git"] is False
+
+
+def test_merge_none_from_fresh_scan_keeps_cached_value():
+    """A partial fresh analysis (metric omitted or None) cannot erase known data."""
+    pa = load_plugin()
+    merged = pa._merge_stats_monotonic({"git_events": 12, "model_names": ["qwen"]}, {"git_events": None})
+    assert merged["git_events"] == 12
+    assert merged["model_names"] == ["qwen"]
+
+
+def _find(computed: Dict[str, Any], achievement_id: str) -> Dict[str, Any]:
+    for section in computed.values():
+        if isinstance(section, list):
+            for item in section:
+                if isinstance(item, dict) and item.get("id") == achievement_id:
+                    return item
+    return {}
+
+
+def test_unlock_floor_restores_highest_tier_not_first(monkeypatch, tmp_path):
+    """A badge that climbed to Gold must not re-display at Copper after compaction."""
+    pa = load_plugin()
+    monkeypatch.setattr(pa, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "plugins" / "hermes-achievements").mkdir(parents=True)
+    definition = next(d for d in pa.ACHIEVEMENTS if d.get("threshold_metric") and len(d.get("tiers", [])) >= 3)
+    metric = definition["threshold_metric"]
+    ladder = sorted(definition["tiers"], key=lambda t: t["threshold"])
+    pa.save_state({"unlocks": {definition["id"]: {"unlocked_at": 1, "first_tier": ladder[0]["name"], "highest_tier": ladder[2]["name"], "evidence": None}}})
+
+    # aggregate lost entirely -> floor at the highest tier reached, not the first
+    lost = _find(pa._compute_from_scan({"aggregate": {metric: 0}, "sessions": []}), definition["id"])
+    assert lost["unlocked"] is True
+    assert lost["tier"] == ladder[2]["name"]
+
+    # aggregate partially lost (live says tier 2) -> still the recorded highest
+    partial = _find(pa._compute_from_scan({"aggregate": {metric: ladder[1]["threshold"]}, "sessions": []}), definition["id"])
+    assert partial["tier"] == ladder[2]["name"]
+
+
+def test_highest_tier_is_recorded_as_progress_climbs(monkeypatch, tmp_path):
+    pa = load_plugin()
+    monkeypatch.setattr(pa, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "plugins" / "hermes-achievements").mkdir(parents=True)
+    definition = next(d for d in pa.ACHIEVEMENTS if d.get("threshold_metric") and len(d.get("tiers", [])) >= 3)
+    metric = definition["threshold_metric"]
+    ladder = sorted(definition["tiers"], key=lambda t: t["threshold"])
+
+    pa._compute_from_scan({"aggregate": {metric: ladder[0]["threshold"]}, "sessions": []})
+    assert pa.load_state()["unlocks"][definition["id"]]["highest_tier"] == ladder[0]["name"]
+    pa._compute_from_scan({"aggregate": {metric: ladder[2]["threshold"]}, "sessions": []})
+    rec = pa.load_state()["unlocks"][definition["id"]]
+    assert rec["first_tier"] == ladder[0]["name"]
+    assert rec["highest_tier"] == ladder[2]["name"]
+    # a later, smaller scan never lowers the record
+    pa._compute_from_scan({"aggregate": {metric: ladder[1]["threshold"]}, "sessions": []})
+    assert pa.load_state()["unlocks"][definition["id"]]["highest_tier"] == ladder[2]["name"]
