@@ -24,6 +24,7 @@ import {
   MIN_PORT_ANNOUNCE_TIMEOUT_MS,
   readDashboardReadyFile,
   resolvePortAnnounceTimeoutMs,
+  waitForBackendClaimAndPort,
   waitForDashboardPort,
   waitForDashboardPortAnnouncement,
   waitForDashboardReadyFile
@@ -99,6 +100,14 @@ test('resolves with a HERMES_BACKEND_READY port (headless `serve`)', async () =>
   assert.equal(await p, 43210)
 })
 
+test('falls back to stdout when a ready file was requested', async () => {
+  const child = makeFakeChild()
+  const readyFile = path.join(os.tmpdir(), `hermes-ready-missing-${process.pid}-${Date.now()}.json`)
+  const p = waitForDashboardPortAnnouncement(child, { readyFile, timeoutMs: 1000 })
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=43211\n')
+  assert.equal(await p, 43211)
+})
+
 test('parses the port even when the line arrives split across chunks', async () => {
   const child = makeFakeChild()
   const p = waitForDashboardPort(child, 1000)
@@ -137,6 +146,23 @@ test('a late announcement after timeout does not throw (listeners torn down)', a
   assert.doesNotThrow(() => {
     child.stdout.emit('data', 'HERMES_DASHBOARD_READY port=9999\n')
   })
+})
+
+test('captures READY emitted while backend ownership claim is still pending', async () => {
+  const child = makeFakeChild()
+  let resolveClaim: (() => void) | undefined
+
+  const claim = new Promise<void>(resolve => {
+    resolveClaim = resolve
+  })
+
+  const result = waitForBackendClaimAndPort(child, async () => {
+    child.stdout.emit('data', 'HERMES_BACKEND_READY port=45678\n')
+    await claim
+  }, { timeoutMs: 1000 })
+
+  resolveClaim?.()
+  assert.deepEqual(await result, { port: 45678 })
 })
 
 // ---------------------------------------------------------------------------

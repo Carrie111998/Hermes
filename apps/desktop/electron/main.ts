@@ -60,7 +60,7 @@ import {
   shouldTrustHermesOverride,
   verifyHermesCli
 } from './backend-probes'
-import { waitForDashboardPortAnnouncement } from './backend-ready'
+import { waitForBackendClaimAndPort } from './backend-ready'
 import {
   isHostKeyChangedBootFailure,
   isRetryableRemoteBootFailure,
@@ -10506,7 +10506,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
-  const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+  const readyFile = makeDashboardReadyFile()
 
   // Guard BEFORE the "Starting" line: a profile that only exists on a remote
   // backend (remote-primary desktop asked for a forced-local child) rejects
@@ -10559,8 +10559,16 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // message instead of a bare exit code. rememberLog attaches later, after
   // the claim, and would miss anything printed before it.
   const outputTail = createBackendOutputTail()
-  outputTail.attach(child)
-  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
+
+  const { port } = await waitForBackendClaimAndPort(
+    child,
+    async () => {
+      outputTail.attach(child)
+
+      return claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
+    },
+    { describeOutputTail: () => outputTail.describe(), readyFile }
+  )
 
   child.stdout.on('data', rememberLog)
   child.stderr.on('data', rememberLog)
@@ -10591,12 +10599,6 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
       )
     }
   })
-
-  // Discover the ephemeral port the child bound to
-  const port = await Promise.race([
-    waitForDashboardPortAnnouncement(child, { describeOutputTail: () => outputTail.describe(), readyFile }),
-    startFailed
-  ])
 
   if (readyFile) {
     fs.unlink(readyFile, () => {})
@@ -10897,7 +10899,7 @@ async function startHermes() {
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
-    const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+    const readyFile = makeDashboardReadyFile()
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
@@ -10946,14 +10948,27 @@ async function startHermes() {
     // before-ready exit message shown by the boot UI. rememberLog attaches
     // later, after the claim, and would miss anything printed before it.
     const primaryOutputTail = createBackendOutputTail()
-    primaryOutputTail.attach(hermesProcess)
-    await claimBackendChild(
+    await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+
+    const { port } = await waitForBackendClaimAndPort(
       hermesProcess,
-      `${backend.command} ${backend.args.join(' ')}`,
-      profile,
-      backendNonce,
-      primaryOutputTail
+      async () => {
+        primaryOutputTail.attach(hermesProcess)
+
+        return claimBackendChild(
+          hermesProcess,
+          `${backend.command} ${backend.args.join(' ')}`,
+          profile,
+          backendNonce,
+          primaryOutputTail
+        )
+      },
+      {
+        describeOutputTail: () => primaryOutputTail.describe(),
+        readyFile
+      }
     )
+
     const processOwner = backendConnectionState.attachProcess(connectionAttempt, hermesProcess)
 
     if (!processOwner) {
@@ -11029,17 +11044,6 @@ async function startHermes() {
         )
       }
     })
-
-    await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
-
-    // Discover the ephemeral port the child bound to
-    const port = await Promise.race([
-      waitForDashboardPortAnnouncement(hermesProcess, {
-        describeOutputTail: () => primaryOutputTail.describe(),
-        readyFile
-      }),
-      backendStartFailed
-    ])
 
     if (readyFile) {
       fs.unlink(readyFile, () => {})

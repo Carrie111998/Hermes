@@ -129,6 +129,7 @@ function waitForDashboardReadyFile(
   describeOutputTail = () => ''
 ) {
   return new Promise((resolve, reject) => {
+    let buf = ''
     let done = false
     let interval = null
 
@@ -144,8 +145,27 @@ function waitForDashboardReadyFile(
         clearInterval(interval)
       }
 
+      child.stdout.off('data', onData)
       child.off('exit', onExit)
       child.off('error', onError)
+    }
+
+    function onData(chunk) {
+      buf += chunk.toString()
+      let nl
+
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        const m = line.match(_READY_RE)
+
+        if (m) {
+          cleanup()
+          resolve(parseInt(m[1], 10))
+
+          return
+        }
+      }
     }
 
     function check() {
@@ -174,6 +194,7 @@ function waitForDashboardReadyFile(
 
     child.on('exit', onExit)
     child.on('error', onError)
+    child.stdout.on('data', onData)
     interval = setInterval(check, 50)
 
     if (typeof interval.unref === 'function') {
@@ -187,7 +208,6 @@ function waitForDashboardReadyFile(
 function waitForDashboardPortAnnouncement(
   child,
   options: {
-    /** Returns a formatted stdout/stderr tail suffix for exit errors (#93608). */
     describeOutputTail?: () => string
     readyFile?: fs.PathOrFileDescriptor | null
     timeoutMs?: number
@@ -203,11 +223,28 @@ function waitForDashboardPortAnnouncement(
   return waitForDashboardPort(child, timeoutMs, describeOutputTail)
 }
 
+async function waitForBackendClaimAndPort<T>(
+  child,
+  claim: () => Promise<T>,
+  options: {
+    describeOutputTail?: () => string
+    readyFile?: fs.PathOrFileDescriptor | null
+    timeoutMs?: number
+  } = {}
+) {
+  const portPromise = waitForDashboardPortAnnouncement(child, options)
+  const claimPromise = claim()
+  const [, port] = await Promise.all([claimPromise, portPromise])
+
+  return { port }
+}
+
 export {
   DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS,
   MIN_PORT_ANNOUNCE_TIMEOUT_MS,
   readDashboardReadyFile,
   resolvePortAnnounceTimeoutMs,
+  waitForBackendClaimAndPort,
   waitForDashboardPort,
   waitForDashboardPortAnnouncement,
   waitForDashboardReadyFile
