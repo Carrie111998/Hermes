@@ -56,6 +56,8 @@ import sys
 import time
 from pathlib import Path
 
+import psutil
+
 _POLL_S = float(os.environ.get("BROWSER_OWNER_WATCHDOG_POLL_S", "2"))
 _MAX_S = float(os.environ.get("BROWSER_OWNER_WATCHDOG_MAX_S", str(24 * 3600)))
 _DRY_RUN = os.environ.get("BROWSER_OWNER_WATCHDOG_DRY_RUN") == "1"
@@ -69,23 +71,20 @@ def _cmdline(pid: int) -> list[str]:
     split on whitespace too — matching NUL-separated tokens alone silently
     misses every Chromium process (t_9b49cd19 verified this)."""
     try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
+        raw = psutil.Process(pid).cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
         return []
     tokens: list[str] = []
-    for chunk in raw.decode("utf-8", "replace").split("\0"):
+    for chunk in raw:
         tokens.extend(t for t in chunk.split() if t)
     return tokens
 
 
 def _ppid_of(pid: int) -> int:
     try:
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("PPid:"):
-                return int(line.split()[1])
-    except (OSError, ValueError):
-        pass
-    return -1
+        return psutil.Process(pid).ppid()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+        return -1
 
 
 def _is_systemd_user(pid: int) -> bool:
@@ -103,13 +102,12 @@ def _alive(pid: int) -> bool:
     the goal is that nothing *consumes resources*, which a zombie does not.
     """
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        # comm may contain spaces/parens; state is the first field after the
-        # final ')' of comm.
-        state = stat[stat.rfind(")") + 2:].split()[0]
-        return state != "Z"
-    except (OSError, IndexError, ValueError):
-        # /proc/pid gone (or unreadable) -> not alive.
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+    except (psutil.AccessDenied, OSError):
+        # Cannot inspect it -> treat as not alive (fail-safe: we do not reap
+        # what we cannot identify).
         return False
 
 
@@ -125,59 +123,36 @@ def _owner_is_gone(original_ppid: int) -> bool:
 
 
 def _tree_kill(pid: int) -> None:
-    """SIGTERM then SIGKILL the process and, best-effort, its descendants.
+    """SIGTERM then SIGKILL the process and its descendants, children first.
 
-    We cannot use a process group here — the agent-browser daemon detached via
-    setsid/double-fork, so it is not in our group. Walk /proc for descendants
-    and kill leaf-first so children are signalled even if a parent exits fast.
+    A process group is not usable here — the agent-browser daemon detached via
+    setsid/double-fork, so it is not in our group. psutil walks the descendant
+    tree for us (and is already a hard dependency of this repo, used the same
+    way in tools/browser_tool.py).
     """
     try:
-        children = sorted(
-            (int(e.name) for e in Path("/proc").iterdir() if e.name.isdigit()),
-            key=lambda p: -_proc_depth(p),
-        )
-    except OSError:
-        children = []
-    # Send SIGTERM to the target and every live descendant.
-    targets = [pid] + [c for c in children if _is_descendant(c, pid)]
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        for t in targets:
-            if _alive(t):
-                try:
-                    os.kill(t, sig)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-        time.sleep(0.5)
-        if not any(_alive(t) for t in targets):
-            break
+        root = psutil.Process(pid)
+        targets = root.children(recursive=True) + [root]
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return
+    for stage in ("terminate", "kill"):
+        for proc in targets:
+            try:
+                getattr(proc, stage)()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                pass
+        _gone, alive = psutil.wait_procs(targets, timeout=0.5)
+        if not alive:
+            return
+        targets = alive
 
 
-def _proc_depth(pid: int) -> int:
-    depth = 0
-    seen = 0
-    cur = pid
-    while cur > 1 and seen < 64:
-        nxt = _ppid_of(cur)
-        if nxt == cur or nxt <= 0:
-            break
-        cur = nxt
-        depth += 1
-        seen += 1
-    return depth
-
-
-def _is_descendant(pid: int, ancestor: int) -> bool:
-    cur = _ppid_of(pid)
-    seen = 0
-    while cur > 1 and seen < 64:
-        if cur == ancestor:
-            return True
-        nxt = _ppid_of(cur)
-        if nxt == cur or nxt <= 0:
-            break
-        cur = nxt
-        seen += 1
-    return False
+def _proc_pids() -> list[int]:
+    """Every live PID, via psutil (cross-platform; no /proc dependency)."""
+    try:
+        return psutil.pids()
+    except (psutil.Error, OSError):
+        return []
 
 
 def _socket_dirs() -> list[str]:
@@ -222,7 +197,7 @@ def _reap_owner_browsers() -> None:
          that hermes PID is dead (or missing and untrackable), tree-kill the
          daemon (which carries its Chromium children in production) and remove
          the socket dir.
-      2. Chromium roots: any Chromium root in /proc carrying
+      2. Chromium roots: any Chromium root carrying
          ``--user-data-dir=/tmp/agent-browser-chrome-*`` that is orphaned
          (PPid 1 / systemd --user — i.e. its launching agent is gone) is
          tree-killed and its profile dir removed. Mirrors t_9b49cd19's proven
@@ -248,18 +223,14 @@ def _reap_owner_browsers() -> None:
     # profile dir is not held by a live owner. We compute the set of profile
     # dirs still referenced by any live process before killing anything.
     live_profile_dirs: set[str] = set()
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        for arg in _cmdline(int(entry.name)):
+    for _pid in _proc_pids():
+        for arg in _cmdline(_pid):
             if arg.startswith(UDD_PREFIX):
                 live_profile_dirs.add(arg.split("=", 1)[1])
 
     orphan_chromium: list[tuple[int, str]] = []  # (pid, profile_dir)
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
+    for _pid in _proc_pids():
+        pid = _pid
         argv = _cmdline(pid)
         udd = next((a for a in argv if a.startswith(UDD_PREFIX)), None)
         if not udd:
@@ -292,8 +263,9 @@ def _reap_owner_browsers() -> None:
         # and every PID named in a /tmp file was tree-killed unconditionally.
         # Do not re-add a socket_dir term here; it carries no information.
         #
-        # Fail-safe: _cmdline() returns [] when /proc/<pid> is unreadable or
-        # gone, so argv == "" and the guard trips (we skip the kill).
+        # Fail-safe: _cmdline() returns [] when the process is gone or
+        # unreadable (psutil raises NoSuchProcess/AccessDenied), so argv == ""
+        # and the guard trips (we skip the kill).
         if "agent-browser" not in argv:
             stale_dirs.append(socket_dir)
             continue
@@ -331,10 +303,8 @@ def _cleanup_orphan_profile_dirs() -> None:
     (non-zombie) process. The keep-set is every profile dir still named in a
     live process cmdline; anything else is stale and safe to remove."""
     live_dirs: set[str] = set()
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
+    for _pid in _proc_pids():
+        pid = _pid
         if not _alive(pid):
             continue
         for arg in _cmdline(pid):
