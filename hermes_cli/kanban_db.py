@@ -4478,6 +4478,23 @@ def release_stale_claims(
     API traffic. ``enforce_max_runtime`` and ``detect_crashed_workers``
     remain the upper bounds for genuinely wedged or dead workers.
 
+    Inline ownership guard: only tasks with a dispatcher-spawned worker
+    (``worker_pid`` set, i.e. status='running' with a real subprocess)
+    are reclaim candidates in the TTL and heartbeat-staleness passes. A
+    ``running`` task whose ``worker_pid`` is NULL is held by an INLINE
+    owner — a CLI ``kanban claim`` or a gateway/admin session, not the
+    dispatcher. Auto-reclaim must never release such a claim: doing so
+    requeues the card to ``ready`` and the dispatcher spawns a duplicate
+    worker beside the inline owner, producing the nudge-loop / double-
+    owner / protocol-violation crash cascade (see the hardening task on
+    inline-owner vs dispatched-worker ownership). A legitimate inline
+    claim always carries both ``claim_lock`` and ``claim_expires``, so it
+    is also structurally excluded from orphan reconciliation (which only
+    touches cards missing either field). The inline owner manages its own
+    lifecycle via ``heartbeat_claim`` and ``complete_task`` /
+    ``block_task``; a genuinely dead inline session is recovered by
+    operator ``reclaim_task``, never by auto-reclaim.
+
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
@@ -4488,7 +4505,8 @@ def release_stale_claims(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "  AND claim_expires < ? "
+        "  AND worker_pid IS NOT NULL",
         (now,),
     ).fetchall()
     for row in stale:
@@ -7349,7 +7367,7 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
     ).fetchall()
 
     for row in rows:
