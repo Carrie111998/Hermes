@@ -46,6 +46,31 @@ class TestParseServiceTierConfig(unittest.TestCase):
 
         self.assertEqual(cli.service_tier, "priority")
 
+    def test_absent_or_invalid_invocation_override_preserves_profile_default(self):
+        cli_mod = _import_cli()
+        config = copy.deepcopy(cli_mod.CLI_CONFIG)
+        config["agent"]["service_tier"] = "fast"
+
+        with patch.object(cli_mod, "CLI_CONFIG", config):
+            inherited = cli_mod.HermesCLI(compact=True)
+            invalid = cli_mod.HermesCLI(service_tier="priority", compact=True)
+
+        self.assertEqual(inherited.service_tier, "priority")
+        self.assertEqual(invalid.service_tier, "priority")
+        self.assertEqual(config["agent"]["service_tier"], "fast")
+
+    def test_invocation_tier_does_not_change_reasoning_effort(self):
+        cli_mod = _import_cli()
+        config = copy.deepcopy(cli_mod.CLI_CONFIG)
+
+        with patch.object(cli_mod, "CLI_CONFIG", config):
+            baseline = cli_mod.HermesCLI(reasoning="low", compact=True)
+            overridden = cli_mod.HermesCLI(
+                reasoning="low", service_tier="normal", compact=True
+            )
+
+        self.assertEqual(overridden.reasoning_config, baseline.reasoning_config)
+
 
 class TestHandleFastCommand(unittest.TestCase):
     def _make_cli(self, service_tier=None):
@@ -138,6 +163,17 @@ class TestPriorityProcessingModels(unittest.TestCase):
             assert not model_supports_fast_mode(model), f"{model} is codex — should not expose /fast"
 
 
+
+    def test_grok_46_supports_priority_processing(self):
+        from hermes_cli.models import (
+            model_supports_fast_mode,
+            resolve_fast_mode_overrides,
+        )
+
+        assert model_supports_fast_mode("grok-4.6") is True
+        assert model_supports_fast_mode("x-ai/grok-4.6-latest") is True
+        assert model_supports_fast_mode("grok-4.5") is False
+        assert resolve_fast_mode_overrides("grok-4.6") == {"service_tier": "priority"}
 
     def test_resolve_overrides_returns_service_tier(self):
         from hermes_cli.models import resolve_fast_mode_overrides
