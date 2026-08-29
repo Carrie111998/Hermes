@@ -612,6 +612,40 @@ describe('GatewayClient websocket attach mode', () => {
     }
   })
 
+  it('keeps delivering gateway events after a subscribed websocket reconnect', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: string[] = []
+
+    try {
+      gw.on('event', event => events.push(event.type))
+      gw.on('exit', () => gw.start())
+      gw.start()
+
+      const first = FakeWebSocket.instances[0]!
+
+      first.open()
+      gw.drain()
+      await Promise.resolve()
+      first.close(1006)
+
+      const second = FakeWebSocket.instances[1]!
+
+      second.open()
+      second.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { type: 'gateway.ready', payload: {} }
+        })
+      )
+
+      expect(events).toContain('gateway.ready')
+    } finally {
+      gw.kill()
+    }
+  })
+
   it('does not auto-reconnect after an intentional kill() (issue #32997)', async () => {
     vi.useFakeTimers()
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'

@@ -340,7 +340,11 @@ export class GatewayClient extends EventEmitter {
     // attached to a discarded child / socket.
     this.rejectPending(new Error('gateway restarting'))
     this.ready = false
-    this.subscribed = false
+    // `subscribed` describes the long-lived UI consumer, not the transport.
+    // Preserve it across WebSocket replacement so the reconnect's
+    // gateway.ready/session events reach the already-mounted app. Clearing it
+    // here buffered every post-reconnect event forever because drain() only
+    // runs once when the consumer mounts.
     // Invalidate any pending deferred drain() flush from a prior transport so
     // its queued microtask becomes a no-op (it captured the old generation).
     this.drainGeneration += 1
