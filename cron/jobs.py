@@ -1921,6 +1921,7 @@ def _validate_job_mode_invariants(
     monitor_url: Optional[str],
     no_agent: bool,
     script: Optional[str],
+    monitor_retry_on_failure: bool = False,
 ) -> None:
     """Shared create/update validation for job execution-mode invariants.
 
@@ -1938,6 +1939,12 @@ def _validate_job_mode_invariants(
             "monitor_script/monitor_url cannot be combined with no_agent=True — "
             "the whole point of a monitor job is to suppress or wake the AGENT "
             "based on source changes. Use a plain no_agent script job instead."
+        )
+    if monitor_retry_on_failure and not (monitor_script or monitor_url):
+        raise ValueError(
+            "monitor_retry_on_failure requires a monitor source "
+            "(monitor_script or monitor_url) — it changes when the monitor "
+            "hash is committed, which is meaningless without a monitor."
         )
     if no_agent and not script:
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
@@ -1964,6 +1971,9 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    monitor_retry_on_failure: bool = False,
+    fallback_provider: Optional[str] = None,
+    fallback_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2031,6 +2041,20 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        monitor_retry_on_failure: Opt-in monitor commit-on-success semantics.
+                When True (requires a monitor source), a detected output
+                change is committed to ``monitor_state`` ONLY after the agent
+                run completes successfully; a failed run leaves the change
+                retryable on the next tick (at-least-once). When False/absent
+                (default, legacy), the change is committed at detection time
+                and a failed run consumes it (at-most-once).
+        fallback_provider: Optional per-job fallback provider pin. Must be
+                paired with ``fallback_model``. When set, this single-entry
+                chain REPLACES the global ``fallback_providers`` chain for
+                this job only; other jobs are unaffected. Absent = job
+                follows the global chain (pre-existing behavior).
+        fallback_model: Optional per-job fallback model pin, paired with
+                ``fallback_provider``.
 
     Returns:
         The created job dict
@@ -2068,6 +2092,18 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_monitor_retry = bool(monitor_retry_on_failure)
+    normalized_fallback_provider = _normalize_job_optional_text(fallback_provider)
+    normalized_fallback_model = _normalize_job_optional_text(fallback_model)
+
+    # The per-job fallback pin is a PAIR: one axis without the other would
+    # mix a pinned provider with an unrelated model (or vice versa) —
+    # exactly the provider/model non-atomicity the primary pin forbids.
+    if bool(normalized_fallback_provider) != bool(normalized_fallback_model):
+        raise ValueError(
+            "fallback_provider and fallback_model must be set together "
+            "(or both cleared) — the per-job fallback pin is an atomic pair."
+        )
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2080,6 +2116,7 @@ def create_job(
         normalized_monitor_url,
         normalized_no_agent,
         normalized_script,
+        normalized_monitor_retry,
     )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -2180,6 +2217,16 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Same conditional-persist rule for the monitor commit-on-success
+    # opt-in: absent key = legacy commit-at-detection semantics, and
+    # existing jobs stay byte-identical (no migration).
+    if normalized_monitor_retry:
+        job["monitor_retry_on_failure"] = True
+    # Same conditional-persist rule for the per-job fallback pin pair:
+    # absent keys = job follows the global fallback_providers chain.
+    if normalized_fallback_provider and normalized_fallback_model:
+        job["fallback_provider"] = normalized_fallback_provider
+        job["fallback_model"] = normalized_fallback_model
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2295,8 +2342,51 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["reasoning_effort"]
                 )
 
+            # Normalize the monitor commit-on-success opt-in: truthy stores
+            # True; falsy CLEARS the key (post-merge pop below) so the
+            # record returns to the legacy absent-key shape (byte-identical
+            # to pre-feature jobs).
+            _monitor_retry_touched = "monitor_retry_on_failure" in updates
+            if _monitor_retry_touched:
+                updates["monitor_retry_on_failure"] = bool(
+                    updates["monitor_retry_on_failure"]
+                )
+
+            # Normalize the per-job fallback pin pair the same way
+            # create_job does (empty string clears the axis; the None-valued
+            # key is popped post-merge below so a cleared pin vanishes from
+            # the record entirely).
+            _fallback_axes_touched = bool(
+                {"fallback_provider", "fallback_model"}.intersection(updates)
+            )
+            for _fb_field in ("fallback_provider", "fallback_model"):
+                if _fb_field in updates:
+                    updates[_fb_field] = _normalize_job_optional_text(
+                        updates[_fb_field]
+                    )
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+
+            if _monitor_retry_touched and not updated.get(
+                "monitor_retry_on_failure"
+            ):
+                updated.pop("monitor_retry_on_failure", None)
+            if _fallback_axes_touched:
+                for _fb_field in ("fallback_provider", "fallback_model"):
+                    if updated.get(_fb_field) is None:
+                        updated.pop(_fb_field, None)
+                # The fallback pin is an atomic pair (same rule as
+                # create_job): one axis without the other would mix a
+                # pinned provider with an unrelated model.
+                if bool(updated.get("fallback_provider")) != bool(
+                    updated.get("fallback_model")
+                ):
+                    raise ValueError(
+                        "fallback_provider and fallback_model must be set "
+                        "together (or both cleared) — the per-job fallback "
+                        "pin is an atomic pair."
+                    )
 
             if (
                 is_terminal_job(job)
@@ -2319,7 +2409,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # monitor: the scheduler's no_agent short-circuit runs before
             # the monitor gate). Scoped to changed fields so legacy records
             # untouched by this update keep loading.
-            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+            if {
+                "monitor_script",
+                "monitor_url",
+                "no_agent",
+                "script",
+                "monitor_retry_on_failure",
+            }.intersection(updates):
                 _upd_script = updated.get("script")
                 _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
                 _validate_job_mode_invariants(
@@ -2327,6 +2423,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updated.get("monitor_url") or None,
                     bool(updated.get("no_agent")),
                     _upd_script or None,
+                    bool(updated.get("monitor_retry_on_failure")),
                 )
 
             if any(k in updates for k in _PAYLOAD_FIELDS):

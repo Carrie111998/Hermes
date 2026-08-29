@@ -422,6 +422,13 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
             "baseline. The source must emit STABLE output (no timestamps, no "
             "random ordering) or every tick will look changed."
         )
+    if job.get("monitor_retry_on_failure"):
+        notes.append(
+            "monitor_retry_on_failure is ON: a detected change commits only "
+            "after the agent run SUCCEEDS — a failed run re-fires the same "
+            "change next tick (at-least-once; the agent may act on the same "
+            "change more than once)."
+        )
     if job.get("no_agent"):
         notes.append(
             "no_agent mode: stdout is delivered verbatim; EMPTY stdout sends "
@@ -787,6 +794,11 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_url"] = job["monitor_url"]
     if job.get("monitor_state"):
         result["monitor_state"] = job["monitor_state"]
+    if job.get("monitor_retry_on_failure"):
+        result["monitor_retry_on_failure"] = True
+    if job.get("fallback_provider"):
+        result["fallback_provider"] = job["fallback_provider"]
+        result["fallback_model"] = job.get("fallback_model")
     if job.get("no_agent"):
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
@@ -1371,6 +1383,9 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    monitor_retry_on_failure: Optional[bool] = None,
+    fallback_provider: Optional[str] = None,
+    fallback_model: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1487,6 +1502,14 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    monitor_retry_on_failure=bool(monitor_retry_on_failure),
+                    # fallback_provider/fallback_model reach here from the
+                    # CLI (`hermes cron create/edit --fallback-provider
+                    # --fallback-model`) ONLY — like model/provider they are
+                    # user-owned spend-routing pins and are deliberately not
+                    # read from model arguments in _cronjob_handler.
+                    fallback_provider=_normalize_optional_job_value(fallback_provider),
+                    fallback_model=_normalize_optional_job_value(fallback_model),
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1750,6 +1773,31 @@ def cronjob(
                         "clear one before setting the other.",
                         success=False,
                     )
+            if monitor_retry_on_failure is not None:
+                # Enabling requires a monitor source on the MERGED record —
+                # same invariant create_job enforces, through the update door.
+                if monitor_retry_on_failure:
+                    eff_mon_script = (
+                        updates["monitor_script"] if "monitor_script" in updates else job.get("monitor_script")
+                    )
+                    eff_mon_url = (
+                        updates["monitor_url"] if "monitor_url" in updates else job.get("monitor_url")
+                    )
+                    if not (eff_mon_script or eff_mon_url):
+                        return tool_error(
+                            "monitor_retry_on_failure requires a monitor source "
+                            "(set monitor first, or in the same update).",
+                            success=False,
+                        )
+                updates["monitor_retry_on_failure"] = bool(monitor_retry_on_failure)
+            if fallback_provider is not None:
+                updates["fallback_provider"] = (
+                    _normalize_optional_job_value(fallback_provider) if fallback_provider else None
+                )
+            if fallback_model is not None:
+                updates["fallback_model"] = (
+                    _normalize_optional_job_value(fallback_model) if fallback_model else None
+                )
             if context_from is not None or continuity is not None:
                 # Empty string / empty list clears the field; otherwise validate
                 # each referenced job exists before storing. Normalized to a list
@@ -1885,6 +1933,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "default": False,
                 "description": "True = no LLM: the scheduler runs `script` (required) on schedule and delivers its stdout verbatim; empty stdout sends nothing (watchdog pattern). Use for script-only pings with fixed output; keep False for anything needing reasoning."
             },
+            "monitor_retry_on_failure": {
+                "type": "boolean",
+                "description": "Only meaningful with `monitor`. True = a detected output change commits its hash ONLY after the agent run succeeds, so a failed run (provider error, timeout) retries the SAME change next tick (at-least-once — the agent may act on one change more than once). Default false = legacy: the change commits at detection time and a failed run consumes it (at-most-once)."
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1975,6 +2027,10 @@ def _cronjob_handler(args, **kw):
         attach_to_session=args.get("attach_to_session"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
+        # monitor_retry_on_failure is a behavior flag (not spend routing),
+        # so the model MAY set it — unlike fallback_provider/fallback_model,
+        # which stay user-owned like model/provider above.
+        monitor_retry_on_failure=args.get("monitor_retry_on_failure"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )
