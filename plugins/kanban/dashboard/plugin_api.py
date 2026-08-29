@@ -149,7 +149,8 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked",
+    "completed_pending_review", "review", "done",
 ]
 
 
@@ -261,6 +262,15 @@ def _compute_task_diagnostics(
     from hermes_cli.config import load_config
 
     diag_config = kd.config_from_runtime_config(load_config())
+
+    # Add graph-aware review-lane warnings. The diagnostic engine stays DB-
+    # agnostic; this dashboard layer supplies the live parent/source context.
+    try:
+        diag_config["review_lane_parent_warnings"] = (
+            kanban_db.review_lane_dependency_warnings(conn, task_ids)
+        )
+    except Exception:
+        diag_config["review_lane_parent_warnings"] = {}
 
     # Build the candidate task list. We need each task's row + its
     # events + its runs. Doing N separate queries works but scales
@@ -1199,21 +1209,30 @@ def _set_status_direct(
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
             terminations.append((prev["worker_pid"], prev["claim_lock"]))
+        event_payload = {
+            "status": effective_status,
+            "requested_status": new_status,
+        }
+        blocked_to_ready_direct = prev["status"] == "blocked" and new_status == "ready"
+        if blocked_to_ready_direct:
+            event_payload = {
+                "status": new_status,
+                "requested_status": new_status,
+                "reason": "dashboard_direct",
+                "prev_status": prev["status"],
+            }
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
-            (
-                task_id,
-                run_id,
-                json.dumps(
-                    {
-                        "status": effective_status,
-                        "requested_status": new_status,
-                    }
-                ),
-                int(time.time()),
-            ),
+            (task_id, run_id, json.dumps(event_payload), int(time.time())),
         )
+        if blocked_to_ready_direct:
+            kanban_db._append_event(
+                conn,
+                task_id,
+                "unblocked",
+                {"reason": "dashboard_direct", "prev_status": prev["status"]},
+            )
         if reopening_satisfied_parent:
             _invalidate_descendants_for_parent_reopen(
                 conn,

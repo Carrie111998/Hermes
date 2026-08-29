@@ -38,6 +38,7 @@ _STATUS_ICONS = {
     "running":  "●",
     "scheduled":"⏱",
     "blocked":  "⊘",
+    "completed_pending_review": "◉",
     "done":     "✓",
     "archived": "—",
 }
@@ -1806,8 +1807,20 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # Pre-compute diagnostics while conn is still open.
+        # Must happen inside the with-block because review_lane_dependency_warnings
+        # and task_graph_context call get_task and other conn-dependent helpers.
+        from hermes_cli import kanban_diagnostics as kd
+        _diag_config = {
+            "review_lane_parent_warnings": kb.review_lane_dependency_warnings(
+                conn, [task.id],
+            )
+        }
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
+        _diags = kd.compute_task_diagnostics(
+            task, events, runs, config=_diag_config, graph=graph,
+        )
 
     if getattr(args, "json", False):
         payload = {
@@ -1883,9 +1896,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics section — surface active distress signals at the top
     # of show output so CLI users see them before scrolling through
-    # comments / runs.
-    from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    # comments / runs. Pre-computed inside the connect_closing() block above.
+    diags = _diags
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -2042,6 +2054,11 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     diag_config = kd.config_from_runtime_config(load_config())
 
     with kb.connect_closing() as conn:
+        diag_config = dict(diag_config)
+        seed_ids = [args.task] if getattr(args, "task", None) else None
+        diag_config["review_lane_parent_warnings"] = (
+            kb.review_lane_dependency_warnings(conn, seed_ids)
+        )
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -2329,6 +2346,9 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     verdict = "done"
     reason = ""
     try:
+        # judge_goal returns (verdict, reason, parse_failed,
+        # wait_directive, transport_failed) — unpacking fewer raises
+        # ValueError into the handler below.
         verdict, reason, _, _, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
@@ -2337,9 +2357,15 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
         import logging as _logging
 
         _logging.getLogger(__name__).warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
+            "goal judge check failed, treating as unreachable: %s",
             judge_exc,
             exc_info=True,
+        )
+        # Transport/API failure is infrastructure, not a work-quality
+        # signal. Do not silently complete: require operator evidence.
+        return (
+            f"goal judge unreachable (transport/API error): "
+            f"{type(judge_exc).__name__}; operator evidence required"
         )
     return reason if verdict != "done" else None
 
@@ -2400,7 +2426,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                # Surface the ACTUAL status instead of the factually false
+                # "unknown id or terminal state" string. A card in `triage`
+                # (parked by the block-loop breaker) is neither unknown nor
+                # terminal; report its real status so the operator can decide.
+                cur_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                real_status = cur_row["status"] if cur_row else "gone"
+                print(
+                    f"cannot complete {tid}: current status is '{real_status}'; "
+                    f"complete accepts running|ready|blocked|triage",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2509,7 +2547,18 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                # Report the ACTUAL status instead of guessing — a card in
+                # `triage` (loop-breaker parking) is not `blocked`/`scheduled`
+                # and the operator needs to know why the verb refused.
+                cur_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                real_status = cur_row["status"] if cur_row else "gone"
+                print(
+                    f"cannot unblock {tid}: current status is '{real_status}'; "
+                    f"unblock accepts blocked|scheduled",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
@@ -2643,9 +2692,18 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 force=bool(args.force),
                 dry_run=bool(args.dry_run),
             )
+            # Surface the ACTUAL target status: a triage-parked card is
+            # routed back to `todo` (the intake lane), not `ready`.
+            target = "todo"
+            if ok:
+                cur_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                target = cur_row["status"] if cur_row else "ready"
             results.append({
                 "task_id": tid,
                 "promoted": ok,
+                "target": target,
                 "dry_run": bool(args.dry_run),
                 "forced": bool(args.force),
                 "reason": reason,
@@ -2664,7 +2722,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     for r in results:
         if r["promoted"]:
             suffix = f": {reason}" if reason else ""
-            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+            print(f"{label} {r['task_id']} -> {r['target']}{tag}{suffix}")
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
@@ -2775,6 +2833,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
+            "missing_exit_signal": res.missing_exit_signal,
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -2802,6 +2861,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Missing exit signal: {len(res.missing_exit_signal)}")
+    if res.missing_exit_signal:
+        print(f"  {', '.join(res.missing_exit_signal)}")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
@@ -3024,7 +3086,10 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in (
+        "triage", "todo", "scheduled", "ready", "running", "blocked",
+        "completed_pending_review", "done",
+    ):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
@@ -3034,6 +3099,12 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    print(
+        "Missing-exit-signal 24h: "
+        f"{stats.get('missing_exit_signal_24h', 0)}/"
+        f"{stats.get('ended_runs_24h', 0)} "
+        f"({stats.get('missing_exit_signal_rate_24h', 0.0):.2%})"
+    )
     return 0
 
 

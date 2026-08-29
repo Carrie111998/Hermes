@@ -1502,6 +1502,32 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
+# Lost-update defense (t_b793ddfc): merge-on-write + removal journal.
+_REMOVALS_JOURNAL_NAME = "removals.jsonl"
+_REMOVAL_MASS_DROP_THRESHOLD = 1
+_PID = os.getpid()
+
+# Fail-closed mark_job_run (t_95fbd07c C2): a completed execution whose
+# jobs.json write is dropped (job removed/zombie between run and mark, or a
+# stale-snapshot clobber) must be probe-visible, never a silent skip. Every
+# not-found mark_job_run appends here; the mechanism-liveness collector reads
+# this journal to surface a counter + last error.
+_MARK_JOB_RUN_SKIPS_JOURNAL_NAME = "mark_job_run_skips.jsonl"
+
+# Completion metadata fields that must NEVER regress on a shared job. When a
+# job exists in both the incoming list and the on-disk store, these fields come
+# from whichever side has the newer ``last_run_at``; everything else follows
+# the incoming (caller) intent. Prevents a stale snapshot writer (second CLI,
+# long-held load, checkout restore) from erasing a fresher completion's write.
+_COMPLETION_FIELDS = (
+    "last_run_at",
+    "last_status",
+    "last_error",
+    "last_delivery_error",
+    "next_run_at",
+)
+
+
 def _peek_jobs_unlocked() -> Optional[List[Dict[str, Any]]]:
     """Best-effort read of on-disk jobs without repair side-effects.
 
@@ -1561,6 +1587,164 @@ def _record_load_stamp(stamp: Optional[Tuple[int, int, int]]) -> None:
     if not getattr(_jobs_lock_state, "depth", 0):
         return
     _jobs_lock_state.load_stamp = stamp
+
+
+def _read_on_disk_job_list() -> List[Dict[str, Any]]:
+    """Best-effort re-read of the on-disk jobs list (defensive, never raises)."""
+    peeked = _peek_jobs_unlocked()
+    if peeked is None:
+        return []
+    return peeked
+
+
+def _journal_removed_job(job: Dict[str, Any]):
+    """Append one append-only line to <cron dir>/removals.jsonl. Never raises."""
+    try:
+        store = _current_cron_store()
+        journal_path = store.cron_dir / _REMOVALS_JOURNAL_NAME
+        ensure_dirs()
+        line = {
+            "ts": _hermes_now().isoformat(),
+            "id": job.get("id"),
+            "name": job.get("name") or job.get("id"),
+            "enabled": bool(job.get("enabled", True)),
+            "pid": _PID,
+            "HERMES_PROFILE": os.getenv("HERMES_PROFILE", ""),
+            "HERMES_KANBAN_TASK": os.getenv("HERMES_KANBAN_TASK", ""),
+        }
+        with open(journal_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _secure_file(journal_path)
+    except Exception as e:  # pragma: no cover - best-effort audit only
+        logger.error("Lost-update guard: failed to append removal journal (%s)", e)
+
+
+def _journal_mark_job_run_skip(job_id: str, success: bool, error: Optional[str]):
+    """Append one append-only line to <cron dir>/mark_job_run_skips.jsonl.
+
+    Fail-closed audit (t_95fbd07c C2): when ``mark_job_run`` cannot find the
+    job in the store it must not silently drop the completion's last_run_at
+    write. Every such skip is journaled here so the mechanism-liveness
+    collector can surface a probe-visible counter + last_error instead of the
+    drop being invisible (the cf46180e12ee / b14dae422186 class). Never
+    raises — the audit trail must never break the write path.
+    """
+    try:
+        store = _current_cron_store()
+        journal_path = store.cron_dir / _MARK_JOB_RUN_SKIPS_JOURNAL_NAME
+        ensure_dirs()
+        line = {
+            "ts": _hermes_now().isoformat(),
+            "job_id": job_id,
+            "success": bool(success),
+            "error": error,
+            "pid": _PID,
+            "HERMES_PROFILE": os.getenv("HERMES_PROFILE", ""),
+            "HERMES_KANBAN_TASK": os.getenv("HERMES_KANBAN_TASK", ""),
+        }
+        with open(journal_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _secure_file(journal_path)
+    except Exception as e:  # pragma: no cover - best-effort audit only
+        logger.error("mark_job_run skip journal: failed to append (%s)", e)
+
+
+def _merge_jobs_for_write(
+    incoming: List[Dict[str, Any]],
+    *,
+    loaded_ids: Optional[Collection[str]] = None,
+    removed_ids: Optional[Collection[str]] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Merge an incoming job list against the on-disk store, journaling drops.
+
+    Runs inside ``_jobs_lock()`` — the on-disk store is the freshest truth.
+    Returns ``(merged_list, dropped_enabled_count)``.
+    """
+    removed_ids = {str(i) for i in (removed_ids or ()) if i}
+    loaded_ids = {str(i) for i in (loaded_ids or ()) if i}
+
+    incoming_by_id: Dict[str, Dict[str, Any]] = {}
+    for job in incoming:
+        if isinstance(job, dict) and job.get("id"):
+            incoming_by_id[str(job["id"])] = job
+
+    implicit_drop_ids = loaded_ids - set(incoming_by_id) - removed_ids
+
+    # Same stamp fast-path as ``_merge_unexpected_disk_jobs``: a matching
+    # load stamp means disk has not changed since this section read it, so
+    # a healthy no-implicit-drop save must not re-parse jobs.json.
+    stamp = getattr(_jobs_lock_state, "load_stamp", None)
+    if (
+        stamp is not None
+        and _jobs_file_stamp(_current_cron_store().jobs_file) == stamp
+        and not implicit_drop_ids
+    ):
+        return list(incoming), 0
+
+    on_disk = _peek_jobs_unlocked()
+    if on_disk is None:
+        # Unreadable/corrupt baseline — do not guess a shrink-merge.
+        return list(incoming), 0
+
+    on_disk_by_id: Dict[str, Dict[str, Any]] = {}
+    for job in on_disk:
+        if isinstance(job, dict) and job.get("id"):
+            on_disk_by_id[str(job["id"])] = job
+
+    merged = dict(incoming_by_id)
+    dropped_enabled = 0
+
+    def _pick_completion_fields(oid: str, incoming_job: Dict[str, Any], on_disk_job: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG001 (oid kept for symmetry with loop variable typing)
+        """Merge completion metadata so it can never regress on a shared job.
+
+        The incoming (caller) dict carries the caller's intent for structural
+        fields (schedule, prompt, enabled, ...). But completion metadata
+        (last_run_at / last_status / last_error / last_delivery_error /
+        next_run_at) is monotonic in time: a stale snapshot must not erase a
+        fresher completion's write. Whichever side has the newer
+        ``last_run_at`` supplies those fields; everything else stays with the
+        incoming job. When only one side has a last_run_at, that side wins the
+        completion fields (a never-run snapshot must not blank a completion).
+        """
+        incoming_last = incoming_job.get("last_run_at")
+        disk_last = on_disk_job.get("last_run_at")
+
+        def _dt(value):
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+
+        inc_dt = _dt(incoming_last)
+        disk_dt = _dt(disk_last)
+        if disk_dt is not None and (inc_dt is None or disk_dt > inc_dt):
+            merged_job = dict(incoming_job)
+            for field in _COMPLETION_FIELDS:
+                if field in on_disk_job:
+                    merged_job[field] = on_disk_job[field]
+            return merged_job
+        return incoming_job
+
+    for oid, on_disk_job in on_disk_by_id.items():
+        if oid in incoming_by_id:
+            merged[oid] = _pick_completion_fields(oid, incoming_by_id[oid], on_disk_job)
+            continue
+        if oid in removed_ids:
+            continue
+        if oid not in loaded_ids:
+            merged[oid] = on_disk_job
+            continue
+        if bool(on_disk_job.get("enabled", True)):
+            dropped_enabled += 1
+        _journal_removed_job(on_disk_job)
+
+    return list(merged.values()), dropped_enabled
 
 
 def _merge_unexpected_disk_jobs(
@@ -1629,15 +1813,41 @@ def _merge_unexpected_disk_jobs(
 def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]],
     *,
+    loaded_ids: Optional[Collection[str]] = None,
     removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
-):
+) -> int:
     """Save all jobs to storage. Caller must hold _jobs_lock().
 
-    ``removed_ids`` lists job ids this mutation intentionally deleted.
-    ``replace=True`` skips the shrink-merge guard (tests / disaster recovery
-    that mean to rewrite the store wholesale).
+    ``loaded_ids`` is the set of ids the caller observed at load time
+    (lost-update defense). ``removed_ids`` lists job ids this mutation
+    intentionally deleted. ``replace=True`` skips the shrink-merge guard
+    (tests / disaster recovery that mean to rewrite the store wholesale).
+
+    Returns the number of ENABLED jobs silently dropped by this write.
     """
+    dropped_enabled = 0
+    implicit_drops: Set[str] = set()
+    if not replace:
+        incoming_ids = {
+            str(j["id"]) for j in jobs if isinstance(j, dict) and j.get("id")
+        }
+        loaded_ids_set = {str(i) for i in (loaded_ids or ()) if i}
+        removed_ids_set = {str(i) for i in (removed_ids or ()) if i}
+        implicit_drops = loaded_ids_set - incoming_ids - removed_ids_set
+        jobs, dropped_enabled = _merge_jobs_for_write(
+            jobs, loaded_ids=loaded_ids, removed_ids=removed_ids
+        )
+        if dropped_enabled > _REMOVAL_MASS_DROP_THRESHOLD:
+            logger.error(
+                "Lost-update guard: write would drop %d enabled job(s) with no explicit "
+                "removal request (threshold=%d). Writing anyway and journaling each so "
+                "the mass drop is attributable — investigate a stale long-held snapshot "
+                "(#t_035603f3).",
+                dropped_enabled,
+                _REMOVAL_MASS_DROP_THRESHOLD,
+            )
+    effective_removed = {str(i) for i in (removed_ids or ()) if i} | implicit_drops
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
@@ -1664,7 +1874,7 @@ def _save_jobs_unlocked(
     try:
         for _attempt in range(5):
             if not replace:
-                jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+                jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=effective_removed)
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
             )
@@ -1702,7 +1912,7 @@ def _save_jobs_unlocked(
                         for j in jobs
                         if isinstance(j, dict) and j.get("id")
                     }
-                    intended = {str(i) for i in (removed_ids or ()) if i}
+                    intended = {str(i) for i in (effective_removed or ()) if i}
                     if any(
                         isinstance(dj, dict)
                         and dj.get("id")
@@ -1730,11 +1940,11 @@ def _save_jobs_unlocked(
             # a degraded sibling landing between replace and stat. Later
             # saves in this section simply take the full merge (fail-safe).
             _record_load_stamp(None)
-            return
+            return dropped_enabled
 
         # Exhausted retries — last merge + write without another re-peek.
         if not replace:
-            jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+            jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=effective_removed)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
         )
@@ -1758,21 +1968,31 @@ def _save_jobs_unlocked(
             except OSError:
                 pass
         raise
+    return dropped_enabled
 
 
 def save_jobs(
     jobs: List[Dict[str, Any]],
     *,
+    loaded_ids: Optional[Collection[str]] = None,
     removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
-):
-    """Save all jobs to storage.
+) -> int:
+    """Save all jobs to storage with lost-update and shrink-merge protection.
 
-    See ``_save_jobs_unlocked`` for ``removed_ids`` / ``replace`` semantics
-    (shrink-merge guard against concurrent-create clobber, #80624).
+    ``loaded_ids`` is the set of ids the caller observed at load time.
+    ``removed_ids`` lists job ids this mutation intentionally deleted.
+    ``replace=True`` skips the shrink-merge guard (tests / disaster recovery).
+
+    Returns the number of ENABLED jobs silently dropped by this write.
     """
     with _jobs_lock():
-        _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
+        return _save_jobs_unlocked(
+            jobs,
+            loaded_ids=loaded_ids,
+            removed_ids=removed_ids,
+            replace=replace,
+        )
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -2610,13 +2830,14 @@ def remove_job(job_id: str) -> bool:
     with _jobs_lock():
         jobs = load_jobs()
         original_len = len(jobs)
+        loaded_ids = {j["id"] for j in jobs}
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
             # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
             # left over from before the create-time guard) fails closed without
             # half-applying the removal.
             job_output_dir = _job_output_dir(canonical_id)
-            save_jobs(jobs, removed_ids={canonical_id})
+            save_jobs(jobs, loaded_ids=loaded_ids, removed_ids={canonical_id})
             # Clean up output directory to prevent orphaned dirs accumulating
             if job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
@@ -2896,7 +3117,7 @@ def _mark_job_run_locked(
                 return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
-        return False
+        _journal_mark_job_run_skip(job_id, success, error)
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
@@ -3029,7 +3250,11 @@ def claim_dispatch(job_id: str) -> bool:
                 # it stops appearing as due, and leave an operator-visible
                 # diagnostic instead of vanishing silently.
                 jobs.pop(i)
-                save_jobs(jobs, removed_ids={job_id})
+                save_jobs(
+                    jobs,
+                    loaded_ids={j["id"] for j in jobs} | {job["id"]},
+                    removed_ids={job_id},
+                )
                 _write_wedged_oneshot_diagnostic(job)
                 logger.info(
                     "Job '%s': dispatch limit reached (%d/%d) — removing",
@@ -3947,7 +4172,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             continue
 
     if needs_save:
-        save_jobs(raw_jobs, removed_ids=intentionally_removed or None)
+        save_jobs(
+            raw_jobs,
+            loaded_ids={rj["id"] for rj in raw_jobs} | intentionally_removed,
+            removed_ids=intentionally_removed or None,
+        )
 
     return due
 
