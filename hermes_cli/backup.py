@@ -1748,16 +1748,16 @@ def _create_quick_snapshot_locked(
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
     # with known high-churn safety snapshots (for example pre-update) can pass a
     # smaller keep value so large state.db copies do not accumulate indefinitely.
-    # #68805 review: skip pruning when a present DB failed to capture OR was
-    # skipped for size — either way the snapshot is incomplete and the older
-    # snapshot may contain the only recoverable database.
+    # #68805 review: when a present DB failed to capture OR was skipped for
+    # size, preserve the latest complete recovery source in addition to the
+    # normal retention window.  Still prune stale incomplete snapshots: they
+    # contain config/auth copies too, and repeated failures must stay bounded.
     incomplete = failed_dbs or oversized_skipped
-    if not incomplete:
-        _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
-    else:
+    retention = _QUICK_DEFAULT_KEEP if keep is None else keep
+    if incomplete:
         if oversized_skipped:
             print(
-                "  ⚠ Skipping snapshot prune: DB file(s) skipped for size: "
+                "  ⚠ Preserving latest complete snapshot: DB file(s) skipped for size: "
                 + ", ".join(oversized_skipped)
             )
             logger.warning(
@@ -1765,11 +1765,15 @@ def _create_quick_snapshot_locked(
                 ", ".join(oversized_skipped),
             )
         logger.warning(
-            "Skipping snapshot prune because %d DB(s) failed to capture "
-            "and/or %d were oversized — preserving older snapshots as "
-            "recovery source",
+            "Snapshot incomplete because %d DB(s) failed to capture and/or %d "
+            "were oversized — preserving latest complete recovery source",
             len(failed_dbs), len(oversized_skipped),
         )
+    _prune_quick_snapshots(
+        root,
+        keep=retention,
+        preserve_latest_complete=bool(incomplete),
+    )
 
     logger.info(
         "quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
@@ -2092,8 +2096,13 @@ def restore_cron_jobs_all_profiles(
     return restored
 
 
-def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
-    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
+def _prune_quick_snapshots(
+    root: Path,
+    keep: int = _QUICK_DEFAULT_KEEP,
+    *,
+    preserve_latest_complete: bool = False,
+) -> int:
+    """Remove old snapshots, optionally retaining one complete recovery source."""
     if not root.exists():
         return 0
 
@@ -2107,8 +2116,26 @@ def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
         reverse=True,
     )
 
+    retained = set(dirs[:keep])
+    if preserve_latest_complete:
+        for d in dirs:
+            try:
+                with open(d / "manifest.json", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(meta, dict)
+                and not meta.get("failed_dbs")
+                and not meta.get("oversized_skipped")
+            ):
+                retained.add(d)
+                break
+
     deleted = 0
-    for d in dirs[keep:]:
+    for d in dirs:
+        if d in retained:
+            continue
         try:
             shutil.rmtree(d)
             deleted += 1
