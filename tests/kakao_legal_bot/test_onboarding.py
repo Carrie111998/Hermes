@@ -61,8 +61,9 @@ async def test_entering_the_room_is_enough_to_get_greeted(wiring):
     assert sender.sent, "입장했는데 방이 비어 있으면 나가 버립니다"
     room_id, text = sender.sent[0]
     assert room_id == "room-new"
-    assert "모아" in text
+    assert "김변호사의 법률상담 채널" in text
     assert "접수번호" in text
+    assert "AI사무장" in text
     assert services.db.get_room("room-new")["intro_sent"] == 1
 
 
@@ -213,7 +214,9 @@ def test_a_broken_intro_file_still_greets(tmp_path, monkeypatch):
 
 def test_no_file_means_the_built_in_greeting(monkeypatch):
     monkeypatch.delenv("INTRO_PATH", raising=False)
-    monkeypatch.setenv("BOT_NAME", "모아")
-    monkeypatch.setenv("LAWYER_NAME", "김변호사")
+    monkeypatch.setenv("LAWYER_NAME", "김재철 변호사")
     text = Settings().intro_message(3)
-    assert "모아" in text and "접수번호 3" in text
+    assert "김재철 변호사의 법률상담 채널" in text
+    assert "접수번호 3" in text
+    assert "김재철 변호사님이 채팅으로 답변" in text
+    assert "비용이 청구될 수 있습니다" in text

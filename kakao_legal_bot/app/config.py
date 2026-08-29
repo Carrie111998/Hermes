@@ -14,13 +14,13 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-DEFAULT_INTRO = """안녕하세요, {bot_name}입니다 🙂
-{lawyer_name}님의 상담 채널에 연결되셨습니다. (접수번호 {consult_id})
+# {lawyer_name} 자리에는 LAWYER_NAME 이 들어갑니다 (예: "김재철 변호사").
+# 문구를 통째로 바꾸시려면 INTRO_PATH 로 파일을 지정하세요.
+DEFAULT_INTRO = """안녕하세요 🙂,
+{lawyer_name}의 법률상담 채널에 연결되셨습니다. (접수번호 {consult_id})
 
-이 대화방은 상담자님 전용이라 다른 분에게는 보이지 않습니다.
-상황을 편하게 적어주시면 관련 법령·판례를 찾아 정리해 드리고,
-문서가 필요하시면 초안을 만들어 {lawyer_name}님 검토 후 보내드립니다.
-(제 답변은 일반적인 법률 정보이고, 최종 판단은 {lawyer_name}님이 확인해 드립니다.)"""
+이 대화방은 상담자님 전용 채팅방이라 다른 분에게는 보이지 않습니다.
+혹시 법률적으로 궁금한 점이 있으시면 현재 고민이나 상황을 편하게 적어주세요. {lawyer_name}님이 채팅으로 답변을 드립니다. 먼저 AI사무장에게 사건의 개요 및 관련자료(증거)에 대해서 자세히 얘기해주시면, {lawyer_name}님을 호출함과 동시에 관련 법령·판례를 찾아 정리해 드립니다. 소송관련 문서작성을 요청하셔도 좋습니다. 다만 이 경우에는 {lawyer_name}님이 직접 최종적으로 작성하시게 되므로 비용이 청구될 수 있습니다."""
 
 
 def _env(name: str, default: str = "") -> str:

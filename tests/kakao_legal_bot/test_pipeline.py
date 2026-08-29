@@ -72,7 +72,7 @@ async def test_first_message_in_a_room_gets_the_intro(settings, db):
 
     await pipeline.handle(make_event("안녕하세요", direct=True))
 
-    assert "모아입니다" in sender.texts[0]
+    assert "법률상담 채널에 연결" in sender.texts[0]
     assert sender.texts[-1] == "답변"
     assert db.get_room("room-1")["intro_sent"] == 1
 
@@ -84,7 +84,7 @@ async def test_intro_is_sent_only_once(settings, db):
     await pipeline.handle(make_event("첫 질문", direct=True, log_id="a"))
     await pipeline.handle(make_event("둘째 질문", direct=True, log_id="b"))
 
-    assert sum("모아입니다" in text for text in sender.texts) == 1
+    assert sum("법률상담 채널에 연결" in text for text in sender.texts) == 1
 
 
 @pytest.mark.asyncio
@@ -276,7 +276,7 @@ async def test_the_opening_alert_goes_out_before_the_answer_exists(settings, db)
             break
 
     assert sender.lawyer_notes and "[1/3]" in sender.lawyer_notes[0]
-    assert sender.texts == [] or "모아입니다" in sender.texts[0]  # answer not sent yet
+    assert sender.texts == [] or "법률상담 채널에 연결" in sender.texts[0]  # answer not sent yet
     await task
 
 

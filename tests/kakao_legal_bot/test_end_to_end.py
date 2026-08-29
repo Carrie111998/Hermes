@@ -181,7 +181,7 @@ def test_full_round_trip_with_a_law_lookup(settings, db, tmp_path):
         to_lawyer = [r["data"] for r in fake_iris.replies if r["room"] == "lawyer-room"]
 
         joined = "\n".join(to_client)
-        assert "모아입니다" in joined  # first contact greeting
+        assert "법률상담 채널에 연결" in joined  # first contact greeting
         assert "동시이행" in joined
 
         # The lawyer learns who applied before the answer exists, and what
