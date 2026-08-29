@@ -511,6 +511,10 @@ class TestSecurityScanGate:
 
     @staticmethod
     def _ask_result():
+        # Coupled to INSTALL_POLICY on purpose: the agent-created row routes
+        # a "dangerous" verdict to "ask" → should_allow_install returns None
+        # (allowed is None), which is the branch these tests exercise. If the
+        # matrix is ever reordered, this fixture silently changes meaning.
         from tools.skills_guard import ScanResult, Finding
 
         finding = Finding(
