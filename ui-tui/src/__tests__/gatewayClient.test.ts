@@ -734,6 +734,89 @@ describe('GatewayClient websocket attach mode', () => {
     }
   })
 
+  it('releases sibling session events after focused session replay', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: Array<{ seq?: number; session_id?: string; type: string }> = []
+
+    try {
+      gw.on('event', event => events.push(event as { seq?: number; session_id?: string; type: string }))
+      gw.on('exit', () => gw.start())
+      gw.start()
+
+      const first = FakeWebSocket.instances[0]!
+
+      first.open()
+      gw.drain()
+      await Promise.resolve()
+      first.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { replay_epoch: 'epoch-1' }, type: 'gateway.ready' }
+        })
+      )
+
+      for (const sessionId of ['s1', 's2']) {
+        first.message(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'event',
+            params: { payload: {}, seq: 1, session_id: sessionId, type: 'message.start' }
+          })
+        )
+      }
+
+      first.close(1006)
+
+      const second = FakeWebSocket.instances[1]!
+
+      second.open()
+      second.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { replay_epoch: 'epoch-1' }, type: 'gateway.ready' }
+        })
+      )
+
+      const replay = gw.replaySessionEvents('s1')
+
+      await vi.waitFor(() => expect(second.sent.some(raw => JSON.parse(raw).method === 'session.events.since')).toBe(true))
+      const replayFrame = second.sent.map(raw => JSON.parse(raw)).find(frame => frame.method === 'session.events.since')!
+
+      second.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { text: 'sibling parked' }, seq: 2, session_id: 's2', type: 'message.delta' }
+        })
+      )
+      second.message(
+        JSON.stringify({
+          id: replayFrame.id,
+          jsonrpc: '2.0',
+          result: { count: 0, epoch: 'epoch-1', events: [], latest_seq: 1, truncated: false }
+        })
+      )
+
+      await expect(replay).resolves.toEqual({ reconcile: false, terminal: false })
+
+      second.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { text: 'sibling live' }, seq: 3, session_id: 's2', type: 'message.complete' }
+        })
+      )
+
+      expect(events.filter(event => event.session_id === 's2' && event.seq === 2)).toHaveLength(1)
+      expect(events.filter(event => event.session_id === 's2' && event.seq === 3)).toHaveLength(1)
+    } finally {
+      gw.kill()
+    }
+  })
+
   it('does not auto-reconnect after an intentional kill() (issue #32997)', async () => {
     vi.useFakeTimers()
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'

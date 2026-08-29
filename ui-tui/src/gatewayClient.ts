@@ -834,13 +834,24 @@ export class GatewayClient extends EventEmitter {
   }
 
   private flushReplayHold(sessionId: string) {
-    const parked = this.replayHold?.get(sessionId) ?? []
+    const replayHold = this.replayHold
 
-    this.replayHold?.delete(sessionId)
-
-    if (this.replayHold?.size === 0) {
-      this.replayHold = null
+    if (!replayHold) {
+      return
     }
+
+    const parked = replayHold.get(sessionId) ?? []
+
+    replayHold.delete(sessionId)
+
+    // Only the focused session is reattached and replayed. Release events for
+    // every other live session too, otherwise their hold has no replay owner
+    // and continues swallowing future events after recovery completes.
+    for (const siblingEvents of replayHold.values()) {
+      parked.push(...siblingEvents)
+    }
+
+    this.replayHold = null
 
     for (const ev of parked) {
       this.publishIfNewer(ev)
