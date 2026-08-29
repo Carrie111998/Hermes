@@ -1838,6 +1838,41 @@ def _resolve_explicit_runtime(
     return None
 
 
+def _resolve_acp_process_runtime(
+    *,
+    provider: str,
+    requested_provider: str,
+    model_cfg: Dict[str, Any],
+    target_model: Optional[str],
+) -> Dict[str, Any]:
+    """Resolve an external-process ACP provider without touching the credential pool."""
+    creds = resolve_external_process_provider_credentials(provider)
+    args = list(creds.get("args") or [])
+    if provider == "kiro-acp":
+        selected_model = str(
+            target_model or model_cfg.get("default") or "claude-opus-5"
+        ).strip()
+        if selected_model and "--model" not in args:
+            args.extend(["--model", selected_model])
+    command = str(creds.get("command") or "").strip()
+    if not command:
+        raise AuthError(
+            f"No usable command resolved for provider '{provider}'.",
+            provider=provider,
+            code="missing_acp_command",
+        )
+    return {
+        "provider": provider,
+        "api_mode": "chat_completions",
+        "base_url": creds.get("base_url", "").rstrip("/"),
+        "api_key": creds.get("api_key", "") or provider,
+        "command": command,
+        "args": args,
+        "source": creds.get("source", "process"),
+        "requested_provider": requested_provider,
+    }
+
+
 def resolve_runtime_provider(
     *,
     requested: Optional[str] = None,
@@ -2009,6 +2044,17 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     model_cfg = _get_model_config()
+
+    # External-process ACP backends have no API key. Resolve them BEFORE the
+    # credential pool so a missing pool entry cannot raise "No usable
+    # credentials" and leftover HTTP creds cannot shadow the subprocess.
+    if provider in {"copilot-acp", "kiro-acp"}:
+        return _resolve_acp_process_runtime(
+            provider=provider,
+            requested_provider=requested_provider,
+            model_cfg=model_cfg,
+            target_model=target_model,
+        )
 
     # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
     # "Ox Alpha"): served ANONYMOUSLY on the Zen relay ONLY. Any bearer the
@@ -2222,19 +2268,6 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "oauth"),
                 "requested_provider": requested_provider,
             }
-
-    if provider == "copilot-acp":
-        creds = resolve_external_process_provider_credentials(provider)
-        return {
-            "provider": "copilot-acp",
-            "api_mode": "chat_completions",
-            "base_url": creds.get("base_url", "").rstrip("/"),
-            "api_key": creds.get("api_key", ""),
-            "command": creds.get("command", ""),
-            "args": list(creds.get("args") or []),
-            "source": creds.get("source", "process"),
-            "requested_provider": requested_provider,
-        }
 
     # Anthropic (native Messages API)
     if provider == "anthropic":

@@ -1306,7 +1306,9 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            from agent.kiro_acp_client import should_use_acp_client
+
+            if should_use_acp_client(provider=agent.provider, base_url=base_url):
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url

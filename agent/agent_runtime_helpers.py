@@ -2724,13 +2724,23 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
-        from agent.copilot_acp_client import CopilotACPClient
+    from agent.kiro_acp_client import build_acp_client, should_use_acp_client
 
-        client = CopilotACPClient(**client_kwargs)
+    if should_use_acp_client(
+        provider=getattr(agent, "provider", ""),
+        base_url=client_kwargs.get("base_url"),
+    ):
+        acp_kwargs = dict(client_kwargs)
+        if not acp_kwargs.get("model"):
+            acp_kwargs["model"] = getattr(agent, "model", None)
+        client = build_acp_client(
+            provider=getattr(agent, "provider", ""),
+            **acp_kwargs,
+        )
         _ra().logger.info(
-            "Copilot ACP client created (%s, shared=%s) %s",
+            "ACP client created (%s, provider=%s, shared=%s) %s",
             reason,
+            getattr(agent, "provider", ""),
             shared,
             agent._client_log_context(),
         )

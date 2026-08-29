@@ -134,6 +134,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_KIRO_ACP_BASE_URL = "acp://kiro"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 DEFAULT_ACTUAL_BASE_URL = "https://api.actual.inc/v1"
 DEFAULT_ACTUAL_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
@@ -304,6 +305,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "kiro-acp": ProviderConfig(
+        id="kiro-acp",
+        name="Kiro ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_KIRO_ACP_BASE_URL,
+        base_url_env_var="KIRO_ACP_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -2237,6 +2245,7 @@ def resolve_provider(
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "kiro": "kiro-acp", "kiro-cli": "kiro-acp", "kiro-agent": "kiro-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "free": "opencode-free", "opencode_free": "opencode-free",
@@ -7275,13 +7284,25 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "kiro-acp":
+        command = (
+            os.getenv("HERMES_KIRO_ACP_COMMAND", "").strip()
+            or os.getenv("KIRO_CLI_PATH", "").strip()
+            or "kiro-cli"
+        )
+        raw_args = os.getenv("HERMES_KIRO_ACP_ARGS", "").strip()
+        # Default is `acp` only. Runtime appends `--model <slug>`.
+        # Do NOT default --trust-all-tools: Kiro permission prompts are
+        # answered by the kiro-only ACP permission handler.
+        args = shlex.split(raw_args) if raw_args else ["acp"]
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
@@ -7316,6 +7337,9 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
+    pconfig = PROVIDER_REGISTRY.get(target)
+    if pconfig and pconfig.auth_type == "external_process":
+        return get_external_process_provider_status(target)
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
@@ -7506,25 +7530,44 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "kiro-acp":
+        command = (
+            os.getenv("HERMES_KIRO_ACP_COMMAND", "").strip()
+            or os.getenv("KIRO_CLI_PATH", "").strip()
+            or "kiro-cli"
+        )
+        raw_args = os.getenv("HERMES_KIRO_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["acp"]
+        product_name = "Kiro CLI"
+        missing_code = "missing_kiro_cli"
+        missing_hint = (
+            "Install Kiro CLI and run `kiro-cli login`, or set "
+            "KIRO_CLI_PATH / HERMES_KIRO_ACP_COMMAND."
+        )
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        product_name = "GitHub Copilot CLI"
+        missing_code = "missing_copilot_cli"
+        missing_hint = (
+            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        )
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the {product_name} command '{command}'. {missing_hint}",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code=missing_code,
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

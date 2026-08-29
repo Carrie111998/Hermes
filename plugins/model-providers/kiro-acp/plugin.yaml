@@ -1,0 +1,5 @@
+name: kiro-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Kiro via ACP subprocess (kiro-cli acp)
+author: Nous Research

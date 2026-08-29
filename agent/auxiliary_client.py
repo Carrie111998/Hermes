@@ -706,6 +706,9 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "kiro": "kiro-acp",
+    "kiro-cli": "kiro-acp",
+    "kiro-agent": "kiro-acp",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -2613,6 +2616,12 @@ def _maybe_wrap_anthropic(
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if _safe_isinstance(client_obj, CopilotACPClient):
+            return client_obj
+    except ImportError:
+        pass
+    try:
+        from agent.kiro_acp_client import KiroACPClient
+        if _safe_isinstance(client_obj, KiroACPClient):
             return client_obj
     except ImportError:
         pass
@@ -6419,6 +6428,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             return sync_client, model
     except ImportError:
         pass
+    try:
+        from agent.kiro_acp_client import KiroACPClient
+        if isinstance(sync_client, KiroACPClient):
+            return sync_client, model
+    except ImportError:
+        pass
 
     async_kwargs = {
         "api_key": sync_client.api_key,
@@ -7198,30 +7213,36 @@ def resolve_provider_client(
             or _read_main_model_for_aux(),
             provider,
         )
-        if provider == "copilot-acp":
-            api_key = str(creds.get("api_key", "")).strip()
-            base_url = str(creds.get("base_url", "")).strip()
-            command = str(creds.get("command", "")).strip() or None
-            args = list(creds.get("args") or [])
+        api_key = str(creds.get("api_key", "")).strip()
+        base_url = str(creds.get("base_url", "")).strip()
+        command = str(creds.get("command", "")).strip() or None
+        args = list(creds.get("args") or [])
+        from agent.kiro_acp_client import build_acp_client, should_use_acp_client
+
+        if should_use_acp_client(provider=provider, base_url=base_url):
+            if provider == "kiro-acp" and final_model and "--model" not in args:
+                args.extend(["--model", final_model])
             if not final_model:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but no model "
-                    "was provided or configured"
+                    "resolve_provider_client: %s requested but no model "
+                    "was provided or configured",
+                    provider,
                 )
                 return None, None
             if not api_key or not base_url:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but external "
-                    "process credentials are incomplete"
+                    "resolve_provider_client: %s requested but external "
+                    "process credentials are incomplete",
+                    provider,
                 )
                 return None, None
-            from agent.copilot_acp_client import CopilotACPClient
-
-            client = CopilotACPClient(
+            client = build_acp_client(
+                provider=provider,
                 api_key=api_key,
                 base_url=base_url,
                 command=command,
                 args=args,
+                model=final_model,
             )
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode

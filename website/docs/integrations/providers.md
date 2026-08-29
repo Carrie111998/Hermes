@@ -231,6 +231,21 @@ hermes chat --provider copilot-acp --model copilot-acp
 # Requires the GitHub Copilot CLI in PATH and an existing `copilot login` session
 ```
 
+**`kiro-acp` — Kiro ACP agent backend**. Spawns the local Kiro CLI as a subprocess. Opt-in only — Hermes' shipped default stays `openai-codex`. Kiro still owns its own read/edit/exec tools; Hermes only forwards agent-level tools and answers Kiro permission prompts with `allow_once`.
+
+```bash
+hermes chat --provider kiro-acp --model claude-opus-5
+# Requires kiro-cli in PATH and an existing `kiro-cli login` session
+```
+
+Verified picker models (in order): `claude-opus-5`, `claude-sonnet-5`.
+
+| Environment variable | Description |
+|---------------------|-------------|
+| `KIRO_CLI_PATH` | Override the Kiro CLI binary path (default: `kiro-cli`) |
+| `HERMES_KIRO_ACP_COMMAND` | Alternate override for the Kiro CLI binary |
+| `HERMES_KIRO_ACP_ARGS` | Override ACP args (default: `acp`; runtime adds `--model <slug>`) |
+
 **Permanent config:**
 ```yaml
 model:
@@ -1601,7 +1616,7 @@ fallback_model:
 
 When activated, the fallback swaps the model and provider mid-session without losing your conversation. The chain is tried entry-by-entry; activation is one-shot per session.
 
-Supported providers: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `ai-gateway`, `azure-foundry`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `actual`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `tencent-tokenplan`, `nebius-token-factory`, `router`, `custom`.
+Supported providers: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `kiro-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `ai-gateway`, `azure-foundry`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `actual`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `tencent-tokenplan`, `nebius-token-factory`, `router`, `custom`.
 
 :::tip
 Fallback is configured exclusively through `config.yaml` — or interactively via `hermes fallback`. For full details on when it triggers, how the chain advances, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/user-guide/features/fallback-providers).
