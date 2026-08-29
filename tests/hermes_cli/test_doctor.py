@@ -226,6 +226,50 @@ class TestDoctorToolAvailabilityOverrides:
         assert available == []
         assert unavailable == [kanban_entry]
 
+    def test_suppresses_browser_use_when_backend_is_off(self, monkeypatch):
+        """backend: off means agent-browser is the stack — not a missing dep."""
+        monkeypatch.setattr(doctor, "_honcho_is_configured_for_doctor", lambda: False)
+        import tools.browser_use_cli as bu
+
+        monkeypatch.setattr(bu, "get_browser_backend", lambda: bu.BACKEND_DISABLED)
+        browser_use_entry = {
+            "name": "browser-use",
+            "env_vars": [],
+            "tools": ["browser_exec"],
+        }
+        discord_entry = {
+            "name": "discord",
+            "env_vars": ["DISCORD_BOT_TOKEN"],
+            "tools": ["discord_send"],
+        }
+
+        available, unavailable = doctor._apply_doctor_tool_availability_overrides(
+            ["browser"],
+            [browser_use_entry, discord_entry],
+        )
+
+        assert available == ["browser"]
+        assert unavailable == [discord_entry]
+
+    def test_keeps_browser_use_unavailable_when_backend_is_not_off(self, monkeypatch):
+        monkeypatch.setattr(doctor, "_honcho_is_configured_for_doctor", lambda: False)
+        import tools.browser_use_cli as bu
+
+        monkeypatch.setattr(bu, "get_browser_backend", lambda: "browser-use")
+        browser_use_entry = {
+            "name": "browser-use",
+            "env_vars": [],
+            "tools": ["browser_exec"],
+        }
+
+        available, unavailable = doctor._apply_doctor_tool_availability_overrides(
+            [],
+            [browser_use_entry],
+        )
+
+        assert available == []
+        assert unavailable == [browser_use_entry]
+
 
 
 

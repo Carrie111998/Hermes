@@ -364,6 +364,16 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
             if "honcho" not in updated_available:
                 updated_available.append("honcho")
             continue
+        # browser-use is intentionally disabled when browser.backend is "off"
+        # (seat uses agent-browser browser_* tools instead). Suppress noise.
+        if name == "browser-use":
+            try:
+                from tools.browser_use_cli import BACKEND_DISABLED, get_browser_backend
+
+                if get_browser_backend() == BACKEND_DISABLED:
+                    continue
+            except Exception:
+                pass
         updated_unavailable.append(item)
     return updated_available, updated_unavailable
 
