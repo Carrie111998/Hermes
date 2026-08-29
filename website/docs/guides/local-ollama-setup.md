@@ -1,7 +1,7 @@
 ---
 sidebar_position: 9
 title: "Run Hermes Locally with Ollama — Zero API Cost"
-description: "Step-by-step guide to running Hermes Agent entirely on your own machine with Ollama and open-weight models like Gemma 4, no cloud API keys or paid subscriptions needed"
+description: "Step-by-step guide to running Hermes Agent entirely on your own machine with Ollama and a tool-capable open-weight model, without cloud API keys or paid subscriptions"
 ---
 
 # Run Hermes Locally with Ollama — Zero API Cost
@@ -23,93 +23,84 @@ By the end, you'll have:
 
 ## What You Need
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| **RAM** | 8 GB (for 3B models) | 32+ GB (for 27B+ models) |
-| **Storage** | 5 GB free | 30+ GB (for multiple models) |
-| **CPU** | 4 cores | 8+ cores (AMD EPYC, Ryzen, Intel Xeon) |
-| **GPU** | Not required | NVIDIA GPU with 8+ GB VRAM speeds things up significantly |
+| Component | Minimum | Recommended for agentic tool use |
+|-----------|---------|----------------------------------|
+| **RAM** | Enough for the selected model and context | 16+ GB for an 8B-class model; more for larger models or 64K context |
+| **Storage** | The model download plus working space | 10+ GB free before pulling a model |
+| **CPU / GPU** | A supported Ollama host | Apple Silicon, NVIDIA GPU, or a modern multi-core CPU |
 
-:::tip CPU-only works, but expect slower responses
-Ollama runs on CPU-only servers. A 9B model on a modern 8-core CPU gives ~10 tokens/sec. A 31B model on CPU is slower (~2–5 tokens/sec) — each response takes 30–120 seconds, but it works. A GPU dramatically improves this. For CPU-only setups, widen the API timeout via the env var (it's not a `config.yaml` key):
-
-```bash
-# ~/.hermes/.env
-HERMES_API_TIMEOUT=1800   # 30 minutes — generous for slow local models
-```
+:::tip Local inference can be slow
+A local model must prefill Hermes' system prompt and tool schemas before it can respond. Keep the first model modest, verify tool calls with a small prompt, then move up in model size only when latency and memory are acceptable.
 :::
 
 ## Step 1: Install Ollama
 
+On macOS, install Ollama with Homebrew:
+
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
+brew install ollama
 ```
 
-Verify it's running:
+For other platforms, use the installer from [ollama.com](https://ollama.com/download). Start the local server if it is not already running:
+
+```bash
+ollama serve
+```
+
+Verify it in another terminal:
 
 ```bash
 ollama --version
 curl http://localhost:11434/api/tags   # Should return {"models":[]}
 ```
 
-## Step 2: Pull a Model
+## Step 2: Pull a Tool-Capable Model
 
-Choose based on your hardware:
+Hermes uses structured tool calls for file operations, terminal commands, and browsing. Choose a model marked **Tools** in the [Ollama model library](https://ollama.com/search?c=tools); do not assume that every chat model can invoke tools.
 
-| Model | Size on Disk | RAM Needed | Tool Calling | Best For |
-|-------|-------------|------------|:------------:|----------|
-| `gemma4:31b` | ~20 GB | 24+ GB | Yes | Best quality — strong tool use and reasoning |
-| `gemma2:27b` | ~16 GB | 20+ GB | No | Conversational tasks, no tool use |
-| `gemma2:9b` | ~5 GB | 8+ GB | No | Fast chat, Q&A — cannot call tools |
-| `llama3.2:3b` | ~2 GB | 4+ GB | No | Lightweight quick answers only |
-
-:::warning Tool calling matters
-Hermes is an **agentic** assistant — it edits files, runs commands, and browses the web through tool calls. Models without tool-call support can only chat; they can't take actions. For the full Hermes experience, use a model that supports tools (like `gemma4:31b`).
-:::
-
-Pull your chosen model:
+For example, Qwen 3 includes tool-use support and has an 8B variant that is a practical starting point on many developer machines:
 
 ```bash
-ollama pull gemma4:31b
+ollama pull qwen3:8b
 ```
 
-:::info Multiple models
-You can pull several models and switch between them inside Hermes with `/model`. Ollama loads the active model into memory on demand and unloads idle ones automatically.
-:::
-
-Verify the model works:
+Use the exact identifier shown by `ollama list` in the commands below. Before configuring Hermes, verify that the OpenAI-compatible endpoint accepts it:
 
 ```bash
 curl http://localhost:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemma4:31b",
+    "model": "qwen3:8b",
     "messages": [{"role": "user", "content": "Say hello"}],
     "max_tokens": 50
   }'
 ```
 
-You should see a JSON response with the model's reply.
+:::info Multiple models
+You can pull several models and switch between models that are already configured in Hermes. Ollama loads the selected model on demand and unloads idle models automatically.
+:::
 
 ## Step 3: Configure Hermes
 
-Run the Hermes setup wizard:
-
-```bash
-hermes setup
-```
-
-When prompted for a provider, select **Custom Endpoint** and enter:
+Run the Hermes setup wizard and select **Custom Endpoint**, then enter:
 
 - **Base URL:** `http://localhost:11434/v1`
-- **API Key:** Leave empty or type `no-key` (Ollama doesn't need one)
-- **Model:** `gemma4:31b` (or whichever model you pulled)
+- **API Key:** Leave empty (Ollama does not require one on loopback)
+- **Model:** the exact identifier from `ollama list`, such as `qwen3:8b`
 
-Alternatively, edit `~/.hermes/config.yaml` directly:
+Or configure the same endpoint non-interactively:
+
+```bash
+hermes config set model.provider custom
+hermes config set model.base_url http://localhost:11434/v1
+hermes config set model.default qwen3:8b
+```
+
+The resulting `~/.hermes/config.yaml` is:
 
 ```yaml
 model:
-  default: "gemma4:31b"
+  default: "qwen3:8b"
   provider: "custom"
   base_url: "http://localhost:11434/v1"
 ```
@@ -132,131 +123,49 @@ You: Create a Python script that fetches the weather for Ho Chi Minh City
 
 Hermes will use the terminal tool, file operations, and your local model — no cloud calls.
 
-## Step 5: Pick the Right Model for Your Task
+## Step 5: Tune for Agentic Work
 
-Not every task needs the biggest model. Here's a practical guide:
+### Set the Context Window
 
-| Task | Recommended Model | Why |
-|------|-------------------|-----|
-| File edits, code, terminal commands | `gemma4:31b` | Only model with reliable tool calling |
-| Quick Q&A (no tool use needed) | `gemma2:9b` | Fast responses for conversational tasks |
-| Lightweight chat | `llama3.2:3b` | Fastest, but very limited capabilities |
-
-:::note
-For full agentic work (editing files, running commands, browsing), `gemma4:31b` is currently the best local option with tool-call support. Check [Ollama's model library](https://ollama.com/library) for newer models — tool-calling support is expanding rapidly.
-:::
-
-Switch models on the fly inside a session:
-
-```
-/model gemma2:9b
-```
-
-## Step 6: Optimize for Speed
-
-### Increase Ollama's Context Window
-
-By default, Ollama uses a 2048-token context. Hermes requires at least 64,000 tokens for agentic work with tools:
+Hermes needs at least 64,000 tokens for full agentic work. Configure that context on an Ollama-derived model, then point Hermes at the new model name:
 
 ```bash
-# Create a Modelfile that extends context
-cat > /tmp/Modelfile << 'EOF'
-FROM gemma4:31b
+cat >/tmp/Modelfile <<'EOF'
+FROM qwen3:8b
 PARAMETER num_ctx 64000
 EOF
-
-ollama create gemma4-64k -f /tmp/Modelfile
+ollama create qwen3-8b-64k -f /tmp/Modelfile
+hermes config set model.default qwen3-8b-64k
 ```
 
-Then update your Hermes config to use `gemma4-64k` as the model name.
+A 64K context consumes substantially more memory. If it does not fit, choose a smaller model, reduce the enabled Hermes toolsets with `hermes tools`, or use a hosted provider.
 
-### Keep the Model Loaded
+### Keep a Gateway Model Loaded
 
-By default, Ollama unloads models after 5 minutes of inactivity. For a persistent gateway bot, keep it loaded:
+For a persistent gateway bot, keep the active model loaded:
 
 ```bash
-# Set keep-alive to 24 hours
 curl http://localhost:11434/api/generate \
-  -d '{"model": "gemma4:31b", "keep_alive": "24h"}'
+  -d '{"model":"qwen3-8b-64k","keep_alive":"24h"}'
 ```
 
-Or set it globally in Ollama's environment:
+Inspect loaded models and their processor split with:
 
 ```bash
-# /etc/systemd/system/ollama.service.d/override.conf
-[Service]
-Environment="OLLAMA_KEEP_ALIVE=24h"
+ollama ps
 ```
 
-### Use GPU Offloading (If Available)
+## Step 6: Run as a Gateway Bot (Optional)
 
-If you have an NVIDIA GPU, Ollama automatically offloads layers to it. Check with:
-
-```bash
-ollama ps   # Shows which model is loaded and how many GPU layers
-```
-
-For a 31B model on a 12 GB GPU, you'll get partial offload (~40 layers on GPU, rest on CPU), which still gives a significant speedup.
-
-## Step 7: Run as a Gateway Bot (Optional)
-
-Once Hermes works locally in the CLI, you can expose it as a Telegram or Discord bot — still running entirely on your hardware.
-
-### Telegram
-
-1. Create a bot via [@BotFather](https://t.me/BotFather) and get the token
-2. Add to your `~/.hermes/config.yaml`:
-
-```yaml
-model:
-  default: "gemma4:31b"
-  provider: "custom"
-  base_url: "http://localhost:11434/v1"
-
-platforms:
-  telegram:
-    enabled: true
-    token: "YOUR_TELEGRAM_BOT_TOKEN"
-```
-
-3. Start the gateway:
+Once the CLI works, the same custom model endpoint is used by Hermes gateways. Configure the platform through `hermes setup` or the existing platform configuration, then start it:
 
 ```bash
 hermes gateway
 ```
 
-Now message your bot on Telegram — it responds using your local model.
+## Step 7: Configure a Fallback (Optional)
 
-### Discord
-
-1. Create a Discord application at [discord.com/developers](https://discord.com/developers/applications)
-2. Add to config:
-
-```yaml
-platforms:
-  discord:
-    enabled: true
-    token: "YOUR_DISCORD_BOT_TOKEN"
-```
-
-3. Start: `hermes gateway`
-
-## Step 8: Set Up Fallbacks (Optional)
-
-Local models can struggle with complex tasks. Set up a cloud fallback that only activates when the local model fails:
-
-```yaml
-model:
-  default: "gemma4:31b"
-  provider: "custom"
-  base_url: "http://localhost:11434/v1"
-
-fallback_providers:
-  - provider: openrouter
-    model: anthropic/claude-sonnet-4
-```
-
-This way, 90% of your usage is free (local), and only the hard tasks hit the paid API.
+A local model can struggle with complex requests. Add a configured cloud fallback with `hermes fallback add`; Hermes uses it only when the primary model fails.
 
 ## Troubleshooting
 
@@ -282,24 +191,24 @@ Hermes sends a fixed payload on every API call — the system prompt plus the to
 
 What helps:
 
-- **Keep the model loaded** — Ollama unloads idle models after 5 minutes, adding a full reload before the next prefill. Set `OLLAMA_KEEP_ALIVE=24h` (see [Step 6](#keep-the-model-loaded)).
-- **Widen the API timeout** — set `HERMES_API_TIMEOUT=1800` in `~/.hermes/.env` (see [What You Need](#what-you-need)).
+- **Keep the model loaded** — Ollama unloads idle models after 5 minutes, adding a full reload before the next prefill. Use the one-request `keep_alive` example in [Step 5](#keep-a-gateway-model-loaded), or configure the Ollama server according to its documentation.
+- **Set an appropriate request timeout** — configure a provider-wide or model-specific `timeout_seconds` value under `providers` in `config.yaml`; see [Configuration](/user-guide/configuration).
 - **Measure and trim the fixed prompt** — run `hermes prompt-size` for a byte breakdown of the system prompt and tool schemas, then disable unused toolsets with `hermes tools` and uninstall skills you don't need with `hermes skills`.
-- **Use GPU offloading** — even a partial offload gives a significant speedup (see [Step 6](#use-gpu-offloading-if-available)).
+- **Use GPU offloading** — inspect it with `ollama ps`.
 
 ### Model doesn't follow tool calls
 
 Models without tool-call support produce plain text instead of structured function calls. Solutions:
 
-- **Use a model with tool-call support** — of the models listed above, only `gemma4:31b` has reliable tool calling.
+- **Use a model marked as tool-capable** in the [Ollama library](https://ollama.com/search?c=tools) and verify it with the OpenAI-compatible request in [Step 2](#step-2-pull-a-tool-capable-model).
 - **Hermes has auto-repair** — it detects malformed tool calls and attempts to fix them automatically.
-- **Set up a fallback** — if the local model fails 3 times, Hermes falls back to a cloud provider.
+- **Set up a fallback** — use `hermes fallback add` so an already configured provider can handle a primary-model failure.
 
 If the model prints raw JSON like `{"name": "web_search", ...}` in its reply instead of actually running the tool, that's usually the *server*, not the model — tool calling isn't enabled or the tool-call format isn't parsed. See the per-server fix table in [Tool calls appear as text instead of executing](/integrations/providers#tool-calls-appear-as-text-instead-of-executing) (llama.cpp needs `--jinja`, vLLM needs `--enable-auto-tool-choice --tool-call-parser hermes`, and so on).
 
 ### Context window errors
 
-The default Ollama context (2048 tokens) is too small for agentic work. See [Step 6](#step-6-optimize-for-speed) to increase it.
+The default Ollama context (2048 tokens) is too small for agentic work. See [Set the Context Window](#set-the-context-window) to increase it.
 
 ## Cost Comparison
 
