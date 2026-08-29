@@ -66,8 +66,9 @@ class TestGuidanceConstants:
         from agent.prompt_builder import MEMORY_GUIDANCE
 
         assert "declarative facts" in MEMORY_GUIDANCE
-        assert "Imperative phrasing" in MEMORY_GUIDANCE
+        assert "imperative phrasing" in MEMORY_GUIDANCE
         assert "stale within a week" in MEMORY_GUIDANCE
+        assert "Save proactively" in MEMORY_GUIDANCE  # positive posture leads
         assert "workflows belong" in MEMORY_GUIDANCE
         # The category/SKIP curricula must NOT be re-taught here.
         assert "PR numbers" not in MEMORY_GUIDANCE

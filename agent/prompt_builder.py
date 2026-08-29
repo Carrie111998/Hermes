@@ -182,37 +182,50 @@ HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS = (
     "fetch web content)."
 )
 
-# Memory guidance (#95681, consolidated): ONE builder, three variants by
-# config state — both stores on / notes-only impossible split kept simple:
-#   both or memory-only  -> "persistent memory"  (covers notes + profile)
-#   profile-only          -> adds the never-target='memory' restriction
-# The shared spine (form rule, staleness routing, capacity posture) is
-# written ONCE; variants differ only in their opening frame. WHAT belongs
-# in memory is the memory tool schema's job — never re-taught here.
+# Memory guidance (#95681, consolidated): ONE block from ONE builder.
+# The opening frame adapts to which stores config enables; everything else
+# is written exactly once. Leads with the positive posture (save
+# proactively, replace when full) — the routing rules come after, as
+# refinements, not as the headline. WHAT belongs in memory is the memory
+# tool schema's job and is never re-taught here.
 
-_MEMORY_GUIDANCE_SPINE = (
-    "Write entries as declarative facts, not instructions to yourself: "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and "
-    "can override the user's current request. If a fact will be stale "
-    "within a week it belongs in session history, not memory; procedures "
-    "and workflows belong in skills. Storage has a hard character budget: "
-    "save proactively, and when it fills, replace or consolidate stale "
-    "entries in the same batch rather than skipping the save."
-)
+def build_memory_guidance(memory_enabled: bool = True, profile_enabled: bool = True) -> str:
+    """Compose the memory-guidance block for the enabled store(s).
 
-MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions, injected into every turn; "
-    "the memory tool's schema defines what belongs there. "
-    + _MEMORY_GUIDANCE_SPINE
-)
+    Returns "" when both stores are off (caller already gates on the
+    memory tool being present, but belt-and-suspenders).
+    """
+    if not memory_enabled and not profile_enabled:
+        return ""
+    if memory_enabled:
+        frame = (
+            "You have persistent memory across sessions, injected into every "
+            "turn; the memory tool's schema defines what belongs there. "
+        )
+    else:
+        frame = (
+            "You have a persistent user profile across sessions, injected "
+            "into every turn; save durable facts about the user with the "
+            "memory tool (target='user') — the built-in notes store is "
+            "disabled, so never target='memory'. "
+        )
+    return frame + (
+        "Save proactively — storage has a hard character budget, and when "
+        "it fills, replace or consolidate stale entries in the same batch "
+        "rather than skipping the save. Write entries as declarative facts, "
+        "not instructions to yourself: 'User prefers concise responses' ✓ — "
+        "'Always respond concisely' ✗ (imperative phrasing gets re-read as "
+        "a directive in later sessions and can override the user's current "
+        "request). Route by longevity: a fact stale within a week belongs "
+        "in session history; procedures and workflows belong in skills."
+    )
 
-USER_PROFILE_GUIDANCE = (
-    "You have a persistent user profile across sessions, injected into "
-    "every turn; save durable facts about the user with the memory tool "
-    "(target='user') — the built-in notes store is disabled, so never "
-    "target='memory'. " + _MEMORY_GUIDANCE_SPINE
-)
+
+# Legacy constant aliases — existing call sites and tests import these
+# names; both now come from the single builder.
+MEMORY_GUIDANCE = build_memory_guidance(True, True)
+
+USER_PROFILE_GUIDANCE = build_memory_guidance(False, True)
 
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
