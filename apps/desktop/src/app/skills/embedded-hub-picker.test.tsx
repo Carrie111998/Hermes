@@ -70,7 +70,7 @@ import { EmbeddedHubPicker } from './embedded-hub-picker'
 
 describe('EmbeddedHubPicker iframe policy', () => {
   it('allows user-initiated hub links and clipboard writes without broader iframe privileges', () => {
-    const { container } = render(<EmbeddedHubPicker installedNames={new Set()} />)
+    const { container } = render(<EmbeddedHubPicker installedNames={new Set<string>()} />)
     const iframe = container.querySelector('iframe')
 
     expect(iframe).not.toBeNull()
