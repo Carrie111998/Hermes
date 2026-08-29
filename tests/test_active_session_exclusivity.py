@@ -28,6 +28,7 @@ from hermes_cli.active_sessions import (
     SESSION_NOT_OWNED,
     active_session_registry_snapshot,
     release_active_session,
+    transfer_active_session,
     try_acquire_active_session,
 )
 
@@ -217,6 +218,17 @@ def test_the_same_live_session_may_re_acquire_its_own_lease():
     other, refusal = acquire("S", live_id="tab-2")
     assert other is None
     assert refusal.reason == SESSION_NOT_OWNED
+
+
+def test_transfer_cannot_bypass_session_ownership():
+    owner, _ = acquire("owned")
+    moving, _ = acquire("other")
+    assert owner is not None and moving is not None
+
+    assert transfer_active_session(moving, session_id="owned") is False
+    assert moving.session_id == "other"
+    held = {entry.get("session_id") for entry in active_session_registry_snapshot()}
+    assert held == {"owned", "other"}
 
 
 def test_the_capability_is_advertised_because_the_check_exists():

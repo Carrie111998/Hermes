@@ -213,14 +213,9 @@ native/fts5_cjk/*.so
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
 
-# Disposable profile created by scripts/probe_active_session_exclusivity.py
-.probe-home/
-.probe-home-ext/
-.probe-dbg*/
-.probe-home-crash*/
-.probe-home-lazy/
+# Disposable profiles created by the delegation/external-turn probes.
 .probe-home*/
-.probe-adapter/
 .probe-dbg*/
+.probe-adapter/
 .c5b-home/
 .c5b-matrix/
