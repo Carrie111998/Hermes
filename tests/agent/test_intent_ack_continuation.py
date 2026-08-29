@@ -151,6 +151,12 @@ def test_pronounless_action_announcements_continue_when_opted_in():
         "Brief written\nCreating the session now",
         "Checking whether the service is healthy.",
         "Launching now — see https://ci.example.com/run?id=5 for progress.",
+        "Creating the migration that adds the users table.",
+        "Running the script that generates the report.",
+        "Starting the worker that consumes the queue.",
+        "Checking the job that failed in CI.",
+        "Fixing the assertion that failed at line 42.",
+        "Running the tests that failed with --verbose.",
     )
     for announcement in announcements:
         assert looks_like_codex_intermediate_ack(
@@ -188,9 +194,19 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Reading the traceback gives you the failing rule.",
         "Running the suite locally reproduces the failure.",
         "Checking the CI logs seems like the first step.",
+        "Running the suite locally reproduced the failure.",
+        "Checking the CI logs revealed a stale cache.",
+        "Testing the parser found three bugs.",
+        "Reviewing the diff surfaced two issues.",
+        "Running the tests fails intermittently.",
+        "Reviewing the diff. Everything looks fine.",
+        "Testing the parser.\n\nAll 42 tests pass.",
+        "Running the numbers. The total is 42.",
         "A few options:\n- Running the suite with a fixed seed\n- Pinning the dependency.",
         "Two ideas:\n* Checking the CI cache\n* Bumping the timeout.",
         "Options:\n1. Running the suite locally.",
+        "Two options. 1. Running the suite locally. 2. Pinning the dependency.",
+        "Two options. 1. Pinning the dependency. 2. Running the suite locally.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(

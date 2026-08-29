@@ -4294,7 +4294,7 @@ def looks_like_codex_intermediate_ack(
         r"checking|running|writing|opening|reading|inspecting|reviewing|"
         r"testing|debugging|searching|fixing)\b"
     )
-    list_item_prefix_pattern = re.compile(r"(?:^|\n)\s*(?:[-*+]|\d+[.)])\s*$")
+    list_item_prefix_pattern = re.compile(r"(?:^|\s)(?:[-*+]|\d+[.)])\s*$")
     completion_predicate_pattern = re.compile(
         r"\b(?:completed|finished|succeeded|failed|passed|complete|done|successful)\b"
         r"(?=\s*(?:$|[)\],;:])|\s+(?:successfully|with|without|due|because|"
@@ -4302,12 +4302,16 @@ def looks_like_codex_intermediate_ack(
         r"over|under|all|every|today|yesterday|already)\b|\s+\d)"
     )
     declarative_predicate_pattern = re.compile(
-        r"\b(?:(?:is|are|was|were|would|could|should|can|will|tells?|shows?|"
-        r"helps?|costs?|means?|takes?|requires?|seems?|appears?)|"
-        r"[a-z]+(?:s|es)(?=\s+(?:a|an|the|this|that|these|those|you|me|us|"
-        r"him|her|them|it|like|to)\b))\b"
+        r"\b(?:is|are|was|were|would|could|should|can|will|tells?|shows?|helps?|"
+        r"costs?|means?|takes?|requires?|seems?|appears?|fails?|gives?|"
+        r"reproduces?|adds?|generates?|consumes?|gave|found|made|reproduced|"
+        r"revealed|surfaced)\b"
     )
     question_pattern = re.compile(r"\?(?=\s|$|[\"'’”)\]])")
+    sentence_boundary_pattern = re.compile(
+        r"(?:[.!…](?=\s|$)|\?(?=\s|$|[\"'’”)\]])|\n+)"
+    )
+    relative_clause_pattern = re.compile(r"\b(?:that|which|who)\b")
     has_pronounless_action = False
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
@@ -4315,13 +4319,42 @@ def looks_like_codex_intermediate_ack(
             if list_item_prefix_pattern.search(action_prefix):
                 continue
             clause_tail = assistant_text[action_match.end() :]
-            clause_tail = re.split(r"[.!?…\n]", clause_tail, maxsplit=1)[0]
-            if completion_predicate_pattern.search(clause_tail):
-                continue
-            declarative_predicate = declarative_predicate_pattern.search(clause_tail)
-            if declarative_predicate and not re.search(
-                r"\b(?:if|whether)\b", clause_tail[: declarative_predicate.start()]
+            boundary_match = sentence_boundary_pattern.search(clause_tail)
+            if boundary_match:
+                if clause_tail[boundary_match.end() :].strip():
+                    continue
+                clause_tail = clause_tail[: boundary_match.start()]
+            predicate_matches = [
+                (match.start(), "completion", match)
+                for match in completion_predicate_pattern.finditer(clause_tail)
+            ]
+            predicate_matches.extend(
+                (match.start(), "declarative", match)
+                for match in declarative_predicate_pattern.finditer(clause_tail)
+            )
+            relative_markers = list(relative_clause_pattern.finditer(clause_tail))
+            relative_index = 0
+            embedded_predicates = 0
+            has_main_predicate = False
+            for predicate_start, predicate_kind, predicate_match in sorted(
+                predicate_matches, key=lambda item: item[0]
             ):
+                while (
+                    relative_index < len(relative_markers)
+                    and relative_markers[relative_index].start() < predicate_start
+                ):
+                    embedded_predicates += 1
+                    relative_index += 1
+                if embedded_predicates:
+                    embedded_predicates -= 1
+                    continue
+                if predicate_kind == "declarative" and re.search(
+                    r"\b(?:if|whether)\b", clause_tail[: predicate_match.start()]
+                ):
+                    continue
+                has_main_predicate = True
+                break
+            if has_main_predicate:
                 continue
             has_pronounless_action = True
             break
