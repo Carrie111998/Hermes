@@ -1790,6 +1790,7 @@ def _supported_compression_kwargs(
     focus_topic: Optional[str],
     force: bool,
     memory_context: str,
+    cancel_check: Any = None,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1812,6 +1813,11 @@ def _supported_compression_kwargs(
         # introduction. Keep the oldest documented call shape when a C-backed
         # or otherwise opaque callable has no inspectable signature.
         return {"current_tokens": current_tokens}
+
+    # Private built-in extension: do not forward host cancellation into plugin
+    # engines merely because they accept arbitrary **kwargs.
+    if "_cancel_check" in parameters:
+        candidates["_cancel_check"] = cancel_check
 
     accepts_kwargs = any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -3490,12 +3496,18 @@ def compress_context(
                 pass
 
         compress_fn = agent.context_compressor.compress
+        _fence_cancel_check = (
+            (lambda: commit_fence.is_cancelled)
+            if commit_fence is not None
+            else None
+        )
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,
             current_tokens=approx_tokens,
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
+            cancel_check=_fence_cancel_check,
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(
@@ -3572,7 +3584,8 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_check=_fence_cancel_check,
+                    cancel_event=_hard_cancel_event,
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider

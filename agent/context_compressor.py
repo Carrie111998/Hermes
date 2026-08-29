@@ -1092,7 +1092,76 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
 _LEAN_DIGEST_CHUNK_CHARS = 72_000      # ~18K tokens of region per chunk
 _LEAN_DIGEST_MAX_CHUNKS = 28
 _LEAN_DIGEST_MAX_TOKENS = 1_400        # per-chunk digest cap (~13:1 ratio)
+_LEAN_ATTEMPT_MAX_PROVIDER_CALLS = 8   # summary/fallback + all chunk digests
 _LEAN_DIGESTS_HEADING = "## Detailed Session Log (chunked digests, oldest first)"
+
+
+class _CompressionAttemptProviderBudget:
+    """Attempt-local provider-call admission shared by summary and digests."""
+
+    def __init__(self, max_calls: int, cancel_check=None) -> None:
+        self.max_calls = max(1, int(max_calls))
+        self.started_calls = 0
+        self.completed_calls = 0
+        self._cancel_check = cancel_check
+
+    @property
+    def remaining_calls(self) -> int:
+        return max(0, self.max_calls - self.started_calls)
+
+    @property
+    def is_cancelled(self) -> bool:
+        if not callable(self._cancel_check):
+            return False
+        try:
+            return bool(self._cancel_check())
+        except Exception:
+            logger.debug("compression provider-work cancellation check failed", exc_info=True)
+            return False
+
+    def try_start_call(self) -> bool:
+        if self.is_cancelled or self.started_calls >= self.max_calls:
+            return False
+        self.started_calls += 1
+        return True
+
+    def finish_call(self) -> None:
+        self.completed_calls += 1
+
+
+_COMPRESSION_ATTEMPT_PROVIDER_BUDGET: contextvars.ContextVar[
+    Optional[_CompressionAttemptProviderBudget]
+] = contextvars.ContextVar("hermes_compression_attempt_provider_budget", default=None)
+
+
+@contextlib.contextmanager
+def _compression_attempt_provider_budget(
+    *,
+    cancel_check=None,
+    max_calls: int = _LEAN_ATTEMPT_MAX_PROVIDER_CALLS,
+):
+    """Bound one synchronous compressor attempt without cross-worker state."""
+    budget = _CompressionAttemptProviderBudget(max_calls, cancel_check)
+    token = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.reset(token)
+
+
+class _CompressionAttemptBudgetExhausted(RuntimeError):
+    pass
+
+
+def _start_compression_provider_call() -> bool:
+    budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
+    return budget is None or budget.try_start_call()
+
+
+def _finish_compression_provider_call() -> None:
+    budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
+    if budget is not None:
+        budget.finish_call()
 
 _LEAN_DIGEST_PROMPT = """You are writing one segment of a detailed session log for an AI agent's context checkpoint. Digest the transcript segment below.
 
@@ -4751,14 +4820,28 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             return ""
         chunk_size = _LEAN_DIGEST_CHUNK_CHARS
         n_chunks = max(1, (len(text) + chunk_size - 1) // chunk_size)
-        if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
-            chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
-            n_chunks = _LEAN_DIGEST_MAX_CHUNKS
+        budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
+        digest_call_limit = _LEAN_DIGEST_MAX_CHUNKS
+        if budget is not None:
+            digest_call_limit = min(digest_call_limit, budget.remaining_calls)
+            if digest_call_limit <= 0 or budget.is_cancelled:
+                return ""
+        if n_chunks > digest_call_limit:
+            chunk_size = (len(text) + digest_call_limit - 1) // digest_call_limit
+            n_chunks = digest_call_limit
         digests: list[str] = []
         for ci in range(n_chunks):
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]
             if not segment.strip():
                 continue
+            if not _start_compression_provider_call():
+                logger.info(
+                    "Stopping lean chunk digests after %d/%d segment(s): "
+                    "compression attempt provider budget cancelled or exhausted",
+                    ci,
+                    n_chunks,
+                )
+                break
             try:
                 from agent.auxiliary_client import call_llm
 
@@ -4784,6 +4867,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             except Exception as exc:
                 logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
                 body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
+            finally:
+                _finish_compression_provider_call()
             digests.append(f"### Segment {ci + 1}/{n_chunks}\n{body}")
         if not digests:
             return ""
@@ -5240,10 +5325,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "prompt_build_ms": max(0, int((_aux_call_start - prompt_started_at) * 1000))
             }
             call_kwargs["latency_info"] = _latency_info
+            if not _start_compression_provider_call():
+                raise _CompressionAttemptBudgetExhausted(
+                    "compression attempt provider-call budget exhausted"
+                )
             try:
                 with aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
             finally:
+                _finish_compression_provider_call()
                 route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
                 _aux_provider = _aux_route.get("provider") or self.provider or ""
                 _aux_model = _aux_route.get("model") or self.summary_model or self.model or ""
@@ -5324,6 +5414,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_network_failure = False
             self._last_summary_empty_content_failure = False
             return self._with_summary_prefix(summary)
+        except _CompressionAttemptBudgetExhausted:
+            logger.warning(
+                "Context compression stopped before summary dispatch: attempt "
+                "provider-call budget exhausted"
+            )
+            return None
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
@@ -7495,6 +7591,25 @@ This compaction should PRIORITISE preserving all information related to the focu
         return merged
 
     def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+        force: bool = False,
+        memory_context: str = "",
+        _cancel_check=None,
+    ) -> List[Dict[str, Any]]:
+        """Run one compression attempt under a total provider-call budget."""
+        with _compression_attempt_provider_budget(cancel_check=_cancel_check):
+            return self._compress_impl(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                force=force,
+                memory_context=memory_context,
+            )
+
+    def _compress_impl(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: Optional[int] = None,
