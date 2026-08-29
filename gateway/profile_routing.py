@@ -7,7 +7,8 @@ Matching priority (most specific first):
   1. platform + chat_id + thread_id (exact thread)  — specificity 14
   2. platform + chat_id (channel route)             — specificity 6
   3. platform + guild_id (guild/server route)       — specificity 2
-  4. No match                                       → default profile
+  4. platform + scope_id (platform account/tenant)  — specificity 1
+  5. No match                                       → default profile
 
 Parent-chain matching:
 For Discord threads and forum posts, ``parent_chat_id`` carries the
@@ -62,11 +63,14 @@ class ProfileRoute:
     chat_id: Optional[str] = None
     thread_id: Optional[str] = None
     enabled: bool = True
+    scope_id: Optional[str] = None
 
     @property
     def specificity(self) -> int:
         """Higher value = more specific match."""
         s = 0
+        if self.scope_id:
+            s += 1
         if self.guild_id:
             s += 2
         if self.chat_id:
@@ -82,6 +86,7 @@ class ProfileRoute:
         chat_id: Optional[str] = None,
         thread_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None,
+        scope_id: Optional[str] = None,
     ) -> bool:
         """Return True if this route matches the given source fields.
 
@@ -96,6 +101,8 @@ class ProfileRoute:
         if not self.enabled:
             return False
         if self.platform != platform:
+            return False
+        if self.scope_id and self.scope_id != scope_id:
             return False
         if self.thread_id and self.thread_id != thread_id:
             return False
@@ -143,6 +150,7 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
                 name=name,
                 platform=platform,
                 profile=profile,
+                scope_id=entry.get("scope_id"),
                 guild_id=entry.get("guild_id"),
                 chat_id=entry.get("chat_id"),
                 thread_id=entry.get("thread_id"),
@@ -162,9 +170,17 @@ def match_profile_route(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     parent_chat_id: Optional[str] = None,
+    scope_id: Optional[str] = None,
 ) -> Optional[ProfileRoute]:
     """Return the best-matching route, or None for no match."""
     for route in routes:
-        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
+        if route.matches(
+            platform,
+            scope_id=scope_id,
+            guild_id=guild_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+        ):
             return route
     return None

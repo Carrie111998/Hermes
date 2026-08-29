@@ -9,7 +9,8 @@
 By default a single gateway run uses one profile (memory, persona, tools). **Profile-based
 routing** lets one gateway instance serve **multiple isolated profiles**, selecting which
 profile handles an inbound message based on *where the message came from* — the platform,
-server (`guild_id`), channel (`chat_id`), and/or thread (`thread_id`).
+adapter-defined account or tenant (`scope_id`), server (`guild_id`), channel (`chat_id`),
+and/or thread (`thread_id`).
 
 This is the inbound counterpart to multiplexing: instead of running N gateways, run one
 gateway and route per-community / per-channel / per-thread to a dedicated profile. Each
@@ -52,6 +53,12 @@ profile_routes:
     chat_id: "9876543210"
     thread_id: "1111111111"
     profile: standup
+
+  # Route an adapter-defined account or tenant to its own profile.
+  - name: sales-account
+    platform: support-phone
+    scope_id: sales
+    profile: sales-agent
 ```
 
 ### Fields
@@ -61,6 +68,7 @@ profile_routes:
 | `name` | yes | Human-readable route identifier (used in logs). |
 | `platform` | yes | Adapter platform: `discord`, `telegram`, `feishu`, `slack`, … |
 | `profile` | yes | Target profile name (must exist under `~/.hermes/profiles/<name>`). |
+| `scope_id` | no | Stable adapter-defined account, tenant, or workspace id. |
 | `guild_id` | no | Server/guild (Discord). |
 | `chat_id` | no | Channel/group/DM id. |
 | `thread_id` | no | Thread id within a channel. |
@@ -72,6 +80,7 @@ A route matches an inbound source when **every discriminator the route declares 
 (conjunctive / AND). A field the route leaves unset is ignored.
 
 - **`platform`** must equal the source platform exactly.
+- **`scope_id`** (if set) must equal the source scope id.
 - **`thread_id`** (if set) must equal the source thread id.
 - **`chat_id`** (if set) must match the source channel **or** its parent — a thread in a
   channel matches the channel's route (hierarchical match for Discord forums/threads).
@@ -87,10 +96,12 @@ When multiple routes match, the **most specific** one wins. Specificity is addit
 | `thread_id` | 8 |
 | `chat_id` | 4 |
 | `guild_id` | 2 |
+| `scope_id` | 1 |
 | (platform only) | 0 |
 
-So a thread route (8) beats a channel route (4) beats a guild route (2) within the same server.
-If no route matches, the message uses the default/active profile.
+So a thread route (8) beats a channel route (4), which beats a guild route (2), which
+beats a scope-only route (1). Combined discriminators add their weights. If no route
+matches, the message uses the default/active profile.
 
 ## How it works at runtime
 
@@ -113,5 +124,5 @@ every platform goes through this path — not just Discord.
 `profile_routes` requires `gateway.multiplex_profiles: true`. Multiplexing is what
 activates the per-profile runtime scope (per-profile `HERMES_HOME`, secret scope, and
 profile-namespaced session keys); routing is the decision layer that picks *which*
-profile a given guild/channel/thread lands in. With multiplexing off, `profile_routes`
+profile a given scope/guild/channel/thread lands in. With multiplexing off, `profile_routes`
 is ignored entirely — behavior is byte-identical to a single-profile gateway.

@@ -7287,10 +7287,10 @@ class BasePlatformAdapter(ABC):
         """Helper to build a SessionSource for this platform.
 
         When ``gateway.profile_routes`` is configured, the routing engine
-        resolves the matching profile from guild/chat/thread and stamps it on
-        ``source.profile``. Downstream code (``_resolve_profile_home_for_source``
-        in run.py) reads that field to enter ``_profile_runtime_scope`` for
-        per-profile HERMES_HOME isolation.
+        resolves the matching profile from scope/guild/chat/thread and stamps it
+        on ``source.profile``. Downstream code
+        (``_resolve_profile_home_for_source`` in run.py) reads that field to
+        enter ``_profile_runtime_scope`` for per-profile HERMES_HOME isolation.
         """
         # Normalize empty topic to None
         if chat_topic is not None and not chat_topic.strip():

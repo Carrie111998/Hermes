@@ -28912,8 +28912,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         no route matches. Callers (``build_source``,
         ``_resolve_profile_home_for_source``) treat ``None`` as "use the
         default/active profile". When ``gateway.profile_routes`` is configured,
-        the most specific matching route wins (guild < channel < thread). See
-        :mod:`gateway.profile_routing` for matching rules.
+        the most specific matching route wins
+        (scope < guild < channel < thread). See :mod:`gateway.profile_routing`
+        for matching rules.
 
         Gated on ``gateway.multiplex_profiles``: routing stamps
         ``source.profile``, which selects the session-key namespace and batch
@@ -28933,6 +28934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             matched = match_profile_route(
                 routes,
                 platform=source.platform.value,
+                scope_id=getattr(source, "scope_id", None),
                 guild_id=getattr(source, "guild_id", None),
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
@@ -28964,9 +28966,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raise ProfileRouteRejected(matched.name)
             return matched.profile
         logger.debug(
-            "No profile route matched: platform=%s chat_id=%s thread_id=%s parent_chat_id=%s",
-            source.platform.value, source.chat_id,
-            getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None),
+            "No profile route matched: platform=%s scope_id=%s chat_id=%s "
+            "thread_id=%s parent_chat_id=%s",
+            source.platform.value,
+            getattr(source, "scope_id", None),
+            source.chat_id,
+            getattr(source, "thread_id", None),
+            getattr(source, "parent_chat_id", None),
         )
         return None
 
