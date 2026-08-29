@@ -448,6 +448,7 @@ py-modules = [
   "toolset_distributions",
   "cli",
   "hermes_bootstrap",
+  "hermes_editable_heal",
   "hermes_constants",
   "hermes_state",
   "hermes_state_common",
