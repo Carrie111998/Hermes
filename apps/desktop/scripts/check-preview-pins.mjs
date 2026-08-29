@@ -109,6 +109,7 @@ const server = createServer((request, response) => {
 })
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
 const URL_ = `http://127.0.0.1:${server.address().port}/`
+const ORIGIN = `http://127.0.0.1:${server.address().port}`
 
 console.log(`\ncheck-preview-pins — ${CHROME}\n`)
 
@@ -206,7 +207,10 @@ async function settled() {
   const deadline = Date.now() + 15_000
   while (Date.now() < deadline) {
     try {
-      if ((await evaluate('document.readyState')) === 'complete') return
+      const where = await evaluate('document.readyState + "|" + location.origin')
+      // The origin matters as much as the state: about:blank reaches
+      // "complete" first and is then replaced, taking every global with it.
+      if (where === `complete|${ORIGIN}`) return
     } catch { /* context swapping under us */ }
     await wait(150)
   }
@@ -234,6 +238,28 @@ async function install() {
     true } catch (err) { window.__installError = err && err.message; false }`)
 }
 
+/**
+ * Install, then prove it took.
+ *
+ * A context swap between the evaluate and the next call is silent — the globals
+ * simply are not there, and it surfaces later as an unexplained missing
+ * function. Verify and retry rather than trusting one shot.
+ */
+async function installed() {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await settled()
+    await install()
+
+    try {
+      if ((await evaluate('typeof window.__pins')) === 'function') return true
+    } catch { /* swapped mid-check */ }
+
+    await wait(250)
+  }
+
+  return false
+}
+
 const centreOf = selector => evaluate(`(() => {
   const el = document.querySelector(${JSON.stringify(selector)})
   const r = el.getBoundingClientRect()
@@ -243,11 +269,9 @@ const centreOf = selector => evaluate(`(() => {
 try {
   await connect()
   await send('Runtime.enable')
-  await settled()
-  await install()
   check(
     'engine installed in a real page',
-    (await evaluate('typeof window.__pins')) === 'function',
+    await installed(),
     await evaluate('String(window.__installError || "no error recorded")')
   )
 
@@ -388,8 +412,7 @@ try {
   await send('Page.enable')
   await send('Page.reload', { ignoreCache: true })
   await wait(400)
-  await settled()
-  await install()
+  await installed()
 
   await evaluate(`window.__seed(${JSON.stringify(JSON.parse(before))})`)
   const after = await evaluate(`window.__pins({ verb: 'reattach' }).pins`)
@@ -465,8 +488,7 @@ try {
 
   // ---- the second page keeps its own comments ------------------------------
 
-  await settled()
-  await install()
+  await installed()
   await evaluate(`window.__seed(${JSON.stringify(JSON.parse(carried))})`)
   const onSecond = await evaluate(`window.__pins({ verb: 'reattach' }).pins`)
   check(
