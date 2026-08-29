@@ -517,9 +517,11 @@ def load_cli_config() -> Dict[str, Any]:
 
             "skin": "default",
         },
-        "clarify": {
-            "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
-        },
+        # NOTE: no top-level "clarify" default here on purpose. resolve_clarify_timeout()
+        # treats clarify.timeout as a legacy override that wins over agent.clarify_timeout
+        # whenever it's not None — a hardcoded default here would silently shadow the
+        # canonical agent.clarify_timeout for every user who never set clarify.timeout
+        # explicitly (that includes <=0 "unlimited", which never got a chance to apply).
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
             "max_tool_calls": 50,  # Max RPC tool calls per execution
@@ -16045,7 +16047,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "selected": 0,
                 "response_queue": response_queue,
             }
-            self._approval_deadline = _time.monotonic() + timeout
+            # <=0 means unlimited (never auto-deny while the user is still
+            # deciding) — same convention as agent.clarify_timeout.
+            self._approval_deadline = None if timeout <= 0 else _time.monotonic() + timeout
 
             # Modal prompt — paint immediately, bypassing the throttle/resize
             # guard. A throttled paint here can be silently dropped (250ms
@@ -16073,9 +16077,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     return result
                 except queue.Empty:
-                    remaining = self._approval_deadline - _time.monotonic()
-                    if remaining <= 0:
-                        break
+                    # None deadline = unlimited: never auto-deny, just keep polling.
+                    if self._approval_deadline is not None:
+                        remaining = self._approval_deadline - _time.monotonic()
+                        if remaining <= 0:
+                            break
                     now = _time.monotonic()
                     if now - _last_countdown_refresh >= 1.0:
                         _last_countdown_refresh = now
@@ -19518,10 +19524,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 ]
 
             if cli_ref._approval_state:
-                remaining = max(0, int(cli_ref._approval_deadline - time.monotonic()))
+                # None deadline = unlimited wait → hide the countdown entirely.
+                if cli_ref._approval_deadline is None:
+                    countdown = ''
+                else:
+                    remaining = max(0, int(cli_ref._approval_deadline - time.monotonic()))
+                    countdown = f'  ({remaining}s)'
                 return [
                     ('class:hint', '  ↑/↓ to select, Enter to confirm'),
-                    ('class:clarify-countdown', f'  ({remaining}s)'),
+                    ('class:clarify-countdown', countdown),
                 ]
 
             if cli_ref._slash_confirm_state:
