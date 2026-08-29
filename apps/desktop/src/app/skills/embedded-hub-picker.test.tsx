@@ -1,13 +1,22 @@
 // @vitest-environment jsdom
 import { render } from '@testing-library/react'
+import type { ComponentProps, ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
+
+type MockButtonProps = Omit<ComponentProps<'button'>, 'size'> & {
+  children?: ReactNode
+  size?: string
+  variant?: string
+}
 
 vi.mock('@nanostores/react', () => ({
   useStore: () => undefined
 }))
 
 vi.mock('@/components/ui/button', () => ({
-  Button: ({ children, size: _size, variant: _variant, ...props }: any) => <button {...props}>{children}</button>
+  Button: ({ children, size: _size, variant: _variant, ...props }: MockButtonProps) => (
+    <button {...props}>{children}</button>
+  )
 }))
 
 vi.mock('@/i18n', () => ({
