@@ -4205,6 +4205,139 @@ class TestPluginAPIAuth:
             pass
 
 
+class TestPluginAPIRuntimeReload:
+    """POST /api/plugins/<name>/reload re-imports a plugin's api file from
+    disk and re-mounts its routes before the SPA catch-all."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home, _install_example_plugin):
+        """Authenticated TestClient + the example plugin installed/enabled.
+
+        ``_install_example_plugin`` copies the fixture plugin into the
+        per-test ``HERMES_HOME`` and mounts its routes; tests then rewrite
+        that copy's ``plugin_api.py`` (never the repo fixture) to exercise
+        the reload path.
+        """
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
+
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+        self.unauth_client = TestClient(app)
+        self.plugin_api_path = (
+            get_hermes_home()
+            / "plugins" / "example-dashboard" / "dashboard" / "plugin_api.py"
+        )
+
+    def _write_plugin_api(self, body: str):
+        self.plugin_api_path.write_text(body, encoding="utf-8")
+
+    def test_reload_picks_up_edited_plugin_code(self):
+        """Editing the api file + reload serves the NEW code — and the
+        re-mounted route is reachable, proving it landed before the SPA
+        catch-all (an appended route would get the catch-all's JSON 404)."""
+        resp = self.client.get("/api/plugins/example/hello")
+        assert resp.status_code == 200
+        assert resp.json()["version"] == "1.0.0"
+
+        self._write_plugin_api(
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/hello')\n"
+            "async def hello():\n"
+            "    return {'message': 'reloaded', 'version': '2.0.0'}\n"
+            "@router.get('/extra')\n"
+            "async def extra():\n"
+            "    return {'extra': True}\n"
+        )
+        resp = self.client.post("/api/plugins/example/reload")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["ok"] is True
+        assert payload["routes"] == 2
+
+        resp = self.client.get("/api/plugins/example/hello")
+        assert resp.status_code == 200
+        assert resp.json()["version"] == "2.0.0"
+        resp = self.client.get("/api/plugins/example/extra")
+        assert resp.status_code == 200
+        assert resp.json() == {"extra": True}
+
+    def test_reload_removes_stale_routes(self):
+        """Routes dropped from the plugin file must stop answering after a
+        reload — the old mount is removed, not just shadowed."""
+        self._write_plugin_api(
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/farewell')\n"
+            "async def farewell():\n"
+            "    return {'bye': True}\n"
+        )
+        resp = self.client.post("/api/plugins/example/reload")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["ok"] is True
+        assert payload["stale_removed"] >= 1
+
+        assert self.client.get("/api/plugins/example/farewell").status_code == 200
+        assert self.client.get("/api/plugins/example/hello").status_code == 404
+
+    def test_reload_import_failure_reported_without_500(self):
+        """A plugin file that's broken mid-edit yields a structured error,
+        not a 500 — and the previously mounted routes keep serving."""
+        self._write_plugin_api("def broken(:\n")
+        resp = self.client.post("/api/plugins/example/reload")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["ok"] is False
+        assert "import failed" in payload["error"]
+
+        # Old behaviour preserved: the boot-time mount still answers.
+        resp = self.client.get("/api/plugins/example/hello")
+        assert resp.status_code == 200
+        assert resp.json()["version"] == "1.0.0"
+
+    def test_reload_unknown_plugin_rejected(self):
+        from hermes_cli import web_server
+
+        # Function level: structured error.
+        result = web_server._reload_plugin_api_routes("_definitely_not_a_plugin_")
+        assert result["ok"] is False
+        assert "not found" in result["error"]
+        # HTTP level: the runtime gate 404s before the handler runs (same
+        # status a disabled plugin's own routes get — no name oracle).
+        resp = self.client.post("/api/plugins/_definitely_not_a_plugin_/reload")
+        assert resp.status_code == 404
+
+    def test_reload_disabled_plugin_rejected(self):
+        from hermes_cli import web_server
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        enabled = cfg.setdefault("plugins", {}).get("enabled") or []
+        cfg["plugins"]["enabled"] = [n for n in enabled if n != "example"]
+        save_config(cfg)
+
+        result = web_server._reload_plugin_api_routes("example")
+        assert result["ok"] is False
+        resp = self.client.post("/api/plugins/example/reload")
+        assert resp.status_code == 404
+
+    def test_reload_requires_auth(self):
+        """The reload endpoint is a mutation primitive — it must sit behind
+        the same session-token middleware as every other /api/ route."""
+        resp = self.unauth_client.post("/api/plugins/example/reload")
+        assert resp.status_code == 401
+
+
 class TestDashboardPluginManifestExtensions:
     """Tests for the extended plugin manifest fields (tab.override,
     tab.hidden, slots) read by _discover_dashboard_plugins()."""
