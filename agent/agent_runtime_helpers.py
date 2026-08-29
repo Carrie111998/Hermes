@@ -4346,19 +4346,17 @@ def looks_like_codex_intermediate_ack(
         r"globals?\s+before\s+(?:the\s+)?agent\s+name)\s*$"
     )
     has_pronounless_action = False
-    status_numbers_by_label = {}
-    for status_match in status_number_pattern.finditer(assistant_text):
-        status_numbers_by_label.setdefault(status_match.group("label"), set()).add(
-            status_match.group("number")
-        )
-    has_status_sequence = any(
-        {"1", "2"}.issubset(numbers) for numbers in status_numbers_by_label.values()
-    )
+    step_numbers = {
+        status_match.group("number")
+        for status_match in status_number_pattern.finditer(assistant_text)
+        if status_match.group("label") == "step"
+    }
+    has_step_sequence = len(step_numbers) >= 2
     numbering_text = status_number_pattern.sub("", assistant_text)
     numbered_markers = {
         match.group(1) for match in numbered_item_pattern.finditer(numbering_text)
     }
-    has_numbered_list = has_status_sequence or {"1", "2"}.issubset(numbered_markers)
+    has_numbered_list = has_step_sequence or len(numbered_markers) >= 2
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
             action_prefix = assistant_text[: action_match.start("action")]

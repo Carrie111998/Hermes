@@ -163,6 +163,7 @@ def test_pronounless_action_announcements_continue_when_opted_in():
         "Attempt 2. Relaunching with corrected arguments.",
         "Exit code 1. Attempt 2. Relaunching with corrected arguments.",
         "Exit code 1. Step 2. Checking the actual log.",
+        "Attempt 1. Attempt 2. Relaunching with corrected arguments.",
     )
     for announcement in announcements:
         assert looks_like_codex_intermediate_ack(
@@ -245,6 +246,8 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Two ways. 1. Creating the session now. 2. Pinning the dep.",
         "Two options. Step 1. Pinning the dependency. Step 2. Relaunching with corrected arguments.",
         "Step 1. Pinning the dependency. Step 2. Relaunching with corrected arguments.",
+        "Step 1. Pinning the dependency. Step 3. Relaunching with corrected arguments.",
+        "Two options. 2. Pinning the dependency. 3. Checking the actual log.",
         "Possible fixes. 1. Checking the actual log. 2. Bumping the timeout.",
         "Two options: pinning the dep, checking the actual log.",
         "Two fixes: bumping the timeout, relaunching with corrected arguments.",
