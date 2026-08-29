@@ -128,8 +128,30 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       '.bubble textarea{display:block;width:100%;min-height:56px;max-height:168px;',
       'background:#131211;color:#f0ede8;border:1px solid #35322e;border-radius:8px;',
       // No resize grip: it drew a corner wart and the field grows on its own.
-      'padding:8px;font:13px/1.5 system-ui,sans-serif;resize:none;outline:none}',
+      'padding:8px;font:13px/1.5 system-ui,sans-serif;resize:none;outline:none;',
+      // The guest page's own scrollbar is whatever Chromium gives that site —
+      // on a plain page that is the chunky legacy bar WITH stepper arrows, and
+      // it lands inside a 304px bubble looking like a piece of another app.
+      // Styled here rather than left alone: the field is ours, so its scrollbar
+      // has to be too. Deliberately NOT the standard `scrollbar-width`/
+      // `scrollbar-color`: setting either makes Chromium ignore every
+      // ::-webkit-scrollbar rule below and draw its own thin bar instead — the
+      // gutter measured 10px with both present, and the thumb colour and the
+      // dropped stepper arrows went with it. The preview guest is always
+      // Chromium, so the pseudo-elements alone are the honest mechanism.
+      'padding-inline-end:2px}',
       '.bubble textarea::placeholder{color:#6f6a63}',
+      // Half the gutter is transparent border, so the thumb reads as a 4px
+      // hairline with breathing room instead of a bar wedged against the text.
+      '.bubble textarea::-webkit-scrollbar{width:8px;height:8px}',
+      '.bubble textarea::-webkit-scrollbar-track{background:transparent}',
+      '.bubble textarea::-webkit-scrollbar-thumb{background:#3b3833;border-radius:8px;',
+      'border:2px solid transparent;background-clip:content-box}',
+      '.bubble textarea:hover::-webkit-scrollbar-thumb{background:#565149;background-clip:content-box}',
+      // The stepper arrows are the loudest part of the legacy bar and nobody
+      // clicks them in a 168px-tall field.
+      '.bubble textarea::-webkit-scrollbar-button{display:none;width:0;height:0}',
+      '.bubble textarea::-webkit-scrollbar-corner{background:transparent}',
       '.bubble textarea:focus{border-color:#d99a5b;box-shadow:0 0 0 3px rgba(217,154,91,.16)}',
       '.row{display:flex;align-items:center;gap:6px;margin-top:9px}',
       '.bubble button{border:1px solid #35322e;border-radius:8px;background:#26241f;',

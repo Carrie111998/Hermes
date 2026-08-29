@@ -449,6 +449,25 @@ try {
     JSON.stringify(bubbleBox)
   )
 
+  // The comment field's scrollbar is the guest page's, which on a plain page is
+  // Chromium's chunky legacy bar with stepper arrows — ~15px of another app's
+  // furniture inside a 304px bubble. Only a real browser can say how wide it
+  // actually came out; jsdom has no scrollbars at all.
+  const gutter = await evaluate(`(() => {
+    const area = document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble textarea')
+    if (!area) return null
+    const was = area.value
+    area.value = ('a long line that has to wrap and wrap again ').repeat(24)
+    const style = getComputedStyle(area)
+    const width = area.offsetWidth - area.clientWidth -
+      parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth)
+    const overflows = area.scrollHeight > area.clientHeight
+    area.value = was
+    return { overflows, width }
+  })()`)
+  check('the comment field does overflow, so there is a scrollbar to judge', gutter?.overflows === true, JSON.stringify(gutter))
+  check('its scrollbar is a slim one, not the page default', gutter && gutter.width > 0 && gutter.width <= 8, JSON.stringify(gutter))
+
   await evaluate(`document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble .go').click(); true`)
 
   // ---- the reload that decides everything ---------------------------------

@@ -9,14 +9,20 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  clearDrainFailure,
   enqueueQueuedPrompt,
   getQueuedPrompts,
+  hasExhaustedDrain,
   isSteerableEntry,
   MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
+  noteDrainFailure,
+  noteQueueStuck,
   promoteQueuedPrompt,
   type QueuedPromptEntry,
+  queueStuckNoticeId,
   removeQueuedPrompt,
+  resolveQueueStuck,
   shouldAutoDrain,
   unparkQueuedPrompts,
   updateQueuedPrompt
@@ -96,7 +102,6 @@ export function useComposerQueue({
 
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
   const drainingQueueRef = useRef(false)
-  const drainFailuresRef = useRef(new Map<string, number>())
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
     if (!activeQueueSessionKey || queueEdit) {
@@ -229,7 +234,7 @@ export function useComposerQueue({
           return false
         }
 
-        drainFailuresRef.current.delete(entry.id)
+        clearDrainFailure(entry.id)
         removeQueuedPrompt(drainQueueSessionKey, entry.id)
         resetBrowseState(drainRuntimeSessionId)
         // A successful drain means the queue is flowing again — lift any park
@@ -278,8 +283,11 @@ export function useComposerQueue({
       }
 
       // A manual send clears the auto-drain backoff so a stuck entry the user
-      // taps gets a fresh attempt (and re-enables auto-retry on success).
-      drainFailuresRef.current.delete(id)
+      // taps gets a fresh attempt (and re-enables auto-retry on success). The
+      // alarm goes with it: the user is acting on exactly what it reported, so
+      // leaving it on screen would describe a state that no longer holds.
+      clearDrainFailure(id)
+      resolveQueueStuck(activeQueueSessionKey)
 
       return runDrain(entries => entries.find(e => e.id === id))
     },
@@ -315,7 +323,7 @@ export function useComposerQueue({
         return false
       }
 
-      drainFailuresRef.current.delete(id)
+      clearDrainFailure(id)
       removeQueuedPrompt(activeQueueSessionKey, id)
       // A steer is the same "keep it moving" intent as a manual send — a park
       // from an earlier Stop must not hold back what's left of the queue.
@@ -337,31 +345,45 @@ export function useComposerQueue({
 
     const entry = pickDrainHead(queuedPrompts)
 
-    if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+    if (!entry || hasExhaustedDrain(entry.id)) {
       return
     }
 
-    const onFail = () => {
-      const fails = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
-      drainFailuresRef.current.set(entry.id, fails)
-
-      if (fails >= MAX_AUTO_DRAIN_ATTEMPTS) {
-        notify({
-          id: 'composer-queue-stuck',
-          kind: 'error',
-          title: t.composer.queueStuckTitle,
-          message: t.composer.queueStuckBody
+    const attempt = () => {
+      void runDrain(() => entry)
+        .then(sent => {
+          if (!sent) {
+            onFail()
+          }
         })
-      }
+        .catch(onFail)
     }
 
-    void runDrain(() => entry)
-      .then(sent => {
-        if (!sent) {
-          onFail()
-        }
+    const onFail = () => {
+      if (noteDrainFailure(entry.id) < MAX_AUTO_DRAIN_ATTEMPTS) {
+        return
+      }
+
+      noteQueueStuck(activeQueueSessionKey, entry.id)
+      // Actionable, because the message tells the user to try sending it again
+      // and the toast body is not a button — only this is. Without it the alarm
+      // named a remedy it gave no way to reach.
+      notify({
+        action: {
+          label: t.composer.queueStuckAction,
+          onClick: () => {
+            clearDrainFailure(entry.id)
+            attempt()
+          }
+        },
+        id: queueStuckNoticeId(activeQueueSessionKey),
+        kind: 'error',
+        message: t.composer.queueStuckBody,
+        title: t.composer.queueStuckTitle
       })
-      .catch(onFail)
+    }
+
+    attempt()
   }, [activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)

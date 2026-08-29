@@ -2423,6 +2423,16 @@ export const en: Translations = {
     queueResumeTip: 'Paused by Stop — resume sending the queued turns',
     queueStuckTitle: 'Queued message not sent',
     queueStuckBody: 'A queued turn kept failing to send. It is still in the queue — try sending it again.',
+    queueStuckBodyIn: title => `A queued turn in “${title}” kept failing to send. It is still in the queue.`,
+    queueStuckAction: 'Send it again',
+    queueLostTitle: 'Queued messages from a chat that is gone',
+    queueLostBody: count =>
+      count === 1
+        ? 'One message was queued in a chat that no longer exists, so it can never be sent. Recover it into the composer?'
+        : `${count} messages were queued in a chat that no longer exists, so they can never be sent. Recover them into the composer?`,
+    queueLostAction: 'Recover the text',
+    queueRecovered: count => (count === 1 ? 'Message recovered into the composer.' : `${count} messages recovered into the composer.`),
+    queueRecoveredNothing: 'Nothing left to recover.',
     previewUnavailable: 'Preview unavailable',
     previewLabel: label => `Preview ${label}`,
     couldNotPreview: label => `Could not preview ${label}`,

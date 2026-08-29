@@ -2054,6 +2054,13 @@ export interface Translations {
     queueResumeTip: string
     queueStuckTitle: string
     queueStuckBody: string
+    queueStuckBodyIn: (title: string) => string
+    queueStuckAction: string
+    queueLostTitle: string
+    queueLostBody: (count: number) => string
+    queueLostAction: string
+    queueRecovered: (count: number) => string
+    queueRecoveredNothing: string
     previewUnavailable: string
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string

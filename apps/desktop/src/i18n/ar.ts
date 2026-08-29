@@ -1890,6 +1890,17 @@ export const ar = defineLocale({
     queueDelete: 'حذف من الطابور',
     queueStuckTitle: 'لم تُرسل الرسالة في قائمة الانتظار',
     queueStuckBody: 'ظل دور في قائمة الانتظار يفشل في الإرسال. ما زال في قائمة الانتظار — حاول إرساله مرة أخرى.',
+    queueStuckBodyIn: title => `ظل دور في قائمة انتظار «${title}» يفشل في الإرسال. ما زال في قائمة الانتظار.`,
+    queueStuckAction: 'أرسله مرة أخرى',
+    queueLostTitle: 'رسائل في انتظار محادثة لم تعد موجودة',
+    queueLostBody: count =>
+      count === 1
+        ? 'رسالة واحدة تنتظر في محادثة لم تعد موجودة، فلن تُرسل أبداً. هل تستعيدها إلى حقل الكتابة؟'
+        : `${count} رسائل تنتظر في محادثة لم تعد موجودة، فلن تُرسل أبداً. هل تستعيدها إلى حقل الكتابة؟`,
+    queueLostAction: 'استعِد النص',
+    queueRecovered: count =>
+      count === 1 ? 'استُعيدت الرسالة إلى حقل الكتابة.' : `استُعيدت ${count} رسائل إلى حقل الكتابة.`,
+    queueRecoveredNothing: 'لم يبق شيء لاستعادته.',
     previewUnavailable: 'المعاينة غير متاحة',
     previewLabel: label => `معاينة ${label}`,
     couldNotPreview: label => `تعذرت معاينة ${label}`,

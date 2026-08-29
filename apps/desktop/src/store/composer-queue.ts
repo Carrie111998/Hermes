@@ -2,7 +2,8 @@ import { atom } from 'nanostores'
 
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 
-import type { ComposerAttachment } from './composer'
+import { addComposerAttachment, appendComposerDraft, type ComposerAttachment } from './composer'
+import { dismissNotification } from './notifications'
 
 export interface QueuedPromptEntry {
   id: string
@@ -88,6 +89,84 @@ const setParked = (sid: string, parked: boolean) => {
   $parkedQueueSessions.set(next)
 }
 
+/**
+ * The queue entry each session has currently given up on, if any.
+ *
+ * A "stuck" toast used to be raised and then never taken down: it is an error
+ * notification, so its duration is 0, and nothing anywhere called
+ * `dismissNotification` for it. It therefore outlived the problem it described
+ * — the entry would drain a minute later and the alarm stayed on screen, with
+ * no way to act on it and no clue which chat it meant. Recording WHICH entry
+ * each alarm is about is what makes the answer to "is this still true?"
+ * available, so `writeSession` below can retract it the moment it is not.
+ */
+export const $stuckQueueEntries = atom<Record<string, string>>({})
+
+/** The toast id for a session's stuck queue. Per session on purpose: a single
+ *  shared id let two stuck chats collapse into one nameless alarm. */
+export const queueStuckNoticeId = (sessionKey: string): string => `composer-queue-stuck-${sessionKey}`
+
+/** Remember that `entryId` is what this session's stuck alarm is about. */
+export const noteQueueStuck = (key: string | null | undefined, entryId: string): void => {
+  const sid = sidOf(key)
+
+  if (!sid || $stuckQueueEntries.get()[sid] === entryId) {
+    return
+  }
+
+  $stuckQueueEntries.set({ ...$stuckQueueEntries.get(), [sid]: entryId })
+}
+
+/** The alarm is no longer true — take it down. Safe to call for any session. */
+export const resolveQueueStuck = (key: string | null | undefined): void => {
+  const sid = sidOf(key)
+
+  if (!sid || !(sid in $stuckQueueEntries.get())) {
+    return
+  }
+
+  const next = { ...$stuckQueueEntries.get() }
+  delete next[sid]
+  $stuckQueueEntries.set(next)
+  dismissNotification(queueStuckNoticeId(sid))
+}
+
+/**
+ * Failed auto-drain attempts per entry.
+ *
+ * Module scope, not a hook ref, because the ref lived on ChatBar: a session
+ * switch, a reconnect or a restart remounted it and wiped the counter while the
+ * queue itself persists in localStorage. The give-up was therefore never final
+ * — every remount bought four fresh attempts and one more identical toast, for
+ * as long as the entry stayed unsendable. Deliberately in-memory: a fresh app
+ * process should try again, once.
+ */
+const drainFailures = new Map<string, number>()
+
+/** Count one failure and report the new total. */
+export const noteDrainFailure = (entryId: string): number => {
+  const failures = (drainFailures.get(entryId) ?? 0) + 1
+  drainFailures.set(entryId, failures)
+
+  return failures
+}
+
+export const clearDrainFailure = (entryId: string): void => {
+  drainFailures.delete(entryId)
+}
+
+export const drainFailureCount = (entryId: string): number => drainFailures.get(entryId) ?? 0
+
+/** Auto-drain has run out of attempts for this entry; only the user moves it now. */
+export const hasExhaustedDrain = (entryId: string): boolean => drainFailureCount(entryId) >= MAX_AUTO_DRAIN_ATTEMPTS
+
+/** Forget every failure and alarm. Module state outlives a component, which is
+ *  the point in the app and a leak between test cases — this is for those. */
+export const resetQueueDrainState = (): void => {
+  drainFailures.clear()
+  $stuckQueueEntries.set({})
+}
+
 const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
   const current = $queuedPromptsBySession.get()
   const next = { ...current }
@@ -103,6 +182,15 @@ const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
 
   $queuedPromptsBySession.set(next)
   save(next)
+
+  // Every queue mutation funnels through here — a send, a delete, an edit, a
+  // clear — so this is the one place that can promise the alarm never outlives
+  // the entry it was raised for.
+  const stuck = $stuckQueueEntries.get()[sid]
+
+  if (stuck && !queue.some(entry => entry.id === stuck)) {
+    resolveQueueStuck(sid)
+  }
 }
 
 const sidOf = (key: string | null | undefined): null | string => {
@@ -262,6 +350,51 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
   }
 
   writeSession(sid, [])
+}
+
+/**
+ * Hand a session's queued entries back to the user, in the composer.
+ *
+ * The escape hatch for a queue nothing can deliver. A bucket keyed by a session
+ * that no longer exists — a fresh chat that was never persisted, so its queue
+ * key was a runtime id that died with the process — can never be drained and is
+ * never rendered either, because the panel that would show it belongs to a chat
+ * that is gone. Without this the words simply sit in localStorage forever,
+ * unsent and unseen. Returns how many entries were recovered.
+ */
+export const recoverQueuedPrompts = (key: string | null | undefined): number => {
+  const sid = sidOf(key)
+
+  if (!sid) {
+    return 0
+  }
+
+  const entries = queueFor(sid)
+
+  if (entries.length === 0) {
+    return 0
+  }
+
+  for (const entry of entries) {
+    // What the user WROTE, not what would have been sent: a queued `/skill`
+    // carries its whole expanded body as `text`, which is not something to
+    // drop into a composer.
+    const text = entry.displayText ?? entry.text
+
+    if (text.trim()) {
+      appendComposerDraft(text)
+    }
+
+    for (const attachment of entry.attachments) {
+      addComposerAttachment(attachment)
+    }
+
+    clearDrainFailure(entry.id)
+  }
+
+  writeSession(sid, [])
+
+  return entries.length
 }
 
 /**

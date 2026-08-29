@@ -7,8 +7,12 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
-  parkQueuedPrompts
+  MAX_AUTO_DRAIN_ATTEMPTS,
+  parkQueuedPrompts,
+  queueStuckNoticeId,
+  resetQueueDrainState
 } from '@/store/composer-queue'
+import { $notifications } from '@/store/notifications'
 
 import type { QueueEditState } from '../composer-utils'
 import type { ChatBarProps } from '../types'
@@ -57,6 +61,8 @@ describe('useComposerQueue park integration', () => {
     window.localStorage.clear()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    resetQueueDrainState()
+    $notifications.set([])
   })
 
   afterEach(() => {
@@ -64,6 +70,8 @@ describe('useComposerQueue park integration', () => {
     vi.restoreAllMocks()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    resetQueueDrainState()
+    $notifications.set([])
   })
 
   it('auto-drains an unparked queue once idle', async () => {
@@ -194,5 +202,133 @@ describe('useComposerQueue park integration', () => {
 
     expect(isQueueParked(SESSION_KEY)).toBe(false)
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+  })
+})
+
+describe('useComposerQueue give-up', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    $queuedPromptsBySession.set({})
+    $parkedQueueSessions.set({})
+    resetQueueDrainState()
+    $notifications.set([])
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    $queuedPromptsBySession.set({})
+    $parkedQueueSessions.set({})
+    resetQueueDrainState()
+    $notifications.set([])
+  })
+
+  const mountDrainer = (onSubmit: ChatBarProps['onSubmit']) => {
+    const queueEditRef: { current: QueueEditState | null } = { current: null }
+
+    return renderHook(
+      ({ busy }: { busy: boolean }) =>
+        useComposerQueue({
+          activeQueueSessionKey: SESSION_KEY,
+          attachments: [],
+          busy,
+          clearDraft: () => undefined,
+          draftRef: { current: '' },
+          focusInput: () => undefined,
+          loadIntoComposer: () => undefined,
+          onCancel: vi.fn(),
+          onSteer: undefined,
+          onSubmit,
+          queueEditRef,
+          queueSessionKey: SESSION_KEY,
+          sessionId: 'rt-session-queue-hook'
+        }),
+      { initialProps: { busy: false } }
+    )
+  }
+
+  /** The composer drains on the idle edge, so each further attempt needs one —
+   *  a turn starting and settling is what a real session does between tries. */
+  const bounceBusy = async (hook: ReturnType<typeof mountDrainer>, times: number) => {
+    for (let i = 0; i < times; i += 1) {
+      await act(async () => {
+        hook.rerender({ busy: true })
+        await Promise.resolve()
+      })
+      await act(async () => {
+        hook.rerender({ busy: false })
+        await Promise.resolve()
+      })
+    }
+  }
+
+  it('offers a way to retry, because the alarm names one', async () => {
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => false)
+
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'refused four times' })
+
+    const hook = mountDrainer(onSubmit)
+    await bounceBusy(hook, MAX_AUTO_DRAIN_ATTEMPTS)
+
+    const toast = $notifications.get().find(n => n.id === queueStuckNoticeId(SESSION_KEY))
+
+    expect(toast).toBeTruthy()
+    // The toast body is not a button — only the action is. Without one, the
+    // message told the user to send it again and gave them nothing to press.
+    expect(toast?.action).toBeTruthy()
+
+    const attempts = onSubmit.mock.calls.length
+
+    await act(async () => {
+      toast?.action?.onClick()
+      await Promise.resolve()
+    })
+
+    expect(onSubmit.mock.calls.length).toBeGreaterThan(attempts)
+  })
+
+  it('takes the alarm down when the entry finally sends', async () => {
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => false)
+
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'sends on the retry' })
+
+    const hook = mountDrainer(onSubmit)
+    await bounceBusy(hook, MAX_AUTO_DRAIN_ATTEMPTS)
+
+    const toast = $notifications.get().find(n => n.id === queueStuckNoticeId(SESSION_KEY))
+    expect(toast).toBeTruthy()
+
+    onSubmit.mockResolvedValue(true)
+
+    await act(async () => {
+      toast?.action?.onClick()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0))
+    expect($notifications.get().some(n => n.id === queueStuckNoticeId(SESSION_KEY))).toBe(false)
+  })
+
+  it('does not keep alarming after a remount, which used to reset the budget', async () => {
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => false)
+
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'unsendable' })
+
+    const first = mountDrainer(onSubmit)
+    await bounceBusy(first, MAX_AUTO_DRAIN_ATTEMPTS)
+    expect($notifications.get().some(n => n.id === queueStuckNoticeId(SESSION_KEY))).toBe(true)
+
+    const spent = onSubmit.mock.calls.length
+    first.unmount()
+    $notifications.set([])
+
+    // A session switch or a reconnect. The counter used to live on this
+    // component, so this bought four more attempts and one more toast — forever,
+    // since the queue itself survives in localStorage.
+    const second = mountDrainer(onSubmit)
+    await bounceBusy(second, MAX_AUTO_DRAIN_ATTEMPTS)
+
+    expect(onSubmit.mock.calls.length).toBe(spent)
+    expect($notifications.get()).toHaveLength(0)
   })
 })
