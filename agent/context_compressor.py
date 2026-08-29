@@ -1102,7 +1102,6 @@ class _CompressionAttemptProviderBudget:
     def __init__(self, max_calls: int, cancel_check=None) -> None:
         self.max_calls = max(1, int(max_calls))
         self.started_calls = 0
-        self.completed_calls = 0
         self._cancel_check = cancel_check
 
     @property
@@ -1124,10 +1123,6 @@ class _CompressionAttemptProviderBudget:
             return False
         self.started_calls += 1
         return True
-
-    def finish_call(self) -> None:
-        self.completed_calls += 1
-
 
 _COMPRESSION_ATTEMPT_PROVIDER_BUDGET: contextvars.ContextVar[
     Optional[_CompressionAttemptProviderBudget]
@@ -1154,14 +1149,9 @@ class _CompressionAttemptBudgetExhausted(RuntimeError):
 
 
 def _start_compression_provider_call() -> bool:
+    """Admit a call, preserving legacy unbounded behavior outside ``compress``."""
     budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
     return budget is None or budget.try_start_call()
-
-
-def _finish_compression_provider_call() -> None:
-    budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
-    if budget is not None:
-        budget.finish_call()
 
 _LEAN_DIGEST_PROMPT = """You are writing one segment of a detailed session log for an AI agent's context checkpoint. Digest the transcript segment below.
 
@@ -4867,8 +4857,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             except Exception as exc:
                 logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
                 body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
-            finally:
-                _finish_compression_provider_call()
             digests.append(f"### Segment {ci + 1}/{n_chunks}\n{body}")
         if not digests:
             return ""
@@ -5333,7 +5321,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                 with aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
             finally:
-                _finish_compression_provider_call()
                 route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
                 _aux_provider = _aux_route.get("provider") or self.provider or ""
                 _aux_model = _aux_route.get("model") or self.summary_model or self.model or ""

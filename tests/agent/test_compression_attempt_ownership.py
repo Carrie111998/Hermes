@@ -264,7 +264,6 @@ class TestLeanAttemptProviderBudget:
 
         with _compression_attempt_provider_budget(max_calls=3) as budget:
             assert budget.try_start_call()  # reserve the main-summary request
-            budget.finish_call()
             result = self._compressor()._build_chunk_digests(turns)
 
         assert len(prompts) == 2
