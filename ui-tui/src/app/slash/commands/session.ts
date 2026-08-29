@@ -100,6 +100,25 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
+    help: 'set a standing goal Hermes works on across turns until achieved',
+    name: 'goal',
+    usage: '/goal [text | draft <text> | show | pause | resume | clear | status]',
+    run: (_arg, ctx, cmd) => {
+      // Backend-owned command — forwarded whole so every subcommand
+      // (including draft/wait/unwait) stays at CLI parity.
+      ctx.gateway.gw
+        .request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
+        .then(
+          ctx.guarded<SlashExecResponse>(r => {
+            const body = r.output || '/goal: no output'
+            ctx.transcript.sys(r.warning ? `warning: ${r.warning}\n${body}` : body)
+          })
+        )
+        .catch(ctx.guardedErr)
+    }
+  },
+
+  {
     help: 'change or show model',
     name: 'model',
     run: (arg, ctx) => {
