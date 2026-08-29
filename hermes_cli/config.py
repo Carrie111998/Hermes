@@ -2329,11 +2329,15 @@ def warn_deprecated_cwd_env_vars() -> None:
 
     # Only emit ANSI color codes when stderr is a color-capable terminal;
     # otherwise the raw ESC sequences leak as jumbled text (e.g. piped
-    # stderr, dumb terminals, NO_COLOR). Matches _term_supports_color()
-    # elsewhere in the codebase, but checks stderr since that's the stream
-    # this warning is written to.
-    color = not os.environ.get("NO_COLOR") and sys.stderr.isatty()
-    warn_mark = "\033[33m⚠\033[0m" if color else "⚠"
+    # stderr, dumb terminals, NO_COLOR). Per the NO_COLOR spec, the mere
+    # presence of NO_COLOR (any value, including empty) disables color.
+    # Matches _term_supports_color() elsewhere in the codebase, but checks
+    # stderr since that's the stream this warning is written to.
+    color = os.environ.get("NO_COLOR") is None and sys.stderr.isatty()
+    yellow = "\033[33m" if color else ""
+    dim = "\033[2m" if color else ""
+    reset = "\033[0m" if color else ""
+    warn_mark = f"{yellow}⚠{reset}" if color else "⚠"
 
     lines: list[str] = []
     if messaging_cwd:
@@ -2350,24 +2354,14 @@ def warn_deprecated_cwd_env_vars() -> None:
         from hermes_constants import display_hermes_home
 
         hint_path = display_hermes_home()
-        if color:
-            lines.insert(0, "\033[33m⚠ Deprecated .env settings detected:\033[0m")
-            lines.append(
-                "  \033[2mMove to config.yaml instead:  "
-                "terminal:\\n    cwd: /your/project/path\033[0m"
-            )
-            lines.append(
-                f"  \033[2mThen remove the old entries from {hint_path}/.env\033[0m"
-            )
-        else:
-            lines.insert(0, "⚠ Deprecated .env settings detected:")
-            lines.append(
-                "  Move to config.yaml instead:  "
-                "terminal:\n    cwd: /your/project/path"
-            )
-            lines.append(
-                f"  Then remove the old entries from {hint_path}/.env"
-            )
+        lines.insert(0, f"{yellow}⚠ Deprecated .env settings detected:{reset}")
+        lines.append(
+            f"  {dim}Move to config.yaml instead:  "
+            f"terminal:\\n    cwd: /your/project/path{reset}"
+        )
+        lines.append(
+            f"  {dim}Then remove the old entries from {hint_path}/.env{reset}"
+        )
         sys.stderr.write("\n".join(lines) + "\n\n")
 
 
