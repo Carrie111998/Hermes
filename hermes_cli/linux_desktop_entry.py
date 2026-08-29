@@ -629,24 +629,21 @@ def _install_icon_to_hicolor(icon: Path) -> bool:
 
     The freedesktop icon lookup finds an installed ``apps/hermes.png``
     by the unqualified name ``hermes``, so the entry can reference the
-    icon without an absolute checkout path. The size subdirectory follows
-    the image's real dimensions read from the PNG IHDR header (no image
-    library needed): a non-256px image belongs in ``scalable`` — putting
-    it under a fixed-size directory would make some themes draw it
-    unscaled. Returns True when the icon is installed (or already up to
-    date); False when it cannot be — the caller then falls back to the
-    absolute path.
+    icon without an absolute checkout path. The size subdirectory must
+    be one the theme actually indexes (hicolor's index.theme lists
+    fixed sizes and ``scalable`` — an unindexed dir like ``1024x1024``
+    would never be found), so the icon lands in ``scalable`` unless the
+    source is exactly 256x256, which goes to the fixed-size dir.
+    Idempotent via content-compare; OSError caught internally (False) —
+    the caller then falls back to the absolute path.
     """
     try:
         raw = icon.read_bytes()
-        width = height = None
+        is_256 = False
         if raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
             width, height = struct.unpack(">II", raw[16:24])
-        subdir = (
-            f"{width}x{height}"
-            if width and height and (width, height) != (256, 256)
-            else ("scalable" if (width, height) != (256, 256) else "256x256")
-        )
+            is_256 = (width, height) == (256, 256)
+        subdir = "256x256" if is_256 else "scalable"
         dest = _xdg_data_home() / "icons" / "hicolor" / subdir / "apps" / "hermes.png"
         if dest.is_file() and dest.read_bytes() == raw:
             return True
