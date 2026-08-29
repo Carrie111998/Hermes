@@ -177,11 +177,12 @@ class TestSaveConfigValueAtomic:
         """The tracked mapping preserves the former plain-dict YAML contract."""
         from hermes_cli.config import load_config
 
-        dumped = yaml.safe_dump(load_config())
+        for dump in (yaml.safe_dump, yaml.dump):
+            dumped = dump(load_config())
 
-        assert yaml.safe_load(dumped)["model"]["default"] == "test-model"
-        assert "_baseline" not in dumped
-        assert "!!python" not in dumped
+            assert yaml.safe_load(dumped)["model"]["default"] == "test-model"
+            assert "_baseline" not in dumped
+            assert "!!python" not in dumped
 
 
 

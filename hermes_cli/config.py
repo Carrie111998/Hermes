@@ -394,10 +394,14 @@ _EXTRA_ENV_KEYS = frozenset({
 })
 import yaml
 
-yaml.SafeDumper.add_representer(
-    _LoadedConfig,
-    yaml.representer.SafeRepresenter.represent_dict,
-)
+
+def _represent_loaded_config(dumper, value):
+    """Serialize tracked snapshots as ordinary YAML mappings."""
+    return dumper.represent_dict(value)
+
+
+yaml.SafeDumper.add_representer(_LoadedConfig, _represent_loaded_config)
+yaml.Dumper.add_representer(_LoadedConfig, _represent_loaded_config)
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
