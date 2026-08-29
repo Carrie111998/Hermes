@@ -10,6 +10,7 @@ import {
   compareApiUrl,
   parseCompareBehindCount,
   resolveBehindCount,
+  resolveSshBehindCount,
   resolveCommitLogSelection,
   shouldCountCommits
 } from './update-count'
@@ -299,4 +300,58 @@ test('parseCompareBehindCount rejects malformed payloads', () => {
   assert.equal(parseCompareBehindCount({ ahead_by: '61' }), null)
   assert.equal(parseCompareBehindCount({ ahead_by: 1.5 }), null)
   assert.equal(parseCompareBehindCount([]), null)
+})
+
+// FAIL-BEFORE: the SSH-official passive check compared tip SHAs and, when they
+// differed, trusted the GitHub compare API alone. A commit that exists only on
+// the user's machine is not on GitHub, so the API 404s and yields null, which
+// the caller read as "update available". Updating cannot clear it — the carried
+// commit survives the update and stays invisible to the API — so the desktop
+// re-prompted on every launch with nothing to install.
+test('ssh check treats a carried local commit as up-to-date, not behind', () => {
+  assert.equal(
+    resolveSshBehindCount({
+      compareBehind: null,
+      currentSha: 'bbb',
+      targetIsAncestorOfHead: true,
+      targetSha: 'aaa'
+    }),
+    0
+  )
+})
+
+test('ssh check reports up-to-date when the tips match', () => {
+  assert.equal(
+    resolveSshBehindCount({
+      compareBehind: 7,
+      currentSha: 'abc',
+      targetIsAncestorOfHead: false,
+      targetSha: 'abc'
+    }),
+    0
+  )
+})
+
+test('ssh check keeps the exact count when genuinely behind', () => {
+  assert.equal(
+    resolveSshBehindCount({
+      compareBehind: 3,
+      currentSha: 'aaa',
+      targetIsAncestorOfHead: false,
+      targetSha: 'bbb'
+    }),
+    3
+  )
+})
+
+test('ssh check keeps the unknown-count signal when the API cannot answer', () => {
+  assert.equal(
+    resolveSshBehindCount({
+      compareBehind: null,
+      currentSha: 'aaa',
+      targetIsAncestorOfHead: false,
+      targetSha: 'bbb'
+    }),
+    null
+  )
 })

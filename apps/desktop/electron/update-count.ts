@@ -9,6 +9,21 @@ function shouldCountCommits({ isShallow }) {
   return !isShallow
 }
 
+// The SSH-official passive check only learns tip SHAs from `ls-remote`, so it
+// cannot count. Differing tips still do not prove the checkout is behind: a
+// carried local commit puts HEAD ahead of the remote tip. Git can prove that
+// case from local objects even on a shallow clone, and it is the only party
+// that knows about a commit which exists nowhere else — the compare API 404s
+// on it and returns null, which would otherwise read as "update available"
+// forever, since updating never removes the carried commit.
+function resolveSshBehindCount({ compareBehind, currentSha, targetIsAncestorOfHead = false, targetSha }) {
+  if (currentSha && targetSha && (currentSha === targetSha || targetIsAncestorOfHead)) {
+    return 0
+  }
+
+  return compareBehind
+}
+
 // Resolve how many commits the local checkout is behind origin for the desktop
 // update indicator. Shallow checkouts use SHA equality plus any positively
 // proven local-ahead ancestry; exact counts remain exclusive to full clones.
@@ -89,4 +104,4 @@ function parseCompareBehindCount(payload) {
   return ahead
 }
 
-export { compareApiUrl, parseCompareBehindCount, resolveBehindCount, resolveCommitLogSelection, shouldCountCommits }
+export { compareApiUrl, parseCompareBehindCount, resolveBehindCount, resolveCommitLogSelection, resolveSshBehindCount, shouldCountCommits }
