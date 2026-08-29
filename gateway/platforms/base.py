@@ -2424,6 +2424,9 @@ class MessageEvent:
     reply_to_author_name: Optional[str] = None
     reply_to_is_own_message: bool = False  # True when the user replied to this bot/assistant's message
 
+    # Normalized source metadata for forwarded platform messages.
+    forward_origin: Optional[Dict[str, str]] = None
+
     # Structured interactive-prompt reply (relay Phase 3). Present when this
     # event is the user answering a native interactive prompt rendered by the
     # relay connector (Discord component / Telegram inline keyboard / Slack
