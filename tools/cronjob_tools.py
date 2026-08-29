@@ -1353,10 +1353,15 @@ def _try_dispatch_background_run(
         ]
         if refreshed.get("next_run_at"):
             lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-        excerpt = _latest_job_output_excerpt(job_id)
-        if excerpt:
-            lines.append("--- JOB OUTPUT ---")
-            lines.append(excerpt)
+        # This completion re-enters the session that invoked action='run', not
+        # the job's delivery target. Repeating an externally delivered payload
+        # here leaks it into a second, potentially unrelated chat/thread. Local
+        # jobs have no other user-facing destination, so retain their excerpt.
+        if deliver == "local":
+            excerpt = _latest_job_output_excerpt(job_id)
+            if excerpt:
+                lines.append("--- JOB OUTPUT ---")
+                lines.append(excerpt)
         return {
             "status": "completed" if res.get("success") else "error",
             "summary": "\n".join(lines),
