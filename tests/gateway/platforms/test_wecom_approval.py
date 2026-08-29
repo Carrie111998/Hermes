@@ -121,7 +121,10 @@ class TestTemplateCardSecurity:
         )
         assert adapter.handle_message.called
 
-    async def test_unknown_event_key_cleans_up(self):
+    async def test_unknown_event_key_preserves_task(self):
+        """Unknown event_key must NOT clean up the task — an attacker could
+        forward the admin's card and use an invalid key to delete the real
+        task before identity validation. Task preservation is fail-closed."""
         adapter = _make_adapter()
         adapter._approval_tasks["task_123"] = (
             "sess_1", "chat_456", "user_789", time.monotonic(),
@@ -131,7 +134,8 @@ class TestTemplateCardSecurity:
         )
         await adapter._handle_template_card_event(payload["body"], payload)
         assert not adapter.handle_message.called
-        assert "task_123" not in adapter._approval_tasks
+        # Task preserved — admin can still approve (fail-closed)
+        assert "task_123" in adapter._approval_tasks
 
     async def test_approve_session_synthesises_correct_command(self):
         adapter = _make_adapter()
@@ -161,6 +165,39 @@ class TestTemplateCardSecurity:
             {"msgtype": "template_card_event"}, {}
         )
         assert not adapter.handle_message.called
+
+    async def test_unknown_task_id_does_not_dispatch(self):
+        """Attack: attacker guesses/forwards a task_id that is NOT in the
+        approval store. With stored=None the chat/user validation is skipped —
+        verify the command is NOT dispatched (no unvalidated /approve)."""
+        adapter = _make_adapter()
+        # No task stored — attacker sends arbitrary task_id
+        payload = _card_payload(task_id="task_attacker_guess")
+        await adapter._handle_template_card_event(payload["body"], payload)
+        assert not adapter.handle_message.called
+
+    async def test_attacker_forwarded_card_invalid_key_preserves_task(self):
+        """Attack: group member forwards the admin's card to their own chat and
+        clicks with an INVALID event_key. The event_key whitelist check pops the
+        task BEFORE chat/user validation — verify the real task survives so the
+        admin can still approve."""
+        adapter = _make_adapter()
+        adapter._approval_tasks["task_legit"] = (
+            "sess_1", "chat_admin_group", "user_admin", time.monotonic(),
+        )
+        # Attacker forwards card to their own chat, clicks with unknown key
+        payload = _card_payload(
+            {
+                "chatid": "chat_attacker",
+                "chattype": "group",
+                "from": {"userid": "user_attacker"},
+                "template_card_event": {"event_key": "hack", "task_id": "task_legit"},
+            }
+        )
+        await adapter._handle_template_card_event(payload["body"], payload)
+        assert not adapter.handle_message.called
+        # Real task must be preserved — admin can still approve
+        assert "task_legit" in adapter._approval_tasks
 
 
 class TestSendExecApproval:

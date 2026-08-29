@@ -2729,11 +2729,14 @@ class WeComAdapter(BasePlatformAdapter):
 
         if event_key not in ("approve", "approve_session", "approve_always", "deny"):
             logger.warning(
-                "[WeCom] Unknown template_card event_key=%s, "
-                "cleaning up task_id=%s",
+                "[WeCom] Unknown template_card event_key=%s, ignoring "
+                "(task_id=%s preserved — admin can still approve)",
                 event_key, task_id,
             )
-            self._approval_tasks.pop(task_id, None)
+            # Do NOT pop here: an attacker can forward the admin's card to
+            # their own chat and send an invalid event_key, which would
+            # delete the real task BEFORE chat/user identity validation.
+            # Stale tasks are handled by _expire_approval_tasks (TTL).
             return
 
         # Extract sender info
@@ -2745,28 +2748,39 @@ class WeComAdapter(BasePlatformAdapter):
         # Validate: button click must come from the expected admin chat AND user.
         # Prevents forwarded cards from being approved by unauthorized users.
         stored = self._approval_tasks.get(task_id)
-        if stored:
-            _, expected_chat_id, expected_user_id, _ = stored
-            if not expected_user_id:
-                logger.warning(
-                    "[WeCom] admin_user_id empty in approval state — "
-                    "admin identity gate is not enforced (user=%s, key=%s)",
-                    sender_id, event_key,
-                )
-            if expected_chat_id and chat_id != expected_chat_id:
-                logger.warning(
-                    "[WeCom] Unauthorized approval click: "
-                    "expected chat %s, got %s (user=%s, key=%s)",
-                    expected_chat_id, chat_id, sender_id, event_key,
-                )
-                return  # Do NOT pop — let the real admin still approve
-            if expected_user_id and sender_id and sender_id != expected_user_id:
-                logger.warning(
-                    "[WeCom] Unauthorized approval click: "
-                    "expected user %s, got %s (chat=%s, key=%s)",
-                    expected_user_id, sender_id, chat_id, event_key,
-                )
-                return  # Do NOT pop — let the real admin still approve
+        if not stored:
+            # Fail-closed: unknown task_id means we cannot verify the click.
+            # An attacker could forward a card or guess a task_id — without a
+            # stored task there is no expected chat/user to validate against,
+            # so refuse rather than dispatch an unvalidated /approve.
+            # (Matches the Feishu/Telegram/Teams pattern: no state → no action.)
+            logger.warning(
+                "[WeCom] Approval click for unknown task_id=%s ignored "
+                "(user=%s, key=%s)",
+                task_id, sender_id, event_key,
+            )
+            return
+        _, expected_chat_id, expected_user_id, _ = stored
+        if not expected_user_id:
+            logger.warning(
+                "[WeCom] admin_user_id empty in approval state — "
+                "admin identity gate is not enforced (user=%s, key=%s)",
+                sender_id, event_key,
+            )
+        if expected_chat_id and chat_id != expected_chat_id:
+            logger.warning(
+                "[WeCom] Unauthorized approval click: "
+                "expected chat %s, got %s (user=%s, key=%s)",
+                expected_chat_id, chat_id, sender_id, event_key,
+            )
+            return  # Do NOT pop — let the real admin still approve
+        if expected_user_id and sender_id and sender_id != expected_user_id:
+            logger.warning(
+                "[WeCom] Unauthorized approval click: "
+                "expected user %s, got %s (chat=%s, key=%s)",
+                expected_user_id, sender_id, chat_id, event_key,
+            )
+            return  # Do NOT pop — let the real admin still approve
 
         # Clean up the task mapping
         self._approval_tasks.pop(task_id, None)
