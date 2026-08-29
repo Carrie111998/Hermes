@@ -113,7 +113,7 @@ class TestUnknownSlugInteractive:
         self, _isolated_hermes_home, capsys, monkeypatch
     ):
         _seed_provider("delegation.provider", "openrouter", _isolated_hermes_home)
-        monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
+        monkeypatch.setattr("hermes_cli.config._is_interactive", lambda: True)
         with patch(
             "hermes_cli.models.cached_provider_model_ids",
             return_value=_OPENROUTER_CATALOG,
@@ -132,7 +132,7 @@ class TestUnknownSlugInteractive:
         self, _isolated_hermes_home, capsys, monkeypatch
     ):
         _seed_provider("delegation.provider", "openrouter", _isolated_hermes_home)
-        monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
+        monkeypatch.setattr("hermes_cli.config._is_interactive", lambda: True)
         with patch(
             "hermes_cli.models.cached_provider_model_ids",
             return_value=_OPENROUTER_CATALOG,
@@ -152,7 +152,7 @@ class TestUnknownSlugNonTty:
         self, _isolated_hermes_home, capsys, monkeypatch
     ):
         _seed_provider("delegation.provider", "openrouter", _isolated_hermes_home)
-        monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: False))
+        monkeypatch.setattr("hermes_cli.config._is_interactive", lambda: False)
         with patch(
             "hermes_cli.models.cached_provider_model_ids",
             return_value=_OPENROUTER_CATALOG,
@@ -165,7 +165,7 @@ class TestUnknownSlugNonTty:
         self, _isolated_hermes_home, capsys, monkeypatch
     ):
         _seed_provider("delegation.provider", "openrouter", _isolated_hermes_home)
-        monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
+        monkeypatch.setattr("hermes_cli.config._is_interactive", lambda: True)
         with patch(
             "hermes_cli.models.cached_provider_model_ids",
             return_value=_OPENROUTER_CATALOG,
@@ -198,7 +198,9 @@ class TestCustomProvider:
         assert "my-custom-model" in _read_config(_isolated_hermes_home)
 
     def test_empty_provider_skips_validation(self, _isolated_hermes_home, capsys):
-        # delegation.provider defaults to '' (inherit parent) — skip silently.
+        # Both delegation.provider AND model.provider are '' (nothing to
+        # inherit) — the parent fallback finds an empty provider, so validation
+        # is skipped silently. No catalog may be consulted.
         with patch(
             "hermes_cli.models.cached_provider_model_ids",
             side_effect=AssertionError("catalog consulted for empty provider"),
@@ -230,3 +232,169 @@ class TestValidationFailsOpen:
             set_config_value("delegation.model", "totally-fake-model-xyz")
         assert "not in provider" not in _all_output(capsys)
         assert "totally-fake-model-xyz" in _read_config(_isolated_hermes_home)
+
+
+# ---------------------------------------------------------------------------
+# model.default is a genuine model-routing leaf (validated via model.provider)
+# ---------------------------------------------------------------------------
+
+class TestModelDefault:
+    def test_model_default_is_actually_validated(self, _isolated_hermes_home, capsys):
+        # Regression: previously `_model_routing_provider_key('model.default')`
+        # returned None (the leaf guard only matched `<...>.model`), so this
+        # key was NEVER validated. It must consult model.provider's catalog.
+        _seed_provider("model.provider", "openrouter", _isolated_hermes_home)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("model.default", "totally-fake-model-xyz")
+        assert "not in provider" in capsys.readouterr().err
+        assert "totally-fake-model-xyz" in _read_config(_isolated_hermes_home)
+
+    def test_model_default_known_slug_validated_no_warning(
+        self, _isolated_hermes_home, capsys
+    ):
+        # A KNOWN slug must not only avoid the warning but must go THROUGH the
+        # catalog check (it consulted model.provider) rather than short-circuit.
+        _seed_provider("model.provider", "openrouter", _isolated_hermes_home)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("model.default", "google/gemini-3-flash")
+        assert "not in provider" not in _all_output(capsys)
+        assert "google/gemini-3-flash" in _read_config(_isolated_hermes_home)
+
+
+# ---------------------------------------------------------------------------
+# Empty delegation/auxiliary provider inherits the parent model.provider
+# ---------------------------------------------------------------------------
+
+class TestProviderInheritance:
+    def test_delegation_model_inherits_parent_provider(
+        self, _isolated_hermes_home, capsys
+    ):
+        # delegation.provider is '' (inherit parent); model.provider is set.
+        # The model must be validated against the PARENT (model.provider).
+        _seed_provider("model.provider", "openrouter", _isolated_hermes_home)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("delegation.model", "totally-not-a-model")
+        assert "not in provider" in capsys.readouterr().err
+        assert "totally-not-a-model" in _read_config(_isolated_hermes_home)
+
+    def test_auxiliary_model_inherits_parent_provider(
+        self, _isolated_hermes_home, capsys
+    ):
+        # auxiliary.vision.provider explicitly '' (inherit parent); the model
+        # must be validated against that inheritable parent (model.provider).
+        _seed_provider("model.provider", "openrouter", _isolated_hermes_home)
+        _seed_provider("auxiliary.vision.provider", "", _isolated_hermes_home)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("auxiliary.vision.model", "totally-not-a-model")
+        assert "not in provider" in capsys.readouterr().err
+        assert "totally-not-a-model" in _read_config(_isolated_hermes_home)
+
+    def test_inherited_provider_matches_catalog_no_warning(
+        self, _isolated_hermes_home, capsys
+    ):
+        _seed_provider("model.provider", "openrouter", _isolated_hermes_home)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("delegation.model", "upstage/solar-pro4")
+        assert "not in provider" not in _all_output(capsys)
+        assert "upstage/solar-pro4" in _read_config(_isolated_hermes_home)
+
+
+# ---------------------------------------------------------------------------
+# Setting a provider re-validates an already-written sibling model (#97656 gap)
+# ---------------------------------------------------------------------------
+
+class TestProviderSetFollowup:
+    def test_set_provider_revalidates_sibling_model(
+        self, _isolated_hermes_home, capsys
+    ):
+        # Model written first while provider was empty (validation legitimately
+        # skipped) — then provider is set. The sibling must be re-checked and
+        # warn (never block) against the now-known provider.
+        set_config_value("delegation.model", "totally-fake-model-xyz")
+        assert "not in provider" not in _all_output(capsys)  # skipped by empty provider
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("delegation.provider", "openrouter")
+        assert "not in provider" in capsys.readouterr().err
+        # Provider write still succeeds (fail-open, warn-only).
+        assert "openrouter" in _read_config(_isolated_hermes_home)
+
+    def test_model_provider_set_revalidates_model_default(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("model.default", "totally-fake-model-xyz")
+        assert "not in provider" not in _all_output(capsys)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("model.provider", "openrouter")
+        assert "not in provider" in capsys.readouterr().err
+        assert "openrouter" in _read_config(_isolated_hermes_home)
+
+
+# ---------------------------------------------------------------------------
+# Interactive detection requires BOTH stdin and stdout to be TTYs
+# ---------------------------------------------------------------------------
+
+class TestIsInteractive:
+    def test_requires_both_stdin_and_stdout_tty(self, monkeypatch):
+        from hermes_cli.config import _is_interactive
+
+        monkeypatch.setattr("hermes_cli.config.sys.stdin", SimpleNamespace(isatty=lambda: True))
+        # stdout redirected (agent pipe / capture) → not interactive.
+        monkeypatch.setattr("hermes_cli.config.sys.stdout", SimpleNamespace(isatty=lambda: False))
+        assert _is_interactive() is False
+        # both TTYs → interactive.
+        monkeypatch.setattr("hermes_cli.config.sys.stdout", SimpleNamespace(isatty=lambda: True))
+        assert _is_interactive() is True
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter ':variant' broadening only applies to the OpenRouter provider
+# ---------------------------------------------------------------------------
+
+class TestVariantStripping:
+    def test_openrouter_variant_matches_base_in_catalog(
+        self, _isolated_hermes_home, capsys
+    ):
+        _seed_provider("delegation.provider", "openrouter", _isolated_hermes_home)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=_OPENROUTER_CATALOG,
+        ):
+            set_config_value("delegation.model", "upstage/solar-pro4:nitro")
+        # ':nitro' is an OpenRouter base-id variant → no warning.
+        assert "not in provider" not in _all_output(capsys)
+        assert "upstage/solar-pro4:nitro" in _read_config(_isolated_hermes_home)
+
+    def test_variant_not_broadened_for_other_provider(
+        self, _isolated_hermes_home, capsys
+    ):
+        # A ':variant' slug for a NON-OpenRouter provider keeps the exact-match
+        # result — the base-id broadening is OpenRouter-specific.
+        _seed_provider("delegation.provider", "anthropic", _isolated_hermes_home)
+        with patch(
+            "hermes_cli.models.cached_provider_model_ids",
+            return_value=["upstage/solar-pro4", "anthropic/claude-sonnet-4"],
+        ):
+            set_config_value("delegation.model", "upstage/solar-pro4:nitro")
+        assert "not in provider" in capsys.readouterr().err
+        assert "upstage/solar-pro4:nitro" in _read_config(_isolated_hermes_home)

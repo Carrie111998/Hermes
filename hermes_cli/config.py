@@ -5588,7 +5588,11 @@ def _model_routing_provider_key(key: str) -> Optional[str]:
     catalog the model id must come from.
     """
     segs = key.strip().lower().split(".")
-    if not segs or segs[-1] != "model":
+    if not segs:
+        return None
+    # Model-routing leaf keys are ``<...>.model`` plus the ``model`` /
+    # ``model.default`` dual (the mapping stores the id at ``model.default``).
+    if segs[-1] != "model" and segs != ["model", "default"]:
         return None
     if segs in (["model"], ["model", "default"]):
         return "model.provider"
@@ -5599,20 +5603,37 @@ def _model_routing_provider_key(key: str) -> Optional[str]:
     return None
 
 
+def _config_node(container: Any, path: str) -> Any:
+    """Walk *container* by dotted *path*, returning the node or ``None``."""
+    node = container
+    for seg in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(seg)
+    return node
+
+
 def _provider_for_config_path(provider_key: str) -> str:
-    """Read a provider config path from the merged config as a stripped string."""
+    """Read a provider config path from the merged config as a stripped string.
+
+    ``delegation.provider`` and ``auxiliary.<task>.provider`` may be *explicitly*
+    set to ``''`` to mean "inherit the parent provider" (delegation defaults to
+    ``''``; auxiliary tasks default to the ``auto`` sentinel).  An empty leaf
+    therefore falls back to the global ``model.provider`` so a delegation /
+    auxiliary model slug is validated against the provider that actually
+    resolves it.  ``model.provider`` is the root of the chain and has nothing
+    to fall back to.
+    """
     try:
         cfg = load_config()
     except Exception:
         return ""
-    node: Any = cfg
-    for seg in provider_key.split("."):
-        if not isinstance(node, dict):
-            return ""
-        node = node.get(seg)
-    if isinstance(node, str):
-        return node.strip()
-    return ""
+    node = _config_node(cfg, provider_key)
+    value = node.strip() if isinstance(node, str) else ""
+    if not value and provider_key != "model.provider":
+        parent = _config_node(cfg, "model.provider")
+        value = parent.strip() if isinstance(parent, str) else ""
+    return value
 
 
 def _provider_skips_catalog_validation(provider: str) -> bool:
@@ -5645,24 +5666,29 @@ def _provider_skips_catalog_validation(provider: str) -> bool:
     return False
 
 
-def _slug_in_catalog(value: str, catalog: List[str]) -> bool:
+def _slug_in_catalog(value: str, catalog: List[str], provider: str = "") -> bool:
     """Exact (case-insensitive) membership of *value* in *catalog*.
 
     OpenRouter per-request routing variants (``model:nitro`` / ``:floor`` /
     ``:exacto`` / ``:online``) are valid on any base id though not separate
-    catalog SKUs, so their base id is also checked.
+    catalog SKUs, so for OpenRouter their base id is also checked.  Those
+    suffixes are OpenRouter-specific, so they only widen membership when the
+    provider is OpenRouter — a ``:variant`` slug for any other provider keeps
+    the exact-match result.
     """
     ids = {str(m).strip().lower() for m in catalog}
     v = value.strip().lower()
     if v in ids:
         return True
-    try:
-        from hermes_cli.models import _openrouter_variant_base
-        base = _openrouter_variant_base(value)
-        if base and base.strip().lower() in ids:
-            return True
-    except Exception:
-        pass
+    if provider:
+        try:
+            from hermes_cli.models import normalize_provider, _openrouter_variant_base
+            if normalize_provider(provider) == "openrouter":
+                base = _openrouter_variant_base(value)
+                if base and base.strip().lower() in ids:
+                    return True
+        except Exception:
+            pass
     return False
 
 
@@ -5683,9 +5709,53 @@ def _print_model_slug_warning(value: str, provider: str, catalog: List[str]) -> 
               file=sys.stderr)
 
 
-def _stdin_is_tty() -> bool:
+def _is_interactive() -> bool:
+    """True only when BOTH stdin and stdout are TTYs (a real terminal session).
+
+    ``input()`` needs a readable console AND its prompt must reach the user.
+    When stdout is redirected (agent pipes, subprocess capture, CI) the y/N
+    prompt would be silently swallowed, so the interactive confirm path is
+    disabled and the read stays non-interactive (warn-only, fail-open).
+    """
     try:
-        return bool(sys.stdin.isatty())
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _model_key_for_provider_path(provider_key: str) -> Optional[str]:
+    """Return the sibling ``<...>.model`` config path for a model-routing
+    provider key, or None when *provider_key* is not a model-routing provider
+    key.  This is the inverse of ``_model_routing_provider_key``: setting a
+    provider re-validates the sibling model value written earlier."""
+    segs = provider_key.strip().lower().split(".")
+    if segs == ["model", "provider"]:
+        return "model.default"
+    if segs == ["delegation", "provider"]:
+        return "delegation.model"
+    if len(segs) == 3 and segs[0] == "auxiliary" and segs[2] == "provider":
+        return "auxiliary.%s.model" % segs[1]
+    return None
+
+
+def _warn_if_slug_not_in_catalog(value: str, provider: str) -> bool:
+    """Print the ``not in provider catalog`` warning for *value* against
+    *provider's* catalog.  Returns True when the slug is genuinely absent
+    (warning printed).  Fails open — never raises — and silently proceeds for
+    unknown/custom/empty providers, empty/cold catalogs, and lookup errors.
+    Used for the write-time warning as well as the provider-set follow-up.
+    """
+    try:
+        if _provider_skips_catalog_validation(provider):
+            return False
+        from hermes_cli.models import cached_provider_model_ids
+        catalog = cached_provider_model_ids(provider)
+        if not catalog:
+            return False  # cold / unresolvable catalog → fail open
+        if _slug_in_catalog(value, catalog, provider):
+            return False
+        _print_model_slug_warning(value, provider, catalog)
+        return True
     except Exception:
         return False
 
@@ -5712,18 +5782,11 @@ def _validate_model_slug_for_write(key: str, value: Any, *, force: bool) -> bool
         if not raw_value:
             return False  # empty/cleared value has nothing to validate
         provider = _provider_for_config_path(provider_key)
-        if _provider_skips_catalog_validation(provider):
-            return False
-        from hermes_cli.models import cached_provider_model_ids
-        catalog = cached_provider_model_ids(provider)
-        if not catalog:
-            return False  # cold / unresolvable catalog → fail open
-        if _slug_in_catalog(raw_value, catalog):
-            return False
-        _print_model_slug_warning(raw_value, provider, catalog)
+        if not _warn_if_slug_not_in_catalog(raw_value, provider):
+            return False  # known slug, or provider/catalog skip → proceed
         if force:
             return False
-        if not _stdin_is_tty():
+        if not _is_interactive():
             return False  # scripts / agents: warn only, proceed
         reply = input("  Set anyway? [y/N] ")
         return reply.strip().lower() not in {"y", "yes"}
@@ -5950,6 +6013,17 @@ def set_config_value(key: str, value: str, force: bool = False):
             file=sys.stderr,
         )
         sys.exit(1)
+    # Provider-set follow-up (#97656): setting a model-routing provider key
+    # (model.provider / delegation.provider / auxiliary.<task>.provider) when a
+    # sibling model value already exists. The model may have been written while
+    # the provider was still empty (validation correctly skipped it), so now
+    # that the provider is known re-check the sibling against its catalog.
+    # Warn-only and fail-open — never blocks the provider write.
+    _sibling_model_key = _model_key_for_provider_path(key)
+    if _sibling_model_key:
+        _sibling_model_val = _config_node(user_config, _sibling_model_key)
+        if isinstance(_sibling_model_val, str) and _sibling_model_val.strip():
+            _warn_if_slug_not_in_catalog(_sibling_model_val.strip(), coerced_value)
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
