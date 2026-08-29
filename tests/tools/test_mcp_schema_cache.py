@@ -110,3 +110,67 @@ class TestWriteSkip:
         # Changed payload → rewrite.
         msc.write_cache_entry("srv", "fp2", tools=tools, utility_tools=[])
         assert len(saves) == 2
+
+
+class TestStartupCachedEntry:
+    def _isolate(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(msc, "_cache_path", lambda: tmp_path / "cache.json")
+
+    def test_unscoped_miss_falls_back_to_requester_scoped_entry(
+        self, monkeypatch, tmp_path
+    ):
+        self._isolate(monkeypatch, tmp_path)
+        from tools.mcp_oauth_identity import (
+            principal_from_bound_fields,
+            resolve_mcp_oauth_scope,
+        )
+
+        scope = resolve_mcp_oauth_scope(
+            identity_mode="per_user",
+            principal=principal_from_bound_fields("slack", "T1", "U-alice"),
+        )
+        tools = [{"name": "t1", "description": "d", "inputSchema": {"type": "object"}}]
+        msc.write_cache_entry("github", "fp1", tools=tools, oauth_scope=scope)
+        assert msc.get_cached_entry("github", "fp1") is None
+        entry = msc.get_startup_cached_entry("github", "fp1")
+        assert entry is not None
+        assert msc.tools_from_cache_entry(entry) == tools
+
+    def test_unscoped_entry_wins_over_scoped(self, monkeypatch, tmp_path):
+        self._isolate(monkeypatch, tmp_path)
+        from tools.mcp_oauth_identity import (
+            principal_from_bound_fields,
+            resolve_mcp_oauth_scope,
+        )
+
+        scope = resolve_mcp_oauth_scope(
+            identity_mode="per_user",
+            principal=principal_from_bound_fields("slack", "T1", "U-alice"),
+        )
+        public = [{"name": "public", "description": "", "inputSchema": {}}]
+        private = [{"name": "private", "description": "", "inputSchema": {}}]
+        msc.write_cache_entry("github", "fp1", tools=private, oauth_scope=scope)
+        msc.write_cache_entry("github", "fp1", tools=public)
+        entry = msc.get_startup_cached_entry("github", "fp1")
+        assert msc.tools_from_cache_entry(entry) == public
+
+    def test_fingerprint_mismatch_does_not_return_scoped_entry(
+        self, monkeypatch, tmp_path
+    ):
+        self._isolate(monkeypatch, tmp_path)
+        from tools.mcp_oauth_identity import (
+            principal_from_bound_fields,
+            resolve_mcp_oauth_scope,
+        )
+
+        scope = resolve_mcp_oauth_scope(
+            identity_mode="per_user",
+            principal=principal_from_bound_fields("slack", "T1", "U-alice"),
+        )
+        msc.write_cache_entry(
+            "github",
+            "fp1",
+            tools=[{"name": "t1", "description": "", "inputSchema": {}}],
+            oauth_scope=scope,
+        )
+        assert msc.get_startup_cached_entry("github", "OTHER") is None

@@ -38,7 +38,8 @@ needs to replace the import + call site:
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -388,6 +389,85 @@ def reset_session_vars() -> None:
         clear_session_cwd()
     except Exception:
         pass
+
+
+@dataclass(frozen=True, slots=True)
+class BoundSessionPrincipal:
+    """Trusted requester identity bound on the current task.
+
+    Returned only by :func:`get_bound_session_principal`. Values come from
+    ContextVars set by :func:`set_session_vars`; they never fall back to
+    ``os.environ``. ``scope_id`` may be empty on platforms that have no
+    tenant namespace (Telegram, Discord DMs, …).
+    """
+
+    platform: str
+    scope_id: str
+    user_id: str
+
+
+def _bound_session_str(var: ContextVar) -> Optional[str]:
+    """Return a ContextVar string only when it was explicitly bound.
+
+    ``None`` means the var is ``_UNSET`` (not bound in this task — env
+    fallback must not be consulted). An empty string means it was bound
+    empty via :func:`set_session_vars` / :func:`clear_session_vars`.
+    """
+    value = var.get()
+    if value is _UNSET:
+        return None
+    if value is None:
+        return ""
+    return str(value)
+
+
+def get_bound_session_principal() -> Optional[BoundSessionPrincipal]:
+    """Return the authenticated requester, or None if identity is not bound.
+
+    Unlike :func:`get_session_env`, this never reads ``os.environ``. A
+    missing platform or user_id (unset *or* bound-empty) yields ``None`` so
+    MCP OAuth ``per_user`` mode can fail closed instead of impersonating a
+    process-global leftover. Empty ``scope_id`` is allowed: many adapters
+    do not have a tenant namespace.
+    """
+    platform = _bound_session_str(_SESSION_PLATFORM)
+    user_id = _bound_session_str(_SESSION_USER_ID)
+    if platform is None or user_id is None:
+        return None
+    platform = platform.strip()
+    user_id = user_id.strip()
+    if not platform or not user_id:
+        return None
+    scope_raw = _bound_session_str(_SESSION_SCOPE_ID)
+    scope_id = "" if scope_raw is None else scope_raw.strip()
+    return BoundSessionPrincipal(
+        platform=platform, scope_id=scope_id, user_id=user_id
+    )
+
+
+@contextmanager
+def apply_bound_session_principal(
+    principal: BoundSessionPrincipal,
+) -> Iterator[None]:
+    """Re-bind a previously captured principal in this task, then restore.
+
+    Used to carry gateway identity onto the dedicated MCP event-loop thread.
+    ``run_coroutine_threadsafe`` copies that thread's context, not the
+    scheduling thread's, so OAuth ``per_user`` capture would otherwise see
+    no requester (or a stale one). Tokens are reset, not cleared to ``""``,
+    so the loop thread does not retain the principal after the call.
+    """
+    tokens = (
+        _SESSION_PLATFORM.set(principal.platform),
+        _SESSION_SCOPE_ID.set(principal.scope_id),
+        _SESSION_USER_ID.set(principal.user_id),
+    )
+    try:
+        yield
+    finally:
+        _SESSION_USER_ID.reset(tokens[2])
+        _SESSION_SCOPE_ID.reset(tokens[1])
+        _SESSION_PLATFORM.reset(tokens[0])
 
 
 def get_session_env(name: str, default: str = "") -> str:

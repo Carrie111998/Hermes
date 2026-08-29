@@ -271,6 +271,24 @@ mcp_servers:
 
 On first connect, Hermes prints an authorize URL, opens your browser when possible, and waits for the OAuth callback on a local loopback port. Tokens are cached at `~/.hermes/mcp-tokens/<server>.json` with 0o600 perms; subsequent runs reuse them silently until refresh fails.
 
+### Shared gateway: per-requester OAuth (`mcp.oauth.identity_mode`)
+
+By default MCP OAuth is **shared** per Hermes profile: one token file per server under `~/.hermes/mcp-tokens/`. That is correct for a single-user CLI. On a **shared messaging gateway** (Slack / Discord / Telegram / …), turn on requester isolation so Alice's GitHub token cannot be used for Bob:
+
+```yaml
+mcp:
+  oauth:
+    identity_mode: per_user   # default: shared. Typos are rejected, never silently downgraded.
+```
+
+In `per_user` mode:
+
+- OAuth credentials, refresh, 401 recovery, and live connections are keyed by the **authenticated gateway requester** (platform + tenant scope + user id). Empty tenant scope (Telegram DMs, Discord DMs, …) is canonicalized; a missing bound identity fail-closes.
+- Tokens live under `~/.hermes/mcp-tokens/by-user/<opaque-key>/<server>.json`. The key is a digest — raw user ids never appear in paths. A legacy shared `mcp-tokens/<server>.json` is **never** assigned to a requester.
+- Direct CLI, TUI, desktop, and cron **cannot** complete or reuse OAuth without a bound gateway principal. There is no `hermes mcp login --user` selector. `hermes mcp remove <server>` is an admin path and deletes that server's artifacts across every `by-user/` namespace.
+- Stdio and static-header MCP servers stay process-level (not multi-user-safe). Isolation applies to `auth: oauth` servers.
+- Headless consent-URL delivery for messaging is a separate issue ([#78169](https://github.com/NousResearch/hermes-agent/issues/78169)) and is not part of this setting.
+
 **Remote / headless hosts.** When Hermes runs on a different machine than your browser, the loopback callback can't reach your laptop. Two ways to complete the flow:
 
 - **Paste-back (no setup):** on an interactive terminal Hermes prints "Or paste the redirect URL here…" alongside the authorize URL. Open the URL in your browser, approve, copy the full URL the browser ends up on (the redirect will show a connection error — that's expected), paste it at the prompt. Bare `?code=…&state=…` query strings work too.

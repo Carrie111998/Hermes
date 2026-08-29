@@ -33,6 +33,7 @@ def reload_env(monkeypatch):
     calls = {"discover": 0, "shutdown": 0}
     rev_box = {"rev": "rev-a"}
 
+    monkeypatch.setattr(mcp_tool, "reload_mcp_connections", lambda: calls.__setitem__("shutdown", calls["shutdown"] + 1))
     monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: calls.__setitem__("shutdown", calls["shutdown"] + 1))
     monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: calls.__setitem__("discover", calls["discover"] + 1))
     monkeypatch.setattr(srv, "_compute_mcp_rev", lambda: rev_box["rev"])

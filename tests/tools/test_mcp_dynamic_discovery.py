@@ -75,6 +75,39 @@ class TestRefreshTools:
             assert "mcp__live_srv__new_tool" in resolve_toolset("live_srv")
             assert server._registered_tool_names == ["mcp__live_srv__new_tool"]
 
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_tools_still_advertised_by_sibling(self, mock_registry):
+        """Alice dropping a tool must not unregister it while Bob still serves it."""
+        import tools.mcp_tool as mcp
+
+        alice = MCPServerTask("peer_srv")
+        bob = MCPServerTask("peer_srv")
+        alice._config = {}
+        mock_registry.register(
+            name="mcp__peer_srv__old_tool", toolset="mcp-peer_srv", schema={},
+            handler=lambda x: x, check_fn=lambda: True, is_async=False,
+            description="", emoji="",
+        )
+        alice._registered_tool_names = ["mcp__peer_srv__old_tool"]
+        bob._registered_tool_names = ["mcp__peer_srv__old_tool"]
+        alice.session = SimpleNamespace(
+            list_tools=AsyncMock(
+                return_value=SimpleNamespace(tools=[_make_mcp_tool("new_tool", "new")])
+            )
+        )
+        mcp._servers["peer_srv-alice"] = alice
+        mcp._servers["peer_srv-bob"] = bob
+        try:
+            with patch("tools.registry.registry", mock_registry):
+                await alice._refresh_tools()
+            assert "mcp__peer_srv__old_tool" in mock_registry.get_all_tool_names()
+            assert "mcp__peer_srv__new_tool" in mock_registry.get_all_tool_names()
+            assert "mcp__peer_srv__old_tool" not in alice._registered_tool_names
+            assert "mcp__peer_srv__old_tool" in bob._registered_tool_names
+        finally:
+            mcp._servers.pop("peer_srv-alice", None)
+            mcp._servers.pop("peer_srv-bob", None)
+
 
 class TestMessageHandler:
     """Tests for MCPServerTask._make_message_handler dispatch."""

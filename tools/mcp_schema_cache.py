@@ -64,7 +64,27 @@ def _save_all(data: Dict[str, Any]) -> None:
     atomic_json_write(_cache_path(), data, mode=0o600)
 
 
-def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
+def _entry_is_fresh(entry: Any, fingerprint: str) -> bool:
+    """True when *entry* is a dict whose fingerprint matches and TTL holds."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("fingerprint") != fingerprint:
+        return False
+    ttl_ms = entry.get("ttl_ms")
+    written_at = entry.get("written_at")
+    if isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float)):
+        if (time.time() - written_at) * 1000.0 >= float(ttl_ms):
+            return False
+    return True
+
+
+def get_cached_entry(
+    server_name: str,
+    fingerprint: str,
+    *,
+    oauth_scope: Optional[Any] = None,
+    cache_scope: Optional[str] = None,
+) -> Optional[dict]:
     """Return cached entry when fingerprint matches (and TTL holds), else None.
 
     MCP 2026-07-28 (SEP-2549): ``tools/list`` results carry ``ttlMs`` as a
@@ -72,25 +92,64 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     older than its TTL is treated as a miss so the next startup re-probes
     the server instead of serving a stale manifest forever. Entries without
     a recorded TTL (pre-2026 servers) keep the old never-expires behavior.
-    ``cacheScope`` is irrelevant here: this cache is per-user local disk,
-    which satisfies even ``private``.
+
+    In ``per_user`` OAuth mode, ``cacheScope=private`` (and missing hints)
+    are keyed by requester so a shared gateway cannot serve Alice's list
+    to Bob. Explicit ``cacheScope=public`` stays on the unscoped key.
     """
+    from tools.mcp_oauth_identity import schema_cache_entry_key
+
+    key = schema_cache_entry_key(
+        server_name, oauth_scope, cache_scope=cache_scope
+    )
     with _cache_lock:
-        entry = _load_all().get(server_name)
-    if not isinstance(entry, dict):
-        return None
-    if entry.get("fingerprint") != fingerprint:
-        return None
-    ttl_ms = entry.get("ttl_ms")
-    written_at = entry.get("written_at")
-    if isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float)):
-        if (time.time() - written_at) * 1000.0 >= float(ttl_ms):
-            return None
-    return entry
+        entry = _load_all().get(key)
+    return entry if _entry_is_fresh(entry, fingerprint) else None
 
 
-def has_cached_entry(server_name: str, fingerprint: str) -> bool:
-    return get_cached_entry(server_name, fingerprint) is not None
+def get_startup_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
+    """Return a schema-cache entry suitable for process-start tool publication.
+
+    Tries the unscoped/public key first, then any requester-scoped entry
+    for this logical server whose fingerprint and TTL still match.
+
+    This is schemas only — tool *names* are process-global in memory so the
+    model can see them after a gateway restart. It must never be used to
+    select OAuth credentials or a live connection.
+    """
+    unscoped = get_cached_entry(server_name, fingerprint)
+    if unscoped is not None:
+        return unscoped
+
+    from tools.mcp_oauth_identity import is_registry_key_for_server
+
+    with _cache_lock:
+        data = _load_all()
+    for key, entry in data.items():
+        if not isinstance(key, str):
+            continue
+        if key == server_name:
+            continue
+        if not is_registry_key_for_server(key, server_name):
+            continue
+        if _entry_is_fresh(entry, fingerprint):
+            return entry
+    return None
+
+
+def has_cached_entry(
+    server_name: str,
+    fingerprint: str,
+    *,
+    oauth_scope: Optional[Any] = None,
+    cache_scope: Optional[str] = None,
+) -> bool:
+    return get_cached_entry(
+        server_name,
+        fingerprint,
+        oauth_scope=oauth_scope,
+        cache_scope=cache_scope,
+    ) is not None
 
 
 def write_cache_entry(
@@ -101,6 +160,7 @@ def write_cache_entry(
     utility_tools: Optional[List[dict]] = None,
     ttl_ms: Optional[float] = None,
     cache_scope: Optional[str] = None,
+    oauth_scope: Optional[Any] = None,
 ) -> None:
     """Persist tool schemas after a successful live connect.
 
@@ -108,6 +168,11 @@ def write_cache_entry(
     ``tools/list`` result (2026-07-28 servers). ``written_at`` anchors TTL
     expiry in :func:`get_cached_entry`.
     """
+    from tools.mcp_oauth_identity import schema_cache_entry_key
+
+    key = schema_cache_entry_key(
+        server_name, oauth_scope, cache_scope=cache_scope
+    )
     entry = {
         "fingerprint": fingerprint,
         "tools": tools,
@@ -126,17 +191,27 @@ def write_cache_entry(
         # always rewrite: written_at must advance or the entry would expire
         # at its ORIGINAL write time no matter how many live reconnects
         # confirmed it since.
-        if "written_at" not in entry and data.get(server_name) == entry:
+        if "written_at" not in entry and data.get(key) == entry:
             return
-        data[server_name] = entry
+        data[key] = entry
         _save_all(data)
 
 
-def clear_cache_entry(server_name: str) -> None:
+def clear_cache_entry(
+    server_name: str,
+    *,
+    oauth_scope: Optional[Any] = None,
+    cache_scope: Optional[str] = None,
+) -> None:
+    from tools.mcp_oauth_identity import schema_cache_entry_key
+
+    key = schema_cache_entry_key(
+        server_name, oauth_scope, cache_scope=cache_scope
+    )
     with _cache_lock:
         data = _load_all()
-        if server_name in data:
-            del data[server_name]
+        if key in data:
+            del data[key]
             _save_all(data)
 
 

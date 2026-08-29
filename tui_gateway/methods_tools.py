@@ -133,7 +133,7 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, f"compute-host reload_mcp failed: {exc}")
             return _ok(rid, {"status": "reloaded", "turn_isolation": True, "host_ack": ack})
 
-        from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools
+        from tools.mcp_tool import reload_mcp_connections, discover_mcp_tools
 
         def _refresh_session_agent() -> None:
             """Rebuild THIS session's cached tool snapshot from the live
@@ -170,7 +170,7 @@ def _(rid, params: dict) -> dict:
         req_rev = str(params.get("rev") or "")
 
         def _do_full_reload() -> None:
-            """shutdown+discover+refresh under the lock, then mark a completed
+            """reload+discover+refresh under the lock, then mark a completed
             generation. The lock spans the refresh too: releasing after
             discover would let a second reload tear the registry down while
             this one is still reading it to rebuild the session snapshot.
@@ -183,7 +183,7 @@ def _(rid, params: dict) -> dict:
 
             loaded = _compute_mcp_rev()
             for _ in range(_MCP_RELOAD_MAX_PASSES):
-                shutdown_mcp_servers()
+                reload_mcp_connections()
                 discover_mcp_tools()
                 after = _compute_mcp_rev()
                 if after == loaded:

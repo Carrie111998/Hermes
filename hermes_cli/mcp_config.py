@@ -56,6 +56,29 @@ def _error(text: str):
     print(color(f"  ✗ {text}", Colors.RED))
 
 
+def _per_user_oauth_cli_block() -> Optional[str]:
+    """Return an error message when per_user mode has no bound requester.
+
+    Direct CLI / TUI / desktop / cron cannot pick a human OAuth token, and
+    there is no ``--user`` selector. Gateway sessions with a bound principal
+    are the intended ``per_user`` path.
+    """
+    from tools.mcp_oauth_identity import (
+        IDENTITY_MODE_PER_USER,
+        MissingRequesterIdentity,
+        configured_identity_mode,
+        resolve_mcp_oauth_scope,
+    )
+
+    if configured_identity_mode() != IDENTITY_MODE_PER_USER:
+        return None
+    try:
+        resolve_mcp_oauth_scope(uses_oauth=True)
+    except MissingRequesterIdentity as exc:
+        return str(exc)
+    return None
+
+
 def _confirm(question: str, default: bool = True) -> bool:
     default_str = "Y/n" if default else "y/N"
     try:
@@ -410,7 +433,11 @@ def _oauth_tokens_present(name: str) -> bool:
     """
     try:
         from tools.mcp_oauth import HermesTokenStorage
+        from tools.mcp_oauth_identity import MissingRequesterIdentity
+
         return HermesTokenStorage(name).has_cached_tokens()
+    except MissingRequesterIdentity:
+        return False
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("Could not check OAuth tokens for '%s': %s", name, exc)
         # Be permissive on unexpected errors: don't block a real success.
@@ -508,6 +535,16 @@ def cmd_mcp_add(args):
     # ── Authentication ────────────────────────────────────────────────
 
     if url and auth_type == "oauth":
+        blocked = _per_user_oauth_cli_block()
+        if blocked:
+            _error(blocked)
+            _info(
+                "mcp.oauth.identity_mode is per_user. Direct CLI cannot "
+                "complete OAuth for a gateway requester. There is no "
+                "--user selector."
+            )
+            return
+
         print()
         _info(f"Starting OAuth flow for '{name}'...")
         oauth_ok = False
@@ -664,9 +701,11 @@ def cmd_mcp_remove(args):
     # Clean up OAuth tokens if they exist — route through MCPOAuthManager so
     # any provider instance cached in the current process (e.g. from an
     # earlier `hermes mcp test` in the same session) is evicted too.
+    # ``all_identities=True`` is the admin path: removing the server from
+    # config deletes shared artifacts and every by-user namespace for it.
     try:
         from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
+        get_manager().remove(name, all_identities=True)
         _success("Cleaned up OAuth tokens")
     except Exception:
         pass
@@ -822,6 +861,16 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     if server_config.get("auth") != "oauth":
         _error(f"Server '{name}' is not configured for OAuth (auth={server_config.get('auth')})")
         _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
+        return False
+
+    blocked = _per_user_oauth_cli_block()
+    if blocked:
+        _error(blocked)
+        _info(
+            "mcp.oauth.identity_mode is per_user. Direct CLI cannot "
+            "complete OAuth for a gateway requester. There is no "
+            "--user selector."
+        )
         return False
 
     # Wipe both disk and in-memory cache so the next probe forces a fresh

@@ -134,10 +134,10 @@ async def test_handle_401_deduplicates_concurrent_callers(tmp_path, monkeypatch)
     call_count = 0
     real_invalidate = mgr.invalidate_if_disk_changed
 
-    async def counting(name):
+    async def counting(name, **_kwargs):
         nonlocal call_count
         call_count += 1
-        return await real_invalidate(name)
+        return await real_invalidate(name, **_kwargs)
 
     monkeypatch.setattr(mgr, "invalidate_if_disk_changed", counting)
 
