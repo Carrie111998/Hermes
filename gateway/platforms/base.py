@@ -122,6 +122,16 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
+    elif (
+        _platform_name(getattr(source, "platform", None)) == "feishu"
+        and thread_id is not None
+    ):
+        # Feishu rich posts and attachments need a concrete message anchor to
+        # stay in the originating topic. A bare thread_id create can be rejected
+        # by the API or open a sibling topic instead.
+        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        if anchor is not None:
+            metadata["reply_to_message_id"] = str(anchor)
     return metadata
 
 
@@ -2574,6 +2584,10 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # Native conversation identifier returned by platforms that create a
+    # thread/topic as part of a send. Kept last for positional compatibility
+    # with third-party adapters constructing older SendResult shapes.
+    thread_id: Optional[str] = None
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -5944,6 +5958,30 @@ class BasePlatformAdapter(ABC):
             return
         del self._active_sessions[session_key]
 
+    def release_retargeted_session_guard(self, session_key: str) -> bool:
+        """Release a guard after its handler moves work to another session.
+
+        Feishu ``/thread`` starts under the parent-chat guard, creates a stable
+        thread id, then continues under that thread's session key. Releasing the
+        parent only after the thread exists keeps concurrent launches linear
+        without blocking unrelated parent-chat turns for the full agent run.
+        """
+        current_task = asyncio.current_task()
+        if (
+            current_task is None
+            or self._session_tasks.get(session_key) is not current_task
+        ):
+            return False
+
+        self._session_tasks.pop(session_key, None)
+        self._release_session_guard(session_key)
+        self._discard_text_debounce(session_key)
+
+        pending_event = self._pending_messages.pop(session_key, None)
+        if pending_event is not None:
+            self._start_session_processing(pending_event, session_key)
+        return True
+
     def _session_task_is_stale(self, session_key: str) -> bool:
         """Return True if the owner task for ``session_key`` is done/cancelled.
 
@@ -6259,8 +6297,12 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
+                    # The handler may retarget a command (for example Feishu
+                    # /thread) to a new conversation before returning.
+                    _thread_meta = _thread_metadata_for_source(
+                        event.source, _reply_anchor_for_event(event)
+                    )
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
                         _r = await self._send_with_retry(
@@ -6478,6 +6520,13 @@ class BasePlatformAdapter(ABC):
             # streaming already delivered the text (already_sent=True) or
             # when the message was queued behind an active agent.  Log at
             # DEBUG to avoid noisy warnings for expected behavior.
+            # A command handler may retarget the event to a newly created
+            # conversation (Feishu /thread). Recompute after the handler so
+            # final/progress delivery follows the new source, not the parent.
+            _thread_metadata = _thread_metadata_for_source(
+                event.source,
+                _reply_anchor_for_event(event),
+            )
             #
             # Suppress stale response when the session was interrupted by a
             # new message that hasn't been consumed yet.  The pending message
@@ -6579,6 +6628,52 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+
+                # Feishu can deliver the common ``text + MEDIA:image`` response
+                # as one rich post. Keep the concrete reply anchor on that post
+                # so both text and image remain in the same conversation.
+                if (
+                    self.platform == Platform.FEISHU
+                    and len(media_files) == 1
+                    and not images
+                    and not local_files
+                    and not force_document_attachments
+                ):
+                    _inline_path, _inline_is_voice = media_files[0]
+                    if (
+                        Path(_inline_path).suffix.lower()
+                        in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+                        and not _inline_is_voice
+                    ):
+                        try:
+                            inline_result = await self.send_image_file(
+                                chat_id=event.source.chat_id,
+                                image_path=_inline_path,
+                                caption=text_content or None,
+                                reply_to=_reply_anchor_for_event(event),
+                                metadata=_final_thread_metadata,
+                            )
+                            _record_delivery(inline_result)
+                            if getattr(inline_result, "success", False):
+                                text_content = ""
+                                media_files = []
+                            else:
+                                logger.warning(
+                                    "[%s] Feishu inline image delivery failed: %s",
+                                    self.name,
+                                    getattr(
+                                        inline_result,
+                                        "error",
+                                        "send returned success=False",
+                                    ),
+                                )
+                        except Exception as inline_err:
+                            logger.warning(
+                                "[%s] Error sending Feishu inline image post: %s",
+                                self.name,
+                                inline_err,
+                                exc_info=True,
+                            )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
