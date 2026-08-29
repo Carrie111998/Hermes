@@ -20,12 +20,17 @@ import pytest
 @pytest.fixture(autouse=True)
 def _reset_backend():
     """Tear down the cached backend between tests."""
-    from tools.computer_use.tool import reset_backend_for_tests
+    from tools.computer_use.tool import reset_backend_for_tests, set_approval_callback
     reset_backend_for_tests()
+    # These tests exercise dispatch and the backend schema, not the approval
+    # prompt. No callback is wired on headless surfaces and _request_approval
+    # fails closed, so grant destructive actions here; conftest clears it.
+    set_approval_callback(lambda action, args, summary: "approve_once")
     # Force the noop backend.
     with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False):
         yield
     reset_backend_for_tests()
+    set_approval_callback(None)
 
 
 @pytest.fixture

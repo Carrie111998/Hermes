@@ -225,6 +225,9 @@ def test_dispatcher_threads_delivery_mode_to_backend():
     from tools.computer_use import tool as cu
     with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False):
         cu.reset_backend_for_tests()
+        # _request_approval fails closed without a wired prompt; this test
+        # covers delivery-mode threading, not approval.
+        cu.set_approval_callback(lambda action, args, summary: "approve_once")
         be = cu._get_backend()
         cu.handle_computer_use({"action": "click", "element": 5,
                                 "delivery_mode": "foreground"})

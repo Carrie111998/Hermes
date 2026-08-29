@@ -610,9 +610,19 @@ def _request_approval(action: str, args: Dict[str, Any],
             return None
     cb = _approval_callback
     if cb is None:
-        # No CLI approval wired — default allow. Gateway approval is handled
-        # one layer out via the normal tool-approval infra.
-        return None
+        # No prompt surface is wired (headless, gateway, messaging runs).
+        # Silence is not consent here either: deny, so destructive actions
+        # need an interactive session or a durable config grant (checked
+        # before this point), never an absent handler.
+        return json.dumps({
+            "error": (
+                "approval required, but no approval prompt is available on "
+                "this surface — ask the user to run this action from an "
+                "interactive session or grant it in config"
+            ),
+            "code": "approval_unavailable",
+            "action": action,
+        })
     summary = _summarize_action(action, args)
     try:
         verdict = cb(action, args, summary)

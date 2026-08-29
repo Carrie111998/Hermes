@@ -7,7 +7,7 @@ changes the behavior of every later computer-use test in the process:
 a raising callback becomes ``verdict = "deny"`` (dispatch tests see an
 empty backend call list), a blocking callback hangs the run. The pair
 below simulates the forgetful test and asserts the next test still sees
-default-allow behavior.
+the pristine fail-closed denial.
 """
 
 import json
@@ -59,17 +59,24 @@ def test_a_forgets_a_poisoned_approval_callback():
     # no reset — the autouse fixture must clean this up
 
 
-def test_b_still_dispatches_with_default_allow():
-    """Without the isolation fixture this fails: the stale callback raises
-    (arity), ``_request_approval`` converts that into a deny, and the
-    backend never sees the click."""
+def test_b_still_fails_closed_without_a_callback():
+    """Without the isolation fixture this fails differently: the stale
+    callback raises (arity), ``_request_approval`` converts that into a
+    "denied by user", and the error never carries the pristine
+    ``approval_unavailable`` code. With the fixture, pristine state is
+    fail-closed: no callback wired means the destructive action is denied
+    with ``approval_unavailable`` and the backend is never touched.
+    """
     from tools.computer_use import tool as cu_tool
 
     backend = _install_backend(cu_tool)
     result = cu_tool.handle_computer_use({"action": "click", "element": 3})
     call_names = [c[0] for c in backend.calls]
-    assert "click" in call_names, (
-        f"leaked approval callback poisoned this test: {result!r}"
+    assert "click" not in call_names, (
+        f"leaked approval callback or stale grant dispatched the click: {result!r}"
     )
     payload = json.loads(result) if isinstance(result, str) else result
-    assert not (isinstance(payload, dict) and payload.get("error"))
+    assert isinstance(payload, dict)
+    assert payload.get("code") == "approval_unavailable", (
+        f"expected the pristine fail-closed denial, got: {result!r}"
+    )
