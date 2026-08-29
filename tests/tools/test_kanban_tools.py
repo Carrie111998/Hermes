@@ -50,6 +50,8 @@ def worker_env(monkeypatch, tmp_path):
     after we've created the task."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    for profile in ("test-worker", "peer", "qa"):
+        (home / "profiles" / profile).mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
@@ -78,6 +80,277 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def test_configured_orchestrator_worker_can_fan_out(worker_env):
+    from pathlib import Path
+    from tools import kanban_tools as kt
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  orchestrator_profile: test-worker\n",
+        encoding="utf-8",
+    )
+    out = json.loads(kt._handle_create({
+        "title": "research child",
+        "assignee": "peer",
+    }))
+    assert out["ok"] is True
+
+
+def test_worker_cannot_create_or_self_dispatch_gate_children(worker_env):
+    """Implementation workers hand off via review; only orchestrators fan out."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "self-created review gate",
+        "assignee": "peer",
+    }))
+    assert "error" in out
+    assert "orchestrator-only" in out["error"]
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "args"),
+    [
+        ("_handle_complete", {"summary": "done"}),
+        ("_handle_block", {"reason": "waiting", "kind": "dependency"}),
+        ("_handle_request_review", {"summary": "candidate ready"}),
+    ],
+)
+def test_worker_cannot_end_run_while_background_process_is_live(
+    monkeypatch, worker_env, handler_name, args
+):
+    """A worker-owned test/build must finish before its task can hand off."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(
+        process_registry,
+        "list_sessions",
+        lambda **kwargs: [{
+            "session_id": "proc_live123",
+            "status": "running",
+            "command": "npm run test:e2e",
+            "kanban_task_id": worker_env,
+        }],
+    )
+    out = json.loads(getattr(kt, handler_name)(args))
+    assert "error" in out
+    assert "proc_live123" in out["error"]
+    assert "process wait" in out["error"]
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task is not None
+    assert task.status == "running"
+
+
+def test_other_task_background_process_does_not_block_handoff(
+    monkeypatch, worker_env
+):
+    from tools import kanban_tools as kt
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(
+        process_registry,
+        "list_sessions",
+        lambda **kwargs: [{
+            "session_id": "proc_other",
+            "status": "running",
+            "command": "long server",
+            "kanban_task_id": "t_other",
+        }],
+    )
+    assert kt._reject_live_background_handoff("kanban_complete") is None
+
+
+def test_background_process_events_are_visible_on_the_task(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    assert kt.record_background_process_event_from_env(
+        "started", "proc_abc", "npm run test:e2e"
+    )
+    assert kt.record_background_process_event_from_env(
+        "completed", "proc_abc", "npm run test:e2e", exit_code=0
+    )
+    with kb.connect_closing() as conn:
+        events = kb.list_events(conn, worker_env)
+    notes = [
+        (event.payload or {}).get("note", "")
+        for event in events if event.kind == "heartbeat"
+    ]
+    assert any("proc_abc started" in note for note in notes)
+    assert any("proc_abc completed" in note and "exit=0" in note for note in notes)
+
+
+def test_worktree_review_metadata_binds_clean_exact_head(tmp_path):
+    import subprocess
+    from types import SimpleNamespace
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "file.txt").write_text("v1", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+    task = SimpleNamespace(workspace_kind="worktree", workspace_path=str(repo))
+
+    metadata, error = kt._bind_worktree_review_metadata(task, {})
+    assert error is None
+    assert metadata["candidate_sha"] == head
+    assert metadata["worktree_clean"] is True
+
+    (repo / "file.txt").write_text("dirty", encoding="utf-8")
+    _, error = kt._bind_worktree_review_metadata(task, {})
+    assert "dirty" in error
+
+
+def test_background_process_completion_repairs_start_race(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    assert kt.record_background_process_event_from_env(
+        "completed", "proc_fast", "true", exit_code=0
+    )
+    assert kt.record_background_process_event_from_env(
+        "started", "proc_fast", "true"
+    )
+    with kb.connect_closing() as conn:
+        notes = [
+            (event.payload or {}).get("note", "")
+            for event in kb.list_events(conn, worker_env)
+            if event.kind == "heartbeat" and "proc_fast" in (event.payload or {}).get("note", "")
+        ]
+    assert [
+        note.split(":", 1)[0]
+        for note in notes
+    ] == [
+        "background process proc_fast started",
+        "background process proc_fast completed exit=0",
+    ]
+
+
+def test_request_review_requires_explicit_independent_reviewer(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_request_review({"summary": "candidate"}))
+    assert "independent reviewer is required" in result["error"]
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task is not None
+    assert task.status == "running"
+
+
+def test_worker_cannot_link_foreign_tasks(worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_link({
+        "parent_id": worker_env,
+        "child_id": "t_someone_else",
+    }))
+    assert "orchestrator-only" in result["error"]
+
+
+def test_orchestrator_cannot_assign_review_back_to_implementer(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="candidate", assignee="peer")
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    result = json.loads(kt._handle_request_review({
+        "task_id": task_id,
+        "summary": "ready",
+        "reviewer": "peer",
+    }))
+    assert "implementation assignee" in result["error"]
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+
+
+def test_request_review_rejects_missing_or_self_reviewer(
+    monkeypatch, worker_env
+):
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    real_exists = profiles_mod.profile_exists
+    monkeypatch.setattr(
+        profiles_mod,
+        "profile_exists",
+        lambda name: False if name == "ghost-reviewer" else real_exists(name),
+    )
+    missing = json.loads(kt._handle_request_review({
+        "summary": "candidate",
+        "reviewer": "ghost-reviewer",
+    }))
+    assert "does not exist" in missing["error"]
+
+    self_review = json.loads(kt._handle_request_review({
+        "summary": "candidate",
+        "reviewer": "test-worker",
+    }))
+    assert "cannot review its own" in self_review["error"]
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task is not None
+    assert task.status == "running"
+
+
+def test_create_rejects_missing_profile_before_persisting(monkeypatch, worker_env):
+    """An invented profile must fail at creation, not rot in ready forever."""
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda name: False)
+    out = json.loads(kt._handle_create({
+        "title": "research Arabic",
+        "assignee": "researcher",
+    }))
+
+    assert "error" in out
+    assert "does not exist" in out["error"]
+    assert "external_assignee" in out["error"]
+    with kb.connect_closing() as conn:
+        assert not any(t.title == "research Arabic" for t in kb.list_tasks(conn))
+
+
+def test_create_allows_explicit_external_assignee(monkeypatch, worker_env):
+    """Human-pulled lanes remain supported, but require explicit intent."""
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda name: False)
+    out = json.loads(kt._handle_create({
+        "title": "external lane task",
+        "assignee": "orion-research",
+        "external_assignee": True,
+    }))
+
+    assert out["ok"] is True
+    with kb.connect_closing() as conn:
+        created = kb.get_task(conn, out["task_id"])
+    assert created is not None
+    assert created.assignee == "orion-research"
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -395,8 +668,9 @@ def test_comment_ignores_caller_supplied_author(worker_env):
         conn.close()
 
 
-def test_create_happy_path(worker_env):
+def test_create_happy_path(monkeypatch, worker_env):
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     out = kt._handle_create({
         "title": "child task",
         "assignee": "peer",
@@ -416,7 +690,7 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
-def test_link_happy_path(worker_env):
+def test_link_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -425,6 +699,7 @@ def test_link_happy_path(worker_env):
     finally:
         conn.close()
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     out = kt._handle_link({"parent_id": a, "child_id": b})
     d = json.loads(out)
     assert d["ok"] is True
@@ -487,7 +762,7 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_worker_lifecycle_through_tools(worker_env):
+def test_worker_lifecycle_through_tools(monkeypatch, worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
     the dispatcher/notifier expect."""
@@ -506,12 +781,14 @@ def test_worker_lifecycle_through_tools(worker_env):
         "body": "note: using stdlib sqlite3 bindings",
     }))["ok"]
 
-    # 4. spawn a child task for follow-up
-    child_out = json.loads(kt._handle_create({
-        "title": "write integration test",
-        "assignee": "qa",
-        "parents": [worker_env],
-    }))
+    # 4. an orchestrator, not this implementation worker, fans out a child
+    with monkeypatch.context() as orchestrator_context:
+        orchestrator_context.delenv("HERMES_KANBAN_TASK")
+        child_out = json.loads(kt._handle_create({
+            "title": "write integration test",
+            "assignee": "qa",
+            "parents": [worker_env],
+        }))
     assert child_out["ok"]
 
     # 5. complete with structured handoff
@@ -843,6 +1120,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
@@ -877,6 +1155,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     We should still auto-subscribe, with platform='tui' and
     chat_id=<key>."""
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
@@ -905,6 +1184,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     """CLI / cron / test sessions have no persistent delivery channel.
     _maybe_auto_subscribe returns False and no row is written."""
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
@@ -931,10 +1211,12 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     # home to avoid mkdir() colliding with the worker's directory.
     home = tmp_path / "gate-home" / ".hermes"
     home.mkdir(parents=True)
+    (home / "profiles" / "peer").mkdir(parents=True)
     (home / "config.yaml").write_text(
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 
@@ -956,6 +1238,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     kanban_create. The function returns False and the parent create
     still succeeds with subscribed=False."""
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
 

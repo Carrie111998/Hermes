@@ -379,6 +379,7 @@ class ProcessSession:
     id: str                                     # Unique session ID ("proc_xxxxxxxxxxxx")
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
+    kanban_task_id: str = ""                    # Owning Kanban card, when scoped
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -1062,6 +1063,7 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            kanban_task_id=os.environ.get("HERMES_KANBAN_TASK", ""),
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
@@ -1297,6 +1299,7 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            kanban_task_id=os.environ.get("HERMES_KANBAN_TASK", ""),
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
@@ -1628,6 +1631,29 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+
+        # Only emit lifecycle signals on the FIRST move. Without this guard,
+        # kill_process() and the reader thread can both report the same exit.
+        if was_running:
+            try:
+                from tools.kanban_tools import record_background_process_event_from_env
+
+                state = (
+                    "killed" if session.completion_reason == "killed"
+                    else "lost" if session.completion_reason == "lost"
+                    else "completed"
+                )
+                record_background_process_event_from_env(
+                    state,
+                    session.id,
+                    session.command,
+                    exit_code=session.exit_code,
+                )
+            except Exception:
+                logger.debug(
+                    "kanban background-process completion bridge failed",
+                    exc_info=True,
+                )
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -2589,6 +2615,8 @@ class ProcessRegistry:
                 "status": "exited" if s.exited else "running",
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
             }
+            if s.kanban_task_id:
+                entry["kanban_task_id"] = s.kanban_task_id
             # Flag processes surfaced only because they share the gateway
             # session (not the current task) — these are the long-lived
             # background processes a user may have forgotten about (#29177).
@@ -2806,6 +2834,7 @@ class ProcessRegistry:
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
+                            "kanban_task_id": s.kanban_task_id,
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
@@ -2896,6 +2925,7 @@ class ProcessRegistry:
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
+                kanban_task_id=entry.get("kanban_task_id", ""),
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,

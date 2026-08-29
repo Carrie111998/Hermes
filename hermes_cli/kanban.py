@@ -369,6 +369,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument(
+        "--external-assignee", action="store_true",
+        help="Allow a non-profile assignee intentionally claimed by an external lane",
+    )
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -1662,6 +1666,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.assignee and not getattr(args, "external_assignee", False):
+        from hermes_cli import profiles as profiles_mod
+
+        canonical = profiles_mod.normalize_profile_name(args.assignee)
+        if not profiles_mod.profile_exists(canonical):
+            available = ", ".join(
+                sorted(p.name for p in profiles_mod.list_profiles())
+            ) or "(none)"
+            print(
+                f"kanban: assignee profile {canonical!r} does not exist. "
+                f"Available profiles: {available}. Create it first, choose an "
+                "existing profile, or pass --external-assignee only for an "
+                "intentionally human-pulled external lane.",
+                file=sys.stderr,
+            )
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,

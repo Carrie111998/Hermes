@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset.** Dispatcher-spawned implementation workers receive only their own lifecycle surface (`kanban_show`, `kanban_complete`, `kanban_request_review`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, and attachments). Board-routing tools (`kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`) are reserved for orchestrator profiles that explicitly enable the `kanban` toolset outside a scoped worker run. This prevents an implementer from constructing and approving its own downstream gate graph. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -205,6 +205,11 @@ hermes gateway start
 # 3. Create a task (you — or an orchestrator agent via kanban_create)
 hermes kanban create "research AI funding landscape" --assignee researcher
 
+# Assignees must be installed Hermes profiles. For a deliberately human-pulled
+# terminal lane, opt out explicitly instead of silently accepting a typo:
+hermes kanban create "manual legal review" \
+    --assignee outside-counsel --external-assignee
+
 # 4. Watch activity live (you)
 hermes kanban watch
 
@@ -297,7 +302,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
+| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and an independent installed reviewer profile. For worktree tasks, Hermes rejects dirty trees and binds the handoff metadata to the exact 40-character `HEAD`. The task moves to `review`; this is not a block. | `summary`, `reviewer` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
@@ -323,7 +328,9 @@ kanban_complete(
 )
 ```
 
-An **orchestrator** worker fans out instead:
+Managed background commands are part of the task lifecycle, not detached side work. Their start and completion are mirrored into task heartbeat events, so the board shows real progress. A worker cannot complete, block, or request review while one of its managed background processes is still running; it must use `process wait` (or intentionally cancel it), record the exit result, and only then hand off. This prevents worker teardown from killing a long build/test and losing its verdict.
+
+A configured **orchestrator** worker fans out instead:
 
 ```
 kanban_show()
@@ -344,7 +351,7 @@ kanban_create(
 kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dependencies")
 ```
 
-The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
+The orchestrator tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are exposed only to an unscoped profile with the `kanban` toolset or to the dispatcher worker named by `kanban.orchestrator_profile`. Other task workers cannot fan out or route their own gate graph; they use the first-class same-card `kanban_request_review` handoff. Destructive lifecycle operations remain task-scoped.
 
 ### Why tools instead of shelling to `hermes kanban`
 

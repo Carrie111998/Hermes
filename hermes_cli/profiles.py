@@ -391,8 +391,12 @@ def get_profile_dir(name: str) -> Path:
 
 
 def profile_exists(name: str) -> bool:
-    """Check whether a live (non-tombstoned) profile directory exists."""
-    canon = normalize_profile_name(name)
+    """Check whether a live, safely named profile directory exists."""
+    try:
+        canon = normalize_profile_name(name)
+        validate_profile_name(canon)
+    except (TypeError, ValueError):
+        return False
     if canon == "default":
         return True
     profile_dir = get_profile_dir(canon)

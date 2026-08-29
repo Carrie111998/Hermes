@@ -15,6 +15,8 @@ from hermes_cli import kanban_db as kb
 def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     home = tmp_path / ".hermes"
     home.mkdir()
+    for profile in ("builder", "reviewer"):
+        (home / "profiles" / profile).mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_PROFILE", "builder")
@@ -288,6 +290,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
 ) -> None:
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / "profiles" / "reviewer").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb._INITIALIZED_PATHS.clear()
@@ -319,7 +322,10 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             False,
         ),
     )
-    rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
+    rejected = json.loads(tools._handle_request_review({
+        "summary": "Looks ready.",
+        "reviewer": "reviewer",
+    }))
     assert "error" in rejected
     assert "rejected by judge" in rejected["error"]
     with kb.connect() as conn:

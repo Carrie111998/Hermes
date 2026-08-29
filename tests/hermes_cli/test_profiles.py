@@ -23,6 +23,7 @@ from hermes_cli.profiles import (
     normalize_profile_name,
     validate_profile_name,
     get_profile_dir,
+    profile_exists,
     create_profile,
     delete_profile,
     list_profiles,
@@ -92,6 +93,13 @@ class TestValidateProfileName:
     def test_invalid_names_rejected(self, name):
         with pytest.raises(ValueError):
             validate_profile_name(name)
+
+
+class TestProfileExists:
+    def test_rejects_traversal_even_when_target_directory_exists(self, profile_env):
+        escaped = get_profile_dir("../../escape")
+        escaped.mkdir(parents=True)
+        assert profile_exists("../../escape") is False
 
 
 # ===================================================================

@@ -40,6 +40,41 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 
+def _parse_kanban(argv):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    return parser.parse_args(["kanban", *argv])
+
+
+def test_cli_create_rejects_missing_profile(monkeypatch, kanban_home, capsys):
+    from hermes_cli import profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda name: False)
+    args = _parse_kanban(["create", "bad", "--assignee", "researcher"])
+    assert kc.kanban_command(args) == 2
+    assert "does not exist" in capsys.readouterr().err
+    with kb.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_cli_create_allows_explicit_external_assignee(
+    monkeypatch, kanban_home
+):
+    from hermes_cli import profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda name: False)
+    args = _parse_kanban([
+        "create", "external", "--assignee", "orion-research",
+        "--external-assignee",
+    ])
+    assert kc.kanban_command(args) == 0
+    with kb.connect_closing() as conn:
+        tasks = kb.list_tasks(conn)
+    assert len(tasks) == 1
+    assert tasks[0].assignee == "orion-research"
+
+
 def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
@@ -135,7 +170,9 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db as kb
 
-    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
+    out1 = kc.run_slash(
+        "create 'stuck worker task' --assignee broken-model --external-assignee"
+    )
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     tid = m.group(1)
