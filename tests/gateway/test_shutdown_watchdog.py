@@ -32,6 +32,49 @@ def test_resolve_shutdown_watchdog_delay_adds_grace():
     assert resolve_shutdown_watchdog_delay(10, grace_s=5) == 15.0
 
 
+def test_loop_heartbeat_missing_unix_server_is_clean_platform_fallback(
+    tmp_path, monkeypatch
+):
+    """Native Windows disables the UNIX witness without an exception warning."""
+    monkeypatch.delattr(asyncio, "start_unix_server", raising=False)
+
+    with patch("gateway.shutdown_watchdog.logger") as watchdog_logger:
+        asyncio.run(
+            loop_heartbeat_forever(
+                interval_s=1.0,
+                home=tmp_path,
+                should_continue=lambda: False,
+            )
+        )
+
+    watchdog_logger.warning.assert_not_called()
+    payload = json.loads(get_loop_heartbeat_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["loop_tick_socket"] is False
+
+
+def test_loop_heartbeat_unix_server_bind_failure_still_warns(tmp_path, monkeypatch):
+    """A supported platform's real witness bind failure remains diagnostic."""
+
+    async def fail_bind(*_args, **_kwargs):
+        raise OSError("test bind failure")
+
+    monkeypatch.setattr(asyncio, "start_unix_server", fail_bind, raising=False)
+
+    with patch("gateway.shutdown_watchdog.logger") as watchdog_logger:
+        asyncio.run(
+            loop_heartbeat_forever(
+                interval_s=1.0,
+                home=tmp_path,
+                should_continue=lambda: False,
+            )
+        )
+
+    watchdog_logger.warning.assert_called_once()
+    assert watchdog_logger.warning.call_args.kwargs["exc_info"] is True
+    payload = json.loads(get_loop_heartbeat_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["loop_tick_socket"] is False
+
+
 def test_arm_shutdown_watchdog_fires_with_dump_and_exit(tmp_path):
     done = threading.Event()
     fired = threading.Event()
