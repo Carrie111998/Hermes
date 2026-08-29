@@ -199,13 +199,15 @@ def build_memory_guidance(memory_enabled: bool = True, profile_enabled: bool = T
         return ""
     if memory_enabled:
         frame = (
-            "You have persistent memory across sessions, injected into every "
-            "turn; the memory tool's schema defines what belongs there. "
+            "You have persistent memory, carried across sessions and loaded "
+            "into each new session's context; the memory tool's schema "
+            "defines what belongs there. "
         )
     else:
         frame = (
-            "You have a persistent user profile across sessions, injected "
-            "into every turn; save durable facts about the user with the "
+            "You have a persistent user profile, carried across sessions and "
+            "loaded into each new session's context; save durable facts "
+            "about the user with the "
             "memory tool (target='user') — the built-in notes store is "
             "disabled, so never target='memory'. "
         )
