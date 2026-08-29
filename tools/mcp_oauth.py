@@ -468,6 +468,12 @@ class HermesTokenStorage:
     def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        # Issuer binding (ported from openai/codex#39615): the authorization
+        # server issuer that granted the currently stored refresh token.
+        # ``loaded_issuer`` reflects what the token file on disk recorded;
+        # ``_bound_issuer`` is stamped onto the next ``set_tokens`` write.
+        self.loaded_issuer: str | None = None
+        self._bound_issuer: str | None = None
 
     def _tokens_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
@@ -504,6 +510,10 @@ class HermesTokenStorage:
         # on the next successful ``set_tokens``, which writes the new
         # ``expires_at`` field. The stored ``expires_at`` is stripped before
         # model_validate because it's not part of the SDK's OAuthToken schema.
+        # Issuer binding: recorded by ``set_tokens`` when the authorization
+        # server metadata was known at save time. Not part of the SDK's
+        # OAuthToken schema — pop before model_validate.
+        self.loaded_issuer = data.pop("hermes_issuer", None)
         absolute_expiry = data.pop("expires_at", None)
         if absolute_expiry is not None:
             data["expires_in"] = int(max(absolute_expiry - time.time(), 0))
@@ -541,8 +551,71 @@ class HermesTokenStorage:
                 # Mock tokens or unusual shapes: skip the expires_at write
                 # rather than fail persistence.
                 pass
+        # Issuer binding (openai/codex#39615): record which authorization
+        # server granted these tokens so a later process can refuse to send
+        # the refresh token to a different issuer.
+        if self._bound_issuer:
+            payload["hermes_issuer"] = self._bound_issuer
+            self.loaded_issuer = self._bound_issuer
         _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
+
+    def bind_issuer(self, issuer: str | None) -> None:
+        """Set the authorization-server issuer stamped on future token writes."""
+        self._bound_issuer = str(issuer) if issuer else None
+
+    def stamp_issuer(self, issuer: str) -> None:
+        """Backfill ``hermes_issuer`` onto an existing legacy token file.
+
+        Pre-binding token files have no issuer record. Rather than forcing a
+        re-login, we adopt the currently discovered issuer once so the *next*
+        read is protected against issuer changes.
+        """
+        data = _read_json(self._tokens_path())
+        if data is None or data.get("hermes_issuer"):
+            return
+        data["hermes_issuer"] = str(issuer)
+        try:
+            _write_json(self._tokens_path(), data)
+        except OSError as exc:  # non-fatal — worst case we stamp next time
+            logger.debug(
+                "Could not stamp issuer on tokens for %s: %s",
+                self._server_name, exc,
+            )
+            return
+        self.loaded_issuer = str(issuer)
+        logger.debug(
+            "Stamped issuer %s onto legacy tokens for %s",
+            issuer, self._server_name,
+        )
+
+    def strip_refresh_token(self) -> None:
+        """Remove the refresh token from disk, keeping the access token.
+
+        Used when the discovered authorization server issuer no longer
+        matches the issuer that granted the stored refresh token: the
+        unexpired access token may still be used, but the refresh token must
+        never be sent to a different issuer (openai/codex#39615).
+        """
+        data = _read_json(self._tokens_path())
+        if data is None or not data.get("refresh_token"):
+            return
+        data.pop("refresh_token", None)
+        data.pop("hermes_issuer", None)
+        self.loaded_issuer = None
+        try:
+            _write_json(self._tokens_path(), data)
+        except OSError as exc:
+            logger.warning(
+                "Could not strip refresh token for %s: %s",
+                self._server_name, exc,
+            )
+            return
+        logger.info(
+            "Removed issuer-mismatched refresh token for %s (re-authorization "
+            "will be required when the access token expires)",
+            self._server_name,
+        )
 
     # -- client info -------------------------------------------------------
 
@@ -1161,6 +1234,81 @@ def _paste_callback_reader(result: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _metadata_issuer(context: Any) -> str | None:
+    """Discovered authorization-server issuer from the SDK auth context."""
+    meta = getattr(context, "oauth_metadata", None)
+    issuer = getattr(meta, "issuer", None) if meta is not None else None
+    if not issuer:
+        return None
+    return str(issuer).rstrip("/")
+
+
+def bind_issuer_from_context(context: Any) -> None:
+    """Record the discovered issuer so newly saved tokens carry it.
+
+    Call before ``storage.set_tokens`` (token exchange or refresh). No-op
+    when metadata hasn't been discovered yet or storage isn't Hermes'.
+    """
+    storage = getattr(context, "storage", None)
+    if not isinstance(storage, HermesTokenStorage):
+        return
+    issuer = _metadata_issuer(context)
+    if issuer:
+        storage.bind_issuer(issuer)
+
+
+def enforce_refresh_token_issuer(context: Any) -> None:
+    """Refuse to reuse a refresh token minted by a different issuer.
+
+    Ported from openai/codex#39615: the authorization server discovered for
+    an MCP server can change (DNS takeover, PRM edit, server migration). A
+    stored refresh token must never be sent to a different issuer than the
+    one that originally granted it, or the new issuer captures a long-lived
+    credential.
+
+    Behavior when the discovered issuer differs from the recorded one:
+    the refresh token is stripped (memory + disk) while any unexpired
+    access token is kept usable, and full re-authorization happens when it
+    expires. Legacy token files with no recorded issuer adopt the currently
+    discovered issuer once instead of forcing an immediate re-login
+    (deliberate divergence from Codex, which requires reauth — Hermes has
+    existing installs whose token files predate the field).
+
+    Call after ``_initialize`` restored tokens + metadata, before the SDK's
+    ``can_refresh_token()`` refresh decision.
+    """
+    storage = getattr(context, "storage", None)
+    if not isinstance(storage, HermesTokenStorage):
+        return
+    tokens = getattr(context, "current_tokens", None)
+    if tokens is None or not getattr(tokens, "refresh_token", None):
+        return
+    current = _metadata_issuer(context)
+    if current is None:
+        # Metadata not discovered yet — nothing to validate against. The
+        # SDK's 401-branch discovery will populate it; new token writes are
+        # stamped via bind_issuer_from_context at that point.
+        return
+    stored = (storage.loaded_issuer or "").rstrip("/") or None
+    if stored is None:
+        storage.stamp_issuer(current)
+        return
+    if stored != current:
+        logger.warning(
+            "MCP OAuth: authorization server issuer changed (%s -> %s); "
+            "dropping the stored refresh token rather than sending it to a "
+            "different issuer",
+            stored, current,
+        )
+        storage.strip_refresh_token()
+        try:
+            tokens.refresh_token = None
+        except (TypeError, ValueError):  # frozen/validating model — rebuild
+            data = tokens.model_dump(mode="json", exclude_none=True)
+            data.pop("refresh_token", None)
+            context.current_tokens = OAuthToken.model_validate(data)
+
+
 HermesOAuthClientProvider: Any = None
 
 
@@ -1217,6 +1365,24 @@ def _get_hermes_oauth_provider_class() -> type | None:
             request = await super()._refresh_token()
             return self._stamp_token_user_agent(request)
 
+        async def _initialize(self) -> None:
+            """Load stored state, then enforce refresh-token issuer binding.
+
+            Restores persisted OAuth server metadata when available so the
+            issuer check (and any preemptive refresh) has the discovered
+            ``token_endpoint``/``issuer`` instead of SDK guesses.
+            """
+            await super()._initialize()
+            storage = self.context.storage
+            if (
+                isinstance(storage, HermesTokenStorage)
+                and self.context.oauth_metadata is None
+            ):
+                meta = storage.load_oauth_metadata()
+                if meta is not None:
+                    self.context.oauth_metadata = meta
+            enforce_refresh_token_issuer(self.context)
+
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
             if 200 <= response.status_code < 300:
@@ -1230,6 +1396,7 @@ def _get_hermes_oauth_provider_class() -> type | None:
                     raise OAuthTokenError("Invalid token response") from None
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
+                bind_issuer_from_context(self.context)
                 await self.context.storage.set_tokens(token_response)
                 return
 
@@ -1252,6 +1419,7 @@ def _get_hermes_oauth_provider_class() -> type | None:
                 token_response = OAuthToken.model_validate_json(content)
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
+                bind_issuer_from_context(self.context)
                 await self.context.storage.set_tokens(token_response)
                 return True
             except (HTTPError, ValidationError):

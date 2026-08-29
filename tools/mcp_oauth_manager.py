@@ -211,6 +211,8 @@ def _make_hermes_provider_class() -> Optional[type]:
                     raise OAuthTokenError("Invalid token response") from None
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
+                from tools.mcp_oauth import bind_issuer_from_context
+                bind_issuer_from_context(self.context)
                 await self.context.storage.set_tokens(token_response)
                 return
 
@@ -234,6 +236,8 @@ def _make_hermes_provider_class() -> Optional[type]:
                 token_response = OAuthToken.model_validate_json(content)
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
+                from tools.mcp_oauth import bind_issuer_from_context
+                bind_issuer_from_context(self.context)
                 await self.context.storage.set_tokens(token_response)
                 return True
             except (HTTPError, ValidationError):
@@ -318,6 +322,12 @@ def _make_hermes_provider_class() -> Optional[type]:
                         "failed (non-fatal): %s",
                         self._hermes_server_name, exc,
                     )
+
+            # Issuer binding (openai/codex#39615): with metadata restored or
+            # prefetched, refuse to reuse a refresh token that was granted by
+            # a different authorization server issuer.
+            from tools.mcp_oauth import enforce_refresh_token_issuer
+            enforce_refresh_token_issuer(self.context)
 
         async def _prefetch_oauth_metadata(self) -> None:
             """Fetch PRM + ASM from the well-known endpoints, cache on context.
