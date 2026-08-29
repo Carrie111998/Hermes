@@ -10,6 +10,8 @@ See: agent.skill_commands.extract_user_instruction_from_skill_message and
 MemoryManager._strip_skill_scaffolding.
 """
 
+from pathlib import Path
+
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -199,4 +201,30 @@ class TestGatewayAutoLoadScaffolding:
         mgr.sync_all(_BARE_AUTO_LOAD, "Done.")
         mgr.flush_pending(timeout=5.0)
         assert provider.synced == []
+
+    def test_quoted_prefix_without_continuation_falls_through(self):
+        # A user turn that merely begins with the auto-load opening (e.g. a
+        # pasted note) must stay intact instead of silently vanishing from
+        # every memory provider.
+        quoted = '[IMPORTANT: The "quoted" note the user pasted verbatim'
+        assert extract_user_instruction_from_skill_message(quoted) == quoted
+
+
+def test_auto_load_discriminator_tracks_gateway_builder():
+    # The extractor regex and the gateway note literal live in different
+    # modules; drift would reintroduce the #92036 leak with no signal, so pin
+    # the source literal against the regex directly.
+    import re as _re
+
+    from agent.skill_commands import _AUTO_LOAD_NOTE_RE
+
+    source = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text()
+    literal = _re.search(
+        r"'\[IMPORTANT: The \"\{[^}]+\}\" skill is auto-loaded\.", source
+    )
+    assert literal, "auto-load note literal moved or changed in gateway/run.py"
+    note = literal.group(0)[1:].replace("{_display_name}", "example-skill")
+    assert _AUTO_LOAD_NOTE_RE.match(note) is not None
 

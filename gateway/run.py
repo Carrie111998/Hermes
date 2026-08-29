@@ -19135,10 +19135,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # behind the shared instruction marker so
                     # extract_user_instruction_from_skill_message can recover
                     # it — otherwise memory providers store the whole injected
-                    # skill body as user speech (#92036).
-                    _combined_parts.append(
-                        f"{_SINGLE_SKILL_INSTRUCTION}{event.text}"
-                    )
+                    # skill body as user speech (#92036). Skip the marker on an
+                    # empty tail so the composed prompt has no dangling fragment.
+                    if event.text.strip():
+                        _combined_parts.append(
+                            f"{_SINGLE_SKILL_INSTRUCTION}{event.text}"
+                        )
                     event.text = "\n\n".join(_combined_parts)
                     logger.info(
                         "[Gateway] Auto-loaded skill(s) %s for session %s",
