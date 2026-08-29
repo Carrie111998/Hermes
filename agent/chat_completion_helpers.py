@@ -2675,10 +2675,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         old_model = agent.model
         old_provider = agent.provider
 
-        # Clear the per-config context_length override so the fallback
-        # model's actual context window is resolved instead of inheriting
-        # the stale value from the previous model.  See #22387.
-        agent._config_context_length = None
+        # Replace the primary model's override with the fallback entry's own
+        # intent.  Clearing unconditionally made fallback_providers[].
+        # context_length ineffective and could reject an otherwise valid local
+        # model at the 64K floor.  See #22387 and #92732.
+        from hermes_cli.config import get_fallback_provider_context_length
+
+        agent._config_context_length = get_fallback_provider_context_length(
+            fb_model,
+            fb_provider,
+            fb_base_url,
+            fb,
+        )
         agent.model = fb_model
         agent.provider = fb_provider
         agent.requested_provider = fb_provider

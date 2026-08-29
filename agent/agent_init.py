@@ -2654,6 +2654,26 @@ def init_agent(
                                     )
                     break
 
+    # A runtime selected from ``fallback_providers`` has already replaced the
+    # configured default before initialization.  Its override belongs to that
+    # destination runtime and must not be discarded with model.context_length.
+    if _config_context_length is None:
+        try:
+            from hermes_cli.config import get_fallback_provider_context_length
+
+            _config_context_length = get_fallback_provider_context_length(
+                agent.model,
+                agent.provider,
+                agent.base_url,
+                fallback_model,
+            )
+        except Exception:
+            logger.debug(
+                "Could not resolve the active fallback context override",
+                exc_info=True,
+            )
+            _config_context_length = None
+
     # Persist for reuse on switch_model / fallback activation. Must come
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
@@ -3103,6 +3123,7 @@ def init_agent(
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "config_context_length": agent._config_context_length,
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).

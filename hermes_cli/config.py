@@ -1895,7 +1895,8 @@ def get_custom_provider_context_length(
 
     Matches any entry whose normalized route identity equals ``base_url`` and
     returns ``custom_providers[i].models.<model>.context_length`` if present and
-    valid.  Returns ``None`` when no override applies.
+    valid.  An entry-level ``context_length`` is the provider-wide fallback.
+    Returns ``None`` when no override applies.
 
     This is the single source of truth for custom-provider context overrides,
     used by:
@@ -1932,13 +1933,14 @@ def get_custom_provider_context_length(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
             continue
+        raw_ctx = None
         models = entry.get("models")
-        if not isinstance(models, dict):
-            continue
-        model_cfg = models.get(model)
-        if not isinstance(model_cfg, dict):
-            continue
-        raw_ctx = model_cfg.get("context_length")
+        if isinstance(models, dict):
+            model_cfg = models.get(model)
+            if isinstance(model_cfg, dict):
+                raw_ctx = model_cfg.get("context_length")
+        if raw_ctx is None:
+            raw_ctx = entry.get("context_length")
         if raw_ctx is None:
             continue
         try:
@@ -1947,6 +1949,58 @@ def get_custom_provider_context_length(
             continue
         if ctx > 0:
             return ctx
+    return None
+
+
+def get_fallback_provider_context_length(
+    model: str,
+    provider: str,
+    base_url: str,
+    fallback_providers: Any,
+) -> Optional[int]:
+    """Return the context override for the active fallback runtime.
+
+    Provider/model identity is required.  When an inline fallback also pins a
+    route, that route must match too; this prevents an override for one custom
+    endpoint leaking onto another endpoint that happens to reuse its model id.
+    """
+    entries = (
+        fallback_providers
+        if isinstance(fallback_providers, list)
+        else [fallback_providers]
+        if isinstance(fallback_providers, dict)
+        else []
+    )
+    active_provider = str(provider or "").strip().lower()
+    active_model = str(model or "").strip()
+    active_url = normalize_route_base_url(base_url)
+    if not active_provider or not active_model:
+        return None
+
+    # Prefer an entry pinned to the active route over an otherwise identical
+    # provider/model entry.  Config order remains the tiebreaker within each
+    # specificity tier.
+    for require_route in (True, False):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_provider = str(entry.get("provider") or "").strip().lower()
+            entry_model = str(entry.get("model") or "").strip()
+            if entry_provider != active_provider or entry_model != active_model:
+                continue
+            entry_url = normalize_route_base_url(entry.get("base_url"))
+            if bool(entry_url) != require_route:
+                continue
+            if entry_url and entry_url != active_url:
+                continue
+            raw_ctx = entry.get("context_length")
+            try:
+                context_length = int(raw_ctx)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(raw_ctx, bool) or context_length <= 0:
+                continue
+            return context_length
     return None
 
 

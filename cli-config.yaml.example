@@ -137,6 +137,10 @@ model:
   #   my-proxy:
   #     base_url: "https://llm.internal.example.com/v1"
   #     key_env: "MY_PROXY_API_KEY"
+  #     context_length: 131072  # Provider-wide default for this route.
+  #     models:
+  #       large-model:
+  #         context_length: 262144  # Per-model value takes precedence.
   #     extra_headers:
   #       CF-Access-Client-Id: "xxxx.access"
   #       CF-Access-Client-Secret: "${CF_ACCESS_SECRET}"

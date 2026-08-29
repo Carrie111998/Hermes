@@ -10,11 +10,44 @@ from unittest.mock import patch
 
 from hermes_cli.config import (
     get_custom_provider_context_length,
+    get_fallback_provider_context_length,
     get_custom_provider_model_capability,
 )
 
 
 class TestGetCustomProviderContextLength:
+
+    def test_provider_level_override_applies_when_model_has_no_override(self):
+        custom = [
+            {
+                "base_url": "https://example.invalid/v1",
+                "context_length": 65_536,
+                "models": {"m": {}},
+            }
+        ]
+
+        assert (
+            get_custom_provider_context_length(
+                "m", "https://example.invalid/v1", custom
+            )
+            == 65_536
+        )
+
+    def test_model_override_wins_over_provider_level_default(self):
+        custom = [
+            {
+                "base_url": "https://example.invalid/v1",
+                "context_length": 65_536,
+                "models": {"m": {"context_length": 131_072}},
+            }
+        ]
+
+        assert (
+            get_custom_provider_context_length(
+                "m", "https://example.invalid/v1", custom
+            )
+            == 131_072
+        )
 
     def test_trailing_slash_insensitive(self):
         custom = [
@@ -50,6 +83,87 @@ class TestGetCustomProviderContextLength:
         assert get_custom_provider_context_length("m", "", [{"base_url": "", "models": {"m": {"context_length": 1}}}]) is None
         assert get_custom_provider_context_length("m", "http://x", None) is None
         assert get_custom_provider_context_length("m", "http://x", []) is None
+
+
+class TestGetFallbackProviderContextLength:
+    def test_matches_the_active_runtime(self):
+        fallbacks = [
+            {
+                "provider": "custom",
+                "model": "qwen3:32b",
+                "base_url": "http://localhost:11434/v1",
+                "context_length": 65_536,
+            }
+        ]
+
+        assert get_fallback_provider_context_length(
+            "qwen3:32b",
+            "custom",
+            "http://localhost:11434/v1/",
+            fallbacks,
+        ) == 65_536
+
+    def test_route_mismatch_does_not_leak_the_override(self):
+        fallback = {
+            "provider": "custom",
+            "model": "shared-model",
+            "base_url": "https://first.invalid/v1",
+            "context_length": 65_536,
+        }
+
+        assert (
+            get_fallback_provider_context_length(
+                "shared-model",
+                "custom",
+                "https://second.invalid/v1",
+                fallback,
+            )
+            is None
+        )
+
+    def test_route_pinned_match_outranks_earlier_unpinned_match(self):
+        fallbacks = [
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "context_length": 32_768,
+            },
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "base_url": "https://exact.invalid/v1",
+                "context_length": 65_536,
+            },
+        ]
+
+        assert get_fallback_provider_context_length(
+            "shared-model",
+            "custom",
+            "https://exact.invalid/v1/",
+            fallbacks,
+        ) == 65_536
+
+    def test_unpinned_match_applies_when_pinned_route_does_not_match(self):
+        fallbacks = [
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "base_url": "https://other.invalid/v1",
+                "context_length": 65_536,
+            },
+            {
+                "provider": "custom",
+                "model": "shared-model",
+                "context_length": 32_768,
+            },
+        ]
+
+        assert get_fallback_provider_context_length(
+            "shared-model",
+            "custom",
+            "https://active.invalid/v1",
+            fallbacks,
+        ) == 32_768
 
 
 class TestGetCustomProviderModelCapability:
