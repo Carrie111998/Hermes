@@ -17,7 +17,9 @@ const baseProps = {
   onToggleConsole: vi.fn(),
   onToggleDevTools: vi.fn(),
   onTogglePins: vi.fn(),
+  onToggleViewport: vi.fn(),
   pinsOpen: false,
+  viewportOpen: false,
   url: 'https://example.com'
 }
 

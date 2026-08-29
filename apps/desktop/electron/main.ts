@@ -16366,6 +16366,53 @@ ipcMain.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
   }
 })
 
+/**
+ * Tell one preview guest it is a different size.
+ *
+ * `scale` shrinks the emulated view into the space the pane actually has; the
+ * renderer sizes the element to match so nothing is letterboxed. Note that
+ * Chromium divides INJECTED input coordinates by this same scale — see
+ * `src/lib/preview-viewport.ts`, which is where the compensation lives.
+ */
+ipcMain.handle('hermes:preview:emulate-device', (_event, payload) => {
+  const guest = electronWebContents.fromId(Number(payload?.webContentsId))
+
+  if (!guest || guest.isDestroyed()) {
+    return false
+  }
+
+  const metrics = payload?.metrics
+
+  try {
+    if (!metrics) {
+      guest.disableDeviceEmulation()
+
+      return true
+    }
+
+    const width = Math.max(1, Math.round(Number(metrics.width) || 0))
+    const height = Math.max(1, Math.round(Number(metrics.height) || 0))
+
+    guest.enableDeviceEmulation({
+      // 0 keeps the real device pixel ratio: this emulates a viewport, not a
+      // screen density, and overriding DPR would change how sharp the preview
+      // looks for no reason the user asked for.
+      deviceScaleFactor: 0,
+      screenPosition: metrics.mobile ? 'mobile' : 'desktop',
+      screenSize: { height, width },
+      scale: Number(metrics.scale) > 0 ? Number(metrics.scale) : 1,
+      viewPosition: { x: 0, y: 0 },
+      viewSize: { height, width }
+    })
+
+    return true
+  } catch {
+    // A guest that went away mid-call is not an error worth surfacing; the
+    // next navigation re-applies from the renderer.
+    return false
+  }
+})
+
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
   const data = payload?.data
 

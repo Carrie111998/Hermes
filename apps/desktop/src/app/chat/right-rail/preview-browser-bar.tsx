@@ -41,7 +41,11 @@ interface PreviewBrowserBarProps {
   /** Opens the annotation panel. Like the console toggle, this acts on THIS
    *  page, so it belongs beside its address rather than on the shared strip. */
   onTogglePins: () => void
+  /** Opens the device-size bar. Same reasoning as the pins toggle: it acts on
+   *  THIS page, so it belongs beside its address. */
+  onToggleViewport: () => void
   pinsOpen: boolean
+  viewportOpen: boolean
   /** The page's CURRENT address (it moves as the user navigates), not the
    *  target the tab was opened with. */
   url: string
@@ -108,8 +112,10 @@ export function PreviewBrowserBar({
   onToggleConsole,
   onToggleDevTools,
   onTogglePins,
+  onToggleViewport,
   pinsOpen,
-  url
+  url,
+  viewportOpen
 }: PreviewBrowserBarProps) {
   const { t } = useI18n()
   const copy = t.preview.web
@@ -212,6 +218,12 @@ export function PreviewBrowserBar({
           text={url}
         />
       </div>
+      <PaneStripGlyph
+        active={viewportOpen}
+        icon={<Codicon name="device-mobile" size="0.8125rem" />}
+        label="Screen size"
+        onSelect={onToggleViewport}
+      />
       <PaneStripGlyph
         active={pinsOpen}
         icon={<Codicon name="comment-draft" size="0.8125rem" />}
