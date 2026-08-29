@@ -434,14 +434,6 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             # dependent-reference migration. Giving this fork terminal access
             # allowed a raw `mv` into .archive/ to bypass that path entirely.
             enabled_toolsets=["skills"],
-            # enabled_toolsets=["skills"] is a security boundary here, not a
-            # convenience filter — this fork must never be able to reach the
-            # filesystem or network directly. The normal toolset resolution
-            # merges in tools a plugin/overlay registered into "skills" via
-            # the registry, which would silently widen this fork's callable
-            # surface without anyone touching this file. Pin it to the
-            # static ["skills_list", "skill_view", "skill_manage"] set.
-            restrict_toolsets_to_static=True,
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The
@@ -453,6 +445,39 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             skip_context_files=True,
             skip_memory=True,
         )
+
+        # enabled_toolsets=["skills"] above is a security boundary here, not
+        # a convenience filter — this fork must never be able to reach the
+        # filesystem or network directly. But AIAgent's normal toolset
+        # resolution merges in tools a plugin/overlay registered into
+        # "skills" via the registry, which would silently widen this fork's
+        # callable surface without anyone touching this file. Recompute the
+        # tool list against ONLY the static toolsets.TOOLSETS definition
+        # (registry merge disabled) and overwrite both `.tools` (what gets
+        # advertised to the model) and `.valid_tool_names` (the actual
+        # dispatch-time gate in conversation_loop.py) so the fork's real
+        # surface is pinned to exactly ["skills_list", "skill_view",
+        # "skill_manage"] regardless of what any plugin registered.
+        #
+        # This is a post-construction override rather than a constructor
+        # kwarg (an earlier version of this fix added
+        # `restrict_toolsets_to_static` to AIAgent.__init__ / init_agent)
+        # specifically so this fix doesn't have to modify run_agent.py or
+        # agent/agent_init.py — both already well past this repo's
+        # file-size gate, and threading a kwarg through them would make
+        # this security fix responsible for sharding two unrelated
+        # multi-thousand-line files.
+        from model_tools import get_tool_definitions
+        _static_tools = get_tool_definitions(
+            enabled_toolsets=["skills"],
+            quiet_mode=True,
+            restrict_toolsets_to_static=True,
+        )
+        review_agent.tools = _static_tools
+        review_agent.valid_tool_names = {
+            t["function"]["name"] for t in _static_tools
+        }
+
         # Disable recursive nudges — the curator must never spawn its own review.
         review_agent._memory_nudge_interval = 0
         review_agent._skill_nudge_interval = 0
@@ -465,23 +490,20 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # start (see agent/turn_context.py).
         review_agent._memory_write_origin = "background_review"
 
-        # Runtime (dispatch-time) belt-and-suspenders on top of
-        # restrict_toolsets_to_static above: even if some future change to
-        # tool assembly (schema caching, provider-specific tool injection,
-        # a permissive function-call parser) let a non-"skills" tool name
-        # reach the model, this thread-local whitelist still refuses to
-        # dispatch it. Same mechanism agent/background_review.py uses for
-        # the memory/skill review fork (#15204) — checked at every tool
-        # dispatch site via hermes_cli.plugins.resolve_pre_tool_block.
+        # Runtime (dispatch-time) belt-and-suspenders on top of the
+        # `.tools`/`.valid_tool_names` override above: even if some future
+        # change to tool assembly (schema caching, provider-specific tool
+        # injection, a permissive function-call parser) let a non-"skills"
+        # tool name reach the model, this thread-local whitelist still
+        # refuses to dispatch it. Same mechanism agent/background_review.py
+        # uses for the memory/skill review fork (#15204) — checked at every
+        # tool dispatch site via hermes_cli.plugins.resolve_pre_tool_block.
         from hermes_cli.plugins import (
             set_thread_tool_whitelist,
             clear_thread_tool_whitelist,
         )
-        review_whitelist = {
-            t["function"]["name"] for t in (getattr(review_agent, "tools", None) or [])
-        }
         set_thread_tool_whitelist(
-            review_whitelist,
+            review_agent.valid_tool_names,
             deny_msg_fmt=(
                 "Curator consolidation pass denied non-whitelisted tool: "
                 "{tool_name}. Only skill management tools are allowed."

@@ -858,6 +858,11 @@ def test_review_fork_restricts_toolsets_to_skills(curator_env, monkeypatch):
     the skills workflow, but only this kwarg filters the advertised request
     schema and prevents raw filesystem mutation. Capturing the constructor
     kwarg is the sole assertion that distinguishes fixed from unfixed code.
+
+    ``_run_llm_review`` additionally overrides ``.tools``/``.valid_tool_names``
+    post-construction to pin the fork to the STATIC skills surface (registry
+    merge disabled) — see ``test_review_fork_pins_tools_to_static_skills_set``
+    for that half of the fix. This test only covers the constructor kwarg.
     """
     curator = curator_env["curator"]
 
@@ -871,9 +876,8 @@ def test_review_fork_restricts_toolsets_to_skills(curator_env, monkeypatch):
     class _StubAgent:
         def __init__(self, *args, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets", "UNSET")
-            captured["restrict_toolsets_to_static"] = kwargs.get(
-                "restrict_toolsets_to_static", "UNSET"
-            )
+            self.tools = []
+            self.valid_tool_names = set()
             self._memory_write_origin = "assistant_tool"
             self._memory_nudge_interval = 0
             self._skill_nudge_interval = 0
@@ -897,13 +901,65 @@ def test_review_fork_restricts_toolsets_to_skills(curator_env, monkeypatch):
         "context_engine tools) would be advertised; got "
         f"{captured.get('enabled_toolsets')!r}"
     )
-    assert captured.get("restrict_toolsets_to_static") is True, (
-        "curator review fork did not pass restrict_toolsets_to_static=True; "
-        "enabled_toolsets=['skills'] alone still merges in any tool a "
-        "plugin/overlay registered into the 'skills' toolset via the "
-        "registry, widening the fork's callable surface past what the "
-        "prompt and guards assume; got "
-        f"{captured.get('restrict_toolsets_to_static')!r}"
+
+
+def test_review_fork_pins_tools_to_static_skills_set(curator_env, monkeypatch):
+    """_run_llm_review must overwrite the fork's `.tools`/`.valid_tool_names`
+    to the STATIC skills surface after construction — not just pass
+    enabled_toolsets=["skills"] to AIAgent(...).
+
+    enabled_toolsets=["skills"] alone still resolves through the
+    registry-merged path (a plugin/overlay could register a tool into the
+    "skills" toolset and widen it). This is a post-construction override
+    (not an AIAgent constructor kwarg) specifically so the fix doesn't have
+    to thread a new parameter through run_agent.py / agent/agent_init.py —
+    both already well past this repo's file-size gate.
+    """
+    curator = curator_env["curator"]
+    import importlib
+    importlib.reload(curator)
+
+    captured = {}
+
+    class _StubAgent:
+        def __init__(self, *args, **kwargs):
+            # A stand-in for whatever AIAgent's own construction would have
+            # produced BEFORE the fix's post-construction override runs —
+            # deliberately including a tool the static surface must not have,
+            # so the assertion below can tell "overwritten" from "untouched".
+            self.tools = [{"function": {"name": "terminal"}}]
+            self.valid_tool_names = {"terminal"}
+            self._memory_write_origin = "assistant_tool"
+            self._memory_nudge_interval = 0
+            self._skill_nudge_interval = 0
+            self._session_messages = []
+
+        def run_conversation(self, user_message=None, **kwargs):
+            # Snapshot from inside the call — this is the state the model
+            # actually saw and the state dispatch actually enforced.
+            captured["tools"] = {
+                t["function"]["name"] for t in (self.tools or [])
+            }
+            captured["valid_tool_names"] = set(self.valid_tool_names or set())
+            return {"final_response": "no change"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
+
+    meta = curator._run_llm_review("review prompt")
+
+    assert meta.get("error") is None, meta.get("error")
+    expected = {"skills_list", "skill_view", "skill_manage"}
+    assert captured.get("tools") == expected, (
+        f"expected .tools overwritten to the static skills set, got "
+        f"{captured.get('tools')!r}"
+    )
+    assert captured.get("valid_tool_names") == expected, (
+        "expected .valid_tool_names (the actual dispatch-time gate in "
+        f"conversation_loop.py) overwritten to the static skills set, got "
+        f"{captured.get('valid_tool_names')!r}"
     )
 
 
@@ -987,10 +1043,11 @@ def test_restrict_toolsets_to_static_blocks_registry_widened_skills_toolset():
 
 
 def test_review_fork_installs_and_clears_runtime_tool_whitelist(curator_env, monkeypatch):
-    """Belt-and-suspenders on top of restrict_toolsets_to_static: the curator
-    fork must also install a dispatch-time thread-local whitelist (the same
-    mechanism agent/background_review.py uses for the memory/skill review
-    fork, #15204) so a tool call outside the resolved surface is refused at
+    """Belt-and-suspenders on top of the `.tools`/`.valid_tool_names`
+    static-surface override: the curator fork must also install a
+    dispatch-time thread-local whitelist (the same mechanism
+    agent/background_review.py uses for the memory/skill review fork,
+    #15204) so a tool call outside the resolved surface is refused at
     dispatch time too, and the whitelist must be cleared afterward so it
     doesn't leak onto unrelated tool calls in this thread.
     """

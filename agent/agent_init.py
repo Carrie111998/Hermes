@@ -547,7 +547,6 @@ def init_agent(
     max_iterations: int = sys.maxsize,  # Default: unlimited tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
-    restrict_toolsets_to_static: bool = False,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
@@ -628,13 +627,6 @@ def init_agent(
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
-        restrict_toolsets_to_static (bool): When True, resolve enabled/disabled
-            toolsets against only the static toolsets.TOOLSETS definition —
-            tools a plugin/overlay registered into a toolset via the registry
-            are excluded from this agent's tool surface. For a caller that
-            relies on enabled_toolsets as a hard security boundary (e.g. the
-            curator's background-review fork), leaving this False lets a
-            plugin silently widen the callable surface (default: False)
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
         verbose_logging (bool): Enable verbose logging for debugging (default: False)
         quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
@@ -962,7 +954,6 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
-    agent.restrict_toolsets_to_static = restrict_toolsets_to_static
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -1618,7 +1609,6 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
-        restrict_toolsets_to_static=restrict_toolsets_to_static,
     )
     
     # Show tool configuration and store valid tool names for validation
