@@ -21,6 +21,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway.master_task_notifications import (
+    build_master_task_event_from_kanban,
+    get_canonical_notification_router,
+)
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -256,6 +260,7 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+        master_task_router = get_canonical_notification_router(self)
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
@@ -696,6 +701,27 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+                        master_task_decision = None
+                        if platform_str == "telegram":
+                            # Telegram operator notifications for master tasks
+                            # now flow through one canonical router. Raw
+                            # subprocess retry telemetry (`crashed` /
+                            # `timed_out`) is still claimed for cursor
+                            # advancement and wake semantics, but it is not
+                            # allowed to act as master-task completion
+                            # authority.
+                            master_task_event = build_master_task_event_from_kanban(
+                                task,
+                                ev,
+                                board_slug=board_slug,
+                            )
+                            if master_task_event is not None:
+                                master_task_decision = master_task_router.decide(
+                                    master_task_event
+                                )
+                                if not master_task_decision.SHOULD_NOTIFY:
+                                    continue
+                                msg = master_task_decision.MESSAGE
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
@@ -782,6 +808,10 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                            if master_task_decision is not None:
+                                master_task_router.remember_delivery(
+                                    master_task_decision.DEDUP_KEY
+                                )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:

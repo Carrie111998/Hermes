@@ -165,7 +165,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
     assert tid in message
-    assert "blocked" in message
+    assert message.startswith("⛔ Task đang bị chặn")
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -609,9 +609,10 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
     text = adapter.sent[0]["text"]
-    assert "TRIAGE" in text
+    assert text.startswith("⛔ Task đang bị chặn")
     assert tid in text
     assert "needs credentials" in text
+    assert "triage" in text
     # Cursor advanced: the event is claimed and not re-delivered.
     conn = kb.connect()
     try:
@@ -682,7 +683,7 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1, "the passive review ping is unchanged"
-    assert "ready for review" in adapter.sent[0]["text"]
+    assert adapter.sent[0]["text"].startswith("👀 Task đang chờ anh review")
 
     wake = _wake_text(adapter)
     assert tid in wake
