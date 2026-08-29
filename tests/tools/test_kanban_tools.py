@@ -487,6 +487,68 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_terminal_tool_run_id_mismatch_fails_loudly(monkeypatch, worker_env):
+    """A worker with a stale env run id gets a DISTINCT error, not a silent
+    protocol violation.
+
+    Regression for the t_d985491b run-id skew: a worker spawned under an old
+    run keeps HERMES_KANBAN_RUN_ID=<old> while the DB current_run_id has
+    advanced. Every terminal tool then failed with the generic "unknown id or
+    not in running/ready", the worker exited rc=0 without a terminal call, and
+    the dispatcher recorded a protocol violation. The tools must now surface
+    the real cause (run-id mismatch) so the worker reports it instead of
+    silently crashing.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Advance the DB current_run_id past what the worker env says.
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, worker_env)  # re-claim creates a NEW run id
+        task = kb.get_task(conn, worker_env)
+        assert task.current_run_id is not None
+    finally:
+        conn.close()
+
+    # Worker env still points at an OLD (stale) run id.
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999")
+
+    for handler, args in (
+        (kt._handle_complete, {"summary": "done"}),
+        (kt._handle_block, {"reason": "stuck", "kind": "dependency"}),
+        (kt._handle_request_review, {"summary": "please review"}),
+    ):
+        out = json.loads(handler(args))
+        assert out.get("ok") is not True, f"{handler.__name__} should fail"
+        msg = out.get("error") or ""
+        assert "run-id mismatch" in msg, (
+            f"{handler.__name__} should fail loudly with run-id mismatch, "
+            f"got: {msg[:200]}"
+        )
+        assert "999" in msg
+
+
+def test_terminal_tool_run_id_match_still_succeeds(worker_env):
+    """A worker whose env run id matches the DB current run id can still
+    complete normally — the mismatch guard must not block healthy workers."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        run_id = task.current_run_id
+    finally:
+        conn.close()
+    assert run_id is not None
+
+    import os
+    os.environ["HERMES_KANBAN_RUN_ID"] = str(run_id)
+    out = json.loads(kt._handle_complete({"summary": "done cleanly"}))
+    assert out.get("ok") is True
+
+
 def test_worker_lifecycle_through_tools(worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
