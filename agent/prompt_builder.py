@@ -1035,18 +1035,15 @@ PLATFORM_HINTS = {
         "a raw host filesystem path. For those cases, state the plain file path "
         "in your response text instead of a MEDIA: tag."
     ),
-    "webui": (
-        "You are in the Hermes WebUI, a browser-based chat interface. "
-        "Full Markdown rendering is supported — headings, bold, italic, code "
-        "blocks, tables, math (LaTeX), and Mermaid diagrams all render natively. "
-        "To display local or remote media/files inline, include "
-        "MEDIA:/absolute/path/to/file or MEDIA:https://... in your response. "
-        "Local file paths must be absolute. Images, audio (with playback speed "
-        "controls), video, PDFs, HTML, CSV, diffs/patches, and Excalidraw files "
-        "render as rich previews. Do not use Markdown image syntax like "
-        "![alt](/path) for local files; local paths are not served that way. "
-        "Use MEDIA:/absolute/path instead."
-    ),
+    # NOTE: a "webui" hint lived here until 2026-08-29. It was a ghost
+    # (verified in the all-platform hint audit, PR #97873): no code path
+    # constructs platform="webui" — the dashboard chat resolves to
+    # 'desktop' or 'tui' (tui_gateway/server.py:_resolve_session_platform),
+    # and the browser chat tab is an xterm.js PTY hosting the TUI, not an
+    # HTML chat renderer. Its content (tables/LaTeX/Mermaid, MEDIA: rich
+    # previews incl. Excalidraw) described a renderer that does not exist
+    # anywhere in web/. If a real WebUI chat surface ships, write a hint
+    # from its actual renderer — do not resurrect this text.
 }
 
 # Telegram rich-messages extension — only injected when the user has opted in
