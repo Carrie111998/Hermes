@@ -58,6 +58,17 @@ const FIXTURE = `<!doctype html>
   <div class="row"><span>Alpha</span><button class="act">Edit</button></div>
   <div class="row"><span>Beta</span><button class="act">Edit</button></div>
   <button id="save" style="margin-top:30px">Save changes</button>
+  <p style="margin-top:40px"><a id="go" href="/second.html">Go to the second page</a></p>
+</body></html>`
+
+// A second page, so the walk between pages can be tested for real: the pin book
+// must not spill page one's comments onto page two.
+const SECOND = `<!doctype html>
+<html><head><meta charset="utf-8"><title>Second</title><style>
+  body{margin:0;font:15px system-ui;padding:24px}
+</style></head><body>
+  <h1 id="second-title">Second page</h1>
+  <button id="publish" style="margin-top:20px">Publish</button>
 </body></html>`
 
 // ---- bundle the engine -----------------------------------------------------
@@ -92,9 +103,9 @@ if (!bundled) {
 // ---- serve + launch --------------------------------------------------------
 
 const profileDir = mkdtempSync(join(tmpdir(), 'hermes-pins-'))
-const server = createServer((_request, response) => {
+const server = createServer((request, response) => {
   response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-  response.end(FIXTURE)
+  response.end(request.url?.startsWith('/second') ? SECOND : FIXTURE)
 })
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
 const URL_ = `http://127.0.0.1:${server.address().port}/`
@@ -184,16 +195,43 @@ async function realDrag(x0, y0, x1, y1) {
   await wait(80)
 }
 
+/**
+ * Wait until the document that will still be here after installing has loaded.
+ *
+ * Evaluating into a context that is about to be replaced by the real document
+ * silently loses every global, which shows up much later as "__pins is not a
+ * function" with no error to explain it.
+ */
+async function settled() {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    try {
+      if ((await evaluate('document.readyState')) === 'complete') return
+    } catch { /* context swapping under us */ }
+    await wait(150)
+  }
+}
+
 /** Install the engine and a tiny driver on the page. */
 async function install() {
-  await evaluate(`${bundled};
+  await evaluate(`try { ${bundled};
     window.__engine = eval(HermesPinBundle.pinEngineSource());
     window.__holder = {};
     window.__pins = function (command) { return window.__engine(document, window.__holder, command) };
     window.__seed = function (pins) {
-      window.__holder.__hermesPinState = { armed: false, drag: null, pins: pins, seq: pins.length }
+      // Mirrors seedScript in preview-pins.ts, filter and all — the rule that
+      // stops one page's comments from being replayed onto another is only
+      // worth testing in the form the app actually ships.
+      var here = String(location.href).replace(/#$/, '');
+      var seed = pins.filter(function (pin) {
+        return !pin.pageUrl || String(pin.pageUrl).replace(/#$/, '') === here;
+      });
+      window.__holder.__hermesPinState = {
+        armed: false, drag: null, hidden: false, pending: [],
+        pins: seed, seq: seed.length, shotData: {}
+      }
     };
-    true`)
+    true } catch (err) { window.__installError = err && err.message; false }`)
 }
 
 const centreOf = selector => evaluate(`(() => {
@@ -205,8 +243,13 @@ const centreOf = selector => evaluate(`(() => {
 try {
   await connect()
   await send('Runtime.enable')
+  await settled()
   await install()
-  check('engine installed in a real page', (await evaluate('typeof window.__pins')) === 'function')
+  check(
+    'engine installed in a real page',
+    (await evaluate('typeof window.__pins')) === 'function',
+    await evaluate('String(window.__installError || "no error recorded")')
+  )
 
   await evaluate(`window.__pins({ verb: 'arm' })`)
   check('armed', (await evaluate(`window.__pins({ verb: 'state' }).armed`)) === true)
@@ -272,18 +315,86 @@ try {
   check('a drag made a region pin', pins[2]?.kind === 'region', JSON.stringify(pins[2]))
   check('the region has real extent', (pins[2]?.region?.w ?? 0) > 0 && (pins[2]?.region?.h ?? 0) > 0)
 
+  // ---- attaching an image, through the real canvas path -------------------
+
+  // jsdom has no canvas and never fires Image.onload, so the downscale, the
+  // thumbnail and the strip only mean anything here.
+  const title = await centreOf('#title')
+  await realClick(title.x, title.y)
+
+  const pasted = await evaluate(`(async () => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 2000
+    canvas.height = 1200
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#2f4fd0'
+    ctx.fillRect(0, 0, 2000, 1200)
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(120, 120, 700, 500)
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
+    const file = new File([blob], 'mockup.png', { type: 'image/png' })
+    const transfer = new DataTransfer()
+    transfer.items.add(file)
+    const area = document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble textarea')
+    if (!area) return { error: 'no bubble textarea' }
+    const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer })
+    area.dispatchEvent(event)
+    return { original: blob.size, prevented: event.defaultPrevented }
+  })()`)
+
+  check('the bubble was open to paste into', !pasted?.error, pasted?.error)
+  check('the paste was swallowed, so no filename lands in the comment', pasted?.prevented === true)
+
+  // FileReader, then two Image decodes and two canvas encodes.
+  let shots = []
+  for (let tries = 0; tries < 40 && !shots.length; tries += 1) {
+    await wait(100)
+    const state = await evaluate(`window.__pins({ verb: 'state' }).pins`)
+    shots = state[3]?.shots ?? []
+  }
+
+  check('a pasted image became an attachment on the pin', shots.length === 1, JSON.stringify(shots).slice(0, 200))
+  check('it was downscaled to the bound', shots[0]?.w === 1400 && shots[0]?.h === 840, JSON.stringify(shots[0] && { h: shots[0].h, w: shots[0].w }))
+  check('the thumbnail is small enough to ride in every report', (shots[0]?.thumb?.length ?? 1e9) < 12_000, String(shots[0]?.thumb?.length))
+
+  const holding = await evaluate(`window.__pins({ verb: 'state' })`)
+  check('the page announces what it is still holding', holding.pendingShots?.length === 1, JSON.stringify(holding.pendingShots))
+  check('an ordinary read carries no image bytes', JSON.stringify(holding.pins).length < 40_000, String(JSON.stringify(holding.pins).length))
+
+  const taken = await evaluate(`window.__pins({ id: ${JSON.stringify(shots[0]?.id ?? '')}, verb: 'take' })`)
+  check('the bytes come out on demand', typeof taken.shot === 'string' && taken.shot.startsWith('data:image/jpeg'), String(taken.shot).slice(0, 40))
+  check('the downscale is worth doing', taken.shot.length < (pasted.original ?? 0), `${taken.shot?.length} vs ${pasted?.original}`)
+  check('nothing is left behind in the page', taken.pendingShots?.length === 0, JSON.stringify(taken.pendingShots))
+  check('asking twice does not resurrect them', (await evaluate(`window.__pins({ id: ${JSON.stringify(shots[0]?.id ?? '')}, verb: 'take' }).shot`)) === null)
+
+  const bubbleBox = await evaluate(`(() => {
+    const node = document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble')
+    if (!node) return null
+    const r = node.getBoundingClientRect()
+    return { bottom: r.bottom, height: r.height, right: r.right, strip: node.querySelectorAll('.strip img').length }
+  })()`)
+  check('the thumbnail is shown in the bubble', bubbleBox?.strip === 1, JSON.stringify(bubbleBox))
+  check(
+    'the bubble stayed on screen after growing',
+    bubbleBox && bubbleBox.bottom <= 900 && bubbleBox.right <= 1000,
+    JSON.stringify(bubbleBox)
+  )
+
+  await evaluate(`document.getElementById('hermes-pin-host').shadowRoot.querySelector('.bubble .go').click(); true`)
+
   // ---- the reload that decides everything ---------------------------------
 
   const before = await evaluate(`JSON.stringify(window.__pins({ verb: 'state' }).pins)`)
   await send('Page.enable')
   await send('Page.reload', { ignoreCache: true })
-  await wait(1200)
+  await wait(400)
+  await settled()
   await install()
 
   await evaluate(`window.__seed(${JSON.stringify(JSON.parse(before))})`)
   const after = await evaluate(`window.__pins({ verb: 'reattach' }).pins`)
 
-  check('every pin came back after a genuine reload', after.length === 3, String(after.length))
+  check('every pin came back after a genuine reload', after.length === 4, String(after.length))
   check('the element pin re-attached', after[0]?.orphaned === false, JSON.stringify(after[0]))
   check('it matched on the page\'s own id', after[0]?.matchedBy === 'selector', after[0]?.matchedBy)
   check('the comment survived', after[0]?.comment === 'too much space above this', after[0]?.comment)
@@ -294,7 +405,8 @@ try {
     const host = document.getElementById('hermes-pin-host')
     return host ? host.shadowRoot.querySelectorAll('.pin').length : 0
   })()`)
-  check('markers were redrawn after the reload', repainted === 3, String(repainted))
+  check('markers were redrawn after the reload', repainted === 4, String(repainted))
+  check('the thumbnail rode along through the reload', (after[3]?.shots?.length ?? 0) === 1, JSON.stringify(after[3]?.shots?.length))
 
   // ---- the element genuinely goes away ------------------------------------
 
@@ -311,6 +423,72 @@ try {
   check('disarming restores the cursor', cursor === '', `cursor is "${cursor}"`)
   const hostStyle = await evaluate(`document.getElementById('hermes-pin-host').getAttribute('style')`)
   check('the overlay stops eating clicks', hostStyle.includes('pointer-events:none'), hostStyle)
+
+  // ---- closing the panel gives the page back -------------------------------
+  //
+  // The reported bug, reproduced the way it was hit: annotate, hide the panel,
+  // click a link. Armed, the click is ours; hidden, it is the page's.
+
+  const link = await centreOf('#go')
+  await evaluate(`window.__pins({ verb: 'arm' })`)
+  const pinsBeforeLink = (await evaluate(`window.__pins({ verb: 'state' }).pins`)).length
+  await realClick(link.x, link.y)
+  await wait(300)
+
+  check(
+    'armed, a click on a link is a comment and not a navigation',
+    (await evaluate(`location.pathname`)) === '/',
+    await evaluate(`location.pathname`)
+  )
+  check(
+    'and it left a pin on the link',
+    (await evaluate(`window.__pins({ verb: 'state' }).pins`)).length === pinsBeforeLink + 1
+  )
+
+  const afterHide = await evaluate(`window.__pins({ verb: 'hide' })`)
+  check('hiding disarms', afterHide.armed === false && afterHide.hidden === true, JSON.stringify({ armed: afterHide.armed, hidden: afterHide.hidden }))
+  check(
+    'hiding takes the markers down',
+    (await evaluate(`document.getElementById('hermes-pin-host').shadowRoot.querySelectorAll('.pin').length`)) === 0
+  )
+  check('hiding keeps the comments', afterHide.pins.length === pinsBeforeLink + 1, String(afterHide.pins.length))
+
+  const carried = await evaluate(`JSON.stringify(window.__pins({ verb: 'state' }).pins)`)
+  await realClick(link.x, link.y)
+  await wait(900)
+
+  check(
+    'hidden, the same click navigates',
+    (await evaluate(`location.pathname`)) === '/second.html',
+    await evaluate(`location.pathname`)
+  )
+
+  // ---- the second page keeps its own comments ------------------------------
+
+  await settled()
+  await install()
+  await evaluate(`window.__seed(${JSON.stringify(JSON.parse(carried))})`)
+  const onSecond = await evaluate(`window.__pins({ verb: 'reattach' }).pins`)
+  check(
+    'page one\'s comments did not follow us here',
+    onSecond.length === 0,
+    JSON.stringify(onSecond.map(pin => pin.target))
+  )
+
+  await evaluate(`window.__pins({ verb: 'arm' })`)
+  const publish = await centreOf('#publish')
+  await realClick(publish.x, publish.y)
+  const secondPins = await evaluate(`window.__pins({ verb: 'state' }).pins`)
+  check('a comment can be placed on the second page', secondPins.length === 1, String(secondPins.length))
+  check(
+    'and it knows which page it belongs to',
+    secondPins[0]?.pageUrl?.endsWith('/second.html'),
+    secondPins[0]?.pageUrl
+  )
+
+  // Both pages together is what "Attach to chat" sends.
+  const mixed = JSON.parse(carried).concat(secondPins)
+  check('the review now spans two pages', new Set(mixed.map(pin => pin.pageUrl)).size === 2, String(new Set(mixed.map(pin => pin.pageUrl)).size))
 } catch (err) {
   failures += 1
   console.log(`  FAIL harness — ${err.message}`)

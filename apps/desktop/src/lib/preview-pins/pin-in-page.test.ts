@@ -164,6 +164,50 @@ describe('placing pins', () => {
     expect(pageSawClick).toBe(false)
   })
 
+  it('holds the click, not just the mouseup', () => {
+    // preventDefault on mouseup does NOT cancel the click the browser
+    // synthesises after it, so without a click listener of its own annotation
+    // mode still followed links. jsdom never generates that click, which is why
+    // this only surfaced in scripts/check-preview-pins.mjs — dispatch it here so
+    // the fast suite keeps the listener honest.
+    // A hash target, not a path: jsdom cannot navigate documents and would
+    // print "Not implemented" noise over a passing run. Whether the browser
+    // really follows the link is settled in check-preview-pins.mjs.
+    document.body.innerHTML = '<a href="#elsewhere" id="go">Go</a>'
+    const link = document.querySelector('#go')!
+    document.elementFromPoint = () => link
+
+    run({ verb: 'arm' })
+    const armedClick = new MouseEvent('click', { bubbles: true, cancelable: true })
+    link.dispatchEvent(armedClick)
+    expect(armedClick.defaultPrevented).toBe(true)
+
+    run({ verb: 'disarm' })
+    const freeClick = new MouseEvent('click', { bubbles: true, cancelable: true })
+    link.dispatchEvent(freeClick)
+    expect(freeClick.defaultPrevented).toBe(false)
+  })
+
+  it('lets the comment bubble keep its own buttons', () => {
+    const pin = placePin('#save')
+    const root = document.getElementById('hermes-pin-host')!.shadowRoot!
+    const bubble = root.querySelector('.bubble')
+    expect(bubble).not.toBeNull()
+
+    const area = bubble!.querySelector('textarea') as HTMLTextAreaElement
+    area.value = 'this needs more room'
+    area.dispatchEvent(new Event('input', { bubbles: true }))
+
+    // The swallower above sees the bubble's clicks first, because the overlay
+    // lives inside the document it listens on. Save has to still work.
+    ;(bubble!.querySelector('button.go') as HTMLButtonElement).click()
+
+    expect(root.querySelector('.bubble')).toBeNull()
+    expect(run({ verb: 'state' }).pins.find((entry: Record<string, unknown>) => entry.id === pin.id)?.comment).toBe(
+      'this needs more room'
+    )
+  })
+
   it('makes a region pin from a drag, for things that are not elements', () => {
     document.elementFromPoint = () => document.querySelector('#save')
     run({ verb: 'arm' })

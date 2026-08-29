@@ -455,6 +455,25 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
   // ---- annotation mode ---------------------------------------------------
 
+  /**
+   * Is this gesture ours?
+   *
+   * Everything the overlay draws lives in the shadow root, so a click on the
+   * comment bubble's Save button arrives at the document listeners first. The
+   * swallowers below must let it through or the bubble's own controls stop
+   * working the moment annotation mode is on.
+   */
+  const insideOverlay = (event: Event) => {
+    const node = doc.getElementById(HOST_ID)
+
+    if (!node) {return false}
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : []
+
+    for (const step of path) {if (step === node) {return true}}
+
+    return false
+  }
+
   const targetAt = (x: number, y: number): Element | null => {
     // The host is pointer-events:none at the root, but a marker inside it is
     // not, so ask the page what is under the cursor with the host discounted.
@@ -463,6 +482,20 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     if (!found || found.id === HOST_ID) {return null}
 
     return found
+  }
+
+  /**
+   * Stop the page acting on a gesture that was meant for us.
+   *
+   * `preventDefault` on mouseup does NOT cancel the click the browser
+   * synthesises afterwards, so commenting on a link still followed it. This is
+   * the listener that actually holds the page still; the mouseup one only
+   * suppresses the default action of the press itself.
+   */
+  const onClick = (event: MouseEvent) => {
+    if (!state.armed || insideOverlay(event)) {return}
+    event.preventDefault()
+    event.stopPropagation()
   }
 
   const onMove = (event: MouseEvent) => {
@@ -497,7 +530,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   }
 
   const onDown = (event: MouseEvent) => {
-    if (!state.armed) {return}
+    if (!state.armed || insideOverlay(event)) {return}
     state.drag = { x0: event.clientX, y0: event.clientY }
   }
 
@@ -513,7 +546,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   }
 
   const onUp = (event: MouseEvent) => {
-    if (!state.armed) {return}
+    if (!state.armed || insideOverlay(event)) {return}
     const drag = state.drag as { x0: number; y0: number } | null
     state.drag = null
     clearLayer('.box')
@@ -596,6 +629,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     doc.addEventListener('mousemove', onMove, true)
     doc.addEventListener('mousedown', onDown, true)
     doc.addEventListener('mouseup', onUp, true)
+    doc.addEventListener('click', onClick as EventListener, true)
     doc.addEventListener('keydown', onKey, true)
     const view = doc.defaultView
 
@@ -604,7 +638,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       view.addEventListener('resize', onScroll, true)
     }
 
-    state.handlers = { onDown, onKey, onMove, onScroll, onUp }
+    state.handlers = { onClick, onDown, onKey, onMove, onScroll, onUp }
     paint()
   }
 
@@ -619,6 +653,7 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       doc.removeEventListener('mousemove', handlers.onMove, true)
       doc.removeEventListener('mousedown', handlers.onDown, true)
       doc.removeEventListener('mouseup', handlers.onUp, true)
+      doc.removeEventListener('click', handlers.onClick, true)
       doc.removeEventListener('keydown', handlers.onKey, true)
       const view = doc.defaultView
 
