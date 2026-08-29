@@ -1,14 +1,226 @@
-"""Shared CLI/TUI-safe helpers for background MCP discovery."""
+"""Shared CLI/TUI-safe helpers for background MCP discovery.
+
+The multiplexed gateway serves many Hermes profiles from ONE process, so the
+coordinator state below is keyed by **canonical profile home** rather than
+being a single process-wide slot. ``tools/mcp_profile.py`` made the MCP
+*runtime* state (server sessions, cooldowns, tool ownership) profile-scoped;
+this module is the thing that decides whether discovery runs at all, and it
+has to be scoped the same way or the first profile to reach the gate owns it
+and every other profile's registry is never populated.
+
+The key is computed the same way ``tools.mcp_profile.canonical_profile_key``
+computes it (``hermes_home_key()`` over the resolved ``HERMES_HOME``), but via
+``hermes_constants`` directly so the non-MCP startup path never imports the
+MCP stack just to look up its own slot.
+"""
 
 from __future__ import annotations
 
 import threading
-from contextlib import nullcontext
-from typing import Optional
+from contextlib import contextmanager, nullcontext
+from typing import Dict, List, Optional, Tuple
 
 _mcp_discovery_lock = threading.Lock()
+
+# Legacy process-global mirror of the MOST RECENTLY started discovery run.
+# Retained because external callers (and several tests) read/inject these
+# directly; the per-profile map below is what actually gates the work. See
+# ``_thread_for_current_profile`` for how an injected legacy thread is told
+# apart from one this module spawned for a specific profile.
 _mcp_discovery_started = False
 _mcp_discovery_thread: Optional[threading.Thread] = None
+
+
+class _ProfileDiscovery:
+    """Background-discovery coordinator state owned by exactly one profile."""
+
+    __slots__ = ("home", "started", "thread")
+
+    def __init__(self, home: str) -> None:
+        self.home = home
+        self.started = False
+        self.thread: Optional[threading.Thread] = None
+
+
+# canonical profile key -> that profile's coordinator state.
+_profile_discovery: Dict[str, _ProfileDiscovery] = {}
+
+# A normal deployment has a handful of profiles, but ephemeral profile homes
+# (one per session) would otherwise accumulate forever in a long-lived
+# gateway. Above this many entries, finished ones are dropped; the worst case
+# for a dropped entry is that its profile re-runs discovery.
+_PROFILE_DISCOVERY_MAX = 256
+
+
+def _current_profile() -> Tuple[str, str]:
+    """Return ``(canonical_key, resolved_home)`` for the CALLING context.
+
+    Falls back to a shared empty key if home resolution fails, which degrades
+    to the historical single-slot behavior rather than crashing startup.
+    """
+    try:
+        from hermes_constants import get_hermes_home, hermes_home_key
+
+        home = str(get_hermes_home())
+        return hermes_home_key(home), home
+    except Exception:
+        return "", ""
+
+
+def _prune_finished_locked() -> None:
+    """Drop coordinator entries with no live thread. Caller holds the lock."""
+    if len(_profile_discovery) < _PROFILE_DISCOVERY_MAX:
+        return
+    for key in [
+        key
+        for key, state in _profile_discovery.items()
+        if state.thread is None or not state.thread.is_alive()
+    ]:
+        _profile_discovery.pop(key, None)
+
+
+def _thread_for_current_profile() -> Optional[threading.Thread]:
+    """Return the discovery thread the CALLING profile should wait on.
+
+    A profile with its own coordinator entry always gets its own thread (or
+    ``None``): profile B must never block on, or report itself in flight
+    because of, profile A's discovery.
+
+    When the calling profile has no entry, fall back to the legacy module
+    global ONLY if that thread was injected from outside (no profile owns it).
+    ``tui_gateway.entry`` and the late-refresh owner probes rely on that
+    fallback; a thread this module spawned belongs to one profile and is
+    deliberately invisible to the others. Either way this is a *wait* target
+    only -- it grants no access to another profile's registry.
+    """
+    key, _home = _current_profile()
+    with _mcp_discovery_lock:
+        state = _profile_discovery.get(key)
+        if state is not None:
+            return state.thread
+        legacy = _mcp_discovery_thread
+        if legacy is None:
+            return None
+        if any(s.thread is legacy for s in _profile_discovery.values()):
+            return None
+        return legacy
+
+
+def _capture_caller_scope() -> Tuple[Optional[str], Optional[object]]:
+    """Snapshot the caller's profile scope for replay inside the thread."""
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        home_override = get_hermes_home_override()
+    except Exception:
+        home_override = None
+    try:
+        from agent.secret_scope import current_secret_scope
+
+        secret_scope = current_secret_scope()
+    except Exception:
+        secret_scope = None
+    return home_override, secret_scope
+
+
+@contextmanager
+def _caller_profile_scope(home_override, secret_scope):
+    """Re-install the caller's profile scope inside the discovery thread.
+
+    ContextVars do not propagate into a bare ``threading.Thread``, so both
+    halves of the profile identity have to be replayed here:
+
+    * the ``HERMES_HOME`` override, or discovery reads the LAUNCH profile's
+      ``mcp_servers`` instead of the selected profile's (#67605);
+    * the **secret scope**, or every ``${VAR}`` in that profile's MCP config
+      resolves through ``agent.secret_scope.get_secret`` with no scope. Under
+      multiplexing that fails closed with ``UnscopedSecretError``, which
+      ``tools.mcp_tool._load_mcp_config`` swallows into an EMPTY config -- the
+      profile silently discovers nothing. The same scope is what the
+      service-account token exchange needs when discovery hands work to the
+      shared MCP event loop (``_wrap_with_profile_scope`` propagates whatever
+      scope is active on the scheduling thread, which is this one).
+
+    A caller with no scope installs none: single-profile CLI/TUI behavior is
+    unchanged, and we never invent a scope that would mask a missing one.
+    """
+    home_token = None
+    secret_token = None
+    try:
+        from hermes_constants import set_hermes_home_override
+
+        home_token = set_hermes_home_override(home_override)
+    except Exception:
+        home_token = None
+    if secret_scope is not None:
+        try:
+            from agent.secret_scope import set_secret_scope
+
+            secret_token = set_secret_scope(secret_scope)
+        except Exception:
+            secret_token = None
+    try:
+        yield
+    finally:
+        if secret_token is not None:
+            try:
+                from agent.secret_scope import reset_secret_scope
+
+                reset_secret_scope(secret_token)
+            except Exception:
+                pass
+        if home_token is not None:
+            try:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(home_token)
+            except Exception:
+                pass
+
+
+def discovery_threads() -> List[threading.Thread]:
+    """Return every live discovery thread this module owns, across profiles.
+
+    Process-wide teardown/diagnostics: a shutdown path must be able to reach
+    all of them, not just the ambient profile's.
+    """
+    with _mcp_discovery_lock:
+        threads = [
+            state.thread
+            for state in _profile_discovery.values()
+            if state.thread is not None
+        ]
+        if _mcp_discovery_thread is not None and not any(
+            t is _mcp_discovery_thread for t in threads
+        ):
+            threads.append(_mcp_discovery_thread)
+    return [t for t in threads if t.is_alive()]
+
+
+def discovery_thread_for_profile(home) -> Optional[threading.Thread]:
+    """Return the discovery thread owned by *home*, or None."""
+    try:
+        from hermes_constants import hermes_home_key
+
+        key = hermes_home_key(str(home))
+    except Exception:
+        return None
+    with _mcp_discovery_lock:
+        state = _profile_discovery.get(key)
+        return state.thread if state is not None else None
+
+
+def reset_discovery_state() -> None:
+    """Forget all coordinator state for every profile.
+
+    Teardown helper: does NOT join running threads (they are daemons and
+    detach cleanly -- each one only touches the state object it captured).
+    """
+    global _mcp_discovery_started, _mcp_discovery_thread
+    with _mcp_discovery_lock:
+        _profile_discovery.clear()
+        _mcp_discovery_started = False
+        _mcp_discovery_thread = None
 
 
 def _has_configured_mcp_servers() -> bool:
@@ -30,18 +242,35 @@ def _has_configured_mcp_servers() -> bool:
 
 
 def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
-    """Spawn one shared background MCP discovery thread for this process.
+    """Spawn one background MCP discovery thread PER PROFILE.
 
-    If the first background discovery run exits without connecting any MCP
-    server (for example after startup cancellation / OOM restart), later calls
-    are allowed to retry instead of permanently pinning the process in a
-    "discovery already started" state with zero MCP tools.
+    Deduplication, the "already started" gate and the retry allowance are all
+    keyed by the CALLING profile's canonical home. Two profiles configuring
+    the same server name therefore each get their own discovery run reading
+    their own ``config.yaml``; a profile whose run is still in flight (or that
+    parked/failed) neither blocks nor suppresses any other profile. Repeated
+    calls for the SAME profile still collapse onto the one live thread.
+
+    If a profile's discovery run exits without connecting any MCP server (for
+    example after startup cancellation / OOM restart), later calls for THAT
+    profile are allowed to retry instead of permanently pinning it in a
+    "discovery already started" state with zero MCP tools. The status probe
+    behind that decision reads the calling profile's registry, so one
+    profile's healthy servers can no longer satisfy another profile's gate.
     """
     global _mcp_discovery_started, _mcp_discovery_thread
 
+    key, home = _current_profile()
+
     with _mcp_discovery_lock:
-        if _mcp_discovery_started:
-            thread = _mcp_discovery_thread
+        state = _profile_discovery.get(key)
+        if state is None:
+            _prune_finished_locked()
+            state = _ProfileDiscovery(home)
+            _profile_discovery[key] = state
+
+        if state.started:
+            thread = state.thread
             if thread is not None and thread.is_alive():
                 return
             try:
@@ -56,65 +285,58 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                 "Background MCP discovery previously exited with no connected "
                 "servers; retrying discovery thread"
             )
-            _mcp_discovery_started = False
-            _mcp_discovery_thread = None
+            state.started = False
+            state.thread = None
 
+        state.started = True
         _mcp_discovery_started = True
         if not _has_configured_mcp_servers():
             return
 
-        # Capture the caller's context-local HERMES_HOME override (profile
-        # scoping in multi-profile processes like the dashboard/desktop
-        # backend) and re-install it inside the discovery thread. ContextVars
-        # do not propagate into bare threads, so without this a session
-        # "switched" to profile X would discover the LAUNCH profile's
-        # mcp_servers instead (#67605). The config gate above already runs on
-        # the caller's thread, so it sees the same override.
-        try:
-            from hermes_constants import get_hermes_home_override
-
-            home_override = get_hermes_home_override()
-        except Exception:
-            home_override = None
+        # Capture the caller's profile scope and replay it inside the thread:
+        # the context-local HERMES_HOME override (so discovery reads the
+        # SELECTED profile's mcp_servers, not the launch profile's -- #67605)
+        # and the profile secret scope (so that config's ${VAR} refs and the
+        # service-account token exchange resolve against the right profile's
+        # credentials instead of failing closed). ContextVars do not propagate
+        # into bare threads; see _caller_profile_scope. The config gate above
+        # already runs on the caller's thread, so it sees the same override.
+        home_override, secret_scope = _capture_caller_scope()
 
         def _discover() -> None:
-            token = None
             try:
-                from hermes_constants import set_hermes_home_override
-
-                token = set_hermes_home_override(home_override)
-            except Exception:
-                token = None
-            try:
-                _discover_mcp_tools_without_interactive_oauth()
-                try:
-                    from tools.mcp_tool import get_mcp_status
-                    status = get_mcp_status() or []
-                    if not any(entry.get("connected") for entry in status):
-                        logger.warning(
-                            "Background MCP discovery completed with zero connected servers"
-                        )
-                except Exception:
-                    logger.debug("Failed to inspect MCP status after background discovery", exc_info=True)
-            except Exception:
-                logger.debug("Background MCP tool discovery failed", exc_info=True)
-            finally:
-                if token is not None:
+                with _caller_profile_scope(home_override, secret_scope):
                     try:
-                        from hermes_constants import reset_hermes_home_override
-
-                        reset_hermes_home_override(token)
+                        _discover_mcp_tools_without_interactive_oauth()
+                        try:
+                            from tools.mcp_tool import get_mcp_status
+                            status = get_mcp_status() or []
+                            if not any(entry.get("connected") for entry in status):
+                                logger.warning(
+                                    "Background MCP discovery completed with zero connected servers"
+                                )
+                        except Exception:
+                            logger.debug("Failed to inspect MCP status after background discovery", exc_info=True)
                     except Exception:
-                        pass
+                        logger.debug("Background MCP tool discovery failed", exc_info=True)
+            finally:
+                global _mcp_discovery_thread
+                me = threading.current_thread()
                 with _mcp_discovery_lock:
-                    global _mcp_discovery_thread, _mcp_discovery_started
-                    _mcp_discovery_thread = None
+                    # Identity-checked: a retry may already have installed a
+                    # newer thread for this profile, and the legacy mirror may
+                    # belong to a different profile entirely.
+                    if state.thread is me:
+                        state.thread = None
+                    if _mcp_discovery_thread is me:
+                        _mcp_discovery_thread = None
 
         thread = threading.Thread(
             target=_discover,
             name=thread_name,
             daemon=True,
         )
+        state.thread = thread
         _mcp_discovery_thread = thread
         thread.start()
 
@@ -187,8 +409,11 @@ def wait_for_mcp_discovery(
     When ``single_query`` is True, the bound comes from
     ``mcp_single_query_discovery_timeout`` instead (default 15s vs 1.5s
     interactive) because one-shot sessions have no second turn to recover.
+
+    Waits on the CALLING profile's discovery thread only, so an agent build
+    for profile B is never delayed by (nor satisfied by) profile A's run.
     """
-    thread = _mcp_discovery_thread
+    thread = _thread_for_current_profile()
     if thread is None or not thread.is_alive():
         return
     thread.join(timeout=_resolve_discovery_timeout(timeout, single_query=single_query))
@@ -201,11 +426,14 @@ def mcp_discovery_in_flight() -> bool:
     start discovery through ``start_background_mcp_discovery`` here (the desktop
     app + dashboard WebSocket sidecar via ``tui_gateway/ws.py``, and
     ``hermes dashboard``).  Those processes populate THIS module's
-    ``_mcp_discovery_thread``, not ``tui_gateway.entry``'s, so the late-refresh
-    scheduler must consult both to decide whether a slow server's tools are
-    still pending (see #51587).
+    per-profile coordinator state, not ``tui_gateway.entry``'s thread, so the
+    late-refresh scheduler must consult both to decide whether a slow server's
+    tools are still pending (see #51587).
+
+    Reports for the CALLING profile (see ``_thread_for_current_profile``): a
+    late refresh for profile B must not wait on profile A's discovery.
     """
-    thread = _mcp_discovery_thread
+    thread = _thread_for_current_profile()
     return thread is not None and thread.is_alive()
 
 
@@ -216,8 +444,10 @@ def join_mcp_discovery(timeout: "float | None" = None) -> bool:
     False if it is still running after the timeout.  Unlike
     ``wait_for_mcp_discovery`` this accepts an unbounded/long wait and reports
     the outcome, for the off-critical-path late-refresh waiter.
+
+    Scoped to the CALLING profile's discovery thread.
     """
-    thread = _mcp_discovery_thread
+    thread = _thread_for_current_profile()
     if thread is None:
         return True
     thread.join(timeout=timeout)
