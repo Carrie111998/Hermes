@@ -4514,6 +4514,15 @@ class BasePlatformAdapter(ABC):
         
         Returns:
             Tuple of (list of (url, alt_text) pairs, cleaned content with image tags removed).
+
+        Scanning runs on ``_mask_protected_spans(content)`` — a copy where
+        fenced code blocks, inline code, and blockquotes are replaced with
+        spaces of equal length. Invariants future regex authors must keep:
+        the mask is length-preserving (match offsets stay valid against the
+        original ``content``, which ``cleaned`` is derived from) and it
+        substitutes plain spaces only — it never normalizes newlines (CRLF
+        payloads keep their offsets) nor introduces characters that could
+        themselves parse as image syntax.
         """
         images = []
         cleaned = content

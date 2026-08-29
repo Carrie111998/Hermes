@@ -191,6 +191,10 @@ class TestExtractImages:
         images, cleaned = BasePlatformAdapter.extract_images(content)
         assert images == []
         assert "![Alt text](https://example.com/image.png)" in cleaned
+        # Prose around the fence must survive too — the guard may not
+        # over-strip text outside the protected spans.
+        assert "To embed an image in Markdown you write:" in cleaned
+        assert "The text in square brackets is the alternative text." in cleaned
 
     def test_inline_code_and_blockquote_examples_survive(self):
         content = (
@@ -215,6 +219,24 @@ class TestExtractImages:
         assert [url for url, _ in images] == ["https://example.com/live.png"]
         assert '<img src="https://example.com/fenced.png">' in cleaned
         assert '<img src="https://example.com/live.png">' not in cleaned
+
+    def test_crlf_payload_offsets_stay_aligned(self):
+        """The mask substitutes spaces 1:1 and never normalizes newlines, so
+        CRLF payloads must keep match offsets aligned: a fenced example is
+        still ignored while the real image after it is still extracted and
+        cleaned at the right span (#93724)."""
+        content = (
+            "Docs:\r\n"
+            "```markdown\r\n"
+            "![Alt text](https://example.com/image.png)\r\n"
+            "```\r\n"
+            "Real: ![r](https://example.com/real.jpg)\r\n"
+        )
+        images, cleaned = BasePlatformAdapter.extract_images(content)
+        assert [url for url, _ in images] == ["https://example.com/real.jpg"]
+        assert "![Alt text](https://example.com/image.png)" in cleaned
+        assert "![r]" not in cleaned
+        assert "\r\n" in cleaned
 
 
 # ---------------------------------------------------------------------------
