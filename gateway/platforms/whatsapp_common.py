@@ -4,6 +4,7 @@ and the official WhatsApp Cloud API adapter.
 
 The mixin provides:
 - Allow-list / DM / group gating
+- Per-contact toolset overrides (``contact_toolsets``)
 - Mention detection (explicit @-mentions + configurable regex patterns)
 - Quoted-reply-to-bot detection
 - Broadcast / Channel / Newsletter filtering
@@ -287,6 +288,96 @@ class WhatsAppBehaviorMixin:
         if self._group_policy == "open":
             return True
         return False
+
+    # --------------------------------------------------- per-contact toolsets
+    def toolsets_for_source(self, source) -> Optional[list]:
+        """Per-contact toolset override for WhatsApp-triggered agent runs.
+
+        ``platform_toolsets.whatsapp`` is platform-wide: every allowlisted
+        contact shares one toolset list. That makes the allowlist all-or-
+        nothing in practice — admitting a low-trust contact (a courier, a
+        client, a receptionist) to answer messages also hands them whatever
+        the platform list carries, and the platform default for WhatsApp
+        includes ``terminal``. The only way to narrow that today is to narrow
+        it for *every* WhatsApp contact, including the operator.
+
+        ``contact_toolsets`` closes that gap by mapping a contact identifier to
+        the toolset list used for runs that contact triggers::
+
+            platforms:
+              whatsapp:
+                extra:
+                  contact_toolsets:
+                    "923001234567": [web, vision, clarify]
+                    "923009876543@s.whatsapp.net": [web]
+
+        Keys are matched with :meth:`_matches_whatsapp_allowlist`, so a phone
+        number, a full JID, or a LID form all resolve to the same contact
+        (WhatsApp delivers senders in either form). DMs match on the sender;
+        group chats match on the group JID, then fall back to the sender so a
+        per-contact restriction still applies to that contact's messages
+        inside a group.
+
+        Returns ``None`` when no entry matches, leaving the normal
+        ``platform_toolsets.whatsapp`` resolution untouched. The gateway
+        validates any returned list through the same ``_get_platform_tools``
+        path as platform config, so unknown or platform-restricted names are
+        dropped rather than trusted — an entry cannot self-grant a toolset
+        that platform config could not.
+
+        A ``"*"`` key is deliberately NOT special-cased here: matching every
+        contact is what ``platform_toolsets.whatsapp`` already does, and
+        honoring it would silently shadow that setting.
+        """
+        extra = getattr(self.config, "extra", None) or {}
+        mapping = extra.get("contact_toolsets") or extra.get("contactToolsets")
+        if not isinstance(mapping, dict) or not mapping:
+            return None
+
+        candidates: list[str] = []
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        # Group JID first so a group-wide entry wins over a per-sender one;
+        # DMs carry the contact in chat_id anyway, so one ordering serves both.
+        if str(getattr(source, "chat_type", "") or "") == "group":
+            candidates = [c for c in (chat_id, user_id) if c]
+        else:
+            candidates = [c for c in (user_id or chat_id,) if c]
+        if not candidates:
+            return None
+
+        for candidate in candidates:
+            for key, toolsets in mapping.items():
+                key_str = str(key).strip()
+                if not key_str or key_str == "*":
+                    continue
+                if not self._matches_whatsapp_allowlist(candidate, {key_str}):
+                    continue
+                if not isinstance(toolsets, list):
+                    logger.warning(
+                        "[%s] contact_toolsets['%s'] must be a list, got %s — "
+                        "ignoring this entry",
+                        getattr(self, "name", "whatsapp"),
+                        key_str,
+                        type(toolsets).__name__,
+                    )
+                    continue
+                cleaned = [str(t).strip() for t in toolsets if str(t).strip()]
+                if not cleaned:
+                    # An empty list cannot mean "no tools": the gateway treats a
+                    # falsy override as "no override" and would fall back to the
+                    # platform list, quietly WIDENING access. Refuse instead.
+                    logger.warning(
+                        "[%s] contact_toolsets['%s'] is empty — ignoring. An "
+                        "empty list cannot express 'no toolsets'; list the "
+                        "toolsets this contact may use, or remove them from "
+                        "the allowlist to deny access entirely.",
+                        getattr(self, "name", "whatsapp"),
+                        key_str,
+                    )
+                    continue
+                return cleaned
+        return None
 
     def _compile_mention_patterns(self):
         patterns = self.config.extra.get("mention_patterns")
