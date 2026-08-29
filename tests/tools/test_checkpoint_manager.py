@@ -124,13 +124,23 @@ class TestStoreInit:
         assert _init_store(store, str(work_dir)) is None
 
         # Simulate gc --prune=now on a bare store with only packed refs.
+        # The packed ref must point at a real object (as it would after a
+        # real gc) — a dangling hash makes git show-ref fail the store on
+        # its own, independent of the repair being tested.
         import shutil
+        from tools.checkpoint_manager import _run_git
+
+        (work_dir / "f.txt").write_text("content", encoding="utf-8")
+        ok, blob_hash, stderr = _run_git(
+            ["hash-object", "-w", str(work_dir / "f.txt")], store, str(work_dir)
+        )
+        assert ok, f"git hash-object failed: {stderr}"
 
         shutil.rmtree(store / "refs" / "heads")
         shutil.rmtree(store / "branches", ignore_errors=True)
         (store / "packed-refs").write_text(
             "# pack-refs with: peeled fully-peeled sorted \n"
-            "0000000000000000000000000000000000000001 refs/heads/some-project\n",
+            f"{blob_hash.strip()} refs/heads/some-project\n",
             encoding="utf-8",
         )
         assert not (store / "refs" / "heads").exists()
@@ -141,11 +151,19 @@ class TestStoreInit:
         assert (store / "branches").is_dir()
 
         # And a working-tree command against the reused store now succeeds.
-        (work_dir / "f.txt").write_text("content", encoding="utf-8")
-        from tools.checkpoint_manager import _run_git
-
         ok, _, stderr = _run_git(["add", "-A"], store, str(work_dir))
         assert ok, f"git add -A against reused store failed: {stderr}"
+
+        # Stale packed refs (pointing at refs the current HEAD doesn't use)
+        # don't confuse the repaired store — show-ref still resolves them.
+        ok, out, stderr = _run_git(["show-ref"], store, str(work_dir))
+        assert ok, f"git show-ref against repaired store failed: {stderr}"
+        assert "refs/heads/some-project" in out
+
+        # The repair helper only recreates refs/heads + branches; the rest
+        # of the fresh-init layout (info/exclude) is gc-stable and must
+        # survive the reuse path untouched.
+        assert (store / "info" / "exclude").exists()
 
     def test_legacy_migration_archives_prev2_repos(
         self, checkpoint_base, work_dir,
