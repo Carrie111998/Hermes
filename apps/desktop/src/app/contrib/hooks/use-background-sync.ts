@@ -149,6 +149,10 @@ export async function reconcileTileTranscripts({
       signatureRef.current.set(signatureKey, signature)
       const messages = toChatMessages(latest.messages)
 
+      if (messages.length === 0) {
+        continue
+      }
+
       updateSessionState(
         runtimeSessionId,
         state => ({
@@ -229,6 +233,10 @@ export async function reconcileActiveTranscript({
 
     signatureRef.current.set(signatureKey, signature)
     const messages = toChatMessages(latest.messages)
+
+    if (messages.length === 0) {
+      return
+    }
 
     updateSessionState(
       runtimeSessionId,
@@ -517,8 +525,8 @@ function visiblePoll(intervalMs: number, tick: () => void): () => void {
 
 /**
  * Keeps app data live while the gateway is open: an on-connect reseed (model /
- * profile / sessions + relative-cwd resolution), the cron / messaging /
- * open-transcript visibility polls, and the fresh-draft model/config reseed.
+ * profile / sessions + relative-cwd resolution), plus cron / messaging /
+ * open-transcript visibility polls.
  * All the "the desktop websocket won't tell us, so poll" logic in one place.
  */
 export function useBackgroundSync({
@@ -527,7 +535,6 @@ export function useBackgroundSync({
   activeIsMessaging,
   activeSessionId,
   activeStoredSessionId,
-  freshDraftReady,
   gatewayState,
   refreshActiveTranscript,
   refreshCronJobs,
@@ -855,12 +862,4 @@ export function useBackgroundSync({
     return visiblePoll(MESSAGING_POLL_INTERVAL_MS, () => void refreshMessagingSessions())
   }, [changeEventsAvailable, gatewayState, refreshMessagingSessions])
 
-  // A fresh new-session draft (gateway open, no active session) re-pulls the
-  // model + config so the composer pill reflects the profile default.
-  useEffect(() => {
-    if (gatewayState === 'open' && !activeSessionId && freshDraftReady) {
-      void refreshCurrentModel()
-      void refreshHermesConfig()
-    }
-  }, [activeSessionId, freshDraftReady, gatewayState, refreshCurrentModel, refreshHermesConfig])
 }

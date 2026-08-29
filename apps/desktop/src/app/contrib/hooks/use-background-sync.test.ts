@@ -166,6 +166,25 @@ describe('active transcript refresh', () => {
     vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('answer') as never)
   })
 
+  it('keeps the mounted transcript when a refresh observes a transient empty page', async () => {
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: ACTIVE_STORED_ID } as never)
+    const fixture = makeRefresh()
+    fixture.state.messages = [
+      { id: '1-0-user', parts: [{ text: 'question', type: 'text' }], role: 'user' },
+      { id: '2-0-assistant', parts: [{ text: 'mounted answer', type: 'text' }], role: 'assistant' }
+    ]
+
+    await fixture.refresh()
+
+    expect(fixture.updateSessionState).not.toHaveBeenCalled()
+    expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({ text: 'mounted answer' })
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('later answer') as never)
+    await fixture.refresh()
+
+    expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({ text: 'later answer' })
+  })
+
   it('refreshes a hidden session through its unique complete owner route', async () => {
     const hiddenStoredSessionId = 'hidden-bot-chat'
 
@@ -260,6 +279,22 @@ describe('active transcript refresh', () => {
     // Behavior assertions:
     expect(updaterCallCount).toBeGreaterThan(0)
     expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+  })
+
+  it('keeps a mounted workspace tile transcript when a refresh observes a transient empty page', async () => {
+    const updateSessionState = vi.fn()
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-tile-empty' } as never)
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ storedSessionId: 'stored-tile-empty', runtimeId: 'runtime-tile-empty' }],
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    expect(updateSessionState).not.toHaveBeenCalled()
   })
 
   it('skips the tile fetch entirely when nothing changed (signature-gated)', async () => {
