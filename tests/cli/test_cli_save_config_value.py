@@ -90,6 +90,31 @@ class TestSaveConfigValueAtomic:
         assert saved["approvals"]["destructive_slash_confirm"] is False
         assert saved["agent"]["max_turns"] == 42
 
+    def test_unrelated_config_set_does_not_restore_stale_session_model(
+        self, config_env
+    ):
+        """A stale session save must preserve repaired routing and the new key."""
+        from hermes_cli.config import load_config, save_config, set_config_value
+
+        stale_session = load_config()
+        assert stale_session["model"]["provider"] == "openrouter"
+
+        set_config_value("model.provider", "litellm")
+        set_config_value(
+            "mcp_servers.gbrain",
+            '{"url":"http://127.0.0.1:8737/mcp","enabled":true}',
+        )
+        stale_session["agent"]["max_turns"] = 42
+        save_config(stale_session)
+
+        saved = yaml.safe_load(config_env.read_text())
+        assert saved["model"]["provider"] == "litellm"
+        assert saved["mcp_servers"]["gbrain"] == {
+            "url": "http://127.0.0.1:8737/mcp",
+            "enabled": True,
+        }
+        assert saved["agent"]["max_turns"] == 42
+
     def test_copied_stale_snapshot_preserves_newer_single_key_write(
         self, config_env
     ):
