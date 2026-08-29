@@ -12038,11 +12038,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # full display set (a session's rows are bounded; the UI-level
             # 500-row cap lives in the endpoint, not here), dedupe in Python,
             # then apply paging.
+            # Cursor eligibility must be fixed before choosing the preferred
+            # copy. A compaction between pages can otherwise move an unseen
+            # logical message above before_id and make its older copy vanish.
+            display_cursor_clause = " AND id < ?" if before_id is not None else ""
+            display_params = [session_id]
+            if before_id is not None:
+                display_params.append(before_id)
             with self._read_ctx() as conn:
                 cursor = conn.execute(
                     "SELECT * FROM messages WHERE session_id = ?" + active_clause
-                    + " ORDER BY id ASC",
-                    [session_id],
+                    + display_cursor_clause + " ORDER BY id ASC",
+                    display_params,
                 )
                 all_rows = cursor.fetchall()
             seen: dict = {}
@@ -12080,8 +12087,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
                     seen[key] = row
             rows = sorted(seen.values(), key=lambda r: r["id"])
-            if before_id is not None:
-                rows = [row for row in rows if row["id"] < before_id]
             if latest:
                 rows = rows[::-1]
             rows = rows[offset:]
