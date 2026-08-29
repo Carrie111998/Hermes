@@ -1,4 +1,4 @@
-"""Dependency boundary for the same-gateway hosted-room backend."""
+"""Dependency boundary for the same-gateway hosted-room file backend."""
 
 from pathlib import Path
 
@@ -15,7 +15,6 @@ LOCAL_ROOM_MODULES = (
 )
 FORBIDDEN_SURFACES = (
     "apps/desktop",
-    "attachments",
     "artifact",
     "gateway.platforms",
     "hosted_room_links",
