@@ -4192,7 +4192,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 model_name = chunk.model
 
             # Accumulate reasoning content
-            reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            reasoning_text = getattr(delta, "reasoning_content", None)
+            if not isinstance(reasoning_text, str) or not reasoning_text:
+                reasoning_text = getattr(delta, "reasoning", None)
+            if not isinstance(reasoning_text, str):
+                reasoning_text = None
             if reasoning_text:
                 # Summary-part models (gpt-5.x and other Responses relays) send
                 # one complete markdown block per delta with no separator, so
