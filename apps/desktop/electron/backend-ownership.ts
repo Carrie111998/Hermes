@@ -36,6 +36,20 @@ export interface BackendClaim extends BackendIdentity {
   parentStartMarker?: string
 }
 
+/**
+ * `ps -p <pid>` exits 1 on macOS when the PID no longer exists. Node exposes
+ * that status as a numeric `error.code`, not `ESRCH`, so treating only the
+ * symbolic errno values as definitive leaves every dead ownership entry in
+ * the store forever. Keep the numeric interpretation Darwin-only: exit 1 from
+ * other process probes can mean something less specific and must remain an
+ * uncertain result.
+ */
+export function processProbeConfirmsMissing(error: unknown, platform: NodeJS.Platform): boolean {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
+
+  return code === 'ENOENT' || code === 'ESRCH' || (platform === 'darwin' && (code === 1 || code === '1'))
+}
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }

@@ -54,7 +54,12 @@ import {
   makeUnsignedOauthError,
   waitForHermesReady
 } from './backend-health'
-import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
+import {
+  backendCommandMatches,
+  createBackendOwnership,
+  createBackendShutdownCoordinator,
+  processProbeConfirmsMissing
+} from './backend-ownership'
 import {
   canImportHermesCli,
   execProbeSync,
@@ -3305,7 +3310,7 @@ async function processIdentityMatches(identity) {
   try {
     return (await processStartMarker(identity.pid)) === identity.startMarker
   } catch (error) {
-    return error?.code === 'ENOENT' || error?.code === 'ESRCH' ? false : undefined
+    return processProbeConfirmsMissing(error, process.platform) ? false : undefined
   }
 }
 
@@ -3333,7 +3338,7 @@ async function backendParentMatches(entry) {
   try {
     return (await processStartMarker(entry.parentPid)) === entry.parentStartMarker
   } catch (error) {
-    return error?.code === 'ENOENT' || error?.code === 'ESRCH' ? false : undefined
+    return processProbeConfirmsMissing(error, process.platform) ? false : undefined
   }
 }
 

@@ -7,7 +7,8 @@ import {
   type BackendIdentity,
   createBackendOwnership,
   createBackendShutdownCoordinator,
-  parseBackendOwnership
+  parseBackendOwnership,
+  processProbeConfirmsMissing
 } from './backend-ownership'
 
 function memoryStore(initial = '') {
@@ -60,6 +61,14 @@ function createOwnership(store = memoryStore(), overrides: Partial<Parameters<ty
     ...overrides
   })
 }
+
+test('macOS ps exit 1 confirms a missing process without weakening other platforms', () => {
+  assert.equal(processProbeConfirmsMissing({ code: 1 }, 'darwin'), true)
+  assert.equal(processProbeConfirmsMissing({ code: '1' }, 'darwin'), true)
+  assert.equal(processProbeConfirmsMissing({ code: 1 }, 'linux'), false)
+  assert.equal(processProbeConfirmsMissing({ code: 'ETIMEDOUT' }, 'darwin'), false)
+  assert.equal(processProbeConfirmsMissing({ code: 'ESRCH' }, 'linux'), true)
+})
 
 test('claim persists the caller-supplied exact identity before resolving', async () => {
   const store = memoryStore()
