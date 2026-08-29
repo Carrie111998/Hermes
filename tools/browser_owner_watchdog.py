@@ -62,6 +62,19 @@ _POLL_S = float(os.environ.get("BROWSER_OWNER_WATCHDOG_POLL_S", "2"))
 _MAX_S = float(os.environ.get("BROWSER_OWNER_WATCHDOG_MAX_S", str(24 * 3600)))
 _DRY_RUN = os.environ.get("BROWSER_OWNER_WATCHDOG_DRY_RUN") == "1"
 
+# Minimum age before a profile dir may be removed. This watchdog fires on ITS
+# OWNER's death, but /tmp is shared: another agent may have just mkdir'd its
+# profile dir and not yet exec'd Chromium, so that dir is referenced by no live
+# process for a moment. Without an age gate we delete a live agent's session out
+# from under it. Mirrors the fail-safe intent of
+# ``browser_tool.BROWSER_ORPHAN_GRACE_SECONDS`` (unknown age -> do not touch),
+# with a shorter default because the window we are closing is a launch race
+# (seconds), not an idle-session ceiling. Anything skipped here is still caught
+# by the hourly orphan reaper in browser_tool.
+_PROFILE_MIN_AGE_S = float(
+    os.environ.get("BROWSER_OWNER_WATCHDOG_PROFILE_MIN_AGE_S", "300")
+)
+
 UDD_PREFIX = "--user-data-dir=/tmp/agent-browser-chrome-"
 TMP_GLOB = "agent-browser-chrome-*"
 
@@ -200,8 +213,9 @@ def _reap_owner_browsers() -> None:
       2. Chromium roots: any Chromium root carrying
          ``--user-data-dir=/tmp/agent-browser-chrome-*`` that is orphaned
          (PPid 1 / systemd --user — i.e. its launching agent is gone) is
-         tree-killed and its profile dir removed. Mirrors t_9b49cd19's proven
-         reaper criterion, minus the age gate (we only fire on owner death).
+         tree-killed and its profile dir removed. Profile-dir REMOVAL is age
+         gated (_PROFILE_MIN_AGE_S): /tmp is shared, so a dir with no live
+         referencing process may be a concurrent agent mid-launch, not a leak.
     """
     live_owner_pids: set[int] = set()
     reap_daemons: list[tuple[int, str]] = []  # (daemon_pid, socket_dir)
@@ -310,8 +324,19 @@ def _cleanup_orphan_profile_dirs() -> None:
         for arg in _cmdline(pid):
             if arg.startswith(UDD_PREFIX):
                 live_dirs.add(arg.split("=", 1)[1])
+    now = time.time()
     for d in Path("/tmp").glob(TMP_GLOB):
         if str(d) in live_dirs:
+            continue
+        # Age gate: never remove a dir that is younger than the grace window, and
+        # never remove one whose age we cannot determine. A dir with no live
+        # referencing process is USUALLY stale — but it is also exactly what a
+        # concurrent agent looks like between mkdir and exec.
+        try:
+            age_s = now - d.stat().st_mtime
+        except OSError:
+            continue  # unknown age -> fail safe, leave it
+        if age_s < _PROFILE_MIN_AGE_S:
             continue
         if not _DRY_RUN:
             shutil.rmtree(d, ignore_errors=True)
