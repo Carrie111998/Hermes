@@ -6368,7 +6368,16 @@ def run_job(
 
             if _session_db_timeout > 0:
                 _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                _session_db_future = _session_db_pool.submit(SessionDB)
+                # ThreadPoolExecutor does not inherit ContextVars.  The
+                # multiplex desktop ticker installs the owning profile's
+                # HERMES_HOME in the dispatch context, but SessionDB is
+                # constructed in this nested worker.  Preserve that context
+                # or a profile cron run silently opens the dashboard
+                # process's state.db instead (#97489).
+                _session_db_context = contextvars.copy_context()
+                _session_db_future = _session_db_pool.submit(
+                    _session_db_context.run, SessionDB
+                )
                 try:
                     _session_db = _session_db_future.result(timeout=_session_db_timeout)
                 except concurrent.futures.TimeoutError:

@@ -21,8 +21,10 @@ suite stays free of timing flakes under parallel load.
 """
 
 import concurrent.futures
+import sys
 import threading
 import time
+import types
 from unittest.mock import MagicMock, patch
 
 from cron.scheduler import run_job
@@ -75,6 +77,60 @@ def _session_db_executor(timeouts: list, *, instant_timeout: bool = True):
 
 
 class TestSessionDbInitTimeout:
+    def test_sessiondb_init_keeps_multiplex_profile_context(self, tmp_path, monkeypatch):
+        """A nested SessionDB worker must open the cron owner's state.db.
+
+        The desktop ticker carries the profile home in a ContextVar.  The
+        SessionDB timeout worker is another thread, so this catches the
+        regression where it silently fell back to the dashboard process home.
+        """
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        dashboard_home = tmp_path / "dashboard"
+        profile_home = tmp_path / "profiles" / "north-caribbean"
+        dashboard_home.mkdir()
+        profile_home.mkdir(parents=True)
+        seen_homes = []
+
+        def capture_session_db():
+            seen_homes.append(get_hermes_home())
+            return MagicMock()
+
+        job = {"id": "profile-sessiondb", "name": "test", "prompt": "hello"}
+        fake_env_loader = types.ModuleType("hermes_cli.env_loader")
+        fake_env_loader.load_hermes_dotenv = lambda **_kwargs: None
+        fake_env_loader.reset_secret_source_cache = lambda: None
+        monkeypatch.setitem(sys.modules, "hermes_cli.env_loader", fake_env_loader)
+        import hermes_cli
+        monkeypatch.setattr(hermes_cli, "env_loader", fake_env_loader, raising=False)
+        profile_token = set_hermes_home_override(profile_home)
+        try:
+            with patch("cron.scheduler._hermes_home", None), \
+                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state.SessionDB", side_effect=capture_session_db), \
+                 patch(
+                     "hermes_cli.runtime_provider.resolve_runtime_provider",
+                     return_value=_RUNTIME,
+                 ), \
+                 patch("run_agent.AIAgent") as mock_agent_cls:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent_cls.return_value = mock_agent
+
+                success, output, final_response, error = run_job(job)
+        finally:
+            reset_hermes_home_override(profile_token)
+
+        assert success is True
+        assert final_response == "ok"
+        assert seen_homes == [profile_home]
+
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
         """run_job proceeds without a session store when SessionDB init times out."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
