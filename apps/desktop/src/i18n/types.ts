@@ -2418,6 +2418,7 @@ export interface Translations {
       model: string
       provider: string
       inputs: string
+      optionsFree: string
       modalityText: string
       modalityImage: string
       modalityAudio: string

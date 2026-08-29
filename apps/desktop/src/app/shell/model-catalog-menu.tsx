@@ -38,7 +38,7 @@ import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-c
 import { $defaultReasoningEffort } from '@/store/session'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
-import { metadataSummary, ModelDetailsSubmenu } from './model-details-submenu'
+import { isFreeTierModelId, metadataSummary, ModelDetailsSubmenu } from './model-details-submenu'
 import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
 /** Whether a catalog row represents the session's current provider. Custom
@@ -430,7 +430,7 @@ export function ModelCatalogMenu({
                     const modelMetadata = group.provider.metadata?.[family.id]
 
                     const meta = detailsOnHover
-                      ? metadataSummary(modelMetadata)
+                      ? metadataSummary(modelMetadata, isFreeTierModelId(family.id) ? t.shell.modelOptions.optionsFree : undefined)
                       : [
                           fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
                           (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null

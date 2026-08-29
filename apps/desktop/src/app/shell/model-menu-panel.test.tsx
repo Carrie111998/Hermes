@@ -50,6 +50,10 @@ const DEEPSEEK_PROVIDER = {
     'deepseek-v4-pro': { fast: false, reasoning: true }
   },
   metadata: {
+    'deepseek-chat-free': {
+      context_window: 65536,
+      input_modalities: ['text']
+    },
     'deepseek-v4-pro': {
       context_window: 200000,
       input_modalities: ['text', 'image', 'pdf'],
@@ -59,7 +63,7 @@ const DEEPSEEK_PROVIDER = {
       supports_vision: true
     }
   },
-  models: ['deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner'],
+  models: ['deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner', 'deepseek-chat-free'],
   name: 'DeepSeek',
   pricing: {
     'deepseek-v4-pro': { cache: null, free: false, input: '$0.50', output: '$1.50' }
@@ -276,6 +280,18 @@ describe('ModelMenuPanel model metadata', () => {
     expect(screen.getByText('$0.50 / Mtok')).toBeTruthy()
     expect(screen.getByText('Output')).toBeTruthy()
     expect(screen.getByText('$1.50 / Mtok')).toBeTruthy()
+  })
+
+  it('derives a Free pricing row from the -free model id suffix', async () => {
+    const { content } = renderPanel()
+    const row = (await content.findByText(/Deepseek Chat Free/i)).closest('[role="menuitem"]')
+
+    expect(row).not.toBeNull()
+    fireEvent.pointerMove(row!, { pointerType: 'mouse' })
+
+    expect(await screen.findByText('Pricing')).toBeTruthy()
+    expect(screen.getByText('Free')).toBeTruthy()
+    expect(screen.getByText('65.5K tokens')).toBeTruthy()
   })
 })
 

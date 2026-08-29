@@ -3014,6 +3014,7 @@ export const zh: Translations = {
       model: '模型',
       provider: '提供商',
       inputs: '输入',
+      optionsFree: '免费',
       modalityText: '文本',
       modalityImage: '图像',
       modalityAudio: '音频',
