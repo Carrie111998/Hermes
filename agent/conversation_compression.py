@@ -2428,17 +2428,33 @@ def _strip_stale_todo_snapshot(content: Any) -> Any:
             return content
         return content[:idx].rstrip()
     if isinstance(content, list):
-        return [
-            part
-            for part in content
-            if not (
-                isinstance(part, dict)
-                and part.get("type") == "text"
-                and str(part.get("text") or "")
-                .lstrip()
-                .startswith(TODO_INJECTION_HEADER)
-            )
-        ]
+        cleaned = []
+        for part in content:
+            if not isinstance(part, dict):
+                cleaned.append(part)
+                continue
+            if part.get("type") == "text":
+                # Mirror the string path: the snapshot is APPENDED after the
+                # user text by ``_append_text_to_content`` (see the injection
+                # site in ``compress_context``), so on multimodal tails the
+                # header sits mid-block and a startswith filter never matches.
+                # ``find`` + cut strips the embedded block; a block that is
+                # nothing but the snapshot drops entirely (no empty text part
+                # left behind).
+                text = str(part.get("text") or "")
+                idx = text.find(TODO_INJECTION_HEADER)
+                if idx == -1:
+                    cleaned.append(part)
+                    continue
+                stripped = text[:idx].rstrip()
+                if stripped:
+                    new_part = dict(part)
+                    new_part["text"] = stripped
+                    cleaned.append(new_part)
+                # else: whole part was snapshot scaffolding — drop it.
+            else:
+                cleaned.append(part)
+        return cleaned
     return content
 
 
