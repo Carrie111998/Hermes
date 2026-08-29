@@ -5,9 +5,11 @@ session identity) resolved from **ambient process state at use time** instead of
 being **bound to the owning profile/session at creation time**.
 
 Each test asserts the *correct* profile-bound behavior and currently fails on
-main, so it is marked ``xfail(strict=False)``. When a member's fix lands, its
-test flips to XPASS and the seam has a live scoreboard — same format as the
-delegation-seam map in ``tests/tools/test_delegation_fallback_class.py``.
+main, so it is marked ``xfail(strict=False)``. Non-strict is deliberate: a
+member fix should not make an otherwise unrelated branch fail CI. Maintainers
+can run this file with ``--runxfail`` when refreshing the map; a fixed member
+then passes normally and its marker can be removed. This follows the format of
+the delegation-seam map in ``tests/tools/test_delegation_fallback_class.py``.
 
 Members and in-flight fixes are tracked on the class table in #82936. The
 junction member (default-profile secrets reaching child processes) is
@@ -18,8 +20,7 @@ profile resolution.
 This file fixes nothing by itself and competes with no open PR.
 """
 
-import os
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,10 +126,11 @@ def test_corrupt_profile_config_fails_loudly(tmp_path):
     reason="#83346: session-key fallback resolves profile from ambient "
     "active-profile state instead of the session's owning profile",
 )
-def test_session_key_profile_binding_not_ambient(monkeypatch, tmp_path):
+def test_session_key_profile_binding_not_ambient(monkeypatch):
     """Two key computations for the SAME sourced event must agree regardless
     of which profile happens to be ambiently active at call time."""
-    from gateway.session import SessionSource, build_session_key
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
     from gateway.platforms.base import Platform
 
     source = SessionSource(
@@ -141,30 +143,28 @@ def test_session_key_profile_binding_not_ambient(monkeypatch, tmp_path):
 
     import hermes_cli.profiles as profiles_mod
 
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            multiplex_profiles=True,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+    )
+
     monkeypatch.setattr(
         profiles_mod, "get_active_profile_name", lambda: "profile-a"
     )
-    key_under_a = build_session_key(source, profile=_ambient_profile(profiles_mod))
+    key_under_a = GatewayRunner._session_key_for_source(runner, source)
 
     monkeypatch.setattr(
         profiles_mod, "get_active_profile_name", lambda: "profile-b"
     )
-    key_under_b = build_session_key(source, profile=_ambient_profile(profiles_mod))
+    key_under_b = GatewayRunner._session_key_for_source(runner, source)
 
     assert key_under_a == key_under_b, (
         "the same event resolves to different session keys depending on the "
         "ambient active profile at call time"
     )
-
-
-def _ambient_profile(profiles_mod):
-    """Mirror the gateway fallback's ambient resolution (gateway/run.py)."""
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Member 4 — #80318: kanban workers run under a profile-scoped HERMES_HOME,
 # which hides root-config MoA presets. resolve_moa_preset against the profile
@@ -222,9 +222,14 @@ def test_profile_scope_resolves_root_moa_preset(tmp_path):
         reset_hermes_home_override(token)
 
     agg = (resolved.get("aggregator") or {}).get("model")
+    references = [item.get("model") for item in resolved.get("reference_models", [])]
     assert agg == "deepseek-v4-flash", (
         "worker resolved a different preset than the one configured in the "
         f"root config (aggregator={agg!r})"
+    )
+    assert references == ["deepseek-v4-flash", "mimo-v2.5"], (
+        "worker resolved different reference models than the root preset "
+        f"(reference_models={references!r})"
     )
 
 
@@ -276,7 +281,7 @@ def test_cron_delivery_runs_inside_job_profile_secret_scope(
             None,
         ),
     )
-    monkeypatch.setattr(sched, "_is_interrupted", lambda _id: False)
+    monkeypatch.setattr(sched, "_is_interrupted", lambda _id, _token=None: False)
     monkeypatch.setattr(sched, "save_job_output", lambda *a, **k: None)
     monkeypatch.setattr(sched, "mark_job_run", lambda *a, **k: None)
 
