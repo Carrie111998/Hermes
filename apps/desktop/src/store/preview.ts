@@ -414,10 +414,24 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
 /** Open (or re-front) the tab for `target`. Re-opening an existing tab refreshes
  *  its target so a stale label/path can't outlive the thing it points at. The
  *  only way anything reaches a preview. */
-export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual') {
+export function openPreview(
+  target: PreviewTarget,
+  source: PreviewRecordSource = 'manual',
+  options: { newTab?: boolean } = {}
+) {
   const resolved = previewTargetForSource(target, source)
   const current = $previewTabs.get()
-  const id = resolved.kind === 'url' ? browserTabId(current, source) : previewTabId(resolved)
+  // `newTab` only means anything for a browser: file and artifact tabs are
+  // addressed by their content, so a second tab on the same file would be the
+  // same tab twice.
+  const fresh = options.newTab && resolved.kind === 'url'
+
+  const id = fresh
+    ? mintBrowserTabId()
+    : resolved.kind === 'url'
+      ? browserTabId(current, source)
+      : previewTabId(resolved)
+
   const index = current.findIndex(tab => tab.id === id)
   // Ownership is the tab's, not the target's: it decides who may navigate this
   // tab later, so it has to outlive the open that created it. Sticky, because a

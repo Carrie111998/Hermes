@@ -17,6 +17,40 @@ export interface ConsoleEntry {
   source?: string
 }
 
+/** Chromium's own names, as `webContents`' console-message reports them since
+ *  Electron 35. `warning` is the spelling that matters — it is what a missing
+ *  translation key arrives as. */
+const LEVEL_NUMBER: Record<string, number> = {
+  debug: 0,
+  error: 3,
+  info: 1,
+  log: 0,
+  verbose: 0,
+  warn: 2,
+  warning: 2
+}
+
+/**
+ * One numeric convention for a level that arrives in two shapes.
+ *
+ * `webContents` moved to a STRING level in Electron 35; `<webview>`, which is
+ * what the pane actually hosts, was never migrated and still emits an Integer
+ * 0-3. The whole app — the panel's colours and labels, and the digest that
+ * tells the agent how many errors a page threw — compares numbers.
+ *
+ * So this is insurance against a silent death rather than a live bug: if that
+ * divergence is ever settled, a string level would quietly stop equalling 3,
+ * every error would count as a `log`, and the agent would go back to being
+ * told a broken page is fine. Nothing would throw.
+ */
+export function consoleLevel(level: number | string | undefined): number {
+  if (typeof level === 'number') {
+    return Number.isFinite(level) ? level : 0
+  }
+
+  return typeof level === 'string' ? (LEVEL_NUMBER[level.toLowerCase()] ?? 0) : 0
+}
+
 export interface ConsoleEntryInput {
   level: number
   line?: number

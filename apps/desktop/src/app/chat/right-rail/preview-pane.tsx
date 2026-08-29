@@ -39,7 +39,7 @@ import {
   isNearConsoleBottom,
   PreviewConsolePanel
 } from './preview-console'
-import { type ConsoleEntry } from './preview-console-state'
+import { type ConsoleEntry, consoleLevel } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { type PreviewInputEvent, registerPreviewInput } from './preview-input'
@@ -874,22 +874,23 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
     const onConsole = (event: Event) => {
       const detail = event as Event & {
-        level?: number
+        level?: number | string
         line?: number
         message?: string
         sourceId?: string
       }
 
       const message = detail.message || ''
+      const level = consoleLevel(detail.level)
 
       appendConsoleEntry({
-        level: detail.level ?? 0,
+        level,
         line: detail.line,
         message,
         source: detail.sourceId
       })
 
-      if ((detail.level ?? 0) >= 3 && isModuleMimeError(message)) {
+      if (level >= 3 && isModuleMimeError(message)) {
         setLoadError({
           description: copy.moduleMimeDescription,
           url: guestPage(webview, target.url).url

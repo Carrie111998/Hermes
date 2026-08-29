@@ -33,7 +33,7 @@ def _normalize_target(raw: str) -> str:
     return v
 
 
-def open_preview_tool(url: str, label: str = "") -> str:
+def open_preview_tool(url: str, label: str = "", new_tab: bool = False) -> str:
     """Ask the desktop GUI to show ``url`` in the preview pane beside the chat."""
     target = _normalize_target(url or "")
     if not target:
@@ -44,13 +44,18 @@ def open_preview_tool(url: str, label: str = "") -> str:
 
     label = (label or "").strip()
     try:
-        ok = desktop_ui.emit("preview.open", {"url": target, "label": label})
+        ok = desktop_ui.emit(
+            "preview.open", {"url": target, "label": label, "new_tab": bool(new_tab)}
+        )
     except Exception as exc:
         return tool_error(f"Failed to open the preview pane: {exc}")
     if not ok:
         return tool_error("The preview pane is only available in the Hermes desktop app.")
 
-    return json.dumps({"success": True, "url": target, "label": label}, ensure_ascii=False)
+    return json.dumps(
+        {"success": True, "url": target, "label": label, "new_tab": bool(new_tab)},
+        ensure_ascii=False,
+    )
 
 
 OPEN_PREVIEW_SCHEMA = {
@@ -94,6 +99,16 @@ OPEN_PREVIEW_SCHEMA = {
                 "type": "string",
                 "description": "Optional tab label; defaults to the target's name.",
             },
+            "new_tab": {
+                "type": "boolean",
+                "description": (
+                    "Open in an ADDITIONAL browser tab instead of the one you are "
+                    "already using. Only for when you need two pages side by side "
+                    "— comparing them, or keeping a reference open while you work. "
+                    "Leave it off otherwise: re-using your tab is what keeps the "
+                    "user's tab strip readable."
+                ),
+            },
         },
         "required": ["url"],
     },
@@ -104,6 +119,10 @@ registry.register(
     name="open_preview",
     toolset="desktop_ui",
     schema=OPEN_PREVIEW_SCHEMA,
-    handler=lambda args, **kw: open_preview_tool(url=args.get("url", ""), label=args.get("label", "")),
+    handler=lambda args, **kw: open_preview_tool(
+        url=args.get("url", ""),
+        label=args.get("label", ""),
+        new_tab=args.get("new_tab", False),
+    ),
     emoji="🖼️",
 )

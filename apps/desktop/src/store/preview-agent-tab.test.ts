@@ -139,6 +139,43 @@ describe('agent browser tabs', () => {
     expect(tabs[1]?.target.url).toBe('about:blank')
   })
 
+  // Two pages side by side — comparing them, or holding a reference open.
+  it('can ask for a second tab of its own', () => {
+    openPreview(url('first.com'), 'tool-result')
+    openPreview(url('second.com'), 'tool-result', { newTab: true })
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(2)
+    expect(tabs.map(tab => tab.target.url)).toEqual(['https://first.com', 'https://second.com'])
+    expect(tabs.every(tab => tab.agent)).toBe(true)
+  })
+
+  // Having asked for a second, plain opens must land in it rather than
+  // reviving the first — otherwise the agent cannot work in the tab it just
+  // made.
+  it('works in the newest tab it opened', () => {
+    openPreview(url('first.com'), 'tool-result')
+    openPreview(url('second.com'), 'tool-result', { newTab: true })
+    openPreview(url('third.com'), 'tool-result')
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(2)
+    expect(tabs.map(tab => tab.target.url)).toEqual(['https://first.com', 'https://third.com'])
+  })
+
+  // A file is addressed by its content, so "another tab" of it is the same tab
+  // twice.
+  it('ignores newTab for a file, which is addressed by its path', () => {
+    const file = { kind: 'file' as const, label: 'a.ts', source: '/a.ts', url: 'file:///a.ts' }
+
+    openPreview(file, 'tool-result', { newTab: true })
+    openPreview(file, 'tool-result', { newTab: true })
+
+    expect($previewTabs.get()).toHaveLength(1)
+  })
+
   // `openBrowserTab` is the hotkey: "show me the browser". With only the
   // agent's tab open that is the browser it should front.
   it('lets the hotkey front the agent tab rather than blanking it', () => {

@@ -8,6 +8,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { consoleDigest, consoleSince } from './preview-console-digest'
+import { consoleLevel } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 
 const LOG = 0
@@ -122,5 +123,47 @@ describe('consoleDigest', () => {
     consoleDigest(id)
 
     expect(consoleSince(id)).toBeNull()
+  })
+})
+
+/**
+ * `<webview>` still emits an Integer level; `webContents` moved to a string in
+ * Electron 35. If that divergence is ever settled, a string level would stop
+ * equalling 3 and every error would silently count as a `log` — the agent would
+ * go back to being told a broken page is fine, with nothing throwing.
+ */
+describe('consoleLevel', () => {
+  it('passes the <webview> integers through', () => {
+    expect([0, 1, 2, 3].map(consoleLevel)).toEqual([0, 1, 2, 3])
+  })
+
+  it('understands the string names too', () => {
+    expect(consoleLevel('error')).toBe(3)
+    // Chromium says 'warning'; console.warn is what i18n reports keys with.
+    expect(consoleLevel('warning')).toBe(2)
+    expect(consoleLevel('warn')).toBe(2)
+    expect(consoleLevel('info')).toBe(1)
+    expect(consoleLevel('log')).toBe(0)
+  })
+
+  it('is not case-sensitive', () => {
+    expect(consoleLevel('ERROR')).toBe(3)
+  })
+
+  // Unknown or absent reads as chatter, never as an error — a breadcrumb that
+  // cried wolf on every log line would be ignored within a turn.
+  it('falls back to log rather than inventing an error', () => {
+    expect(consoleLevel(undefined)).toBe(0)
+    expect(consoleLevel('something-new')).toBe(0)
+    expect(consoleLevel(Number.NaN)).toBe(0)
+  })
+
+  it('counts a string-level error the same as a numeric one', () => {
+    const id = 'url:browser-digest-levels'
+
+    previewConsoleState(id).append({ level: consoleLevel('error'), message: 'boom' })
+    previewConsoleState(id).append({ level: consoleLevel('warning'), message: 'missing key' })
+
+    expect(consoleSince(id)).toEqual({ errors: 1, warnings: 1 })
   })
 })
