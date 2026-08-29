@@ -92,8 +92,10 @@ def test_install_prefers_themed_icon_from_hicolor(tmp_path, xdg_home, monkeypatc
     values = _parse(entry.read_text(encoding="utf-8"))
     assert values["Icon"] == "hermes"
 
-    # And the icon really landed in the hicolor tree.
-    dest = xdg_home / "icons" / "hicolor" / "256x256" / "apps" / "hermes.png"
+    # And the icon really landed in the hicolor tree: the fixture icon is
+    # a fake PNG (no valid IHDR), so the size is unknown and the icon
+    # lands under scalable/.
+    dest = xdg_home / "icons" / "hicolor" / "scalable" / "apps" / "hermes.png"
     assert dest.is_file()
     assert dest.read_bytes() == lde.icon_path(root).read_bytes()
 

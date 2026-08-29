@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -381,7 +382,12 @@ def _wrapper_shebang_safe(wrapper: Path) -> bool:
     # itself execs the right interpreter. Only python-flavored `env`
     # shebangs are the escape hazard.
     if interp.name == "env":
-        target = Path(tokens[1]) if len(tokens) > 1 else Path("")
+        # Skip env's own flags (-S, -u VAR, ...) and inspect the first
+        # real token: `env -S bash` is still a shell launcher.
+        target = next(
+            (Path(t) for t in tokens[1:] if not t.startswith("-")),
+            Path(""),
+        )
         if target.name in ("bash", "sh", "dash", "zsh", "ksh"):
             return True
         return not _shebang_escapes_running_env(shebang)
@@ -623,13 +629,26 @@ def _install_icon_to_hicolor(icon: Path) -> bool:
 
     The freedesktop icon lookup finds an installed ``apps/hermes.png``
     by the unqualified name ``hermes``, so the entry can reference the
-    icon without an absolute checkout path. Returns True when the icon
-    is installed (or already up to date); False when it cannot be —
-    the caller then falls back to the absolute path.
+    icon without an absolute checkout path. The size subdirectory follows
+    the image's real dimensions read from the PNG IHDR header (no image
+    library needed): a non-256px image belongs in ``scalable`` — putting
+    it under a fixed-size directory would make some themes draw it
+    unscaled. Returns True when the icon is installed (or already up to
+    date); False when it cannot be — the caller then falls back to the
+    absolute path.
     """
-    dest = _xdg_data_home() / "icons" / "hicolor" / "256x256" / "apps" / "hermes.png"
     try:
-        if dest.is_file() and dest.read_bytes() == icon.read_bytes():
+        raw = icon.read_bytes()
+        width = height = None
+        if raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
+            width, height = struct.unpack(">II", raw[16:24])
+        subdir = (
+            f"{width}x{height}"
+            if width and height and (width, height) != (256, 256)
+            else ("scalable" if (width, height) != (256, 256) else "256x256")
+        )
+        dest = _xdg_data_home() / "icons" / "hicolor" / subdir / "apps" / "hermes.png"
+        if dest.is_file() and dest.read_bytes() == raw:
             return True
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(icon, dest)
