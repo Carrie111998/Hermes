@@ -141,6 +141,7 @@ def _stub_uvicorn_run(monkeypatch):
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda _host, _port: False)
     return captured
 
 

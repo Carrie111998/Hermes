@@ -82,7 +82,7 @@ def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=9)
 
-    assert builtin.start_kwargs == {"interval": 9}
+    assert builtin.start_kwargs == {"interval": 9, "owner_session_db": None}
 
 
 def test_enumeration_failure_fails_open(monkeypatch, _providers):
@@ -97,7 +97,7 @@ def test_enumeration_failure_fails_open(monkeypatch, _providers):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=11)
 
-    assert builtin.start_kwargs == {"interval": 11}
+    assert builtin.start_kwargs == {"interval": 11, "owner_session_db": None}
 
 
 def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):
