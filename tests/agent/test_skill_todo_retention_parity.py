@@ -269,6 +269,46 @@ class TestNoticeStripLifecycle:
         assert stripped == "real user words"
         assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER not in stripped
 
+    def test_strip_removes_embedded_snapshot_from_list_content(self):
+        """Regression (#97602 class): snapshots merged onto an existing text
+        block by ``_append_text_to_content`` start AFTER user text, so a
+        ``startswith`` filter never matches them. On a multimodal tail this
+        accumulates a duplicate snapshot at every compaction boundary."""
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    "real user words\n\n"
+                    + TODO_INJECTION_HEADER
+                    + "\n- [ ] t1. old task (pending)\n\n"
+                    + _PRUNED_SKILL_RELOAD_NOTICE_HEADER
+                    + "\nreload skill_view(name='old-skill') first."
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ]
+        stripped = _strip_stale_todo_snapshot(content)
+        assert stripped[0] == {"type": "text", "text": "real user words"}
+        assert stripped[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,..."},
+        }
+
+    def test_strip_keeps_snapshot_only_block_dropped_in_list_content(self):
+        """A text block that is nothing but the snapshot still drops entirely
+        (previous whole-part behavior preserved), not truncated to empty."""
+        content = [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+            {
+                "type": "text",
+                "text": TODO_INJECTION_HEADER + "\n- [ ] t1. old task (pending)",
+            },
+        ]
+        stripped = _strip_stale_todo_snapshot(content)
+        assert stripped == [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ]
+
     def test_repeated_boundaries_keep_single_notice(self, tmp_path):
         """Second compaction with a tail already carrying snapshot+notice
         refreshes in place instead of stacking duplicates (#26981 parity)."""
