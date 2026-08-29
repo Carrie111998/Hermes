@@ -360,7 +360,7 @@ class TestNlo365ApprovalButtons:
         assert result.success is True
         assert captured_rows == [
             [
-                {"text": "✅ Approve & Execute", "callback_data": f"na:a:{self.APPROVAL_ID}"},
+                {"text": "🔍 Review", "callback_data": f"na:v:{self.APPROVAL_ID}"},
                 {"text": "❌ Reject", "callback_data": f"na:r:{self.APPROVAL_ID}"},
             ],
             [{"text": "ℹ️ Status", "callback_data": f"na:s:{self.APPROVAL_ID}"}],
@@ -391,8 +391,8 @@ class TestNlo365ApprovalButtons:
 
         rows = adapter._bot.send_message.call_args.kwargs["reply_markup"]
         assert rows[0][0] == {
-            "text": "✅ Approve & Execute",
-            "callback_data": f"na:a:{self.APPROVAL_ID}",
+            "text": "🔍 Review",
+            "callback_data": f"na:v:{self.APPROVAL_ID}",
         }
 
     @pytest.mark.asyncio
@@ -407,12 +407,74 @@ class TestNlo365ApprovalButtons:
 
         assert "reply_markup" not in adapter._bot.send_message.call_args.kwargs
 
+    def test_nlo365_initial_keyboard_requires_review_before_execute(self, monkeypatch):
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: {"text": text, "callback_data": callback_data},
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+        keyboard = _make_adapter()._nlo365_approval_keyboard(self.APPROVAL_ID)
+        callback_data = [button["callback_data"] for row in keyboard for button in row]
+
+        assert f"na:v:{self.APPROVAL_ID}" in callback_data
+        assert f"na:a:{self.APPROVAL_ID}" not in callback_data
+
+    @pytest.mark.asyncio
+    async def test_authorized_review_shows_exact_normalized_contact_intent(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: {"text": text, "callback_data": callback_data},
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+        adapter._run_nlo365_approval_action = AsyncMock(
+            return_value={
+                "approval_id": self.APPROVAL_ID,
+                "action": "contact.change.draft",
+                "status": "pending",
+                "resource": {"mailbox": "box@example.com"},
+                "payload": {
+                    "operation": "create",
+                    "fields": {
+                        "displayName": "Synthetic Contact",
+                        "personalNotes": "Temporary synthetic note",
+                    },
+                },
+            }
+        )
+        query = AsyncMock()
+        query.data = f"na:v:{self.APPROVAL_ID}"
+        query.message = MagicMock(chat_id=12345)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id=111, first_name="Ilan")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._run_nlo365_approval_action.assert_awaited_once_with(
+            "v", self.APPROVAL_ID
+        )
+        edit = query.edit_message_text.call_args.kwargs
+        assert "Review before execution" in edit["text"]
+        assert '"personalNotes": "Temporary synthetic note"' in edit["text"]
+        callback_data = [
+            button["callback_data"]
+            for row in edit["reply_markup"]
+            for button in row
+        ]
+        assert f"na:c:{self.APPROVAL_ID}" in callback_data
+
     @pytest.mark.asyncio
     async def test_unauthorized_callback_never_runs_broker(self):
         adapter = _make_adapter()
         adapter._run_nlo365_approval_action = AsyncMock()
         query = AsyncMock()
-        query.data = f"na:a:{self.APPROVAL_ID}"
+        query.data = f"na:c:{self.APPROVAL_ID}"
         query.message = MagicMock(chat_id=12345)
         query.message.chat.type = "private"
         query.from_user = MagicMock(id=222, first_name="Mallory")
@@ -438,7 +500,7 @@ class TestNlo365ApprovalButtons:
             }
         )
         query = AsyncMock()
-        query.data = f"na:a:{self.APPROVAL_ID}"
+        query.data = f"na:c:{self.APPROVAL_ID}"
         query.message = MagicMock(chat_id=12345)
         query.message.chat.type = "private"
         query.from_user = MagicMock(id=111, first_name="Ilan")
@@ -448,8 +510,38 @@ class TestNlo365ApprovalButtons:
             await adapter._handle_callback_query(update, MagicMock())
 
         adapter._run_nlo365_approval_action.assert_awaited_once_with(
-            "a", self.APPROVAL_ID
+            "c", self.APPROVAL_ID
         )
         edit = query.edit_message_text.call_args.kwargs
         assert "Verified" in edit["text"]
         assert edit["reply_markup"] is None
+
+    @pytest.mark.asyncio
+    async def test_verified_callback_treats_identical_edit_as_success(self):
+        adapter = _make_adapter()
+        adapter._run_nlo365_approval_action = AsyncMock(
+            return_value={
+                "approval_id": self.APPROVAL_ID,
+                "action": "contact.change.draft",
+                "status": "verified",
+                "provider_id_present": True,
+                "verification_matched": True,
+                "verification_stage": "contact_readback",
+            }
+        )
+        query = AsyncMock()
+        query.data = f"na:s:{self.APPROVAL_ID}"
+        query.message = MagicMock(chat_id=12345)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id=111, first_name="Ilan")
+        query.edit_message_text = AsyncMock(
+            side_effect=RuntimeError("Message is not modified")
+        )
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._run_nlo365_approval_action.assert_awaited_once_with(
+            "s", self.APPROVAL_ID
+        )

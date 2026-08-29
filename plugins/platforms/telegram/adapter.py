@@ -7211,7 +7211,7 @@ class TelegramAdapter(BasePlatformAdapter):
             [
                 [
                     InlineKeyboardButton(
-                        "✅ Approve & Execute", callback_data=f"na:a:{approval_id}"
+                        "🔍 Review", callback_data=f"na:v:{approval_id}"
                     ),
                     InlineKeyboardButton(
                         "❌ Reject", callback_data=f"na:r:{approval_id}"
@@ -7225,6 +7225,19 @@ class TelegramAdapter(BasePlatformAdapter):
             ]
         )
 
+    @staticmethod
+    def _nlo365_confirmation_keyboard(approval_id: str):
+        return InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(
+                    "✅ Confirm & Execute", callback_data=f"na:c:{approval_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Reject", callback_data=f"na:r:{approval_id}"
+                ),
+            ]]
+        )
+
     async def _run_nlo365_approval_action(
         self, choice: str, approval_id: str
     ) -> Dict[str, Any]:
@@ -7234,9 +7247,10 @@ class TelegramAdapter(BasePlatformAdapter):
         except ValueError as exc:
             raise RuntimeError("invalid approval identifier") from exc
         command = {
-            "a": "approve-execute-safe",
+            "c": "approve-execute-safe",
             "r": "reject-safe",
             "s": "status-safe",
+            "v": "preview-authorized",
         }.get(choice)
         if command is None:
             raise RuntimeError("invalid approval action")
@@ -7274,7 +7288,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_user_name,
     ) -> None:
         parts = data.split(":", 2)
-        if len(parts) != 3 or parts[1] not in {"a", "r", "s"}:
+        if len(parts) != 3 or parts[1] not in {"c", "r", "s", "v"}:
             await query.answer(text="Invalid Microsoft 365 approval data.")
             return
         choice, approval_id = parts[1], parts[2]
@@ -7295,7 +7309,13 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text="⛔ You are not authorized to approve Microsoft 365 changes.")
             return
 
-        await query.answer(text="Processing…" if choice != "s" else "Checking status…")
+        if choice == "s":
+            callback_status = "Checking status…"
+        elif choice == "v":
+            callback_status = "Loading exact request…"
+        else:
+            callback_status = "Processing…"
+        await query.answer(text=callback_status)
         try:
             result = await self._run_nlo365_approval_action(choice, approval_id)
         except Exception:
@@ -7311,7 +7331,31 @@ class TelegramAdapter(BasePlatformAdapter):
 
         status = str(result.get("status") or "unknown")
         action = str(result.get("action") or "Microsoft 365 change")
-        if status == "verified" and result.get("verification_matched") is True:
+        if choice == "v" and status in {"pending", "approved"}:
+            exact_intent = json.dumps(
+                {
+                    "resource": result.get("resource") or {},
+                    "payload": result.get("payload") or {},
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            text = (
+                f"🔍 Review before execution\nAction: {action}\n"
+                f"Approval ID: {approval_id}\n\nExact normalized request:\n"
+                f"{exact_intent}"
+            )
+            if len(text) > 3900:
+                text = (
+                    "⚠️ This request is too large to review safely in Telegram. "
+                    "It was not approved or executed.\n"
+                    f"Approval ID: {approval_id}"
+                )
+                reply_markup = None
+            else:
+                reply_markup = self._nlo365_confirmation_keyboard(approval_id)
+        elif status == "verified" and result.get("verification_matched") is True:
             text = f"✅ Verified: {action}\nApproval ID: {approval_id}"
             reply_markup = None
         elif status == "rejected":
@@ -7323,7 +7367,12 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             text = f"⚠️ {action}: {status}\nApproval ID: {approval_id}"
             reply_markup = None
-        await query.edit_message_text(text=text, reply_markup=reply_markup)
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            raise
 
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
