@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { getNested, setNested } from '@/app/settings/helpers'
 import { Button } from '@/components/ui/button'
 import { Tip } from '@/components/ui/tooltip'
-import { saveHermesConfig } from '@/hermes'
+import { type ProfileScope, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { GitBranch, iconSize, Loader2 } from '@/lib/icons'
@@ -11,8 +11,8 @@ import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 
 import {
+  hermesConfigCacheWriter,
   invalidateHermesConfig,
-  setHermesConfigCache,
   useHermesConfigRecord
 } from '../../hooks/use-config-record'
 
@@ -37,10 +37,10 @@ export const ROUTE_REPO_CHANGES_KEY = 'delegate_wave.route_repo_changes'
  * off, and this component likewise renders nothing rather than assert a state
  * it does not have.
  */
-export function DelegationToggle({ disabled }: { disabled: boolean }) {
+export function DelegationToggle({ disabled, profileScope }: { disabled: boolean; profileScope?: ProfileScope }) {
   const { t } = useI18n()
   const c = t.composer
-  const { data: config } = useHermesConfigRecord()
+  const { data: config } = useHermesConfigRecord(profileScope)
   const [saving, setSaving] = useState(false)
 
   // No config yet (gateway still starting, or a failed fetch) means we cannot
@@ -64,10 +64,11 @@ export function DelegationToggle({ disabled }: { disabled: boolean }) {
     // Optimistic: the switch answers the click immediately, and a failed save
     // rolls the cache back by refetching rather than leaving a switch that
     // claims a policy the backend never accepted.
-    setHermesConfigCache(next)
+    const writeCache = hermesConfigCacheWriter(profileScope)
+    writeCache(next)
 
     try {
-      const result = await saveHermesConfig(next)
+      const result = await saveHermesConfig(next, profileScope)
 
       if (!result.ok) {
         throw new Error(c.delegationRoutingSaveFailed)
@@ -76,10 +77,10 @@ export function DelegationToggle({ disabled }: { disabled: boolean }) {
       // Roll back immediately. Invalidation may fail for the same reason as
       // the save and cannot be the only correction for a safety switch that
       // never persisted.
-      setHermesConfigCache(config)
+      writeCache(config)
       notifyError(error, c.delegationRoutingSaveFailed)
     } finally {
-      void invalidateHermesConfig()
+      void invalidateHermesConfig(profileScope)
       setSaving(false)
     }
   }

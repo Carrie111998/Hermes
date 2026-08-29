@@ -18,7 +18,7 @@ import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
 import { ErrorState } from '@/components/ui/error-state'
 import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
-import { type HermesGateway } from '@/hermes'
+import { type HermesGateway, type ProfileScope } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
@@ -83,6 +83,7 @@ import { advanceTranscriptWindow, type TranscriptWindowState } from './transcrip
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
+  profileScope?: ProfileScope
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
   onCancel: () => Promise<void> | void
@@ -359,6 +360,7 @@ const ChatViewContent = memo(function ChatViewContent({
   className,
   gateway,
   modelMenuContent,
+  profileScope,
   onToggleSelectedPin,
   onDeleteSelectedSession,
   onCancel,
@@ -394,6 +396,21 @@ const ChatViewContent = memo(function ChatViewContent({
   const isPrimary = view.kind === 'primary'
   const activeSessionId = useStore(view.$runtimeId)
   const storedId = useStore(view.$storedId)
+  const connection = useStore($connection)
+  const activeProfile = useStore($activeGatewayProfile)
+
+  const composerProfileScope = useMemo(() => {
+    const connectionId = connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')
+
+    const owner = storedId
+      ? getSessionOwnerHint(storedId, connectionId ? { connectionId, profile: activeProfile } : undefined)
+      : undefined
+
+    return owner
+      ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
+      : undefined
+  }, [activeProfile, connection?.connectionId, connection?.mode, storedId])
+
   // Multi-pane dimming: only the focused surface paints at full strength, so
   // two sessions side by side read as "this one, and that one over there".
   // A selector, not a plain useStore — the focused id changes on click, and a
@@ -734,6 +751,7 @@ const ChatViewContent = memo(function ChatViewContent({
               onSteer={onSteer}
               onSubmit={onSubmit}
               onTranscribeAudio={onTranscribeAudio}
+              profileScope={profileScope ?? composerProfileScope}
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}
               state={chatBarState}

@@ -90,9 +90,9 @@ export function getHermesConfigSchema(profile?: null | string): Promise<ConfigSc
   })
 }
 
-export function saveHermesConfig(config: HermesConfigRecord, profile?: null | string): Promise<{ ok: boolean }> {
-  return hermesApi<{ ok: boolean }>({
-    ...profileScoped(profile),
+export function saveHermesConfig(config: HermesConfigRecord, profile?: ProfileScope): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...capabilityScoped(profile),
     path: '/api/config',
     method: 'PUT',
     body: { config }

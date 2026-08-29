@@ -8292,7 +8292,7 @@ def get_registered_mcp_server_names() -> set:
 
 
 
-def refresh_agent_mcp_tools(
+def refresh_agent_tools(
     agent,
     *,
     enabled_override=None,
@@ -8300,10 +8300,11 @@ def refresh_agent_mcp_tools(
     quiet_mode: bool = True,
     content_aware: bool = False,
 ) -> set:
-    """Re-derive an already-built agent's tool snapshot from the live registry.
+    """Re-derive an already-built agent's complete tool snapshot.
 
-    The agent snapshots ``agent.tools`` once at build time and never re-reads
-    the registry (see ``run_agent`` / ``agent_init``).  When MCP servers connect
+    This is not conditional on MCP. The agent snapshots ``agent.tools`` once at
+    build time, while repository-routing policy is live config and must be
+    re-evaluated before every turn. When MCP servers connect
     *after* that snapshot — a slow HTTP/OAuth server that misses the bounded
     startup wait, or a ``/reload-mcp`` — their tools are invisible until the
     snapshot is rebuilt.  This is the single shared rebuild used by every such
@@ -8434,6 +8435,11 @@ def refresh_agent_mcp_tools(
             engine_names.update(staged_engine_names)
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
         return new_names - current
+
+
+def refresh_agent_mcp_tools(agent, **kwargs) -> set:
+    """Compatibility name for callers whose trigger is MCP discovery/reload."""
+    return refresh_agent_tools(agent, **kwargs)
 
 
 def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:

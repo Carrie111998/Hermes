@@ -1417,6 +1417,20 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
             )
 
+    # Defense in depth for a stale schema already emitted by a provider. The
+    # turn-boundary rebuild is the primary boundary, but policy may also change
+    # from another surface after request assembly. Never dispatch a direct
+    # repository mutator while routing is currently enabled. Config read errors
+    # deliberately propagate: an unknown policy cannot authorize mutation.
+    from tools.delegate_routing import routing_enabled as _routing_enabled
+    from tools.registry import repo_access_of as _repo_access_of
+
+    if _repo_access_of(function_name) == "write" and _routing_enabled():
+        return tool_error(
+            f"'{function_name}' is unavailable while repository changes are "
+            "routed through Delegate Wave."
+        )
+
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
         try:

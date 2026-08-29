@@ -52,6 +52,18 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+def synchronize_agent_tools_for_turn(agent: Any) -> None:
+    """Publish the current config-filtered tool surface or fail the turn."""
+    if getattr(agent, "_skip_tool_refresh", False) or getattr(
+        agent, "_skip_mcp_refresh", False
+    ):
+        return
+
+    from tools.mcp_tool import refresh_agent_tools
+
+    refresh_agent_tools(agent, quiet_mode=True)
+
+
 def _preflight_request_tokens(
     agent: Any,
     messages: List[Dict[str, Any]],
@@ -588,33 +600,14 @@ def build_turn_context(
     except Exception:
         pass
 
-    # Between-turns MCP refresh: an MCP server that finished connecting since
-    # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
-    # connect, missing the bounded startup wait) lands in THIS turn's tool
-    # snapshot.  This is cache-safe by construction: it runs in the per-turn
-    # prologue, before this turn's first API call assembles ``tools=``, so it
-    # only ever extends a fresh request prefix — it never mutates the cached
-    # prefix of an in-flight turn.  No-op when no MCP servers are registered
-    # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
-    # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
-    # name and leaves the snapshot untouched on no-change).
-    try:
-        if not getattr(agent, "_skip_mcp_refresh", False):
-            # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
-            # package (~0.4s measured) even when the user has zero MCP servers
-            # configured.  MCP tools can only be registered by code that has
-            # already imported ``tools.mcp_tool`` (discovery, /reload-mcp,
-            # late-binding refresh) — so if it isn't in sys.modules yet, there
-            # is nothing to refresh and the import can be skipped outright.
-            # This keeps the no-MCP first turn off the heavy import path
-            # without changing behavior for MCP users.
-            import sys as _sys
-            if "tools.mcp_tool" in _sys.modules:
-                from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-                if has_registered_mcp_tools():
-                    refresh_agent_mcp_tools(agent, quiet_mode=True)
-    except Exception:
-        logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
+    # Turn-boundary tool synchronization is a routing safety boundary, not an
+    # MCP convenience. Repository policy can change after this long-lived
+    # agent was built, so rebuild unconditionally before anything can contact
+    # the provider. A corrupt config must propagate and abort the turn; keeping
+    # an older permissive snapshot would defeat fail-closed routing. The same
+    # rebuild also picks up late MCP registrations when present, but zero MCP
+    # servers follow this exact path too.
+    synchronize_agent_tools_for_turn(agent)
 
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):

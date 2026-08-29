@@ -1,18 +1,23 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
+import type { ProfileScope } from '@/hermes'
 import { I18nProvider } from '@/i18n'
 import type { HermesConfigRecord } from '@/types/hermes'
 
-const saveHermesConfig = vi.fn((_config: HermesConfigRecord) => Promise.resolve({ ok: true }))
-const getHermesConfigRecord = vi.fn<() => Promise<HermesConfigRecord>>(() => Promise.resolve({}))
+const saveHermesConfig = vi.fn((_config: HermesConfigRecord, _profile?: ProfileScope) => Promise.resolve({ ok: true }))
+const getHermesConfigRecord = vi.fn((_profile?: ProfileScope) => Promise.resolve<HermesConfigRecord>({}))
 
 vi.mock('@/hermes', async () => {
   const actual = await vi.importActual<typeof HermesApi>('@/hermes')
 
-  return { ...actual, getHermesConfigRecord: () => getHermesConfigRecord(), saveHermesConfig: (c: HermesConfigRecord) => saveHermesConfig(c) }
+  return {
+    ...actual,
+    getHermesConfigRecord: (profile?: ProfileScope) => getHermesConfigRecord(profile),
+    saveHermesConfig: (config: HermesConfigRecord, profile?: ProfileScope) => saveHermesConfig(config, profile)
+  }
 })
 
 const { DelegationToggle } = await import('./delegation-toggle')
@@ -23,13 +28,12 @@ afterEach(() => {
   getHermesConfigRecord.mockResolvedValue({})
 })
 
-function renderToggle() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+function renderToggle(profileScope?: ProfileScope, client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
 
   return render(
     <QueryClientProvider client={client}>
       <I18nProvider configClient={null} initialLocale="en">
-        <DelegationToggle disabled={false} />
+        <DelegationToggle disabled={false} profileScope={profileScope} />
       </I18nProvider>
     </QueryClientProvider>
   )
@@ -58,7 +62,10 @@ describe('DelegationToggle', () => {
     button().click()
 
     await waitFor(() =>
-      expect(saveHermesConfig).toHaveBeenCalledWith(expect.objectContaining({ delegate_wave: { route_repo_changes: true } }))
+      expect(saveHermesConfig).toHaveBeenCalledWith(
+        expect.objectContaining({ delegate_wave: { route_repo_changes: true } }),
+        undefined
+      )
     )
   })
 
@@ -70,7 +77,10 @@ describe('DelegationToggle', () => {
     button().click()
 
     await waitFor(() =>
-      expect(saveHermesConfig).toHaveBeenCalledWith(expect.objectContaining({ delegate_wave: { route_repo_changes: false } }))
+      expect(saveHermesConfig).toHaveBeenCalledWith(
+        expect.objectContaining({ delegate_wave: { route_repo_changes: false } }),
+        undefined
+      )
     )
   })
 
@@ -102,5 +112,34 @@ describe('DelegationToggle', () => {
     renderToggle()
 
     expect(screen.queryByRole('button')).toBeNull()
+  })
+
+  it('reads and writes the exact owner profile without touching the ambient profile', async () => {
+    const ownerA = { connectionId: 'pc-a', profile: 'default' }
+    const ownerB = { connectionId: 'pc-b', profile: 'work' }
+    getHermesConfigRecord.mockImplementation(async profile =>
+      typeof profile === 'object' && profile?.connectionId === 'pc-b'
+        ? ({ delegate_wave: { route_repo_changes: false } } as HermesConfigRecord)
+        : ({ delegate_wave: { route_repo_changes: true } } as HermesConfigRecord)
+    )
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    renderToggle(ownerA, client)
+    renderToggle(ownerB, client)
+    await waitFor(() => expect(screen.getAllByRole('button')).toHaveLength(2))
+    const [buttonA, buttonB] = screen.getAllByRole('button')
+    await waitFor(() => expect(buttonA.getAttribute('aria-pressed')).toBe('true'))
+    await waitFor(() => expect(buttonB.getAttribute('aria-pressed')).toBe('false'))
+
+    fireEvent.click(buttonB)
+
+    await waitFor(() =>
+      expect(saveHermesConfig).toHaveBeenCalledWith(
+        expect.objectContaining({ delegate_wave: { route_repo_changes: true } }),
+        ownerB
+      )
+    )
+    expect(saveHermesConfig).not.toHaveBeenCalledWith(expect.anything(), ownerA)
+    expect(buttonA.getAttribute('aria-pressed')).toBe('true')
   })
 })

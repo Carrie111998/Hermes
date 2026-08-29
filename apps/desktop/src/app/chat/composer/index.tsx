@@ -93,6 +93,7 @@ export function ChatBar({
   focusKey,
   gateway,
   maxRecordingSeconds = 120,
+  profileScope,
   queueSessionKey,
   sessionId,
   state,
@@ -1029,6 +1030,7 @@ export function ChatBar({
       onDictate={dictate}
       onQueue={queueDraft}
       onToggleAutoSpeak={handleToggleAutoSpeak}
+      profileScope={profileScope}
       state={state}
       voiceStatus={voiceStatus}
     />

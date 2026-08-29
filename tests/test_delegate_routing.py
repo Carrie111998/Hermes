@@ -11,6 +11,7 @@ that delegated children were covered.
 """
 
 import pytest
+from types import SimpleNamespace
 
 from tools import delegate_routing
 from tools.delegate_routing import filter_tools, routing_enabled, status_label
@@ -526,3 +527,82 @@ def test_process_cannot_be_used_to_reach_a_shell_that_is_already_running():
     assert "process" not in filter_tools({"process", "read_file"}, ON)
     # Still available when the switch is off, like everything else.
     assert "process" in filter_tools({"process", "read_file"}, OFF)
+
+
+@pytest.mark.parametrize("with_mcp", [False, True])
+def test_live_agent_refresh_tracks_routing_transitions_with_or_without_mcp(
+    monkeypatch, with_mcp
+):
+    """OFF→ON→OFF is a turn-boundary property, never an MCP side effect."""
+    import model_tools
+    from tools.mcp_tool import refresh_agent_tools
+    from tools.registry import registry
+
+    mcp_name = "mcp__routing_matrix__poll"
+    if with_mcp:
+        registry.register(
+            name=mcp_name,
+            toolset="mcp-routing-matrix",
+            schema={"name": mcp_name, "description": "test", "parameters": {}},
+            handler=lambda _args, **_kwargs: "ok",
+            repo_access="none",
+        )
+
+    state = {"enabled": False}
+    monkeypatch.setattr(delegate_routing, "routing_enabled", lambda _config=None: state["enabled"])
+    agent = SimpleNamespace(
+        enabled_toolsets=["file"] + (["mcp-routing-matrix"] if with_mcp else []),
+        disabled_toolsets=None,
+        tools=[],
+        valid_tool_names=set(),
+        _tool_snapshot_generation=-1,
+    )
+
+    try:
+        model_tools._clear_tool_defs_cache()
+        refresh_agent_tools(agent)
+        assert {"patch", "write_file"} <= agent.valid_tool_names
+        if with_mcp:
+            assert mcp_name in agent.valid_tool_names
+
+        state["enabled"] = True
+        model_tools._clear_tool_defs_cache()
+        refresh_agent_tools(agent)
+        assert not ({"patch", "write_file"} & agent.valid_tool_names)
+        assert "read_file" in agent.valid_tool_names
+        if with_mcp:
+            assert mcp_name in agent.valid_tool_names
+
+        state["enabled"] = False
+        model_tools._clear_tool_defs_cache()
+        refresh_agent_tools(agent)
+        assert {"patch", "write_file"} <= agent.valid_tool_names
+    finally:
+        if with_mcp:
+            registry.deregister(mcp_name)
+        model_tools._clear_tool_defs_cache()
+
+
+def test_turn_boundary_refresh_failure_aborts_instead_of_using_stale_tools(monkeypatch):
+    from agent.turn_context import synchronize_agent_tools_for_turn
+    from tools import mcp_tool
+
+    monkeypatch.setattr(
+        mcp_tool,
+        "refresh_agent_tools",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            delegate_routing.RoutingConfigUnreadable("corrupt config")
+        ),
+    )
+
+    with pytest.raises(delegate_routing.RoutingConfigUnreadable, match="corrupt"):
+        synchronize_agent_tools_for_turn(SimpleNamespace())
+
+
+def test_dispatch_rechecks_write_policy_against_a_stale_tool_call(monkeypatch):
+    import model_tools
+
+    monkeypatch.setattr(delegate_routing, "routing_enabled", lambda _config=None: True)
+    result = model_tools.handle_function_call("patch", {"patch": "irrelevant"})
+
+    assert "unavailable while repository changes are routed" in result

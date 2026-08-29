@@ -3,6 +3,7 @@ import { useStore } from '@nanostores/react'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
+import type { ProfileScope } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { AudioLines, Ear, EarOff, iconSize, Layers3, Loader2, Square, Volume2, VolumeX } from '@/lib/icons'
@@ -43,6 +44,7 @@ export function ComposerControls({
   foldVoice = false,
   hasComposerPayload,
   minimal = false,
+  profileScope,
   state,
   voiceStatus,
   onDictate,
@@ -59,6 +61,7 @@ export function ComposerControls({
   foldVoice?: boolean
   hasComposerPayload: boolean
   minimal?: boolean
+  profileScope?: ProfileScope
   state: ChatBarState
   voiceStatus: VoiceStatus
   onDictate: () => void
@@ -109,7 +112,7 @@ export function ComposerControls({
       {minimal ? null : (
         <>
           <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
-          <DelegationToggle disabled={disabled} />
+          <DelegationToggle disabled={disabled || busy} profileScope={profileScope} />
           {voiceControls}
         </>
       )}
