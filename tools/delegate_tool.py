@@ -3887,6 +3887,13 @@ def delegate_task(
                     _resolve_delegation_credentials(per_task_cfg, parent_agent)
                 )
             except Exception as exc:
+                # Unexpected resolution errors are attributed to the task but
+                # logged at exception level first (GPT-OSS R2 SHOULD-FIX) so a
+                # programming error (TypeError, etc.) is diagnosable from logs
+                # rather than silently flattened into a tool_error string.
+                logger.exception(
+                    "Task %s model/provider override resolution failed", i
+                )
                 return tool_error(f"Task {i} model/provider override failed: {exc}")
         else:
             # No override: keep the batch-level `creds` (no redundant
