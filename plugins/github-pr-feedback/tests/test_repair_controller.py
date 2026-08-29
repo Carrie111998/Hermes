@@ -102,6 +102,34 @@ def test_repair_triggers_cover_conflicts_changes_requested_and_non_green_actions
     ) == ("merge_conflict", "changes_requested", "actions_not_green")
 
 
+def test_repair_triggers_does_not_treat_a_billing_lockout_as_a_repair_trigger() -> None:
+    """A GitHub Actions billing lockout fails every check regardless of code quality.
+
+    It is not evidence this PR needs a repair; the local-CI lane is the
+    billing-aware trigger for a genuine failure found under lockout.
+    """
+
+    assert repair_triggers(
+        merge_state(),
+        ReviewState(None, 0),
+        CheckState(True, False, 2, True),
+    ) == ()
+
+
+def test_repair_triggers_does_not_treat_action_required_as_a_repair_trigger() -> None:
+    """A check waiting on human workflow-run approval is not a code defect.
+
+    No repair commit can satisfy GitHub's own action_required conclusion; only
+    a human approving the gated run (or otherwise resolving it) can.
+    """
+
+    assert repair_triggers(
+        merge_state(),
+        ReviewState(None, 0),
+        CheckState(True, False, 2, False, True),
+    ) == ()
+
+
 class GitHub:
     def list_open_pull_requests(self, repository: str, owner: str):
         from github_pr_feedback.policy import PullRequest
@@ -123,6 +151,16 @@ class GitHub:
 class GitHubWithoutChecks(GitHub):
     def get_check_state(self, repository: str, head_sha: str):
         raise RuntimeError("check state unavailable")
+
+
+class ActionRequiredGitHub(GitHub):
+    """A PR with no conflict/review trigger, only a GitHub action_required check."""
+
+    def get_merge_state(self, repository: str, number: int):
+        return merge_state()
+
+    def get_check_state(self, repository: str, head_sha: str):
+        return CheckState(True, False, 1, False, True)
 
 
 class BehindBaseGitHub(GitHub):
@@ -240,11 +278,65 @@ def test_repair_controller_dedupes_exact_head_and_preserves_merge_authority(
     assert task.assignee == "pr-repair-steward"
     assert task.initial_status == "running"
     assert task.max_runtime_seconds == 1200
-    assert "normal merge" in task.instructions
+    assert "git merge --no-ff --no-edit" in task.instructions
     assert "Commit the resolved merge before running base-relative" in task.instructions
     assert "Do not merge the pull request" in task.instructions
     assert "Do not force-push" in task.instructions
     assert "Do not weaken" in task.instructions
+    assert task.evidence["expected_base_branch"] == "main"
+    assert task.evidence["expected_base_sha"] == "b" * 40
+    assert task.evidence["expected_head_branch"] == "codex/fix"
+    assert task.evidence["expected_head_repository"] == "acme/widgets"
+    assert task.evidence["expected_head_sha"] == SHA
+    identity_command = (
+        "gh pr view 17 --repo acme/widgets --json "
+        "baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
+    )
+    assert task.instructions.count(identity_command) == 1
+    assert "before any fetch, checkout, edit, test, commit, push, or reply" in (
+        task.instructions
+    )
+    assert "require all five returned identity fields" in task.instructions.casefold()
+    assert task.idempotency_key.startswith("github-pr-repair:v3:")
+    ledger.close()
+
+
+def test_repair_controller_escalates_an_action_required_pr_instead_of_repairing_it(
+    tmp_path: Path,
+) -> None:
+    """A PR with no conflict/review trigger, only action_required, still gets a card.
+
+    It must be a blocked, human-facing escalation -- distinct from (and never
+    absorbed into) the ordinary repair path, since no repair commit can clear
+    GitHub's own action_required conclusion.
+    """
+
+    configured = policy(tmp_path)
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    kanban = Kanban()
+    controller = RepairController(
+        configured,
+        ledger,
+        ActionRequiredGitHub(),
+        kanban,
+        LocalGit(),
+        clock=lambda: datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+    )
+
+    first = controller.scan()
+    second = controller.scan()
+
+    assert first.created == 1
+    assert first.skipped.get("no_repair_trigger") == 1
+    assert second.created == 0
+    assert len(kanban.tasks) == 1
+    task = kanban.tasks[0]
+    assert task.assignee == "fallback"
+    assert task.initial_status == "blocked"
+    assert task.title == "Actions needed: acme/widgets#17 (GitHub check action_required)"
+    assert "action_required" in task.instructions
+    assert "Do not push, edit, approve, or merge" in task.instructions
+    assert task.evidence["reason"] == "github_check_action_required"
     ledger.close()
 
 
@@ -265,9 +357,9 @@ def test_repair_controller_routes_a_stale_pr_base_into_the_refresh_lane(
 
     assert result.created == 1
     assert kanban.tasks[0].evidence["triggers"] == ["base_refresh_required"]
-    assert "normal merge" in kanban.tasks[0].instructions
+    assert "git merge --no-ff --no-edit" in kanban.tasks[0].instructions
     assert "base_refresh_required" in kanban.tasks[0].instructions
-    assert "hermes github-pr-feedback complete-feedback" in kanban.tasks[0].instructions
+    assert "github-pr-feedback complete-feedback" in kanban.tasks[0].instructions
     assert "--feedback-kind pr_repair" in kanban.tasks[0].instructions
     assert "--feedback-id repair:base_refresh_required" in kanban.tasks[0].instructions
     assert "--resolved-head-sha <full literal resolved head SHA>" in (
@@ -366,7 +458,10 @@ def test_terminal_refresh_binding_does_not_hold_slot_before_archived_recovery(
     assert result.created == 1
     assert result.skipped == {"duplicate": 1}
     assert [task.evidence["pr_number"] for task in kanban.tasks] == [18]
-    assert ledger.exact_pending_task_binding(archived) is not None
+    assert any(
+        binding.task_id == "repair-task"
+        for binding in ledger.pending_task_bindings_for_head(archived)
+    )
     ledger.close()
 
 
