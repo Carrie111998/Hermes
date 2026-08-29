@@ -120,6 +120,36 @@ def test_concurrent_preflight_interrupt_skips_all(monkeypatch):
 
 
 
+def test_concurrent_exception_result_and_log_are_sink_safe(monkeypatch, caplog):
+    """A worker exception must not enter either public result or logging sinks."""
+    agent = _make_agent(monkeypatch)
+    marker = "opaque-r3-final-concurrent-SECRET-654321"
+    agent._invoke_tool = MagicMock(side_effect=RuntimeError(marker))
+    agent._tool_guardrails = MagicMock()
+    guardrail_decision = MagicMock()
+    guardrail_decision.allows_execution = True
+    agent._tool_guardrails.before_call.return_value = guardrail_decision
+    agent._append_guardrail_observation = lambda _name, _args, result, **_kw: result
+    agent._subdirectory_hints.check_tool_call.return_value = ""
+    agent._tool_result_content_for_active_model = lambda _name, result: result
+    agent._record_file_mutation_result = lambda *args, **kwargs: None
+    agent._flush_messages_to_session_db = lambda *args, **kwargs: True
+    msg = _FakeAssistantMsg([
+        _FakeToolCall("tool_a", call_id="tc_a"),
+        _FakeToolCall("tool_b", call_id="tc_b"),
+    ])
+
+    with caplog.at_level("DEBUG"):
+        messages = []
+        agent._execute_tool_calls_concurrent(msg, messages, "test_task")
+
+    assert len(messages) == 2
+    assert marker not in repr(messages)
+    assert marker not in caplog.text
+    assert all("RuntimeError" in message["content"] for message in messages)
+
+
+
 def test_clear_interrupt_clears_worker_tids(monkeypatch):
     """After clear_interrupt(), stale worker-tid bits must be cleared so the
     next turn's tools — which may be scheduled onto recycled tids — don't

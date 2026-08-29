@@ -51,6 +51,7 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
     extract_persisted_path, sanitize_tool_result_for_sink,
 )
+from tools.tool_result_sanitization import sanitize_exception_for_sink
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -
         if path:
             agent._tool_guardrails.record_persisted_result(tool_call_id, path)
     except Exception as exc:
-        logger.debug("persisted-path record for result stub failed: %s", exc)
+        logger.debug("persisted-path record for result stub failed: %s", sanitize_exception_for_sink(exc))
 
 
 def _ensure_file_checkpoint(
@@ -235,7 +236,7 @@ def _flush_session_db_after_tool_progress(
         agent._incremental_persistence_failed = True
         from hermes_state import classify_persistence_error
         agent._last_persistence_error_cause = classify_persistence_error(exc)
-        logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
+        logger.warning("Incremental tool-call persistence failed after %s: %s", stage, sanitize_exception_for_sink(exc))
         return False
 
 
@@ -487,11 +488,11 @@ class _ConcurrentToolAuthorizationGate:
                 # thread: excluded_seconds() is polled from the batch wait
                 # loop, whose context may differ from the workers'.
                 self._session_key = get_current_session_key()
-            except Exception:
+            except Exception as exc:
                 logger.debug(
                     "authorization gate could not snapshot the session key; "
-                    "human-wait exclusion will re-resolve it at poll time",
-                    exc_info=True,
+                    "human-wait exclusion will re-resolve it at poll time: %s",
+                    sanitize_exception_for_sink(exc),
                 )
         self._baseline_wait_seconds = self._human_wait_seconds()
 
@@ -1071,7 +1072,7 @@ def _begin_tool_execution(
                 tool_call_id, function_name, display_args
             )
         except Exception as callback_error:
-            logging.debug("Tool start callback error: %s", callback_error)
+            logger.debug("Tool start callback error: %s", sanitize_exception_for_sink(callback_error))
 
     if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
         try:
@@ -1444,8 +1445,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 return
             except Exception as tool_error:
-                result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("_invoke_tool raised for %s: %s", function_name, sanitize_tool_result_for_sink(tool_error), exc_info=True)
+                safe_error = sanitize_exception_for_sink(tool_error)
+                result = f"Error executing tool '{function_name}': {safe_error}"
+                logger.error("_invoke_tool raised for %s: %s", function_name, safe_error)
             duration = time.time() - start
             if not blocked and not dispatched:
                 _emit_terminal_post_tool_call(
@@ -1807,7 +1809,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         function_name, function_args, function_result, is_error,
                     )
                 except Exception as _ver_err:
-                    logging.debug("file-mutation verifier record failed: %s", _ver_err)
+                    logging.debug("file-mutation verifier record failed: %s", sanitize_exception_for_sink(_ver_err))
 
             if agent.verbose_logging:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)

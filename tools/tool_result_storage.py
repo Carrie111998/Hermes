@@ -38,7 +38,10 @@ from tools.budget_config import (
     BudgetConfig,
     DEFAULT_BUDGET,
 )
-from tools.tool_result_sanitization import sanitize_tool_result_for_sink
+from tools.tool_result_sanitization import (
+    sanitize_exception_for_sink,
+    sanitize_tool_result_for_sink,
+)
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -104,7 +107,7 @@ def _prune_spillover_once() -> None:
         if removed:
             logger.debug("Pruned %d expired spillover file(s)", removed)
     except Exception as exc:
-        logger.debug("Spillover prune failed: %s", exc)
+        logger.debug("Spillover prune failed: %s", sanitize_exception_for_sink(exc))
 
 
 def _is_host_side_env(env) -> bool:
@@ -151,7 +154,11 @@ def _write_to_spillover(content, filename: str):
             else:
                 raise FileExistsError("could not reserve a unique spillover path")
     except Exception as exc:
-        logger.warning("Spillover write failed for %s: %s", sanitize_tool_result_for_sink(filename), sanitize_tool_result_for_sink(exc))
+        logger.warning(
+            "Spillover write failed for %s: %s",
+            sanitize_tool_result_for_sink(filename),
+            sanitize_exception_for_sink(exc),
+        )
         return None
     finally:
         if temporary_path is not None:
@@ -170,7 +177,10 @@ def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
 
         visible = to_agent_visible_cache_path(host_path)
     except Exception as exc:
-        logger.debug("Spillover path translation failed: %s", exc)
+        logger.debug(
+            "Spillover path translation failed: %s",
+            sanitize_exception_for_sink(exc),
+        )
         return None
 
     sync_manager = getattr(env, "_sync_manager", None)
@@ -178,14 +188,17 @@ def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
         try:
             sync_manager.sync(force=True)
         except Exception as exc:
-            logger.debug("Spillover sync failed: %s", exc)
+            logger.debug("Spillover sync failed: %s", sanitize_exception_for_sink(exc))
 
     try:
         result = env.execute(f"test -r {shlex.quote(visible)}", timeout=15)
         if result.get("returncode", 1) == 0:
             return visible
     except Exception as exc:
-        logger.debug("Spillover readability probe failed: %s", exc)
+        logger.debug(
+            "Spillover readability probe failed: %s",
+            sanitize_exception_for_sink(exc),
+        )
     return None
 
 
@@ -197,7 +210,10 @@ def _resolve_storage_dir(env) -> str:
             try:
                 temp_dir = get_temp_dir()
             except Exception as exc:
-                logger.debug("Could not resolve env temp dir: %s", exc)
+                logger.debug(
+                    "Could not resolve env temp dir: %s",
+                    sanitize_exception_for_sink(exc),
+                )
             else:
                 if temp_dir:
                     temp_dir = temp_dir.rstrip("/") or "/"
@@ -377,7 +393,11 @@ def maybe_persist_tool_result(
                 )
                 return _build_persisted_message(preview, has_more, content_length, remote_path)
         except Exception as exc:
-            logger.warning("Sandbox write failed for correlation=%s: %s", _safe_result_id_label(tool_use_id), exc)
+            logger.warning(
+                "Sandbox write failed for correlation=%s: %s",
+                _safe_result_id_label(tool_use_id),
+                sanitize_exception_for_sink(exc),
+            )
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
