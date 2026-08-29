@@ -23,6 +23,9 @@ no timing, no threads.
 
 from types import SimpleNamespace
 
+import pytest
+
+from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.conversation_compression import (
     _claim_compressor_attempt,
     _clear_compression_cancelled_check_if_owner,
@@ -289,11 +292,12 @@ class TestLeanAttemptProviderBudget:
         monkeypatch.setattr(context_compressor, "_LEAN_DIGEST_CHUNK_CHARS", 40)
         turns = [{"role": "user", "content": "x" * 400}]
 
-        with _compression_attempt_provider_budget(
-            cancel_check=lambda: cancelled,
-            max_calls=8,
-        ):
-            self._compressor()._build_chunk_digests(turns)
+        with pytest.raises(AuxiliaryExplicitCancellation):
+            with _compression_attempt_provider_budget(
+                cancel_check=lambda: cancelled,
+                max_calls=8,
+            ):
+                self._compressor()._build_chunk_digests(turns)
 
         assert calls == 1
 

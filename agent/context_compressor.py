@@ -1148,10 +1148,24 @@ class _CompressionAttemptBudgetExhausted(RuntimeError):
     pass
 
 
+def _raise_if_compression_attempt_cancelled() -> None:
+    budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
+    if budget is not None and budget.is_cancelled:
+        raise AuxiliaryExplicitCancellation()
+
+
 def _start_compression_provider_call() -> bool:
     """Admit a call, preserving legacy unbounded behavior outside ``compress``."""
     budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
-    return budget is None or budget.try_start_call()
+    if budget is None:
+        return True
+    _raise_if_compression_attempt_cancelled()
+    admitted = budget.try_start_call()
+    if not admitted:
+        # ``try_start_call`` also checks cancellation. Re-check so a cancel
+        # racing admission is never mistaken for ordinary budget exhaustion.
+        _raise_if_compression_attempt_cancelled()
+    return admitted
 
 _LEAN_DIGEST_PROMPT = """You are writing one segment of a detailed session log for an AI agent's context checkpoint. Digest the transcript segment below.
 
@@ -4813,8 +4827,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         budget = _COMPRESSION_ATTEMPT_PROVIDER_BUDGET.get()
         digest_call_limit = _LEAN_DIGEST_MAX_CHUNKS
         if budget is not None:
+            _raise_if_compression_attempt_cancelled()
             digest_call_limit = min(digest_call_limit, budget.remaining_calls)
-            if digest_call_limit <= 0 or budget.is_cancelled:
+            if digest_call_limit <= 0:
                 return ""
         if n_chunks > digest_call_limit:
             chunk_size = (len(text) + digest_call_limit - 1) // digest_call_limit
@@ -4858,6 +4873,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
                 body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
             digests.append(f"### Segment {ci + 1}/{n_chunks}\n{body}")
+        _raise_if_compression_attempt_cancelled()
         if not digests:
             return ""
         return (
@@ -5391,6 +5407,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
+            _raise_if_compression_attempt_cancelled()
             self._validate_summary_user_provenance(summary, has_user_turn)
             # Store for iterative updates on next compaction
             self._previous_summary = summary
@@ -7588,13 +7605,15 @@ This compaction should PRIORITISE preserving all information related to the focu
     ) -> List[Dict[str, Any]]:
         """Run one compression attempt under a total provider-call budget."""
         with _compression_attempt_provider_budget(cancel_check=_cancel_check):
-            return self._compress_impl(
+            result = self._compress_impl(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
                 memory_context=memory_context,
             )
+            _raise_if_compression_attempt_cancelled()
+            return result
 
     def _compress_impl(
         self,
