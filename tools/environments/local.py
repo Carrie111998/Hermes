@@ -590,15 +590,14 @@ def _inject_session_context_env(env: dict) -> None:
 # approvals.model_config_confirm gate can distinguish the two (#97652).  A human's
 # own `hermes config set` in their login shell is never spawned by Hermes and
 # thus never carries this marker.  Inert unless something reads it.
-HERMES_AGENT_INITIATED = "HERMES_AGENT_INITIATED"
+# Single source of truth lives in tools/environments/base.py; re-exported here
+# so the local builders keep the short name.
+from tools.environments.base import (
+    AGENT_INITIATED_ENV,
+    stamp_agent_initiated as _stamp_agent_initiated,
+)
 
-
-def _stamp_agent_initiated(env: dict) -> None:
-    """Mark a child environment as agent-initiated (best-effort, fail-open)."""
-    try:
-        env[HERMES_AGENT_INITIATED] = "1"
-    except Exception:
-        pass
+HERMES_AGENT_INITIATED = AGENT_INITIATED_ENV
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -884,6 +883,12 @@ def build_subprocess_env(
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
+    # Agent-initiated marker (#97652): the non-scrub path was the one spawn
+    # site that skipped it. Every Hermes-spawned child must carry the marker so
+    # a nested `hermes config set` is gated regardless of the environment path
+    # (singularity builds its child env through this factory with
+    # scrub_secrets=False).
+    _stamp_agent_initiated(env)
     return env
 
 

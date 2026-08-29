@@ -295,6 +295,37 @@ def get_sandbox_dir() -> Path:
     return p
 
 
+# Agent-initiated marker (#97652).  Every Hermes-tool-spawned child environment
+# must carry this so a nested `hermes config set` knows it was invoked by an
+# agent (not a human shell) and routes the write through the
+# approvals.model_config_confirm gate.  The local backend stamps it in
+# tools/environments/local.py; every remote/container backend (docker, ssh,
+# modal, daytona, singularity, vercel_sandbox) must stamp it in the env it
+# builds for the child so agent writes through those backends are gated too.
+AGENT_INITIATED_ENV = "HERMES_AGENT_INITIATED"
+
+
+def stamp_agent_initiated(env: dict) -> None:
+    """Mark a child environment as agent-initiated (best-effort, fail-open)."""
+    try:
+        env[AGENT_INITIATED_ENV] = "1"
+    except Exception:
+        pass
+
+
+def agent_initiated_command(command: str) -> str:
+    """Prefix a shell command so its child env carries the agent marker.
+
+    Remote/container backends (ssh, modal, daytona, vercel_sandbox) run the
+    command in a remote shell where an env dict cannot be injected portably
+    across SDKs.  Exporting the marker at the start of the command string marks
+    the process as agent-initiated, so a nested ``hermes config set`` running in
+    that shell is gated by ``approvals.model_config_confirm`` (#97652).
+    """
+    return f"export {AGENT_INITIATED_ENV}=1; {command}"
+
+
+
 # A persistent sandbox's host directory is named after task_id, and that name
 # then becomes the source half of a `-v <source>:<target>` spec (Docker) or a
 # writable-overlay directory (Singularity). Docker splits the spec on ':', so

@@ -23,6 +23,7 @@ from tools.environments.base import (
     EnvironmentConnectionError,
     _popen_bash,
     sanitize_task_id_for_path,
+    stamp_agent_initiated,
 )
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
@@ -932,6 +933,12 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        # Agent-initiated marker (#97652): the container child env is built from
+        # self._env (via _build_init_env_args / _build_runtime_env_args), so a
+        # nested `hermes config set` inside the container is gated like a local
+        # agent write — otherwise agent writes through the docker backend would
+        # bypass approvals.model_config_confirm entirely.
+        stamp_agent_initiated(self._env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}

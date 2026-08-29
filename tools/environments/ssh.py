@@ -19,6 +19,7 @@ from tools.environments.base import (
     BaseEnvironment,
     EnvironmentConnectionError,
     _popen_bash,
+    agent_initiated_command,
 )
 from tools.environments.file_sync import (
     FileSyncManager,
@@ -405,6 +406,7 @@ class SSHEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn an SSH process that runs bash on the remote host."""
         cmd = self._build_ssh_command()
+        cmd_string = agent_initiated_command(cmd_string)
         if login:
             cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
         else:

@@ -5575,9 +5575,10 @@ def _coerce_float(value: str):
 # via a single ``hermes config set`` — even with ``approvals.mode: off``.  That
 # determines what the user pays per token for every subagent, so an unseen
 # rewrite is unacceptable UX.  This gate converts agent-initiated (Hermes-tool-
-# spawned) writes into a y/N prompt in an interactive TTY, or a hard refusal in
-# the non-interactive context the agent actually runs in.  Human CLI writes
-# carry no Hermes-agent marker and are never gated.
+# spawned) writes into a hard refusal in the non-interactive context the agent
+# actually runs in.  It NEVER prompts: a Hermes terminal-tool PTY run gives the
+# child a real TTY, so an ``input()`` would hang until the command timeout.
+# Human CLI writes carry no Hermes-agent marker and are never gated.
 
 # Marker hand-inscribed by the agent command-execution layer (see
 # tools/environments/local.py).  A human's own ``hermes config set`` in their
@@ -5590,7 +5591,9 @@ def _is_model_routing_key(key: str) -> bool:
 
     Covers the model-routing keys an agent-initiated rewrite must not do
     silently: ``model`` (shorthand for ``model.default``), ``model.*``,
-    ``delegation.model/provider/base_url``, and
+    ``delegation`` and ``auxiliary`` section writes (a ``--force`` write can
+    replace the whole section, so the top-level section key itself is
+    billing-relevant), ``delegation.model/provider/base_url``, and
     ``auxiliary.<name>.model/provider/base_url``.
     """
     if not key:
@@ -5599,6 +5602,10 @@ def _is_model_routing_key(key: str) -> bool:
     if k == "model":
         return True
     if k.startswith("model."):
+        return True
+    # Whole-section writes (via --force) can replace the entire routing block,
+    # so the bare section keys are themselves gate-worthy (#97652).
+    if k in ("delegation", "auxiliary"):
         return True
     if k in ("delegation.model", "delegation.provider", "delegation.base_url"):
         return True
@@ -5624,7 +5631,14 @@ def _is_agent_initiated_write() -> bool:
 
 
 def _model_config_confirm_enabled() -> bool:
-    """Read ``approvals.model_config_confirm`` (default True), fail-open to True."""
+    """Read ``approvals.model_config_confirm`` (default True), fail-open to True.
+
+    Reads via ``load_config()``, which is a pure read over on-disk config (no
+    write lock).  The gate's caller (``set_config_value``) already calls
+    ``load_config()`` on this same write path through ``_lookup_old_value``, so
+    this is a second plain snapshot read, not a re-entrant write — no
+    recursion / deadlock risk (review NIT; comment only).
+    """
     try:
         cfg = load_config()
         approvals = cfg.get("approvals") if isinstance(cfg, dict) else None
@@ -5653,35 +5667,45 @@ def _lookup_old_value(key: str):
         return None
 
 
+def _gate_redacted(value, key) -> str:
+    """Mask credential-shaped values so the gate notice/refusal never leaks a secret.
+
+    ``_is_model_routing_key`` matches ``model.*``, which includes
+    ``model.api_key`` — a custom-provider credential that lives in config.yaml
+    (lowercase ``api_key`` misses the .env routing and lands in config.yaml,
+    then hits the gate).  So a gated value *can* be a secret.  Mirror the
+    key-name masking ``set_config_value`` uses for its post-write echo: any
+    value whose leaf key is credential-shaped is redacted for display.
+    """
+    leaf = key.rsplit(".", 1)[-1].lower()
+    if leaf in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
+        from agent.redact import mask_secret
+
+        return mask_secret(value)
+    return value
+
+
 def _emit_model_change_notice(key: str, old_value, new_value) -> None:
     """Surface the *fact* of a model-routing change, even when approved."""
-    old_str = "None" if old_value is None else old_value
-    print(f"⚠ {key} changed: {old_str} → {new_value} (model-routing config)")
+    old_str = "None" if old_value is None else _gate_redacted(old_value, key)
+    new_str = _gate_redacted(new_value, key)
+    print(f"⚠ {key} changed: {old_str} → {new_str} (model-routing config)")
 
 
 def _emit_model_routing_refusal(key: str, old_value, new_value) -> None:
     """Non-interactive refusal: no hang, a loud instruction to surface it."""
-    old_str = "None" if old_value is None else old_value
+    old_str = "None" if old_value is None else _gate_redacted(old_value, key)
+    new_str = _gate_redacted(new_value, key)
     print(
         f"✗ Refusing agent-initiated change to model-routing key {key!r} "
-        f"({old_str} → {new_value}).\n"
+        f"({old_str} → {new_str}).\n"
         "  Model-routing config determines what you pay per token for every "
         "subagent, so an agent must not rewrite it silently.\n"
-        "  Surface this proposed change to the user and retry only on their "
-        "explicit direction with:\n"
-        f"      hermes config set {key} {new_value} --confirm-model-change",
+        "  Surface this proposed change to the user and retry only with their "
+        "explicit user direction (a user-directed write uses "
+        "--confirm-model-change).",
         file=sys.stderr,
     )
-
-
-def _prompt_model_config_confirm(key: str, new_value) -> bool:
-    """Interactive y/N prompt (destructive-slash style)."""
-    prompt = f"⚠ Agent-initiated model-routing change: set {key} = {new_value!r}? [y/N] "
-    try:
-        answer = input(prompt)
-    except EOFError:
-        return False
-    return answer.strip().lower() in ("y", "yes")
 
 
 def _maybe_gate_model_routing_write(
@@ -5698,6 +5722,14 @@ def _maybe_gate_model_routing_write(
     untouched.  ``confirm_model_change`` (the CLI's ``--confirm-model-change``)
     marks a user-directed write and bypasses the prompt while still surfacing
     the change with a visible notice.
+
+    The gate NEVER prompts.  ``_is_agent_initiated_write()`` is already True
+    by the time we reach the body, and a Hermes terminal-tool PTY run
+    (``pty=true``) hands the child a real TTY — ``sys.stdin.isatty()`` returns
+    True, so an ``input()`` here would block until the 600s command timeout.
+    Interactive prompting is for humans only, and a human write carries no
+    agent marker (so it exits above).  Therefore every agent-initiated write
+    that isn't user-directed or gate-disabled is refused loudly.
     """
     if not _is_agent_initiated_write():
         return True
@@ -5709,13 +5741,7 @@ def _maybe_gate_model_routing_write(
     if not _model_config_confirm_enabled():
         _emit_model_change_notice(key, old_value, value)
         return True
-    if _is_interactive_tty():
-        if _prompt_model_config_confirm(key, value):
-            _emit_model_change_notice(key, old_value, value)
-            return True
-        _emit_model_routing_refusal(key, old_value, value)
-        return False
-    # Non-interactive agent context: refuse without hanging.
+    # Never prompt: an agent-marked process must not wait on stdin (PTY-hang).
     _emit_model_routing_refusal(key, old_value, value)
     return False
 
