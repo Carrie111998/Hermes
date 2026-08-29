@@ -16468,8 +16468,10 @@ def _gateway_ws_ticket_from_subprotocol(ws: "WebSocket") -> tuple[str, str]:
     return (ticket, "ok") if ticket else ("", "invalid")
 
 
-def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
-    """Validate WS-upgrade auth; return ``(reason, credential)``.
+def _ws_auth_reason(
+    ws: "WebSocket", *, include_info: bool = False
+) -> tuple[Optional[str], str] | tuple[Optional[str], str, Optional[dict]]:
+    """Validate WS auth; optionally return the credential-bound identity.
 
     ``reason`` is None when the credential is accepted, else a short
     machine-parseable token explaining the rejection (``no_credential``,
@@ -16500,6 +16502,10 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     Audit-logs the rejection so operators can debug "WS keeps closing"
     issues from the log.
     """
+    def result(reason, credential, info=None):
+        value = (reason, credential, info)
+        return value if include_info else value[:2]
+
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses
@@ -16507,6 +16513,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
         from hermes_cli.dashboard_auth.ws_tickets import (
             TicketInvalid,
+            consume_principal_capability,
             consume_internal_credential,
             consume_ticket,
         )
@@ -16518,6 +16525,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         if internal:
             try:
                 info = consume_internal_credential(internal)
+                capability = ws.query_params.get("principal", "")
+                if capability:
+                    info = consume_principal_capability(capability)
                 # Stamp the server-minted identity onto the WS object so the
                 # connection (and any transport built from it) can never be
                 # impersonated by RPC params. Internal peers are marked
@@ -16527,7 +16537,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                     "user_id": info.get("user_id"),
                     "provider": info.get("provider"),
                 }
-                return None, "internal"
+                return result(None, "internal", info)
             except TicketInvalid as exc:
                 audit_log(
                     AuditEvent.WS_TICKET_REJECTED,
@@ -16535,14 +16545,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                     ip=(ws.client.host if ws.client else ""),
                     path=ws.url.path,
                 )
-                return "internal_invalid", "internal"
+                return result("internal_invalid", "internal")
 
         protocol_ticket, protocol_reason = _gateway_ws_ticket_from_subprotocol(ws)
         if protocol_reason == "invalid":
-            return "ticket_invalid", "ticket-subprotocol"
+            return result("ticket_invalid", "ticket-subprotocol")
         ticket = protocol_ticket or ws.query_params.get("ticket", "")
         if not ticket:
-            return "no_credential", "none"
+            return result("no_credential", "none")
 
         try:
             info = consume_ticket(ticket)
@@ -16562,8 +16572,8 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 # ticket-bearing protocol is a credential and must never be
                 # reflected back to the browser or retained after admission.
                 ws._hermes_ws_subprotocol = _GATEWAY_WS_PROTOCOL
-                return None, "ticket-subprotocol"
-            return None, "ticket"
+                return result(None, "ticket-subprotocol", info)
+            return result(None, "ticket", info)
         except TicketInvalid as exc:
             audit_log(
                 AuditEvent.WS_TICKET_REJECTED,
@@ -16571,19 +16581,30 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 ip=(ws.client.host if ws.client else ""),
                 path=ws.url.path,
             )
-            return "ticket_invalid", "ticket"
+            return result("ticket_invalid", "ticket")
 
     token = ws.query_params.get("token", "")
     if not token:
-        return "no_credential", "none"
+        return result("no_credential", "none")
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-        return None, "token"
-    return "token_mismatch", "token"
+        return result(None, "token")
+    return result("token_mismatch", "token")
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
     return _ws_auth_reason(ws)[0] is None
+
+
+def _ws_auth_with_info(ws: "WebSocket"):
+    """Read identity when supported while keeping old test doubles usable."""
+    try:
+        return _ws_auth_reason(ws, include_info=True)
+    except TypeError as exc:
+        if "include_info" not in str(exc):
+            raise
+        reason, credential = _ws_auth_reason(ws)
+        return reason, credential, None
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -16598,6 +16619,9 @@ def _resolve_chat_argv(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    user_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    principal_capability: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -16694,6 +16718,10 @@ def _resolve_chat_argv(
     # setdefault so an explicit operator value still wins.
     env.setdefault("COLORTERM", "truecolor")
     env["HERMES_TUI_DASHBOARD"] = "1"
+    if user_id:
+        env["HERMES_TUI_USER_ID"] = user_id
+    if provider:
+        env["HERMES_TUI_USER_PROVIDER"] = provider
 
     if resume:
         _resume_db = _open_session_db_for_profile(
@@ -16719,7 +16747,12 @@ def _resolve_chat_argv(
     # attach URL, gatewayClient spawns its own `tui_gateway.entry`, which
     # inherits the profile HERMES_HOME set above.
     if profile_dir is None:
-        if gateway_ws_url := _build_gateway_ws_url():
+        gateway_ws_url = (
+            _build_gateway_ws_url(principal_capability=principal_capability)
+            if principal_capability
+            else _build_gateway_ws_url()
+        )
+        if gateway_ws_url:
             env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
 
     return list(argv), str(cwd) if cwd else None, env
@@ -16763,7 +16796,9 @@ def _resolve_client_ws_host() -> Optional[str]:
     return host
 
 
-def _build_gateway_ws_url() -> Optional[str]:
+def _build_gateway_ws_url(
+    *, principal_capability: Optional[str] = None
+) -> Optional[str]:
     """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic.
 
     Loopback / ``--insecure``: ``?token=<_SESSION_TOKEN>``.
@@ -16789,7 +16824,10 @@ def _build_gateway_ws_url() -> Optional[str]:
     if getattr(app.state, "auth_required", False):
         from hermes_cli.dashboard_auth.ws_tickets import internal_ws_credential
 
-        qs = urllib.parse.urlencode({"internal": internal_ws_credential()})
+        params = {"internal": internal_ws_credential()}
+        if principal_capability:
+            params["principal"] = principal_capability
+        qs = urllib.parse.urlencode(params)
     else:
         qs = urllib.parse.urlencode({"token": _SESSION_TOKEN})
 
@@ -16801,6 +16839,9 @@ async def _resolve_chat_argv_async(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    user_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    principal_capability: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv without blocking the dashboard event loop.
 
@@ -16819,6 +16860,12 @@ async def _resolve_chat_argv_async(
     }
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
+    if user_id is not None:
+        kwargs["user_id"] = user_id
+    if provider is not None:
+        kwargs["provider"] = provider
+    if principal_capability is not None:
+        kwargs["principal_capability"] = principal_capability
 
     async with _get_chat_argv_lock(app):
         return await asyncio.to_thread(
@@ -17509,7 +17556,7 @@ async def pty_ws(ws: WebSocket) -> None:
     #     browser banner agree on the cause:
     #       4401 bad credential   4403 host/origin mismatch
     #       4408 peer not allowed  4404 chat disabled
-    auth_reason, cred = _ws_auth_reason(ws)
+    auth_reason, cred, auth_info = _ws_auth_with_info(ws)
     mode = _ws_auth_mode()
     if auth_reason is not None:
         _log.warning(
@@ -17579,6 +17626,16 @@ async def pty_ws(ws: WebSocket) -> None:
         "sidecar_url": sidecar_url,
         "profile": profile,
     }
+    if auth_info and auth_info.get("user_id") != "server-internal":
+        from hermes_cli.dashboard_auth.ws_tickets import mint_principal_capability
+
+        resolve_kwargs.update(
+            user_id=auth_info.get("user_id"),
+            provider=auth_info.get("provider"),
+            principal_capability=mint_principal_capability(
+                user_id=auth_info["user_id"], provider=auth_info["provider"]
+            ),
+        )
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
 
@@ -17696,7 +17753,8 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    auth_reason, _credential, auth_info = _ws_auth_with_info(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
@@ -17706,12 +17764,9 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    # The authenticated identity (ticket / internal credential) was stamped
-    # onto the WS object by _ws_auth_reason; carry it into the gateway
-    # transport where it becomes the identity authority for privileged RPCs
-    # (browser.controller.register). None on the legacy token path.
     await handle_ws(
         ws,
+        principal_info=auth_info,
         auth_identity=getattr(ws, "_hermes_auth_identity", None),
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
     )
