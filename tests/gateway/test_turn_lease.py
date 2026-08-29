@@ -176,17 +176,26 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
 ):
     """A lease rejection is not a completed turn for `/goal` evaluation.
 
-    The lease wait also has its own clock: a short lease budget must reject
-    promptly even while the normal agent inactivity timeout remains long.
+    Registry-level tests cover the real lock wait clock; this full-dispatch
+    test injects the timeout at the lease boundary so it is not sensitive to
+    scheduler latency under the parallel suite.
     """
     from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
     runner = _bootstrap(monkeypatch, tmp_path)
     runner._turn_leases = SessionTurnLeaseRegistry()
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
-    )
-    assert holder is not None
+
+    async def _timeout_acquire(session_id, *, owner_key, generation, timeout):
+        assert session_id == "sess-dedup"
+        assert timeout == pytest.approx(0.02)
+        raise TurnLeaseTimeoutError(
+            session_id,
+            owner_key=owner_key,
+            generation=generation,
+            wait_seconds=timeout,
+        )
+
+    monkeypatch.setattr(runner._turn_leases, "acquire", _timeout_acquire)
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
     monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
 
@@ -199,10 +208,7 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
 
-    try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
-    finally:
-        assert runner._turn_leases.release(holder) is True
+    response = await asyncio.wait_for(runner._handle_message(_event()), timeout=5)
 
     assert isinstance(response, str)
     assert "not processed" in response.lower()
