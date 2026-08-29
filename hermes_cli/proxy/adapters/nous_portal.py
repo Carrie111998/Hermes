@@ -62,6 +62,20 @@ class NousPortalAdapter(UpstreamAdapter):
     def allowed_paths(self) -> FrozenSet[str]:
         return _ALLOWED_PATHS
 
+    @property
+    def upstream_headers(self) -> Dict[str, str]:
+        # The Portal's Cloudflare policy rejects SDK fingerprints like
+        # ``OpenAI/Python`` with HTTP 403 (error 1010) before inference sees
+        # the request, so the credential-attaching proxy must identify itself
+        # as Hermes regardless of the downstream client. Same policy class
+        # already fixed for the /v1/models probe (#12999).
+        try:
+            from hermes_cli import __version__
+            _v = str(__version__)
+        except Exception:
+            _v = "0"
+        return {"User-Agent": f"HermesAgent/{_v}"}
+
     def is_authenticated(self) -> bool:
         state = self._read_state()
         if state is None:

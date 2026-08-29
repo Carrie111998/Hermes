@@ -7,6 +7,7 @@ local proxy can forward requests to. The adapter is responsible for:
   - refreshing/minting credentials when needed
   - reporting the resolved upstream base URL
   - declaring which request paths it accepts
+  - declaring provider-required request headers, if any
 
 The proxy server is otherwise provider-agnostic.
 """
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import Dict, FrozenSet, Optional
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,18 @@ class UpstreamAdapter(ABC):
         ``http://127.0.0.1:<port>/v1/chat/completions``. Requests to paths
         not in this set get a 404 with a helpful error body.
         """
+
+    @property
+    def upstream_headers(self) -> Dict[str, str]:
+        """Request headers this provider requires on every forwarded request.
+
+        Applied after client headers are filtered and before the proxy adds
+        its own ``Authorization``, so a provider requirement (e.g. a
+        provider-specific ``User-Agent``) overrides the downstream SDK
+        fingerprint. Empty by default — adapters without provider-specific
+        requirements keep forwarding client headers unchanged.
+        """
+        return {}
 
     @abstractmethod
     def is_authenticated(self) -> bool:

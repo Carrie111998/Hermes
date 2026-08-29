@@ -238,12 +238,14 @@ class FakeAdapter(UpstreamAdapter):
 
     def __init__(self, base_url: str, bearer: str = "test-bearer",
                  allowed=None, raise_on_credential=False,
-                 retry_bearer: str | None = None):
+                 retry_bearer: str | None = None,
+                 upstream_headers: dict | None = None):
         self._base_url = base_url
         self._bearer = bearer
         self._allowed = frozenset(allowed or ["/chat/completions"])
         self._raise = raise_on_credential
         self._retry_bearer = retry_bearer
+        self._upstream_headers = dict(upstream_headers) if upstream_headers else {}
         self.calls = 0
         self.retry_calls = 0
 
@@ -255,6 +257,9 @@ class FakeAdapter(UpstreamAdapter):
 
     @property
     def allowed_paths(self): return self._allowed
+
+    @property
+    def upstream_headers(self): return dict(self._upstream_headers)
 
     def is_authenticated(self): return True
 
@@ -297,6 +302,9 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
             "method": request.method,
             "path": request.path,
             "auth": request.headers.get("Authorization"),
+            # All User-Agent values that reached the upstream, in any casing —
+            # catches both the value and case-variant duplicates.
+            "user_agents": request.headers.getall("User-Agent", []),
             "body": body.decode("utf-8") if body else "",
         })
         return web.json_response({"echoed": True, "path": request.path})
@@ -363,6 +371,72 @@ def test_server_strips_client_auth_header():
             await upstream_runner.cleanup()
 
     asyncio.run(run())
+
+
+def test_server_applies_adapter_upstream_headers_over_client_ua():
+    """Adapter-declared headers must override the downstream SDK fingerprint.
+
+    The Nous Portal rejects ``OpenAI/Python`` User-Agents with Cloudflare 403
+    (error 1010); a client may also send the header in lowercase, and both
+    case variants must collapse into the single adapter value (#97796).
+    """
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            bearer="ours",
+            upstream_headers={"User-Agent": "HermesAgent/test"},
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={"user-agent": "OpenAI/Python 4.104.0"},
+                ) as resp:
+                    await resp.read()
+            assert captured["requests"][0]["user_agents"] == ["HermesAgent/test"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_preserves_client_ua_without_adapter_overrides():
+    """Adapters with no upstream_headers keep forwarding client headers unchanged."""
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={"User-Agent": "OpenAI/Python 4.104.0"},
+                ) as resp:
+                    await resp.read()
+            assert captured["requests"][0]["user_agents"] == ["OpenAI/Python 4.104.0"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_nous_adapter_declares_hermes_user_agent():
+    """The Nous adapter identifies the proxy as Hermes regardless of client SDK."""
+    from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+
+    headers = NousPortalAdapter().upstream_headers
+    assert set(headers) == {"User-Agent"}
+    assert headers["User-Agent"].startswith("HermesAgent/")
 
 
 # ---------------------------------------------------------------------------
