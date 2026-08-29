@@ -223,6 +223,38 @@ class TestForeignVendorSlugStrippedOnNativeProviders:
             == "ollama/glm-5.2"
         )
 
+    def test_vendor_namespace_native_provider_keeps_slugs(self):
+        # Nebius serves `vendor/model` catalog ids natively — `Qwen/` and
+        # `openai/` are part of the served model id, not aggregator
+        # pollution, so the foreign-slug strip must not touch them.
+        assert (
+            normalize_model_for_provider(
+                "Qwen/Qwen3.5-397B-A17B-fast", "nebius-token-factory"
+            )
+            == "Qwen/Qwen3.5-397B-A17B-fast"
+        )
+        assert (
+            normalize_model_for_provider(
+                "nebius/Qwen/Qwen3.5-397B-A17B-fast", "nebius-token-factory"
+            )
+            == "Qwen/Qwen3.5-397B-A17B-fast"
+        )
+        assert (
+            normalize_model_for_provider(
+                "openai/gpt-oss-120b-fast", "nebius-token-factory"
+            )
+            == "openai/gpt-oss-120b-fast"
+        )
+
+    def test_custom_endpoint_keeps_vendor_slugged_ids(self):
+        # A custom endpoint may front a proxy whose route *requires* the
+        # vendor slug (e.g. a LiteLLM box serving z-ai/glm-5.2) — stripping
+        # it would 404 on the proxy, so `custom` stays a passthrough.
+        assert (
+            normalize_model_for_provider("z-ai/glm-5.2", "custom")
+            == "z-ai/glm-5.2"
+        )
+
     def test_aggregator_still_namespaces_bare_glm(self):
         # The OpenRouter direction is untouched: bare glm still gains the
         # z-ai/ prefix for the aggregator.
