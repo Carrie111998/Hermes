@@ -2147,6 +2147,33 @@ class TestSystemdCgroupIsolation:
         assert "MemorySwapMax=0" in argv
         assert "hermes-worker-system-test" in argv
 
+    def test_system_scope_preserves_sanitized_worker_environment(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(
+            "shutil.which",
+            lambda name: {
+                "systemd-run": "/usr/bin/systemd-run",
+                "sudo": "/usr/bin/sudo",
+            }.get(name),
+        )
+        argv = pr._build_systemd_scope_argv(
+            ["/usr/bin/env"],
+            "browser-test",
+            backend="system",
+            environment={
+                "AGENT_BROWSER_SOCKET_DIR": "/tmp/socket",
+                "DISPLAY": ":99",
+                "PATH": "/custom/bin",
+            },
+        )
+
+        preserve = next(value for value in argv if value.startswith("--preserve-env="))
+        assert "AGENT_BROWSER_SOCKET_DIR" in preserve
+        assert "DISPLAY" in preserve
+        assert "PATH" not in preserve
+        assert "/tmp/socket" not in " ".join(argv)
+
     def test_required_worker_cgroup_refuses_unisolated_spawn(
         self, registry, monkeypatch, _gateway_identity
     ):

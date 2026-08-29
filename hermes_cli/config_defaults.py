@@ -3117,9 +3117,9 @@ DEFAULT_CONFIG = {
         # Resource-aware admission protects the messaging control plane. The
         # legacy global max_concurrent_sessions remains the fallback cap.
         "admission": {
-            "max_parallel_agents": None,
-            "min_host_memory_headroom_mb": 0,
-            "queue_limit": 32,
+            "max_parallel_agents": 3,
+            "min_host_memory_headroom_mb": 2048,
+            "queue_limit": 16,
             "poll_interval_seconds": 2.0,
         },
         # Optional named-profile allowlist for multiplex mode. None preserves

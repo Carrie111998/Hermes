@@ -971,9 +971,9 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
-    max_parallel_agents: Optional[int] = None
-    min_host_memory_headroom_mb: int = 0
-    agent_queue_limit: int = 32
+    max_parallel_agents: Optional[int] = 3
+    min_host_memory_headroom_mb: int = 2048
+    agent_queue_limit: int = 16
     admission_poll_interval_seconds: float = 2.0
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
@@ -1308,19 +1308,19 @@ class GatewayConfig:
         if not isinstance(admission, dict):
             admission = {}
         max_parallel_agents = _coerce_optional_positive_int(
-            admission.get("max_parallel_agents"),
+            admission.get("max_parallel_agents", 3),
             "gateway.admission.max_parallel_agents",
         )
         try:
             min_host_memory_headroom_mb = max(
-                0, int(admission.get("min_host_memory_headroom_mb", 0) or 0)
+                0, int(admission.get("min_host_memory_headroom_mb", 2048) or 0)
             )
         except (TypeError, ValueError):
-            min_host_memory_headroom_mb = 0
+            min_host_memory_headroom_mb = 2048
         try:
-            agent_queue_limit = max(0, int(admission.get("queue_limit", 32)))
+            agent_queue_limit = max(0, int(admission.get("queue_limit", 16)))
         except (TypeError, ValueError):
-            agent_queue_limit = 32
+            agent_queue_limit = 16
         try:
             admission_poll_interval_seconds = max(
                 0.05, float(admission.get("poll_interval_seconds", 2.0))

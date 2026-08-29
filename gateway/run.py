@@ -12949,6 +12949,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except RuntimeError:
             self._gateway_loop = None
         if self._gateway_loop is not None:
+            from gateway.admission import install_gateway_admission
+
+            self._agent_admission.set_change_callback(self._persist_active_agents)
+            install_gateway_admission(self._agent_admission, self._gateway_loop)
             self._start_loop_liveness_guards(self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
@@ -23656,6 +23660,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return sorted(_get_platform_tools(user_config, platform_key))
 
+    from gateway.admission import gateway_admitted_async as _gateway_admitted_async
+
+    @_gateway_admitted_async("background", id_kwargs=("task_id",))
     async def _run_background_task_inner(
         self,
         prompt: str,

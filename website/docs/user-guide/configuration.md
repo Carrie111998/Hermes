@@ -2236,7 +2236,10 @@ terminal:
   local_memory_max_mb: 2048
 ```
 
-`max_parallel_agents` falls back to `max_concurrent_sessions` when omitted.
+Hermes defaults to three parallel agents, 2048 MiB of preserved headroom, and
+a 16-task queue. Setting `max_parallel_agents: null` explicitly falls back to
+`max_concurrent_sessions`; production gateways should keep a finite explicit
+value.
 At capacity or below the memory-headroom threshold, existing turns continue
 and new gateway work receives a queue-position notice. A released slot wakes
 the oldest queued turn. `queue_limit: 0` disables queueing and returns a clear

@@ -12,8 +12,9 @@ python3 scripts/hermes_gateway_diagnostics.py --since-minutes 30
 ```
 
 It reports the gateway PID/RSS, host `MemAvailable`, the gateway cgroup's
-current/high/max values and memory events, and independently scoped worker
-PIDs/RSS. Shutdown log records include the signal, explicit reason, parent,
+current/high/max values and memory events, independently scoped worker
+PIDs/RSS, and each worker cgroup's current/high/max values and OOM events.
+Shutdown log records include the signal, explicit reason, parent,
 gateway RSS, host headroom, active and queued task IDs, worker PIDs, and cgroup
 OOM counters.
 
@@ -50,6 +51,50 @@ or external health guard is a different failure path.
 - For production Linux gateways, verify either `systemd-run --user --scope` or
   the same-UID `sudo -n systemd-run --system --scope --uid=<runtime-user>` path
   works before selecting `terminal.worker_cgroup_mode: required`.
+
+### Replace restart-on-pressure health guards
+
+`scripts/hermes_health_guard.py` is the supported alert-only guard. It records
+the same pressure, SQLite-lock, WAL, Telegram-connectivity, active-agent, and
+queue evidence, but always sets `recovery_attempted=false` and never invokes a
+gateway lifecycle command. Install it only inside the controlled deployment
+window, after active work has genuinely drained:
+
+```bash
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp --preserve=all /usr/local/sbin/hermes-health-guard \
+  "/usr/local/sbin/hermes-health-guard.rollback-${stamp}"
+sudo install -o root -g root -m 0755 scripts/hermes_health_guard.py \
+  /usr/local/sbin/hermes-health-guard
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system/hermes-health-guard.service.d
+sudo tee /etc/systemd/system/hermes-health-guard.service.d/alert-only.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 /usr/local/sbin/hermes-health-guard --hermes-home /home/ubuntu/.hermes
+EOF
+sudo systemctl daemon-reload
+sudo systemctl start hermes-health-guard.service
+sudo jq '{decision,recovery_attempted,reasons,active_agents,queued_tasks}' \
+  /var/lib/hermes-health-guard/state.json
+```
+
+Pass requires `recovery_attempted: false`; a pressured host may legitimately
+report `decision: alert_only`. Do not restart the gateway to make this check
+green. Keep the timer enabled so alerts continue.
+
+Rollback restores the timestamped executable, removes only the drop-in above,
+reloads systemd, and runs one guard check. Restoring a restart-capable guard is
+itself risky and must not occur while unrelated agent work is active:
+
+```bash
+sudo install -o root -g root -m 0755 \
+  /usr/local/sbin/hermes-health-guard.rollback-<timestamp> \
+  /usr/local/sbin/hermes-health-guard
+sudo rm /etc/systemd/system/hermes-health-guard.service.d/alert-only.conf
+sudo systemctl daemon-reload
+sudo systemctl start hermes-health-guard.service
+```
 
 ## Controlled stress verification
 

@@ -5418,6 +5418,10 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+from gateway.admission import gateway_admitted_sync as _gateway_admitted_sync
+
+
+@_gateway_admitted_sync("cron", id_kwargs=("job",))
 def run_job(
     job: dict,
     *,

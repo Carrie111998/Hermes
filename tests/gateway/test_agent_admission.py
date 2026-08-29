@@ -10,6 +10,10 @@ from gateway.admission import (
     AdmissionRejected,
     AgentAdmissionController,
     cgroup_available_memory_mb,
+    clear_gateway_admission,
+    gateway_admitted_async,
+    gateway_admitted_sync,
+    install_gateway_admission,
 )
 
 
@@ -138,3 +142,99 @@ async def test_cancelled_waiter_does_not_block_following_task():
     await controller.release("active")
     await asyncio.wait_for(following, timeout=0.2)
     assert controller.snapshot().active_task_ids == ("following",)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_task_id_cannot_share_one_set_slot():
+    controller = AgentAdmissionController(max_parallel=3)
+    await controller.acquire("same-id")
+
+    with pytest.raises(AdmissionRejected, match="already owns an active slot"):
+        await controller.acquire("same-id")
+
+    assert controller.snapshot().active == 1
+
+
+@pytest.mark.asyncio
+async def test_async_and_scheduler_surfaces_share_one_global_limit():
+    controller = AgentAdmissionController(
+        max_parallel=1, queue_limit=2, poll_interval_seconds=0.01
+    )
+    install_gateway_admission(controller, asyncio.get_running_loop())
+    release_api = asyncio.Event()
+
+    @gateway_admitted_async("api", id_kwargs=("session_id",))
+    async def api_turn(*, session_id: str):
+        await release_api.wait()
+        return session_id
+
+    @gateway_admitted_sync("cron", id_kwargs=("job",))
+    def cron_turn(job: dict):
+        return job["id"]
+
+    try:
+        running = asyncio.create_task(api_turn(session_id="chat-1"))
+        await asyncio.sleep(0.02)
+        queued = asyncio.create_task(
+            asyncio.to_thread(cron_turn, {"id": "daily-report", "prompt": "secret"})
+        )
+        await asyncio.sleep(0.03)
+        snapshot = controller.snapshot()
+        assert len(snapshot.active_task_ids) == 1
+        assert snapshot.active_task_ids[0].startswith("api:chat-1:")
+        assert len(snapshot.queued_task_ids) == 1
+        assert snapshot.queued_task_ids[0].startswith("cron:daily-report:")
+        assert "secret" not in " ".join(snapshot.queued_task_ids)
+
+        release_api.set()
+        assert await asyncio.wait_for(running, timeout=0.2) == "chat-1"
+        assert await asyncio.wait_for(queued, timeout=0.2) == "daily-report"
+        assert controller.snapshot().active == 0
+    finally:
+        clear_gateway_admission(controller)
+
+
+def test_all_gateway_agent_entry_points_declare_global_admission():
+    from cron.scheduler import run_job
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.run import GatewayRunner
+
+    assert GatewayRunner._run_background_task_inner._gateway_admission_surface == "background"
+    assert APIServerAdapter._run_agent._gateway_admission_surface == "api"
+    assert run_job._gateway_admission_surface == "cron"
+
+
+@pytest.mark.asyncio
+async def test_sync_surface_fails_closed_instead_of_deadlocking_gateway_loop():
+    controller = AgentAdmissionController(max_parallel=1)
+    install_gateway_admission(controller, asyncio.get_running_loop())
+
+    @gateway_admitted_sync("cron", id_kwargs=("job",))
+    def cron_turn(job: dict):
+        return job["id"]
+
+    try:
+        with pytest.raises(RuntimeError, match="event-loop thread"):
+            cron_turn({"id": "unsafe-direct-call"})
+    finally:
+        clear_gateway_admission(controller)
+
+
+def test_change_callback_observes_queue_start_and_release():
+    changes: list[int] = []
+    controller = AgentAdmissionController(
+        max_parallel=1,
+        memory_reader=lambda: 4096,
+        on_change=lambda: changes.append(1),
+    )
+
+    async def scenario():
+        await controller.acquire("one")
+        waiter = asyncio.create_task(controller.acquire("two"))
+        await asyncio.sleep(0.02)
+        await controller.release("one")
+        await waiter
+        await controller.release("two")
+
+    asyncio.run(scenario())
+    assert len(changes) >= 5

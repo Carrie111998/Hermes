@@ -3,13 +3,161 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
+import inspect
 import json
 import logging
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+_registry_lock = threading.Lock()
+_gateway_controller: Optional["AgentAdmissionController"] = None
+_gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def install_gateway_admission(
+    controller: "AgentAdmissionController",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Publish the gateway-wide controller to cron/API/background surfaces.
+
+    Gateway-owned agent entry points do not all live in ``gateway.run``:
+    cron executes in scheduler threads and the API server owns a separate
+    runner.  A single installed controller keeps those paths under the same
+    global capacity and memory-headroom decision.
+    """
+    global _gateway_controller, _gateway_loop
+    with _registry_lock:
+        _gateway_controller = controller
+        _gateway_loop = loop
+
+
+def clear_gateway_admission(
+    controller: Optional["AgentAdmissionController"] = None,
+) -> None:
+    """Clear the registry, optionally only when *controller* still owns it."""
+    global _gateway_controller, _gateway_loop
+    with _registry_lock:
+        if controller is not None and _gateway_controller is not controller:
+            return
+        _gateway_controller = None
+        _gateway_loop = None
+
+
+def _installed_gateway_admission() -> tuple[
+    Optional["AgentAdmissionController"], Optional[asyncio.AbstractEventLoop]
+]:
+    with _registry_lock:
+        return _gateway_controller, _gateway_loop
+
+
+def _decorated_task_id(
+    prefix: str,
+    id_kwargs: tuple[str, ...],
+    signature: inspect.Signature,
+    args: tuple,
+    kwargs: dict,
+) -> str:
+    try:
+        bound = signature.bind_partial(*args, **kwargs)
+        for name in id_kwargs:
+            value = bound.arguments.get(name)
+            if isinstance(value, dict):
+                value = value.get("id")
+            if value:
+                return f"{prefix}:{value}:{uuid.uuid4().hex[:8]}"
+    except (TypeError, ValueError):
+        pass
+    return f"{prefix}:{uuid.uuid4().hex}"
+
+
+def gateway_admitted_async(
+    prefix: str,
+    *,
+    id_kwargs: tuple[str, ...],
+):
+    """Decorate an async gateway agent entry point with global admission."""
+    def decorate(func):
+        signature = inspect.signature(func)
+
+        @functools.wraps(func)
+        async def wrapped(*args, **kwargs):
+            controller, _loop = _installed_gateway_admission()
+            if controller is None:
+                return await func(*args, **kwargs)
+            task_id = _decorated_task_id(prefix, id_kwargs, signature, args, kwargs)
+            await controller.acquire(task_id)
+            outcome = "finished"
+            try:
+                return await func(*args, **kwargs)
+            except BaseException:
+                outcome = "crashed"
+                raise
+            finally:
+                await controller.release(task_id, outcome=outcome)
+
+        wrapped._gateway_admission_surface = prefix
+        return wrapped
+
+    return decorate
+
+
+def gateway_admitted_sync(
+    prefix: str,
+    *,
+    id_kwargs: tuple[str, ...],
+):
+    """Decorate a scheduler-thread agent entry point with global admission.
+
+    All controller mutation remains on the gateway event loop.  Standalone
+    cron invocations have no installed gateway controller and retain their
+    historical behavior.
+    """
+    def decorate(func):
+        signature = inspect.signature(func)
+
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            controller, loop = _installed_gateway_admission()
+            if controller is None or loop is None or not loop.is_running():
+                return func(*args, **kwargs)
+            if getattr(loop, "_thread_id", None) == threading.get_ident():
+                raise RuntimeError(
+                    "Synchronous gateway agent entry point cannot wait for "
+                    "admission on the gateway event-loop thread"
+                )
+            task_id = _decorated_task_id(prefix, id_kwargs, signature, args, kwargs)
+            acquired = asyncio.run_coroutine_threadsafe(
+                controller.acquire(task_id), loop
+            )
+            acquired.result()
+            outcome = "finished"
+            try:
+                return func(*args, **kwargs)
+            except BaseException:
+                outcome = "crashed"
+                raise
+            finally:
+                released = asyncio.run_coroutine_threadsafe(
+                    controller.release(task_id, outcome=outcome), loop
+                )
+                try:
+                    released.result(timeout=10)
+                except (concurrent.futures.TimeoutError, RuntimeError):
+                    logger.error(
+                        "Timed out releasing admission slot for %s", task_id
+                    )
+
+        wrapped._gateway_admission_surface = prefix
+        return wrapped
+
+    return decorate
 
 
 def host_available_memory_mb(meminfo_path: Path = Path("/proc/meminfo")) -> Optional[int]:
@@ -79,16 +227,29 @@ class AgentAdmissionController:
         queue_limit: int = 32,
         poll_interval_seconds: float = 2.0,
         memory_reader: Callable[[], Optional[int]] = available_resource_memory_mb,
+        on_change: Optional[Callable[[], None]] = None,
     ) -> None:
         self.max_parallel = max_parallel if max_parallel and max_parallel > 0 else None
         self.min_headroom_mb = max(0, int(min_headroom_mb or 0))
         self.queue_limit = max(0, int(queue_limit or 0))
         self.poll_interval_seconds = max(0.05, float(poll_interval_seconds or 2.0))
         self._memory_reader = memory_reader
+        self._on_change = on_change
         self._condition = asyncio.Condition()
         self._active: set[str] = set()
         self._queue: list[str] = []
         self._closed_reason: Optional[str] = None
+
+    def set_change_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        self._on_change = callback
+
+    def _notify_change(self) -> None:
+        if self._on_change is None:
+            return
+        try:
+            self._on_change()
+        except Exception:
+            logger.debug("Admission change callback failed", exc_info=True)
 
     def snapshot(self) -> AdmissionSnapshot:
         available = self._memory_reader()
@@ -153,6 +314,10 @@ class AgentAdmissionController:
                 while True:
                     if self._closed_reason is not None:
                         raise AdmissionRejected(self._closed_reason)
+                    if task_id in self._active:
+                        raise AdmissionRejected(
+                            f"Agent task {task_id} already owns an active slot."
+                        )
                     available = self._memory_reader()
                     at_front = not self._queue or self._queue[0] == task_id
                     reason = self._capacity_reason(available)
@@ -161,6 +326,7 @@ class AgentAdmissionController:
                             self._queue.pop(0)
                         self._active.add(task_id)
                         self._log("start", task_id)
+                        self._notify_change()
                         return
                     if task_id not in self._queue:
                         if self.queue_limit == 0 or len(self._queue) >= self.queue_limit:
@@ -172,6 +338,7 @@ class AgentAdmissionController:
                         self._queue.append(task_id)
                         reason = reason or "waiting for earlier queued task"
                         self._log("queue", task_id, reason)
+                        self._notify_change()
                     if not queued_notice_sent and on_queued is not None:
                         queued_notice_sent = True
                         position = self._queue.index(task_id) + 1
@@ -198,6 +365,7 @@ class AgentAdmissionController:
                 if task_id in self._queue:
                     self._queue.remove(task_id)
                     self._condition.notify_all()
+                    self._notify_change()
                 raise
 
     async def release(self, task_id: str, *, outcome: str = "finished") -> None:
@@ -205,6 +373,7 @@ class AgentAdmissionController:
             self._active.discard(str(task_id))
             self._log(outcome, str(task_id))
             self._condition.notify_all()
+            self._notify_change()
 
     async def close(self, reason: str) -> tuple[str, ...]:
         """Reject waiters explicitly; running turns remain owned by shutdown."""
@@ -213,4 +382,5 @@ class AgentAdmissionController:
             queued = tuple(self._queue)
             self._queue.clear()
             self._condition.notify_all()
+            self._notify_change()
             return queued

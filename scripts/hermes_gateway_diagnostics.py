@@ -130,12 +130,14 @@ def _bounded_incident_journal(unit: str, since_minutes: int) -> list[dict[str, s
 def collect(
     unit: str = "hermes-gateway.service",
     hermes_home: Path = Path.home() / ".hermes",
+    proc_root: Path = Path("/proc"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
 ) -> dict[str, Any]:
     pid = _service_pid(unit)
     result: dict[str, Any] = {
         "unit": unit,
         "gateway_pid": pid,
-        "host_memory_kb": _fields(Path("/proc/meminfo")),
+        "host_memory_kb": _fields(proc_root / "meminfo"),
     }
     runtime_path = hermes_home / "gateway_state.json"
     runtime = _runtime_status(runtime_path)
@@ -150,15 +152,15 @@ def collect(
         result["runtime_status"] = None
     if not pid:
         return result
-    status = _fields(Path(f"/proc/{pid}/status"))
+    status = _fields(proc_root / str(pid) / "status")
     result["gateway_rss_kb"] = status.get("VmRSS")
-    cgroup_raw = _read(Path(f"/proc/{pid}/cgroup")) or ""
+    cgroup_raw = _read(proc_root / str(pid) / "cgroup") or ""
     relative = next(
         (line.partition("::")[2].lstrip("/") for line in cgroup_raw.splitlines() if line.startswith("0::")),
         None,
     )
     if relative is not None:
-        root = Path("/sys/fs/cgroup") / relative
+        root = cgroup_root / relative
         result["gateway_cgroup"] = "/" + relative
         result["cgroup_memory"] = {
             "current": _read(root / "memory.current"),
@@ -167,17 +169,50 @@ def collect(
             "events": _fields(root / "memory.events"),
         }
     worker_rows: list[dict[str, Any]] = []
-    for proc_status in sorted(Path("/proc").glob("[0-9]*/status")):
+    worker_cgroups: dict[str, dict[str, Any]] = {}
+    for proc_status in sorted(proc_root.glob("[0-9]*/status")):
         proc_pid = int(proc_status.parent.name)
         proc_cgroup = _read(proc_status.parent / "cgroup") or ""
         if "hermes-worker-" not in proc_cgroup:
             continue
         fields = _fields(proc_status)
-        worker_rows.append(
-            {"pid": proc_pid, "rss_kb": fields.get("VmRSS"), "cgroup": proc_cgroup[:300]}
+        relative = next(
+            (
+                line.partition("::")[2].lstrip("/")
+                for line in proc_cgroup.splitlines()
+                if line.startswith("0::")
+            ),
+            "",
         )
+        rss_kb = fields.get("VmRSS")
+        worker_rows.append(
+            {"pid": proc_pid, "rss_kb": rss_kb, "cgroup": relative[:300]}
+        )
+        if relative:
+            row = worker_cgroups.setdefault(
+                relative,
+                {"cgroup": "/" + relative, "pids": [], "rss_kb": 0},
+            )
+            row["pids"].append(proc_pid)
+            row["rss_kb"] += int(rss_kb or 0)
+
+    worker_scope_rows: list[dict[str, Any]] = []
+    for relative, row in sorted(worker_cgroups.items()):
+        root = cgroup_root / relative
+        row.update(
+            {
+                "memory_current": _read(root / "memory.current"),
+                "memory_high": _read(root / "memory.high"),
+                "memory_max": _read(root / "memory.max"),
+                "memory_events": _fields(root / "memory.events"),
+            }
+        )
+        row["pids"] = sorted(row["pids"])
+        worker_scope_rows.append(row)
     result["workers"] = worker_rows[:100]
-    result["worker_count"] = len(worker_rows)
+    result["worker_process_count"] = len(worker_rows)
+    result["worker_cgroups"] = worker_scope_rows[:100]
+    result["worker_count"] = len(worker_scope_rows)
     return result
 
 

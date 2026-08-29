@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import subprocess
@@ -353,6 +354,7 @@ def _build_systemd_scope_argv(
     shell_argv: List[str],
     unit_suffix: str,
     backend: str = "user",
+    environment: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation.
 
@@ -368,14 +370,30 @@ def _build_systemd_scope_argv(
         # Caller should have checked _systemd_run_user_scope_available();
         # guard anyway so we never pass None into Popen.
         return shell_argv
-    unit_name = f"hermes-worker-{'system-' if backend == 'system' else ''}{unit_suffix}"
+    safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
+    safe_suffix = (safe_suffix or uuid.uuid4().hex)[:160]
+    unit_name = f"hermes-worker-{'system-' if backend == 'system' else ''}{safe_suffix}"
     memory_max = _worker_memory_max_bytes()
     prefix = [binary, "--user"]
     if backend == "system":
         sudo = shutil.which("sudo")
         if sudo is None:
             return shell_argv
-        prefix = [sudo, "-n", binary, "--system"]
+        prefix = [sudo, "-n"]
+        if environment:
+            preserve = sorted(
+                key
+                for key in environment
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                and key
+                not in {
+                    "HOME", "LOGNAME", "PATH", "SHELL", "SUDO_COMMAND",
+                    "SUDO_GID", "SUDO_UID", "SUDO_USER", "USER",
+                }
+            )
+            if preserve:
+                prefix.append(f"--preserve-env={','.join(preserve)}")
+        prefix.extend([binary, "--system"])
     argv = [
         *prefix,
         "--scope",
@@ -396,6 +414,46 @@ def _build_systemd_scope_argv(
         argv.extend(["--uid", str(os.getuid()), "--gid", str(os.getgid())])
     argv.extend(["--", *shell_argv])
     return argv
+
+
+def build_gateway_worker_scope_argv(
+    argv: List[str],
+    *,
+    unit_suffix: str,
+    environment: Optional[Dict[str, str]] = None,
+) -> tuple[List[str], Optional[str]]:
+    """Wrap any gateway-owned local workload in its independent cgroup.
+
+    This is shared by terminal, browser, and computer-use launchers. Outside
+    the supervised gateway it is a no-op. In ``required`` mode inability to
+    create a scope fails closed instead of silently putting the workload back
+    into the control-plane cgroup.
+    """
+    if _IS_WINDOWS or not _is_supervised_gateway_process():
+        return argv, None
+    mode = _worker_cgroup_mode()
+    if mode == "off":
+        return argv, None
+    backend = _worker_scope_backend()
+    if backend is None:
+        if mode == "required":
+            raise RuntimeError(
+                "Worker cgroup isolation is required but no systemd scope backend is available"
+            )
+        logger.warning(
+            "Gateway workload %s is not isolated in a systemd scope", unit_suffix
+        )
+        return argv, None
+    wrapped = _build_systemd_scope_argv(
+        argv,
+        unit_suffix=unit_suffix,
+        backend=backend,
+        environment=environment,
+    )
+    safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
+    safe_suffix = (safe_suffix or "worker")[:160]
+    unit = f"hermes-worker-{'system-' if backend == 'system' else ''}{safe_suffix}.scope"
+    return wrapped, unit
 
 
 def _stop_systemd_unit(unit_name: str) -> bool:
@@ -1190,6 +1248,7 @@ class ProcessRegistry:
                         pty_argv,
                         unit_suffix=session.id,
                         backend=pty_scope_backend,
+                        environment=pty_env,
                     )
                     session.systemd_unit = f"hermes-worker-{'system-' if pty_scope_backend == 'system' else ''}{session.id}.scope"
                     pty_scope_attempted = True
@@ -1279,6 +1338,7 @@ class ProcessRegistry:
                 shell_argv,
                 unit_suffix=unit_suffix,
                 backend=scope_backend,
+                environment=bg_env,
             )
             session.systemd_unit = f"hermes-worker-{'system-' if scope_backend == 'system' else ''}{unit_suffix}.scope"
             # CRITICAL (#70716 regression): systemd-run --scope does NOT give
