@@ -113,6 +113,11 @@ export default function SocialEmbedRenderer({ descriptor }: { descriptor: EmbedD
         clearTimeout(timer)
       }
 
+      // Explicitly detach generated iframes before clearing innerHTML
+      // so Chromium's compositor layer drops backing stores immediately.
+      const iframes = container.querySelectorAll('iframe')
+      iframes.forEach(iframe => iframe.remove())
+
       container.innerHTML = ''
     }
   }, [descriptor, isDark])

@@ -60,9 +60,10 @@ export function UrlEmbed({ descriptor }: { descriptor: EmbedDescriptor }) {
 
   // Ratio embeds cap WIDTH off the ratio so height tops out at the cap while
   // scaling. Non-ratio embeds own their own height (measured / fixed).
+  // Note: contentVisibility: 'auto' is deliberately omitted to prevent Chromium GPU
+  // compositor layer ghosting/quad retention across session switches on third-party iframes.
   const style: CSSProperties = {
     containIntrinsicSize: `auto ${intrinsicHeight(descriptor)}px`,
-    contentVisibility: 'auto',
     ...(aspect
       ? { width: `min(${descriptor.maxWidth ?? 640}px, 100%, calc(${EMBED_MAX_H} * ${aspect}))` }
       : { width: descriptor.maxWidth ? `min(${descriptor.maxWidth}px, 100%)` : '100%' })
