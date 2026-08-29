@@ -1410,6 +1410,17 @@ class SessionSearchMixin:
             except sqlite3.OperationalError:
                 # Query failed at runtime — let the caller fall back.
                 return None
+            except sqlite3.DatabaseError:
+                # Corrupt shadow table on the substring-capable index — the
+                # same class the main FTS5 branch self-heals. Return None so
+                # the caller falls back to another strategy instead of
+                # erroring the whole search (#97794).
+                logger.warning(
+                    "Substring FTS search (%s) hit a corruption error; "
+                    "letting the caller fall back.",
+                    table,
+                )
+                return None
             return [dict(row) for row in tri_cursor.fetchall()]
 
     def search_messages(
@@ -2128,8 +2139,30 @@ class SessionSearchMixin:
                 # holds no writer lock, so rebuild_fts() can acquire it — and
                 # retry, so search self-heals for read-only sessions (cron/CLI
                 # history search) that never trigger a write to repair it first.
+                # When the one-shot rebuild is refused (already attempted, FTS
+                # disabled, or a different error class), fall back to the LIKE
+                # substring path over the canonical messages table instead of
+                # erroring out: an FTS-only failure must degrade search, not
+                # break it (#97794).
                 if not self._try_runtime_fts_rebuild(exc):
-                    raise
+                    logger.warning(
+                        "FTS5 search hit a corruption error (%s) and no "
+                        "in-place rebuild was possible; falling back to LIKE.",
+                        exc,
+                    )
+                    matches = self._search_messages_like_fallback(
+                        query,
+                        source_filter=source_filter,
+                        exclude_sources=exclude_sources,
+                        role_filter=role_filter,
+                        limit=limit,
+                        offset=offset,
+                        sort=sort,
+                        include_inactive=include_inactive,
+                    )
+                    return self._finalize_search_matches(
+                        matches, result_fields=result_fields
+                    )
                 with self._read_ctx() as conn:
                     cursor = conn.execute(sql, params)
                     matches = [dict(row) for row in cursor.fetchall()]
