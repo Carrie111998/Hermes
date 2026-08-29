@@ -382,8 +382,12 @@ def test_profile_dir_age_gate_protects_a_concurrent_agent():
         os.utime(stale, (old_t, old_t))
 
         removed = []
+        # Point the cleanup's search roots at the sandbox instead of the real
+        # tmpdirs. Single replacement point by design — see _cleanup_orphan_
+        # profile_dirs, which searches {resolved tmpdir, "/tmp"}.
         src = open(wd.__file__, encoding="utf-8").read().replace(
-            'Path("/tmp").glob(TMP_GLOB)', f'Path("{sandbox}").glob(TMP_GLOB)')
+            'search_roots = {_socket_safe_tmpdir(), "/tmp"}',
+            f'search_roots = {{"{sandbox}"}}')
         ns = {}
         exec(compile(src, wd.__file__, "exec"), ns)
         ns["_proc_pids"] = lambda: []          # nothing references either dir

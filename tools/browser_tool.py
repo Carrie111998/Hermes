@@ -2568,11 +2568,23 @@ def _spawn_owner_watchdog():
         logger.warning("browser owner watchdog script missing: %s", script)
         return
     try:
+        # The watchdog reports what it reaped on stdout. Sending that to DEVNULL
+        # made every reap invisible — there was no way to tell a watchdog that
+        # cleaned up a leaked Chromium tree from one that silently did nothing.
+        # Append both streams to a log file instead; it is the only diagnostic
+        # this detached process has.
+        try:
+            _wd_log = open(
+                os.path.join(_socket_safe_tmpdir(), "agent-browser-watchdog.log"),
+                "a", encoding="utf-8",
+            )
+        except OSError:
+            _wd_log = subprocess.DEVNULL
         proc = subprocess.Popen(
             [sys.executable, script, "--ppid", str(os.getpid())],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=_wd_log,
+            stderr=_wd_log,
             start_new_session=True,
             close_fds=True,
         )

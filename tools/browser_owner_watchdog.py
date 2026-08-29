@@ -53,6 +53,7 @@ import os
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -160,6 +161,20 @@ def _tree_kill(pid: int) -> None:
         targets = alive
 
 
+def _socket_safe_tmpdir() -> str:
+    """Mirror of ``browser_tool._socket_safe_tmpdir``.
+
+    browser_tool creates its socket dirs under this path, so the watchdog must
+    look in the SAME place or it silently finds nothing to reap. Kept as a local
+    copy rather than an import because this module is spawned as a standalone
+    script and deliberately depends only on the stdlib plus psutil. If the
+    original changes, change this with it.
+    """
+    if sys.platform == "darwin":
+        return "/tmp"
+    return tempfile.gettempdir()
+
+
 def _proc_pids() -> list[int]:
     """Every live PID, via psutil (cross-platform; no /proc dependency)."""
     try:
@@ -169,7 +184,7 @@ def _proc_pids() -> list[int]:
 
 
 def _socket_dirs() -> list[str]:
-    tmpdir = "/tmp"
+    tmpdir = _socket_safe_tmpdir()
     out: list[str] = []
     for pattern in ("agent-browser-h_*", "agent-browser-cdp_*",
                     "agent-browser-hermes_*", "agent-browser-rp_*"):
@@ -234,30 +249,49 @@ def _reap_owner_browsers() -> None:
             stale_dirs.append(socket_dir)
 
     # Reap Chromium roots that are orphaned (PPid 1 / systemd --user) and whose
-    # profile dir is not held by a live owner. We compute the set of profile
-    # dirs still referenced by any live process before killing anything.
-    live_profile_dirs: set[str] = set()
+    # profile dir is not held by a process that will SURVIVE this reap.
+    #
+    # Order matters. A previous version built the keep-set from every live
+    # process first, then skipped any candidate whose profile dir was in it —
+    # but a candidate always carries its own --user-data-dir, so it put its own
+    # dir in the keep-set and then skipped itself. The condition was always true
+    # and this whole mechanism was unreachable. Identify candidates FIRST, then
+    # build the keep-set from processes that are not about to die with one.
+    candidates: list[tuple[int, str]] = []  # (pid, profile_dir)
     for _pid in _proc_pids():
-        for arg in _cmdline(_pid):
-            if arg.startswith(UDD_PREFIX):
-                live_profile_dirs.add(arg.split("=", 1)[1])
-
-    orphan_chromium: list[tuple[int, str]] = []  # (pid, profile_dir)
-    for _pid in _proc_pids():
-        pid = _pid
-        argv = _cmdline(pid)
+        argv = _cmdline(_pid)
         udd = next((a for a in argv if a.startswith(UDD_PREFIX)), None)
         if not udd:
             continue
         if any(a.startswith("--type=") for a in argv):
             continue  # child process; dies with its root
-        parent = _ppid_of(pid)
+        parent = _ppid_of(_pid)
         if parent != 1 and not _is_systemd_user(parent):
             continue  # still owned by a live daemon/agent
-        profile_dir = udd.split("=", 1)[1]
-        if profile_dir in live_profile_dirs:
-            continue  # some live process still references it — leave alone
-        orphan_chromium.append((pid, profile_dir))
+        candidates.append((_pid, udd.split("=", 1)[1]))
+
+    # Everything that dies when we reap the candidates: the roots plus their
+    # descendants. Those must not vote to keep a profile dir alive.
+    doomed: set[int] = {pid for pid, _ in candidates}
+    for pid, _ in list(candidates):
+        try:
+            doomed.update(c.pid for c in psutil.Process(pid).children(recursive=True))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+
+    live_profile_dirs: set[str] = set()
+    for _pid in _proc_pids():
+        if _pid in doomed:
+            continue
+        for arg in _cmdline(_pid):
+            if arg.startswith(UDD_PREFIX):
+                live_profile_dirs.add(arg.split("=", 1)[1])
+
+    orphan_chromium: list[tuple[int, str]] = [
+        (pid, profile_dir)
+        for pid, profile_dir in candidates
+        if profile_dir not in live_profile_dirs
+    ]
 
     reaped = 0
     for daemon_pid, socket_dir in reap_daemons:
@@ -325,7 +359,12 @@ def _cleanup_orphan_profile_dirs() -> None:
             if arg.startswith(UDD_PREFIX):
                 live_dirs.add(arg.split("=", 1)[1])
     now = time.time()
-    for d in Path("/tmp").glob(TMP_GLOB):
+    # The Chromium profile dirs are created by the external agent-browser CLI,
+    # not by browser_tool, so we do not control that path. Search the resolved
+    # tmpdir AND /tmp (deduped) rather than assuming either one.
+    search_roots = {_socket_safe_tmpdir(), "/tmp"}
+    candidates_d = {d for root in search_roots for d in Path(root).glob(TMP_GLOB)}
+    for d in sorted(candidates_d):
         if str(d) in live_dirs:
             continue
         # Age gate: never remove a dir that is younger than the grace window, and
@@ -353,8 +392,9 @@ def _run(original_ppid: int) -> int:
     before (t_8a1037d1 review, round 1). The watchdog is stdlib-only and sleeps
     2s per poll, so a single instance guarding the owner for its whole life is
     trivially cheap. Exit only on owner death (after reaping) or the absolute
-    ``_MAX_S`` lifetime cap (a safety net so a wedged watchdog can never
-    accumulate).
+    ``_MAX_S`` lifetime cap, at which point we RE-EXEC rather than exit: the cap
+    exists so a wedged watchdog can never accumulate, and re-exec replaces this
+    process instead of adding one while keeping a long-lived owner protected.
     """
     start = time.time()
     while True:
@@ -363,7 +403,25 @@ def _run(original_ppid: int) -> int:
             return 0
 
         if time.time() - start >= _MAX_S:
-            return 0
+            # Lifetime cap reached. We only get here with the owner STILL ALIVE
+            # (owner death returns above, after reaping), so we must NOT reap —
+            # that would kill a live session. But simply exiting would leave a
+            # long-lived owner unprotected until its next browser session
+            # happens to respawn us, and a SIGKILL in that gap leaks exactly the
+            # orphan Chromium this watchdog exists to prevent.
+            #
+            # Re-exec instead: the cap's purpose is that a WEDGED watchdog can
+            # never accumulate, and re-exec replaces this process rather than
+            # adding one — same pid, same parent, so owner-death detection via
+            # getppid() is unaffected — while the fresh image resets any wedged
+            # state. If exec fails for any reason, fall back to the old
+            # behaviour and exit rather than spin.
+            try:
+                os.execv(sys.executable,
+                         [sys.executable, os.path.abspath(__file__),
+                          "--ppid", str(original_ppid)])
+            except OSError:
+                return 0
 
         time.sleep(_POLL_S)
 
