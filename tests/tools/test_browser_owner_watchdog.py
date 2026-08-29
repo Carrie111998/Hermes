@@ -17,6 +17,9 @@ remove them on teardown. They never touch real browser sessions (unique uuids).
 """
 
 import os
+import shutil
+import types
+import tempfile
 import signal
 import subprocess
 import sys
@@ -151,9 +154,16 @@ def fake_session_factory():
         fs.cleanup()
 
 
-def _watchdog_env():
+def _watchdog_env(profile_min_age_s="0"):
     env = dict(os.environ)
     env["BROWSER_OWNER_WATCHDOG_POLL_S"] = "0.2"
+    # Profile-dir removal is age gated in production so a concurrent agent's
+    # freshly-mkdir'd dir (referenced by no live process until it execs Chromium)
+    # is never deleted out from under it. These fixtures are created moments
+    # before the assertion, so the gate would legitimately protect them; disable
+    # it here to exercise the REAP path. test_profile_dir_age_gate_protects_a
+    # _concurrent_agent covers the gate itself.
+    env["BROWSER_OWNER_WATCHDOG_PROFILE_MIN_AGE_S"] = profile_min_age_s
     return env
 
 
@@ -175,6 +185,9 @@ import os, subprocess, sys, time
 watchdog = sys.argv[1]
 env = dict(os.environ)
 env["BROWSER_OWNER_WATCHDOG_POLL_S"] = "0.2"
+# Fixtures are created moments before assertion; disable the profile-dir age
+# gate so this exercises the REAP path (the gate itself has its own test).
+env["BROWSER_OWNER_WATCHDOG_PROFILE_MIN_AGE_S"] = "0"
 wd = subprocess.Popen(
     [sys.executable, watchdog, "--ppid", str(os.getpid())],
     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -340,3 +353,48 @@ def test_multi_session_lifecycle(fake_session_factory):
         if _pid_alive(owner_pid):
             os.kill(owner_pid, signal.SIGKILL)
             owner.wait()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="browser owner watchdog is POSIX-only")
+def test_profile_dir_age_gate_protects_a_concurrent_agent():
+    """A profile dir younger than the grace window must NOT be removed.
+
+    /tmp is shared. Between another agent's ``mkdir`` of its profile dir and its
+    ``exec`` of Chromium, that dir is referenced by no live process — which is
+    indistinguishable from a leak by cmdline alone. Deleting it destroys a live
+    session, so the watchdog age gates removal. Regression test for the unscoped
+    rm -rf that shipped before the gate existed.
+    """
+    import importlib
+    import sys as _sys
+
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    wd = importlib.import_module("tools.browser_owner_watchdog")
+
+    sandbox = tempfile.mkdtemp(prefix="wd_agegate_")
+    try:
+        fresh = os.path.join(sandbox, "agent-browser-chrome-fresh")
+        stale = os.path.join(sandbox, "agent-browser-chrome-stale")
+        os.makedirs(fresh)
+        os.makedirs(stale)
+        old_t = time.time() - 7200
+        os.utime(stale, (old_t, old_t))
+
+        removed = []
+        src = open(wd.__file__, encoding="utf-8").read().replace(
+            'Path("/tmp").glob(TMP_GLOB)', f'Path("{sandbox}").glob(TMP_GLOB)')
+        ns = {}
+        exec(compile(src, wd.__file__, "exec"), ns)
+        ns["_proc_pids"] = lambda: []          # nothing references either dir
+        ns["_DRY_RUN"] = False
+        ns["_PROFILE_MIN_AGE_S"] = 300.0
+        ns["shutil"] = types.SimpleNamespace(
+            rmtree=lambda d, **k: removed.append(os.path.basename(str(d))))
+        ns["_cleanup_orphan_profile_dirs"]()
+
+        assert "agent-browser-chrome-stale" in removed, "genuine orphan not reaped"
+        assert "agent-browser-chrome-fresh" not in removed, (
+            "age gate failed: deleted a concurrent agent's fresh profile dir")
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
