@@ -2709,17 +2709,16 @@ def _merge_loaded_config_snapshot(base: Any, requested: Any, current: Any) -> An
             return _CONFIG_MISSING
         return copy.deepcopy(current)
 
-    if (
-        isinstance(base, dict)
-        and isinstance(requested, dict)
-        and isinstance(current, dict)
+    if isinstance(base, dict) and isinstance(requested, dict) and (
+        isinstance(current, dict) or current is _CONFIG_MISSING
     ):
+        current_mapping = {} if current is _CONFIG_MISSING else current
         merged: Dict[str, Any] = {}
-        for key in base.keys() | requested.keys() | current.keys():
+        for key in base.keys() | requested.keys() | current_mapping.keys():
             value = _merge_loaded_config_snapshot(
                 base.get(key, _CONFIG_MISSING),
                 requested.get(key, _CONFIG_MISSING),
-                current.get(key, _CONFIG_MISSING),
+                current_mapping.get(key, _CONFIG_MISSING),
             )
             if value is not _CONFIG_MISSING:
                 merged[key] = value
