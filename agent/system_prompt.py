@@ -50,7 +50,8 @@ from agent.prompt_builder import (
     TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
-    drain_truncation_warnings,
+    drain_context_file_notices,
+    isolated_context_file_notices,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -58,6 +59,8 @@ from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+_CONTEXT_SCAN_POLICY_MARKER = "Context file scanning policy: "
+_VALID_CONTEXT_SCAN_POLICIES = frozenset({"enforce", "warn", "off"})
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
@@ -265,6 +268,25 @@ def restore_plugin_prompt_sections(agent: Any, prompt: str) -> None:
     agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(prompt)
 
 
+def restore_context_file_scan_policy(agent: Any, prompt: str) -> str:
+    """Restore the lazy scanner policy frozen in persisted prompt bytes.
+
+    The core marker is the final prompt line, so project, memory, or plugin text
+    cannot spoof it. Legacy and malformed prompts fail closed to ``enforce``.
+    """
+    policy = "enforce"
+    if isinstance(prompt, str):
+        marker = f"\n\n{_CONTEXT_SCAN_POLICY_MARKER}"
+        if marker in prompt:
+            configured = prompt.rsplit(marker, 1)[-1]
+            if configured in _VALID_CONTEXT_SCAN_POLICIES:
+                policy = configured
+    tracker = getattr(agent, "_subdirectory_hints", None)
+    if tracker is not None:
+        tracker.set_scan_policy(policy)
+    return policy
+
+
 def _plugin_section_blocks(sections: tuple, position: str) -> List[str]:
     from hermes_cli.plugins import format_system_prompt_sections
 
@@ -304,7 +326,7 @@ def _agent_home(agent: Any) -> Optional[Path]:
     try:
         db = getattr(agent, "_session_db", None)
         db_path = getattr(db, "db_path", None)
-        if db_path:
+        if isinstance(db_path, (str, os.PathLike)):
             return Path(db_path).parent
     except Exception:
         pass
@@ -338,7 +360,12 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+def build_system_prompt_parts(
+    agent: Any,
+    system_message: Optional[str] = None,
+    *,
+    install_runtime_state: bool = False,
+) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
     Returns a dict with three keys:
@@ -352,7 +379,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     Joined into a single string by :func:`build_system_prompt` and
     cached on ``agent._cached_system_prompt`` for the lifetime of the
-    AIAgent.  Hermes never re-renders parts of this string mid-
+    AIAgent. ``install_runtime_state`` is reserved for that authoritative
+    cached-prompt build; read-only projections must leave session state alone.
+    Hermes never re-renders parts of this string mid-
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
@@ -372,6 +401,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
+    # Resolve the agent home and policy once for the whole build so SOUL.md
+    # and every project context
+    # file observe one coherent policy even if config.yaml changes mid-build.
+    agent_home = _agent_home(agent)
+    _context_scan_policy = _r._context_file_scanning_policy(
+        home_override=agent_home
+    )
+    subdirectory_hints = getattr(agent, "_subdirectory_hints", None)
+    if install_runtime_state and subdirectory_hints is not None:
+        subdirectory_hints.set_scan_policy(_context_scan_policy)
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -383,7 +423,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
         # ambient resolution on a thread that lost the HERMES_HOME ContextVar
         # reads the launch profile's SOUL.md instead (#50233).
-        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
+        if install_runtime_state:
+            _soul_content = _r.load_soul_md(
+                _ctx_len,
+                home_override=agent_home,
+                scan_policy=_context_scan_policy,
+            )
+        else:
+            with isolated_context_file_notices():
+                _soul_content = _r.load_soul_md(
+                    _ctx_len,
+                    home_override=agent_home,
+                    scan_policy=_context_scan_policy,
+                )
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -789,11 +841,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
-        context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
-            context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=_agent_home(agent))
+        if install_runtime_state:
+            context_files_prompt = _r.build_context_files_prompt(
+                cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+                context_length=_ctx_len,
+                allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+                home_override=agent_home,
+                scan_policy=_context_scan_policy)
+        else:
+            with isolated_context_file_notices():
+                context_files_prompt = _r.build_context_files_prompt(
+                    cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+                    context_length=_ctx_len,
+                    allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+                    home_override=agent_home,
+                    scan_policy=_context_scan_policy)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
@@ -897,6 +959,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
+    # Persist the authoritative policy in the prompt itself. Gateway turns
+    # construct a fresh AIAgent and restore these exact bytes, so process-local
+    # tracker state alone cannot carry the policy across turns.
+    volatile_parts.append(f"{_CONTEXT_SCAN_POLICY_MARKER}{_context_scan_policy}")
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
@@ -922,13 +988,17 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     rebuilt (on compaction/restore) the unchanged stable scaffold ahead of
     the change stays in the reused prefix.
     """
-    parts = build_system_prompt_parts(agent, system_message=system_message)
+    parts = build_system_prompt_parts(
+        agent,
+        system_message=system_message,
+        install_runtime_state=True,
+    )
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
 
-    # Surface context-file truncation warnings through the normal agent status
-    # channel so gateway/CLI users see them in chat instead of only in logs.
-    for warning in drain_truncation_warnings():
+    # Surface context-file truncation and security-scan warnings through the
+    # normal agent status channel so users see them instead of only in logs.
+    for warning in drain_context_file_notices():
         agent._emit_status(warning)
 
     return joined
@@ -1029,5 +1099,6 @@ __all__ = [
     "build_system_prompt",
     "invalidate_system_prompt",
     "restore_plugin_prompt_sections",
+    "restore_context_file_scan_policy",
     "format_tools_for_system_message",
 ]

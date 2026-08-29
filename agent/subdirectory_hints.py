@@ -82,8 +82,13 @@ class SubdirectoryHintTracker:
             tool_result += hints  # append to the tool result string
     """
 
-    def __init__(self, working_dir: Optional[str] = None):
+    def __init__(
+        self,
+        working_dir: Optional[str] = None,
+        scan_policy: str = "enforce",
+    ):
         self.working_dir = Path(working_dir or os.getcwd()).resolve()
+        self.set_scan_policy(scan_policy)
         self._loaded_dirs: Set[Path] = set()
         # Content digests already injected — prevents re-sending the same file
         # reachable through symlinks, hardlinks, or duplicated copies.
@@ -91,6 +96,12 @@ class SubdirectoryHintTracker:
         # Pre-mark the working dir as loaded (startup context handles it)
         self._loaded_dirs.add(self.working_dir)
         self._seed_working_dir_digest()
+
+    def set_scan_policy(self, policy: str) -> None:
+        """Freeze the context-file scan policy used by lazy hint discovery."""
+        self._scan_policy = (
+            policy if policy in {"enforce", "warn", "off"} else "enforce"
+        )
 
     def _seed_working_dir_digest(self) -> None:
         """Record the CWD context file's digest so it is never re-injected.
@@ -302,7 +313,11 @@ class SubdirectoryHintTracker:
                     break
                 self._loaded_digests.add(digest)
                 # Same security scan as startup context loading
-                content = _scan_context_content(content, filename)
+                content = _scan_context_content(
+                    content,
+                    filename,
+                    policy=self._scan_policy,
+                )
                 if len(content) > _MAX_HINT_CHARS:
                     content = (
                         content[:_MAX_HINT_CHARS]

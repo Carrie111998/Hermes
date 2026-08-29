@@ -1674,6 +1674,64 @@ class TestExecuteToolCalls:
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
+    def test_sequential_lazy_context_notice_is_emitted_and_drained(self, agent):
+        from agent.prompt_builder import (
+            _record_truncation_warning,
+            drain_context_file_notices,
+        )
+
+        drain_context_file_notices()
+        statuses = []
+        agent._emit_status = statuses.append
+        tool_call = _mock_tool_call(
+            name="web_search", arguments='{"q":"pkg/file.py"}', call_id="c1"
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        def lazy_hint(*_args, **_kwargs):
+            _record_truncation_warning("lazy scanner notice")
+            return "\n\n<system-hint>blocked context</system-hint>"
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(
+                agent._subdirectory_hints,
+                "check_tool_call",
+                side_effect=lazy_hint,
+            ),
+        ):
+            agent._execute_tool_calls_sequential(message, [], "task-1")
+
+        assert statuses == ["lazy scanner notice"]
+        assert drain_context_file_notices() == []
+
+    @pytest.mark.parametrize("policy", ["warn", "off"])
+    def test_sequential_lazy_context_restores_adopted_prompt_policy(
+        self, agent, policy
+    ):
+        agent._cached_system_prompt = (
+            "adopted prompt\n\nContext file scanning policy: " + policy
+        )
+        agent._subdirectory_hints.set_scan_policy("enforce")
+        tool_call = _mock_tool_call(
+            name="web_search", arguments='{"q":"pkg/file.py"}', call_id="c1"
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        def assert_restored_policy(*_args, **_kwargs):
+            assert agent._subdirectory_hints._scan_policy == policy
+            return None
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(
+                agent._subdirectory_hints,
+                "check_tool_call",
+                side_effect=assert_restored_policy,
+            ),
+        ):
+            agent._execute_tool_calls_sequential(message, [], "task-1")
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(
@@ -2006,6 +2064,42 @@ class TestConcurrentToolExecution:
         assert "alpha" in messages[0]["content"]
         assert "beta" in messages[1]["content"]
         assert "gamma" in messages[2]["content"]
+
+    def test_concurrent_lazy_context_notice_is_emitted_and_drained(self, agent):
+        from agent.prompt_builder import (
+            _record_truncation_warning,
+            drain_context_file_notices,
+        )
+
+        drain_context_file_notices()
+        statuses = []
+        agent._emit_status = statuses.append
+        tool_calls = [
+            _mock_tool_call(
+                name="web_search", arguments=json.dumps({"q": query}), call_id=f"c{i}"
+            )
+            for i, query in enumerate(("pkg/a.py", "pkg/b.py"), start=1)
+        ]
+        message = _mock_assistant_msg(content="", tool_calls=tool_calls)
+
+        def lazy_hint(_name, args):
+            if args["q"].endswith("a.py"):
+                _record_truncation_warning("parallel lazy scanner notice")
+                return "\n\n<system-hint>blocked context</system-hint>"
+            return None
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(
+                agent._subdirectory_hints,
+                "check_tool_call",
+                side_effect=lazy_hint,
+            ),
+        ):
+            agent._execute_tool_calls_concurrent(message, [], "task-1")
+
+        assert statuses == ["parallel lazy scanner notice"]
+        assert drain_context_file_notices() == []
 
     def test_concurrent_none_args_rejected_without_crash(self, agent):
         """Concurrent executor must not crash on arguments=None. Current

@@ -2424,6 +2424,7 @@ Pre-execution security scanning and secret redaction:
 ```yaml
 security:
   redact_secrets: true           # Redact API key patterns in tool output and logs (on by default)
+  context_file_scanning: "enforce" # "enforce" | "warn" | "off" (default: "enforce")
   tirith_enabled: true           # Enable Tirith security scanning for terminal commands
   tirith_path: "tirith"          # Path to tirith binary (default: "tirith" in $PATH)
   tirith_timeout: 5              # Seconds to wait for tirith scan before timing out
@@ -2435,6 +2436,7 @@ security:
 ```
 
 - `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development.
+- `context_file_scanning` — controls prompt-injection scanning for `SOUL.md`, `AGENTS.md`, `CLAUDE.md`, `.hermes.md`, and Cursor rules. `enforce` (default) replaces a flagged file with a blocked placeholder; `warn` loads it with a warning banner; `off` skips scanning. Both `enforce` and `warn` also surface an interactive status notice naming the file and findings. Use `warn` or `off` only for files you trust.
 - `tirith_enabled` — when `true`, terminal commands are scanned by [Tirith](https://github.com/sheeki03/tirith) before execution to detect potentially dangerous operations.
 - `tirith_path` — path to the tirith binary. Set this if tirith is installed in a non-standard location.
 - `tirith_timeout` — maximum seconds to wait for a tirith scan. Commands proceed if the scan times out.

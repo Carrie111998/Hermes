@@ -11,6 +11,7 @@ import sys
 import threading
 import contextvars
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_constants import (
@@ -58,8 +59,38 @@ logger = logging.getLogger(__name__)
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
-def _scan_context_content(content: str, filename: str) -> str:
-    """Scan context file content for injection. Returns sanitized content.
+def _context_file_scanning_policy(home_override: "Path | None" = None) -> str:
+    """Return the profile-scoped context-file scan policy, failing closed."""
+    home_token = None
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        if home_override is not None:
+            home_token = set_hermes_home_override(str(home_override))
+        security = load_config_readonly().get("security", {})
+        configured = security.get("context_file_scanning", "enforce")
+    except Exception as exc:
+        logger.debug("Could not read context-file scanning policy: %s", exc)
+        return "enforce"
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+    if isinstance(configured, str):
+        policy = configured.strip().lower()
+        if policy in {"enforce", "warn", "off"}:
+            return policy
+    logger.warning(
+        "invalid security.context_file_scanning value %r; using enforce",
+        configured,
+    )
+    return "enforce"
+
+
+def _scan_context_content(
+    content: str, filename: str, *, policy: Optional[str] = None
+) -> str:
+    """Apply the configured injection policy to context-file content.
 
     Uses the "context" scope from the shared threat-pattern library, which
     covers classic injection + promptware/C2 patterns + role-play hijack.
@@ -67,7 +98,9 @@ def _scan_context_content(content: str, filename: str) -> str:
     applied here — those are too aggressive for a context file in a
     cloned repo (security research, infra docs).  Content matching is
     BLOCKED at this layer because the file would otherwise enter the
-    system prompt verbatim and the user has no chance to intervene.
+    system prompt verbatim and the user has no chance to intervene. The
+    default ``enforce`` policy preserves that behavior; ``warn`` loads the
+    file with an in-prompt banner, and ``off`` bypasses scanning explicitly.
     """
     # Editors (Windows Notepad, PowerShell Out-File without -Encoding
     # utf8NoBOM, some VS Code profiles) prefix a UTF-8 BOM as an encoding
@@ -77,10 +110,41 @@ def _scan_context_content(content: str, filename: str) -> str:
     if content.startswith("\ufeff"):
         content = content[1:]
 
+    if policy is None:
+        policy = _context_file_scanning_policy()
+    if policy == "off":
+        return content
+
     findings = _scan_for_threats(content, scope="context")
     if findings:
-        logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
-        return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
+        finding_text = ", ".join(findings)
+        if policy == "warn":
+            logger.warning(
+                "Context file %s matched scanner but was loaded by warn policy: %s",
+                filename,
+                finding_text,
+            )
+            _record_truncation_warning(
+                f"⚠ Context file {filename} matched the prompt-injection scanner "
+                f"({finding_text}); content was loaded because "
+                "security.context_file_scanning is warn."
+            )
+            return (
+                f"[WARNING: {filename} matched potential prompt injection "
+                f"({finding_text}). Content loaded because "
+                f"security.context_file_scanning=warn.]\n\n{content}"
+            )
+
+        logger.warning("Context file %s blocked: %s", filename, finding_text)
+        _record_truncation_warning(
+            f"⚠ Context file {filename} was blocked by the prompt-injection "
+            f"scanner ({finding_text}). Review the file or set "
+            "security.context_file_scanning to warn/off only if you trust it."
+        )
+        return (
+            f"[BLOCKED: {filename} contained potential prompt injection "
+            f"({finding_text}). Content not loaded.]"
+        )
 
     return content
 
@@ -1475,7 +1539,7 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
         logger.debug("Could not read context_file_max_chars from config: %s", e)
     return _dynamic_context_file_max_chars(context_length)
 
-# Collect truncation warnings so the caller (run_agent) can surface them.
+# Collect context-file warnings so the caller (run_agent) can surface them.
 # A ContextVar (not a module-global list) isolates accumulation per thread /
 # per async task, so concurrent gateway-session prompt builds can't drain or
 # clear each other's pending warnings (cross-session leak). Each build runs in
@@ -1483,6 +1547,21 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
 _truncation_warnings: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
     "context_file_truncation_warnings", default=None
 )
+
+
+@contextmanager
+def isolated_context_file_notices():
+    """Discard notices produced by a read-only prompt projection.
+
+    A fresh accumulator preserves any authoritative notices already pending in
+    the caller's context while ensuring inspection-only builds cannot leak
+    delayed status messages into a later tool call.
+    """
+    token = _truncation_warnings.set([])
+    try:
+        yield
+    finally:
+        _truncation_warnings.reset(token)
 
 
 def _record_truncation_warning(msg: str) -> None:
@@ -1494,14 +1573,19 @@ def _record_truncation_warning(msg: str) -> None:
     warnings.append(msg)
 
 
-def drain_truncation_warnings() -> list:
-    """Return and clear any truncation warnings accumulated in this context."""
+def drain_context_file_notices() -> list:
+    """Return and clear context-file notices accumulated in this context."""
     warnings = _truncation_warnings.get()
     if not warnings:
         return []
     drained = list(warnings)
     warnings.clear()
     return drained
+
+
+def drain_truncation_warnings() -> list:
+    """Compatibility alias for callers using the historical channel name."""
+    return drain_context_file_notices()
 
 
 # =========================================================================
@@ -2183,6 +2267,7 @@ def _truncate_content(
 def load_soul_md(
     context_length: Optional[int] = None,
     home_override: "Path | None" = None,
+    scan_policy: Optional[str] = None,
 ) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
@@ -2210,7 +2295,7 @@ def load_soul_md(
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
             return None
-        content = _scan_context_content(content, "SOUL.md")
+        content = _scan_context_content(content, "SOUL.md", policy=scan_policy)
         content = _truncate_content(
             content, "SOUL.md", context_length=context_length,
             read_path=str(soul_path),
@@ -2221,7 +2306,11 @@ def load_soul_md(
         return None
 
 
-def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_hermes_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
     if not hermes_md_path:
@@ -2236,7 +2325,7 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             rel = str(hermes_md_path.relative_to(cwd_path))
         except ValueError:
             pass
-        content = _scan_context_content(content, rel)
+        content = _scan_context_content(content, rel, policy=scan_policy)
         result = f"## {rel}\n\n{content}"
         return _truncate_content(
             result, ".hermes.md", context_length=context_length,
@@ -2274,7 +2363,11 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
     return chain
 
 
-def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_agents_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
@@ -2310,7 +2403,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
                 label = name
             else:
                 label = os.path.relpath(candidate, cwd_resolved)
-            scanned = _scan_context_content(content, label)
+            scanned = _scan_context_content(content, label, policy=scan_policy)
             section = f"## {label}\n\n{scanned}"
             section = _truncate_content(
                 section, label, context_length=context_length,
@@ -2332,7 +2425,11 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     )
 
 
-def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_claude_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
@@ -2340,7 +2437,7 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
-                    content = _scan_context_content(content, name)
+                    content = _scan_context_content(content, name, policy=scan_policy)
                     result = f"## {name}\n\n{content}"
                     return _truncate_content(
                         result, "CLAUDE.md", context_length=context_length,
@@ -2351,7 +2448,11 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     return ""
 
 
-def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_cursorrules(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    scan_policy: Optional[str] = None,
+) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
     cursorrules_file = cwd_path / ".cursorrules"
@@ -2359,7 +2460,9 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
         try:
             content = cursorrules_file.read_text(encoding="utf-8").strip()
             if content:
-                content = _scan_context_content(content, ".cursorrules")
+                content = _scan_context_content(
+                    content, ".cursorrules", policy=scan_policy
+                )
                 cursorrules_content += f"## .cursorrules\n\n{content}\n\n"
         except Exception as e:
             logger.debug("Could not read .cursorrules: %s", e)
@@ -2371,7 +2474,11 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
             try:
                 content = mdc_file.read_text(encoding="utf-8").strip()
                 if content:
-                    content = _scan_context_content(content, f".cursor/rules/{mdc_file.name}")
+                    content = _scan_context_content(
+                        content,
+                        f".cursor/rules/{mdc_file.name}",
+                        policy=scan_policy,
+                    )
                     cursorrules_content += f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"
             except Exception as e:
                 logger.debug("Could not read %s: %s", mdc_file, e)
@@ -2390,6 +2497,7 @@ def build_context_files_prompt(
     context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False,
     home_override: "Path | None" = None,
+    scan_policy: Optional[str] = None,
 ) -> str:
     """Discover and load context files for the system prompt.
 
@@ -2409,6 +2517,9 @@ def build_context_files_prompt(
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).
     """
+    if scan_policy is None:
+        scan_policy = _context_file_scanning_policy()
+
     if cwd is None:
         cwd = os.getcwd()
         cwd_is_fallback = True
@@ -2443,17 +2554,21 @@ def build_context_files_prompt(
     else:
         # Priority-based project context: first match wins
         project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
+            _load_hermes_md(cwd_path, context_length, scan_policy)
+            or _load_agents_md(cwd_path, context_length, scan_policy)
+            or _load_claude_md(cwd_path, context_length, scan_policy)
+            or _load_cursorrules(cwd_path, context_length, scan_policy)
         )
     if project_context:
         sections.append(project_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
-        soul_content = load_soul_md(context_length, home_override=home_override)
+        soul_content = load_soul_md(
+            context_length,
+            home_override=home_override,
+            scan_policy=scan_policy,
+        )
         if soul_content:
             sections.append(soul_content)
 

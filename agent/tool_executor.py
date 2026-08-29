@@ -56,6 +56,14 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _emit_context_file_notices(agent) -> None:
+    """Surface notices produced by lazy subdirectory context discovery."""
+    from agent.prompt_builder import drain_context_file_notices
+
+    for notice in drain_context_file_notices():
+        agent._emit_status(notice)
+
+
 def _pairing_tool_call_id(tool_call: Any) -> str:
     """Return the canonical id used by the persisted assistant message."""
     return coalesce_tool_call_id(tool_call)
@@ -1824,7 +1832,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
+        # Cached prompts are also adopted by compression and background-review
+        # paths. Restore at the single lazy-execution choke point so every
+        # consumer observes the policy frozen in those prompt bytes.
+        from agent.system_prompt import restore_context_file_scan_policy
+
+        restore_context_file_scan_policy(
+            agent, getattr(agent, "_cached_system_prompt", None)
+        )
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
+        _emit_context_file_notices(agent)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 # Append the hint to the text summary part so the model
@@ -2749,8 +2766,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
+        # Adopted cached prompts (for example background-review agents) carry
+        # the parent session's frozen scan policy in their final marker. Keep
+        # the sequential path aligned with concurrent execution before lazy
+        # context discovery.
+        from agent.system_prompt import restore_context_file_scan_policy
+
+        restore_context_file_scan_policy(
+            agent, getattr(agent, "_cached_system_prompt", None)
+        )
+
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
+        _emit_context_file_notices(agent)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)
