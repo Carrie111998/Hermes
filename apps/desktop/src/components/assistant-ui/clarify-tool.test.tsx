@@ -700,6 +700,64 @@ describe('ClarifyTool batch card', () => {
     })
   })
 
+  it('keeps choices actionable after a one-question batch skip', async () => {
+    const inserts: string[] = []
+
+    const stop = onComposerInsertRequest(detail => {
+      inserts.push(detail.text)
+    })
+
+    try {
+      renderClarify(
+        <ClarifyTool
+          {...settledClarifyProps(
+            { questions: [{ choices: ['red', 'blue'], question: 'Color?' }] },
+            {
+              responses: [
+                { choices_offered: ['red', 'blue'], question: 'Color?', user_response: '' }
+              ]
+            },
+            'clarify-batch-skipped'
+          )}
+        />
+      )
+
+      expect(screen.getByText('Color?')).toBeTruthy()
+      expect(screen.getByText('Skipped')).toBeTruthy()
+      expect(document.querySelector('[data-clarify-late-choices]')).toBeTruthy()
+      expect(screen.getByRole('button', { name: /blue/ })).toBeTruthy()
+
+      fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+
+      expect(inserts).toHaveLength(1)
+      expect(inserts[0]).toContain('Color?')
+      expect(inserts[0]).toContain('blue')
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not render late choices for an answered batch row', () => {
+    renderClarify(
+      <ClarifyTool
+        {...settledClarifyProps(
+          { questions: [{ choices: ['red', 'blue'], question: 'Color?' }] },
+          {
+            responses: [
+              { choices_offered: ['red', 'blue'], question: 'Color?', user_response: 'red' }
+            ]
+          },
+          'clarify-batch-answered'
+        )}
+      />
+    )
+
+    expect(screen.getByText('Color?')).toBeTruthy()
+    expect(screen.getByText('red')).toBeTruthy()
+    expect(document.querySelector('[data-clarify-late-choices]')).toBeNull()
+  })
+
   it('renders the settled batch with all questions and answers', () => {
     renderClarify(
       <ClarifyTool
