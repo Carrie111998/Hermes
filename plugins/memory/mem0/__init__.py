@@ -203,6 +203,9 @@ class Mem0MemoryProvider(MemoryProvider):
         self._mode = "platform"
         self._api_key = ""
         self._host = ""
+        # Active HERMES_HOME from initialize() kwargs; scopes OSS-local
+        # storage (mem0 history db) to the running profile (#97923).
+        self._hermes_home = ""
         self._user_id = _DEFAULT_USER_ID
         self._agent_id = "hermes"
         self._rerank_default = False
@@ -280,7 +283,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             if self._mode == "oss":
                 from ._backend import OSSBackend
-                return OSSBackend(self._config.get("oss", {}))
+                return OSSBackend(self._config.get("oss", {}), hermes_home=self._hermes_home)
             if self._host:
                 from ._backend import SelfHostedBackend
                 return SelfHostedBackend(self._api_key, self._host)
@@ -335,6 +338,10 @@ class Mem0MemoryProvider(MemoryProvider):
             )
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        # Profile-scoped storage root: always present per the MemoryProvider
+        # contract. Captured before anything builds a backend so OSS-local
+        # state lands under the active profile, not the native home (#97923).
+        self._hermes_home = kwargs.get("hermes_home") or ""
         self._config = _load_config()
         self._mode = self._config.get("mode", "platform")
         self._api_key = self._config.get("api_key", "")
