@@ -16,7 +16,11 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
-from tools.delegate_tool import DELEGATE_TASK_SCHEMA, delegate_task
+from tools.delegate_tool import (
+    DELEGATE_TASK_SCHEMA,
+    _resolve_child_credential_pool,
+    delegate_task,
+)
 
 
 def _make_mock_parent(depth=0):
@@ -241,6 +245,168 @@ class TestPerDispatchOverrideResolution(unittest.TestCase):
         _, kw1 = MockAgent.call_args_list[1]
         self.assertEqual(kw1["model"], "config-model")
         self.assertEqual(kw1["provider"], "openrouter")
+
+
+class TestPerDispatchOverrideFailureIsolation(unittest.TestCase):
+    """Errors during per-task override resolution must fail the dispatch
+    cleanly and never orphan a prior constructed child or write config."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_non_valueerror_resolution_error_is_clean_tool_error(
+        self, mock_resolve, mock_cfg
+    ):
+        """A non-ValueError raised while resolving a per-task override is
+        attributed to the right task index (not a batch-crashing exception)."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "config-model",
+            "provider": "openrouter",
+        }
+
+        def _resolve(cfg, parent):
+            if cfg.get("provider") == "bogus-prov":
+                raise RuntimeError("RESOLUTION_EXPLODED")
+            return {
+                "model": cfg.get("model") or "config-model",
+                "provider": cfg.get("provider") or "openrouter",
+                "base_url": None,
+                "api_key": None,
+            }
+
+        mock_resolve.side_effect = _resolve
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "g0", "provider": "bogus-prov"}],
+                    parent_agent=parent,
+                )
+            )
+            MockAgent.assert_not_called()
+
+        self.assertIn("error", result)
+        self.assertIn("Task 0", result["error"])
+        self.assertIn("model/provider override failed", result["error"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_mixed_batch_invalid_override_never_constructs_prior_child(
+        self, mock_resolve, mock_cfg
+    ):
+        """Task 0 with a valid override + task 1 with an invalid override must
+        fail the whole dispatch BEFORE any child is constructed, so task 0's
+        never-run child is not orphaned (SessionDB handle + active_children)."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "config-model",
+            "provider": "openrouter",
+        }
+
+        def _resolve(cfg, parent):
+            if cfg.get("provider") == "bogus-prov":
+                raise ValueError("bad override")
+            return {
+                "model": cfg.get("model") or "config-model",
+                "provider": cfg.get("provider") or "openrouter",
+                "base_url": None,
+                "api_key": None,
+            }
+
+        mock_resolve.side_effect = _resolve
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "Resolve the valid override first", "provider": "good-prov"},
+                        {"goal": "Resolve the invalid override second", "provider": "bogus-prov"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+            # Two-pass: task 1's resolution fails in pass 1 before task 0's
+            # child is even built — nothing is orphaned.
+            MockAgent.assert_not_called()
+
+        self.assertIn("error", result)
+        self.assertIn("Task 1", result["error"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_override_to_provider_without_pool_is_graceful(
+        self, mock_resolve, mock_cfg
+    ):
+        """Per-task override to a provider that is NOT the parent's pool
+        provider degrades gracefully: no lease is taken from the wrong pool,
+        and the child simply runs on the override provider. Pins that an
+        override to a different provider cannot crash on pool leasing."""
+        mock_resolve.side_effect = _fake_resolve
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "config-model",
+            "provider": "openrouter",
+        }
+        parent = _make_mock_parent()  # provider=openrouter, no _credential_pool
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._run_single_child") as mock_run,
+            patch("agent.credential_pool.load_pool", return_value=None) as mock_load,
+        ):
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+            mock_run.return_value = _completed(0)
+            delegate_task(
+                tasks=[{"goal": "g0", "provider": "override-prov"}],
+                parent_agent=parent,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "override-prov")
+        # The override provider ('override-prov') differs from the parent's
+        # pool provider (openrouter) and has no pool of its own, so pool
+        # resolution must return None (no lease, no child._credential_pool).
+        self.assertIsNone(
+            _resolve_child_credential_pool(
+                "override-prov", parent, "https://override-prov.example/v1"
+            )
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("hermes_cli.config.save_config")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_override_dispatch_never_writes_config(self, mock_resolve, mock_save, mock_cfg):
+        """Invariant: the per-task override path is read-only. If any code
+        tried to persist config it would blow up (save_config patched to
+        raise); we assert it is never even called."""
+        mock_save.side_effect = AssertionError("override MUST NOT write config")
+        mock_resolve.side_effect = _fake_resolve
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "config-model",
+            "provider": "openrouter",
+        }
+        parent = _make_mock_parent()
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._run_single_child") as mock_run,
+        ):
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+            mock_run.return_value = _completed(0)
+            delegate_task(
+                tasks=[{"goal": "g0", "model": "override-model", "provider": "override-prov"}],
+                parent_agent=parent,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "override-model")
+        self.assertEqual(kwargs["provider"], "override-prov")
+        mock_save.assert_not_called()
 
 
 if __name__ == "__main__":

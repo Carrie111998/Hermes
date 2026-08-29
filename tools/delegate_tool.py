@@ -3861,6 +3861,38 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
+    # Per-dispatch model/provider override (#97653) — TWO-PASS RESOLUTION.
+    # Pass 1 resolves EVERY task's override creds BEFORE any child is
+    # constructed, so an invalid override on task N fails the whole dispatch
+    # with a clean tool_error naming that task WITHOUT having built (and
+    # orphaned) tasks 0..N-1. Constructing a child opens a dedicated
+    # SessionDB handle (#81267) and registers it on parent._active_children;
+    # a constructed-but-never-run child leaks both, so resolving all overrides
+    # first is required for failure isolation. Tasks with no override keep the
+    # batch-level `creds` (no redundant re-resolution).
+    # Never persisted: only _load_config (read-only) is consulted — there is
+    # no config write anywhere in this path.
+    resolved_task_creds: List[Dict[str, Any]] = []
+    for i, t in enumerate(task_list):
+        task_model_override = str(t.get("model") or "").strip() or None
+        task_provider_override = str(t.get("provider") or "").strip() or None
+        if task_model_override or task_provider_override:
+            per_task_cfg = dict(cfg)
+            if task_model_override:
+                per_task_cfg["model"] = task_model_override
+            if task_provider_override:
+                per_task_cfg["provider"] = task_provider_override
+            try:
+                resolved_task_creds.append(
+                    _resolve_delegation_credentials(per_task_cfg, parent_agent)
+                )
+            except Exception as exc:
+                return tool_error(f"Task {i} model/provider override failed: {exc}")
+        else:
+            # No override: keep the batch-level `creds` (no redundant
+            # re-resolution, and unprefixed tasks stay on the parent's path).
+            resolved_task_creds.append(creds)
+
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
@@ -3879,27 +3911,10 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
-        # Per-dispatch model/provider override (#97653): the per-task value
-        # beats delegation config, which itself beats parent inheritance.
-        # Resolve by merging the override into a copy of the delegation
-        # config and re-running the same runtime-provider resolution, so an
-        # invalid override fails THIS dispatch with a clear error. Never
-        # persisted: only _load_config (read-only) is consulted — there is no
-        # config write anywhere in this path. Tasks with no override keep the
-        # batch-level `creds` (no redundant re-resolution).
-        task_creds = creds
-        task_model_override = str(t.get("model") or "").strip() or None
-        task_provider_override = str(t.get("provider") or "").strip() or None
-        if task_model_override or task_provider_override:
-            per_task_cfg = dict(cfg)
-            if task_model_override:
-                per_task_cfg["model"] = task_model_override
-            if task_provider_override:
-                per_task_cfg["provider"] = task_provider_override
-            try:
-                task_creds = _resolve_delegation_credentials(per_task_cfg, parent_agent)
-            except ValueError as exc:
-                return tool_error(f"Task {i} model/provider override failed: {exc}")
+        # Resolved in pass 1 above (two-pass, so a later invalid override
+        # never orphans already-constructed children). Tasks with no override
+        # carry the batch-level `creds`.
+        task_creds = resolved_task_creds[i]
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
