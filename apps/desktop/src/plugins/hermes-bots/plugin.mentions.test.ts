@@ -253,11 +253,12 @@ describe('the mention middleware', () => {
     expect(hostMock.requestProfile).not.toHaveBeenCalled()
   })
 
-  it('hands the agent the connection-qualified message_agent target', async () => {
+  it('hands the agent a relay-resolvable connection-qualified message_agent target', async () => {
     const { handler } = await contributions()
     const result = await handler({ text: 'ping @default-vera' })
 
-    expect(result.text).toMatch(/message_agent target: "default-vera@vera"/)
+    expect(result.text).toMatch(/message_agent target: "default@vera"/)
+    expect(result.text).not.toMatch(/message_agent target: "default-vera@vera"/)
     expect(result.text).toMatch(/on Vera/)
   })
 

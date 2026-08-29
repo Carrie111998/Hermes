@@ -730,7 +730,9 @@ export default {
               botRosterMeta(bot, $botMeta.get())?.title || bot.ui_meta?.['hermes-bots']?.title || bot.title || ''
             ).trim()
 
-            const target = bot.remoteSource && bot.connectionId ? `${handle}@${bot.connectionId}` : handle
+            // A multi-source handle is a UI disambiguation alias. The relay
+            // resolves only the registered profile or relay handle.
+            const target = bot.remoteSource && bot.connectionId ? `${bot.name}@${bot.connectionId}` : handle
 
             const where = bot.remoteSource
               ? ` — on ${bot.connectionLabel || bot.connectionId} (message_agent target: "${target}")`
