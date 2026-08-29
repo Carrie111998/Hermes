@@ -2737,6 +2737,13 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # OAuth-authenticated dashboard subjects allowed to approve generated
+        # specialist promotion. Empty means fail closed. Subjects are exact
+        # ``<dashboard-auth-provider>:<user_id>`` values; a loopback session
+        # token never qualifies because it carries no human identity.
+        "specialist_operator_approvals": {
+            "allowed_subjects": [],
+        },
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
