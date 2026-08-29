@@ -2247,6 +2247,24 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
+    if agent.provider == "claude-agent-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://claude-agent"):
+        from agent.acp_subprocess_client import ACPSubprocessClient
+
+        # Resume an in-process ACP session across a client rebuild (a model
+        # switch that rebuilds agent.client) when a prior session id is known;
+        # otherwise a fresh session is started. No cross-restart persistence
+        # here — that is left to integrators.
+        client = ACPSubprocessClient(
+            resume_session_id=getattr(agent, "_acp_session_id", None),
+            **client_kwargs,
+        )
+        _ra().logger.info(
+            "Claude Agent ACP client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 

@@ -2338,13 +2338,15 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
+                # ACP subprocess clients (CopilotACPClient, ACPSubprocessClient)
+                # communicate over subprocess stdio and return a plain
+                # SimpleNamespace from the blocking completion path — not an
+                # iterable stream. Mirror the ACP exclusion used for the
+                # Responses API upgrade.
                 elif (
-                    agent.provider in {"copilot-acp"}
+                    agent.provider in {"copilot-acp", "claude-agent-acp"}
                     or str(agent.base_url or "").lower().startswith("acp://copilot")
+                    or str(agent.base_url or "").lower().startswith("acp://claude-agent")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
                 ):
                     _use_streaming = False

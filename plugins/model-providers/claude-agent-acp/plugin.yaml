@@ -1,0 +1,5 @@
+name: claude-agent-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Claude Code via the claude-agent-acp ACP subprocess (Claude Agent SDK)
+author: Hermes Agent
