@@ -217,6 +217,13 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     import cron.scheduler as scheduler
 
     events = []
+    delivered_jobs = []
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda job_id, *, source: {"id": "exec-3", "job_id": job_id, "source": source},
+        raising=False,
+    )
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
@@ -236,11 +243,16 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
         lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
-    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda job, *_args, **_kwargs: delivered_jobs.append(dict(job)),
+    )
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
-    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
+    assert scheduler.run_one_job({"id": "job-3"}) is True
     assert events[0] == ("running", "exec-3")
+    assert delivered_jobs[0]["execution_id"] == "exec-3"
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
 

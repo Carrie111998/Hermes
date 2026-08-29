@@ -367,6 +367,7 @@ class TestDeliverResultWrapping:
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
             job = {
                 "id": "test-job",
+                "execution_id": "test-run-123",
                 "name": "daily-report",
                 "deliver": "origin",
                 "origin": {"platform": "telegram", "chat_id": "123"},
@@ -376,7 +377,7 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
+        assert "```text\njob_id=test-job\nrun_id=test-run-123\n```" in sent_content
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
