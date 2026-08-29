@@ -646,9 +646,19 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       return
     }
 
-    stopScroll()
-    el.scrollTop = el.scrollHeight
-    loadSettledRef.current = false
+    // Same-load re-arm guard (#botchat-scroll-yank): when hasGroups flips
+    // empty→non-empty for the SAME sessionKey (a transiently-empty reconcile
+    // landing on an already-viewed transcript, or a tail refetch), the user's
+    // reading position is real and must survive — only a genuine session
+    // switch owns the position outright. Skip the unconditional
+    // stopScroll()+scrollTop pin for those re-arms.
+    const sameLoadReArm = settleKeyRef.current === sessionKey && loadSettledRef.current
+
+    if (!sameLoadReArm) {
+      stopScroll()
+      el.scrollTop = el.scrollHeight
+      loadSettledRef.current = false
+    }
 
     // An anchor captured for the OUTGOING transcript must not be applied to
     // this one — a switch owns the position outright. The empty→non-empty
@@ -656,6 +666,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     if (settleKeyRef.current !== sessionKey) {
       settleKeyRef.current = sessionKey
       restoreFromBottomRef.current = null
+    }
+
+    // Same-load re-arm (see guard above): the position is already settled and
+    // owned by the reader — do not run the frame loop that pins scrollTop to
+    // the bottom on every frame.
+    if (sameLoadReArm) {
+      return
     }
 
     let frame = 0
