@@ -108,6 +108,18 @@ class TestSharedConnection:
             b.close()
 
 
+def test_extract_entities_includes_single_word_proper_nouns(db_path):
+    """Ordinary single-token names must participate in entity retrieval."""
+    store = MemoryStore(db_path)
+    try:
+        assert store._extract_entities("Michael prefers dark roast coffee.") == ["Michael"]
+        assert store._extract_entities("Michael Jones prefers dark roast coffee.") == [
+            "Michael Jones"
+        ]
+    finally:
+        store.close()
+
+
 class TestCloseSemantics:
     def test_closing_one_instance_keeps_sibling_alive(self, db_path):
         a = MemoryStore(db_path)
@@ -224,4 +236,3 @@ class TestProviderShutdown:
 
         assert provider._store is None
         assert MemoryStore._shared == {}
-
