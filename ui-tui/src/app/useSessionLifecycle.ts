@@ -336,6 +336,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
           patchUiState({ status: 'setup required' })
 
+          if (recovering) {
+            gw.finishReconnectRecovery(id)
+          }
+
           return
         }
 
@@ -412,6 +416,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           .catch((e: Error) => {
             sys(`error: ${e.message}`)
             patchUiState({ status: 'ready' })
+          })
+          .finally(() => {
+            if (recovering) {
+              gw.finishReconnectRecovery(id)
+            }
           })
       })
     },

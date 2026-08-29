@@ -833,6 +833,10 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
+  finishReconnectRecovery(sessionId: string) {
+    this.flushReplayHold(sessionId)
+  }
+
   private flushReplayHold(sessionId: string) {
     const replayHold = this.replayHold
 

@@ -817,6 +817,83 @@ describe('GatewayClient websocket attach mode', () => {
     }
   })
 
+  it('releases sibling events when the focused recovery has no watermark', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const events: Array<{ seq?: number; session_id?: string; type: string }> = []
+
+    try {
+      gw.on('event', event => events.push(event as { seq?: number; session_id?: string; type: string }))
+      gw.on('exit', () => gw.start())
+      gw.start()
+
+      const first = FakeWebSocket.instances[0]!
+
+      first.open()
+      gw.drain()
+      await Promise.resolve()
+      first.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { replay_epoch: 'epoch-1' }, type: 'gateway.ready' }
+        })
+      )
+      first.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: {}, seq: 1, session_id: 'sibling', type: 'message.start' }
+        })
+      )
+      first.close(1006)
+
+      const second = FakeWebSocket.instances[1]!
+
+      second.open()
+      second.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { replay_epoch: 'epoch-1' }, type: 'gateway.ready' }
+        })
+      )
+
+      expect(gw.hasReplayWatermark('focused')).toBe(false)
+
+      const resume = gw.request('session.resume', { session_id: 'focused' })
+
+      await vi.waitFor(() => expect(second.sent.some(raw => JSON.parse(raw).method === 'session.resume')).toBe(true))
+      const resumeFrame = second.sent.map(raw => JSON.parse(raw)).find(frame => frame.method === 'session.resume')!
+
+      second.message(JSON.stringify({ id: resumeFrame.id, jsonrpc: '2.0', result: { session_id: 'focused' } }))
+      await resume
+      second.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { text: 'parked' }, seq: 2, session_id: 'sibling', type: 'message.delta' }
+        })
+      )
+
+      expect(events.filter(event => event.session_id === 'sibling' && event.seq === 2)).toHaveLength(0)
+      gw.finishReconnectRecovery('focused')
+
+      second.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { payload: { text: 'live' }, seq: 3, session_id: 'sibling', type: 'message.complete' }
+        })
+      )
+
+      expect(events.filter(event => event.session_id === 'sibling' && event.seq === 2)).toHaveLength(1)
+      expect(events.filter(event => event.session_id === 'sibling' && event.seq === 3)).toHaveLength(1)
+    } finally {
+      gw.kill()
+    }
+  })
+
   it('does not auto-reconnect after an intentional kill() (issue #32997)', async () => {
     vi.useFakeTimers()
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
