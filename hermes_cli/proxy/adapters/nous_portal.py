@@ -14,6 +14,7 @@ from typing import Any, Dict, FrozenSet, Optional
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_NOUS_INFERENCE_URL,
+    get_provider_auth_state,
     _load_auth_store,
     _auth_store_lock,
     _is_terminal_nous_refresh_error,
@@ -161,13 +162,10 @@ class NousPortalAdapter(UpstreamAdapter):
 
     def _read_state(self) -> Optional[Dict[str, Any]]:
         try:
-            with _auth_store_lock():
-                store = _load_auth_store()
+            state = get_provider_auth_state("nous")
         except Exception as exc:
-            logger.warning("proxy: failed to load auth store: %s", exc)
+            logger.warning("proxy: failed to resolve Nous auth state: %s", exc)
             return None
-        providers = store.get("providers") or {}
-        state = providers.get("nous")
         if not isinstance(state, dict):
             return None
         return dict(state)  # copy so the refresh helper can mutate freely
