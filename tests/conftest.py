@@ -564,6 +564,31 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
 
 
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with an empty kanban DB.
+
+    Creates a per-test tempdir, sets HERMES_HOME + Path.home() to point
+    under it, and initializes a fresh kanban DB. The autouse
+    ``_hermetic_environment`` fixture already clears all
+    ``HERMES_KANBAN_*`` env vars (including ``HERMES_KANBAN_DB`` which
+    the dispatcher injects into worker env, and which ``kanban_db_path()``
+    checks *before* HERMES_HOME), so ``connect()`` resolves to the
+    tempdir's ``kanban.db``. ``init_db()`` creates the schema.
+
+    Tests that need custom settings (e.g. ``HERMES_KANBAN_CRASH_GRACE_SECONDS``)
+    override this fixture locally, calling the shared one and adding
+    their extras on top.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb.init_db()
+    return home
+
+
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
 @pytest.fixture(autouse=True)

@@ -33,7 +33,7 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None):
 
 def test_specify_promotes_triage_to_todo(kanban_home):
     with kb.connect() as conn:
-        tid = _create_triage(conn, title="rough idea")
+        tid = _create_triage(conn, title="rough idea", assignee="worker")
         assert kb.get_task(conn, tid).status == "triage"
     with kb.connect() as conn:
         ok = kb.specify_triage_task(

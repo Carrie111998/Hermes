@@ -70,7 +70,7 @@ def _patch_aux_client(content: str, *, model: str = "test-model"):
 
 def test_specify_task_happy_path(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rough", triage=True)
+        tid = kb.create_task(conn, title="rough", triage=True, assignee="worker")
 
     content = jsonlib.dumps({
         "title": "Refined rough",
@@ -113,9 +113,9 @@ def _run_cli(*argv: str) -> int:
 
 def test_cli_specify_tenant_filter(kanban_home, capsys):
     with kb.connect() as conn:
-        outside = kb.create_task(conn, title="outside", triage=True)
+        outside = kb.create_task(conn, title="outside", triage=True, assignee="worker")
         inside = kb.create_task(
-            conn, title="inside", triage=True, tenant="proj-a",
+            conn, title="inside", triage=True, tenant="proj-a", assignee="worker",
         )
 
     content = jsonlib.dumps({"title": "spec", "body": "body"})

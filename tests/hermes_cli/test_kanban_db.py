@@ -579,7 +579,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="render chart")
+        t = kb.create_task(conn, title="render chart", assignee="worker")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -631,10 +631,10 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     child_dir = tmp_path / "persistent-child"
     child_dir.mkdir()
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="scratch parent")
+        parent = kb.create_task(conn, title="scratch parent", assignee="worker")
         child = kb.create_task(
             conn, title="dir child", workspace_kind="dir",
-            workspace_path=str(child_dir),
+            workspace_path=str(child_dir), assignee="worker",
         )
         kb.link_tasks(conn, parent, child)
         p_task = kb.get_task(conn, parent)
@@ -1052,15 +1052,15 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     """
     with kb.connect() as conn:
         # A is done.
-        a = kb.create_task(conn, title="parent-done")
+        a = kb.create_task(conn, title="parent-done", assignee="worker")
         kb.complete_task(conn, a)
 
         # C is running (not done) — blocks child B.
-        c = kb.create_task(conn, title="parent-running")
+        c = kb.create_task(conn, title="parent-running", assignee="worker")
         kb.claim_task(conn, c, claimer="worker:1")
 
         # B depends on both A (done) and C (running) → stays todo.
-        b = kb.create_task(conn, title="child", parents=[a, c])
+        b = kb.create_task(conn, title="child", parents=[a, c], assignee="worker")
         assert kb.get_task(conn, b).status == "todo"
 
         # Remove the blocking dependency C → B.

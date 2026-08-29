@@ -3166,6 +3166,26 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _kanban_default_assignee() -> Optional[str]:
+    """Read ``kanban.default_assignee`` from the active config (may be unset).
+
+    When set, the dispatcher auto-assigns unassigned ``ready`` tasks to this
+    profile on its next tick (#27145).  This means an unassigned card in
+    ``ready`` is *expected* and will be routed — there is no need to force
+    it to ``triage``.  When unset, an unassigned ``ready`` card would be
+    invisible to the dispatcher, so callers should force it to ``triage``
+    for the auto-decomposer to route instead.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _cfg = load_config_readonly()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        return (_kanban_cfg.get("default_assignee") or "").strip() or None
+    except Exception:
+        return None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3474,6 +3494,21 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
+                    # A card that would land in 'ready' with no assignee is
+                    # invisible to the dispatcher and sits idle forever
+                    # — but only when ``kanban.default_assignee`` is NOT
+                    # configured.  When it is set, the dispatcher's #27145
+                    # path auto-assigns unassigned ready tasks on its next
+                    # tick, so forcing triage here would bypass that feature
+                    # (#27145 regression).  When unset, force triage so the
+                    # auto-decomposer can route the card to the right profile
+                    # instead of letting it sit invisible.
+                    if (
+                        task_status == "ready"
+                        and not assignee
+                        and not _kanban_default_assignee()
+                    ):
+                        task_status = "triage"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -4552,10 +4587,16 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    # Read ``kanban.default_assignee`` once (#27145).  When set, unassigned
+    # ready cards are expected — the dispatcher auto-assigns them on its
+    # next tick — so we must NOT force triage here.  When unset, force
+    # unassigned ready cards to triage so they're not invisible to the
+    # dispatcher (matches the same guard in ``create_task``).
+    _has_default_assignee = bool(_kanban_default_assignee())
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4592,6 +4633,22 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
+                # Unassigned card without a default_assignee: lock to
+                # triage so the auto-decomposer can route it instead of
+                # landing it in ready where it would be invisible (#27145
+                # compatibility — see ``create_task`` for the same guard).
+                # When ``kanban.default_assignee`` IS set, the dispatcher
+                # auto-assigns on its next tick, so let it go to ready.
+                row_assignee = row["assignee"]
+                if (not row_assignee) and not _has_default_assignee:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'triage' "
+                        "WHERE id = ? AND status IN ('todo', 'blocked')",
+                        (task_id,),
+                    )
+                    _append_event(conn, task_id, "forced_triage", None)
+                    continue
+                if cur_status == "blocked":
                     conn.execute(
                         "UPDATE tasks SET status = ? "
                         "WHERE id = ? AND status = 'blocked'",
@@ -6799,7 +6856,7 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -6809,6 +6866,19 @@ def promote_task(
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
+        )
+
+    # Guard: don't promote an unassigned card to ready when there's no
+    # ``kanban.default_assignee`` — it would be invisible to the dispatcher.
+    # Match the create_task/recompute_ready guard so all three promotion
+    # paths are consistent.  ``--force`` overrides this (deliberate operator
+    # action, same audit trail).  When ``kanban.default_assignee`` IS set,
+    # the dispatcher picks it up on its next tick (#27145).
+    if not row["assignee"] and not _kanban_default_assignee() and not force:
+        return False, (
+            f"task {task_id} has no assignee and kanban.default_assignee "
+            f"is unset — it would be invisible in 'ready'. "
+            f"Assign it first, set kanban.default_assignee, or use --force."
         )
 
     if not force:
@@ -6930,6 +7000,18 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        # Unassigned card with no ``kanban.default_assignee`` and no open
+        # parents: don't land it in 'ready' where it would be invisible to
+        # the dispatcher — force triage instead.  This closes the same gap
+        # guarded in create_task / recompute_ready / promote_task.  When
+        # ``kanban.default_assignee`` IS set, the dispatcher auto-assigns
+        # on its next tick (#27145), so 'ready' is the right destination.
+        if new_status == "ready":
+            task_assignee = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task_assignee and not task_assignee["assignee"] and not _kanban_default_assignee():
+                new_status = "triage"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -7309,7 +7391,7 @@ def decompose_triage_task(
         {
             "title": "...",
             "body": "...",                     # optional
-            "assignee": "profile-name",        # optional, None -> default fallback
+            "assignee": "profile-name",        # required — null/blank raises ValueError
             "parents": [0, 2],                 # indices into this same children list
         }
 
@@ -7336,6 +7418,18 @@ def decompose_triage_task(
         title = child.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"child[{idx}].title is required")
+        # Defensive: a child task must NEVER reach the DB with a null
+        # assignee — the decomposer normalizes upstream, but we guard
+        # here too so a direct caller bypassing decompose_task() can't
+        # create an unassigned ready card.
+        assignee_val = child.get("assignee")
+        if not assignee_val or (
+            isinstance(assignee_val, str) and not assignee_val.strip()
+        ):
+            raise ValueError(
+                f"child[{idx}].assignee is required — pass a valid profile "
+                "name or the default_assignee; null is not accepted"
+            )
         parents_idx = child.get("parents") or []
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")

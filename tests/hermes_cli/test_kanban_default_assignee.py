@@ -19,6 +19,16 @@ def isolated_kanban_home(monkeypatch):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
+    # Write a config.yaml with kanban.default_assignee set so that
+    # ``create_task`` allows unassigned cards to land in 'ready' (the
+    # dispatcher auto-assigns on its next tick — #27145).  Without this,
+    # the create-time guard would force unassigned cards to triage and
+    # the dispatcher would never see them.
+    import pathlib
+
+    (pathlib.Path(test_home) / "config.yaml").write_text(
+        "kanban:\n  default_assignee: default\n"
+    )
     # Force-reimport so the fresh HERMES_HOME is picked up.
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
@@ -28,6 +38,9 @@ def isolated_kanban_home(monkeypatch):
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
     # gives each test its own monkeypatched HERMES_HOME so no cross-test
     # contamination.
+    import shutil
+
+    shutil.rmtree(test_home, ignore_errors=True)
 
 
 def _fake_spawn(*args, **kwargs):

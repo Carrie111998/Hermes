@@ -89,9 +89,9 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
+        parent = kb.create_task(conn, title="parent", assignee="worker")
         children = [
-            kb.create_task(conn, title=f"c{i}", parents=[parent])
+            kb.create_task(conn, title=f"c{i}", parents=[parent], assignee="worker")
             for i in range(3)
         ]
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
