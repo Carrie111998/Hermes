@@ -53,10 +53,11 @@ dispatcher used to claim their task — even under unusual symlink or
 Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
-task_events.  The ``workspace_kind`` field decouples coordination from git
+task_events, notification subscriptions, and the persisted board-notifier
+edge state. The ``workspace_kind`` field decouples coordination from git
 worktrees so that research / ops / digital-twin workloads work alongside
-coding workloads.  See ``docs/hermes-kanban-v1-spec.pdf`` for the full
-design specification.
+coding workloads. See ``docs/hermes-kanban-v1-spec.pdf`` for the full design
+specification.
 
 Concurrency strategy: WAL mode + ``BEGIN IMMEDIATE`` for write
 transactions + compare-and-swap (CAS) updates on ``tasks.status`` and
@@ -103,6 +104,15 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+BOARD_INCOMPLETE_STATUSES = (
+    "triage",
+    "todo",
+    "scheduled",
+    "ready",
+    "running",
+    "blocked",
+    "review",
+)
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -2378,6 +2388,19 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Last observed incomplete-task count for an existing notification
+-- destination. A row is created on the first watcher tick as a baseline;
+-- only a later >0 -> 0 transition emits the aggregate board-complete ping.
+CREATE TABLE IF NOT EXISTS kanban_board_notify_state (
+    board_key          TEXT NOT NULL,
+    platform           TEXT NOT NULL,
+    chat_id            TEXT NOT NULL,
+    thread_id          TEXT NOT NULL DEFAULT '',
+    incomplete_count   INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (board_key, platform, chat_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2388,6 +2411,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_board_notify_state_board
+    ON kanban_board_notify_state(board_key);
 """
 
 
@@ -13077,6 +13102,99 @@ def count_notify_subs(
                 return 0
             raise
         return int(row[0]) if row else 0
+
+
+def claim_board_completion(
+    conn: sqlite3.Connection,
+    *,
+    board_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> tuple[bool, int]:
+    """Record a destination's board progress and claim a completion edge.
+
+    The first observation for a board/destination is a baseline and never
+    fires. Later observations fire only when the persisted incomplete count
+    was positive and the current count is zero. The read and update share one
+    ``BEGIN IMMEDIATE`` transaction so concurrent gateway watchers cannot both
+    claim the same completion edge.
+
+    Returns ``(claimed, previous_count)``. ``previous_count`` is useful to
+    rewind the edge when the eventual outbound send fails.
+    """
+    board_key = str(board_key or "").strip()
+    platform = str(platform or "").strip().lower()
+    chat_id = str(chat_id or "")
+    thread_id = str(thread_id or "")
+    now = int(time.time())
+    with write_txn(conn):
+        count_row = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status IN "
+            "(?, ?, ?, ?, ?, ?, ?)",
+            BOARD_INCOMPLETE_STATUSES,
+        ).fetchone()
+        incomplete_count = int(count_row[0] if count_row else 0)
+        state = conn.execute(
+            "SELECT incomplete_count FROM kanban_board_notify_state "
+            "WHERE board_key = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (board_key, platform, chat_id, thread_id),
+        ).fetchone()
+        if state is None:
+            conn.execute(
+                "INSERT INTO kanban_board_notify_state "
+                "(board_key, platform, chat_id, thread_id, incomplete_count, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (board_key, platform, chat_id, thread_id, incomplete_count, now),
+            )
+            return False, incomplete_count
+        previous_count = int(state["incomplete_count"])
+        claimed = previous_count > 0 and incomplete_count == 0
+        if previous_count == incomplete_count:
+            return False, previous_count
+        conn.execute(
+            "UPDATE kanban_board_notify_state SET incomplete_count = ?, updated_at = ? "
+            "WHERE board_key = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (incomplete_count, now, board_key, platform, chat_id, thread_id),
+        )
+        return claimed, previous_count
+
+
+def rewind_board_completion(
+    conn: sqlite3.Connection,
+    *,
+    board_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    previous_count: int,
+) -> bool:
+    """Restore a claimed board edge when its outbound delivery fails.
+
+    The compare-and-swap guard avoids overwriting a later observation from a
+    different watcher or from a task being reopened while the send was in
+    flight.
+    """
+    board_key = str(board_key or "").strip()
+    platform = str(platform or "").strip().lower()
+    chat_id = str(chat_id or "")
+    thread_id = str(thread_id or "")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_board_notify_state "
+            "SET incomplete_count = ?, updated_at = ? "
+            "WHERE board_key = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND incomplete_count = 0",
+            (
+                max(1, int(previous_count)),
+                int(time.time()),
+                board_key,
+                platform,
+                chat_id,
+                thread_id,
+            ),
+        )
+    return cur.rowcount > 0
 
 
 def remove_notify_sub(

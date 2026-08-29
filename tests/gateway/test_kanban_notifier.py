@@ -55,6 +55,12 @@ def _make_runner(adapter):
     return runner
 
 
+def _make_discord_runner(adapter):
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    return runner
+
+
 def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:
@@ -622,3 +628,134 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_discord_notifier_mentions_subscription_user_for_issue_event(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "discord-issue-mention.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    user_id = "450680409500680193"
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="needs operator", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="discord-chat",
+            thread_id="discord-thread",
+            user_id=user_id,
+        )
+        kb.block_task(conn, task_id, reason="needs credentials", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_discord_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"].startswith(f"<@{user_id}> ")
+
+
+def test_discord_notifier_delivers_issue_without_missing_user_mention(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "discord-missing-user-mention.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="missing requester", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="discord-chat",
+            thread_id="discord-thread",
+        )
+        kb.block_task(conn, task_id, reason="needs credentials", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_discord_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "<@" not in adapter.sent[0]["text"]
+    assert "blocked" in adapter.sent[0]["text"]
+
+
+def test_discord_notifier_mentions_dedicated_destination_once_on_board_completion(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "discord-board-complete.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    user_id = "450680409500680193"
+    conn = kb.connect()
+    try:
+        task_ids = [
+            kb.create_task(conn, title="slice one", assignee="worker"),
+            kb.create_task(conn, title="slice two", assignee="worker"),
+            kb.create_task(conn, title="slice three", assignee="worker"),
+        ]
+        for task_id in task_ids[:2]:
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="discord",
+                chat_id="shared-chat",
+                thread_id="shared-thread",
+                user_id=user_id,
+            )
+        kb.add_notify_sub(
+            conn,
+            task_id=task_ids[2],
+            platform="discord",
+            chat_id="shared-chat",
+            thread_id="shared-thread",
+            user_id=user_id,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_discord_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent == []
+
+    conn = kb.connect()
+    try:
+        for task_id in task_ids:
+            assert kb.complete_task(conn, task_id, summary="slice done")
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_discord_runner(adapter)))
+
+    complete_messages = [
+        delivery for delivery in adapter.sent
+        if "project complete" in delivery["text"].lower()
+    ]
+    assert [delivery["chat_id"] for delivery in complete_messages] == ["shared-chat"]
+    assert [delivery["metadata"]["thread_id"] for delivery in complete_messages] == [
+        "shared-thread"
+    ]
+    assert all(
+        delivery["text"].startswith(f"<@{user_id}> ")
+        for delivery in complete_messages
+    )
+    assert sum(f"<@{user_id}>" in delivery["text"] for delivery in adapter.sent) == 1
+
+    # A fresh watcher must observe the persisted completed-board state rather
+    # than paging the same destinations again.
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_discord_runner(adapter)))
+    assert len([
+        delivery for delivery in adapter.sent
+        if "project complete" in delivery["text"].lower()
+    ]) == 1

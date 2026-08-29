@@ -24,6 +24,27 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+_DISCORD_ISSUE_KINDS = frozenset({
+    "blocked",
+    "gave_up",
+    "crashed",
+    "timed_out",
+    "block_loop_detected",
+})
+
+
+def _discord_user_mention(platform: str, user_id: Any) -> str:
+    """Return a safe Discord user mention, or no ping when unavailable."""
+    value = str(user_id or "").strip()
+    if (
+        platform != "discord"
+        or not value
+        or not value.isascii()
+        or not all(char.isalnum() or char in "-_" for char in value)
+    ):
+        return ""
+    return f"<@{value}> "
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -183,12 +204,15 @@ class GatewayKanbanWatchersMixin:
         stored cursor with kind in the terminal set (``completed``,
         ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
         ``review_requested``, ``block_loop_detected``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. The subscription is removed only when the
-        task is ``archived``. A ``done`` task can be reopened for review or
-        continuation, so its subscription and origin-session ownership must
-        survive completion. Cursor advancement prevents old events replaying
-        when that happens.
+        message per new event to ``(platform, chat_id, thread_id)``, adding a
+        fail-closed Discord user mention only for issue kinds. A separate
+        aggregate message is emitted when the board's incomplete count crosses
+        from positive to zero; its persisted edge state prevents a restart
+        from re-paging an already-complete board. The subscription is removed
+        only when the task is ``archived``. A ``done`` task can be reopened for
+        review or continuation, so its subscription and origin-session
+        ownership must survive completion. Cursor advancement prevents old
+        events replaying when that happens.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -414,6 +438,7 @@ class GatewayKanbanWatchersMixin:
                             )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
+                            board_destinations: dict[tuple[str, str, str], dict] = {}
                             for sub in subs:
                                 try:
                                     owner_profile = sub.get("notifier_profile") or None
@@ -432,6 +457,43 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    # A board-complete notification is an
+                                    # aggregate board message, not another
+                                    # per-card notification. Discord boards
+                                    # have one dedicated thread, so collapse
+                                    # all Discord card subscriptions to one
+                                    # representative destination. Other
+                                    # platforms retain their existing
+                                    # destination granularity.
+                                    destination_key = (
+                                        platform,
+                                        "__board__" if platform == "discord" else str(
+                                            sub.get("chat_id") or ""
+                                        ),
+                                        "" if platform == "discord" else str(
+                                            sub.get("thread_id") or ""
+                                        ),
+                                    )
+                                    existing_destination = board_destinations.get(destination_key)
+                                    current_mention = _discord_user_mention(
+                                        platform, sub.get("user_id")
+                                    )
+                                    existing_mention = _discord_user_mention(
+                                        platform,
+                                        existing_destination.get("user_id")
+                                        if existing_destination
+                                        else None,
+                                    )
+                                    if (
+                                        existing_destination is None
+                                        or (
+                                            (existing_destination.get("delivery_mode") or "notify")
+                                            == "wake"
+                                            and (sub.get("delivery_mode") or "notify") != "wake"
+                                        )
+                                        or (not existing_mention and current_mention)
+                                    ):
+                                        board_destinations[destination_key] = sub
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
@@ -463,6 +525,28 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: subscription for %s on board %s failed: %s",
                                         sub.get("task_id"), slug, sub_exc,
                                     )
+                            for destination_sub in board_destinations.values():
+                                try:
+                                    board_complete, previous_count = _kb.claim_board_completion(
+                                        conn,
+                                        board_key=slug,
+                                        platform=destination_sub["platform"],
+                                        chat_id=destination_sub["chat_id"],
+                                        thread_id=destination_sub.get("thread_id") or "",
+                                    )
+                                    if board_complete:
+                                        deliveries.append({
+                                            "sub": destination_sub,
+                                            "board": slug,
+                                            "board_completion": True,
+                                            "previous_incomplete_count": previous_count,
+                                        })
+                                except Exception as board_exc:
+                                    logger.warning(
+                                        "kanban notifier: board completion check failed "
+                                        "for %s on board %s: %s",
+                                        destination_sub.get("platform"), slug, board_exc,
+                                    )
                         finally:
                             conn.close()
                     return deliveries
@@ -470,8 +554,101 @@ class GatewayKanbanWatchersMixin:
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
-                    task = d["task"]
                     board_slug = d.get("board")
+                    if d.get("board_completion"):
+                        platform_str = (sub.get("platform") or "").lower()
+                        try:
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            await asyncio.to_thread(
+                                self._kanban_board_rewind,
+                                sub,
+                                d["previous_incomplete_count"],
+                                board_slug,
+                            )
+                            continue
+                        sub_profile = sub.get("notifier_profile") or ""
+                        adapter = self._authorization_adapter(plat, sub_profile or None)
+                        if adapter is None:
+                            logger.debug(
+                                "kanban notifier: adapter %s disconnected before board completion delivery; rewinding",
+                                platform_str,
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_board_rewind,
+                                sub,
+                                d["previous_incomplete_count"],
+                                board_slug,
+                            )
+                            continue
+                        if (sub.get("delivery_mode") or "notify") == "wake":
+                            # Preserve wake-only semantics: the board edge is
+                            # recorded, but no visible text ping is emitted.
+                            continue
+                        from gateway.wake import adapter_supports_push
+                        if not adapter_supports_push(adapter):
+                            # A non-push adapter has no channel for an
+                            # aggregate board message. Task events have a
+                            # dedicated wake path; this aggregate does not.
+                            continue
+                        delivery_metadata = sub.get("delivery_metadata")
+                        metadata: dict[str, Any] = (
+                            dict(delivery_metadata)
+                            if isinstance(delivery_metadata, dict)
+                            else {}
+                        )
+                        if sub.get("thread_id") and not metadata.get("thread_id"):
+                            metadata["thread_id"] = sub["thread_id"]
+                        mention = _discord_user_mention(
+                            platform_str, sub.get("user_id")
+                        )
+                        board_tag = f"[{board_slug}] " if board_slug else ""
+                        msg = (
+                            f"{mention}🎉 {board_tag}Kanban project complete "
+                            "— all tasks are done"
+                        )
+                        sub_key = (
+                            sub["task_id"],
+                            sub["platform"],
+                            sub["chat_id"],
+                            sub.get("thread_id") or "",
+                        )
+                        try:
+                            _send_res = await adapter.send(
+                                sub["chat_id"], msg, metadata=metadata,
+                            )
+                            if getattr(_send_res, "success", True) is False:
+                                raise RuntimeError(
+                                    "adapter send() reported failure: "
+                                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                )
+                            sub_fail_counts.pop(sub_key, None)
+                            logger.debug(
+                                "kanban notifier: delivered board completion for %s/%s on board %s",
+                                platform_str, sub["chat_id"], board_slug,
+                            )
+                        except Exception as exc:
+                            fails = sub_fail_counts.get(sub_key, 0) + 1
+                            sub_fail_counts[sub_key] = fails
+                            logger.warning(
+                                "kanban notifier: board completion send failed for %s "
+                                "on %s (attempt %d/%d): %s",
+                                sub["chat_id"], platform_str, fails,
+                                MAX_SEND_FAILURES, exc,
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_board_rewind,
+                                sub,
+                                d["previous_incomplete_count"],
+                                board_slug,
+                            )
+                            if fails >= MAX_SEND_FAILURES:
+                                await asyncio.to_thread(
+                                    self._kanban_unsub, sub, board_slug,
+                                )
+                                sub_fail_counts.pop(sub_key, None)
+                        continue
+                    task = d["task"]
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -624,6 +801,10 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+                        if platform_str == "discord" and kind in _DISCORD_ISSUE_KINDS:
+                            msg = _discord_user_mention(
+                                platform_str, sub.get("user_id")
+                            ) + msg
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
@@ -1066,6 +1247,27 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_board_rewind(
+        self,
+        sub: dict,
+        previous_count: int,
+        board: Optional[str] = None,
+    ) -> None:
+        """Sync helper: undo a claimed board-completion edge after send failure."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.rewind_board_completion(
+                conn,
+                board_key=board or _kb.DEFAULT_BOARD,
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                previous_count=previous_count,
             )
         finally:
             conn.close()
