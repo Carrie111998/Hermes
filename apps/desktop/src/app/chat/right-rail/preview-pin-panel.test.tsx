@@ -13,6 +13,25 @@ import { $composerAttachments } from '@/store/composer'
 
 import { PreviewPinPanel } from './preview-pin-panel'
 
+const auxiliary = vi.fn(() => false)
+const relay = vi.fn((_attachment: unknown) => true)
+const notified: { kind?: string; title?: string }[] = []
+
+vi.mock('@/store/windows', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  isAuxiliaryWindow: () => auxiliary()
+}))
+
+vi.mock('@/store/composer-relay', () => ({ relayComposerAttachment: (a: unknown) => relay(a) }))
+
+vi.mock('@/store/notifications', () => ({
+  notify: (input: { kind?: string; title?: string }) => {
+    notified.push(input)
+
+    return 'id'
+  }
+}))
+
 const HOME = 'http://localhost:5178/en/index.html'
 const ABOUT = 'http://localhost:5178/en/about.html'
 
@@ -112,6 +131,9 @@ beforeEach(() => {
   page.pins = {}
   page.url = HOME
   $composerAttachments.set([])
+  auxiliary.mockReturnValue(false)
+  relay.mockReturnValue(true)
+  notified.length = 0
 })
 
 afterEach(() => {
@@ -193,6 +215,45 @@ describe('a review across pages', () => {
     // request, not two.
     expect(attachment.detail).toContain('hero')
     expect(attachment.detail).toContain('team photo')
+  })
+
+  it('hands the chip to the window that owns the composer', async () => {
+    // A popped-out Browser window has no composer of its own: adding there is a
+    // click into a void, which is exactly how this was reported.
+    auxiliary.mockReturnValue(true)
+    page.pins[HOME] = [pin(HOME, 'hero')]
+    render(<PreviewPinPanel open url={HOME} />)
+    await waitFor(() => expect(screen.getAllByText('hero').length).toBeGreaterThan(0))
+
+    screen.getByText('Attach to chat').click()
+
+    await waitFor(() => expect(relay).toHaveBeenCalled())
+    expect($composerAttachments.get()).toHaveLength(0)
+    await waitFor(() => expect(notified.at(-1)?.kind).toBe('success'))
+  })
+
+  it('says so when there is nowhere to put it', async () => {
+    auxiliary.mockReturnValue(true)
+    relay.mockReturnValue(false)
+    page.pins[HOME] = [pin(HOME, 'hero')]
+    render(<PreviewPinPanel open url={HOME} />)
+    await waitFor(() => expect(screen.getAllByText('hero').length).toBeGreaterThan(0))
+
+    screen.getByText('Attach to chat').click()
+
+    // Silence is what made the bug invisible; an error is the minimum.
+    await waitFor(() => expect(notified.at(-1)?.kind).toBe('error'))
+  })
+
+  it('confirms out loud when it did land, since the composer may be off-screen', async () => {
+    page.pins[HOME] = [pin(HOME, 'hero')]
+    render(<PreviewPinPanel open url={HOME} />)
+    await waitFor(() => expect(screen.getAllByText('hero').length).toBeGreaterThan(0))
+
+    screen.getByText('Attach to chat').click()
+
+    await waitFor(() => expect($composerAttachments.get()).toHaveLength(1))
+    await waitFor(() => expect(notified.at(-1)?.title).toBe('Added to chat'))
   })
 
   it('can still attach from a page that has nothing on it', async () => {

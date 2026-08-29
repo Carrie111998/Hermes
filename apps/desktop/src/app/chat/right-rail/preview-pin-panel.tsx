@@ -21,6 +21,9 @@ import { allPins, mergeReport, otherPages, type PinBook, pinsForPage } from '@/l
 import type { PreviewPin } from '@/lib/preview-pins/types'
 import { cn } from '@/lib/utils'
 import { addComposerAttachment, createComposerAttachmentOccurrenceId } from '@/store/composer'
+import { relayComposerAttachment } from '@/store/composer-relay'
+import { notify } from '@/store/notifications'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 import {
   armPins,
@@ -137,7 +140,26 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
 
     if (!sending.length) {return}
 
-    addComposerAttachment({
+    let delivered = 0
+
+    /**
+     * Put the chip where the composer actually is.
+     *
+     * A popped-out Browser window has no composer, so adding to its own store
+     * was a click that succeeded into a void — the reported "nothing happens".
+     */
+    const deliver = (attachment: Parameters<typeof addComposerAttachment>[0]) => {
+      if (isAuxiliaryWindow()) {
+        if (relayComposerAttachment(attachment)) {delivered += 1}
+
+        return
+      }
+
+      addComposerAttachment(attachment)
+      delivered += 1
+    }
+
+    deliver({
       detail: JSON.stringify(sending),
       // Derived from the pins alone: once a batch spans pages, no single url
       // identifies it.
@@ -165,7 +187,7 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
 
         if (!path) {continue}
 
-        addComposerAttachment({
+        deliver({
           detail: path,
           id: `pin-image:${shot.id}`,
           kind: 'image',
@@ -181,6 +203,23 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
         continue
       }
     }
+
+    // Say so either way. The chip lands in a composer that may be scrolled out
+    // of sight or in another window entirely, and a button that looks inert is
+    // exactly how this was reported.
+    notify(
+      delivered
+        ? {
+            kind: 'success',
+            message: `${sending.length} comment${sending.length === 1 ? '' : 's'} ready in the composer`,
+            title: 'Added to chat'
+          }
+        : {
+            kind: 'error',
+            message: 'No composer window is open to receive them.',
+            title: 'Could not add to chat'
+          }
+    )
   }
 
   const clearEverything = async () => {
