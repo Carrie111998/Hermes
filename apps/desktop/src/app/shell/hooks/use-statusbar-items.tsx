@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { revealFileInTree } from '@/store/layout'
+import { openBrowserTab } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree, projectNameForCwd } from '@/store/projects'
 import {
@@ -599,6 +600,21 @@ export function useStatusbarItems({
         onSelect: () => togglePaneVisible('terminal'),
         title: terminalShowing ? copy.hideTerminal : copy.showTerminal,
         toggleLabel: copy.toggleTerminal,
+        variant: 'action'
+      },
+      // The Browser had a keybind and a ⌘K row and no button anywhere, so the
+      // only discoverable way in was to ask the agent to open it. Same door the
+      // terminal gets, next to it — and carrying `actionId`, so the tooltip
+      // teaches ⌘⇧L rather than hiding it.
+      {
+        actionId: 'view.showBrowser',
+        className: 'w-7 justify-center px-0',
+        hidden: !chatOpen,
+        icon: <Globe className="size-3.5" />,
+        id: 'browser',
+        onSelect: () => openBrowserTab(),
+        title: copy.showBrowser,
+        toggleLabel: copy.toggleBrowser,
         variant: 'action'
       },
       clientVersionItem,

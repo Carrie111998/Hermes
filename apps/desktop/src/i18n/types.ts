@@ -2461,6 +2461,7 @@ export interface Translations {
       openCommandCenter: string
       showTerminal: string
       hideTerminal: string
+      showBrowser: string
       gateway: string
       gatewayReady: string
       gatewayNeedsSetup: string
@@ -2479,6 +2480,7 @@ export interface Translations {
       toggleContextUsage: string
       toggleRunningTimer: string
       toggleSessionTimer: string
+      toggleBrowser: string
       toggleTerminal: string
       toggleVersion: string
       toggleWorkspace: string

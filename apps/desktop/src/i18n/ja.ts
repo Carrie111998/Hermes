@@ -2536,6 +2536,7 @@ export const ja = defineLocale({
       closeCommandCenter: 'コマンドセンターを閉じる',
       openCommandCenter: 'コマンドセンターを開く',
       showTerminal: 'ターミナルを表示',
+      showBrowser: 'ブラウザを開く',
       hideTerminal: 'ターミナルを非表示',
       gateway: 'ゲートウェイ',
       gatewayReady: '準備完了',
