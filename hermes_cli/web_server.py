@@ -114,7 +114,7 @@ try:
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, SecretStr, field_validator
     from starlette.concurrency import run_in_threadpool
@@ -130,7 +130,7 @@ except ImportError:
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, SecretStr, field_validator
         from starlette.concurrency import run_in_threadpool
@@ -18051,6 +18051,13 @@ def mount_spa(application: FastAPI):
         )
 
         @application.get("/spectator")
+        async def redirect_spectator_to_directory(request: Request):
+            # The Vite bundle uses relative `./assets/...` URLs. Without the
+            # directory slash, browsers resolve them against `/` and paint a
+            # blank page after every script 404s at `/assets/...`.
+            prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+            return RedirectResponse(url=f"{prefix}/spectator/", status_code=307)
+
         @application.get("/spectator/")
         async def serve_spectator(request: Request):
             prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))

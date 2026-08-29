@@ -5186,6 +5186,20 @@ class TestHashedAssetCacheHeaders:
         assert "window.__HERMES_SPECTATOR_TOKEN__=" in resp.text
         assert "window.__HERMES_SESSION_TOKEN__=" not in resp.text
 
+    def test_slashless_spectator_redirects_so_relative_assets_stay_in_scope(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/spectator", follow_redirects=False)
+        assert resp.status_code == 307
+        assert resp.headers["location"] == "/spectator/"
+
+        prefixed = client.get(
+            "/spectator",
+            headers={"X-Forwarded-Prefix": "/hermes"},
+            follow_redirects=False,
+        )
+        assert prefixed.status_code == 307
+        assert prefixed.headers["location"] == "/hermes/spectator/"
+
     def test_spectator_prefix_separates_api_and_static_scopes(self, tmp_path, monkeypatch):
         client = self._client(tmp_path, monkeypatch)
         resp = client.get("/spectator/", headers={"X-Forwarded-Prefix": "/hermes"})
