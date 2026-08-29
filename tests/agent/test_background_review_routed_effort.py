@@ -40,6 +40,14 @@ class _StubAgent:
     def _safe_print(self, *a, **k):
         pass
 
+    # No-op seams so future fork-path changes (activity tracking, progress
+    # reporting) fail assertions on behavior instead of AttributeError.
+    def _touch_activity(self, *a, **k):
+        pass
+
+    def tool_progress_callback(self, *a, **k):
+        pass
+
     _memory_store = None
     _memory_enabled = False
     _session_db = None
@@ -142,7 +150,9 @@ def test_routed_review_invalid_effort_ignored_with_warning(monkeypatch, caplog):
             {"reasoning_effort": "ludicrous"},
         )
     assert "reasoning_config" not in captured
-    assert "not a valid level" in caplog.text
+    # Assert on the invalid value, not the warning's exact wording, so a
+    # message edit can't break this test for a cosmetic reason.
+    assert "ludicrous" in caplog.text
 
 
 def test_same_model_review_still_inherits_parent_config(monkeypatch):

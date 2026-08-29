@@ -27,6 +27,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
+from hermes_constants import parse_reasoning_effort
 
 logger = logging.getLogger(__name__)
 
@@ -1262,10 +1263,12 @@ def _run_review_in_thread(
                 # over provider defaults (#94825), same wire contract as
                 # every other auxiliary task (_get_task_extra_body folds the
                 # same key into extra_body.reasoning there).
-                _routed_effort = task_cfg.get("reasoning_effort") if task_cfg else None
+                _routed_effort = (
+                    task_cfg.get("reasoning_effort")
+                    if isinstance(task_cfg, dict)
+                    else None
+                )
                 if _routed_effort is not None and _routed_effort != "":
-                    from hermes_constants import parse_reasoning_effort
-
                     _parsed = parse_reasoning_effort(_routed_effort)
                     if _parsed is not None:
                         _fork_kwargs["reasoning_config"] = _parsed
