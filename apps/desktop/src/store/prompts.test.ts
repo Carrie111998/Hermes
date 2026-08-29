@@ -6,6 +6,7 @@ import {
   $approvalRequest,
   $secretRequest,
   $sudoRequest,
+  approvalOwnerRouteFromEvent,
   clearAllPrompts,
   clearApprovalRequest,
   clearSecretRequest,
@@ -31,6 +32,14 @@ afterEach(() => {
 })
 
 describe('approval prompt store', () => {
+  it('captures an exact owner only from a connection-tagged approval event', () => {
+    expect(approvalOwnerRouteFromEvent({ connectionId: 'local', profile: 'default' })).toEqual({
+      connectionId: 'local',
+      profile: 'default'
+    })
+    expect(approvalOwnerRouteFromEvent({ profile: 'default' })).toBeUndefined()
+  })
+
   it('holds the active session-keyed approval request', () => {
     setApprovalRequest({ command: 'rm -rf /tmp/x', description: 'recursive delete', sessionId: 's1' })
 

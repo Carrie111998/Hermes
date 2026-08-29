@@ -2,6 +2,8 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { $clarifyRequest, $clarifyRequests } from './clarify'
 import { $activeSessionId } from './session'
+import { requestForSessionProfile, type SessionOwnerRoute } from './session-request-router'
+import { requestForOwnedSession } from './session-states'
 
 // Blocking interactive prompts the gateway raises mid-turn. Each maps to a
 // `*.request` event the Python side emits while it blocks the agent thread
@@ -76,12 +78,19 @@ export interface ApprovalRequest extends KeyedPrompt {
   choices?: string[]
   command: string
   description: string
+  /** Exact registry route that delivered this approval request. */
+  ownerRoute?: SessionOwnerRoute
   requestId?: string
   smartDenied?: boolean
 }
 
 interface ApprovalGateway {
-  request: (method: string, params: Record<string, unknown>) => Promise<unknown>
+  request: (
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ) => Promise<unknown>
 }
 
 interface PendingApprovalPayload {
@@ -115,6 +124,66 @@ export const $approvalRequest = approval.$active
 export const setApprovalRequest = approval.set
 export const clearApprovalRequest = approval.clear
 
+export function approvalOwnerRouteFromEvent(event: {
+  connectionId?: string
+  profile?: string
+}): SessionOwnerRoute | undefined {
+  const connectionId = event.connectionId?.trim()
+
+  return connectionId
+    ? { connectionId, profile: event.profile?.trim() || 'default' }
+    : undefined
+}
+
+function requestThroughApprovalOwner<T>(
+  gateway: ApprovalGateway,
+  ownerRoute: SessionOwnerRoute | undefined,
+  method: string,
+  params: Record<string, unknown>
+): Promise<T> {
+  const ambient = <R>(
+    ambientMethod: string,
+    ambientParams?: Record<string, unknown>,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<R> => {
+    const params = ambientParams ?? {}
+
+    return (timeoutMs === undefined && signal === undefined
+      ? gateway.request(ambientMethod, params)
+      : gateway.request(ambientMethod, params, timeoutMs, signal)) as Promise<R>
+  }
+
+  return ownerRoute
+    ? requestForSessionProfile(ownerRoute, ambient, method, params)
+    : requestForOwnedSession(params.session_id as string | undefined, ambient, method, params)
+}
+
+export async function respondToApproval(
+  gateway: ApprovalGateway,
+  request: ApprovalRequest,
+  choice: 'always' | 'deny' | 'once' | 'session'
+): Promise<unknown> {
+  const params = {
+    choice,
+    ...(request.requestId ? { request_id: request.requestId } : {}),
+    session_id: request.sessionId ?? undefined
+  }
+
+  const result = await requestThroughApprovalOwner<{ resolved?: boolean }>(
+    gateway,
+    request.ownerRoute,
+    'approval.respond',
+    params
+  )
+
+  if (result?.resolved === false) {
+    throw new Error('The approval is no longer pending on its owning backend.')
+  }
+
+  return result
+}
+
 export async function receiveApprovalRequest(gateway: ApprovalGateway | null, request: ApprovalRequest): Promise<void> {
   setApprovalRequest(request)
 
@@ -126,14 +195,21 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
   }
 }
 
-export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
+export async function replayPendingApproval(
+  gateway: ApprovalGateway | null,
+  sessionId: string | null,
+  ownerRoute?: SessionOwnerRoute
+): Promise<void> {
   if (!gateway || !sessionId) {
     return
   }
 
-  const rawResult = await gateway.request('approval.pending', {
-    session_id: sessionId
-  })
+  const rawResult = await requestThroughApprovalOwner<{ approvals?: PendingApprovalPayload[] }>(
+    gateway,
+    ownerRoute,
+    'approval.pending',
+    { session_id: sessionId }
+  )
 
   const result =
     rawResult && typeof rawResult === 'object' ? (rawResult as { approvals?: PendingApprovalPayload[] }) : {}
@@ -149,6 +225,7 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     choices: Array.isArray(pending.choices) ? pending.choices.filter(choice => typeof choice === 'string') : undefined,
     command: typeof pending.command === 'string' ? pending.command : '',
     description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
+    ownerRoute,
     requestId: pending.request_id,
     sessionId,
     smartDenied: pending.smart_denied === true

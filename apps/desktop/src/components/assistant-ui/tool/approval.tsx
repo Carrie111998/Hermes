@@ -25,10 +25,10 @@ import {
   clearApprovalRequest,
   registerApprovalInlineAnchor,
   replayPendingApproval,
+  respondToApproval,
   sessionApprovalInlineVisible,
   sessionApprovalRequest
 } from '@/store/prompts'
-import { requestForOwnedSession } from '@/store/session-states'
 
 import type { ToolPart } from './fallback-model'
 
@@ -148,27 +148,16 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         // ambient only when no owner is known. The ambient socket follows
         // foreground focus, and for a cross-profile session it points at a
         // backend that never held this approval (#91684 client half).
-        await requestForOwnedSession<{ resolved?: boolean }>(
-          request.sessionId,
-          // Bound (not wrapped) so the ambient fallback keeps the exact
-          // 2-arg call shape gateway.request callers assert on.
-          gateway.request.bind(gateway) as typeof gateway.request,
-          'approval.respond',
-          {
-            choice,
-            request_id: request.requestId,
-            session_id: request.sessionId ?? undefined
-          }
-        )
+        await respondToApproval(gateway, request, choice)
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
         clearApprovalRequest(request.sessionId, request.requestId)
-        void replayPendingApproval(gateway, request.sessionId).catch(() => undefined)
+        void replayPendingApproval(gateway, request.sessionId, request.ownerRoute).catch(() => undefined)
       } catch (error) {
         notifyError(error, copy.sendFailed)
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.requestId, request.sessionId]
+    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.

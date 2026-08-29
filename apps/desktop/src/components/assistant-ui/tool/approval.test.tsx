@@ -9,6 +9,22 @@ import { $activeSessionId } from '@/store/session'
 import { PendingApprovalFallback, PendingToolApproval } from './approval'
 import type { ToolPart } from './fallback-model'
 
+const routingMocks = vi.hoisted(() => ({
+  requestForSessionProfile: vi.fn(
+    async (
+      owner: unknown,
+      ambient: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
+      method: string,
+      params?: Record<string, unknown>
+    ) => (owner ? { resolved: true } : ambient(method, params))
+  )
+}))
+
+vi.mock('@/store/session-request-router', async () => ({
+  ...(await vi.importActual<Record<string, unknown>>('@/store/session-request-router')),
+  requestForSessionProfile: routingMocks.requestForSessionProfile
+}))
+
 // Radix's DropdownMenu touches pointer-capture + scrollIntoView, which jsdom
 // doesn't implement; stub them so the menu can open in tests.
 beforeAll(() => {
@@ -33,7 +49,12 @@ function part(toolName: string): ToolPart {
 function setRequest(
   command = 'rm -rf /tmp/x',
   allowPermanent?: boolean,
-  extra: { choices?: string[]; smartDenied?: boolean } = {}
+  extra: {
+    choices?: string[]
+    ownerRoute?: { connectionId: string; profile: string }
+    requestId?: string
+    smartDenied?: boolean
+  } = {}
 ) {
   $activeSessionId.set('sess-1')
   setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
@@ -49,6 +70,7 @@ function mockGateway() {
 afterEach(() => {
   cleanup()
   clearAllPrompts()
+  vi.clearAllMocks()
   $activeSessionId.set(null)
   $gateway.set(null)
 })
@@ -94,6 +116,52 @@ describe('PendingToolApproval', () => {
       expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
     })
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('answers through the exact owner attached to the inbound approval', async () => {
+    const ambient = mockGateway()
+    const ownerRoute = { connectionId: 'local', profile: 'default' }
+    setRequest('chmod 600 /tmp/x', undefined, { ownerRoute, requestId: 'approval-1' })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect(routingMocks.requestForSessionProfile).toHaveBeenCalledWith(
+        ownerRoute,
+        expect.any(Function),
+        'approval.respond',
+        { choice: 'once', request_id: 'approval-1', session_id: 'sess-1' }
+      )
+      expect(routingMocks.requestForSessionProfile).toHaveBeenCalledWith(
+        ownerRoute,
+        expect.any(Function),
+        'approval.pending',
+        { session_id: 'sess-1' }
+      )
+    })
+    expect(ambient).not.toHaveBeenCalled()
+    expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('keeps the approval parked when its exact owner does not resolve it', async () => {
+    mockGateway()
+    routingMocks.requestForSessionProfile.mockResolvedValueOnce({ resolved: false })
+    const ownerRoute = { connectionId: 'local', profile: 'default' }
+    setRequest('chmod 600 /tmp/x', undefined, { ownerRoute, requestId: 'approval-stale' })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect(routingMocks.requestForSessionProfile).toHaveBeenCalledWith(
+        ownerRoute,
+        expect.any(Function),
+        'approval.respond',
+        { choice: 'once', request_id: 'approval-stale', session_id: 'sess-1' }
+      )
+    })
+    expect($approvalRequest.get()?.requestId).toBe('approval-stale')
   })
 
   it('reveals the full command inline when the Command toggle is clicked', () => {
