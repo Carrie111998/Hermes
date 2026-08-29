@@ -168,6 +168,11 @@ class TestShouldExclude:
         assert _should_exclude(Path("home/.npm/_logs/2026-08-24.log"))
         assert _should_exclude(Path(".bun/install/cache/zstd"))
         assert _should_exclude(Path("profiles/coder/.bun/install/cache/x"))
+        # Matching is by path component, so a stray file *named* like the
+        # cache dir is skipped as well — component checks can't tell a
+        # dotfile from a dot-directory. A near-miss component stays included.
+        assert _should_exclude(Path("docs/.npm"))
+        assert not _should_exclude(Path("npm/notes.txt"))
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,13 @@ _EXCLUDED_DIRS = {
     # invocation the agent runs populates ``.npm/`` and ``.bun/`` inside the
     # walked tree (#93760) — regenerable caches that otherwise ship in every
     # backup (measured at 82% of one install's payload).
+    #
+    # Intent: caches, not configuration. Matching below is by path
+    # component (same semantics as every name in this set): any directory
+    # named ``.npm``/``.bun`` at any depth is skipped — a stray *file* with
+    # that name is skipped too, since component matching cannot tell them
+    # apart. Don't extend this set with user-data dirs (e.g. ``.vscode``)
+    # without measuring payload share like #93760 did.
     ".npm",
     ".bun",
 }
