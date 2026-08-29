@@ -812,6 +812,72 @@ def _is_known_provider_base_url(base_url: str) -> bool:
     return _infer_provider_from_url(base_url) is not None
 
 
+def _looks_like_ollama_base_url(base_url: str) -> bool:
+    """True when ``base_url`` is an Ollama host, not a generic OpenAI-compat relay.
+
+    Matches the custom-provider heuristic (default port 11434, ``ollama.com``,
+    or ``ollama`` as a hostname label). Arbitrary localhost is *not* Ollama —
+    llama.cpp, vLLM, LM Studio, and OpenAI-compat reverse proxies share it.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    try:
+        if parsed.port == 11434:
+            return True
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "ollama.com" or host.endswith(".ollama.com"):
+        return True
+    return "ollama" in host.split(".")
+
+
+def _should_probe_ollama_native(base_url: str = "", provider: str = "") -> bool:
+    """Whether to fingerprint the endpoint as a local inference server.
+
+    Ollama (and LM Studio / llama.cpp / vLLM) expose native routes such as
+    ``POST /api/show`` and ``GET /api/tags``. OpenAI-compatible custom
+    gateways do not. Those probes are synchronous HTTP and commonly run on
+    the messaging gateway's asyncio thread during first-turn context
+    resolution — a slow or hanging ``/api/show`` stalls Slack/Discord ACKs.
+
+    Probe when the configured or inferred provider is Ollama, or the URL
+    looks like Ollama (port 11434 / ``ollama`` host), or the endpoint is
+    local *and* is not a named ``custom:*`` provider.
+
+    Skip when:
+    - provider is a named custom OpenAI-compat relay (``custom:acme``),
+      including loopback reverse proxies in front of one
+    - the host is a known non-Ollama provider
+    - the host is a remote unknown URL (HTTPS custom gateway)
+
+    Bare ``provider=custom`` on localhost still probes — that is the
+    documented local-Ollama / vLLM path. Same class of gate as
+    ``agent.image_routing._should_probe_ollama_vision`` (#89863).
+    """
+    provider_l = (provider or "").strip().lower()
+    if provider_l.startswith("ollama"):
+        return True
+    if _looks_like_ollama_base_url(base_url):
+        return True
+    inferred = _infer_provider_from_url(base_url) if base_url else None
+    if inferred and "ollama" in inferred:
+        return True
+    if inferred:
+        return False
+    # Named custom providers are OpenAI-compat relays even on loopback.
+    # Bare "custom" remains the local-runtime profile and still probes.
+    if provider_l.startswith("custom:"):
+        return False
+    if base_url and is_local_endpoint(base_url):
+        return True
+    return False
+
+
 def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
     """Return context metadata confirmed for one provider endpoint.
 
@@ -1346,11 +1412,16 @@ def fetch_endpoint_model_metadata(
     base_url: str,
     api_key: str = "",
     force_refresh: bool = False,
+    provider: str = "",
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from an OpenAI-compatible ``/models`` endpoint.
 
     This is used for explicit custom endpoints where hardcoded global model-name
     defaults are unreliable. Results are cached in memory per base URL.
+
+    ``provider`` is optional. When set, it gates the local-server-type
+    waterfall (LM Studio ``/api/v1/models`` before OpenAI ``/models``) so a
+    named ``custom:*`` relay on loopback is not fingerprinted as Ollama.
     """
     normalized = _normalize_base_url(base_url)
     if not normalized or _is_openrouter_base_url(normalized):
@@ -1380,7 +1451,9 @@ def fetch_endpoint_model_metadata(
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_error: Optional[Exception] = None
 
-    if is_local_endpoint(normalized):
+    if is_local_endpoint(normalized) and _should_probe_ollama_native(
+        normalized, provider
+    ):
         try:
             if detect_local_server_type(normalized, api_key=api_key) == "lm-studio":
                 server_url = _lmstudio_server_root(normalized)
@@ -1527,9 +1600,12 @@ def _resolve_endpoint_context_length(
     model: str,
     base_url: str,
     api_key: str = "",
+    provider: str = "",
 ) -> Optional[int]:
     """Resolve context length from an endpoint's live ``/models`` metadata."""
-    endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+    endpoint_metadata = fetch_endpoint_model_metadata(
+        base_url, api_key=api_key, provider=provider,
+    )
     matched = endpoint_metadata.get(model)
     if not matched:
         if len(endpoint_metadata) == 1:
@@ -2083,10 +2159,11 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
 def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Optional[int]:
     """Query an Ollama server's native ``/api/show`` for context length.
 
-    Provider-agnostic: works against ANY Ollama-compatible server regardless
-    of hostname — local Ollama, Ollama Cloud (``ollama.com``), custom Ollama
-    hosting behind a reverse proxy, etc.  For non-Ollama servers the POST
-    returns 404/405 quickly; the function handles errors gracefully.
+    Provider-agnostic against Ollama-compatible servers — local Ollama,
+    Ollama Cloud (``ollama.com``), custom Ollama hosting behind a reverse
+    proxy. Callers must gate with ``_should_probe_ollama_native``: a
+    non-Ollama OpenAI-compat gateway may hang or 401 rather than 404
+    quickly, and this POST is synchronous.
 
     Results are cached in ``_LOCAL_CTX_PROBE_CACHE`` (same 30s TTL,
     positive-only — see ``_query_local_context_length``) so back-to-back
@@ -2956,7 +3033,7 @@ def get_model_context_length(
           portal-derived values are persisted to disk.
        c. Codex OAuth /models probe
        d. GMI /models endpoint
-       e. Ollama native /api/show probe (any base_url, provider-agnostic)
+       e. Ollama native /api/show probe (Ollama URLs / local runtimes only)
        f. models.dev registry lookup (with :cloud/-cloud suffix fallback)
     6. OpenRouter live API metadata (Kimi-family 32k guard)
     7. Local server query (before hardcoded defaults for local endpoints)
@@ -3224,7 +3301,9 @@ def get_model_context_length(
     # returns 128k) instead of the model's full context (400k).  models.dev
     # has the correct per-provider values and is checked at step 5+.
     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
-        context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        context_length = _resolve_endpoint_context_length(
+            model, base_url, api_key=api_key, provider=provider,
+        )
         if context_length is not None:
             return context_length
         if not _is_known_provider_base_url(base_url):
@@ -3233,21 +3312,29 @@ def get_model_context_length(
             # prefers num_ctx from Modelfile, while _query_ollama_api_show
             # returns the GGUF training max first which can be larger and
             # would create a false-safe window for compression (#63122).
-            # Non-local endpoints preserve the existing GGUF-first behavior.
-            if is_local_endpoint(base_url):
-                local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
-                if local_ctx and local_ctx > 0:
+            # Remote OpenAI-compat gateways and named custom:* relays are
+            # not Ollama — POSTing /api/show at them is a synchronous stall
+            # (often on the messaging asyncio thread). Skip unless the URL
+            # actually looks like Ollama.
+            if _should_probe_ollama_native(base_url, provider):
+                if is_local_endpoint(base_url):
+                    local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+                    if local_ctx and local_ctx > 0:
+                        if not _skip_persistent_context_cache(base_url, provider):
+                            _maybe_cache_local_context_length(model, base_url, local_ctx)
+                        return local_ctx
+                # 2b. Ollama native /api/show — GGUF-first for hosted Ollama.
+                ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+                if ctx is not None:
                     if not _skip_persistent_context_cache(base_url, provider):
-                        _maybe_cache_local_context_length(model, base_url, local_ctx)
-                    return local_ctx
-            # 2b. Ollama native /api/show — non-local endpoints preserve
-            # the existing generic /api/show GGUF-first behavior.
-            # Non-Ollama servers return 404/405 quickly.
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
-            if ctx is not None:
-                if not _skip_persistent_context_cache(base_url, provider):
-                    save_context_length(model, base_url, ctx)
-                return ctx
+                        save_context_length(model, base_url, ctx)
+                    return ctx
+            else:
+                logger.debug(
+                    "Skipping Ollama /api/show probe for %s (provider=%s); "
+                    "set model.context_length if the window is unknown",
+                    base_url, provider or "(none)",
+                )
             # 3. Probe-down fallback after endpoint-specific detection failed
             logger.info(
                 "Could not detect context length for model %r at %s — "
@@ -3349,29 +3436,19 @@ def get_model_context_length(
         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if ctx is not None:
             return ctx
-    # 5e. Ollama native /api/show probe — runs for providers whose base_url
-    # is NOT a known non-Ollama provider.  Ollama-compatible servers expose
-    # this endpoint regardless of hostname (local Ollama, Ollama Cloud,
-    # custom Ollama hosting).  The OpenAI-compat /v1/models endpoint
-    # correctly omits context_length per the OpenAI schema, but /api/show
-    # returns the authoritative GGUF model_info.context_length.
-    # Known hosted providers (OpenRouter, Anthropic, OpenAI, …) are skipped:
-    # they are definitively not Ollama, the POST always 404s, and the result
-    # is never cached for them — so every fresh process used to pay a
-    # ~300ms blocking HTTP round-trip on the first-turn critical path
-    # (measured against openrouter.ai; worse on slow DNS).
-    if base_url:
-        _inferred_for_probe = _infer_provider_from_url(base_url)
-        _skip_ollama_probe = (
-            _inferred_for_probe is not None
-            and "ollama" not in _inferred_for_probe
-        )
-        if not _skip_ollama_probe:
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
-            if ctx is not None:
-                if not _skip_persistent_context_cache(base_url, provider):
-                    save_context_length(model, base_url, ctx)
-                return ctx
+    # 5e. Ollama native /api/show probe — only for endpoints that actually
+    # look like Ollama (provider, ollama.com, port 11434, or a local
+    # runtime that is not a named custom:* relay). OpenAI-compat custom
+    # gateways omit context_length on /v1/models by spec; probing /api/show
+    # at them is a blocking miss, not a GGUF lookup.
+    if base_url and _should_probe_ollama_native(
+        base_url, provider or effective_provider
+    ):
+        ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+        if ctx is not None:
+            if not _skip_persistent_context_cache(base_url, provider):
+                save_context_length(model, base_url, ctx)
+            return ctx
     # 5f. OpenRouter live /models metadata — authoritative for OpenRouter-routed
     # models. OpenRouter's catalog carries per-model context_length (e.g.
     # anthropic/claude-fable-5 -> 1M) and refreshes as new slugs ship, so it
