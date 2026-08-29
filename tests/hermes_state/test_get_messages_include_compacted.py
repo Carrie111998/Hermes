@@ -90,6 +90,26 @@ class TestIncludeCompacted:
         msgs = db.get_messages(sid, include_inactive=True)
         assert len(msgs) == 7  # 4 archived + 1 live + 2 rewound
 
+    def test_combined_inactive_and_compacted_flags_still_dedupe(self, db):
+        """The combined audit/display mode keeps its historical dedupe."""
+        sid = "combined-uncompacted-flags"
+        db.create_session(sid, source="cli")
+        inactive_id = db.append_message(sid, "user", "duplicate", timestamp=1.0)
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET active = 0 WHERE id = ?",
+                [inactive_id],
+            )
+        )
+        active_id = db.append_message(sid, "user", "duplicate", timestamp=1.0)
+
+        assert _row_ids(
+            db,
+            sid,
+            include_inactive=True,
+            include_compacted=True,
+        ) == [active_id]
+
     def test_latest_page_with_compacted_rows(self, db):
         """latest=True pages back from the newest message, still in order."""
         sid = "s1"
@@ -184,6 +204,53 @@ class TestIncludeCompacted:
 
         assert [message["content"] for message in page] == [
             f"live message {index}" for index in range(80, 200)
+        ]
+        assert decoded == 120
+
+    def test_coarse_import_timestamps_do_not_expand_collision_decode(
+        self, db, monkeypatch
+    ):
+        """Legacy imports can give thousands of distinct rows one timestamp."""
+        sid = "coarse-import-timestamps"
+        db.create_session(sid, source="desktop")
+        archived_id = db.append_message(sid, "assistant", "archived marker")
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
+                [archived_id],
+            )
+        )
+        db.append_messages_batch(
+            sid,
+            [
+                {
+                    "role": "user",
+                    "content": f"imported message {index}",
+                    "timestamp": 1.0,
+                }
+                for index in range(3_000)
+            ],
+        )
+
+        original_decode = db._decode_content
+        decoded = 0
+
+        def _counted_decode(content):
+            nonlocal decoded
+            decoded += 1
+            return original_decode(content)
+
+        monkeypatch.setattr(db, "_decode_content", _counted_decode)
+
+        page = db.get_messages(
+            sid,
+            include_compacted=True,
+            latest=True,
+            limit=120,
+        )
+
+        assert [message["content"] for message in page] == [
+            f"imported message {index}" for index in range(2_880, 3_000)
         ]
         assert decoded == 120
 
@@ -324,6 +391,47 @@ class TestDisplayDedupe:
 
         assert _row_ids(db, sid, include_compacted=True) == [carrier_id, answer_id]
         assert [message["id"] for message in page] == [carrier_id]
+
+    def test_composite_carriers_with_distinct_display_kinds_are_not_merged(self, db):
+        """Display kind can change whether an identical carrier is projected."""
+        from agent.context_compressor import (
+            HISTORICAL_TASK_HEADING,
+            SUMMARY_PREFIX,
+            _SUMMARY_END_MARKER,
+        )
+
+        sid = "composite-carrier-display-kind"
+        timestamp = 1_700_000_000.0
+        carrier = (
+            f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n"
+            f"{_SUMMARY_END_MARKER}\n\nREAL ASK"
+        )
+        db.create_session(sid, source="desktop")
+        hidden_id = db.append_message(
+            sid,
+            "user",
+            carrier,
+            timestamp=timestamp,
+            display_kind="hidden",
+        )
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
+                [hidden_id],
+            )
+        )
+        notification_id = db.append_message(
+            sid,
+            "user",
+            carrier,
+            timestamp=timestamp,
+            display_kind="internal_notification",
+        )
+
+        assert _row_ids(db, sid, include_compacted=True) == [
+            hidden_id,
+            notification_id,
+        ]
 
     def test_distinct_tool_calls_with_same_content_are_not_merged(self, db):
         """Two real tool messages that happen to share role/content/timestamp
