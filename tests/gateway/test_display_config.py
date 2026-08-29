@@ -327,3 +327,73 @@ class TestLiveStatusSetting:
         assert resolve_display_setting({}, "slack", "live_status") == "full"
 
 
+class TestPerGuildOverrides:
+    """display.platforms.<plat>.guilds.<id> beats platform-wide settings."""
+
+    def test_guild_tool_progress_off_beats_platform_new(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "tool_progress": "all",
+                "platforms": {
+                    "discord": {
+                        "tool_progress": "new",
+                        "guilds": {
+                            "999": {"tool_progress": "off"},
+                        },
+                    }
+                },
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "discord", "tool_progress", scope_id="999"
+            )
+            == "off"
+        )
+        assert (
+            resolve_display_setting(
+                config, "discord", "tool_progress", scope_id="888"
+            )
+            == "new"
+        )
+        assert resolve_display_setting(config, "discord", "tool_progress") == "new"
+
+    def test_guild_id_alias_and_int_yaml_key(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "discord": {
+                        "tool_progress": "all",
+                        "guilds": {1234567890: {"tool_progress": "off"}},
+                    }
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "discord", "tool_progress", guild_id="1234567890"
+            )
+            == "off"
+        )
+
+    def test_dm_without_scope_keeps_platform_default(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "discord": {
+                        "tool_progress": "new",
+                        "guilds": {"1": {"tool_progress": "off"}},
+                    }
+                }
+            }
+        }
+        assert resolve_display_setting(config, "discord", "tool_progress") == "new"
+
+
+

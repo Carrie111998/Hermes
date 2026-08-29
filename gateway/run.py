@@ -29099,11 +29099,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # which checks display.platforms.<platform>.<key> first, then
         # display.<key> global, then built-in platform defaults.
         from gateway.display_config import resolve_display_setting
+        _scope_id = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
 
         # Apply tool preview length config (0 = no limit)
         try:
             from agent.display import set_tool_preview_max_len
-            _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0)
+            _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0, scope_id=_scope_id)
             set_tool_preview_max_len(int(_tpl) if _tpl else 0)
         except Exception:
             pass
@@ -29111,23 +29112,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Apply friendly tool labels config (default on) — per-platform aware
         try:
             from agent.display import set_friendly_tool_labels
-            _ftl = resolve_display_setting(user_config, platform_key, "friendly_tool_labels", True)
+            _ftl = resolve_display_setting(user_config, platform_key, "friendly_tool_labels", True, scope_id=_scope_id)
             set_friendly_tool_labels(bool(_ftl))
         except Exception:
             pass
 
         # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
+        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress", scope_id=_scope_id)
         _env_tp = os.getenv("HERMES_TOOL_PROGRESS_MODE")
         _display_cfg = display_config if isinstance(display_config, dict) else {}
         _platforms_cfg = _display_cfg.get("platforms") or {}
         _platform_cfg = _platforms_cfg.get(platform_key) or {}
         _legacy_tp_overrides = _display_cfg.get("tool_progress_overrides") or {}
+        _guilds_cfg = _platform_cfg.get("guilds") if isinstance(_platform_cfg, dict) else None
+        _guild_cfg = None
+        if isinstance(_guilds_cfg, dict) and _scope_id is not None:
+            _guild_cfg = _guilds_cfg.get(str(_scope_id))
+            if _guild_cfg is None:
+                try:
+                    _guild_cfg = _guilds_cfg.get(int(str(_scope_id)))
+                except (TypeError, ValueError):
+                    _guild_cfg = None
         _tool_progress_configured = (
             "tool_progress" in _display_cfg
             or (
                 isinstance(_platform_cfg, dict)
                 and "tool_progress" in _platform_cfg
+            )
+            or (
+                isinstance(_guild_cfg, dict)
+                and "tool_progress" in _guild_cfg
             )
             or (
                 isinstance(_legacy_tp_overrides, dict)
@@ -29140,7 +29154,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else (_resolved_tp or _env_tp or "all")
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
-        progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping", scope_id=_scope_id) or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         _generic_status_recent: List[str] = []
         _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
@@ -29291,7 +29305,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are collected here and deleted after the final response lands.
         # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
         _cleanup_progress = bool(
-            resolve_display_setting(user_config, platform_key, "cleanup_progress")
+            resolve_display_setting(user_config, platform_key, "cleanup_progress", scope_id=_scope_id)
         )
         _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
         # getattr, not attribute access — same duck-typed-adapter guard as the

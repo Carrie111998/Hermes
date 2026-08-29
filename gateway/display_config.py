@@ -4,6 +4,8 @@ Provides ``resolve_display_setting()`` — the single entry-point for reading
 display settings with platform-specific overrides and sensible defaults.
 
 Resolution order (first non-None wins):
+    0. ``display.platforms.<platform>.guilds.<scope_id>.<key>`` — per Discord
+       guild / Slack workspace / Matrix server (``SessionSource.scope_id``)
     1. ``display.platforms.<platform>.<key>``  — explicit per-platform user override
     2. ``display.<key>``                       — global user setting
     3. ``_PLATFORM_DEFAULTS[<platform>][<key>]``  — built-in sensible default
@@ -194,6 +196,9 @@ def resolve_display_setting(
     platform_key: str,
     setting: str,
     fallback: Any = None,
+    *,
+    scope_id: Any = None,
+    guild_id: Any = None,
 ) -> Any:
     """Resolve a display setting with per-platform override support.
 
@@ -208,16 +213,27 @@ def resolve_display_setting(
         Display setting name (e.g. ``"tool_progress"``, ``"show_reasoning"``).
     fallback : Any
         Fallback value when the setting isn't found anywhere.
+    scope_id, guild_id : Any
+        Optional server/workspace id (SessionSource.scope_id; guild_id is the
+        deprecated alias). When set, display.platforms.<plat>.guilds.<id>
+        wins over the platform-wide override so one Discord bot can be quiet
+        in a public guild and chatty in DMs.
 
     Returns
     -------
     The resolved value, or *fallback* if nothing is configured.
     """
     display_cfg = user_config.get("display") or {}
+    scope = scope_id if scope_id is not None else guild_id
 
-    # 1. Explicit per-platform override (display.platforms.<platform>.<key>)
+    # 0. Per-guild / per-workspace override
     platforms = display_cfg.get("platforms") or {}
     plat_overrides = platforms.get(platform_key)
+    found, scoped_val = _lookup_guild_setting(plat_overrides, scope, setting)
+    if found:
+        return _normalise(setting, scoped_val)
+
+    # 1. Explicit per-platform override (display.platforms.<platform>.<key>)
     if isinstance(plat_overrides, dict):
         val = plat_overrides.get(setting)
         if val is not None:
@@ -257,6 +273,28 @@ def resolve_display_setting(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _lookup_guild_setting(plat_overrides: Any, scope_id: Any, setting: str) -> tuple[bool, Any]:
+    """Return (found, value) for display.platforms.<plat>.guilds.<scope_id>.<setting>."""
+    if scope_id is None or not isinstance(plat_overrides, dict):
+        return False, None
+    scopes = plat_overrides.get("guilds")
+    if not isinstance(scopes, dict):
+        return False, None
+    keys: list[Any] = [str(scope_id)]
+    try:
+        keys.append(int(str(scope_id)))
+    except (TypeError, ValueError):
+        pass
+    block = None
+    for key in keys:
+        if key in scopes:
+            block = scopes[key]
+            break
+    if not isinstance(block, dict) or setting not in block:
+        return False, None
+    return True, block.get(setting)
+
 
 def _normalise(setting: str, value: Any) -> Any:
     """Normalise YAML quirks (bare ``off`` → False in YAML 1.1)."""
