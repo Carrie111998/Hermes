@@ -930,16 +930,6 @@ def sync_skills(quiet: bool = False) -> dict:
                     skipped += 1
                 continue
 
-            if user_hash == bundled_hash:
-                # Stock copy under a stale origin hash: the destination is
-                # byte-identical to the current bundled version (e.g. repaired
-                # by hand or restored from a backup), so there is nothing to
-                # update and nothing to protect. Re-baseline the manifest
-                # instead of reporting it as user-modified on every sync.
-                manifest[skill_name] = bundled_hash
-                skipped += 1
-                continue
-
             if _is_tracked_user_modification(origin_hash, user_hash):
                 # User modified this skill — don't overwrite their changes
                 user_modified.append(skill_name)

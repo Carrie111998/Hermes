@@ -547,40 +547,6 @@ class TestSyncSkills:
         )
         assert "new-skill" not in result["updated"]
 
-    def test_stock_copy_with_stale_origin_hash_is_rebaselined(self, tmp_path):
-        """A destination byte-identical to the current bundled version but
-        recorded under a stale origin hash must self-heal (re-baseline),
-        not be reported as user-modified on every sync forever (#97791)."""
-        bundled = self._setup_bundled(tmp_path)
-        skills_dir = tmp_path / "user_skills"
-        manifest_file = skills_dir / ".bundled_manifest"
-
-        # Simulate: skill was installed from an older bundled version...
-        user_skill = skills_dir / "old-skill"
-        user_skill.mkdir(parents=True)
-        (user_skill / "SKILL.md").write_text("# Old v1")
-        manifest_file.write_text(f"old-skill:{_dir_hash(user_skill)}\n")
-
-        # ...then the bundled version changed and the user repaired their
-        # copy to be byte-identical to the new bundled content.
-        (bundled / "old-skill" / "SKILL.md").write_text("# Old")
-        shutil.rmtree(user_skill)
-        shutil.copytree(bundled / "old-skill", user_skill)
-        assert _dir_hash(user_skill) == _dir_hash(bundled / "old-skill")
-
-        with self._patches(bundled, skills_dir, manifest_file):
-            result = sync_skills(quiet=True)
-            manifest = _read_manifest()
-
-        assert "old-skill" not in result["user_modified"], (
-            "A stock copy identical to the current bundled version is still "
-            "flagged as user-modified forever"
-        )
-        assert "old-skill" not in result["updated"]
-        assert manifest["old-skill"] == _dir_hash(bundled / "old-skill"), (
-            "Manifest was not re-baselined to the current bundled hash"
-        )
-
     def test_second_sync_of_stock_copy_stays_skipped(self, tmp_path):
         """The unchanged-source fast path must keep skipping a healthy copy:
         no update churn, no user-modified noise on an already-synced tree."""
@@ -652,12 +618,11 @@ class TestResetBundledSkill:
         manifest_file.write_text("google-workspace:STALEHASH000000000000000000000000\n")
 
         with self._patches(bundled, skills_dir, manifest_file):
-            # Sanity check: since the #97791 re-baseline fix, sync self-heals
-            # exactly this state (a stock copy under a stale origin hash) and
-            # no longer flags it user_modified forever; reset stays as the
-            # escape hatch for genuinely customized copies.
+            # Sanity check: without reset, sync would flag it user_modified
+            # (the documented reset-based recovery contract — see
+            # website/docs/user-guide/features/skills.md).
             pre = sync_skills(quiet=True)
-            assert "google-workspace" not in pre["user_modified"]
+            assert "google-workspace" in pre["user_modified"]
 
             # Reset (no --restore) should clear the manifest entry and re-baseline
             result = reset_bundled_skill("google-workspace", restore=False)
