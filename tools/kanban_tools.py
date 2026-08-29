@@ -872,9 +872,38 @@ def _handle_block(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
+                # Disambiguate before erroring (idempotency fix): block_task
+                # returns False both for "unknown id" and "not in a blockable
+                # state". A worker whose earlier block ALREADY landed (double
+                # delivery, judge-driven retry, orphaned tool result) must not
+                # end its run on a spurious hard error — re-blocking a task
+                # that is already sitting in a blocked-family state is a no-op
+                # success, reported with idempotent=True.
+                landed = kb.get_task(conn, tid)
+                if landed is None:
+                    return tool_error(f"could not block {tid} (unknown id)")
+                already_kind = getattr(landed, "block_kind", None)
+                blocked_family = (
+                    landed.status in ("blocked", "triage")
+                    or (landed.status == "todo" and already_kind == "dependency")
+                )
+                if blocked_family:
+                    run = kb.latest_run(conn, tid)
+                    return _ok(
+                        task_id=tid,
+                        run_id=run.id if run else None,
+                        status=landed.status,
+                        block_kind=already_kind,
+                        idempotent=True,
+                        note=(
+                            "task was already in a blocked state; treated as "
+                            "an idempotent no-op (existing block preserved)"
+                        ),
+                    )
                 return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"could not block {tid}: task is in status "
+                    f"{landed.status!r}, not running/ready (a task that has "
+                    f"already finished cannot be blocked)"
                 )
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't

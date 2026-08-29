@@ -228,6 +228,77 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_already_blocked_is_idempotent(worker_env):
+    """Re-blocking a task whose block already landed (double delivery,
+    judge-driven retry, orphaned tool result) must be a no-op success, not a
+    hard error that ends the worker's run on a spurious failure."""
+    from tools import kanban_tools as kt
+    first = json.loads(kt._handle_block({"reason": "need clarification"}))
+    assert first["ok"] is True
+    second = json.loads(kt._handle_block({"reason": "need clarification"}))
+    assert second["ok"] is True
+    assert second["idempotent"] is True
+    assert second["status"] == "blocked"
+    # The original block must be preserved untouched.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_dependency_kind_double_block_is_idempotent(worker_env):
+    """kind='dependency' routes to todo (not blocked); a second dependency
+    block must also be treated as an idempotent no-op."""
+    from tools import kanban_tools as kt
+    first = json.loads(
+        kt._handle_block({"reason": "waiting on parent", "kind": "dependency"})
+    )
+    assert first["ok"] is True
+    assert first["status"] == "todo"
+    second = json.loads(
+        kt._handle_block({"reason": "waiting on parent", "kind": "dependency"})
+    )
+    assert second["ok"] is True
+    assert second["idempotent"] is True
+    assert second["status"] == "todo"
+    assert second["block_kind"] == "dependency"
+
+
+def test_block_unknown_id_gets_distinct_error(worker_env, monkeypatch):
+    """Unknown task id and already-finished task were previously conflated
+    into one ambiguous error; each must now be distinct and precise.
+    (Non-worker context: the worker task-scoping guard would otherwise
+    reject the foreign id before the block logic runs.)"""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    out = json.loads(kt._handle_block({"task_id": "t_deadbeef", "reason": "x"}))
+    assert "error" in out
+    assert "unknown id" in out["error"]
+
+
+def test_block_finished_task_gets_distinct_error(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    conn = kb.connect()
+    try:
+        done_tid = kb.create_task(
+            conn, title="already-done", assignee="test-worker"
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id = ?", (done_tid,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    out = json.loads(kt._handle_block({"task_id": done_tid, "reason": "x"}))
+    assert "error" in out
+    assert "'done'" in out["error"]
+    assert "already finished" in out["error"]
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
