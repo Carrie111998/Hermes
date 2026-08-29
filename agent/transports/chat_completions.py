@@ -331,6 +331,13 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — strict providers reject this
                 or "api_content" in msg  # persist-what-you-send sidecar
+                # Anthropic-only interned replay channel (set by
+                # normalize_response for interleaved signed-thinking + tool_use
+                # turns). Consumed by the anthropic adapter; NEVER valid on an
+                # OpenAI-wire request, so a chat_completions target (Palantir
+                # GPT/Gemini proxy, Groq, …) rejects it with HTTP 400
+                # ("property 'anthropic_content_blocks' is unsupported").
+                or "anthropic_content_blocks" in msg
             ):
                 needs_sanitize = True
                 break
@@ -402,6 +409,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — leak into strict providers
                 or "api_content" in msg  # persist-what-you-send sidecar
+                or "anthropic_content_blocks" in msg  # Anthropic-only replay channel
             ):
                 out_msg = mutable_msg()
                 out_msg.pop("codex_reasoning_items", None)
@@ -410,6 +418,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("effect_disposition", None)
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
+                out_msg.pop("anthropic_content_blocks", None)  # Anthropic-only replay channel
 
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).

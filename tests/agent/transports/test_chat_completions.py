@@ -146,6 +146,44 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    def test_convert_messages_strips_anthropic_content_blocks(self, transport):
+        """The ``anthropic_content_blocks`` interned replay channel is an
+        Anthropic-only, in-memory field: ``normalize_response`` attaches it to
+        an assistant turn that interleaves signed *thinking* blocks with
+        ``tool_use`` so the Anthropic adapter can replay the turn verbatim and
+        keep the thinking-block signatures valid. It is consumed by the
+        Anthropic adapter and is NEVER part of the OpenAI Chat Completions
+        schema, so a chat_completions target (an OpenAI-compatible proxy, or a
+        fallback from an Anthropic primary onto an OpenAI-wire provider) rejects
+        it with HTTP 400 ``property 'anthropic_content_blocks' is unsupported``.
+        Same leak class as ``timestamp`` (#47868) / ``codex_reasoning_items``.
+        """
+        blocks = [
+            {"type": "thinking", "thinking": "plan the read", "signature": "sig-1"},
+            {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+             "input": {"path": "x"}},
+        ]
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "ok",
+                "anthropic_content_blocks": blocks,
+                "tool_calls": [
+                    {"id": "toolu_1", "type": "function",
+                     "function": {"name": "read_file",
+                                  "arguments": '{"path": "x"}'}}
+                ],
+            },
+        ]
+        result = transport.convert_messages(msgs)
+        assert "anthropic_content_blocks" not in result[1]
+        assert result[1]["content"] == "ok"
+        assert result[1]["role"] == "assistant"
+        assert result[1]["tool_calls"] == msgs[1]["tool_calls"]
+        # Original list untouched (deepcopy-on-demand)
+        assert msgs[1]["anthropic_content_blocks"] == blocks
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 
