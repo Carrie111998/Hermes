@@ -195,6 +195,14 @@ _PROVIDER_AUTH_PARAMS: dict[str, dict[str, str]] = {
 }
 
 
+# Standard OAuth params that providers must not override via user config.
+_STANDARD_OAUTH_PARAMS = frozenset({
+    "response_type", "client_id", "redirect_uri", "state",
+    "code_challenge", "code_challenge_method", "scope", "resource",
+    "prompt", "iss",
+})
+
+
 def _extract_extra_auth_params(
     server_url: str,
     user_config: dict[str, str] | None = None,
@@ -204,6 +212,9 @@ def _extract_extra_auth_params(
     Built-in provider defaults (``_PROVIDER_AUTH_PARAMS``) are merged with
     any ``user_config`` overrides (which win on conflict).  Returns an empty
     dict when no match is found.
+
+    User-supplied params that shadow standard OAuth parameters are rejected
+    with a warning to prevent accidental misconfiguration.
     """
     url_lower = server_url.lower()
     result: dict[str, str] = {}
@@ -212,7 +223,14 @@ def _extract_extra_auth_params(
             result.update(params)
             break
     if user_config:
-        result.update(user_config)
+        for key, value in user_config.items():
+            if key in _STANDARD_OAUTH_PARAMS:
+                logger.warning(
+                    "Ignoring extra auth param %r — shadows standard OAuth parameter",
+                    key,
+                )
+                continue
+            result[key] = value
     return result
 
 
@@ -544,7 +562,7 @@ class HermesTokenStorage:
         # model_validate because it's not part of the SDK's OAuthToken schema.
         absolute_expiry = data.pop("expires_at", None)
         if absolute_expiry is not None:
-            data["expires_in"] = int(max(absolute_expiry - time.time(), 0))
+            data["expires_in"] = int(max(absolute_expiry - time.time() - 60, 0))
         elif data.get("expires_in") is not None:
             try:
                 file_mtime = self._tokens_path().stat().st_mtime
@@ -553,7 +571,7 @@ class HermesTokenStorage:
             if file_mtime is not None:
                 try:
                     implied_expiry = file_mtime + int(data["expires_in"])
-                    data["expires_in"] = int(max(implied_expiry - time.time(), 0))
+                    data["expires_in"] = int(max(implied_expiry - time.time() - 60, 0))
                 except (TypeError, ValueError):
                     pass
         try:
@@ -1377,6 +1395,59 @@ def _get_hermes_oauth_provider_class() -> type | None:
                 logger.warning("Invalid refresh response: %s", response.status_code)
                 self.context.clear_tokens()
                 return False
+
+        async def async_auth_flow(self, request: Any) -> Any:
+            """Override to try refresh_token before browser auth on 401.
+
+            The base SDK goes straight to browser authorization when a 401
+            arrives, even when a refresh token is available. This causes
+            unnecessary browser tab accumulation when tokens expire during
+            normal operation. This override intercepts the 401 response and
+            attempts a token refresh first, only falling through to the full
+            browser flow when refresh fails.
+            """
+            # Yield the initial request - httpx will add auth headers
+            response = yield request
+
+            # On 401, try refresh before browser auth
+            if response.status_code == 401:
+                logger.debug("Got 401, attempting token refresh before browser auth")
+
+                # Check if we have a refresh token available
+                if (self.context.current_tokens is not None and
+                    hasattr(self.context.current_tokens, 'refresh_token') and
+                    self.context.current_tokens.refresh_token is not None):
+
+                    try:
+                        # Attempt token refresh
+                        refresh_request = await self._refresh_token()
+                        refresh_response = yield refresh_request
+
+                        if await self._handle_refresh_response(refresh_response):
+                            logger.debug("Token refresh successful, retrying original request")
+                            # Refresh succeeded - retry the original request
+                            self._add_auth_header(request)
+                            response = yield request
+
+                            # If the retry also fails, we need full re-auth
+                            if response.status_code == 401:
+                                logger.debug("Retry after refresh still got 401, falling through to browser auth")
+                                async for r in super().async_auth_flow(request):
+                                    response = yield r
+                        else:
+                            # Refresh failed - need full browser auth
+                            logger.debug("Token refresh failed, falling through to browser auth")
+                            async for r in super().async_auth_flow(request):
+                                response = yield r
+                    except Exception as e:
+                        # Any error during refresh - fall back to browser auth
+                        logger.debug("Token refresh error: %s, falling through to browser auth", e)
+                        async for r in super().async_auth_flow(request):
+                            response = yield r
+                else:
+                    # No refresh token available - use parent's browser auth
+                    async for r in super().async_auth_flow(request):
+                        response = yield r
 
     _HermesOAuthClientProvider.__name__ = "HermesOAuthClientProvider"
     _HermesOAuthClientProvider.__qualname__ = "HermesOAuthClientProvider"
