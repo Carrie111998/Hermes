@@ -441,10 +441,10 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     pointer to scroll the middle.
     """
     try:
-        meta = db.get_session(session_id) or {}
+        meta = db.get_session(session_id)
     except Exception as e:
-        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
-        meta = {}
+        logging.error("get_session failed for %s: %s", session_id, e, exc_info=True)
+        return tool_error(f"failed to load session: {e}", success=False)
     if not meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
@@ -606,10 +606,10 @@ def _scroll(
 
     # Session existence check
     try:
-        session_meta = db.get_session(session_id) or {}
+        session_meta = db.get_session(session_id)
     except Exception as e:
-        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
-        session_meta = {}
+        logging.error("get_session failed for %s: %s", session_id, e, exc_info=True)
+        return tool_error(f"failed to load session: {e}", success=False)
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
