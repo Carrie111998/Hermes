@@ -1734,10 +1734,29 @@ def _count_respawn_guarded(conn, task_id: str) -> int:
 
 
 def _make_active_pr_task(conn, title: str) -> str:
-    """Create a ready task with an OPEN (still-guarded) PR comment."""
+    """Create a ready task with an OPEN (still-guarded) PR comment.
+
+    Seeds a prior run under the comment author's profile so the composed
+    guard (own-worker author restriction, t_ac710e3f) admits the PR scan —
+    the throttle under test (t_1ccac654) operates on the composed guard.
+    The run profile is the task's assignee (claim_task records it), so the
+    PR comment must be authored by the assignee to count as own-worker.
+    """
     t = kb.create_task(conn, title=title, assignee="alice")
+    kb.claim_task(conn, t)
+    run_id = kb.get_task(conn, t).current_run_id
+    conn.execute(
+        "UPDATE task_runs SET outcome='completed', status='completed', "
+        "ended_at=? WHERE id=?",
+        (int(time.time()) - 7200, run_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', current_run_id=NULL, "
+        "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+        (t,),
+    )
     kb.add_comment(
-        conn, t, "worker",
+        conn, t, "alice",
         "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
     )
     return t
