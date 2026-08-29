@@ -66,6 +66,12 @@ export interface PinEngineReport {
   /** Markers are painted out and the page is fully released. Set while the
    *  panel is closed, so a reopen knows to repaint rather than re-place. */
   hidden: boolean
+  /** Ids of images whose bytes the page is still holding. The app drains these
+   *  after every verb — the page is a bad place to keep megabytes, and a
+   *  navigation would take them with it. */
+  pendingShots?: string[]
   pins: PreviewPin[]
+  /** Full bytes, only in the answer to a `take`. */
+  shot?: null | string
   url: string
 }

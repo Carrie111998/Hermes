@@ -220,6 +220,110 @@ describe('managing pins', () => {
   })
 })
 
+/**
+ * The drain contract, which is all of this that jsdom can judge: it has no
+ * canvas and never fires `Image.onload`, so pasting, downscaling and the strip
+ * itself are only meaningful in `scripts/check-preview-pins.mjs`. What is
+ * testable here is the rule those parts depend on — bytes leave the page once,
+ * and never ride in a report.
+ */
+describe('attached images', () => {
+  /** Stand in for a paste, whose async half needs a real browser. */
+  function fakeShot(pinId: string, shotId: string, bytes = 'data:image/jpeg;base64,AAAA') {
+    const state = holder.__hermesPinState as {
+      pending: string[]
+      pins: Record<string, unknown>[]
+      shotData: Record<string, string>
+    }
+
+    const pin = state.pins.find(entry => entry.id === pinId)!
+    pin.shots = ((pin.shots as unknown[]) ?? []).concat([
+      { h: 40, id: shotId, thumb: 'data:image/jpeg;base64,tiny', w: 60 }
+    ])
+    state.shotData[shotId] = bytes
+    state.pending.push(shotId)
+
+    return state
+  }
+
+  it('advertises what it is holding on every report, armed or not', () => {
+    const pin = placePin('#save', 'like this')
+    fakeShot(pin.id as string, 's1')
+
+    // Not only while annotating: an image pasted and then abandoned still has
+    // to get out before the page goes away.
+    expect(run({ verb: 'state' }).pendingShots).toEqual(['s1'])
+    expect(run({ verb: 'hide' }).pendingShots).toEqual(['s1'])
+  })
+
+  it('hands the bytes over once and forgets them', () => {
+    const pin = placePin('#save')
+    fakeShot(pin.id as string, 's1', 'data:image/jpeg;base64,PAYLOAD')
+
+    const first = run({ id: 's1', verb: 'take' })
+    expect(first.shot).toBe('data:image/jpeg;base64,PAYLOAD')
+    expect(first.pendingShots).toEqual([])
+
+    // Asked twice — a re-render, a double poll — it must not resurrect them.
+    expect(run({ id: 's1', verb: 'take' }).shot).toBeNull()
+  })
+
+  it('never carries the bytes in an ordinary read', () => {
+    const pin = placePin('#save')
+    fakeShot(pin.id as string, 's1', 'data:image/jpeg;base64,PAYLOAD')
+
+    const state = run({ verb: 'state' })
+    // A megabyte of base64 crossing the bridge every 700ms is the difference
+    // between a panel that feels live and one that stutters.
+    expect(state.shot).toBeNull()
+    expect(JSON.stringify(state.pins)).not.toContain('PAYLOAD')
+    expect(JSON.stringify(state.pins)).toContain('tiny')
+  })
+
+  it('keeps the thumbnail on the pin, so the list can show it', () => {
+    const pin = placePin('#save')
+    fakeShot(pin.id as string, 's1')
+    const shots = run({ verb: 'state' }).pins[0].shots as { thumb: string }[]
+    expect(shots).toHaveLength(1)
+    expect(shots[0].thumb).toContain('data:image/jpeg')
+  })
+
+  it('drops undrained bytes along with the pin that owned them', () => {
+    const pin = placePin('#save')
+    const state = fakeShot(pin.id as string, 's1')
+    run({ id: pin.id as string, verb: 'remove' })
+    expect(state.shotData.s1).toBeUndefined()
+  })
+
+  it('drops them all on clear', () => {
+    const first = placePin('#save')
+    const second = placePin('#note')
+    const state = fakeShot(first.id as string, 's1')
+    fakeShot(second.id as string, 's2')
+
+    run({ verb: 'clear' })
+    expect(Object.keys(state.shotData)).toHaveLength(0)
+    expect(run({ verb: 'state' }).pendingShots).toEqual([])
+  })
+
+  it('marks a marker that carries one, so it is visible without opening it', () => {
+    const pin = placePin('#save')
+    fakeShot(pin.id as string, 's1')
+    // A real paste repaints as soon as the thumbnail lands; `state` is the read
+    // side and deliberately does not, so that polling stays cheap.
+    run({ verb: 'show' })
+    const marker = document.getElementById('hermes-pin-host')!.shadowRoot!.querySelector('.pin')
+    expect(marker?.className).toContain('shot')
+  })
+
+  it('survives a seeded state that predates images', () => {
+    // A pin book written before this existed has no shotData and no pending.
+    holder = { __hermesPinState: { armed: false, drag: null, pins: [], seq: 0 } }
+    expect(() => run({ verb: 'state' })).not.toThrow()
+    expect(run({ verb: 'state' }).pendingShots).toEqual([])
+  })
+})
+
 describe('surviving a rebuild', () => {
   it('re-attaches pins after the page is rebuilt', () => {
     placePin('#save', 'too much padding')

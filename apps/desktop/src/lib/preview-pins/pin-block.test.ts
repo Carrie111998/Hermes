@@ -193,7 +193,7 @@ describe('orderedShots', () => {
       pin({ createdAt: 1, id: 'a', shots: [shot('s1')] })
     ]))
 
-    expect(orderedShots(pins).map(entry => entry.shotId)).toEqual(['s1', 's2'])
+    expect(orderedShots(pins).map(entry => entry.shot.id)).toEqual(['s1', 's2'])
   })
 
   it('skips pins carrying no image', () => {

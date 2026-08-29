@@ -15,11 +15,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
-import { pinAttachmentLabel } from '@/lib/preview-pins/pin-block'
+import { dataUrlToBlob } from '@/lib/embedded-images'
+import { orderedShots, pinAttachmentLabel } from '@/lib/preview-pins/pin-block'
 import { allPins, mergeReport, otherPages, type PinBook, pinsForPage } from '@/lib/preview-pins/pin-book'
 import type { PreviewPin } from '@/lib/preview-pins/types'
 import { cn } from '@/lib/utils'
-import { addComposerAttachment } from '@/store/composer'
+import { addComposerAttachment, createComposerAttachmentOccurrenceId } from '@/store/composer'
 
 import {
   armPins,
@@ -30,6 +31,7 @@ import {
   reattachPins,
   removePin,
   showPins,
+  takeShot,
   togglePinResolved
 } from './preview-pins'
 
@@ -47,11 +49,24 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
   const book = useRef<PinBook>({})
   const [elsewhere, setElsewhere] = useState({ count: 0, pages: 0 })
 
+  /** Full image bytes, drained out of the page and owned here. */
+  const bytes = useRef<Map<string, string>>(new Map())
+
   const sync = useCallback(async (report: Awaited<ReturnType<typeof readPins>>) => {
     if (!report) {
       setLive(false)
 
       return
+    }
+
+    // Drain first, and after every verb rather than only while annotating: an
+    // image pasted and then left alone still has to get out of the page before
+    // the next navigation takes the page with it.
+    for (const id of report.pendingShots ?? []) {
+      if (bytes.current.has(id)) {continue}
+      const answer = await takeShot(id)
+
+      if (answer?.shot) {bytes.current.set(id, answer.shot)}
     }
 
     setLive(true)
@@ -64,15 +79,17 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
     setElsewhere(otherPages(book.current, report.url))
   }, [])
 
-  // Poll only while the panel is open AND armed. A background poll against a
-  // page the user is not annotating is a round trip into the guest document
-  // every beat for nothing.
+  // Poll while the panel is open — not only while armed. A marker stays
+  // clickable after disarming, so a comment can be edited or an image pasted
+  // with annotation mode off, and those bytes need draining too. Closed, this
+  // stops entirely: a poll against a page nobody is reviewing is a round trip
+  // into the guest document every beat for nothing.
   useEffect(() => {
-    if (!open || !armed) {return}
+    if (!open) {return}
     const timer = setInterval(() => void readPins().then(sync), POLL_MS)
 
     return () => clearInterval(timer)
-  }, [armed, open, sync])
+  }, [open, sync])
 
   // Closing the panel hands the page back. Without this the engine stays armed
   // behind a UI that is no longer on screen: the next click on a link is eaten
@@ -103,12 +120,23 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
     await sync(report)
   }
 
-  const attach = () => {
+  const attach = async () => {
     // The whole review, not just the page in front of us. Someone who commented
     // on the home page and then on a product page meant one request.
-    const sending = allPins(book.current).filter(pin => !pin.resolved)
+    const held = allPins(book.current).filter(pin => !pin.resolved)
+
+    // Drop any image whose bytes never reached us — a page closed before the
+    // drain, say. The block numbers images off this list and the attachments
+    // are built from the same walk, so pruning here keeps "[image 2]" and the
+    // second picture the same picture by construction.
+    const sending = held.map(pin => {
+      const shots = (pin.shots ?? []).filter(shot => bytes.current.has(shot.id))
+
+      return shots.length === (pin.shots?.length ?? 0) ? pin : { ...pin, shots }
+    })
 
     if (!sending.length) {return}
+
     addComposerAttachment({
       detail: JSON.stringify(sending),
       // Derived from the pins alone: once a batch spans pages, no single url
@@ -118,6 +146,41 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
       label: pinAttachmentLabel(sending),
       refText: `${sending.length} preview comment${sending.length === 1 ? '' : 's'}`
     })
+
+    // Then the pictures themselves, as ordinary image attachments — the same
+    // road a dropped screenshot takes, so nothing downstream needs to know
+    // these came from a pin.
+    let index = 0
+
+    for (const { shot } of orderedShots(sending)) {
+      index += 1
+      const data = bytes.current.get(shot.id)
+      const blob = data ? dataUrlToBlob(data) : null
+
+      if (!blob) {continue}
+
+      try {
+        const buffer = new Uint8Array(await blob.arrayBuffer())
+        const path = await window.hermesDesktop?.saveImageBuffer(buffer, blob.type === 'image/png' ? '.png' : '.jpg')
+
+        if (!path) {continue}
+
+        addComposerAttachment({
+          detail: path,
+          id: `pin-image:${shot.id}`,
+          kind: 'image',
+          // Matches the "[image 2]" marker in the block above.
+          label: `image ${index}`,
+          occurrenceId: createComposerAttachmentOccurrenceId(),
+          path,
+          thumbnailUrl: shot.thumb
+        })
+      } catch {
+        // One picture that would not stage is not worth losing the comments
+        // over; the block still describes what the user meant.
+        continue
+      }
+    }
   }
 
   const clearEverything = async () => {
@@ -165,7 +228,7 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
           <button
             className="rounded px-2 py-1 hover:bg-muted disabled:opacity-40"
             disabled={!openCount && !elsewhere.count}
-            onClick={attach}
+            onClick={() => void attach()}
             title="Add every open comment, across every page, to the composer"
             type="button"
           >
@@ -194,9 +257,21 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
               key={pin.id}
             >
               <span className="mt-0.5 font-mono text-muted-foreground">{index + 1}</span>
+              {/* The thumbnail the user pasted, at list size. Seeing it here is
+                  what makes the strip inside the bubble discoverable at all. */}
+              {pin.shots?.length ? (
+                <img
+                  alt=""
+                  className="mt-0.5 size-6 shrink-0 rounded-sm border border-border/60 object-cover"
+                  src={pin.shots[0].thumb}
+                />
+              ) : null}
               <div className="min-w-0 flex-1">
                 <div className="truncate font-medium">
                   {pin.target || 'region'}
+                  {(pin.shots?.length ?? 0) > 1 && (
+                    <span className="ms-1 text-muted-foreground">·{pin.shots!.length} images</span>
+                  )}
                   {/* A pin that came back on a weak rung is worth seeing. The
                       comment is still attached to something, but not to the
                       thing the page promised it. */}

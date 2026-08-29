@@ -117,3 +117,5 @@ export const commentPin = (id: string, comment: string) => pinVerb({ comment, id
 export const togglePinResolved = (id: string) => pinVerb({ id, verb: 'resolve' })
 export const removePin = (id: string) => pinVerb({ id, verb: 'remove' })
 export const clearPins = () => pinVerb({ verb: 'clear' })
+/** Take one attached image's bytes out of the page and leave nothing behind. */
+export const takeShot = (id: string) => pinVerb({ id, verb: 'take' })

@@ -14,7 +14,7 @@
  * Pure and dependency-free so it can be unit-tested without a page.
  */
 
-import type { PreviewPin } from './types'
+import type { PinShot, PreviewPin } from './types'
 
 /** Round a document fraction to something readable in a prompt. */
 function percent(value: number): string {
@@ -63,8 +63,8 @@ export function openPins(detail: string): PreviewPin[] {
  * that owns it, so this walk and the one that builds those attachments have to
  * produce the same order — hence one function, used by both.
  */
-export function orderedShots(pins: PreviewPin[]): { pin: PreviewPin; shotId: string }[] {
-  return pins.flatMap(pin => (pin.shots ?? []).map(shot => ({ pin, shotId: shot.id })))
+export function orderedShots(pins: PreviewPin[]): { pin: PreviewPin; shot: PinShot }[] {
+  return pins.flatMap(pin => (pin.shots ?? []).map(shot => ({ pin, shot })))
 }
 
 /** Group pins by the page they were placed on, keeping first-seen page order. */

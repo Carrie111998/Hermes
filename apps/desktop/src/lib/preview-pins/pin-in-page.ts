@@ -31,6 +31,7 @@ export type PinVerb =
   | 'resolve'
   | 'remove'
   | 'clear'
+  | 'take'
 
 export interface PinCommand {
   comment?: string
@@ -49,17 +50,39 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   const STATE_KEY = '__hermesPinState'
   const now = () => Date.now()
 
+  // Declared in here, not at module scope: this body is stringified into the
+  // guest page, where a reference to anything outside it is a ReferenceError
+  // reported only as "Script failed to execute".
+  //
+  // Longest edge of an attached image and of its thumbnail. A UI screenshot is
+  // legible far below its native size and the model reads it just as well.
+  const SHOT_MAX_EDGE = 1400
+  const THUMB_MAX_EDGE = 96
+  /** Enough for a before, an after and a reference. More in one comment is a
+   *  sign it wanted to be two comments. */
+  const MAX_SHOTS = 4
+
   const state = (holder[STATE_KEY] as Record<string, unknown> | undefined) ?? {
     armed: false,
     drag: null,
     hidden: false,
+    pending: [],
     pins: [],
-    seq: 0
+    seq: 0,
+    shotData: {}
   }
 
   holder[STATE_KEY] = state
 
+  // A seeded state predates these fields. Nothing else re-checks them, so this
+  // is the one place they are guaranteed to exist.
+  if (!state.shotData) {state.shotData = {}}
+
+  if (!state.pending) {state.pending = []}
+
   const pins = state.pins as Record<string, unknown>[]
+  const shotData = state.shotData as Record<string, string>
+  const pending = state.pending as string[]
 
   // ---- overlay -----------------------------------------------------------
 
@@ -97,7 +120,22 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
       '.bubble .row{display:flex;gap:6px;margin-top:7px}',
       '.bubble button{flex:1;padding:5px;border:1px solid #3a3733;border-radius:5px;',
       'background:#242220;color:#eae7e1;font:600 12px system-ui;cursor:pointer}',
-      '.bubble button.go{background:#d99a5b;color:#1c1b19;border-color:#d99a5b}'
+      '.bubble button:hover{background:#2e2b28}',
+      '.bubble button.go{background:#d99a5b;color:#1c1b19;border-color:#d99a5b}',
+      '.bubble button.add{flex:0 0 auto;padding:5px 9px}',
+      '.strip{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}',
+      '.strip figure{position:relative;margin:0;width:56px;height:42px;border-radius:4px;',
+      'overflow:hidden;border:1px solid #3a3733;background:#111}',
+      '.strip img{width:100%;height:100%;object-fit:cover;display:block}',
+      '.strip span{position:absolute;top:1px;inset-inline-end:1px;width:15px;height:15px;',
+      'line-height:14px;text-align:center;border-radius:50%;background:rgba(0,0,0,.72);',
+      'color:#fff;font:700 10px system-ui;cursor:pointer}',
+      '.hint{margin-top:6px;color:#8d8880;font:11px/1.4 system-ui}',
+      '.bubble.over{outline:2px dashed #d99a5b;outline-offset:2px}',
+      // A marker whose comment carries an image says so, so the strip is not a
+      // surprise waiting inside a bubble nobody reopens.
+      '.pin.shot::after{content:"";position:absolute;right:-2px;bottom:-2px;width:7px;',
+      'height:7px;border-radius:50%;background:#eae7e1;box-shadow:0 0 0 1.5px #1c1b19}'
     ].join('')
     root.append(style)
     doc.body.append(node)
@@ -134,7 +172,12 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     const root = shadow()
     pins.forEach((pin, index) => {
       const marker = doc.createElement('div')
-      marker.className = 'pin' + (pin.resolved ? ' resolved' : '') + (pin.orphaned ? ' orphan' : '')
+      const shots = (pin.shots as unknown[] | undefined) ?? []
+      marker.className =
+        'pin' +
+        (pin.resolved ? ' resolved' : '') +
+        (pin.orphaned ? ' orphan' : '') +
+        (shots.length ? ' shot' : '')
       marker.textContent = String(index + 1)
       marker.dataset.pin = String(pin.id)
 
@@ -165,6 +208,52 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
   const closeBubble = () => clearLayer('.bubble')
 
+  /**
+   * Shrink an image and hand back a data URL.
+   *
+   * Two passes per attachment: one bounded copy that goes to the model, one
+   * thumbnail small enough to ride in every state report and every navigation
+   * seed without being felt. A pasted retina screenshot is several megabytes
+   * and none of them buy the model anything.
+   */
+  const shrink = (
+    source: string,
+    edge: number,
+    quality: number,
+    done: (data: null | string, w: number, h: number) => void
+  ) => {
+    const image = new Image()
+
+    image.onload = () => {
+      const scale = Math.min(1, edge / Math.max(1, Math.max(image.width, image.height)))
+      const w = Math.max(1, Math.round(image.width * scale))
+      const h = Math.max(1, Math.round(image.height * scale))
+      const canvas = doc.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+
+      // No 2D context means no canvas at all (jsdom, a locked-down page). The
+      // original is worse but correct; refusing the paste would be worse still.
+      if (!ctx) {
+        done(source, image.width || w, image.height || h)
+
+        return
+      }
+
+      ctx.drawImage(image, 0, 0, w, h)
+
+      try {
+        done(canvas.toDataURL('image/jpeg', quality), w, h)
+      } catch {
+        done(source, w, h)
+      }
+    }
+
+    image.onerror = () => done(null, 0, 0)
+    image.src = source
+  }
+
   const openBubble = (pinId: string, left: number, top: number) => {
     closeBubble()
     const pin = pins.find(entry => entry.id === pinId)
@@ -173,47 +262,194 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     const view = doc.defaultView
     const bubble = doc.createElement('div')
     bubble.className = 'bubble'
-    // Keep the bubble on screen when the pin is near the right or bottom edge.
-    const maxLeft = (view ? view.innerWidth : 800) - 262
-    const maxTop = (view ? view.innerHeight : 600) - 140
-    bubble.style.left = Math.max(8, Math.min(left, maxLeft)) + 'px'
-    bubble.style.top = Math.max(8, Math.min(top, maxTop)) + 'px'
+
+    /**
+     * Put the bubble where it fits.
+     *
+     * Measured after every change rather than clamped against a guessed size:
+     * the bubble grows when an image is added, and a hardcoded height puts it
+     * half off the bottom of the window the moment it does.
+     */
+    const place = () => {
+      const box = bubble.getBoundingClientRect()
+      const vw = view ? view.innerWidth : 800
+      const vh = view ? view.innerHeight : 600
+      bubble.style.left = Math.max(8, Math.min(left, vw - (box.width || 250) - 8)) + 'px'
+      bubble.style.top = Math.max(8, Math.min(top, vh - (box.height || 140) - 8)) + 'px'
+    }
 
     const area = doc.createElement('textarea')
     area.value = String(pin.comment || '')
     area.placeholder = 'What should change here?'
+
+    const strip = doc.createElement('div')
+    strip.className = 'strip'
+
+    const hint = doc.createElement('div')
+    hint.className = 'hint'
+    hint.textContent = 'Paste or drop an image · ⌘/Ctrl+Enter to save'
+
+    const shotsOf = () => (pin.shots as Record<string, unknown>[] | undefined) ?? []
+
+    const drawStrip = () => {
+      strip.textContent = ''
+
+      for (const shot of shotsOf()) {
+        const figure = doc.createElement('figure')
+        const thumb = doc.createElement('img')
+        thumb.src = String(shot.thumb || '')
+        const drop = doc.createElement('span')
+        drop.textContent = '×'
+        drop.title = 'Remove image'
+        drop.addEventListener('click', event => {
+          event.stopPropagation()
+          const list = shotsOf().filter(entry => entry.id !== shot.id)
+          pin.shots = list
+          delete shotData[String(shot.id)]
+          drawStrip()
+          paint()
+        })
+        figure.append(thumb, drop)
+        strip.append(figure)
+      }
+
+      place()
+    }
+
+    /** Take a File list from a paste, a drop or the picker. */
+    const ingest = (files: ArrayLike<File> | null) => {
+      if (!files) {return}
+
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index]
+
+        if (!file || !String(file.type || '').startsWith('image/')) {continue}
+
+        if (shotsOf().length >= MAX_SHOTS) {
+          hint.textContent = 'Up to ' + MAX_SHOTS + ' images per comment'
+
+          break
+        }
+
+        const reader = new FileReader()
+
+        reader.onload = () => {
+          const source = String(reader.result || '')
+
+          if (!source) {return}
+          shrink(source, SHOT_MAX_EDGE, 0.85, (full, w, h) => {
+            if (!full) {return}
+            shrink(full, THUMB_MAX_EDGE, 0.5, thumb => {
+              const id = 'shot-' + now().toString(36) + '-' + Math.round(Math.random() * 1e6).toString(36)
+              // The bytes stay here only until the app drains them; the pin
+              // itself never carries more than the thumbnail.
+              shotData[id] = full
+              pending.push(id)
+              pin.shots = shotsOf().concat([{ h, id, thumb: thumb || full, w }])
+              drawStrip()
+              paint()
+            })
+          })
+        }
+
+        reader.readAsDataURL(file)
+      }
+    }
+
+    const picker = doc.createElement('input')
+    picker.type = 'file'
+    picker.accept = 'image/*'
+    picker.multiple = true
+    picker.style.display = 'none'
+    picker.addEventListener('change', () => {
+      ingest(picker.files)
+      picker.value = ''
+    })
+
     const row = doc.createElement('div')
     row.className = 'row'
+    const add = doc.createElement('button')
+    add.className = 'add'
+    add.title = 'Attach an image'
+    add.textContent = '＋'
     const save = doc.createElement('button')
     save.className = 'go'
     save.textContent = 'Save'
-    const drop = doc.createElement('button')
-    drop.textContent = 'Delete'
+    const remove = doc.createElement('button')
+    remove.textContent = 'Delete'
 
+    add.addEventListener('click', event => {
+      event.stopPropagation()
+      picker.click()
+    })
     save.addEventListener('click', event => {
       event.stopPropagation()
       pin.comment = area.value
       closeBubble()
       paint()
     })
-    drop.addEventListener('click', event => {
+    remove.addEventListener('click', event => {
       event.stopPropagation()
       const index = pins.findIndex(entry => entry.id === pinId)
 
-      if (index !== -1) {pins.splice(index, 1)}
+      if (index !== -1) {
+        for (const shot of shotsOf()) {delete shotData[String(shot.id)]}
+        pins.splice(index, 1)
+      }
+
       closeBubble()
       paint()
     })
 
+    // Keep the comment as it is typed. Losing a paragraph to an Escape pressed
+    // out of habit is not a trade worth making for a tidier save path.
+    area.addEventListener('input', () => {
+      pin.comment = area.value
+    })
+
     // Typing in the page must not reach the page. A review comment containing
     // "d" should not trigger the app's own keyboard shortcut for it.
-    for (const type of ['keydown', 'keyup', 'keypress']) {
+    for (const type of ['keydown', 'keyup', 'keypress', 'paste']) {
       area.addEventListener(type, event => event.stopPropagation())
     }
 
-    row.append(save, drop)
-    bubble.append(area, row)
+    area.addEventListener('keydown', event => {
+      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        event.preventDefault()
+        pin.comment = area.value
+        closeBubble()
+        paint()
+      }
+    })
+
+    area.addEventListener('paste', event => {
+      const data = (event as ClipboardEvent).clipboardData
+      const files = data ? data.files : null
+
+      if (!files || !files.length) {return}
+      // Otherwise the filename lands in the textarea as text next to the image.
+      event.preventDefault()
+      ingest(files)
+    })
+
+    bubble.addEventListener('dragover', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      bubble.classList.add('over')
+    })
+    bubble.addEventListener('dragleave', () => bubble.classList.remove('over'))
+    bubble.addEventListener('drop', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      bubble.classList.remove('over')
+      const data = (event as DragEvent).dataTransfer
+      ingest(data ? data.files : null)
+    })
+
+    row.append(add, save, remove)
+    bubble.append(area, strip, hint, row, picker)
     shadow().append(bubble)
+    drawStrip()
     area.focus()
   }
 
@@ -449,6 +685,9 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     state.wired = true
   }
 
+  /** Full image bytes, for the one verb that asks for them. */
+  let taken: null | string = null
+
   switch (command.verb) {
     case 'arm':
       arm()
@@ -494,7 +733,14 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
     case 'remove': {
       const index = pins.findIndex(entry => entry.id === command.id)
 
-      if (index !== -1) {pins.splice(index, 1)}
+      if (index !== -1) {
+        for (const shot of (pins[index].shots as Record<string, unknown>[] | undefined) ?? []) {
+          delete shotData[String(shot.id)]
+        }
+
+        pins.splice(index, 1)
+      }
+
       paint()
 
       break
@@ -502,10 +748,30 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
 
     case 'clear':
       pins.splice(0, pins.length)
+
+      for (const key of Object.keys(shotData)) {delete shotData[key]}
+      pending.splice(0, pending.length)
       closeBubble()
       paint()
 
       break
+    /**
+     * Hand one image's bytes to the app and forget them here.
+     *
+     * The page is a bad place to keep megabytes: a navigation drops them, and
+     * anything still here rides along in the next state report. The app takes
+     * them the moment it hears about them and becomes the only owner.
+     */
+    case 'take': {
+      const id = String(command.id ?? '')
+      taken = shotData[id] ?? null
+      delete shotData[id]
+      const slot = pending.indexOf(id)
+
+      if (slot !== -1) {pending.splice(slot, 1)}
+
+      break
+    }
 
     case 'state':
 
@@ -516,7 +782,12 @@ export function pinEngineCore(doc: Document, holder: Record<string, unknown>, co
   return {
     armed: state.armed === true,
     hidden: state.hidden === true,
+    // Announced on EVERY report, not just while annotating. An image pasted
+    // and then left alone — Escape, or the panel closed — still has to reach
+    // the app before the next navigation drops the page holding it.
+    pendingShots: pending.slice(),
     pins: JSON.parse(JSON.stringify(pins)),
+    shot: taken,
     url: doc.location ? doc.location.href : ''
   }
 }
