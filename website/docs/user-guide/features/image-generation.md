@@ -40,6 +40,31 @@ If the managed gateway returns `HTTP 4xx` for a specific model, that model isn't
 1. Sign up at [fal.ai](https://fal.ai/)
 2. Generate an API key from your dashboard
 
+### Google AI Studio (direct)
+
+If you have a Google AI Studio key, Hermes can call Gemini's native image
+endpoint directly — no FAL, OpenRouter, or Nous Portal account is required.
+Set either `GOOGLE_API_KEY` or `GEMINI_API_KEY`, then choose **Google AI
+Studio (direct)** under **🎨 Image Generation** in `hermes tools`.
+
+The direct backend offers these models:
+
+| Model | Strengths |
+|---|---|
+| `gemini-3-pro-image-preview` | Nano Banana Pro; highest fidelity and editing |
+| `gemini-2.5-flash-image` | Nano Banana; faster generation and editing |
+
+The selection is stored as:
+
+```yaml
+image_gen:
+  provider: gemini
+  gemini:
+    model: gemini-3-pro-image-preview
+```
+
+You can override the model for scripts with `GEMINI_IMAGE_MODEL`.
+
 ### Configure and Pick a Model
 
 Run the tools command:
@@ -67,7 +92,7 @@ image_gen:
   max_parallel_requests: 4      # concurrent images in one tool-call batch
 ```
 
-`image_gen.provider` is the single selection key: `nous` routes through the managed Tool Gateway; a vendor name (`fal`, `openai`, `xai`, `krea`, ...) goes direct with your own key. The runtime always follows this stored selection — a `FAL_KEY` in `.env` is ignored while `provider: nous`, and `provider: fal` without `FAL_KEY` errors with `image_gen is configured to use fal (set via hermes tools), but FAL_KEY is not set. Run 'hermes tools' to change it.` rather than silently rerouting. Change providers via `hermes tools`, not by adding/removing keys. (The old `use_gateway` boolean is legacy — still read as `nous` when `true`, but never written anymore.)
+`image_gen.provider` is the single selection key: `nous` routes through the managed Tool Gateway; a vendor name (`fal`, `gemini`, `openai`, `xai`, `krea`, ...) goes direct with your own key. The runtime always follows this stored selection — a `FAL_KEY` in `.env` is ignored while `provider: nous`, and `provider: fal` without `FAL_KEY` errors with `image_gen is configured to use fal (set via hermes tools), but FAL_KEY is not set. Run 'hermes tools' to change it.` rather than silently rerouting. Change providers via `hermes tools`, not by adding/removing keys. (The old `use_gateway` boolean is legacy — still read as `nous` when `true`, but never written anymore.)
 
 `max_parallel_requests` defaults to `4`. Hermes clamps it to at least one and
 to the global tool-worker limit, so image providers receive bounded parallel
@@ -150,6 +175,7 @@ Two inputs drive the edit:
 | **Krea** (`Krea 2`) | ✓ | up to 10 | reference-guided generation (`image_style_references`) |
 | **OpenAI (Codex auth)** | ✓ | up to 16 | Codex Responses `image_generation` tool with `input_image` content parts |
 | **OpenRouter** (Image API models) | ✓ | up to 14–16 (per model) | `input_references` on `POST /images/generations`; chat-served models use `image_url` content parts (up to 3) |
+| **Google AI Studio** (Gemini image models) | ✓ | up to 3 | Native Gemini `generateContent` with `inlineData` image parts |
 
 FAL models with an editing endpoint: `flux-2/klein/9b`, `flux-2-pro`,
 `nano-banana-pro`, `gpt-image-1.5`, `gpt-image-2`, `ideogram/v3`, and
@@ -256,7 +282,7 @@ Debug logs go to `./logs/image_tools_debug_<session_id>.json` with per-call deta
 
 ## Limitations
 
-- **Requires credentials** for the active backend (FAL `FAL_KEY` / Nous Subscription, `OPENAI_API_KEY`, xAI OAuth, `KREA_API_KEY`)
+- **Requires credentials** for the active backend (FAL `FAL_KEY` / Nous Subscription, Google `GOOGLE_API_KEY` or `GEMINI_API_KEY`, `OPENAI_API_KEY`, xAI OAuth, `KREA_API_KEY`)
 - **Editing is model-dependent** — image-to-image works only on edit-capable models (see the table above); text-to-image-only models reject image inputs with a clear error
 - **Temporary URLs** — backends return hosted URLs that expire after hours/days; Hermes materializes them to the local cache so delivery still works after expiry
 - **Per-model constraints** — some models don't support `seed`, `num_inference_steps`, etc. The `supports` / `edit_supports` filter silently drops unsupported params; this is expected behavior
