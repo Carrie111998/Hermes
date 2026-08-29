@@ -96,6 +96,7 @@ class TestDetectDefaultDarwin:
         "bundle,expected",
         [
             ("com.google.Chrome", "chrome"),
+            ("company.thebrowser.Dia", "dia"),
             ("com.brave.Browser", "brave"),
             ("com.microsoft.edgemac", "edge"),
             ("org.chromium.Chromium", "chromium"),
