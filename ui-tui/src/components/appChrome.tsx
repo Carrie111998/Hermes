@@ -484,6 +484,9 @@ export function StatusRule({
   sessionStartedAt,
   turnStartedAt,
   voiceLabel,
+  yolo,
+  yoloSource,
+  hideYoloBadge,
   onSessionCountClick,
   t
 }: StatusRuleProps) {
@@ -503,6 +506,16 @@ export function StatusRule({
 
   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
+
+  // YOLO / approval-bypass reminder. This is a SAFETY affordance: while a
+  // bypass is live, dangerous-command auto-approval is in effect, so the full
+  // warning must always be visible and can never be allowed to clip to `⚠ YO`
+  // or vanish under load. It is therefore treated as a pinned essential (below)
+  // and rendered AHEAD of model/context so it is the LAST thing to yield, not
+  // the first. `hide_yolo_badge` is a purely visual opt-out — it suppresses the
+  // reminder only, never the underlying bypass (the gateway still reports
+  // yolo=true and approvals behave exactly as configured).
+  const yoloBadgeText = yolo && !hideYoloBadge ? (yoloSource === 'config' ? '⚠ APPROVALS OFF' : '⚠ YOLO') : ''
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery = !!battery && battery.available && battery.percent != null
@@ -537,6 +550,10 @@ export function StatusRule({
     stringWidth('─ ') +
     batteryWidth +
     slotWidth +
+    // The YOLO badge is pinned AHEAD of model/context (it renders first below),
+    // so reserve its full width here — this is what guarantees the complete
+    // `⚠ YOLO` survives on a narrow terminal instead of clipping to `⚠ YO`.
+    (yoloBadgeText ? stringWidth(' │ ') + stringWidth(yoloBadgeText) : 0) +
     stringWidth(' │ ') +
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
@@ -655,8 +672,18 @@ export function StatusRule({
             </Text>
           </Box>
         ) : null}
-        {/* Pinned essentials — model + context never shrink, always visible. */}
+        {/* Pinned essentials — the YOLO safety badge, model, and context never
+            shrink and are always visible. The badge renders FIRST so, if the
+            terminal is too narrow for everything, model/context yield before the
+            warning ever clips (a bypass reminder that reads `⚠ YO` or vanishes
+            defeats its purpose). */}
         <Box flexDirection="row" flexShrink={0}>
+          {yoloBadgeText ? (
+            <Text color={t.color.warn} wrap="truncate-end">
+              {' │ '}
+              {yoloBadgeText}
+            </Text>
+          ) : null}
           {DEV_CREDITS_MODE ? (
             <Text color={t.color.warn} wrap="truncate-end">
               {' (dev credits)'}
@@ -877,6 +904,9 @@ interface StatusRuleProps {
   turnStartedAt?: null | number
   usage: Usage
   voiceLabel?: string
+  yolo?: boolean
+  yoloSource?: string
+  hideYoloBadge?: boolean
   onSessionCountClick?: () => void
 }
 
