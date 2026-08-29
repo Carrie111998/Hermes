@@ -67,11 +67,6 @@ class _ToThreadSpy:
 
 
 @pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
 def _isolated_config(tmp_path, monkeypatch):
     """Point the handler at an empty isolated home so config loading is cheap
     and deterministic (no real provider creds / network)."""
@@ -90,7 +85,7 @@ def _isolated_config(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_text_fallback_forwards_provider_scoped_exclusions(
     _isolated_config,
     monkeypatch,
@@ -156,7 +151,7 @@ class _FakePickerAdapter:
         return None
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_picker_path_offloads_list_picker_providers(_isolated_config, monkeypatch):
     """A picker-capable adapter => handler takes the picker branch, which must
     offload ``list_picker_providers`` to a worker thread."""
@@ -193,7 +188,7 @@ async def test_picker_path_offloads_list_picker_providers(_isolated_config, monk
     )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_picker_path_forwards_provider_scoped_exclusions(
     _isolated_config,
     monkeypatch,

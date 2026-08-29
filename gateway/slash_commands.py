@@ -40,7 +40,13 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_cli.config import (
+    atomic_config_write,
+    cfg_get,
+    clear_model_endpoint_credentials,
+    coerce_provider_id,
+    stringify_provider_map,
+)
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -1819,10 +1825,12 @@ class GatewaySlashCommandsMixin:
             if cfg:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("default", "")
-                    current_provider = model_cfg.get("provider", current_provider)
-                    current_base_url = model_cfg.get("base_url", "")
-                user_provs = cfg.get("providers")
+                    current_model = str(model_cfg.get("default", "") or "")
+                    current_provider = coerce_provider_id(
+                        model_cfg.get("provider", current_provider)
+                    )
+                    current_base_url = str(model_cfg.get("base_url", "") or "")
+                user_provs = stringify_provider_map(cfg.get("providers"))
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
                     custom_provs = get_compatible_custom_providers(cfg)
