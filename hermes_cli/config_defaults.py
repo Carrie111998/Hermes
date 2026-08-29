@@ -54,6 +54,17 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Per-session billed-token fuse (#96814). 0/null = disabled (default).
+        # Counted as CanonicalUsage.total_tokens: fresh input + cache read +
+        # cache write + output, accumulated across the session (not per turn).
+        # When crossed, the conversation loop ends the turn BEFORE the next
+        # provider call with end_reason token_hard_stop.
+        "session_token_hard_stop": None,
+        # Optional absolute billed-token warn threshold. When unset and a
+        # hard stop is set, a one-time system notice fires at 80% of the
+        # ceiling so the model can wind down. 0/null with no hard stop =
+        # no warn.
+        "session_token_warn": None,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

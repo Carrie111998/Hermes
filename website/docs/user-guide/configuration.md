@@ -1108,6 +1108,22 @@ When a budget is set, two things happen:
 
 The budget is per `run_conversation` turn (it resets on each user message) and the feature is completely dormant when unset — no clock reads, no injection, no timeout changes.
 
+## Session Token Hard Stop
+
+`max_turns` resets every user message, so it cannot bound a runaway conversation — only a runaway turn. `session_token_hard_stop` is a **per-session billed-token fuse**:
+
+```yaml
+agent:
+  session_token_hard_stop: 5000000   # null/0/unset = disabled (default)
+  session_token_warn: 4000000        # optional; default is 80% of the hard stop
+```
+
+**Formula:** billed tokens = fresh input + cache-read + cache-write + output (the same split Hermes already accumulates as `session_input_tokens`, `session_cache_*_tokens`, and `session_output_tokens`). Cache reads are included because they are billed and dominate long-session cost.
+
+When the ceiling is crossed, the conversation loop ends the turn **before** the next provider call with a visible `token_hard_stop` exit reason. It does not spend an extra wrap-up API call.
+
+Older unused names (`agent.gateway_usage_hard_api_calls`, `gateway_usage_hard_tokens`, and their warn variants) are **not** implemented. Setting them warns at config load so a safety key is never silently inert.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.
