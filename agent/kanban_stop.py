@@ -1,7 +1,10 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
-(especially GLM / Qwen families) sometimes narrate the next step
+Kanban workers must end their run with a terminal board tool:
+``kanban_complete``, ``kanban_block``, ``kanban_request_review`` (ends the
+implementation run; the card moves to the review lane), or
+``kanban_request_changes`` (ends a review run; the card returns for rework).
+Models (especially GLM / Qwen families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 ``protocol_violation``.
@@ -17,7 +20,17 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    # request_review / request_changes are documented run-enders in the
+    # worker system prompt (KANBAN_GUIDANCE §5) and in the board state
+    # machine: request_review leaves the card in review (the dispatcher's
+    # clean-exit check only flags tasks still ``running``), and
+    # request_changes closes the review run and re-queues rework (#98107).
+    "kanban_request_review",
+    "kanban_request_changes",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -90,12 +103,17 @@ def build_kanban_stop_nudge(
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
         f"Task `{tid}` is still `running`. Ending now without a board tool "
-        "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block`).\n\n"
+        "causes a protocol violation (clean exit with no terminal kanban "
+        "call).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done; `kanban_request_review(summary=..., metadata=...)` if the "
+        "card needs review before it is final; `kanban_request_changes"
+        "(reason=...)` if you are the reviewer sending it back for rework; "
+        "OR `kanban_block(reason=...)` if you are blocked. If a lifecycle "
+        "call already succeeded, do not repeat it — pick the one legal "
+        "transition for the card's current column.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

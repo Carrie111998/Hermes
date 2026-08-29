@@ -74,6 +74,84 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_after_kanban_request_review(clear_kanban_env):
+    # #98107: a worker that ends its turn right after a successful
+    # kanban_request_review (card moves to the review lane) must not be
+    # nudged — the only tool the old nudge taught, kanban_complete, fails
+    # on an already-review card with "unknown id or already terminal".
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_4a177ae4")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Implementation finished; handing off for review.",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_request_review",
+                        "arguments": '{"summary": "implemented and verified"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "tool_call_id": "1",
+            "content": "review requested",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_no_nudge_after_kanban_request_changes(clear_kanban_env):
+    # Review workers run under HERMES_KANBAN_TASK too; request_changes is
+    # the documented ender for a review run (card returns for rework).
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_request_changes",
+                        "arguments": '{"reason": "missing test coverage"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_changes",
+            "tool_call_id": "1",
+            "content": "changes requested",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_nudge_lists_all_run_enders(clear_kanban_env):
+    # The nudge must teach every legal run-ender, not just
+    # kanban_complete/kanban_block, or a nudged worker on an already-review
+    # card burns turns on impossible kanban_complete calls (#98107).
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    nudge = build_kanban_stop_nudge(messages=[], attempts=0)
+    assert nudge is not None
+    for tool in (
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+    ):
+        assert tool in nudge
+
+
 
 
 
