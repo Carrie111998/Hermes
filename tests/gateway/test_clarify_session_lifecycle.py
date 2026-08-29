@@ -283,16 +283,15 @@ def test_turn_runner_old_unwind_preserves_new_generation_clarify():
         assert new_waiter.result(timeout=2.0) == "new"
 
 
-def test_turn_runner_teardown_before_clarify_registration_fences_stale_prompt():
-    """A stopped turn cannot register after its generation teardown finished."""
-    from gateway.run import TurnRunner
+def test_turn_runner_interrupt_fence_before_clear_blocks_late_registration():
+    """The interrupt boundary fences admission before clearing old waiters."""
+    from gateway.run import TurnRunner, _fence_and_clear_pending_clarify
     from gateway.turn_context import TurnContext
     from tools import clarify_gateway as cm
 
     register_entered = threading.Event()
     allow_register = threading.Event()
-    turn_alive = threading.Event()
-    turn_alive.set()
+    agent_instances = []
     original_register = cm.register
 
     def _register_after_teardown(*args, **kwargs):
@@ -302,15 +301,21 @@ def test_turn_runner_teardown_before_clarify_registration_fences_stale_prompt():
 
     class _ClarifyingAgent:
         def __init__(self, **kwargs):
+            agent_instances.append(self)
             self.model = kwargs["model"]
             self.session_id = kwargs["session_id"]
             self.tools = []
+            self._interrupt_requested = False
             self.context_compressor = SimpleNamespace(
                 last_prompt_tokens=0,
                 context_length=200_000,
             )
             self.session_prompt_tokens = 0
             self.session_completion_tokens = 0
+
+        @property
+        def is_interrupted(self):
+            return self._interrupt_requested
 
         def run_conversation(self, _message, **_kwargs):
             response = self.clarify_callback("Pick", ["A"])
@@ -360,7 +365,7 @@ def test_turn_runner_teardown_before_clarify_registration_fences_stale_prompt():
         user_config={},
         AIAgent=_ClarifyingAgent,
         resolve_display_setting=lambda *_args: False,
-        _run_still_current=turn_alive.is_set,
+        _run_still_current=lambda: True,
         _hooks_ref=SimpleNamespace(loaded_hooks=False),
         _status_adapter=MagicMock(),
         _status_chat_id="123456",
@@ -376,12 +381,19 @@ def test_turn_runner_teardown_before_clarify_registration_fences_stale_prompt():
     ):
         old_run = pool.submit(TurnRunner(runner, ctx).run_sync)
         assert register_entered.wait(2.0)
-        turn_alive.clear()
-        assert cm.clear_session(session_key, run_generation=1) == 0
+        assert agent_instances
+        assert (
+            _fence_and_clear_pending_clarify(
+                agent_instances[0],
+                session_key,
+                run_generation=1,
+            )
+            == 0
+        )
         allow_register.set()
         result = old_run.result(timeout=2.0)
 
-    assert "no longer active" in result["final_response"]
+    assert "interrupted" in result["final_response"]
     assert not cm.has_pending(session_key)
 
 

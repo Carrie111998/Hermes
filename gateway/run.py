@@ -1018,6 +1018,24 @@ def _clear_pending_clarify_session(
         return 0
 
 
+def _fence_and_clear_pending_clarify(
+    agent: Any,
+    session_key: str,
+    *,
+    run_generation: Optional[int] = None,
+) -> int:
+    """Close clarify admission before waking this interrupted turn's waiter."""
+    if agent is not None:
+        try:
+            agent._gateway_clarify_admission_closed = True
+        except Exception:
+            logger.debug("Failed to fence clarify admission", exc_info=True)
+    return _clear_pending_clarify_session(
+        session_key,
+        run_generation=run_generation,
+    )
+
+
 def _clear_all_pending_clarifies() -> int:
     """Invalidate process-local clarify state before gateway teardown."""
     try:
@@ -3528,7 +3546,8 @@ def _abandon_timed_out_gateway_turn(
     agent = agent_holder[0] if agent_holder else None
     if agent is not None:
         try:
-            _clear_pending_clarify_session(
+            _fence_and_clear_pending_clarify(
+                agent,
                 session_key or "",
                 run_generation=run_generation,
             )
@@ -6156,6 +6175,8 @@ class TurnRunner:
                 except Exception:
                     return "[clarify unavailable because this turn is no longer active]"
                 _agent = ctx.agent_holder[0] if ctx.agent_holder else None
+                if getattr(_agent, "_gateway_clarify_admission_closed", False) is True:
+                    return "[clarify unavailable because this turn was interrupted]"
                 if getattr(_agent, "is_interrupted", False) is True:
                     return "[clarify unavailable because this turn was interrupted]"
                 return None
@@ -6303,6 +6324,7 @@ class TurnRunner:
                     )
             return _clarify_response
 
+        agent._gateway_clarify_admission_closed = False
         agent.clarify_callback = _clarify_callback_sync
 
         # Show assistant thinking between tool calls — independent of
@@ -10809,7 +10831,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif not _interrupt_text and _media_urls:
                     _interrupt_text = _build_media_placeholder(event)
-                _clear_pending_clarify_session(
+                _fence_and_clear_pending_clarify(
+                    running_agent,
                     session_key,
                     run_generation=_busy_run_generation,
                 )
@@ -11055,7 +11078,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
-                _clear_pending_clarify_session(session_key)
+                _fence_and_clear_pending_clarify(agent, session_key)
                 request_hard_interrupt(agent, reason)
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
@@ -18306,7 +18329,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
-            _clear_pending_clarify_session(
+            _fence_and_clear_pending_clarify(
+                running_agent,
                 _quick_key,
                 run_generation=_running_generation,
             )
@@ -27817,9 +27841,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # A clarify wait blocks inside the agent worker.  Wake it before
         # requesting interruption so /stop, /new, and equivalent control
         # paths never leave an orphan waiter behind the interrupted turn.
-        _clear_pending_clarify_session(session_key)
         _iac_state = self._peek_session_state(session_key)
         running_agent = _iac_state.turn.agent if _iac_state else None
+        _fence_and_clear_pending_clarify(running_agent, session_key)
         _process_task_id = ""
         _process_baseline = None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
@@ -29952,7 +29976,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 elif not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
-                            _clear_pending_clarify_session(
+                            _fence_and_clear_pending_clarify(
+                                agent,
                                 session_key,
                                 run_generation=run_generation,
                             )
@@ -30245,7 +30270,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _clear_pending_clarify_session(
+                            _fence_and_clear_pending_clarify(
+                                _backup_agent,
                                 session_key,
                                 run_generation=run_generation,
                             )
@@ -30353,7 +30379,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _clear_pending_clarify_session(
+                            _fence_and_clear_pending_clarify(
+                                _backup_agent,
                                 session_key,
                                 run_generation=run_generation,
                             )
@@ -30391,7 +30418,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
                 if _timed_out_agent:
-                    _clear_pending_clarify_session(
+                    _fence_and_clear_pending_clarify(
+                        _timed_out_agent,
                         session_key,
                         run_generation=run_generation,
                     )
