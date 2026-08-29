@@ -59,6 +59,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__, __release_date__
+import hermes_cli.auth as auth_mod
 from hermes_cli.config import (
     build_cron_model_impact,
     cfg_get,
@@ -14286,6 +14287,7 @@ async def list_credential_pool():
 
 
 @app.post("/api/credentials/pool")
+@auth_mod._pin_auth_authority
 async def add_credential_pool_entry(body: CredentialPoolAdd):
     import uuid as _uuid
     from agent.credential_pool import (
@@ -14338,6 +14340,7 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
 
 
 @app.delete("/api/credentials/pool/{provider}/{index}")
+@auth_mod._pin_auth_authority
 async def remove_credential_pool_entry(provider: str, index: int):
     """Remove a pool entry.  ``index`` is 1-based (matches the list response).
 

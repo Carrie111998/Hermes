@@ -28,6 +28,7 @@ import stat
 import sys
 import base64
 import hashlib
+import inspect
 import subprocess
 import threading
 import time
@@ -76,6 +77,7 @@ else:
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
@@ -85,6 +87,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
     read_raw_config,
+    read_user_config_raw,
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
@@ -92,6 +95,23 @@ from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+def _pin_auth_authority(operation: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a complete sync or async auth operation against one authority."""
+    if inspect.iscoroutinefunction(operation):
+        @wraps(operation)
+        async def pinned_async(*args: Any, **kwargs: Any) -> Any:
+            with _auth_authority_context():
+                return await operation(*args, **kwargs)
+        return pinned_async
+
+    @wraps(operation)
+    def pinned(*args: Any, **kwargs: Any) -> Any:
+        with _auth_authority_context():
+            return operation(*args, **kwargs)
+    return pinned
+
 
 try:
     import fcntl
@@ -896,6 +916,7 @@ def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str
         pool.shutdown(wait=False)
 
 
+@_pin_auth_authority
 def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> str:
     """Return the correct Z.AI base URL by probing endpoints.
 
@@ -1112,20 +1133,159 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+def _configured_auth_source_path() -> Optional[Path]:
+    """Resolve an explicit named-profile credential store.
+
+    API-only profiles can remain policy-isolated while sharing the credential
+    pool owned by another named profile. Reads, refreshes, status writes, and
+    locking must all target the same store; copying or read-only fallback would
+    split rotating OAuth state across profiles.
+    """
+    try:
+        raw_config = read_user_config_raw()
+    except Exception as error:
+        raise RuntimeError(
+            "Cannot safely resolve auth.source_profile because the active profile config is unreadable"
+        ) from error
+    auth_config = raw_config.get("auth") if isinstance(raw_config, dict) else None
+    source_profile = auth_config.get("source_profile") if isinstance(auth_config, dict) else None
+    if source_profile is None or not str(source_profile).strip():
+        return None
+    source_profile = str(source_profile).strip()
+    if not source_profile.replace("-", "").replace("_", "").isalnum():
+        raise RuntimeError("auth.source_profile must be a simple named profile")
+    from hermes_constants import get_default_hermes_root
+
+    profiles_root = (get_default_hermes_root() / "profiles").resolve(strict=True)
+    source_link = profiles_root / source_profile
+    try:
+        source_home = source_link.resolve(strict=True)
+        source_home.relative_to(profiles_root)
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise RuntimeError(f"Configured auth source profile does not exist or escapes profiles root: {source_profile}") from error
+    if source_link.is_symlink() or source_home.parent != profiles_root:
+        raise RuntimeError(f"Configured auth source profile escapes profiles root: {source_profile}")
+    active_home = get_hermes_home().resolve(strict=False)
+    if _same_path(source_home, active_home):
+        raise RuntimeError("auth.source_profile must not reference the active profile")
+    if not source_home.is_dir():
+        raise RuntimeError(f"Configured auth source profile does not exist: {source_profile}")
+    auth_path = source_home / "auth.json"
+    if auth_path.is_symlink():
+        raise RuntimeError(f"Configured auth source store must not be a symlink: {source_profile}")
+    if auth_path.exists() and not auth_path.is_file():
+        raise RuntimeError(f"Configured auth source store is not a regular file: {source_profile}")
+    try:
+        auth_path.resolve(strict=False).relative_to(source_home)
+    except ValueError as error:
+        raise RuntimeError(f"Configured auth source store escapes profile directory: {source_profile}") from error
+    return auth_path
+
+
+_AUTH_AUTHORITY_LOCAL = threading.local()
+
+
+def _resolve_auth_authority() -> Tuple[Path, Optional[Path]]:
+    """Resolve active and legacy-fallback auth paths exactly once."""
+    configured = _configured_auth_source_path()
+    active_path = configured or (get_hermes_home() / "auth.json")
+    if configured is not None:
+        return active_path, None
+    try:
+        from hermes_constants import get_default_hermes_root
+        global_root = get_default_hermes_root()
+    except Exception:
+        return active_path, None
+    profile_home = get_hermes_home()
+    try:
+        same_home = profile_home.resolve(strict=False) == global_root.resolve(strict=False)
+    except Exception:
+        same_home = profile_home == global_root
+    return active_path, None if same_home else global_root / "auth.json"
+
+
+@contextmanager
+def _auth_authority_context():
+    """Pin auth-store authority for one complete operation in one profile."""
+    previous = getattr(_AUTH_AUTHORITY_LOCAL, "value", None)
+    previous_home = getattr(_AUTH_AUTHORITY_LOCAL, "home", None)
+    current_home = get_hermes_home().resolve(strict=False)
+    replaced = previous is None or previous_home != current_home
+    if replaced:
+        _AUTH_AUTHORITY_LOCAL.value = _resolve_auth_authority()
+        _AUTH_AUTHORITY_LOCAL.home = current_home
+    try:
+        yield _AUTH_AUTHORITY_LOCAL.value
+    finally:
+        if replaced:
+            if previous is None:
+                for attribute in ("value", "home"):
+                    try:
+                        delattr(_AUTH_AUTHORITY_LOCAL, attribute)
+                    except AttributeError:
+                        pass
+            else:
+                _AUTH_AUTHORITY_LOCAL.value = previous
+                _AUTH_AUTHORITY_LOCAL.home = previous_home
+
+
+def _capture_auth_authority() -> Tuple[Tuple[Path, Optional[Path]], Path]:
+    """Capture the current profile's immutable auth authority for later use."""
+    with _auth_authority_context() as authority:
+        home = getattr(
+            _AUTH_AUTHORITY_LOCAL,
+            "home",
+            get_hermes_home().resolve(strict=False),
+        )
+        return authority, home
+
+
+@contextmanager
+def _use_auth_authority(
+    binding: Tuple[Tuple[Path, Optional[Path]], Path],
+):
+    """Temporarily restore a previously captured auth authority binding."""
+    previous = getattr(_AUTH_AUTHORITY_LOCAL, "value", None)
+    previous_home = getattr(_AUTH_AUTHORITY_LOCAL, "home", None)
+    authority, home = binding
+    _AUTH_AUTHORITY_LOCAL.value = authority
+    _AUTH_AUTHORITY_LOCAL.home = home
+    try:
+        yield authority
+    finally:
+        if previous is None:
+            for attribute in ("value", "home"):
+                try:
+                    delattr(_AUTH_AUTHORITY_LOCAL, attribute)
+                except AttributeError:
+                    pass
+        else:
+            _AUTH_AUTHORITY_LOCAL.value = previous
+            _AUTH_AUTHORITY_LOCAL.home = previous_home
+
+
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
+    authority = getattr(_AUTH_AUTHORITY_LOCAL, "value", None)
+    path = authority[0] if authority is not None else _resolve_auth_authority()[0]
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
     # user's auth store, refuse rather than silently corrupt it. This catches
     # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
+        declared_home = Path(os.environ.get("HOME", str(Path.home())))
+        real_hermes_root = (declared_home / ".hermes").resolve(strict=False)
         try:
             resolved = path.resolve(strict=False)
         except Exception:
             resolved = path
-        if resolved == real_home_auth:
+        real_root_auth = real_hermes_root / "auth.json"
+        try:
+            relative = resolved.relative_to(real_hermes_root / "profiles")
+            real_profile_auth = len(relative.parts) == 2 and relative.parts[-1] == "auth.json"
+        except ValueError:
+            real_profile_auth = False
+        if resolved == real_root_auth or real_profile_auth:
             raise RuntimeError(
                 f"Refusing to touch real user auth store during test run: {path}. "
                 "Set HERMES_HOME to a tmp_path in your test fixture, or run "
@@ -1137,6 +1297,10 @@ def _auth_file_path() -> Path:
 def _global_auth_file_path() -> Optional[Path]:
     """Return the global-root auth.json when the process is in profile mode.
 
+    An explicit ``auth.source_profile`` is exclusive: falling through to the
+    default/root store would silently reintroduce the very profile ambiguity
+    the setting is meant to eliminate.
+
     Returns ``None`` when the profile and global root resolve to the same
     directory (classic mode, or custom HERMES_HOME that is not a profile).
     Used by read-only fallback paths so providers authed at the root are
@@ -1144,25 +1308,8 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
-    try:
-        from hermes_constants import get_default_hermes_root
-        global_root = get_default_hermes_root()
-    except Exception:
-        return None
-    profile_home = get_hermes_home()
-    try:
-        if profile_home.resolve(strict=False) == global_root.resolve(strict=False):
-            return None
-    except Exception:
-        if profile_home == global_root:
-            return None
-    # No pytest seat belt here: this is a pure read-only path, and
-    # ``_load_global_auth_store()`` wraps the read in a try/except so an
-    # unreadable global file can never break the profile process.  The
-    # write-side seat belt still lives on ``_auth_file_path()`` where it
-    # belongs (that's what protects the real user's auth store from being
-    # corrupted by a mis-configured test).
-    return global_root / "auth.json"
+    authority = getattr(_AUTH_AUTHORITY_LOCAL, "value", None)
+    return authority[1] if authority is not None else _resolve_auth_authority()[1]
 
 
 def _load_global_auth_store() -> Dict[str, Any]:
@@ -1334,15 +1481,16 @@ def _auth_store_lock(
     refresh paths follow this order; violating it risks deadlock
     against a concurrent import on the shared store.
     """
-    auth_path = target_path if target_path is not None else _auth_file_path()
-    lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
-    with _file_lock(
-        lock_path,
-        _auth_lock_holder_for(auth_path),
-        timeout_seconds,
-        "Timed out waiting for auth store lock",
-    ):
-        yield
+    with _auth_authority_context():
+        auth_path = target_path if target_path is not None else _auth_file_path()
+        lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
+        with _file_lock(
+            lock_path,
+            _auth_lock_holder_for(auth_path),
+            timeout_seconds,
+            "Timed out waiting for auth store lock",
+        ):
+            yield
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
@@ -1667,7 +1815,7 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def _read_credential_pool_pinned(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1712,6 +1860,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
     return list(global_entries) if isinstance(global_entries, list) else []
+
+
+def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+    """Read one credential-pool snapshot under a single pinned authority."""
+    with _auth_authority_context():
+        return _read_credential_pool_pinned(provider_id)
 
 
 _POOL_STATUS_FIELDS = (
@@ -1929,8 +2083,9 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     global-scope provider state (e.g. a globally-authenticated Anthropic
     OAuth or Nous device-code session). See issue #18594 follow-up.
     """
-    auth_store = _load_auth_store()
-    return _load_provider_state(auth_store, provider_id)
+    with _auth_authority_context():
+        auth_store = _load_auth_store()
+        return _load_provider_state(auth_store, provider_id)
 
 
 def get_active_provider() -> Optional[str]:
@@ -1939,6 +2094,7 @@ def get_active_provider() -> Optional[str]:
     return auth_store.get("active_provider")
 
 
+@_pin_auth_authority
 def is_provider_explicitly_configured(provider_id: str) -> bool:
     """Return True only if the user has explicitly configured this provider.
 
@@ -2186,6 +2342,7 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
         return ""
 
 
+@_pin_auth_authority
 def resolve_provider(
     requested: Optional[str] = None,
     *,
@@ -3530,6 +3687,7 @@ def _spotify_interactive_setup(redirect_uri_hint: str) -> str:
     return raw
 
 
+@_pin_auth_authority
 def login_spotify_command(args) -> None:
     existing_state = get_provider_auth_state("spotify") or {}
 
@@ -3800,6 +3958,7 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+@_pin_auth_authority
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -4206,6 +4365,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+@_pin_auth_authority
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -4700,6 +4860,7 @@ def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+@_pin_auth_authority
 def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     if _lock:
         with _auth_store_lock():
@@ -5163,6 +5324,7 @@ def refresh_xai_oauth_pure(
     return updated
 
 
+@_pin_auth_authority
 def _refresh_xai_oauth_tokens(
     tokens: Dict[str, Any],
     *,
@@ -5206,6 +5368,7 @@ def _refresh_xai_oauth_tokens(
     return updated_tokens
 
 
+@_pin_auth_authority
 def resolve_xai_oauth_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -6362,6 +6525,7 @@ def refresh_nous_oauth_from_state(
     )
 
 
+@_pin_auth_authority
 def persist_nous_credentials(
     creds: Dict[str, Any],
     *,
@@ -6431,6 +6595,7 @@ def _sync_nous_pool_from_auth_store() -> None:
         logger.debug("Failed to sync Nous credential pool from auth store: %s", exc)
 
 
+@_pin_auth_authority
 def resolve_nous_runtime_credentials(
     *,
     timeout_seconds: float = 15.0,
@@ -6877,6 +7042,7 @@ def invalidate_nous_auth_status_cache() -> None:
     _nous_auth_status_cache = None
 
 
+@_pin_auth_authority
 def get_nous_auth_status() -> Dict[str, Any]:
     """Status snapshot for Nous auth.
 
@@ -6910,6 +7076,7 @@ def get_nous_auth_status() -> Dict[str, Any]:
     return status
 
 
+@_pin_auth_authority
 def _compute_nous_auth_status() -> Dict[str, Any]:
     """Uncached implementation of get_nous_auth_status(). See that function."""
     state = get_provider_auth_state("nous")
@@ -6962,6 +7129,7 @@ def _compute_nous_auth_status() -> Dict[str, Any]:
     return _snapshot_nous_pool_status()
 
 
+@_pin_auth_authority
 def get_nous_auth_status_local() -> Dict[str, Any]:
     """Refresh-free Nous auth snapshot for read-only display surfaces.
 
@@ -7091,6 +7259,7 @@ def get_nous_session_validity() -> str:
     return NOUS_SESSION_UNKNOWN
 
 
+@_pin_auth_authority
 def get_codex_auth_status() -> Dict[str, Any]:
     """Status snapshot for Codex auth.
     
@@ -7156,6 +7325,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
         }
 
 
+@_pin_auth_authority
 def get_xai_oauth_auth_status() -> Dict[str, Any]:
     try:
         from agent.credential_pool import load_pool
@@ -7290,6 +7460,7 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+@_pin_auth_authority
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = (provider_id or get_active_provider() or "").strip().lower()
@@ -7402,6 +7573,7 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     return info
 
 
+@_pin_auth_authority
 def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve API key and base URL for an API-key provider.
 
@@ -8025,6 +8197,7 @@ def login_command(args) -> None:
     raise SystemExit(0)
 
 
+@_pin_auth_authority
 def _login_openai_codex(
     args,
     pconfig: ProviderConfig,
@@ -8099,6 +8272,7 @@ def _login_openai_codex(
     print(f"  Config updated: {config_path} (model.provider=openai-codex)")
 
 
+@_pin_auth_authority
 def _login_xai_oauth(
     args,
     pconfig: ProviderConfig,
@@ -8962,6 +9136,7 @@ def build_minimax_oauth_token_provider() -> Callable[[], str]:
     process (CLI, gateway, cron) is immediately visible to every other
     process sharing the same ``auth.json``.
     """
+    @_pin_auth_authority
     def _provide() -> str:
         state = get_provider_auth_state("minimax-oauth")
         if not state or not state.get("access_token"):
@@ -8986,6 +9161,7 @@ def build_minimax_oauth_token_provider() -> Callable[[], str]:
     return _provide
 
 
+@_pin_auth_authority
 def resolve_minimax_oauth_runtime_credentials(
     *, min_token_ttl_seconds: int = MINIMAX_OAUTH_REFRESH_SKEW_SECONDS,
     as_token_provider: bool = False,
@@ -9217,6 +9393,7 @@ def nous_token_has_billing_scope() -> bool:
     return NOUS_BILLING_MANAGE_SCOPE in scope.split()
 
 
+@_pin_auth_authority
 def step_up_nous_billing_scope(
     *,
     open_browser: bool = True,
@@ -9284,6 +9461,7 @@ def step_up_nous_billing_scope(
     return isinstance(granted, str) and NOUS_BILLING_MANAGE_SCOPE in granted.split()
 
 
+@_pin_auth_authority
 def _login_nous(args, pconfig: ProviderConfig) -> None:
     """Nous Portal device authorization flow."""
     timeout_seconds = getattr(args, "timeout", None) or 15.0
@@ -9488,6 +9666,7 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
         raise SystemExit(1)
 
 
+@_pin_auth_authority
 def logout_command(args) -> None:
     """Clear auth state for a provider."""
     provider_id = getattr(args, "provider", None)

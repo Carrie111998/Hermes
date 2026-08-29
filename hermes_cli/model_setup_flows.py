@@ -22,6 +22,7 @@ from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
 import argparse
+from functools import wraps
 import os
 import subprocess
 import urllib.parse
@@ -39,6 +40,16 @@ from hermes_cli.providers import custom_provider_slug
 BEDROCK_GEO_PREFIXES = (
     "us.", "eu.", "ap.", "apac.", "jp.", "ca.", "sa.", "me.", "af.",
 )
+
+
+def _pin_model_auth_authority(operation):
+    """Keep one credential-store authority across a complete model flow."""
+    @wraps(operation)
+    def pinned(*args, **kwargs):
+        from hermes_cli.auth import _auth_authority_context
+        with _auth_authority_context():
+            return operation(*args, **kwargs)
+    return pinned
 
 
 def bedrock_region_geo_prefix(region_name: str) -> str:
@@ -85,6 +96,7 @@ def _existing_api_key_for_model_flow(provider_id: str, pconfig) -> tuple[str, st
     return _resolve_api_key_provider_secret(provider_id, pconfig)
 
 
+@_pin_model_auth_authority
 def _prune_replaced_custom_model_config_credentials(
     base_url: str,
     *,
