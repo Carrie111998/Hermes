@@ -19,6 +19,11 @@ from utils import atomic_replace, fast_safe_load
 # pure ASCII (they become HTTP header values).
 _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY")
 
+# Values minted or injected by the process launcher must win over persistent
+# profile/project dotenv files, external secret sources, and managed config.
+# Add launcher-owned variables here instead of adding one-off restore blocks.
+LAUNCHER_PROTECTED_ENV_VARS = ("HERMES_DASHBOARD_SESSION_TOKEN",)
+
 # Names we've already warned about during this process, so repeated
 # load_hermes_dotenv() calls (user env + project env, gateway hot-reload,
 # tests) don't spam the same warning multiple times.
@@ -480,17 +485,18 @@ def load_hermes_dotenv(
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
+    - process-launcher values named in ``LAUNCHER_PROTECTED_ENV_VARS`` win over
+      profile/project dotenv, external secret sources, and managed config.
     - callers that only maintain the installation can set
       ``load_external_secrets=False`` to avoid loading optional secret-manager
       dependencies into the process that replaces that same environment.
     """
     loaded: list[Path] = []
-    # This token is minted/injected by the process launcher (Desktop, a
-    # companion app, or a service wrapper).  A profile dotenv is persistent
-    # configuration and must not replace the launcher's current pairing.
-    process_dashboard_session_token = os.environ.get(
-        "HERMES_DASHBOARD_SESSION_TOKEN"
-    )
+    launcher_values = {
+        name: os.environ[name]
+        for name in LAUNCHER_PROTECTED_ENV_VARS
+        if name in os.environ
+    }
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -558,10 +564,8 @@ def load_hermes_dotenv(
     # what lands in the env.
     _reapply_terminal_config_bridge(home_path)
 
-    if process_dashboard_session_token is not None:
-        os.environ["HERMES_DASHBOARD_SESSION_TOKEN"] = (
-            process_dashboard_session_token
-        )
+    for name, value in launcher_values.items():
+        os.environ[name] = value
 
     return loaded
 
