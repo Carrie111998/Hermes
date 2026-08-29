@@ -847,17 +847,17 @@ def test_review_fork_uses_runtime_model_and_output_cap(curator_env, monkeypatch)
 
 
 
-def test_review_fork_restricts_toolsets_to_skills_and_terminal(curator_env, monkeypatch):
-    """The curator LLM fork must advertise only the skills + terminal toolsets.
+def test_review_fork_restricts_toolsets_to_skills(curator_env, monkeypatch):
+    """The curator LLM fork must advertise only the skills toolset.
 
-    Without ``enabled_toolsets=["skills", "terminal"]`` on the AIAgent(...) call
+    Without ``enabled_toolsets=["skills"]`` on the AIAgent(...) call
     in ``_run_llm_review``, ``enabled_toolsets`` defaults to None and init_agent
     grants the fork the full default catalog (~30 tools) plus the context_engine
     (lcm_*) tools, billing ~7K wasted schema tokens on every one of the fork's
-    50-100 API calls per consolidation pass. The prompt (curator.py:509-523)
-    confines the model to four tools in natural language, but only this kwarg
-    filters the advertised request schema. Capturing the constructor kwarg is
-    the sole assertion that distinguishes fixed from unfixed code.
+    50-100 API calls per consolidation pass. The prompt confines the model to
+    the skills workflow, but only this kwarg filters the advertised request
+    schema and prevents raw filesystem mutation. Capturing the constructor
+    kwarg is the sole assertion that distinguishes fixed from unfixed code.
     """
     curator = curator_env["curator"]
 
@@ -888,15 +888,15 @@ def test_review_fork_restricts_toolsets_to_skills_and_terminal(curator_env, monk
 
     # error is None proves the fork was actually constructed (capture ran).
     assert meta.get("error") is None, meta.get("error")
-    assert captured.get("enabled_toolsets") == ["skills", "terminal"], (
-        "curator review fork did not pass enabled_toolsets=['skills', "
-        "'terminal'] to AIAgent; the full default tool catalog (plus lcm_* "
+    assert captured.get("enabled_toolsets") == ["skills"], (
+        "curator review fork did not pass enabled_toolsets=['skills'] to "
+        "AIAgent; the full default tool catalog (plus lcm_* "
         "context_engine tools) would be advertised; got "
         f"{captured.get('enabled_toolsets')!r}"
     )
 
 
-def test_review_fork_toolset_surface_is_skills_plus_terminal():
+def test_review_fork_toolset_surface_is_skills_only():
     """Documentary check on the static surface the fork's kwarg resolves to.
 
     Registry-independent (include_registry=False) so a plugin-registered tool
@@ -908,15 +908,13 @@ def test_review_fork_toolset_surface_is_skills_plus_terminal():
     """
     from toolsets import resolve_toolset
 
-    surface = set(resolve_toolset("skills", include_registry=False)) | set(
-        resolve_toolset("terminal", include_registry=False)
-    )
+    surface = set(resolve_toolset("skills", include_registry=False))
 
     # The four prompt-named tools are all present.
     assert "skills_list" in surface
     assert "skill_view" in surface
     assert "skill_manage" in surface
-    assert "terminal" in surface
+    assert "terminal" not in surface
 
     # Representative dropped default + context_engine tools are absent.
     assert "read_file" not in surface

@@ -411,9 +411,8 @@ CURATOR_DRY_RUN_BANNER = (
     "\n"
     "  • DO NOT call skill_manage with action=patch, create, delete, "
     "write_file, or remove_file.\n"
-    "  • DO NOT call terminal to mv skill directories into .archive/.\n"
-    "  • DO NOT call terminal to mv, cp, rm, or rewrite any file under "
-    "~/.hermes/skills/.\n"
+    "  • The curator has no terminal access. Do not attempt filesystem "
+    "moves or shell-based skill mutations.\n"
     "  • skills_list and skill_view are FINE — read as much as you need.\n"
     "\n"
     "Your output IS the deliverable. Produce the exact same "
@@ -508,9 +507,8 @@ CURATOR_REVIEW_PROMPT = (
     "copied and modified\n"
     "      • `scripts/<name>.<ext>` for statically re-runnable actions "
     "(verification scripts, fixture generators, probes)\n"
-    "      Then archive the old sibling. Use `terminal` with `mkdir -p "
-    "~/.hermes/skills/<umbrella>/references/ && mv ... <umbrella>/"
-    "references/<topic>.md` (or templates/ / scripts/).\n\n"
+    "      Then archive the old sibling through the guarded "
+    "`skill_manage(action=delete, absorbed_into=<umbrella>)` path.\n\n"
     "Package integrity — not optional:\n"
     "Before demoting or archiving a skill, inspect it as a COMPLETE "
     "directory package, not just SKILL.md. A skill root may include "
@@ -556,9 +554,9 @@ CURATOR_REVIEW_PROMPT = (
     "skill, or `absorbed_into=\"\"` when you're truly pruning with no "
     "forwarding target. This drives cron-job skill-reference migration — "
     "guessing from your YAML summary after the fact is fragile.\n"
-    "  - terminal                       — move LOCAL candidate content into "
-    "a support subfile when package integrity requires it; never mv, cp, rm, "
-    "patch, or rewrite bundled, hub-installed, or external-dir skills\n\n"
+    "  - There is no shell/filesystem tool in this fork. Use "
+    "`skill_manage(action=write_file)` for new support files and preserve the "
+    "original package when safe re-homing cannot be completed.\n\n"
     "'keep' is a legitimate decision ONLY when the skill is already a "
     "class-level umbrella and none of the proposed merges would improve "
     "discoverability. 'This is narrow but distinct from its siblings' "
@@ -1945,7 +1943,11 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             credential_pool=_credential_pool,
             request_overrides=_request_overrides,
             **_agent_kwargs,
-            enabled_toolsets=["skills", "terminal"],
+            # Filesystem mutations must go through skill_manage so the
+            # curator's consolidation guard can coordinate archive and
+            # dependent-reference migration. Giving this fork terminal access
+            # allowed a raw `mv` into .archive/ to bypass that path entirely.
+            enabled_toolsets=["skills"],
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The
