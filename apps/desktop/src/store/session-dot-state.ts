@@ -74,6 +74,34 @@ export type SessionDotState = 'background' | 'draft' | 'idle' | 'needs-input' | 
  *  louder cue and two treatments at once fight each other. */
 export const showsRunningArc = (state: SessionDotState): boolean => state === 'stalled' || state === 'working'
 
+/** How many rows may run their ring ANIMATION at once.
+ *
+ *  The ring itself always renders — it is what marks a row as running. Only the
+ *  motion is capped, because motion is what costs: an active transform
+ *  animation gives its element a compositing layer, and Blink promotes
+ *  everything that overlaps that layer too (the `Overlap` reason). Nothing
+ *  bounded how many rings could animate, so the layer tree grew with the number
+ *  of agents at work.
+ *
+ *  Measured with `multitab --busy N` (see scripts/perf): layers grow 29 + ~4·N
+ *  and Layerize goes 3.2% -> 19.9% of the main thread between N=0 and N=16,
+ *  while longtasks, frame p99 and slow-frame counts all stay green — which is
+ *  why this went unnoticed. Layerize runs on the main thread, so that share is
+ *  taken straight out of the budget for keystrokes.
+ *
+ *  Four is a product call, not a measurement: past a handful of simultaneously
+ *  shimmering rows the motion has stopped telling anyone which session to look
+ *  at, and the dot already carries the state. */
+export const MAX_ANIMATED_RUNNING_ARCS = 4
+
+/** False once more rows are running than `MAX_ANIMATED_RUNNING_ARCS`. All rings
+ *  then go still together — never a subset, which would make the sidebar's
+ *  motion depend on list order and flicker as rows re-sort. */
+export const $runningArcsAnimated = computed(
+  [$workingSessionIds, $stalledSessionIds],
+  (working, stalled) => working.length + stalled.length <= MAX_ANIMATED_RUNNING_ARCS
+)
+
 /** Whether this turn is the session's own, live: brighter title, and the row's
  *  age yields to the actions menu. Wider than the arc — a turn waiting on an
  *  answer has not ended. */

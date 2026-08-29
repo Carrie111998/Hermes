@@ -55,6 +55,15 @@
   animation-play-state: paused !important;
 }
 
+/* Pausing is not enough to give the layers back. `will-change: transform` is a
+   standing promise of future movement, so Blink keeps the promoted layer for a
+   paused animation just as it does for a running one — a backgrounded window
+   went quiet but kept paying for every ring's compositing layer (4 per running
+   sidebar row, measured). Withdraw the promise with the pause. */
+:root[data-renderer-animations-paused] .arc-border::before {
+  will-change: auto !important;
+}
+
 /* Sidebar sections: tall viewports give each its own scroller; compact ones
    (this variant) flatten everything into one shared scroll. See ChatSidebar. */
 @custom-variant compact (@media (max-height: 768px));
@@ -1042,6 +1051,25 @@
     linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
   mask-composite: exclude;
+}
+
+/* Ring without motion. Set once more rows are running than
+   MAX_ANIMATED_RUNNING_ARCS: the row still reads as running, but the ring stops
+   costing compositing layers.
+
+   BOTH declarations are load-bearing, and `will-change` is the one that
+   actually matters. Dropping only the animation left the layer count exactly
+   unchanged (86 layers at 16 running rows, measured): `will-change: transform`
+   below promotes the pseudo-element on its own, animation or not. That is what
+   `will-change` is FOR — it is a standing promise of future movement — so an
+   element that has stopped moving has to withdraw it.
+
+   The ring is worth 4 layers per row while promoted: 2 for the masked host,
+   1 for this pseudo-element, and 1 for the row control it overlaps (Blink's
+   `Overlap` reason drags neighbours along). */
+.arc-border.arc-still::before {
+  animation: none;
+  will-change: auto;
 }
 
 :root.dark .arc-border {

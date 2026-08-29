@@ -15,9 +15,11 @@ import {
 } from './session'
 import {
   $delegatingSessionIds,
+  $runningArcsAnimated,
   $sessionDotStateById,
   $unreadSessionCount,
   hasLiveTurn,
+  MAX_ANIMATED_RUNNING_ARCS,
   showsRunningArc,
   unreadSessionCount
 } from './session-dot-state'
@@ -238,5 +240,55 @@ describe('$unreadSessionCount (titlebar badge)', () => {
 
     expect($unreadSessionCount.get()).toBe(0)
     expect($sessionDotStateById.get()['cron-1']).not.toBe('unread')
+  })
+})
+
+describe('$runningArcsAnimated', () => {
+  beforeEach(() => {
+    clearAllSessionStates()
+    $sessions.set([])
+  })
+
+  afterEach(() => {
+    clearAllSessionStates()
+    $sessions.set([])
+  })
+
+  const runRows = (n: number) => {
+    setSessions(Array.from({ length: n }, (_, i) => storedRow(`run-${i}`)))
+
+    for (let i = 0; i < n; i++) {
+      publishSessionState(`rt-${i}`, { ...createClientSessionState(`run-${i}`), busy: true })
+    }
+  }
+
+  it('animates while only a few rows are running', () => {
+    runRows(MAX_ANIMATED_RUNNING_ARCS)
+
+    expect($runningArcsAnimated.get()).toBe(true)
+  })
+
+  it('goes still once more rows run than the cap allows', () => {
+    // The cost this guards is not the animation itself but the compositing
+    // layer each one takes, plus every layer it promotes by overlap.
+    runRows(MAX_ANIMATED_RUNNING_ARCS + 1)
+
+    expect($runningArcsAnimated.get()).toBe(false)
+  })
+
+  it('animates again once the extra turns finish', () => {
+    runRows(MAX_ANIMATED_RUNNING_ARCS + 4)
+    expect($runningArcsAnimated.get()).toBe(false)
+
+    clearAllSessionStates()
+    runRows(2)
+
+    expect($runningArcsAnimated.get()).toBe(true)
+  })
+
+  it('animates when nothing is running at all', () => {
+    runRows(0)
+
+    expect($runningArcsAnimated.get()).toBe(true)
   })
 })
