@@ -57,3 +57,25 @@ def test_parent_watchdog_preserves_legacy_exact_windows_marker():
         )
         is False
     )
+
+
+def test_macos_ps_marker_requires_full_lstart_not_a_truncated_weekday():
+    from hermes_cli.web_server import _parent_start_markers_match
+
+    assert _valid_parent_start_marker("ps:Sat Aug 29 15:04:31 2026") is True
+    assert _valid_parent_start_marker("ps:Sat") is False
+    assert (
+        _parent_start_markers_match(
+            "ps:Sat Aug 29 15:04:31 2026",
+            "ps:Sat Aug 29 15:04:31 2026    ",
+        )
+        is True
+    )
+    assert (
+        _is_serve_orphaned(
+            4242,
+            "ps:Sat Aug 29 15:04:31 2026",
+            process_start_marker=lambda _pid: "ps:Sat Aug 29 15:04:31 2026    ",
+        )
+        is False
+    )
