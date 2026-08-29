@@ -58,21 +58,40 @@ def test_sidecar_symlink_is_not_followed(tmp_path):
 def test_interrupted_sidecar_publication_leaves_no_partial_destination(tmp_path, monkeypatch):
     primary = tmp_path / "auth.json"
     _corrupt(primary)
-    real_link = os.link
-
     def fail_link(*args, **kwargs):
         raise OSError("synthetic publication interruption")
 
-    monkeypatch.setattr(owner.os, "link", fail_link)
+    if os.name == "nt":
+        monkeypatch.setattr(owner, "_windows_link_sidecar_relative", fail_link)
+    else:
+        monkeypatch.setattr(owner.os, "link", fail_link)
     with pytest.raises(auth.AuthStoreCorruptionError) as caught:
         auth._load_auth_store(primary)
 
     assert caught.value.preserved is False
     assert primary.read_bytes() == b"{broken"
     assert not list(tmp_path.glob("*.corrupt"))
-    # Restore explicitly so this test remains clear if the implementation
-    # imports os through another alias in a future extraction.
-    monkeypatch.setattr(owner.os, "link", real_link)
+
+
+def test_sidecar_cleanup_failure_keeps_single_verified_winner(tmp_path, monkeypatch):
+    """A post-link temp cleanup fault must not duplicate or lose evidence."""
+    primary = tmp_path / "auth.json"
+    original = _corrupt(primary, b"{cleanup-race")
+    real_unlink = Path.unlink
+
+    def fail_temp_cleanup(path, *args, **kwargs):
+        if ".tmp." in path.name:
+            raise OSError("synthetic temp cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_temp_cleanup)
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(primary)
+
+    assert caught.value.preserved is True
+    sidecars = list(tmp_path.glob("auth.json.corrupt*"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_bytes() == original
 
 
 def test_recovery_rejects_changed_reviewed_source(tmp_path):
@@ -196,7 +215,52 @@ def test_recovery_requires_reviewed_digest(tmp_path):
     assert primary.read_bytes() == b"{broken"
 
 
-def test_publication_refuses_destination_symlink_without_touching_target(tmp_path):
+def test_recovery_rejects_caller_digest_for_healthy_store(tmp_path):
+    primary = tmp_path / "auth.json"
+    auth._save_auth_store({"version": 1, "providers": {"keep": {"ok": True}}}, primary)
+    original = primary.read_bytes()
+
+    with pytest.raises(auth.AuthStoreRecoveryConflictError):
+        auth.recover_auth_store(
+            _replacement(),
+            primary,
+            expected_corrupt_sha256=hashlib.sha256(original).hexdigest(),
+            expected_corrupt_path=primary,
+        )
+
+    assert primary.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"version": 1},
+        {"version": 1, "providers": {}, "metadata": []},
+        {"version": 1, "providers": {}, "metadata": "not-an-object"},
+    ],
+    ids=["missing-section", "metadata-list", "metadata-string"],
+)
+def test_existing_incomplete_current_schema_is_read_only(tmp_path, payload):
+    primary = tmp_path / "auth.json"
+    original = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    primary.write_bytes(original)
+
+    with pytest.raises(auth.AuthStoreCorruptionError):
+        auth._load_auth_store(primary, allow_legacy_empty=True)
+
+    assert primary.read_bytes() == original
+
+
+def test_fresh_store_replacement_succeeds_without_snapshot(tmp_path):
+    primary = tmp_path / "auth.json"
+    auth._save_auth_store({"version": 1, "providers": {"first": {}}}, primary)
+
+    auth._save_auth_store({"version": 1, "providers": {"second": {}}}, primary)
+
+    assert json.loads(primary.read_text(encoding="utf-8"))["providers"] == {"second": {}}
+
+
+def test_publication_refuses_destination_symlink_without_touching_target(tmp_path, monkeypatch):
     primary = tmp_path / "auth.json"
     attacker_target = tmp_path / "attacker-target"
     attacker_bytes = b"attacker-owned"
@@ -275,18 +339,23 @@ def test_windows_sidecar_race_does_not_publish_into_swapped_ancestor(tmp_path, m
     attacker_parent = tmp_path / "attacker-home"
     attacker_parent.mkdir()
     moved_parent = tmp_path / "auth-home-original"
-    real_link = os.link
+    real_link = owner._windows_link_sidecar_relative
     swapped = False
 
-    def swap_then_link(source, destination, **kwargs):
+    def swap_then_link(source, destination, parent_handle):
         nonlocal swapped
         if not swapped:
-            original_parent.rename(moved_parent)
-            original_parent.symlink_to(attacker_parent, target_is_directory=True)
+            try:
+                original_parent.rename(moved_parent)
+                original_parent.symlink_to(attacker_parent, target_is_directory=True)
+            except OSError as exc:
+                # The retained parent handle is expected to deny this rename.
+                raise OSError("synthetic ancestor swap blocked") from exc
             swapped = True
-        return real_link(source, destination, **kwargs)
+            raise OSError("synthetic ancestor swap")
+        return real_link(source, destination, parent_handle)
 
-    monkeypatch.setattr(owner.os, "link", swap_then_link)
+    monkeypatch.setattr(owner, "_windows_link_sidecar_relative", swap_then_link)
     try:
         assert owner._write_corrupt_sidecar(primary, b"credential-bearing-corruption") is None
         assert not list(attacker_parent.glob("*.corrupt*"))
@@ -333,6 +402,34 @@ def test_recovery_cas_rechecks_after_serialization_callback(tmp_path, monkeypatc
             expected_corrupt_path=primary,
         )
     assert primary.read_bytes() == b"{changed-in-publication-window"
+
+
+def test_recovery_cas_rechecks_inside_publication_primitive(tmp_path, monkeypatch):
+    """Mutation at the final publication boundary must not be overwritten."""
+    primary = tmp_path / "auth.json"
+    original = _corrupt(primary)
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(primary)
+
+    real_rename = owner._windows_rename_relative
+
+    def mutate_before_rename(source, parent_handle, destination_name, **kwargs):
+        primary.write_bytes(b"{external-writer-after-final-check")
+        return real_rename(source, parent_handle, destination_name, **kwargs)
+
+    if os.name == "nt":
+        monkeypatch.setattr(owner, "_windows_rename_relative", mutate_before_rename)
+    else:
+        pytest.skip("native publication-boundary probe is Windows-specific")
+
+    with pytest.raises(auth.AuthStoreRecoveryConflictError):
+        auth.recover_auth_store(
+            _replacement(),
+            primary,
+            expected_corrupt_sha256=hashlib.sha256(original).hexdigest(),
+            expected_corrupt_path=primary,
+        )
+    assert primary.read_bytes() == b"{external-writer-after-final-check"
 
 
 @pytest.mark.windows_only

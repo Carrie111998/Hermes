@@ -901,7 +901,7 @@ def test_logout_resets_codex_config_when_auth_state_already_cleared(tmp_path, mo
 def test_unsuppress_credential_source_clears_marker(tmp_path, monkeypatch):
     """unsuppress_credential_source() removes a previously-set marker."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from hermes_cli.auth import suppress_credential_source, unsuppress_credential_source, is_source_suppressed
 
@@ -920,7 +920,7 @@ def test_unsuppress_credential_source_clears_marker(tmp_path, monkeypatch):
 def test_unsuppress_credential_source_preserves_other_markers(tmp_path, monkeypatch):
     """Clearing one marker must not affect unrelated markers."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from hermes_cli.auth import (
         suppress_credential_source,

@@ -279,7 +279,7 @@ def test_write_through_fires_on_every_refresh_not_just_first(
     # asserts the on-disk values after each refresh.
 
     # ---- REFRESH 1 ----
-    _write_store(profile_path, {"version": 1})
+    _write_store(profile_path, {"version": 1, "providers": {}})
     entry1 = _entry(
         provider, id="c1", access_token="ac1", refresh_token="rf1"
     )

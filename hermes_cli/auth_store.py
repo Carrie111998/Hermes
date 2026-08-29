@@ -235,20 +235,32 @@ def _windows_read_handle(handle: Any, win32file: Any) -> bytes:
         chunks.append(data)
 
 
+def _windows_file_identity(handle: Any, win32file: Any) -> Tuple[int, int]:
+    """Return the volume/file-index identity for an already-open handle."""
+    info = win32file.GetFileInformationByHandle(handle)
+    return info[4], (info[8] << 32) | info[9]
+
+
 def _windows_rename_relative(
     source_path: Path,
     parent_handle: Any,
     destination_name: str,
     *,
     replace_existing: bool,
+    expected_digest: Optional[str] = None,
+    expected_identity: Optional[Tuple[int, int]] = None,
+    recovery: bool = False,
 ) -> None:
     """Rename a file relative to a retained directory handle.
 
     ``MoveFileEx`` accepts only paths, so it can be redirected after a
     validated directory is closed. ``SetFileInformationByHandle`` keeps the
-    directory identity in the kernel operation itself.
+    directory identity in the kernel operation itself.  The final target
+    validation is deliberately inside this primitive, immediately before the
+    kernel rename, rather than only in its caller.
     """
     try:
+        import pywintypes
         import win32con
         import win32file
     except Exception as exc:  # pragma: no cover - dependency is Windows-only
@@ -257,24 +269,55 @@ def _windows_rename_relative(
     # the source. This closes the check/open gap for an ancestor reparse swap;
     # the source handle is then checked against the same directory identity.
     parent_actual = _windows_final_path(source_path.parent, parent_handle, win32file)
-    source_handle = win32file.CreateFile(
-        str(source_path),
-        win32con.GENERIC_READ | win32con.DELETE,
-        win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
-        None,
-        win32con.OPEN_EXISTING,
-        win32con.FILE_ATTRIBUTE_NORMAL,
-        None,
+    target_path = source_path.parent / destination_name
+    if expected_digest is not None:
+        target_handle = None
+        try:
+            try:
+                target_handle = _windows_open_no_reparse(
+                    target_path,
+                    share_mode=(
+                        win32con.FILE_SHARE_READ
+                        | win32con.FILE_SHARE_WRITE
+                        | win32con.FILE_SHARE_DELETE
+                    ),
+                )
+            except pywintypes.error as exc:
+                if exc.winerror != 2:
+                    raise
+            if target_handle is None:
+                current = b""
+                identity = None
+            else:
+                current = _windows_read_handle(target_handle, win32file)
+                identity = _windows_file_identity(target_handle, win32file)
+            if (
+                _digest(current) != expected_digest
+                or (expected_identity is not None and identity != expected_identity)
+            ):
+                raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(target_path)
+        finally:
+            if target_handle is not None:
+                win32file.CloseHandle(target_handle)
+
+    source_handle = _windows_open_no_reparse(
+        source_path,
+        share_mode=(
+            win32con.FILE_SHARE_READ
+            | win32con.FILE_SHARE_WRITE
+            | win32con.FILE_SHARE_DELETE
+        ),
+        desired_access=win32con.GENERIC_READ | win32con.DELETE,
     )
     try:
         source_actual = _windows_final_path(source_path, source_handle, win32file)
         if os.path.normcase(os.path.normpath(os.path.dirname(source_actual))) != os.path.normcase(os.path.normpath(parent_actual)):
             raise OSError(f"Auth-store source escaped its expected parent: {source_path}")
-        # pywin32's FileRenameInfo wrapper does not correctly marshal the
-        # RootDirectory form on all supported Windows builds. Marshal the
-        # documented FILE_RENAME_INFO layout directly instead. The trailing
-        # UTF-16 NUL is required by the Windows implementation even though
-        # FileNameLength excludes it.
+        # Windows accepts the full destination path with a null root more
+        # consistently than FILE_RENAME_INFO.RootDirectory on supported builds.
+        # The retained parent handle remains open with DELETE sharing denied,
+        # while both source and destination are revalidated immediately before
+        # this operation; this prevents ancestor replacement during publication.
         name = str(source_path.parent / destination_name).encode("utf-16-le") + b"\x00\x00"
         info = struct.pack(
             "<I4xQI",
@@ -365,7 +408,7 @@ def _digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _validate_auth_store_schema(auth_store: Any, *, require_section: bool = False) -> None:
+def _validate_auth_store_schema(auth_store: Any, *, require_section: bool = True) -> None:
     """Validate the canonical auth-store document without touching the disk."""
     if not isinstance(auth_store, dict):
         raise ValueError("Auth store must be a JSON object")
@@ -393,6 +436,9 @@ def _validate_auth_store_schema(auth_store: Any, *, require_section: bool = Fals
     updated_at = auth_store.get("updated_at")
     if updated_at is not None and not isinstance(updated_at, str):
         raise ValueError("Auth store updated_at must be a string")
+    metadata = auth_store.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("Auth store metadata must be an object")
     suppressed_sources = auth_store.get("suppressed_sources")
     if suppressed_sources is not None:
         if not isinstance(suppressed_sources, dict):
@@ -409,6 +455,22 @@ def _validate_auth_store_schema(auth_store: Any, *, require_section: bool = Fals
 def _validate_recovery_store(auth_store: Any) -> None:
     """Reject incomplete or malformed replacement shapes before any write."""
     _validate_auth_store_schema(auth_store, require_section=True)
+
+
+def _is_valid_current_store_bytes(raw_bytes: bytes) -> bool:
+    """Return whether bytes describe a complete, non-recovery auth store."""
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8-sig"))
+        if isinstance(raw, dict) and "systems" in raw and "providers" not in raw:
+            systems = raw.get("systems")
+            return isinstance(systems, dict) and all(
+                isinstance(key, str) and isinstance(value, dict)
+                for key, value in systems.items()
+            )
+        _validate_auth_store_schema(raw, require_section=True)
+    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return True
 
 
 def _raise_preserved_corruption(auth_file: Path, raw_bytes: bytes, reason: Any) -> None:
@@ -446,11 +508,44 @@ def _raise_preserved_corruption(auth_file: Path, raw_bytes: bytes, reason: Any) 
     )
 
 
+def _posix_file_identity(path: Path) -> Optional[Tuple[int, int]]:
+    try:
+        info = os.stat(os.fspath(path), follow_symlinks=False)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _posix_atomic_replace(
+    tmp_path: Path,
+    auth_file: Path,
+    *,
+    expected_digest: str,
+    expected_identity: Optional[Tuple[int, int]],
+    recovery: bool,
+) -> None:
+    """Revalidate bytes and directory-entry identity at the replace boundary."""
+    try:
+        current_identity = _posix_file_identity(auth_file)
+        current_bytes = _read_auth_bytes(auth_file)
+    except OSError as exc:
+        raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file) from exc
+    if expected_identity is None:
+        raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
+    if current_identity != expected_identity or _digest(current_bytes) != expected_digest:
+        raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
+    # POSIX rename replaces the directory entry atomically and does not follow
+    # a final symlink. The identity/digest fence above binds this replace to the
+    # reviewed entry as closely as the platform permits.
+    os.replace(os.fspath(tmp_path), os.fspath(auth_file))
+
+
 def _atomic_publish_auth_store(
     tmp_path: Path,
     auth_file: Path,
     *,
     expected_digest: Optional[str] = None,
+    expected_identity: Optional[Tuple[int, int]] = None,
     recovery: bool = False,
 ) -> None:
     """Atomically publish while retaining the validated target directory."""
@@ -468,7 +563,6 @@ def _atomic_publish_auth_store(
             share_mode=(
                 win32con.FILE_SHARE_READ
                 | win32con.FILE_SHARE_WRITE
-                | win32con.FILE_SHARE_DELETE
             ),
         )
         target_handle = None
@@ -487,27 +581,26 @@ def _atomic_publish_auth_store(
                     raise
             if expected_digest is not None:
                 if target_handle is None:
-                    if expected_digest == _digest(b""):
-                        # A first write snapshots the absent target as the
-                        # digest of an empty byte string.
-                        pass
-                    else:
+                    if expected_digest != _digest(b""):
                         raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
                 else:
                     current_digest = _digest(_windows_read_handle(target_handle, win32file))
                     if current_digest != expected_digest:
                         raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
-                    # Windows refuses replacement while an existing destination
-                    # handle is open, even when it grants FILE_SHARE_DELETE. The
-                    # digest check above is the final target read; release that
-                    # handle before the atomic rename primitive.
-                    win32file.CloseHandle(target_handle)
-                    target_handle = None
+            # A destination handle must never remain open across replacement.
+            # The publication primitive performs the final digest revalidation
+            # after this close and immediately before the kernel rename.
+            if target_handle is not None:
+                win32file.CloseHandle(target_handle)
+                target_handle = None
             _windows_rename_relative(
                 tmp_path,
                 parent_handle,
                 auth_file.name,
                 replace_existing=True,
+                expected_digest=expected_digest,
+                expected_identity=expected_identity,
+                recovery=recovery,
             )
         finally:
             if target_handle is not None:
@@ -518,16 +611,24 @@ def _atomic_publish_auth_store(
     if os.path.lexists(os.fspath(auth_file)) and _is_reparse_or_link(auth_file):
         raise OSError(f"Refusing to publish through auth-store link or reparse: {auth_file}")
     if expected_digest is not None:
-        try:
-            current_digest = _digest(_read_auth_bytes(auth_file))
-        except OSError as exc:
-            raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file) from exc
-        if current_digest != expected_digest:
-            raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
-    # POSIX rename replaces the directory entry and does not follow a final
-    # symlink. The lexical check above is a policy guard; rename itself is the
-    # atomic no-follow publication primitive.
-    os.replace(os.fspath(tmp_path), os.fspath(auth_file))
+        if (
+            expected_identity is None
+            and expected_digest == _digest(b"")
+            and not os.path.lexists(os.fspath(auth_file))
+        ):
+            os.replace(os.fspath(tmp_path), os.fspath(auth_file))
+        else:
+            _posix_atomic_replace(
+                tmp_path,
+                auth_file,
+                expected_digest=expected_digest,
+                expected_identity=expected_identity,
+                recovery=recovery,
+            )
+    else:
+        # POSIX rename replaces the directory entry and does not follow a final
+        # symlink. The lexical check above is a policy guard for fresh writes.
+        os.replace(os.fspath(tmp_path), os.fspath(auth_file))
 
 
 def _validate_auth_store_parent(auth_file: Path) -> None:
@@ -788,71 +889,154 @@ def _sidecar_candidate(auth_file: Path, *, unique: bool) -> Path:
     return auth_file.with_name(f"{auth_file.name}.corrupt{suffix}")
 
 
+def _windows_create_sidecar_temp(
+    temp: Path,
+    raw: bytes,
+    parent_handle: Any,
+    parent_actual: str,
+) -> None:
+    """Create and flush a sidecar temp without Python path open/link shims."""
+    import win32con
+    import win32file
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateFileW
+    create.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create.restype = wintypes.HANDLE
+    handle = create(
+        str(temp),
+        win32con.GENERIC_WRITE,
+        win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
+        None,
+        win32con.CREATE_NEW,
+        win32con.FILE_ATTRIBUTE_NORMAL | 0x00200000,
+        None,
+    )
+    handle_value = int(handle)
+    if handle_value == -1:
+        error = ctypes.get_last_error()
+        if error == 80:  # ERROR_FILE_EXISTS
+            raise FileExistsError(os.fspath(temp))
+        raise OSError(error, f"Could not create auth sidecar temp: {temp}")
+    try:
+        actual = _windows_final_path(temp, handle, win32file)
+        if os.path.normcase(os.path.normpath(os.path.dirname(actual))) != os.path.normcase(os.path.normpath(parent_actual)):
+            raise OSError(f"Auth sidecar temp escaped its expected parent: {temp}")
+        write = kernel32.WriteFile
+        write.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.c_void_p,
+        ]
+        write.restype = wintypes.BOOL
+        payload = ctypes.create_string_buffer(raw)
+        written = wintypes.DWORD()
+        if not write(handle, payload, len(raw), ctypes.byref(written), None) or written.value != len(raw):
+            error = ctypes.get_last_error()
+            raise OSError(error, f"Could not write auth sidecar temp: {temp}")
+        flush = kernel32.FlushFileBuffers
+        flush.argtypes = [wintypes.HANDLE]
+        flush.restype = wintypes.BOOL
+        if not flush(handle):
+            error = ctypes.get_last_error()
+            raise OSError(error, f"Could not flush auth sidecar temp: {temp}")
+    finally:
+        win32file.CloseHandle(handle)
+
+
+def _windows_link_sidecar_relative(
+    temp: Path,
+    destination_name: str,
+    parent_handle: Any,
+) -> None:
+    """Publish an exclusive sidecar with the native hard-link primitive."""
+    del parent_handle  # retained by the caller for ancestor-delete exclusion
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    publish = kernel32.CreateHardLinkW
+    publish.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p]
+    publish.restype = wintypes.BOOL
+    destination = temp.with_name(destination_name)
+    if not publish(str(destination), str(temp), None):
+        error = ctypes.get_last_error()
+        if error in (80, 183):  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+            raise FileExistsError(os.fspath(destination))
+        raise OSError(error, f"Could not publish auth sidecar: {destination_name}")
+
+
 def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
     """Publish an immutable, exclusive forensic copy without following links."""
     parent = auth_file.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    # Keep the historical name for the first incident. Any collision, including
-    # a symlink/reparse at that name, goes to a fresh nonce path and never
-    # overwrites the incumbent evidence.
+    # The primary file was just opened through this parent; do not create or
+    # resolve a different parent as part of forensic publication.
     candidates = [_sidecar_candidate(auth_file, unique=False)]
     candidates.extend(_sidecar_candidate(auth_file, unique=True) for _ in range(8))
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     parent_handle = None
+    parent_actual = None
     if sys.platform == "win32":
         try:
             import win32con
+            import win32file
+
             parent_handle = _windows_open_no_reparse(
                 parent,
                 directory=True,
-                share_mode=(
-                    win32con.FILE_SHARE_READ
-                    | win32con.FILE_SHARE_WRITE
-                ),
+                share_mode=win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
             )
+            parent_actual = _windows_final_path(parent, parent_handle, win32file)
         except OSError:
             return None
     try:
         for destination in candidates:
             temp = parent / f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
             fd = None
+            published = False
             try:
-                fd = os.open(
-                    os.fspath(temp),
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
-                    stat.S_IRUSR | stat.S_IWUSR,
-                )
-                with os.fdopen(fd, "wb") as handle:
-                    fd = None
-                    handle.write(raw)
-                    handle.flush()
-                    os.fsync(handle.fileno())
                 if sys.platform == "win32":
-                    # A retained parent handle with delete sharing denied
-                    # prevents an ancestor junction/rename while this
-                    # no-replace hard-link is published. Unlike rename, the
-                    # hard-link operation also gives the required collision
-                    # behavior for an incumbent forensic sidecar.
-                    os.link(
-                        os.fspath(temp),
-                        os.fspath(destination),
-                        follow_symlinks=False,
-                    )
-                    temp.unlink()
+                    _windows_create_sidecar_temp(temp, raw, parent_handle, parent_actual)
                 else:
-                    # Hard-link publication is atomic and no-replace: unlike
-                    # rename it cannot redirect through a destination symlink.
+                    fd = os.open(
+                        os.fspath(temp),
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                        stat.S_IRUSR | stat.S_IWUSR,
+                    )
+                    with os.fdopen(fd, "wb") as handle:
+                        fd = None
+                        handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                if sys.platform == "win32":
+                    _windows_link_sidecar_relative(temp, destination.name, parent_handle)
+                else:
                     os.link(os.fspath(temp), os.fspath(destination), follow_symlinks=False)
-                    temp.unlink()
+                published = True
+                # Once the no-replace link wins, never retry: a cleanup fault
+                # must not cause duplicate forensic publications or a false
+                # "preserved=False" result.
                 if _is_reparse_or_link(destination) or _digest(_read_auth_bytes(destination)) != _digest(raw):
                     raise OSError(f"Corrupt sidecar verification failed: {destination}")
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
                 return destination
             except FileExistsError:
-                # A deterministic incumbent or a raced destination is evidence,
-                # not an error. Try only a new nonce path.
+                if published:
+                    return destination
+                # A deterministic incumbent or raced destination is evidence;
+                # only nonce candidates may be attempted after this point.
                 pass
             except (OSError, ValueError):
-                # A partial write or publication failure is fail-closed.
                 pass
             finally:
                 if fd is not None:
@@ -860,12 +1044,11 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
                         os.close(fd)
                     except OSError:
                         pass
-                try:
-                    temp.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
+                if not published:
+                    try:
+                        temp.unlink()
+                    except (FileNotFoundError, OSError):
+                        pass
     finally:
         if parent_handle is not None:
             try:
@@ -921,13 +1104,22 @@ def _load_auth_store(
                 _raise_preserved_corruption(auth_file, raw_bytes, "invalid legacy systems shape")
         else:
             try:
-                if allow_legacy_empty and isinstance(raw, dict):
+                # ``allow_legacy_empty`` is retained for source compatibility
+                # with pool readers, but it is not a schema bypass. Legacy
+                # suppression mappings are normalized only on an otherwise
+                # complete current document; an existing object without a
+                # persistence section remains corruption.
+                if (
+                    allow_legacy_empty
+                    and isinstance(raw, dict)
+                    and ("providers" in raw or "credential_pool" in raw)
+                ):
                     suppressed = raw.get("suppressed_sources")
                     if isinstance(suppressed, dict):
                         for provider_id, sources in list(suppressed.items()):
                             if isinstance(sources, dict):
                                 suppressed[provider_id] = [str(name) for name in sources]
-                _validate_auth_store_schema(raw, require_section=not allow_legacy_empty)
+                _validate_auth_store_schema(raw, require_section=True)
             except ValueError as exc:
                 _raise_preserved_corruption(auth_file, raw_bytes, exc)
 
@@ -959,10 +1151,12 @@ def _save_auth_store_locked(
     *,
     recovery: bool,
     recovery_expected_digest: Optional[str] = None,
+    recovery_expected_identity: Optional[Tuple[int, int]] = None,
 ) -> Path:
     """Write while the caller owns the target lock and final digest check."""
     _validate_recovery_store(auth_store) if recovery else _validate_auth_store_schema(auth_store)
     expected_digest = recovery_expected_digest if recovery else _snapshot_for(auth_store, auth_file)
+    expected_identity: Optional[Tuple[int, int]] = recovery_expected_identity
     if auth_file.exists() and not recovery:
         try:
             current_bytes = _read_auth_bytes(auth_file)
@@ -980,6 +1174,10 @@ def _save_auth_store_locked(
             raise AuthStoreRecoveryRequired(auth_file) from exc
         if expected_digest is not None and expected_digest != _digest(current_bytes):
             raise AuthStoreWriteConflictError(auth_file)
+        if expected_digest is not None:
+            expected_identity = _posix_file_identity(auth_file)
+    if expected_digest is not None and expected_identity is None and auth_file.exists():
+        expected_identity = _posix_file_identity(auth_file)
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     _validate_auth_store_parent(auth_file)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
@@ -1011,6 +1209,7 @@ def _save_auth_store_locked(
             tmp_path,
             auth_file,
             expected_digest=expected_digest,
+            expected_identity=expected_identity,
             recovery=recovery,
         )
         try:
@@ -1058,7 +1257,11 @@ def recover_auth_store(
     the corruption exception. Recovery without a reviewed digest is refused.
     """
     _validate_recovery_store(auth_store)
-    if not isinstance(expected_corrupt_sha256, str) or not expected_corrupt_sha256:
+    if (
+        not isinstance(expected_corrupt_sha256, str)
+        or len(expected_corrupt_sha256) != hashlib.sha256().digest_size * 2
+        or any(char not in "0123456789abcdefABCDEF" for char in expected_corrupt_sha256)
+    ):
         raise ValueError("Explicit recovery requires the reviewed corrupt-store SHA-256")
     auth_file = target_path if target_path is not None else _auth_file_path()
     with _auth_store_lock(target_path=auth_file):
@@ -1073,6 +1276,11 @@ def recover_auth_store(
             expected_corrupt_sha256 = current_digest
         if expected_corrupt_sha256 != current_digest:
             raise AuthStoreRecoveryConflictError(auth_file)
+        # A digest supplied by a caller is not provenance by itself. Revalidate
+        # the target under the recovery lock and refuse a healthy canonical (or
+        # explicitly supported legacy) store even when its digest matches.
+        if _is_valid_current_store_bytes(current_bytes):
+            raise AuthStoreRecoveryConflictError(auth_file)
         previous = getattr(_recovery_state, "enabled", False)
         _recovery_state.enabled = True
         try:
@@ -1081,6 +1289,7 @@ def recover_auth_store(
                 auth_file,
                 recovery=True,
                 recovery_expected_digest=expected_corrupt_sha256,
+                recovery_expected_identity=_posix_file_identity(auth_file),
             )
         finally:
             _recovery_state.enabled = previous
