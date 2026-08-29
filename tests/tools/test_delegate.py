@@ -147,6 +147,97 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
+    @patch("agent.prompt_builder.build_context_files_prompt")
+    def test_forwards_explicit_context_length(self, mock_context_prompt):
+        mock_context_prompt.return_value = "project conventions"
+
+        prompt = _build_child_system_prompt(
+            "Fix the tests",
+            workspace_path="/tmp/workspace",
+            context_length=131072,
+        )
+
+        mock_context_prompt.assert_called_once_with(
+            cwd="/tmp/workspace", skip_soul=True, context_length=131072
+        )
+        self.assertIn("project conventions", prompt)
+
+
+class TestChildPromptContextLength(unittest.TestCase):
+    def _build_with_context_length(self, compressor_length, metadata_result=None, metadata_error=None):
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.context_compressor.context_length = compressor_length
+
+        def construct_child(**kwargs):
+            self.assertNotIn("project-context-", kwargs["ephemeral_system_prompt"])
+            return child
+
+        metadata = MagicMock()
+        if metadata_error is not None:
+            metadata.side_effect = metadata_error
+        else:
+            metadata.return_value = metadata_result
+
+        with (
+            patch("tools.delegate_tool._resolve_workspace_hint", return_value="/tmp/workspace"),
+            patch("run_agent.AIAgent", side_effect=construct_child),
+            patch(
+                "agent.prompt_builder.build_context_files_prompt",
+                side_effect=lambda **kwargs: f"project-context-{kwargs['context_length']}",
+            ) as context_prompt,
+            patch("agent.model_metadata.get_model_context_length", metadata),
+        ):
+            result = _build_child_agent(
+                task_index=0,
+                goal="test",
+                context=None,
+                toolsets=None,
+                model="delegated-model",
+                max_iterations=5,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="delegated-provider",
+                override_base_url="https://delegated.example/v1",
+                override_api_key="delegated-key",
+            )
+
+        return result, context_prompt, metadata
+
+    def test_prefers_valid_child_compressor_context_length(self):
+        child, context_prompt, metadata = self._build_with_context_length(262144)
+
+        self.assertIn("project-context-262144", child.ephemeral_system_prompt)
+        context_prompt.assert_called_once_with(
+            cwd="/tmp/workspace", skip_soul=True, context_length=262144
+        )
+        metadata.assert_not_called()
+
+    def test_invalid_child_compressor_falls_back_to_delegated_model_metadata(self):
+        child, context_prompt, metadata = self._build_with_context_length(0, 131072)
+
+        self.assertIn("project-context-131072", child.ephemeral_system_prompt)
+        context_prompt.assert_called_once_with(
+            cwd="/tmp/workspace", skip_soul=True, context_length=131072
+        )
+        metadata.assert_called_once_with(
+            "delegated-model",
+            base_url="https://delegated.example/v1",
+            api_key="delegated-key",
+            provider="delegated-provider",
+        )
+
+    def test_metadata_failure_preserves_none_best_effort_fallback(self):
+        child, context_prompt, metadata = self._build_with_context_length(
+            None, metadata_error=RuntimeError("metadata unavailable")
+        )
+
+        self.assertIn("project-context-None", child.ephemeral_system_prompt)
+        context_prompt.assert_called_once_with(
+            cwd="/tmp/workspace", skip_soul=True, context_length=None
+        )
+        metadata.assert_called_once()
+
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
