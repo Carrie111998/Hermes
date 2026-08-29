@@ -1334,29 +1334,36 @@ def _try_dispatch_background_run(
         max_async = 3
 
     started_at = time.time()
-    deliver = job.get("deliver", "local")
+    deliver = _normalize_deliver_param(claimed_job.get("deliver")) or "local"
 
     def _runner() -> Dict[str, Any]:
         res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
+        delivery_error = str(refreshed.get("last_delivery_error") or "").strip()
+        if deliver == "local":
+            delivery_note = " (output saved locally only)"
+        elif delivery_error:
+            delivery_note = f" (delivery failed: {delivery_error})"
+        else:
+            delivery_note = " (output was delivered there by the job itself)"
         lines = [
             f"Cron job '{job_name}' ({job_id}) finished its manual run.",
             f"Result: {'ok' if res.get('success') else 'FAILED'}"
             + (f" — {res.get('error')}" if res.get("error") else ""),
-            f"Delivery target: {deliver}"
-            + (
-                " (output was delivered there by the job itself)"
-                if deliver != "local"
-                else " (output saved locally only)"
-            ),
+            f"Delivery target: {deliver}{delivery_note}",
         ]
         if refreshed.get("next_run_at"):
             lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-        excerpt = _latest_job_output_excerpt(job_id)
-        if excerpt:
-            lines.append("--- JOB OUTPUT ---")
-            lines.append(excerpt)
+        # This completion re-enters the session that invoked action='run', not
+        # the job's delivery target. Repeating an externally delivered payload
+        # here leaks it into a second, potentially unrelated chat/thread. Local
+        # jobs have no other user-facing destination, so retain their excerpt.
+        if deliver == "local":
+            excerpt = _latest_job_output_excerpt(job_id)
+            if excerpt:
+                lines.append("--- JOB OUTPUT ---")
+                lines.append(excerpt)
         return {
             "status": "completed" if res.get("success") else "error",
             "summary": "\n".join(lines),
