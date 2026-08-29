@@ -72,7 +72,7 @@ def _patch_managed_uv(request):
 
 
 @pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
+def _patch_gateway_discovery(monkeypatch):
     """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
 
     The restart phase used to swallow every exception at debug level, so these
@@ -83,6 +83,10 @@ def _patch_gateway_discovery():
     Discovery returning nothing makes the phase a clean no-op for every test
     in this module (none of them assert on gateway restarts).
     """
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(hm, "_reload_updated_runtime_modules", lambda: None)
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
          patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
