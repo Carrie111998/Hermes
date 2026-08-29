@@ -20,6 +20,7 @@ from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import (  # noqa: E402
     TelegramAdapter,
     _escape_mdv2,
+    _sanitize_telegram_markdown_links,
     _strip_mdv2,
     _wrap_markdown_tables,
 )
@@ -73,6 +74,24 @@ class TestFormatMessageBasic:
         result = adapter.format_message("Price is $5.00!")
         assert "\\." in result
         assert "\\!" in result
+
+    def test_internal_session_links_degrade_to_labels(self, adapter):
+        result = adapter.format_message(
+            "Already underway in [Research](Research) and "
+            "[Archive](@session:work/abc)."
+        )
+        assert "[" not in result
+        assert "Research" in result
+        assert "Archive" in result
+        assert "\\." in result
+
+    def test_supported_external_links_remain_clickable(self, adapter):
+        result = adapter.format_message("Read [Docs](https://example.com/docs).")
+        assert "[Docs](https://example.com/docs)" in result
+
+    def test_code_links_are_not_rewritten(self):
+        source = "Use `[Title](Title)` literally."
+        assert _sanitize_telegram_markdown_links(source) == source
 
 
 # =========================================================================
