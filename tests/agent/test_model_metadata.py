@@ -217,6 +217,29 @@ class TestEstimateRequestTokensRough:
 # =========================================================================
 
 class TestDefaultContextLengths:
+    def test_openrouter_routing_suffix_falls_back_to_bare_models_dev_entry(self):
+        registry = {
+            "openrouter": {
+                "models": {
+                    "z-ai/glm-5.3-flash": {
+                        "limit": {"context": 1_310_720, "output": 131_072},
+                    },
+                },
+            },
+        }
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            context = get_model_context_length(
+                "z-ai/glm-5.3-flash:floor",
+                base_url="https://openrouter.ai/api/v1",
+                provider="openrouter",
+            )
+
+        assert context == 1_310_720
+
     def test_nvidia_deepseek_v4_pro_context_is_endpoint_scoped(self):
         """NVIDIA's 262K NIM window must not lower DeepSeek V4 globally."""
         with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
