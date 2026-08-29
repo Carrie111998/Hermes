@@ -4298,6 +4298,10 @@ def looks_like_codex_intermediate_ack(
     )
     list_item_prefix_pattern = re.compile(r"(?:^|\n)\s*(?:[-*+]|\d+[.)])\s*$")
     numbered_item_pattern = re.compile(r"(?:^|\s)(\d+)[.)](?=\s)")
+    status_number_pattern = re.compile(
+        r"\b(?P<label>exit\s+code|attempt|step|retry)\s+"
+        r"(?P<number>\d+)[.)](?=\s)"
+    )
     question_pattern = re.compile(r"\?(?=\s|$|[\"'’”)\]])")
     sentence_boundary_pattern = re.compile(
         r"(?:[.!…](?=\s|$)|\?(?=\s|$|[\"'’”)\]])|\n+)"
@@ -4342,10 +4346,29 @@ def looks_like_codex_intermediate_ack(
         r"globals?\s+before\s+(?:the\s+)?agent\s+name)\s*$"
     )
     has_pronounless_action = False
+    status_numbers_by_label = {}
+    for status_match in status_number_pattern.finditer(assistant_text):
+        status_numbers_by_label.setdefault(status_match.group("label"), set()).add(
+            status_match.group("number")
+        )
+    has_status_sequence = any(
+        {"1", "2"}.issubset(numbers)
+        for numbers in status_numbers_by_label.values()
+    )
+    has_enumeration_intro = bool(
+        re.search(r"\b(?:options?|ideas?|approaches?|ways|fixes)\b", assistant_text)
+    )
+    numbering_text = (
+        assistant_text
+        if has_enumeration_intro
+        else status_number_pattern.sub("", assistant_text)
+    )
     numbered_markers = {
-        match.group(1) for match in numbered_item_pattern.finditer(assistant_text)
+        match.group(1) for match in numbered_item_pattern.finditer(numbering_text)
     }
-    has_numbered_list = {"1", "2"}.issubset(numbered_markers)
+    has_numbered_list = has_status_sequence or {"1", "2"}.issubset(
+        numbered_markers
+    )
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
             action_prefix = assistant_text[: action_match.start("action")]

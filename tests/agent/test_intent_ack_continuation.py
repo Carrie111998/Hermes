@@ -161,6 +161,8 @@ def test_pronounless_action_announcements_continue_when_opted_in():
         "Exit code 1. Checking the actual log.",
         "Step 2. Creating the session now.",
         "Attempt 2. Relaunching with corrected arguments.",
+        "Exit code 1. Attempt 2. Relaunching with corrected arguments.",
+        "Exit code 1. Step 2. Checking the actual log.",
     )
     for announcement in announcements:
         assert looks_like_codex_intermediate_ack(
@@ -241,6 +243,8 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Two approaches. 1. Checking the actual log. 2. Bumping the timeout.",
         "Two approaches. 1. Pinning the dependency. 2. Checking the actual log.",
         "Two ways. 1. Creating the session now. 2. Pinning the dep.",
+        "Two options. Step 1. Pinning the dependency. Step 2. Relaunching with corrected arguments.",
+        "Step 1. Pinning the dependency. Step 2. Relaunching with corrected arguments.",
         "Possible fixes. 1. Checking the actual log. 2. Bumping the timeout.",
         "Two options: pinning the dep, checking the actual log.",
         "Two fixes: bumping the timeout, relaunching with corrected arguments.",
@@ -252,7 +256,6 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
 
 
 # ── detector: guardrails that hold regardless of workspace ───────────────────
-
 
 
 
