@@ -68,10 +68,14 @@ describe('HUD sheet CSS contract', () => {
   it('shows the sheet while a turn is recent, not only while the composer is focused', () => {
     // The bug: composer-bounds rose on data-hud-recent, but the glass stayed
     // at opacity 0 until :focus. White overlay ink then sat on the desktop.
-    const recent = of('[data-hud-shell][data-hud-recent] [data-hud-glass]')
+    // Games are excluded — they pin data-hud-recent for the whole overlay
+    // session, and a sheet that followed recent would cover the action.
+    const recent = of('[data-hud-shell][data-hud-recent]:not([data-hud-game]) [data-hud-glass]')
+    const gameRecent = of('[data-hud-shell][data-hud-game][data-hud-recent] [data-hud-glass]')
 
     expect(recent.opacity).toBe('1')
     expect(recent.translate).toBe('none')
+    expect(gameRecent.opacity ?? '').not.toBe('1')
   })
 
   it('paints the resting sheet as opaque theme paper, not a translucent scrim', () => {
@@ -82,8 +86,10 @@ describe('HUD sheet CSS contract', () => {
   })
 
   it('keeps focusing from punching a hole back through to the desktop', () => {
-    const focused = of("[data-hud-shell]:has([data-slot='composer-rich-input']:focus) [data-hud-glass]")
-    const recent = of('[data-hud-shell][data-hud-recent] [data-hud-glass]')
+    const focused = of(
+      "[data-hud-shell]:not([data-hud-game]):has([data-slot='composer-rich-input']:focus) [data-hud-glass]"
+    )
+    const recent = of('[data-hud-shell][data-hud-recent]:not([data-hud-game]) [data-hud-glass]')
 
     expect(focused.background).toBe('var(--ui-bg-elevated)')
     expect(recent.background).toBe('var(--ui-bg-elevated)')
@@ -118,9 +124,23 @@ describe('HUD sheet CSS contract', () => {
     expect(gameDescendants.color).toContain('!important')
   })
 
-  it('keeps a translucent scrim only over a game', () => {
-    const gameGlass = of('[data-hud-shell][data-hud-game] [data-hud-glass]')
+  it('keeps a translucent scrim over a game, including Glass-on and focus', () => {
+    // The (0,3,0) game-only rule lost to later opaque-paper rules
+    // (focus :has is (0,4,0); glass-on resting is (0,4,0); glass-on +
+    // recent/focus is higher). Overlay ink is #fff, so those losses put
+    // white text on --ui-bg-elevated.
+    const scrim = /rgb\(12 14 18\s*\/\s*0\.\d+\)/
+    const gameStates = [
+      '[data-hud-shell][data-hud-game] [data-hud-glass]',
+      '[data-hud-shell][data-hud-game][data-hud-recent] [data-hud-glass]',
+      "[data-hud-shell][data-hud-game]:has([data-slot='composer-rich-input']:focus) [data-hud-glass]",
+      ':root[data-hermes-glass-on] [data-hud-shell][data-hud-game] [data-hud-glass]',
+      ':root[data-hermes-glass-on] [data-hud-shell][data-hud-game][data-hud-recent] [data-hud-glass]',
+      ":root[data-hermes-glass-on] [data-hud-shell][data-hud-game]:has([data-slot='composer-rich-input']:focus) [data-hud-glass]"
+    ]
 
-    expect(gameGlass.background).toMatch(/rgb\(12 14 18\s*\/\s*0\.\d+\)/)
+    for (const selector of gameStates) {
+      expect(of(selector).background, selector).toMatch(scrim)
+    }
   })
 })

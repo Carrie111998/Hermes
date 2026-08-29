@@ -2747,10 +2747,14 @@ button[data-slot='aui_msg-reactions'] svg {
     background-color var(--hud-dim) var(--hud-ease-enter);
 }
 
-/* The sheet rides the band: visible while a turn is recent/held OR while the
-   composer has the caret. Focus-only left the text up (data-hud-recent) with
-   the paper gone — white overlay ink on whatever was behind the window. */
-[data-hud-shell][data-hud-recent] [data-hud-glass],
+/* Desktop sheet rides the band: visible while a turn is recent/held OR while
+   the composer has the caret. Focus-only left the text up (data-hud-recent)
+   with the paper gone — white overlay ink on whatever was behind the window.
+
+   Games are excluded: they pin data-hud-recent for the whole overlay session
+   (useHudHeld), and a sheet that follows recent would park a panel on the
+   action. Over a game the sheet stays focus-only, same as before. */
+[data-hud-shell][data-hud-recent]:not([data-hud-game]) [data-hud-glass],
 [data-hud-shell]:has([data-slot='composer-rich-input']:focus) [data-hud-glass] {
   translate: none;
   opacity: 1;
@@ -2800,9 +2804,10 @@ button[data-slot='aui_msg-reactions'] svg {
 }
 
 /* Engaged, the field stays the same opaque paper — focusing must not punch
-   a hole back through to the desktop. */
-:root[data-hermes-glass-on] [data-hud-shell][data-hud-recent] [data-hud-glass],
-:root[data-hermes-glass-on] [data-hud-shell]:has([data-slot='composer-rich-input']:focus) [data-hud-glass] {
+   a hole back through to the desktop. Games are excluded so overlay ink
+   cannot land on --ui-bg-elevated. */
+:root[data-hermes-glass-on] [data-hud-shell][data-hud-recent]:not([data-hud-game]) [data-hud-glass],
+:root[data-hermes-glass-on] [data-hud-shell]:not([data-hud-game]):has([data-slot='composer-rich-input']:focus) [data-hud-glass] {
   background: var(--ui-bg-elevated);
 }
 
@@ -2812,8 +2817,8 @@ button[data-slot='aui_msg-reactions'] svg {
    to use it, and the transcript flew open every time it was moved. Hit-testing
    below stays on :focus-within — being permissive about what can be clicked is
    harmless, being permissive about what lights up is not. */
-[data-hud-shell][data-hud-recent] [data-hud-glass],
-[data-hud-shell]:has([data-slot='composer-rich-input']:focus) [data-hud-glass] {
+[data-hud-shell][data-hud-recent]:not([data-hud-game]) [data-hud-glass],
+[data-hud-shell]:not([data-hud-game]):has([data-slot='composer-rich-input']:focus) [data-hud-glass] {
   background: var(--ui-bg-elevated);
 }
 
@@ -3366,9 +3371,17 @@ button[data-slot='aui_msg-reactions'] svg {
   transition: opacity var(--hud-reveal) var(--hud-ease-enter);
 }
 
-/* Over a game the card steps back to a translucent scrim so the action stays
-   visible under the log. Desktop HUD keeps the opaque theme paper. */
-[data-hud-shell][data-hud-game] [data-hud-glass] {
+/* Over a game the sheet is a translucent scrim so the action stays visible
+   under the log. These selectors must outrank the opaque-paper
+   recent/focus/glass-on rules — otherwise overlay ink (#fff) lands on
+   --ui-bg-elevated. Games also pin data-hud-recent, so the glass-on +
+   recent override is the steady state, not an edge case. */
+[data-hud-shell][data-hud-game] [data-hud-glass],
+[data-hud-shell][data-hud-game][data-hud-recent] [data-hud-glass],
+[data-hud-shell][data-hud-game]:has([data-slot='composer-rich-input']:focus) [data-hud-glass],
+:root[data-hermes-glass-on] [data-hud-shell][data-hud-game] [data-hud-glass],
+:root[data-hermes-glass-on] [data-hud-shell][data-hud-game][data-hud-recent] [data-hud-glass],
+:root[data-hermes-glass-on] [data-hud-shell][data-hud-game]:has([data-slot='composer-rich-input']:focus) [data-hud-glass] {
   background: rgb(12 14 18 / 0.62);
 }
 
