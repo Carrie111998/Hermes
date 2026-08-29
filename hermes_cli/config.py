@@ -400,8 +400,10 @@ def _represent_loaded_config(dumper, value):
     return dumper.represent_dict(value)
 
 
-yaml.SafeDumper.add_representer(_LoadedConfig, _represent_loaded_config)
-yaml.Dumper.add_representer(_LoadedConfig, _represent_loaded_config)
+for _dumper_name in ("SafeDumper", "Dumper", "CSafeDumper", "CDumper"):
+    _dumper = getattr(yaml, _dumper_name, None)
+    if _dumper is not None:
+        _dumper.add_representer(_LoadedConfig, _represent_loaded_config)
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
