@@ -71,6 +71,62 @@ def _adapter_with_allowlist(monkeypatch, allowed_user_ids):
     return adapter
 
 
+def _adapter_real_gate(allowed_user_ids):
+    """Same construction as ``_adapter_with_allowlist`` but the real
+    ``_is_allowed_user`` gate runs — the receipt tests above pin the logging
+    behavior with the gate monkeypatched, so a regression in the gate itself
+    (e.g. an inverted membership check) would not surface there. The gate
+    env snapshot pins the two allow-all bypasses off, isolating the test
+    from ambient env."""
+    from gateway.config import Platform
+
+    adapter = object.__new__(DiscordAdapter)
+    adapter.platform = Platform.DISCORD
+    adapter._allowed_user_ids = set(allowed_user_ids)
+    adapter._allowed_role_ids = set()
+    adapter._warned_fail_closed_default = True  # isolate from that warning
+    adapter._gate_env_snapshot = {
+        "DISCORD_ALLOW_ALL_USERS": "",
+        "GATEWAY_ALLOW_ALL_USERS": "",
+    }
+    dedup = MagicMock()
+    dedup.is_duplicate.return_value = False
+    dedup.contains.return_value = False
+    adapter._dedup = dedup
+    client = MagicMock()
+    client.user = SimpleNamespace(id=1, bot=True)
+    adapter._client = client
+    return adapter
+
+
+class TestRealAllowlistGateReceipt:
+    def test_unknown_sender_fails_real_gate_allowlist_reason(self, caplog):
+        adapter = _adapter_real_gate(["1"])
+        msg = _dm_message(sender_id="42")
+
+        with caplog.at_level(logging.WARNING, logger=adapter_mod.__name__):
+            admitted, _ = adapter._discord_message_admission(msg, claim=True)
+
+        assert admitted is False
+        receipts = [r for r in caplog.records if "message refused" in r.getMessage()]
+        assert receipts, "real gate must still refuse an unknown sender"
+        assert "reason=sender_not_in_allowlist" in receipts[0].getMessage()
+        assert "channel_id=-" in receipts[0].getMessage()
+
+    def test_no_allowlist_refusal_reports_fail_closed_reason(self, caplog):
+        adapter = _adapter_real_gate([])  # nothing configured: fail-closed
+        msg = _dm_message(sender_id="42")
+
+        with caplog.at_level(logging.WARNING, logger=adapter_mod.__name__):
+            admitted, _ = adapter._discord_message_admission(msg, claim=True)
+
+        assert admitted is False
+        receipts = [r for r in caplog.records if "message refused" in r.getMessage()]
+        assert receipts
+        # The reason must not misattribute: there IS no allowlist to miss.
+        assert "reason=fail_closed_no_allowlist" in receipts[0].getMessage()
+
+
 class TestRefusalReceipt:
     def test_unknown_dm_sender_produces_receipt(self, monkeypatch, caplog):
         adapter = _adapter_with_allowlist(monkeypatch, ["1"])
