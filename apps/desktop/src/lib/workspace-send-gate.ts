@@ -1,29 +1,118 @@
-/**
- * Sessions-switch send barrier. Blocks turn creation only while a workspace
- * switch is in flight (phase-1 dial or phase-2 commit) or the captured switch
- * generation is stale. Bot Mode talking across machines is not a switch.
- */
-export function isWorkspaceSendBlocked(input: {
+/** Existing Sessions/Bot send-surface states. Fail closed unless a state allows send. */
+export const WORKSPACE_SEND_SURFACE_STATES = [
+  'already_active',
+  'auth_required',
+  'bot_talk_across',
+  'idle_fleet',
+  'route_invalid',
+  'switch_failed',
+  'switching',
+  'unreachable',
+  'unsupported_build'
+] as const
+
+export type WorkspaceSendSurfaceState = (typeof WORKSPACE_SEND_SURFACE_STATES)[number]
+
+export type WorkspaceSendTuple = {
+  connectionId: string
+  profile: string
+}
+
+export type WorkspaceSendInput = {
   capturedGeneration?: number
   currentGeneration?: number
   gatewaySwitching: boolean
   pendingConnectionId: string | null
-}): boolean {
-  if (input.pendingConnectionId != null) {
-    return true
-  }
+  authRequired?: boolean
+  botTalkAcross?: boolean
+  intendedOwner?: null | WorkspaceSendTuple
+  isNewChat?: boolean
+  ambientTupleValid?: boolean
+  readinessResolved?: boolean
+  socketOwner?: null | WorkspaceSendTuple
+  switchFailed?: boolean
+  unreachable?: boolean
+  unsupportedBuild?: boolean
+}
 
-  if (input.gatewaySwitching) {
-    return true
-  }
+export type WorkspaceSendVerdict = {
+  allowed: boolean
+  state: WorkspaceSendSurfaceState
+}
 
+export type WorkspaceSubmitResult =
+  { ok: true; reason?: WorkspaceSendSurfaceState } | { ok: false; reason: WorkspaceSendSurfaceState }
+
+function tuplesEqual(left?: null | WorkspaceSendTuple, right?: null | WorkspaceSendTuple): boolean {
+  return Boolean(left && right && left.connectionId === right.connectionId && left.profile === right.profile)
+}
+
+export function evaluateWorkspaceSend(input: WorkspaceSendInput): WorkspaceSendVerdict {
   if (
-    input.capturedGeneration !== undefined &&
-    input.currentGeneration !== undefined &&
-    input.capturedGeneration !== input.currentGeneration
+    input.pendingConnectionId != null ||
+    input.gatewaySwitching ||
+    (input.capturedGeneration !== undefined &&
+      input.currentGeneration !== undefined &&
+      input.capturedGeneration !== input.currentGeneration)
   ) {
-    return true
+    return { allowed: false, state: 'switching' }
   }
 
-  return false
+  if (input.switchFailed) {
+    return { allowed: false, state: 'switch_failed' }
+  }
+
+  if (input.unsupportedBuild) {
+    return { allowed: false, state: 'unsupported_build' }
+  }
+
+  if (input.unreachable) {
+    return { allowed: false, state: 'unreachable' }
+  }
+
+  if (input.authRequired || input.readinessResolved === false) {
+    return { allowed: false, state: 'auth_required' }
+  }
+
+  if (input.botTalkAcross) {
+    return { allowed: true, state: 'bot_talk_across' }
+  }
+
+  if (input.intendedOwner === null && input.isNewChat === false) {
+    return { allowed: false, state: 'route_invalid' }
+  }
+
+  if (input.intendedOwner && input.socketOwner && !tuplesEqual(input.intendedOwner, input.socketOwner)) {
+    return { allowed: false, state: 'route_invalid' }
+  }
+
+  if (input.intendedOwner && input.socketOwner && tuplesEqual(input.intendedOwner, input.socketOwner)) {
+    return { allowed: true, state: 'already_active' }
+  }
+
+  if (input.isNewChat && input.ambientTupleValid) {
+    return { allowed: true, state: 'idle_fleet' }
+  }
+
+  return { allowed: true, state: 'idle_fleet' }
+}
+
+/** Sessions-switch send barrier plus the fail-closed existing-surface set. */
+export function isWorkspaceSendBlocked(input: WorkspaceSendInput): boolean {
+  return !evaluateWorkspaceSend(input).allowed
+}
+
+export function isSessionsSwitchInFlight(input: {
+  gatewaySwitching: boolean
+  pendingConnectionId: string | null
+}): boolean {
+  return evaluateWorkspaceSend({ ...input }).state === 'switching'
+}
+
+export function isSubmitDeferred(result: WorkspaceSubmitResult | boolean): boolean {
+  return typeof result === 'object' && result.ok === false && result.reason === 'switching'
+}
+
+export function isSubmitAccepted(result: WorkspaceSubmitResult | boolean): boolean {
+  return result === true || (typeof result === 'object' && result.ok === true)
 }

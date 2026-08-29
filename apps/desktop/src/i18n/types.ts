@@ -1578,6 +1578,10 @@ export interface Translations {
       consequence: string
       switching: (name: string, gateway: string) => string
       switchFailed: (name: string, gateway: string, previous: string) => string
+      routeInvalid: (gateway: string) => string
+      unreachableTuple: (name: string, gateway: string) => string
+      authRequiredTuple: (name: string, gateway: string) => string
+      unsupportedBuild: string
       deleteOn: (gateway: string) => string
     }
     remoteOverride: {

@@ -1859,6 +1859,10 @@ export const en: Translations = {
       switching: (name, gateway) => `Switching Sessions to ${name} on ${gateway}…`,
       switchFailed: (name, gateway, previous) =>
         `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
+      routeInvalid: gateway => `Can't switch to ${gateway}. The profile route is missing or ambiguous.`,
+      unreachableTuple: (name, gateway) => `${name} · ${gateway} · unreachable`,
+      authRequiredTuple: (name, gateway) => `${name} · ${gateway} · sign-in required`,
+      unsupportedBuild: 'This gateway build cannot switch Sessions from here.',
       deleteOn: gateway => ` on ${gateway}`
     },
     remoteOverride: {
@@ -2362,7 +2366,7 @@ export const en: Translations = {
     steer: 'Steer the current run',
     stop: 'Stop',
     send: 'Send',
-    sessionsSwitchingSendBlocked: "Can't send while Sessions is switching.",
+    sessionsSwitchingSendBlocked: "Can't send while Sessions is switching. Your draft is saved.",
     speaking: 'Speaking',
     transcribing: 'Transcribing',
     thinking: 'Thinking',

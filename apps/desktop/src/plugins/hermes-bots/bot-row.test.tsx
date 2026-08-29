@@ -113,6 +113,8 @@ describe('the row delegates the open and claims no activation authority', () => 
 
     expect(ensureAgent).not.toHaveBeenCalled()
     expect(openRosterBot.mock.calls).toEqual([[bot]])
+    expect(screen.getByText('Research')).toBeTruthy()
+    expect(screen.getByText('Work')).toBeTruthy()
   })
 
   it('never resolves a remote default into the same-named local bot', async () => {

@@ -43,6 +43,9 @@ vi.mock('@/i18n', () => ({
           gateway: (gateway: string) => `Profiles on ${gateway}`,
           gatewayUnreachable: (gateway: string) => `${gateway} · unreachable`,
           onGateway: (name: string, gateway: string) => `${name} · ${gateway}`,
+          routeInvalid: (gateway: string) => `Can't switch to ${gateway}. The profile route is missing or ambiguous.`,
+          unreachableTuple: (name: string, gateway: string) => `${name} · ${gateway} · unreachable`,
+          authRequiredTuple: (name: string, gateway: string) => `${name} · ${gateway} · sign-in required`,
           switchFailed: (name: string, gateway: string, previous: string) =>
             `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
           switching: (name: string, gateway: string) => `Switching Sessions to ${name} on ${gateway}…`,
@@ -127,9 +130,10 @@ const connectionsRegistry = connectionsStore.$connectionsRegistry as ReturnType<
   typeof atom<DesktopConnectionsRegistry | null>
 >
 
-const { $profiles, $profileScope } = await import('@/store/profile')
+const { $profiles, $profileScope, $activeGatewayProfile } = await import('@/store/profile')
 const profiles = $profiles as ReturnType<typeof atom<Array<{ is_default: boolean; name: string }>>>
 const profileScope = $profileScope as ReturnType<typeof atom<string>>
+const gatewayProfile = $activeGatewayProfile as ReturnType<typeof atom<string>>
 const { _resetFleetRosterForTests } = await import('@/store/fleet-roster')
 
 const registry: DesktopConnectionsRegistry = {
@@ -212,6 +216,7 @@ afterEach(() => {
   connectionsRegistry.set(null)
   activeConnectionId.set(null)
   profileScope.set('default')
+  gatewayProfile.set('default')
   profiles.set([{ is_default: true, name: 'default' }])
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
 })
@@ -277,7 +282,7 @@ describe('ProfileRail fleet mode', () => {
         '[data-slot="profile-rail-divider"][data-connection-id="vps"] [data-slot="profile-rail-unreachable"]'
       )
     ).toBeTruthy()
-    expect(within(vps as HTMLElement).getByRole('button', { name: 'Switch to default on VPS' })).toBeTruthy()
+    expect(within(vps as HTMLElement).getByRole('button', { name: 'default · VPS · unreachable' })).toBeTruthy()
   })
 
   it('re-homes onto the exact (gateway, profile) when an at-rest square is clicked', async () => {
@@ -410,5 +415,95 @@ describe('ProfileRail fleet mode', () => {
       })
     ).toBeTruthy()
     expect(globalThis.document.activeElement).toBe(omer)
+  })
+
+  it('treats a named active exact tuple as status, including mac-cockpit', async () => {
+    armFleet()
+    activeConnectionId.set('local')
+    gatewayProfile.set('mac-cockpit')
+    profiles.set([
+      { is_default: true, name: 'default' },
+      { is_default: false, name: 'mac-cockpit' }
+    ])
+    await renderFleet()
+
+    expect(screen.getByRole('status', { name: 'mac-cockpit · This device' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'mac-cockpit' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Switch to default on This device' })).toBeTruthy()
+  })
+
+  it('ignores a second rest-square click while a switch is pending and restores on failure', async () => {
+    armFleet()
+    await renderFleet()
+
+    let rejectFirst: (error: Error) => void = () => undefined
+    selectConnection.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectFirst = reject
+        })
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to omer on This device' }))
+    fireEvent.click(screen.getByRole('button', { name: 'default · VPS · unreachable' }))
+
+    expect(selectConnection).toHaveBeenCalledTimes(1)
+    expect(selectConnection).toHaveBeenCalledWith('local', { profile: 'omer' })
+
+    await act(async () => {
+      rejectFirst(new Error('dial failed'))
+      await Promise.resolve()
+    })
+
+    expect(activeConnectionId.get()).toBe('pandora')
+
+    fireEvent.click(screen.getByRole('button', { name: 'default · VPS · unreachable' }))
+    expect(selectConnection).toHaveBeenCalledWith('vps', { profile: 'default' })
+  })
+
+  it('shows profile plus connection on condensed trigger and rest rows', async () => {
+    armFleet()
+    profiles.set([
+      { is_default: true, name: 'default' },
+      ...Array.from({ length: 11 }, (_, index) => ({ is_default: false, name: `p${index + 1}` }))
+    ])
+    await renderFleet()
+
+    const trigger = screen.getByRole('button', { name: 'Profiles' })
+    expect(trigger.textContent).toContain('default · Pandora')
+
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+
+    expect(await screen.findByText('omer · This device')).toBeTruthy()
+    expect(screen.getByText('default · VPS · unreachable')).toBeTruthy()
+  })
+
+  it('keeps the fleet live region sr-only so the icon rail has no visible prose', async () => {
+    armFleet()
+    await renderFleet()
+
+    let settle: () => void = () => undefined
+    selectConnection.mockImplementationOnce(() => new Promise<void>(resolve => (settle = resolve)))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to omer on This device' }))
+
+    const live = screen.getByRole('status', { name: /Switching Sessions to omer on This device/ })
+    expect(live.className).toContain('sr-only')
+    expect(live.getAttribute('role')).toBe('status')
+    expect(live.getAttribute('aria-live')).toBe('polite')
+
+    await act(async () => {
+      settle()
+      await Promise.resolve()
+    })
+  })
+
+  it('names unreachable routes with the tuple and explicit text, never color only', async () => {
+    armFleet()
+    await renderFleet()
+
+    const vps = screen.getByRole('button', { name: /default · VPS · unreachable/ })
+    expect(vps.textContent || vps.getAttribute('aria-label')).toMatch(/unreachable/)
   })
 })

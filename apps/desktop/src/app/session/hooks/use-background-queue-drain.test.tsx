@@ -10,6 +10,9 @@ import {
   getQueuedPrompts,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching, endGatewaySwitch } from '@/store/gateway-switch'
+import { $notifications, clearNotifications } from '@/store/notifications'
 import { $sessions, setSessions } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -71,6 +74,10 @@ describe('useBackgroundQueueDrain', () => {
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
     $sessions.set([])
+    $pendingConnectionId.set(null)
+    endGatewaySwitch()
+    $gatewaySwitching.set(false)
+    clearNotifications()
     clearAllSessionStates()
   })
 
@@ -220,6 +227,42 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     expect(submitText).toHaveBeenCalledTimes(2)
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+  })
+
+  it('treats a Sessions-switch block as a deferral across more than four retry intervals', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => false)
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'wait out the switch', attachments: [] })
+    $pendingConnectionId.set('pop-os-hermes')
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750 * 5)
+      await Promise.resolve()
+    })
+
+    expect(submitText).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect($notifications.get().some(item => item.id.includes('queue-stuck'))).toBe(false)
+
+    $pendingConnectionId.set(null)
+    submitText.mockResolvedValue(true)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750)
+      await Promise.resolve()
+    })
+
+    expect(submitText).toHaveBeenCalledTimes(1)
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
   })
 })

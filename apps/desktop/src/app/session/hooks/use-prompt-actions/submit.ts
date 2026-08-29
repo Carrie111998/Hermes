@@ -12,7 +12,7 @@ import {
   stopVoicePlayback,
   takeVoicePlaybackInterrupted
 } from '@/lib/voice-playback'
-import { isWorkspaceSendBlocked } from '@/lib/workspace-send-gate'
+import { evaluateWorkspaceSend } from '@/lib/workspace-send-gate'
 import {
   $composerAttachments,
   type ComposerAttachment,
@@ -102,12 +102,12 @@ const MAIN_SUBMIT_SCOPE: NonNullable<SubmitPromptDeps['scope']> = {
 }
 
 function workspaceSendBlocked(capturedGeneration?: number): boolean {
-  return isWorkspaceSendBlocked({
+  return !evaluateWorkspaceSend({
     capturedGeneration,
     currentGeneration: capturedGeneration === undefined ? undefined : currentGatewaySwitchGeneration(),
     gatewaySwitching: $gatewaySwitching.get(),
     pendingConnectionId: $pendingConnectionId.get()
-  })
+  }).allowed
 }
 
 /** The prompt submit pipeline, extracted from usePromptActions. */
@@ -195,7 +195,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // Sessions-switch barrier: fail closed before any turn side effects.
       // Bot Mode talking across machines is not a switch and does not set
       // $pendingConnectionId / $gatewaySwitching.
-      if (workspaceSendBlocked()) {
+      if (workspaceSendBlocked(capturedSwitchGeneration)) {
         return false
       }
 
@@ -561,6 +561,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       if (!options?.storedSessionId && !sessionId && routedStoredSessionId && routedSessionNeedsResume) {
+        if (workspaceSendBlocked(capturedSwitchGeneration)) {
+          return abortForSessionSwitch(sessionId)
+        }
+
         // The URL still names a durable conversation, but a profile
         // swap/reconnect left its volatile session binding incomplete or
         // cross-wired. Run the full profile-aware resume path. Creating here
@@ -622,6 +626,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           const resumed = cachedRuntimeId
             ? { session_id: cachedRuntimeId }
             : await singleFlightSessionResume(targetStoredSessionId, async () => {
+                if (workspaceSendBlocked(capturedSwitchGeneration)) {
+                  throw new Error('sessions-switch-blocked')
+                }
+
                 const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
 
                 return requestGateway<{ session_id: string }>('session.resume', {
@@ -678,6 +686,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       if (!sessionId) {
+        if (workspaceSendBlocked(capturedSwitchGeneration)) {
+          return abortForSessionSwitch(null)
+        }
+
         try {
           sessionId = await createBackendSessionForSend(bubbleText)
         } catch (err) {

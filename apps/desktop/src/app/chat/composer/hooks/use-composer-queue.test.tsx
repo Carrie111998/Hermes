@@ -9,6 +9,9 @@ import {
   isQueueParked,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching, endGatewaySwitch } from '@/store/gateway-switch'
+import { $notifications, clearNotifications } from '@/store/notifications'
 
 import type { QueueEditState } from '../composer-utils'
 import type { ChatBarProps } from '../types'
@@ -64,6 +67,10 @@ describe('useComposerQueue park integration', () => {
     vi.restoreAllMocks()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    $pendingConnectionId.set(null)
+    endGatewaySwitch()
+    $gatewaySwitching.set(false)
+    clearNotifications()
   })
 
   it('auto-drains an unparked queue once idle', async () => {
@@ -194,5 +201,30 @@ describe('useComposerQueue park integration', () => {
 
     expect(isQueueParked(SESSION_KEY)).toBe(false)
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+  })
+
+  it('does not burn the auto-drain budget while Sessions is switching, then drains once', async () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'hold for switch' })
+    $pendingConnectionId.set('pop-os-hermes')
+
+    const { hook, onSubmit } = renderQueueHook()
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      hook.rerender({ busy: true })
+      hook.rerender({ busy: false })
+      await act(async () => {
+        await Promise.resolve()
+      })
+    }
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+    expect($notifications.get().some(item => item.id === 'composer-queue-stuck')).toBe(false)
+
+    $pendingConnectionId.set(null)
+    hook.rerender({ busy: false })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 })

@@ -2039,10 +2039,14 @@ export const zh: Translations = {
       gatewayUnreachable: gateway => `${gateway} · 无法连接`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `切换到 ${gateway} 上的 ${name}`,
-      consequence: 'Sessions moves to this gateway; the open chat stays on its current machine.',
-      switching: (name, gateway) => `Switching Sessions to ${name} on ${gateway}…`,
+      consequence: 'Sessions 会移到此网关；已打开的聊天仍留在当前机器。',
+      switching: (name, gateway) => `正在将 Sessions 切换到 ${gateway} 上的 ${name}…`,
       switchFailed: (name, gateway, previous) =>
-        `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
+        `无法切换到 ${gateway} 上的 ${name}。仍停留在 ${previous}。没有发送任何内容。`,
+      routeInvalid: gateway => `无法切换到 ${gateway}。配置档案路由缺失或不明确。`,
+      unreachableTuple: (name, gateway) => `${name} · ${gateway} · 无法连接`,
+      authRequiredTuple: (name, gateway) => `${name} · ${gateway} · 需要登录`,
+      unsupportedBuild: '此网关版本无法从这里切换 Sessions。',
       deleteOn: gateway => `（位于 ${gateway}）`
     },
     remoteOverride: {
@@ -2541,7 +2545,7 @@ export const zh: Translations = {
     steer: '引导当前运行',
     stop: '停止',
     send: '发送',
-    sessionsSwitchingSendBlocked: "Can't send while Sessions is switching.",
+    sessionsSwitchingSendBlocked: 'Sessions 正在切换，暂时无法发送。草稿已保存。',
     speaking: '讲话中',
     transcribing: '转写中',
     thinking: '思考中',

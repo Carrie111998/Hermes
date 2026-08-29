@@ -22,6 +22,7 @@ import {
   connectionTooltip,
   sortConnectionsForDisplay
 } from '@/lib/connection-display'
+import { resolveUnambiguousConnectionProfile } from '@/lib/connection-tuple'
 import { triggerHaptic } from '@/lib/haptics'
 import { Loader2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -31,11 +32,13 @@ import {
   $connectionsRegistry,
   $pendingConnectionId,
   initializeConnectionsRegistry,
+  lastProfileForConnection,
   refreshConnectionsRegistry,
   selectConnection
 } from '@/store/connections'
 import { closeFindBar } from '@/store/find-in-page'
-import { notifyError } from '@/store/notifications'
+import { $fleetRoster } from '@/store/fleet-roster'
+import { notify, notifyError } from '@/store/notifications'
 import { isAuxiliaryWindow, isPeerInstanceWindow } from '@/store/windows'
 
 import { ConnectionGlyph } from './connection-glyph'
@@ -127,8 +130,28 @@ export function ConnectionSwitcher({ compact = false, onConnect }: { compact?: b
   const choose = (connectionId: string) => {
     triggerHaptic('selection')
     const connection = connections.find(candidate => candidate.id === connectionId)
+    const last = lastProfileForConnection(connectionId)
 
-    void selectConnection(connectionId).catch(error =>
+    const rosterProfiles = ($fleetRoster.get()?.agents ?? [])
+      .filter(agent => agent.connectionId === connectionId)
+      .map(agent => agent.profile)
+
+    const profile = resolveUnambiguousConnectionProfile({
+      connectionId,
+      lastProfileByConnection: last ? { [connectionId]: last } : {},
+      rosterProfiles
+    })
+
+    if (!profile) {
+      notify({
+        kind: 'error',
+        message: t.profiles.fleet.routeInvalid(connection?.label ?? connectionId)
+      })
+
+      return
+    }
+
+    void selectConnection(connectionId, { profile }).catch(error =>
       notifyError(error, t.profiles.switchConnectionFailed(connection?.label ?? connectionId))
     )
   }

@@ -169,8 +169,11 @@ export function ProfileRail() {
   const [pendingRestDelete, setPendingRestDelete] = useState<null | FleetAgent>(null)
   const [pendingRestSoul, setPendingRestSoul] = useState<null | FleetAgent>(null)
   // Route key of the at-rest square whose switch is dialing (spinner on that
-  // square, not in the statusbar — the previous source stays painted).
+  // square, not in the statusbar — the previous source stays painted). A ref
+  // owns the in-flight lock so a second rest click in the same tick cannot
+  // start another dial before React re-renders.
   const [pendingRoute, setPendingRoute] = useState<null | string>(null)
+  const pendingRouteRef = useRef<null | string>(null)
   const [fleetSwitchStatus, setFleetSwitchStatus] = useState<null | string>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -227,13 +230,18 @@ export function ProfileRail() {
   const condensed = profiles.length + countRestAgents(restGroups) > PROFILE_DROPDOWN_THRESHOLD
 
   const switchToRest = (agent: FleetAgent) => {
+    if (pendingRouteRef.current) {
+      return
+    }
+
     const key = fleetRouteKey(agent.connectionId, agent.profile)
+
     const previous = activeConnection ? p.fleet.onGateway(gatewayProfile, activeConnection.label) : gatewayProfile
 
     triggerHaptic('selection')
+    pendingRouteRef.current = key
     setPendingRoute(key)
     setFleetSwitchStatus(p.fleet.switching(agent.profile, agent.connectionLabel))
-
     void selectConnection(agent.connectionId, { profile: agent.profile })
       .then(() => {
         setFleetSwitchStatus(current =>
@@ -244,7 +252,13 @@ export function ProfileRail() {
         notifyError(error, p.switchConnectionFailed(agent.connectionLabel))
         setFleetSwitchStatus(p.fleet.switchFailed(agent.profile, agent.connectionLabel, previous))
       })
-      .finally(() => setPendingRoute(current => (current === key ? null : current)))
+      .finally(() => {
+        if (pendingRouteRef.current === key) {
+          pendingRouteRef.current = null
+        }
+
+        setPendingRoute(current => (current === key ? null : current))
+      })
   }
 
   const restScope = (agent: FleetAgent): ProfileScope => ({ connectionId: agent.connectionId, profile: agent.profile })
@@ -362,6 +376,11 @@ export function ProfileRail() {
 
   // The sortable strip of the active gateway's named profiles (unchanged
   // from the single-gateway rail; fleet mode only decides where it sits).
+  // In fleet mode the active named square is status, not a second action,
+  // so it is excluded from the sortable set.
+  const sortableNamed =
+    fleet && !isAll && activeKey ? named.filter(profile => normalizeProfileKey(profile.name) !== activeKey) : named
+
   const activeStrip = (
     <>
       {multiProfile && (
@@ -373,29 +392,44 @@ export function ProfileRail() {
           onDragStart={handleDragStart}
           sensors={sensors}
         >
-          <SortableContext items={named.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
+          <SortableContext items={sortableNamed.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
             {/* relative → the strip is the dragged square's offsetParent, so the
               clamp modifier bounds drags to the occupied cells (not the +). */}
             <div className="relative flex items-center gap-1">
-              {named.map(profile => (
-                <ProfileSquare
-                  active={!isAll && normalizeProfileKey(profile.name) === activeKey}
-                  color={resolveProfileColor(profile.name, colors)}
-                  key={profile.name}
-                  label={profileLabel(profile)}
-                  // The legacy per-profile remote override predates the
-                  // gateway registry; once the rail shows machines directly
-                  // it only confuses, so it is offered on single-gateway
-                  // setups only.
-                  onConnectRemote={multipleConnections ? undefined : () => openRemoteOverrideDialog(profile.name)}
-                  onDelete={() => setPendingDelete(profile)}
-                  onEditSoul={() => setPendingSoul(profile.name)}
-                  onRecolor={color => setProfileColor(profile.name, color)}
-                  onRename={() => setPendingRename(profile)}
-                  onSelect={() => selectProfile(profile.name)}
-                  remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
-                />
-              ))}
+              {named.map(profile => {
+                const active = !isAll && normalizeProfileKey(profile.name) === activeKey
+
+                if (fleet && active && activeConnection) {
+                  return (
+                    <FleetActiveNamedSquare
+                      color={resolveProfileColor(profile.name, colors)}
+                      key={profile.name}
+                      label={p.fleet.onGateway(profileLabel(profile), activeConnection.label)}
+                      name={profile.name}
+                    />
+                  )
+                }
+
+                return (
+                  <ProfileSquare
+                    active={active}
+                    color={resolveProfileColor(profile.name, colors)}
+                    key={profile.name}
+                    label={profileLabel(profile)}
+                    // The legacy per-profile remote override predates the
+                    // gateway registry; once the rail shows machines directly
+                    // it only confuses, so it is offered on single-gateway
+                    // setups only.
+                    onConnectRemote={multipleConnections ? undefined : () => openRemoteOverrideDialog(profile.name)}
+                    onDelete={() => setPendingDelete(profile)}
+                    onEditSoul={() => setPendingSoul(profile.name)}
+                    onRecolor={color => setProfileColor(profile.name, color)}
+                    onRename={() => setPendingRename(profile)}
+                    onSelect={() => selectProfile(profile.name)}
+                    remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
+                  />
+                )
+              })}
             </div>
           </SortableContext>
         </DndContext>
@@ -417,7 +451,7 @@ export function ProfileRail() {
       role="group"
     >
       {fleetSwitchStatus ? (
-        <span aria-label={fleetSwitchStatus} aria-live="polite" role="status">
+        <span aria-label={fleetSwitchStatus} aria-live="polite" className="sr-only" role="status">
           {fleetSwitchStatus}
         </span>
       ) : null}
@@ -474,6 +508,9 @@ export function ProfileRail() {
             onSelectRest={switchToRest}
             profiles={named}
             restGroups={restGroups}
+            triggerText={
+              fleet && activeConnection ? p.fleet.onGateway(gatewayProfile, activeConnection.label) : undefined
+            }
           />
         </div>
       ) : (
@@ -764,7 +801,8 @@ function ProfileDropdown({
   onSelect,
   onSelectRest,
   profiles,
-  restGroups
+  restGroups,
+  triggerText
 }: {
   activeKey: null | string
   colors: Record<string, string>
@@ -775,6 +813,7 @@ function ProfileDropdown({
   profiles: ProfileInfo[]
   // Fleet: the other gateways' agents, each under its own section header.
   restGroups: readonly FleetGroup[]
+  triggerText?: string
 }) {
   const { t } = useI18n()
   const p = t.profiles
@@ -794,7 +833,19 @@ function ProfileDropdown({
           variant="ghost"
         >
           <span className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
-            {activeProfile ? (
+            {triggerText ? (
+              <>
+                {activeProfile ? (
+                  <ProfileGlyph
+                    aria-hidden="true"
+                    color={resolveProfileColor(activeProfile.name, colors)}
+                    isDefault={false}
+                    name={activeProfile.name}
+                  />
+                ) : null}
+                <span className="truncate">{triggerText}</span>
+              </>
+            ) : activeProfile ? (
               <>
                 <ProfileGlyph
                   aria-hidden="true"
@@ -839,25 +890,35 @@ function ProfileDropdown({
               <span className="truncate">{group.label}</span>
               {!group.reachable && <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-amber-500" />}
             </DropdownMenuLabel>
-            {[group.defaultAgent, ...group.named].map(agent => (
-              <DropdownMenuItem
-                aria-description={p.fleet.consequence}
-                aria-label={p.fleet.switchTo(agent.profile, group.label)}
-                className="min-w-0"
-                key={agent.profile}
-                onSelect={() => onSelectRest(agent)}
-              >
-                <span className="flex min-w-0 items-center gap-1.5">
-                  <ProfileGlyph
-                    aria-hidden="true"
-                    color={resolveProfileColor(agent.profile, colors)}
-                    isDefault={agent.isDefault}
-                    name={agent.profile}
-                  />
-                  <span className="truncate">{agent.profile}</span>
-                </span>
-              </DropdownMenuItem>
-            ))}
+            {[group.defaultAgent, ...group.named].map(agent => {
+              const tuple = group.reachable
+                ? p.fleet.onGateway(agent.profile, group.label)
+                : p.fleet.unreachableTuple(agent.profile, group.label)
+
+              const action = group.reachable
+                ? p.fleet.switchTo(agent.profile, group.label)
+                : p.fleet.unreachableTuple(agent.profile, group.label)
+
+              return (
+                <DropdownMenuItem
+                  aria-description={p.fleet.consequence}
+                  aria-label={action}
+                  className="min-w-0"
+                  key={agent.profile}
+                  onSelect={() => onSelectRest(agent)}
+                >
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <ProfileGlyph
+                      aria-hidden="true"
+                      color={resolveProfileColor(agent.profile, colors)}
+                      isDefault={agent.isDefault}
+                      name={agent.profile}
+                    />
+                    <span className="truncate">{tuple}</span>
+                  </span>
+                </DropdownMenuItem>
+              )
+            })}
           </div>
         ))}
       </DropdownMenuContent>
@@ -955,6 +1016,28 @@ function FleetActiveTuple({ connectionId, glyph, label }: { connectionId?: strin
   )
 }
 
+function FleetActiveNamedSquare({ color, label, name }: { color: null | string; label: string; name: string }) {
+  const hue = color ?? 'var(--ui-text-quaternary)'
+
+  return (
+    <Tip label={label}>
+      <span
+        aria-label={label}
+        className="relative grid size-5 shrink-0 select-none place-items-center rounded-[3px] text-[0.5625rem] font-semibold uppercase leading-none"
+        data-slot="profile-rail-active-tuple"
+        role="status"
+        style={{
+          backgroundColor: profileColorSoft(hue, 30),
+          boxShadow: `inset 0 0 0 1.5px ${hue}`,
+          color: color ?? undefined
+        }}
+      >
+        {name.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
+      </span>
+    </Tip>
+  )
+}
+
 // The gateway marker that heads every group on the fleet rail: its kind glyph
 // (device / network / terminal / cloud — the same glyph the statusbar readout
 // uses), an amber dot when the roster last found it unreachable, and a hairline
@@ -1040,7 +1123,11 @@ function FleetRestGroup({
           connectionId={group.connectionId}
           description={p.fleet.consequence}
           glyph="home"
-          label={p.fleet.switchTo(group.defaultAgent.profile, group.label)}
+          label={
+            group.reachable
+              ? p.fleet.switchTo(group.defaultAgent.profile, group.label)
+              : p.fleet.unreachableTuple(group.defaultAgent.profile, group.label)
+          }
           muted
           onSelect={() => onSelect(group.defaultAgent)}
           pending={pendingRoute === defaultKey}
@@ -1057,6 +1144,7 @@ function FleetRestGroup({
             onRename={() => onRename(agent)}
             onSelect={() => onSelect(agent)}
             pending={pendingRoute === fleetRouteKey(agent.connectionId, agent.profile)}
+            reachable={group.reachable}
           />
         ))}
       </span>
@@ -1077,7 +1165,8 @@ function RestSquare({
   onRecolor,
   onRename,
   onSelect,
-  pending
+  pending,
+  reachable
 }: {
   agent: FleetAgent
   color: null | string
@@ -1087,12 +1176,16 @@ function RestSquare({
   onRename: () => void
   onSelect: () => void
   pending: boolean
+  reachable: boolean
 }) {
   const { t } = useI18n()
   const p = t.profiles
   const hue = color ?? 'var(--ui-text-quaternary)'
   const [pickerOpen, setPickerOpen] = useState(false)
-  const label = p.fleet.switchTo(agent.profile, agent.connectionLabel)
+
+  const label = reachable
+    ? p.fleet.switchTo(agent.profile, agent.connectionLabel)
+    : p.fleet.unreachableTuple(agent.profile, agent.connectionLabel)
 
   const pickColor = (next: null | string) => {
     onRecolor(next)

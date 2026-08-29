@@ -7,7 +7,7 @@ vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
       composer: {
-        sessionsSwitchingSendBlocked: "Can't send while Sessions is switching."
+        sessionsSwitchingSendBlocked: "Can't send while Sessions is switching. Your draft is saved."
       }
     }
   })
@@ -21,7 +21,7 @@ describe('SessionsSwitchStatus', () => {
 
     const status = screen.getByRole('status')
     expect(status.getAttribute('aria-live')).toBe('polite')
-    expect(status.textContent).toBe("Can't send while Sessions is switching.")
+    expect(status.textContent).toBe("Can't send while Sessions is switching. Your draft is saved.")
     expect(status.getAttribute('role')).toBe('status')
   })
 
