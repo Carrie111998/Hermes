@@ -22,7 +22,7 @@ COMPOSE-SAFETY (non-negotiable)
   sig    = authorship of the same canonical content
 
 ROLE OF allowed_signers
-  The registered-principal root is /home/frank/.hermes/governance/allowed_signers
+  The registered-principal root is <hermes-root>/governance/allowed_signers
   (canonical) — the SAME root git commit-signing uses. An event signature is
   GOOD only if it (a) cryptographically verifies against the signer's public
   key AND (b) that signer is registered in allowed_signers. A valid signature
@@ -56,9 +56,34 @@ import sys
 import tempfile
 
 # ---- paths / constants -----------------------------------------------------
-DEFAULT_ALLOWED_SIGNERS = "/home/frank/.hermes/governance/allowed_signers"
-DEFAULT_SIDECAR = "/home/frank/.hermes/audit/kanban-event-signatures.db"
-HERMES_HOME = "/home/frank/.hermes"
+def _canonical_root() -> str:
+    """Fleet-wide Hermes root, even when this process is a profile gateway.
+
+    Signing keys live at ``<root>/profiles/<id>/keys`` and the signature sidecar
+    is a single fleet-wide audit store, so BOTH must resolve against the root.
+    A profile gateway runs with ``HERMES_HOME=<root>/profiles/<name>``; resolving
+    against that would look for ``<root>/profiles/<name>/profiles/<id>/keys``
+    (finding no key) and would fragment the audit trail per profile.
+
+    Previously these were hardcoded to one developer's absolute home, which
+    (a) is not portable, and (b) meant every process signing an event wrote into
+    that one file — including test runs under a temp HERMES_HOME, which left 596
+    signatures across 107 throwaway board names in the production audit store.
+    ``get_default_hermes_root()`` honours HERMES_HOME, so tests are isolated.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        return str(get_default_hermes_root())
+    except Exception:
+        return os.path.expanduser("~/.hermes")
+
+
+def default_allowed_signers() -> str:
+    return os.path.join(_canonical_root(), "governance", "allowed_signers")
+
+
+def default_sidecar() -> str:
+    return os.path.join(_canonical_root(), "audit", "kanban-event-signatures.db")
 
 SIDECAR_STATEMENTS = [
     "CREATE TABLE IF NOT EXISTS event_signatures ("
@@ -137,8 +162,8 @@ def resolve_signing_key(profile: str | None = None) -> tuple[str, str] | None:
     """
     def cand(identity: str) -> str:
         for base in (
-            os.path.join(HERMES_HOME, "profiles", identity, "keys"),
-            os.path.join(HERMES_HOME, "seats", identity, "keys"),
+            os.path.join(_canonical_root(), "profiles", identity, "keys"),
+            os.path.join(_canonical_root(), "seats", identity, "keys"),
         ):
             p = os.path.join(base, f"{identity}-signing")
             if os.path.isfile(p):
@@ -165,7 +190,7 @@ def resolve_signing_key(profile: str | None = None) -> tuple[str, str] | None:
             return f"{ident}@hermes-fleet", p
 
     # Last resort: scan known profile key dirs (never a shared key).
-    prof_root = os.path.join(HERMES_HOME, "profiles")
+    prof_root = os.path.join(_canonical_root(), "profiles")
     try:
         for name in sorted(os.listdir(prof_root)):
             if name in seen or not os.path.isdir(os.path.join(prof_root, name)):
@@ -381,14 +406,14 @@ def _cmd_selftest(args=None):
                 encoding=serialization.Encoding.OpenSSH,
                 format=serialization.PublicFormat.OpenSSH,
             ).decode("ascii")
-            with open(os.path.join(td, f"{ident}.pub"), "w") as f:
+            with open(os.path.join(td, f"{ident}.pub"), "w", encoding="utf-8") as f:
                 f.write(f"{ident}@hermes-fleet namespaces=\"git\" ssh-ed25519 {pub.split()[1]}\n")
             keypaths[ident] = kp
 
         allowed = os.path.join(td, "allowed_signers")
-        with open(allowed, "w") as f:
-            f.write(open(os.path.join(td, "alice.pub")).read())
-            f.write(open(os.path.join(td, "bob.pub")).read())
+        with open(allowed, "w", encoding="utf-8") as f:
+            f.write(open(os.path.join(td, "alice.pub"), encoding="utf-8").read())
+            f.write(open(os.path.join(td, "bob.pub"), encoding="utf-8").read())
 
         content = event_content(1, "t_000001", None, "heartbeat", None, 1700000000)
         # 1. sign+verify roundtrip (alice)
@@ -443,8 +468,8 @@ def main(argv=None):
     rk.set_defaults(func=_cmd_resolve_key)
     v = sub.add_parser("verify")
     v.add_argument("--kanban-db", required=True)
-    v.add_argument("--sidecar", default=DEFAULT_SIDECAR)
-    v.add_argument("--allowed-signers", default=DEFAULT_ALLOWED_SIGNERS)
+    v.add_argument("--sidecar", default=default_sidecar())
+    v.add_argument("--allowed-signers", default=default_allowed_signers())
     v.set_defaults(func=_cmd_verify)
     st = sub.add_parser("selftest")
     st.set_defaults(func=_cmd_selftest)

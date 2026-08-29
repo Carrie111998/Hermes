@@ -4339,8 +4339,8 @@ def _append_event(
     if event_id is not None:
         try:
             from hermes_cli.kanban_event_signing import (
-                DEFAULT_SIDECAR,
                 board_for_conn,
+                default_sidecar,
                 resolve_signing_key,
                 sign_event_payload,
                 store_signature,
@@ -4358,7 +4358,8 @@ def _append_event(
 
                 content = event_content(event_id, task_id, run_id, kind, pl, now)
                 store_signature(
-                    DEFAULT_SIDECAR, board, event_id, identity, sig, content, now
+                    default_sidecar(), board, event_id, identity, sig, content,
+                    now,
                 )
         except Exception as exc:  # noqa: BLE001 - fail-open
             _log.debug(
