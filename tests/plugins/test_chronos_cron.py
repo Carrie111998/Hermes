@@ -61,6 +61,34 @@ def test_is_available_false_without_config(temp_home, monkeypatch):
     assert ChronosCronScheduler().is_available() is False
 
 
+def test_is_available_accepts_hosted_agent_key(temp_home, monkeypatch):
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos._cfg",
+        lambda *k, default="": "https://agent.example/"
+        if k[-1] == "callback_url"
+        else "https://portal.test",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda _provider: {"agent_key": "bootstrap-jwt"},
+    )
+
+    assert ChronosCronScheduler().is_available() is True
+
+
+def test_nas_client_uses_runtime_agent_credential(monkeypatch):
+    from plugins.cron_providers.chronos._nas_client import NasCronClient
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_nous_runtime_credentials",
+        lambda: {"api_key": "bootstrap-jwt"},
+    )
+
+    assert NasCronClient("https://portal.test")._access_token() == "bootstrap-jwt"
+
+
 # -- arming -------------------------------------------------------------------
 
 def test_arm_one_shot_sends_provision(chronos):

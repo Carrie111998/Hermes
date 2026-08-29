@@ -83,7 +83,10 @@ class ChronosCronScheduler(CronScheduler):
         try:
             from hermes_cli.auth import get_provider_auth_state
             state = get_provider_auth_state("nous") or {}
-            return bool(state.get("access_token"))
+            # Hosted installs may persist the bootstrap/invoke credential as
+            # ``agent_key`` while the refreshable user token is absent. Both
+            # are valid signals for the lazy runtime resolver below.
+            return bool(state.get("access_token") or state.get("agent_key"))
         except Exception:
             return False
 
