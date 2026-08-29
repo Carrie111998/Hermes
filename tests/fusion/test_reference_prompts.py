@@ -6,6 +6,7 @@ from agent.fusion.prompts import (
     build_locate_prompt,
     build_premortem_prompt,
     build_probe_prompt,
+    build_spike_prompt,
     build_wrong_layer_prompt,
 )
 from agent.fusion.verification import verify_convergence_votes
@@ -54,6 +55,32 @@ def test_wrong_layer_prompt_challenges_solution_boundary():
     assert "wrong-layer" in prompt
     assert "outside the shown or over-discussed layer" in prompt
     assert "Required Probes" in prompt
+
+
+def test_spike_prompt_allows_only_isolated_worktree_writes():
+    spec = _specs()[0]
+    vote_result = FusionParticipantResult(
+        spec=spec,
+        status="completed",
+        phase="vote-1",
+        output='```json\n{"candidate_id":"candidate-r1","approved":false,"material_dissent":["unsafe"],"required_changes":["add guard"],"unsupported_claims":[],"confidence":"high","summary":"blocked"}\n```',
+    )
+    report = verify_convergence_votes([vote_result], candidate_id="candidate-r1", total_participants=1)
+    candidate = FusionCandidate(id="candidate-r1", round_index=1, content="# candidate\n")
+    prompt = build_spike_prompt(
+        spec,
+        FusionRequest(mode="plan", task="x"),
+        _context(),
+        report,
+        candidate,
+        worktree_root="/tmp/fusion-spike",
+        brief=_brief(),
+    )
+    assert "isolated spike worktree" in prompt
+    assert "write_file/patch" in prompt
+    assert "ONLY inside" in prompt
+    assert "Do not run shell commands" in prompt
+    assert "/tmp/fusion-spike" in prompt
 
 
 def test_probe_and_premortem_prompts_feed_later_consensus():

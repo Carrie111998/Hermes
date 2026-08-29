@@ -57,9 +57,8 @@ def _root_cause_marker(result: FusionResult | None) -> str:
         return "hypothesis"
     routing = result.routing or {}
     if routing.get("task_kind") == "bug_unknown_root":
-        # Hermes-native Fusion does not currently execute write-enabled repro/spikes.
-        # LOCATE evidence can raise confidence but should not be laundered into a
-        # confirmed runtime root cause unless the model record explicitly says so.
+        # LOCATE/spike evidence can raise confidence but should not be laundered into
+        # a confirmed runtime root cause unless the model record explicitly says so.
         return "hypothesis"
     return "not-applicable"
 
@@ -75,6 +74,7 @@ def synthesize_candidate_plan(
     cross_verifications: list[FusionParticipantResult] | None = None,
     wrong_layer_results: list[FusionParticipantResult] | None = None,
     probe_results: list[FusionParticipantResult] | None = None,
+    spike_results: list[FusionParticipantResult] | None = None,
     premortem_results: list[FusionParticipantResult] | None = None,
     brief: dict | None = None,
 ) -> FusionCandidate:
@@ -84,7 +84,7 @@ def synthesize_candidate_plan(
     lines = [
         f"# Fusion Candidate Plan ({candidate_id})",
         "",
-        "This candidate is mechanically synthesized from the shared evidence brief, independent drafts, cross-verification, wrong-layer challenge, debate, and read-only probe artifacts. It is not final until every successful participant approves it with no material dissent.",
+        "This candidate is mechanically synthesized from the shared evidence brief, independent drafts, cross-verification, wrong-layer challenge, debate, isolated spike worktree evidence, and read-only probe artifacts. It is not final until every successful participant approves it with no material dissent.",
         "",
         "## Decision State",
         f"- candidate_id: `{candidate_id}`",
@@ -111,6 +111,9 @@ def synthesize_candidate_plan(
     lines.extend([""])
     lines.extend(_summarize_results("Wrong-layer / Wrong-abstraction Findings", wrong_layer_results, limit=800))
     lines.extend([""])
+    if spike_results:
+        lines.extend(_summarize_results("Isolated Spike Worktree Results", spike_results, limit=1000))
+        lines.append("")
     if probe_results:
         lines.extend(_summarize_results("Read-only Probe Results", probe_results, limit=800))
         lines.append("")
@@ -132,7 +135,7 @@ def synthesize_candidate_plan(
         lines.append("")
     lines.extend([
         "## Proposed Plan",
-        "- Use only claims supported by the evidence brief, participant drafts, cross-verification, debate, probes, or explicitly listed hypotheses.",
+        "- Use only claims supported by the evidence brief, participant drafts, cross-verification, debate, isolated spike/probe evidence, or explicitly listed hypotheses.",
         "- Preserve all repo read-only and write-leak safeguards named by the participants.",
         "- Prefer the implementation sequence that is supported by the strongest shared repo evidence and has no unresolved material dissent.",
         "- Treat every unresolved material dissent, unsupported claim, or live pre-mortem blocker as blocking until a later candidate resolves it or the operator decides.",
@@ -156,7 +159,7 @@ def synthesize_candidate_plan(
         id=candidate_id,
         round_index=round_index,
         content="\n".join(lines).rstrip() + "\n",
-        source_phases=["brief", "draft", "cross-verify", "wrong-layer", "debate", "probe", "premortem"],
+        source_phases=["brief", "draft", "cross-verify", "wrong-layer", "debate", "spike", "probe", "premortem"],
     )
 
 

@@ -116,6 +116,15 @@ TOOLSETS = {
         ],
         "includes": [],
     },
+
+    "fusion_spike": {
+        "description": "Write-enabled file tools scoped to an isolated Fusion spike worktree",
+        "tools": [
+            "read_file", "search_files", "write_file", "patch",
+            "web_search", "web_extract", "skills_list", "skill_view", "session_search", "todo",
+        ],
+        "includes": [],
+    },
     
     "search": {
         "description": "Web search only (no content extraction/scraping)",

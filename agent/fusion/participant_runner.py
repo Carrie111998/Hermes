@@ -46,8 +46,10 @@ def run_participant_turn(
     phase_prompt: str,
     parent_agent=None,
     progress_callback: ProgressCallback | None = None,
+    toolset: str = "fusion_readonly",
+    write_root: str | None = None,
 ) -> FusionParticipantResult:
-    """Run one Fusion participant phase as a fresh read-only child ``AIAgent``."""
+    """Run one Fusion participant phase as a fresh scoped child ``AIAgent``."""
     started = time.monotonic()
     task_id = f"fusion-{phase}-{spec.slug}-{uuid.uuid4().hex[:8]}"
     if progress_callback:
@@ -55,7 +57,12 @@ def run_participant_turn(
 
     try:
         from run_agent import AIAgent
-        from tools.file_tools import register_fusion_readonly_root, unregister_fusion_readonly_root
+        from tools.file_tools import (
+            register_fusion_readonly_root,
+            register_fusion_write_root,
+            unregister_fusion_readonly_root,
+            unregister_fusion_write_root,
+        )
     except Exception as exc:
         return FusionParticipantResult(
             spec=spec,
@@ -66,7 +73,10 @@ def run_participant_turn(
         )
 
     repo_root = context.repo_root
-    if repo_root:
+    scope_root = write_root if toolset == "fusion_spike" and write_root else repo_root
+    if toolset == "fusion_spike" and write_root:
+        register_fusion_write_root(task_id, write_root)
+    elif repo_root:
         register_fusion_readonly_root(task_id, repo_root)
 
     child = None
@@ -81,7 +91,7 @@ def run_participant_turn(
             api_mode=api_mode,
             model=model,
             max_iterations=20,
-            enabled_toolsets=["fusion_readonly"],
+            enabled_toolsets=[toolset],
             quiet_mode=True,
             ephemeral_system_prompt=build_participant_system_prompt(spec, context, phase=phase),
             platform=_parent_attr(parent_agent, "platform", "cli"),
@@ -135,7 +145,9 @@ def run_participant_turn(
             provider=provider,
             metadata={
                 "task_id": task_id,
-                "toolsets": ["fusion_readonly"],
+                "toolsets": [toolset],
+                "scope_root": scope_root,
+                "write_root": write_root if toolset == "fusion_spike" else None,
                 "phase": phase,
                 "requested_provider": spec.requested_provider,
                 "requested_model": spec.requested_model,
@@ -160,7 +172,9 @@ def run_participant_turn(
             provider=spec.provider,
         )
     finally:
-        if repo_root:
+        if toolset == "fusion_spike" and write_root:
+            unregister_fusion_write_root(task_id)
+        elif repo_root:
             unregister_fusion_readonly_root(task_id)
         if child is not None:
             try:
@@ -178,6 +192,8 @@ def run_participant(
     progress_callback: ProgressCallback | None = None,
     phase: str = "draft",
     phase_prompt: str | None = None,
+    toolset: str = "fusion_readonly",
+    write_root: str | None = None,
 ) -> FusionParticipantResult:
     """Backward-compatible entry point for a participant phase."""
     return run_participant_turn(
@@ -188,4 +204,6 @@ def run_participant(
         phase_prompt=phase_prompt or build_participant_user_prompt(spec, request, context),
         parent_agent=parent_agent,
         progress_callback=progress_callback,
+        toolset=toolset,
+        write_root=write_root,
     )

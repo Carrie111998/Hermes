@@ -55,3 +55,4 @@ def test_default_fusion_round_limit_is_five_with_early_exit_capacity():
     request = normalize_request(FusionRequest(mode="plan", task="x"))
     assert request.debate_rounds == 5
     assert request.convergence_rounds == 5
+    assert request.spike_worktrees is True

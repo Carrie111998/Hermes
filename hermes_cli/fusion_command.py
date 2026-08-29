@@ -150,6 +150,10 @@ def render_fusion_result(result: FusionResult) -> str:
     if result.phases:
         phase_bits = [f"{phase}={len([p for p in items if p.ok])}/{len(items)}" for phase, items in result.phases.items()]
         lines.append("Phases: " + ", ".join(phase_bits))
+    if result.spikes:
+        available = len([spike for spike in result.spikes if spike.available])
+        cleaned = len([spike for spike in result.spikes if spike.cleanup_ok])
+        lines.append(f"Spikes: {available}/{len(result.spikes)} worktrees available, cleanup {cleaned}/{len(result.spikes)}")
     if result.status == "converged":
         final_path = result.artifacts.get("synthesis:final_plan") or "synthesis/final_plan.md"
         lines.append(f"Final artifact emitted: `{final_path}`")

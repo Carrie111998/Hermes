@@ -75,6 +75,7 @@ DEFAULT_FUSION_CONFIG: dict[str, Any] = {
     "debate_rounds": 5,
     "convergence_rounds": 5,
     "reasoning_effort": "xhigh",
+    "spike_worktrees": True,
 }
 
 
@@ -172,6 +173,7 @@ def normalize_request(request: FusionRequest, config: dict[str, Any] | None = No
         debate_rounds=debate_rounds,
         convergence_rounds=convergence_rounds,
         reasoning_effort=_normalize_reasoning(request.reasoning_effort) or _normalize_reasoning(cfg.get("reasoning_effort")),
+        spike_worktrees=bool(request.spike_worktrees and _coerce_bool(cfg.get("spike_worktrees", True))),
     )
 
 

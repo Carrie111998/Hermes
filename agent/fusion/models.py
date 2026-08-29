@@ -78,6 +78,7 @@ class FusionRequest(JsonModel):
     debate_rounds: int = 5
     convergence_rounds: int = 5
     reasoning_effort: str | None = None
+    spike_worktrees: bool = True
 
 
 @dataclass(slots=True)
@@ -204,6 +205,18 @@ class FusionOperatorDecision(JsonModel):
 
 
 @dataclass(slots=True)
+class FusionSpikeRun(JsonModel):
+    round_index: int
+    phase: str
+    worktree_path: str | None = None
+    available: bool = False
+    cleanup_ok: bool = False
+    diff_stat: str = ""
+    diff: str = ""
+    error: str | None = None
+
+
+@dataclass(slots=True)
 class FusionRepoSnapshot(JsonModel):
     repo_root: str | None
     available: bool
@@ -231,6 +244,7 @@ class FusionResult(JsonModel):
     participants: list[FusionParticipantResult] = field(default_factory=list)
     phases: dict[str, list[FusionParticipantResult]] = field(default_factory=dict)
     candidates: list[FusionCandidate] = field(default_factory=list)
+    spikes: list[FusionSpikeRun] = field(default_factory=list)
     votes: list[FusionConvergenceVote] = field(default_factory=list)
     model_diversity: dict[str, Any] = field(default_factory=dict)
     routing: dict[str, Any] = field(default_factory=dict)

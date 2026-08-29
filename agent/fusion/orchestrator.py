@@ -19,10 +19,12 @@ from .prompts import (
     build_locate_prompt,
     build_premortem_prompt,
     build_probe_prompt,
+    build_spike_prompt,
     build_vote_prompt,
     build_wrong_layer_prompt,
 )
 from .repo_guard import RepoMutationGuard
+from .spikes import capture_spike_diff, cleanup_spike_worktree, create_spike_worktree
 from .synthesis import (
     operator_decision_from_conflicts,
     synthesize_candidate_plan,
@@ -47,6 +49,8 @@ def _run_phase(
     prompt_builder,
     parent_agent=None,
     progress_callback=None,
+    toolset: str = "fusion_readonly",
+    write_root: str | None = None,
 ) -> list[FusionParticipantResult]:
     results: list[FusionParticipantResult] = []
     executor = ThreadPoolExecutor(max_workers=max(1, len(specs)))
@@ -60,6 +64,8 @@ def _run_phase(
             progress_callback=progress_callback,
             phase=phase,
             phase_prompt=prompt_builder(spec),
+            toolset=toolset,
+            write_root=write_root,
         ): spec
         for spec in specs
     }
@@ -174,6 +180,72 @@ def _target_for_cross_verify(
         if target is not None and target.spec.slug != spec.slug:
             return target
     return None
+
+
+def _attach_spike_diff(result: FusionParticipantResult, spike) -> FusionParticipantResult:
+    result.metadata["spike"] = spike.to_dict()
+    if spike.diff_stat or spike.diff:
+        sections = [result.output.rstrip(), "", "## Captured Spike Diff"]
+        if spike.diff_stat:
+            sections.extend(["", "### Diff Stat", "```", spike.diff_stat, "```"])
+        if spike.diff:
+            sections.extend(["", "### Diff", "```diff", spike.diff, "```"])
+        result.output = "\n".join(sections).rstrip() + "\n"
+    return result
+
+
+def _run_spike_phase(
+    round_index: int,
+    specs: list[FusionParticipantSpec],
+    request: FusionRequest,
+    context,
+    runner: ParticipantRunner,
+    *,
+    report,
+    candidate: FusionCandidate,
+    result: FusionResult,
+    parent_agent=None,
+    progress_callback=None,
+) -> list[FusionParticipantResult]:
+    phase = f"spike-{round_index}"
+    outputs: list[FusionParticipantResult] = []
+    for spec in specs:
+        spike = create_spike_worktree(context.repo_root, result.run_dir, round_index, spec.slug)
+        result.spikes.append(spike)
+        if not spike.available or not spike.worktree_path:
+            continue
+        spike_context = build_context_packet(spike.worktree_path)
+        try:
+            phase_results = _run_phase(
+                phase,
+                [spec],
+                request,
+                spike_context,
+                runner,
+                prompt_builder=lambda participant, worktree=spike.worktree_path: build_spike_prompt(
+                    participant,
+                    request,
+                    spike_context,
+                    report,
+                    candidate,
+                    worktree_root=worktree,
+                    brief=result.brief,
+                ),
+                parent_agent=parent_agent,
+                progress_callback=progress_callback,
+                toolset="fusion_spike",
+                write_root=spike.worktree_path,
+            )
+            spike = capture_spike_diff(spike)
+            phase_results = [_attach_spike_diff(item, spike) for item in phase_results]
+            outputs.extend(phase_results)
+        finally:
+            spike = cleanup_spike_worktree(context.repo_root, spike)
+            result.spikes[-1] = spike
+            for item in outputs:
+                if item.metadata.get("spike", {}).get("phase") == spike.phase and item.spec.slug == spec.slug:
+                    item.metadata["spike"] = spike.to_dict()
+    return outputs
 
 
 def _operator_decision_result(
@@ -319,6 +391,7 @@ def run_fusion(
 
     all_debates: list[FusionParticipantResult] = []
     all_probes: list[FusionParticipantResult] = []
+    all_spikes: list[FusionParticipantResult] = []
     all_premortems: list[FusionParticipantResult] = []
     candidate: FusionCandidate | None = None
     report = None
@@ -332,7 +405,7 @@ def run_fusion(
                 request,
                 context,
                 runner,
-                prompt_builder=lambda spec, r=round_index, previous=tuple(all_debates), probes=tuple(all_probes), cand=candidate, feedback=report: build_debate_prompt(
+                prompt_builder=lambda spec, r=round_index, previous=tuple(all_debates), probes=tuple(all_probes), spikes=tuple(all_spikes), cand=candidate, feedback=report: build_debate_prompt(
                     spec,
                     request,
                     context,
@@ -344,6 +417,7 @@ def run_fusion(
                     cross_verifications=cross_verifications,
                     wrong_layer_results=wrong_layer_results,
                     probe_results=list(probes),
+                    spike_results=list(spikes),
                     brief=result.brief,
                 ),
                 parent_agent=parent_agent,
@@ -368,6 +442,7 @@ def run_fusion(
             cross_verifications=cross_verifications,
             wrong_layer_results=wrong_layer_results,
             probe_results=all_probes,
+            spike_results=all_spikes,
             premortem_results=all_premortems,
             brief=result.brief,
         )
@@ -454,28 +529,51 @@ def run_fusion(
         if not has_more_rounds:
             return _operator_decision_result(result, specs, gate.conflicts)
 
-        probe_phase = f"probe-{round_index}"
-        probes = _run_phase(
-            probe_phase,
-            specs,
-            request,
-            context,
-            runner,
-            prompt_builder=lambda spec, rep=report, cand=candidate: build_probe_prompt(
-                spec,
+        spike_results: list[FusionParticipantResult] = []
+        if request.spike_worktrees:
+            spike_phase = f"spike-{round_index}"
+            spike_results = _run_spike_phase(
+                round_index,
+                specs,
                 request,
                 context,
-                rep,
-                cand,
-                result.brief,
-            ),
-            parent_agent=parent_agent,
-            progress_callback=progress_callback,
-        )
-        result.phases[probe_phase] = probes
-        all_probes.extend(probes)
-        leaked = _check_write_leak(result, guard, before, specs)
-        if leaked:
-            return leaked
+                runner,
+                report=report,
+                candidate=candidate,
+                result=result,
+                parent_agent=parent_agent,
+                progress_callback=progress_callback,
+            )
+            if spike_results:
+                result.phases[spike_phase] = spike_results
+                all_spikes.extend(spike_results)
+                leaked = _check_write_leak(result, guard, before, specs)
+                if leaked:
+                    return leaked
+
+        if not spike_results:
+            probe_phase = f"probe-{round_index}"
+            probes = _run_phase(
+                probe_phase,
+                specs,
+                request,
+                context,
+                runner,
+                prompt_builder=lambda spec, rep=report, cand=candidate: build_probe_prompt(
+                    spec,
+                    request,
+                    context,
+                    rep,
+                    cand,
+                    result.brief,
+                ),
+                parent_agent=parent_agent,
+                progress_callback=progress_callback,
+            )
+            result.phases[probe_phase] = probes
+            all_probes.extend(probes)
+            leaked = _check_write_leak(result, guard, before, specs)
+            if leaked:
+                return leaked
 
     return _operator_decision_result(result, specs, result.gate.conflicts if result.gate else [])

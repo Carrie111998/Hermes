@@ -31,9 +31,15 @@ def _brief_block(brief: dict | str | None, *, limit: int = 9000) -> str:
 def build_participant_system_prompt(spec: FusionParticipantSpec, context: FusionContext, *, phase: str = "draft") -> str:
     repo_line = context.repo_root or "<no repo root resolved>"
     axes = "\n".join(f"- {axis}" for axis in MATERIAL_AXES)
+    spike_mode = phase.startswith("spike")
+    capability_line = (
+        "Fusion spike mode: you MAY use write_file/patch only inside the isolated throwaway worktree registered for this task. Do not treat those edits as applied to the real repo; summarize the experiment and diff evidence. You still MUST NOT run shell commands, execute code, install packages, send messages, schedule jobs, or use external side-effect tools."
+        if spike_mode
+        else "Fusion normal mode is read-only. You MUST NOT modify files, run shell commands, execute code, install packages, send messages, schedule jobs, or use side-effect tools. Use only read/search/research tools that are available to you. If a tool is unavailable, state that limitation."
+    )
     return f"""You are a Fusion v2 equal peer participant: {spec.slug}.
 
-Fusion is a read-only, multi-LLM planning/review surface. You MUST NOT modify files, run shell commands, execute code, install packages, send messages, schedule jobs, or use side-effect tools. Use only read/search/research tools that are available to you. If a tool is unavailable, state that limitation.
+{capability_line}
 
 Repository scope: {repo_line}
 Participant label: {spec.role}
@@ -295,6 +301,7 @@ def build_debate_prompt(
     cross_verifications: list[FusionParticipantResult] | None = None,
     wrong_layer_results: list[FusionParticipantResult] | None = None,
     probe_results: list[FusionParticipantResult] | None = None,
+    spike_results: list[FusionParticipantResult] | None = None,
     brief: dict | str | None = None,
 ) -> str:
     siblings = _summarize_outputs(drafts, exclude_slug=spec.slug)
@@ -319,6 +326,7 @@ def build_debate_prompt(
     cross_block = _summarize_outputs(cross_verifications or [], limit=3500)
     wrong_block = _summarize_outputs(wrong_layer_results or [], limit=2500)
     probe_block = _summarize_outputs(probe_results or [], limit=2500)
+    spike_block = _summarize_outputs(spike_results or [], limit=3500)
     return f"""Fusion mode: {request.mode}
 Task:
 {request.task}
@@ -342,6 +350,9 @@ If prior convergence feedback exists, focus this round on resolving the listed d
 
 ## Wrong-layer / wrong-abstraction findings
 {wrong_block}
+
+## Spike worktree evidence from prior unresolved dissent
+{spike_block or '<none yet>'}
 
 ## Read-only probe evidence from prior unresolved dissent
 {probe_block or '<none yet>'}
@@ -400,6 +411,61 @@ Return markdown with this exact structure:
 
 ## Probe Results
 - <dissent/change/unsupported claim>: <confirmed|refuted|inconclusive> — <evidence path/probe limitation>
+
+## Candidate Revision Guidance
+- <specific change needed, or 'none'>
+
+## Remaining Operator Unknowns
+- <unknown requiring human/live-system input, or 'none'>
+"""
+
+
+def build_spike_prompt(
+    spec: FusionParticipantSpec,
+    request: FusionRequest,
+    context: FusionContext,
+    report: FusionVerificationReport,
+    candidate: FusionCandidate,
+    *,
+    worktree_root: str,
+    brief: dict | str | None = None,
+) -> str:
+    return f"""Fusion mode: {request.mode}
+Task:
+{request.task}
+
+Phase 4a: isolated spike worktree to resolve material dissent.
+The previous candidate did not reach unanimous consensus. You may use read_file/search_files/write_file/patch, but writes are allowed ONLY inside this isolated throwaway worktree:
+
+`{worktree_root}`
+
+Do not run shell commands. Do not install packages. Do not touch the operator's main repo. Treat any edits you make as an experiment only: they will be diffed, summarized, and discarded. The final Fusion output remains a plan, not applied code.
+
+Shared evidence brief:
+{_brief_block(brief, limit=6000)}
+
+Candidate needing revision:
+{_short_candidate(candidate, limit=3500)}
+
+Vote feedback:
+{_summarize_vote_feedback(report) or '<no structured feedback>'}
+
+Instructions:
+- If a small file edit would clarify or validate a disputed approach, make it inside the worktree.
+- Keep edits minimal and targeted to the dissent/required changes.
+- If no write experiment is useful, say so and use read/search evidence instead.
+- Report what you changed and why. The orchestrator will capture the git diff; do not paste huge diffs.
+
+Return markdown with this exact structure:
+
+## Spike Hypothesis
+- <what this experiment tried to validate>
+
+## Spike Edits
+- <file path>: <change made, or 'none'>
+
+## Spike Findings
+- <dissent/change/unsupported claim>: <confirmed|refuted|inconclusive> — <evidence>
 
 ## Candidate Revision Guidance
 - <specific change needed, or 'none'>

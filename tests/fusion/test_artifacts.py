@@ -9,6 +9,7 @@ from agent.fusion.models import (
     FusionParticipantSpec,
     FusionRequest,
     FusionResult,
+    FusionSpikeRun,
 )
 
 
@@ -23,6 +24,7 @@ def test_artifacts_record_models_phases_candidates_and_votes(tmp_path):
         participants=[draft],
         phases={"draft": [draft]},
         candidates=[FusionCandidate(id="candidate-r1", round_index=1, content="# candidate\n")],
+        spikes=[FusionSpikeRun(round_index=1, phase="spike-1", worktree_path="/tmp/spike", available=True, cleanup_ok=True, diff_stat="tracked.txt | 2 +-", diff="diff --git a/tracked.txt b/tracked.txt")],
         votes=[vote],
         model_diversity={"distinct_count": 1, "participants": [{"slug": "glm-max", "provider": "zai", "model": "glm-5.2"}]},
         routing={"task_kind": "design_wide_solution", "locate_required": False},
@@ -38,6 +40,7 @@ def test_artifacts_record_models_phases_candidates_and_votes(tmp_path):
     assert manifest["model_diversity"]["distinct_count"] == 1
     assert manifest["routing"]["task_kind"] == "design_wide_solution"
     assert manifest["coverage"]["requested"] == 1
+    assert manifest["spikes"][0]["phase"] == "spike-1"
     assert status["schema"] == "fusion-v2-status/v2"
     assert status["decision"] == "consensus"
     assert status["coverage"]["degraded"] is False
@@ -46,3 +49,5 @@ def test_artifacts_record_models_phases_candidates_and_votes(tmp_path):
     assert (Path(result.run_dir) / "brief" / "brief.md").exists()
     assert (Path(result.run_dir) / "participants" / "glm-max" / "draft.md").exists()
     assert (Path(result.run_dir) / "synthesis" / "candidate-r1.md").exists()
+    assert (Path(result.run_dir) / "spikes" / "spikes.json").exists()
+    assert (Path(result.run_dir) / "spikes" / "spike-1" / "diff.patch").exists()

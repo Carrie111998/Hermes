@@ -2,7 +2,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.fusion.models import FusionParticipantSpec, FusionResult, FusionRequest
+from agent.fusion.models import FusionParticipantSpec, FusionResult, FusionRequest, FusionSpikeRun
 from cli import HermesCLI
 from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command
 from hermes_cli.fusion_command import parse_fusion_command, render_fusion_result
@@ -51,12 +51,14 @@ def test_render_operator_decision_says_no_final_plan_and_lists_models(tmp_path):
         routing={"task_kind": "bug_unknown_root", "locate_required": True},
         coverage={"requested": 3, "draft_successful": 2, "degraded": True},
         decision="operator_decision",
+        spikes=[FusionSpikeRun(round_index=1, phase="spike-1", available=True, cleanup_ok=True)],
     )
     rendered = render_fusion_result(result)
     assert "No final plan was emitted" in rendered
     assert "zai:glm-5.2" in rendered
     assert "Route: `bug_unknown_root`" in rendered
     assert "Coverage: 2/3 degraded" in rendered
+    assert "Spikes: 1/1 worktrees available, cleanup 1/1" in rendered
 
 
 def test_render_model_diversity_error(tmp_path):

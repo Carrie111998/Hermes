@@ -146,6 +146,7 @@ def write_fusion_artifacts(result: FusionResult, synthesis_docs: dict[str, str] 
             for _phase, p in _all_phase_results(result)
         ],
         "candidates": [candidate.to_dict() for candidate in result.candidates],
+        "spikes": [spike.to_dict() for spike in result.spikes],
     }
     manifest_path = run_dir / "manifest.json"
     _write_json(manifest_path, manifest)
@@ -184,6 +185,21 @@ def write_fusion_artifacts(result: FusionResult, synthesis_docs: dict[str, str] 
         _write_text(path, candidate.content)
         artifacts[f"candidate:{candidate.id}"] = _rel(run_dir, path)
 
+    if result.spikes:
+        spikes_path = run_dir / "spikes" / "spikes.json"
+        _write_json(spikes_path, [spike.to_dict() for spike in result.spikes])
+        artifacts["spikes"] = _rel(run_dir, spikes_path)
+        for spike in result.spikes:
+            phase_dir = run_dir / "spikes" / spike.phase
+            if spike.diff_stat:
+                stat_path = phase_dir / "diff.stat.txt"
+                _write_text(stat_path, spike.diff_stat + "\n")
+                artifacts[f"spike:{spike.phase}:diff_stat"] = _rel(run_dir, stat_path)
+            if spike.diff:
+                diff_path = phase_dir / "diff.patch"
+                _write_text(diff_path, spike.diff + "\n")
+                artifacts[f"spike:{spike.phase}:diff"] = _rel(run_dir, diff_path)
+
     votes_path = run_dir / "verification" / "votes.json"
     _write_json(votes_path, [vote.to_dict() for vote in result.votes])
     artifacts["votes"] = _rel(run_dir, votes_path)
@@ -215,6 +231,7 @@ def write_fusion_artifacts(result: FusionResult, synthesis_docs: dict[str, str] 
         "coverage": result.coverage,
         "model_diversity": result.model_diversity,
         "phases": _phase_summary(result),
+        "spikes": [spike.to_dict() for spike in result.spikes],
         "repo_guard": result.repo_guard.to_dict() if result.repo_guard else None,
         "gate": result.gate.to_dict() if result.gate else None,
         "error": result.error,

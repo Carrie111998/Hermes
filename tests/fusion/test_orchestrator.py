@@ -33,7 +33,7 @@ def _approval_json(candidate_id: str, approved=True, dissent=None, changes=None)
     }) + "\n```"
 
 
-def _runner_factory(*, reject_slug=None, leak_phase=None, first_round_changes=False):
+def _runner_factory(*, reject_slug=None, leak_phase=None, first_round_changes=False, spike_write=False):
     calls = []
 
     def runner(spec, request, context, **kwargs):
@@ -49,6 +49,10 @@ def _runner_factory(*, reject_slug=None, leak_phase=None, first_round_changes=Fa
             )
         elif phase.startswith("debate"):
             output = "## Debate Summary\n- agree\n\n## Material Dissent\n- none"
+        elif phase.startswith("spike"):
+            if spike_write:
+                (Path(context.repo_root) / f"{spec.slug}-spike.txt").write_text("spike experiment\n", encoding="utf-8")
+            output = "## Spike Findings\n- experiment complete\n\n## Candidate Revision Guidance\n- tighten safety wording"
         elif phase.startswith("vote"):
             candidate_id = "candidate-r" + phase.rsplit("-", 1)[1]
             if first_round_changes and phase == "vote-1" and spec.slug == "deepseek-deepseek-v4-pro":
@@ -109,16 +113,21 @@ def test_orchestrator_revises_candidate_when_vote_has_required_changes(tmp_path)
     repo = _init_repo(tmp_path / "repo")
     result = run_fusion(
         FusionRequest(mode="plan", task="test revision", repo_path=str(repo), output_root=str(tmp_path / "runs"), convergence_rounds=2),
-        participant_runner=_runner_factory(first_round_changes=True),
+        participant_runner=_runner_factory(first_round_changes=True, spike_write=True),
         config=_cfg(),
     )
     assert result.status == "converged"
     assert [candidate.id for candidate in result.candidates] == ["candidate-r1", "candidate-r2"]
     assert "vote-2" in result.phases
-    assert "probe-1" in result.phases
+    assert "spike-1" in result.phases
+    assert "probe-1" not in result.phases
     assert "premortem-2" in result.phases
     assert "debate-2" in result.phases
     assert "debate-3" not in result.phases
+    assert result.spikes
+    assert all(spike.cleanup_ok for spike in result.spikes if spike.available)
+    assert "spike" in result.candidates[-1].content.lower()
+    assert not any(repo.glob("*-spike.txt"))
 
 
 def test_orchestrator_stops_on_write_leak_in_any_phase(tmp_path):
