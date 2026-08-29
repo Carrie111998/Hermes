@@ -279,8 +279,22 @@ def _reap_owner_browsers() -> None:
         # Identity guard: never tree-kill an arbitrary PID from a world-writable
         # temp dir; confirm it is actually bound to this agent-browser session.
         argv = " ".join(_cmdline(daemon_pid)).lower()
-        if "agent-browser" not in argv and "agent-browser" not in (
-                os.path.basename(socket_dir) or ""):
+        # Identity guard: never tree-kill an arbitrary PID read out of a
+        # world-writable temp dir. The PID comes from a file under /tmp, so it
+        # can be stale (the real daemon exited and the number was reused) or
+        # planted. Confirm from the process's OWN argv that it really is an
+        # agent-browser daemon before signalling it.
+        #
+        # This previously also OR'd in a basename(socket_dir) check, which made
+        # the condition dead: every socket_dir comes from _socket_dirs(), which
+        # globs only "agent-browser-*", so that conjunct was ALWAYS False and
+        # `argv-check and False` could never be True — the guard never tripped
+        # and every PID named in a /tmp file was tree-killed unconditionally.
+        # Do not re-add a socket_dir term here; it carries no information.
+        #
+        # Fail-safe: _cmdline() returns [] when /proc/<pid> is unreadable or
+        # gone, so argv == "" and the guard trips (we skip the kill).
+        if "agent-browser" not in argv:
             stale_dirs.append(socket_dir)
             continue
         if not _DRY_RUN:
