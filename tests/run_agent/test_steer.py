@@ -669,6 +669,7 @@ class TestSteerMarkerContract:
         """
         from agent.prompt_builder import STEER_CHANNEL_NOTE
 
+        assert "latest user message" in STEER_CHANNEL_NOTE
         assert "latest tool-result batch" in STEER_CHANNEL_NOTE
         assert "no later assistant message follows it" in STEER_CHANNEL_NOTE
         assert "do not treat it as a new message" in STEER_CHANNEL_NOTE
@@ -847,3 +848,184 @@ class TestLegacyHiddenPlaceholderWireSubstitution:
         wire = agent.client.chat.completions.create.call_args.kwargs["messages"]
         wire_assistants = [m for m in wire if m.get("role") == "assistant"]
         assert wire_assistants[0]["content"] == "visible text"
+
+
+class TestPreApiSteerLanding:
+    """The pre-API drain (``_land_pre_api_steer``) must land a queued /steer
+    on the very next API iteration whenever there is an alternation-safe slot,
+    including the owner's starvation case: a long single-purpose stretch whose
+    message tail is a bare assistant message (no tool batch to piggyback on).
+
+    All landings happen on the message list AFTER the cached system prefix, so
+    the prompt-cache prefix is never rebuilt (AGENTS.md invariant).
+    """
+
+    def test_lands_on_tail_tool_result(self):
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "tool output", "tool_call_id": "a"},
+        ]
+
+        landed = _land_pre_api_steer(agent, messages, "also check the logs")
+
+        assert landed is True
+        # Same message count — appended into the existing tool result.
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
+        assert messages[-1]["content"].startswith("tool output")
+        assert STEER_MARKER_OPEN in messages[-1]["content"]
+        assert "also check the logs" in messages[-1]["content"]
+
+    def test_lands_as_user_turn_after_assistant_tail(self):
+        """The starvation fix: an assistant-tail stretch with no tool batch."""
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "still working step 3 of 40..."},
+        ]
+
+        landed = _land_pre_api_steer(agent, messages, "switch to the fast path")
+
+        assert landed is True
+        # A genuine user turn was appended — strict alternation preserved.
+        assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+        assert STEER_MARKER_OPEN in messages[-1]["content"]
+        assert "switch to the fast path" in messages[-1]["content"]
+
+    def test_assistant_tail_never_rewrites_older_tool_result(self):
+        """A cached tool result before the assistant tail is immutable."""
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        old_tool_content = "cached output must stay byte-identical"
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "tool_calls": [{"id": "old"}]},
+            {
+                "role": "tool",
+                "tool_call_id": "old",
+                "content": old_tool_content,
+            },
+            {"role": "assistant", "content": "continuing without tools"},
+        ]
+
+        landed = _land_pre_api_steer(agent, messages, "change direction")
+
+        assert landed is True
+        assert messages[2]["content"] == old_tool_content
+        assert messages[-1]["role"] == "user"
+        assert isinstance(messages[-1]["content"], str)
+        assert messages[-1]["content"].count(STEER_MARKER_OPEN) == 1
+
+    def test_reparks_when_assistant_tail_has_unpaired_tool_calls(self):
+        """An assistant row awaiting its tool results is not a safe slot — a
+        user turn there would split the tool_calls/tool_result pairing."""
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+        ]
+
+        landed = _land_pre_api_steer(agent, messages, "late steer")
+
+        assert landed is False
+        assert [m["role"] for m in messages] == ["user", "assistant"]
+
+    def test_reparks_when_tail_is_user(self):
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        messages = [{"role": "user", "content": "start"}]
+
+        landed = _land_pre_api_steer(agent, messages, "steer")
+
+        assert landed is False
+        assert [m["role"] for m in messages] == ["user"]
+
+    def test_reparks_on_empty_messages(self):
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        messages: list = []
+
+        assert _land_pre_api_steer(agent, messages, "steer") is False
+        assert messages == []
+
+    def test_lands_exactly_once_on_assistant_tail(self):
+        """Draining clears the slot, and the marker is added exactly one time
+        so a later replay cannot re-inject the same steer."""
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        agent.steer("do the thing")
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "narrating..."},
+        ]
+
+        drained = agent._drain_pending_steer()
+        assert drained == "do the thing"
+        assert agent._pending_steer is None  # slot cleared — no second landing
+
+        landed = _land_pre_api_steer(agent, messages, drained)
+        assert landed is True
+        occurrences = sum(
+            m.get("content", "").count(STEER_MARKER_OPEN)
+            for m in messages
+            if isinstance(m.get("content"), str)
+        )
+        assert occurrences == 1
+
+    def test_assistant_tail_landing_preserves_multimodal_tool_tail(self):
+        """When the tail is a multimodal (block-list) tool result, the marker
+        is appended as a text block instead of corrupting the structure."""
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {
+                "role": "tool",
+                "tool_call_id": "a",
+                "content": [{"type": "text", "text": "img analysis"}],
+            },
+        ]
+
+        landed = _land_pre_api_steer(agent, messages, "zoom in on the top-left")
+
+        assert landed is True
+        blocks = messages[-1]["content"]
+        assert isinstance(blocks, list)
+        assert blocks[0] == {"type": "text", "text": "img analysis"}
+        assert any(
+            b.get("type") == "text" and "zoom in on the top-left" in b.get("text", "")
+            for b in blocks
+        )
+
+    def test_cached_system_prefix_is_never_touched(self):
+        """The helper must only ever mutate the message list, never a system
+        message — the prompt-cache prefix stays byte-stable."""
+        from agent.conversation_loop import _land_pre_api_steer
+
+        agent = _bare_agent()
+        system = {"role": "system", "content": "STABLE SYSTEM PROMPT"}
+        messages = [
+            system,
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "working..."},
+        ]
+
+        _land_pre_api_steer(agent, messages, "steer text")
+
+        # System message identity + bytes unchanged; append happened at the end.
+        assert messages[0] is system
+        assert messages[0]["content"] == "STABLE SYSTEM PROMPT"
+        assert messages[-1]["role"] == "user"
