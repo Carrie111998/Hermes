@@ -8643,7 +8643,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if not result["copied"] and not result.get("updated"):
                 print("  ✓ Skills are up to date")
         except Exception as e:
-            logger.debug("Skills sync during update failed: %s", e)
+            logger.warning("Skills sync during update failed: %s", e)
 
         # Sync bundled skills to all profiles (including the active one).
         # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so
@@ -8665,6 +8665,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         r = seed_profile_skills(p.path, quiet=True)
                         if r and r.get("skipped_opt_out"):
                             status = "opted out (--no-skills)"
+                        elif r and r.get("error"):
+                            status = f"sync failed ({r['error']})"
                         elif r:
                             copied = len(r.get("copied", []))
                             updated = len(r.get("updated", []))

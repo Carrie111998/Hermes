@@ -1381,7 +1381,9 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
     """Seed bundled skills into a profile via subprocess.
 
     Uses subprocess because sync_skills() caches HERMES_HOME at module level.
-    Returns the sync result dict, or None on failure.
+    Returns the sync result dict, or a ``{"error": ...}`` dict describing the
+    failure (exit code + last stderr line, timeout, or exception) — callers
+    can surface the reason even when ``quiet=True`` (#97792).
 
     Profiles that opted out of bundled skills (via ``hermes profile create
     --no-skills`` — which writes ``.no-bundled-skills`` to the profile root)
@@ -1401,19 +1403,22 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout.strip())
+        # quiet suppresses success chatter, not error detail: keep returning
+        # the reason so `hermes update` can print why a profile failed (#97792).
+        stderr_tail = result.stderr.strip().splitlines() or ["no stderr"]
         if not quiet:
             print(f"⚠ Skill seeding returned exit code {result.returncode}")
             if result.stderr.strip():
                 print(f"  {result.stderr.strip()[:200]}")
-        return None
+        return {"error": f"rc={result.returncode}: {stderr_tail[-1][:200]}"}
     except subprocess.TimeoutExpired:
         if not quiet:
             print("⚠ Skill seeding timed out (60s)")
-        return None
+        return {"error": "timed out after 60s"}
     except Exception as e:
         if not quiet:
             print(f"⚠ Skill seeding failed: {e}")
-        return None
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def backfill_profile_envs(quiet: bool = False) -> List[str]:
