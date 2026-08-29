@@ -327,6 +327,7 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { safeSuggestedImageName } from './safe-suggested-image-name'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
@@ -5814,20 +5815,6 @@ async function resourceBufferFromUrl(rawUrl) {
 
     req.on('error', reject)
   })
-}
-
-function safeSuggestedImageName(value, extension) {
-  const base = Array.from(path.basename(String(value || '')).replace(/[<>:"/\\|?*]/g, '_'), char =>
-    char.charCodeAt(0) < 32 ? '_' : char
-  )
-    .join('')
-    .trim()
-
-  if (!base) {
-    return `image${extension}`
-  }
-
-  return path.extname(base) ? base : `${base}${extension}`
 }
 
 async function saveImageFromUrl(rawUrl, suggestedName?: string) {
@@ -16336,9 +16323,11 @@ ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
 
 ipcMain.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(payload))
 
-ipcMain.handle('hermes:saveImageFromUrl', (_event, payload) =>
-  saveImageFromUrl(String(payload?.url || ''), payload?.suggestedName)
-)
+ipcMain.handle('hermes:saveImageFromUrl', (_event, payload) => {
+  const url = typeof payload === 'string' ? payload : String(payload?.url || '')
+  const suggestedName = typeof payload === 'string' || payload == null ? undefined : payload.suggestedName
+  return saveImageFromUrl(url, suggestedName)
+})
 
 // The custom context menu's edit verbs. They act on the SENDER's focused
 // element, so the renderer restores focus to the editable before invoking.
