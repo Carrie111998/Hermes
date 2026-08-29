@@ -43,6 +43,9 @@ import {
  *  reflect within a beat reads as the click having missed. */
 const POLL_MS = 700
 
+/** How many comments the panel shows before it asks to be expanded. */
+const COLLAPSED_ROWS = 2
+
 export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
   const [pins, setPins] = useState<PreviewPin[]>([])
   const [armed, setArmed] = useState(false)
@@ -51,6 +54,7 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
    *  holds the current page's; this is the side that outlives a navigation. */
   const book = useRef<PinBook>({})
   const [elsewhere, setElsewhere] = useState({ count: 0, pages: 0 })
+  const [expanded, setExpanded] = useState(false)
 
   /** Full image bytes, drained out of the page and owned here. */
   const bytes = useRef<Map<string, string>>(new Map())
@@ -232,6 +236,13 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
 
   const openCount = pins.filter(pin => !pin.resolved).length
 
+  // Newest first, and only a couple of them: the panel sits above the page it
+  // is describing, and a comment list that grows without bound eats the very
+  // thing being reviewed. The number stays the pin's own, so a row and the
+  // marker on the page always agree even when the order does not.
+  const numbered = pins.map((pin, index) => ({ number: index + 1, pin })).reverse()
+  const listed = expanded ? numbered : numbered.slice(0, COLLAPSED_ROWS)
+
   return (
     <div className="flex flex-col gap-2 border-t border-border/60 px-3 py-2 text-xs">
       <div className="flex items-center gap-2">
@@ -285,39 +296,39 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
         </div>
       </div>
 
-      {pins.length > 0 && (
-        <ul className="flex max-h-44 flex-col gap-1 overflow-y-auto">
-          {pins.map((pin, index) => (
+      {listed.length > 0 && (
+        <ul className={cn('flex flex-col gap-0.5', expanded && 'max-h-40 overflow-y-auto pe-0.5')}>
+          {listed.map(({ number, pin }) => (
             <li
               className={cn(
-                'flex items-start gap-2 rounded px-2 py-1',
+                // One line per comment. Two lines each turned four comments
+                // into half the preview, which is the space the page needs.
+                'flex items-center gap-2 rounded px-2 py-1',
                 pin.resolved ? 'opacity-50' : 'bg-muted/40'
               )}
               key={pin.id}
             >
-              <span className="mt-0.5 font-mono text-muted-foreground">{index + 1}</span>
+              <span className="font-mono text-[10px] text-muted-foreground">{number}</span>
               {/* The thumbnail the user pasted, at list size. Seeing it here is
                   what makes the strip inside the bubble discoverable at all. */}
               {pin.shots?.length ? (
                 <img
                   alt=""
-                  className="mt-0.5 size-6 shrink-0 rounded-sm border border-border/60 object-cover"
+                  className="size-5 shrink-0 rounded-sm border border-border/60 object-cover"
                   src={pin.shots[0].thumb}
                 />
               ) : null}
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-medium">
-                  {pin.target || 'region'}
-                  {(pin.shots?.length ?? 0) > 1 && (
-                    <span className="ms-1 text-muted-foreground">·{pin.shots!.length} images</span>
-                  )}
-                  {/* A pin that came back on a weak rung is worth seeing. The
-                      comment is still attached to something, but not to the
-                      thing the page promised it. */}
-                  {pin.orphaned && <span className="ms-1.5 text-amber-500">· detached</span>}
-                </div>
-                <div className="truncate text-muted-foreground">{pin.comment || 'no comment yet'}</div>
-              </div>
+              <span className="min-w-0 flex-1 truncate">
+                <span className="font-medium">{pin.target || 'region'}</span>
+                {(pin.shots?.length ?? 0) > 1 && (
+                  <span className="ms-1 text-muted-foreground">·{pin.shots!.length} images</span>
+                )}
+                {/* A pin that came back on a weak rung is worth seeing. The
+                    comment is still attached to something, but not to the
+                    thing the page promised it. */}
+                {pin.orphaned && <span className="ms-1.5 text-amber-500">· detached</span>}
+                <span className="ms-1.5 text-muted-foreground">{pin.comment || 'no comment yet'}</span>
+              </span>
               <button
                 className="rounded px-1 hover:bg-muted"
                 onClick={() => void togglePinResolved(pin.id).then(sync)}
@@ -337,6 +348,16 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
             </li>
           ))}
         </ul>
+      )}
+
+      {pins.length > COLLAPSED_ROWS && (
+        <button
+          className="self-start rounded px-1 text-muted-foreground hover:text-foreground"
+          onClick={() => setExpanded(open => !open)}
+          type="button"
+        >
+          {expanded ? 'Show fewer' : `Show all ${pins.length}`}
+        </button>
       )}
     </div>
   )

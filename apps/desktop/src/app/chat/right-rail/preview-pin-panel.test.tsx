@@ -256,6 +256,47 @@ describe('a review across pages', () => {
     await waitFor(() => expect(notified.at(-1)?.title).toBe('Added to chat'))
   })
 
+  it('shows only the two newest, so the list never eats the page', async () => {
+    page.pins[HOME] = ['one', 'two', 'three', 'four'].map((name, index) => ({
+      ...pin(HOME, name),
+      createdAt: index
+    }))
+    render(<PreviewPinPanel open url={HOME} />)
+
+    await waitFor(() => expect(screen.getAllByText('four').length).toBeGreaterThan(0))
+    expect(screen.getAllByText('three').length).toBeGreaterThan(0)
+    // The oldest two are behind the toggle rather than pushing the preview down.
+    expect(screen.queryAllByText('one')).toHaveLength(0)
+    expect(screen.queryAllByText('two')).toHaveLength(0)
+
+    screen.getByText('Show all 4').click()
+    await waitFor(() => expect(screen.getAllByText('one').length).toBeGreaterThan(0))
+
+    screen.getByText('Show fewer').click()
+    await waitFor(() => expect(screen.queryAllByText('one')).toHaveLength(0))
+  })
+
+  it('keeps each row numbered as its own marker, not as its place in the list', async () => {
+    page.pins[HOME] = ['one', 'two', 'three'].map((name, index) => ({
+      ...pin(HOME, name),
+      createdAt: index
+    }))
+    render(<PreviewPinPanel open url={HOME} />)
+
+    // Newest first, but "3" is still the third pin placed — the page's marker
+    // says 3 too, and the two must agree.
+    await waitFor(() => expect(screen.getByText('3')).toBeTruthy())
+    expect(screen.getByText('2')).toBeTruthy()
+    expect(screen.queryByText('1')).toBeNull()
+  })
+
+  it('offers no toggle when everything already fits', async () => {
+    page.pins[HOME] = [pin(HOME, 'only one')]
+    render(<PreviewPinPanel open url={HOME} />)
+    await waitFor(() => expect(screen.getAllByText('only one').length).toBeGreaterThan(0))
+    expect(screen.queryByText(/Show all/)).toBeNull()
+  })
+
   it('can still attach from a page that has nothing on it', async () => {
     page.pins[HOME] = [pin(HOME, 'hero')]
     const view = render(<PreviewPinPanel open url={HOME} />)
