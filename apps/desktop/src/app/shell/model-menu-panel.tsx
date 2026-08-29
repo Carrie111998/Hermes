@@ -24,6 +24,7 @@ import { sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { ModelCatalogMenu, type ModelMenuController } from './model-catalog-menu'
+import { useGatewayConnected } from './use-gateway-connected'
 
 export { ModelMenuCloseContext } from './model-catalog-menu'
 
@@ -53,6 +54,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const copy = t.shell.modelMenu
   const [refreshing, setRefreshing] = useState(false)
   const queryClient = useQueryClient()
+  const gatewayConnected = useGatewayConnected(gateway)
   // Bind to THIS surface's SessionView (primary or tile) so each pane's menu
   // shows/switches its own model — not the primary-only globals.
   const view = useSessionView()
@@ -70,8 +72,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // dedupes, no second fetch). It must be a live subscription, not a cache
   // peek: with no model in the session store yet, currentPickerSelection falls
   // back to the catalog's reported current, and a non-reactive read would
-  // never repaint that fallback once the catalog resolved.
+  // never repaint that fallback once the catalog resolved. Keep the query
+  // disabled while an explicit gateway socket is down so a reconnect toggles
+  // it back on and gives React Query a clean retry boundary (#83160).
   const modelOptions = useQuery({
+    enabled: gatewayConnected,
     queryKey: modelOptionsQueryKey(profile, activeSessionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
       requestModelOptions({ gateway, profile, request: requestGateway, sessionId: activeSessionId })
