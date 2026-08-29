@@ -10,6 +10,7 @@ import {
   type MessageGroup,
   resolveThreadScrollTarget,
   shouldClampTranscriptBudget,
+  shouldEscapeBottomFollow,
   subscribeToThreadForeground,
   transcriptBackfillFrameCount,
   transcriptPaneBudget
@@ -155,6 +156,17 @@ describe('buildGroups', () => {
     const groups = buildGroups('0:a:assistant:0')
 
     expect(groups).toEqual([{ id: 'a', index: 0, kind: 'standalone', weight: 1 }])
+  })
+})
+
+describe('shouldEscapeBottomFollow', () => {
+  it('escapes immediately on an upward wheel while the thread is scrollable', () => {
+    expect(shouldEscapeBottomFollow(-1, 1200, 800)).toBe(true)
+  })
+
+  it('keeps following for downward wheels and non-scrollable threads', () => {
+    expect(shouldEscapeBottomFollow(1, 1200, 800)).toBe(false)
+    expect(shouldEscapeBottomFollow(-1, 800, 800)).toBe(false)
   })
 })
 

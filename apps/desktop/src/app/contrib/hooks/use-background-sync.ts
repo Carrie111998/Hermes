@@ -230,19 +230,6 @@ export async function reconcileActiveTranscript({
     signatureRef.current.set(signatureKey, signature)
     const messages = toChatMessages(latest.messages)
 
-    // Empty-flash guard (#botchat-scroll-yank): the messaging-session poll can
-    // observe a transiently EMPTY persisted transcript — right after a turn is
-    // accepted (rows not yet flushed) or when the tail page read races a
-    // write. Publishing that empty transcript over a non-empty one unmounts
-    // every row (hasGroups flip false→true on the next tick), which both
-    // hard-pins scrollTop to the bottom mid-read and drops the composer's
-    // focus. An empty authoritative read is never newer information than the
-    // transcript already on screen, so keep the current state and let the next
-    // signature-gated refresh publish the real tail.
-    if (messages.length === 0) {
-      return
-    }
-
     updateSessionState(
       runtimeSessionId,
       state => ({
