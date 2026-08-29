@@ -30,6 +30,7 @@ Four review findings on the original branch:
 """
 
 import asyncio
+import logging
 import os
 from datetime import datetime
 from types import SimpleNamespace
@@ -319,6 +320,49 @@ def test_fallback_source_reconstruction_without_scope_still_routes():
     assert source is not None
     assert source.scope_id is None
     assert source.user_id == "U1"
+
+
+def _scopeless_group_event():
+    return {
+        "session_key": "agent:main:discord:group:C123:U9",
+        "platform": "discord",
+        "chat_type": "group",
+        "chat_id": "C123",
+        "user_id": "U9",
+        "type": "async_delegation",
+    }
+
+
+def test_native_fallback_source_without_scope_does_not_warn(caplog):
+    """Native delivery has no relay tenant guard, so scope is irrelevant."""
+    runner = _fallback_runner()
+    runner.__dict__["config"] = SimpleNamespace(platforms={})
+    runner.__dict__["adapters"] = {Platform.DISCORD: object()}
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        source = runner._build_process_event_source(_scopeless_group_event())
+
+    assert source is not None
+    assert "scoped relay egress may be declined" not in caplog.text
+
+
+def test_relay_fronted_fallback_source_without_scope_still_warns(caplog):
+    """The original fail-closed relay diagnostic must remain actionable."""
+
+    class _Relay:
+        @staticmethod
+        def fronts_platform(platform):
+            return platform == Platform.DISCORD
+
+    runner = _fallback_runner()
+    runner.__dict__["config"] = SimpleNamespace(platforms={})
+    runner.__dict__["adapters"] = {Platform.RELAY: _Relay()}
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        source = runner._build_process_event_source(_scopeless_group_event())
+
+    assert source is not None
+    assert "scoped relay egress may be declined" in caplog.text
 
 
 # ---------------------------------------------------------------------------
