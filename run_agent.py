@@ -8139,12 +8139,19 @@ class AIAgent:
                         return system_message or ""
 
                 def _on_timeout(idle, waited, since_progress):
+                    total_ceiling_expired = waited >= total_ceiling
+                    timeout_reason = (
+                        "total ceiling"
+                        if total_ceiling_expired
+                        else "inactivity window"
+                    )
                     logger.warning(
-                        "Context compression made no progress for %.1fs "
-                        "(total wait %.1fs, ceiling %.1fs); continuing without "
-                        "compression",
-                        since_progress,
+                        "Context compression exceeded its %s after %.1fs "
+                        "(last progress %.1fs ago, ceiling %.1fs); continuing "
+                        "without compression",
+                        timeout_reason,
                         waited,
+                        since_progress,
                         total_ceiling,
                     )
                     touch = getattr(self, "_touch_activity", None)
@@ -8168,7 +8175,7 @@ class AIAgent:
                             try:
                                 record(
                                     "host compress_context timeout "
-                                    "(no summary progress)"
+                                    f"({timeout_reason})"
                                 )
                             except Exception:
                                 logger.debug(
@@ -8178,13 +8185,22 @@ class AIAgent:
                                 )
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
-                        emit(
-                            "⚠ Context compression timed out "
-                            f"after {idle:.1f}s with no output from the summary "
-                            "model. No messages were dropped — continuing without "
-                            "compression. Run /compress to retry, /new for a clean "
-                            "session, or check auxiliary.compression."
-                        )
+                        if total_ceiling_expired:
+                            emit(
+                                "⚠ Context compression reached the total "
+                                f"ceiling after {waited:.1f}s (ceiling "
+                                f"{total_ceiling:.1f}s). No messages were dropped "
+                                "— continuing without compression. Run /compress "
+                                "to retry, or check auxiliary.compression."
+                            )
+                        else:
+                            emit(
+                                "⚠ Context compression timed out after "
+                                f"{idle:.1f}s with no output from the summary model. "
+                                "No messages were dropped — continuing without "
+                                "compression. Run /compress to retry, /new for a "
+                                "clean session, or check auxiliary.compression."
+                            )
 
                 def _on_commit_overrun(waited, ceiling):
                     # Commit-phase ceiling breach: the SessionDB mutation is in

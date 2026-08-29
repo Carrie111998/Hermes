@@ -1197,6 +1197,24 @@ def _digest_worthy(role: str, content: str) -> bool:
     return True
 
 
+def _compression_cancelled(compressor: Any) -> bool:
+    """Return whether the host has cancelled this compression attempt.
+
+    The progress-aware host cannot kill a provider request that is already in
+    flight, but it can prevent the next request in a multi-call compaction
+    plan. Keep this check callback-based so detached workers do not need to
+    share mutable host state beyond the commit fence.
+    """
+    check = getattr(compressor, "_compression_cancelled_check", None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check())
+    except Exception:
+        logger.debug("compression cancellation check failed", exc_info=True)
+        return False
+
+
 def _serialize_turns_for_digest(
     turns: List[Dict[str, Any]],
     pristine: "dict[str, str] | None" = None,
@@ -4762,6 +4780,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             try:
                 from agent.auxiliary_client import call_llm
 
+                # Lean compaction can issue many independent digest requests.
+                # Once the host-owned fence cancels the candidate, do not
+                # start another request against the unchanged session.
+                if _compression_cancelled(self):
+                    raise AuxiliaryExplicitCancellation()
+
                 # During a stall-fallback retry, follow the summary onto the
                 # pinned healthy route (non-consuming read) instead of
                 # re-addressing the stalled task backend (#96634 follow-up).
@@ -4774,6 +4798,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     max_tokens=_LEAN_DIGEST_MAX_TOKENS,
                     **attempt_summary_route_kwargs(),
                 )
+                if _compression_cancelled(self):
+                    raise AuxiliaryExplicitCancellation()
                 body = (
                     resp.choices[0].message.content
                     if hasattr(resp, "choices") else str(resp)
@@ -5243,6 +5269,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             try:
                 with aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
+                if _compression_cancelled(self):
+                    raise AuxiliaryExplicitCancellation()
             finally:
                 route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
                 _aux_provider = _aux_route.get("provider") or self.provider or ""
@@ -5325,6 +5353,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_empty_content_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
+            # A cancelled host must not let a failed summary enter the normal
+            # fallback recursion, which would issue a fresh provider request
+            # after the timeout has already been returned to the caller.
+            if _compression_cancelled(self):
+                raise AuxiliaryExplicitCancellation()
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
             #      a permanent misconfiguration, long cooldown is correct.

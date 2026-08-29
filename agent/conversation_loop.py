@@ -33,6 +33,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    compression_deferred_reason,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
@@ -1468,15 +1469,16 @@ def _compression_deferred_result(
     agent,
     messages: List[Dict],
     api_call_count: int,
+    *,
+    reason: str = "lock",
 ) -> Dict[str, Any]:
-    """Build the soft turn result for a lock-contended compression defer.
+    """Build the soft turn result for a temporary compression defer.
 
-    Another path (a sibling turn, a background review fork, a manual
-    ``/compress``) holds this session's compression lock, so every
-    compression pass this turn no-oped and the request still does not fit.
-    This is a TEMPORARY condition — the lock winner is actively shrinking
-    the same session — so the turn must end as a soft defer
-    (``compression_deferred``), never as ``compression_exhausted``: the
+    Another path may hold this session's compression lock, or a prior timeout
+    may have installed a live summary-failure cooldown. In either case every
+    automatic compression pass this turn no-oped and the request still does
+    not fit. This is a TEMPORARY condition, so the turn must end as a soft
+    defer (``compression_deferred``), never as ``compression_exhausted``: the
     gateway auto-resets (wipes) the session on exhaustion (#9893/#35809),
     which would destroy a session that the concurrent compressor is about
     to make healthy again.
@@ -1485,21 +1487,34 @@ def _compression_deferred_result(
     branch) and retry-next-message semantics apply.
     """
     holder = getattr(agent, "_compression_skipped_due_to_lock", None)
-    logger.info(
-        "turn deferred: compression lock held by another path "
-        "(session=%s holder=%s) — not counting as compression exhaustion",
-        agent.session_id or "none",
-        holder if isinstance(holder, str) else "unconfirmed",
-    )
+    if reason == "cooldown":
+        logger.info(
+            "turn deferred: automatic compression cooldown is active "
+            "(session=%s) — not counting as compression exhaustion",
+            agent.session_id or "none",
+        )
+    else:
+        logger.info(
+            "turn deferred: compression lock held by another path "
+            "(session=%s holder=%s) — not counting as compression exhaustion",
+            agent.session_id or "none",
+            holder if isinstance(holder, str) else "unconfirmed",
+        )
     try:
         agent._flush_status_buffer()
     except Exception:
         pass
-    _final = (
-        "Context compression is already running for this session. "
-        "Please retry in a moment — your next message will be processed "
-        "once the concurrent compression finishes."
-    )
+    if reason == "cooldown":
+        _final = (
+            "Context compression is temporarily cooling down after a previous "
+            "timeout. Please retry in a moment; your session was preserved."
+        )
+    else:
+        _final = (
+            "Context compression is already running for this session. "
+            "Please retry in a moment — your next message will be processed "
+            "once the concurrent compression finishes."
+        )
     return {
         "final_response": _final,
         "messages": messages,
@@ -5714,7 +5729,12 @@ def run_conversation(
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
                     )
-                    if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                    _deferred_reason = (
+                        compression_deferred_reason(agent)
+                        if messages is _overflow_input
+                        else None
+                    )
+                    if _deferred_reason:
                         # #69870 lock-skip: the provider proved the request
                         # does not fit, but this compression pass no-oped only
                         # because another path holds the session's compression
@@ -5724,7 +5744,10 @@ def run_conversation(
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
-                            agent, messages, api_call_count
+                            agent,
+                            messages,
+                            api_call_count,
+                            reason=_deferred_reason,
                         )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
@@ -5878,11 +5901,19 @@ def run_conversation(
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
                             )
-                            if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                            _deferred_reason = (
+                                compression_deferred_reason(agent)
+                                if messages is _overflow_input
+                                else None
+                            )
+                            if _deferred_reason:
                                 compression_attempts -= 1
                                 agent._persist_session(messages, conversation_history)
                                 return _compression_deferred_result(
-                                    agent, messages, api_call_count
+                                    agent,
+                                    messages,
+                                    api_call_count,
+                                    reason=_deferred_reason,
                                 )
                             conversation_history = conversation_history_after_compression(
                                 agent, messages, conversation_history
@@ -6032,7 +6063,12 @@ def run_conversation(
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
                     )
-                    if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                    _deferred_reason = (
+                        compression_deferred_reason(agent)
+                        if messages is _overflow_input
+                        else None
+                    )
+                    if _deferred_reason:
                         # #69870 lock-skip: the provider proved the request
                         # does not fit, but this compression pass no-oped only
                         # because another path holds the session's compression
@@ -6042,7 +6078,10 @@ def run_conversation(
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
-                            agent, messages, api_call_count
+                            agent,
+                            messages,
+                            api_call_count,
+                            reason=_deferred_reason,
                         )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history

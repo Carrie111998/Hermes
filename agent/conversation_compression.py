@@ -1311,19 +1311,23 @@ def run_compress_context_with_progress_timeout(
     # settle admission themselves (worker result returned, or fence cancel
     # won); everything else revokes in the ``finally``.
     handled_exit = False
+    timeout_reason = None
     try:
         while True:
             waited = time.monotonic() - wait_started
             remaining_ceiling = ceiling - waited
             if remaining_ceiling <= 0:
+                timeout_reason = "total_ceiling"
                 break
             # #76354 S3 analogue for this wait: charge the idle budget from
             # the LAST PROGRESS event, not from the start of this wait slice.
             # Waiting a full ``idle`` after progress that landed early in the
             # previous slice would allow silence to approach 2x the budget.
             since_progress = fence.seconds_since_progress()
+            idle_wait = max(idle - since_progress, 0.005)
+            ceiling_limited = remaining_ceiling <= idle_wait
             wait_slice = min(
-                max(idle - since_progress, 0.005), remaining_ceiling
+                idle_wait, remaining_ceiling
             )
             try:
                 result = future.result(timeout=wait_slice)
@@ -1342,6 +1346,12 @@ def run_compress_context_with_progress_timeout(
                         ceiling,
                     )
                     continue
+                # Use the boundary that limited this wait rather than an
+                # exact wall-clock comparison: Future.result() can return a
+                # few milliseconds before/after its requested timeout.
+                timeout_reason = (
+                    "total_ceiling" if ceiling_limited else "inactivity"
+                )
                 break
 
         # F6: a not-yet-started future must not linger as a stale queued job.
@@ -1426,19 +1436,25 @@ def run_compress_context_with_progress_timeout(
                     continue
 
         # Idle-timeout path: cancellation won before the commit boundary.
-        # The fence already blocks any future commit; F4 additionally frees
-        # the timed-out worker's durable lease via the holder-qualified hook
-        # so a NEW compressor can acquire the lock immediately (no ABA: the
-        # DB release is holder-scoped).
+        # A total-ceiling cancellation is different from ordinary inactivity:
+        # lean compaction may still be inside a long sequence of healthy digest
+        # calls. Keep its holder-qualified lease until the worker observes the
+        # cancelled fence and unwinds, preventing a second automatic attempt
+        # from starting against the same unchanged transcript. The worker's
+        # normal cleanup releases the lease; if the provider never returns,
+        # the lease refresher keeps the session fail-closed instead of allowing
+        # overlapping compactions.
         handled_exit = True
-        fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        total_ceiling_expired = timeout_reason == "total_ceiling"
+        if not total_ceiling_expired:
+            fence.release_cancelled_compression_lock()
         # The durable lease is free again (above), so a fallback attempt can
         # acquire it immediately. Run it BEFORE on_timeout: that callback
         # records the summary-failure cooldown, which would make the retry's
         # own summary call a no-op.
-        if stall_fallback:
+        if stall_fallback and not total_ceiling_expired:
             recovered = _retry_compression_on_fallback_chain(
                 worker=worker,
                 messages=messages,
@@ -1609,6 +1625,34 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     """
     _sig = getattr(agent, "_compression_skipped_due_to_lock", None)
     return _sig is True or isinstance(_sig, str)
+
+
+def compression_deferred_reason(agent: Any) -> Optional[str]:
+    """Return the temporary guard that made compression a no-op.
+
+    Context-overflow recovery must distinguish a temporary automatic
+    compression guard from a compressor that actually ran and made no
+    progress. The latter is permanent exhaustion for this turn; lock
+    contention and a live summary-failure cooldown are retryable conditions
+    that must never trigger the gateway's session auto-reset.
+    """
+    if compression_skipped_due_to_lock(agent):
+        return "lock"
+    compressor = getattr(agent, "context_compressor", None)
+    getter = getattr(compressor, "get_active_compression_failure_cooldown", None)
+    if not callable(getter):
+        return None
+    try:
+        state = getter()
+    except Exception:
+        return None
+    if not isinstance(state, dict):
+        return None
+    try:
+        remaining = float(state.get("remaining_seconds") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return "cooldown" if remaining > 0 else None
 
 
 def _adopt_live_compression_child(
