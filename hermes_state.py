@@ -3893,6 +3893,12 @@ class SessionTurnLeaseLostError(RuntimeError):
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
+    The CPython sqlite3 statement cache is disabled for every SessionDB
+    connection.  These connections may be handed across threads via
+    ``check_same_thread=False``; CPython issues #118172 and #146471 document
+    cache corruption and native crashes under concurrent use, with
+    ``cached_statements=0`` as the supported workaround.
+
     While a connection is live, byte-level probes of the same file are
     refused: an ``open()``/``close()`` cancels every POSIX advisory lock this
     process holds on it -- including a running VACUUM's EXCLUSIVE lock.
@@ -3904,6 +3910,7 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     connect would disable the guard for the lifetime of that connection,
     which is precisely the failure mode this module exists to prevent.
     """
+    kwargs.setdefault("cached_statements", 0)
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:

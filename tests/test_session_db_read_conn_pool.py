@@ -66,6 +66,36 @@ def _read(db):
     db.get_messages("s1")
 
 
+def test_tracked_connections_disable_sqlite_statement_cache(monkeypatch, tmp_path):
+    """Shared SessionDB connections must not use CPython's unsafe cache.
+
+    CPython issues #118172 and #146471 show that concurrent use of a
+    ``check_same_thread=False`` connection can corrupt the sqlite3 statement
+    cache and segfault in ``bounded_lru_cache_wrapper``.  Every SessionDB
+    connection passes through ``_connect_tracked_db``, so pin the documented
+    ``cached_statements=0`` workaround at that choke point.
+    """
+    import hermes_cli.sqlite_safe_read as safe_read
+    import hermes_state as state
+
+    observed = {}
+    sentinel = object()
+
+    def fake_connect_tracked(path, **kwargs):
+        observed.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(safe_read, "connect_tracked", fake_connect_tracked)
+
+    result = state._connect_tracked_db(
+        tmp_path / "state.db",
+        check_same_thread=False,
+    )
+
+    assert result is sentinel
+    assert observed["cached_statements"] == 0
+
+
 @pytest.mark.requires_wal
 def test_read_pool_is_bounded_across_many_threads(db):
     """150 short-lived reader threads must not pin 150 connections.
