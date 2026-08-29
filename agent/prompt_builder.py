@@ -810,8 +810,12 @@ PLATFORM_HINTS = {
         "Prefer bullet lists and labeled key:value pairs for structured data. "
         "You can send media files natively: to deliver a file to the user, "
         "include MEDIA:/absolute/path/to/file in your response. Images "
-        "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
-        "bubbles, and videos (.mp4) play inline. You can also include image "
+        "(.png, .jpg, .webp) appear as photos and videos (.mp4) play inline. "
+        "Audio: put [[audio_as_voice]] on its own line in the same response "
+        "to send ANY audio file as a native voice bubble (non-Opus formats "
+        "are transcoded automatically); without the directive, .mp3/.m4a "
+        "arrive as playable audio files and other formats as documents. "
+        "You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as native photos."
     ),
     "discord": (
@@ -965,7 +969,9 @@ PLATFORM_HINTS = {
         "links are supported. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
-        "inline, audio files as voice messages, and other files as attachments."
+        "inline, audio files as native voice messages (non-Opus formats are "
+        "transcoded automatically; without ffmpeg they fall back to file "
+        "attachments), and other files as attachments."
     ),
     "weixin": (
         "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
