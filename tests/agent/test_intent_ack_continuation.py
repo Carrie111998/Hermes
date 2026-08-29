@@ -150,6 +150,7 @@ def test_pronounless_action_announcements_continue_when_opted_in():
         "Running now (pid 19441, no early exit). Checking the log…",
         "Brief written\nCreating the session now",
         "Checking whether the service is healthy.",
+        "Launching now — see https://ci.example.com/run?id=5 for progress.",
     )
     for announcement in announcements:
         assert looks_like_codex_intermediate_ack(
@@ -176,10 +177,20 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Running successful.",
         "Testing the parser completed successfully.",
         "Checking the logs finished with no errors.",
+        "Testing completed in 3.2 seconds.",
+        "Checking finished at 10:42.",
+        "Running the suite passed 42 of 42 assertions.",
+        "Testing completed and everything looks good.",
         "Running the suite passed. 42 tests, 0 failures.",
         "Running the suite in parallel with pytest-xdist is the fastest win.",
         "Checking the CI logs would be the first step.",
         "Reading the traceback tells you which parser rule failed.",
+        "Reading the traceback gives you the failing rule.",
+        "Running the suite locally reproduces the failure.",
+        "Checking the CI logs seems like the first step.",
+        "A few options:\n- Running the suite with a fixed seed\n- Pinning the dependency.",
+        "Two ideas:\n* Checking the CI cache\n* Bumping the timeout.",
+        "Options:\n1. Running the suite locally.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(

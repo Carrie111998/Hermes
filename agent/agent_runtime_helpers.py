@@ -4290,21 +4290,30 @@ def looks_like_codex_intermediate_ack(
     # "Testing completed successfully") stay final, and questions are never
     # auto-continued.
     action_clause_pattern = re.compile(
-        r"(?:^|[.!…—–-]\s+|\n+\s*)(?:(?:re)?launching|(?:re)?starting|creating|"
+        r"(?:^|[.!…—–]\s+|\n+\s*)(?P<action>(?:re)?launching|(?:re)?starting|creating|"
         r"checking|running|writing|opening|reading|inspecting|reviewing|"
         r"testing|debugging|searching|fixing)\b"
     )
+    list_item_prefix_pattern = re.compile(r"(?:^|\n)\s*(?:[-*+]|\d+[.)])\s*$")
     completion_predicate_pattern = re.compile(
         r"\b(?:completed|finished|succeeded|failed|passed|complete|done|successful)\b"
-        r"(?=\s*(?:$|[)\]])|\s+(?:successfully|with|without|due|because|after|before)\b)"
+        r"(?=\s*(?:$|[)\],;:])|\s+(?:successfully|with|without|due|because|"
+        r"after|before|in|at|and|but|while|when|so|as|on|during|by|for|from|"
+        r"over|under|all|every|today|yesterday|already)\b|\s+\d)"
     )
     declarative_predicate_pattern = re.compile(
-        r"\b(?:is|are|was|were|would|could|should|can|will|tells?|shows?|helps?|"
-        r"costs?|means?|takes?|requires?)\b"
+        r"\b(?:(?:is|are|was|were|would|could|should|can|will|tells?|shows?|"
+        r"helps?|costs?|means?|takes?|requires?|seems?|appears?)|"
+        r"[a-z]+(?:s|es)(?=\s+(?:a|an|the|this|that|these|those|you|me|us|"
+        r"him|her|them|it|like|to)\b))\b"
     )
+    question_pattern = re.compile(r"\?(?=\s|$|[\"'’”)\]])")
     has_pronounless_action = False
-    if "?" not in assistant_text:
+    if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
+            action_prefix = assistant_text[: action_match.start("action")]
+            if list_item_prefix_pattern.search(action_prefix):
+                continue
             clause_tail = assistant_text[action_match.end() :]
             clause_tail = re.split(r"[.!?…\n]", clause_tail, maxsplit=1)[0]
             if completion_predicate_pattern.search(clause_tail):
