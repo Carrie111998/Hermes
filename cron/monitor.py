@@ -27,6 +27,32 @@ State lives in two places, both durable across scheduler restarts:
 
 Inspired by: ChatGPT Work monitor tasks (idea-level, docs-only);
 enabler: #80774.
+
+Failure-retry semantics (opt-in, ``monitor_retry_on_failure``):
+
+* DEFAULT (field absent/False — legacy): the new hash is committed at
+  DETECTION time, before the agent runs. A failed agent run consumes the
+  change; the next tick sees the same output as ``no_change`` and stays
+  silent. At-most-once alerting per change.
+* OPT-IN (``monitor_retry_on_failure: true``): detection stashes the new
+  hash in a process-local PENDING slot instead of committing it, and
+  ``run_job`` commits it only when the agent run completes successfully
+  (``commit_monitor_change``). A failed agent run leaves the stored hash
+  untouched, so the next tick re-detects the SAME change and retries the
+  agent — at-least-once alerting per change. Opt-in because replay can
+  duplicate side effects for jobs whose agent acts on the world; jobs
+  that do not opt in keep byte-identical legacy behavior.
+* Commit boundary: the hash commits on AGENT-RUN SUCCESS inside
+  ``run_job`` — BEFORE delivery. A delivery error afterwards never
+  un-commits (the agent already acted on the change; replaying it would
+  duplicate side effects, and delivery failure is tracked separately via
+  ``last_delivery_error``). A wake-gate skip (``wakeAgent: false``) does
+  NOT commit — the agent never ran, so the change stays pending.
+* Crash/restart: the pending slot is process-local, so a scheduler crash
+  between detection and commit simply re-detects the change on the next
+  tick (the stored hash was never touched) — correct by construction.
+  A no_change tick (output reverted to the committed output) CLEARS the
+  pending slot so an evaporated change cannot be committed stale later.
 """
 
 from __future__ import annotations
@@ -34,6 +60,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -49,6 +76,43 @@ URL_TIMEOUT_SECONDS = 30
 MAX_URL_BYTES = 262_144  # 256 KiB
 
 _SNAPSHOT_FILENAME = "monitor_last_output.txt"
+
+
+# Process-local pending commits for ``monitor_retry_on_failure`` jobs:
+# job_id -> (new_hash, output). Detection STASHES here instead of
+# committing; ``commit_monitor_change`` persists after a successful agent
+# run. Process-local by design (see module docstring): a crash simply
+# re-detects the change next tick. Guarded by a lock because the
+# scheduler fires jobs from a parallel thread pool.
+_PENDING_LOCK = threading.Lock()
+_PENDING_COMMITS: dict[str, tuple[str, str]] = {}
+
+
+def job_retries_monitor_on_failure(job: dict) -> bool:
+    """True when the job opted in to commit-on-success monitor semantics."""
+    return bool(job.get("monitor_retry_on_failure"))
+
+
+def commit_monitor_change(job_id: str) -> bool:
+    """Persist a pending monitor change after a successful agent run.
+
+    No-op (returns False) when the job has no pending change — legacy
+    jobs commit at detection time and never populate the slot. Idempotent:
+    a second call after a successful commit finds an empty slot.
+    """
+    with _PENDING_LOCK:
+        pending = _PENDING_COMMITS.pop(str(job_id or ""), None)
+    if pending is None:
+        return False
+    new_hash, output = pending
+    _persist_monitor_state(str(job_id), new_hash, output)
+    return True
+
+
+def clear_pending_monitor_change(job_id: str) -> None:
+    """Drop a pending change without committing (evaporated change)."""
+    with _PENDING_LOCK:
+        _PENDING_COMMITS.pop(str(job_id or ""), None)
 
 
 @dataclass
@@ -148,10 +212,19 @@ def job_has_monitor(job: dict) -> bool:
 def check_monitor(job: dict) -> MonitorOutcome:
     """Run the monitor source and decide whether the agent should run.
 
-    On change (or first run) the new hash + snapshot are persisted BEFORE
-    the agent runs — detection time is the state boundary, so a failed
-    agent run doesn't re-alert on the same content forever.
-    On failure nothing is persisted.
+    On change (or first run) the persistence boundary depends on the
+    job's ``monitor_retry_on_failure`` flag:
+
+    * LEGACY (flag absent/False): the new hash + snapshot are persisted
+      BEFORE the agent runs — detection time is the state boundary, so a
+      failed agent run doesn't re-alert on the same content forever.
+    * OPT-IN (flag True): the new hash + output are stashed in the
+      process-local pending slot instead; ``commit_monitor_change``
+      persists them only after the agent run completes successfully, so
+      a failed run leaves the change retryable on the next tick.
+
+    On source failure nothing is persisted (and any pending change is
+    left in place — the retry is still owed).
     """
     job_id = str(job.get("id") or "")
     ok, output = _run_monitor_source(job)
@@ -164,6 +237,10 @@ def check_monitor(job: dict) -> MonitorOutcome:
     last_hash = state.get("last_output_hash")
 
     if last_hash is not None and new_hash == last_hash:
+        # Unchanged — the previously detected change (if any) evaporated:
+        # the source returned to the committed output, so a stale pending
+        # commit must not be persisted later by an unrelated success.
+        clear_pending_monitor_change(job_id)
         return MonitorOutcome(ok=True, changed=False)
 
     first_run = last_hash is None
@@ -189,7 +266,16 @@ def check_monitor(job: dict) -> MonitorOutcome:
             f"### Current output\n\n```\n{shown_output}\n```"
         )
 
-    _persist_monitor_state(job_id, new_hash, output)
+    if job_retries_monitor_on_failure(job):
+        # Commit-on-success: stash the detected change; run_job persists it
+        # via commit_monitor_change only after the agent completes
+        # successfully. A failed agent run leaves the stored hash untouched
+        # so the next tick re-detects THIS change and retries.
+        with _PENDING_LOCK:
+            _PENDING_COMMITS[job_id] = (new_hash, output)
+    else:
+        # Legacy: detection time is the state boundary — persist now.
+        _persist_monitor_state(job_id, new_hash, output)
     return MonitorOutcome(
         ok=True, changed=True, first_run=first_run, context_block=context_block
     )

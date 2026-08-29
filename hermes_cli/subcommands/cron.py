@@ -120,6 +120,32 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--monitor-retry-on-failure",
+        dest="monitor_retry_on_failure",
+        action="store_true",
+        default=False,
+        help=(
+            "Monitor mode only: commit a detected output change ONLY after "
+            "the agent run succeeds, so a failed run (provider error, "
+            "timeout) retries the SAME change next tick (at-least-once). "
+            "Default off = legacy commit-at-detection (at-most-once)."
+        ),
+    )
+    cron_create.add_argument(
+        "--fallback-provider",
+        dest="fallback_provider",
+        help=(
+            "Per-job fallback provider pin (user-owned; the agent's cronjob "
+            "tool cannot set this). REQUIRES --fallback-model. Replaces the "
+            "global fallback_providers chain for this job only."
+        ),
+    )
+    cron_create.add_argument(
+        "--fallback-model",
+        dest="fallback_model",
+        help="Fallback model paired with --fallback-provider.",
+    )
+    cron_create.add_argument(
         "--continuity",
         dest="continuity",
         action="store_const",
@@ -244,6 +270,37 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--monitor-retry-on-failure",
+        dest="monitor_retry_on_failure",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Monitor mode only: commit a detected change only after the "
+            "agent run succeeds (failed runs retry the same change)."
+        ),
+    )
+    cron_edit.add_argument(
+        "--no-monitor-retry-on-failure",
+        dest="monitor_retry_on_failure",
+        action="store_const",
+        const=False,
+        help="Restore legacy monitor commit-at-detection semantics.",
+    )
+    cron_edit.add_argument(
+        "--fallback-provider",
+        dest="fallback_provider",
+        help=(
+            "Per-job fallback provider pin (requires --fallback-model). "
+            "Pass empty string together with --fallback-model '' to clear."
+        ),
+    )
+    cron_edit.add_argument(
+        "--fallback-model",
+        dest="fallback_model",
+        help="Fallback model paired with --fallback-provider.",
     )
     cron_edit.add_argument(
         "--reasoning-effort",

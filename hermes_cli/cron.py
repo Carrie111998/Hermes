@@ -545,6 +545,9 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        monitor_retry_on_failure=getattr(args, "monitor_retry_on_failure", None),
+        fallback_provider=getattr(args, "fallback_provider", None),
+        fallback_model=getattr(args, "fallback_model", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -561,6 +564,10 @@ def cron_create(args):
         print(f"  Monitor: {job_data['monitor_script']} (agent runs only on output change)")
     if job_data.get("monitor_url"):
         print(f"  Monitor: {job_data['monitor_url']} (agent runs only on output change)")
+    if job_data.get("monitor_retry_on_failure"):
+        print("  Monitor retry: on (change commits only after a successful agent run)")
+    if job_data.get("fallback_provider"):
+        print(f"  Fallback: {job_data['fallback_provider']} / {job_data.get('fallback_model')} (per-job, replaces global chain)")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("continuity"):
@@ -620,6 +627,9 @@ def cron_edit(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        monitor_retry_on_failure=getattr(args, "monitor_retry_on_failure", None),
+        fallback_provider=getattr(args, "fallback_provider", None),
+        fallback_model=getattr(args, "fallback_model", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -639,6 +649,10 @@ def cron_edit(args):
         print(f"  Monitor: {updated['monitor_script']} (agent runs only on output change)")
     if updated.get("monitor_url"):
         print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
+    if updated.get("monitor_retry_on_failure"):
+        print("  Monitor retry: on (change commits only after a successful agent run)")
+    if updated.get("fallback_provider"):
+        print(f"  Fallback: {updated['fallback_provider']} / {updated.get('fallback_model')} (per-job, replaces global chain)")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("continuity"):

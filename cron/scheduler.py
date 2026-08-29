@@ -121,32 +121,106 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
-def _fallback_chain_phrase() -> str:
+def _resolve_job_fallback_chain(job: dict, cfg: dict) -> list:
+    """Effective fallback chain for ONE cron job.
+
+    A job pinned with ``fallback_provider`` + ``fallback_model`` (an atomic
+    pair, validated in cron.jobs) runs a single-entry chain of exactly that
+    pin — REPLACING the global ``fallback_providers`` chain for this job
+    only. Every other job keeps the global chain (pre-existing behavior).
+    """
+    if isinstance(job, dict):
+        fb_provider = str(job.get("fallback_provider") or "").strip()
+        fb_model = str(job.get("fallback_model") or "").strip()
+        if fb_provider and fb_model:
+            return [{"provider": fb_provider, "model": fb_model}]
+    return get_fallback_chain(cfg)
+
+
+def _job_backend_identity(job: dict):
+    """Best-effort BackendIdentity of the job's CURRENT (failing) backend.
+
+    Pinned axes win; unpinned axes fall back to the creation-time drift
+    snapshots (what the job actually resolved to). Returns None when the
+    identity is unprovable — callers must then fail to the legacy wording
+    rather than guess.
+    """
+    if not isinstance(job, dict):
+        return None
+    provider = (job.get("provider") or job.get("provider_snapshot") or "")
+    model = (job.get("model") or job.get("model_snapshot") or "")
+    base_url = str(job.get("base_url") or "")
+    provider = str(provider).strip()
+    model = str(model).strip()
+    if not provider or not model:
+        return None
+    from agent.backend_identity import BackendIdentity
+
+    return BackendIdentity.build(provider=provider, model=model, base_url=base_url)
+
+
+def _fallback_chain_phrase(job: dict | None = None) -> str:
     """Wording for the fallback-chain clause of a provider-failure message.
 
     "Fallback chain was exhausted or unavailable." used to fire
     unconditionally on every provider failure, which implies a fallback was
-    attempted and failed. Most installs have fallback_providers: [] (no
-    chain configured at all), so that wording was actively misleading: it
-    sent the operator looking for why a fallback "failed" when none was
-    ever attempted. Distinguish the two cases explicitly.
+    attempted and failed. Two real cases make that wording a lie:
 
-    Fails open to the original ambiguous-but-safe wording if config can't be
-    read (e.g. mid-shutdown, permissions) -- never let a lookup error crash
-    failure-message generation itself.
+    1. Most installs have fallback_providers: [] (no chain at all) — nothing
+       was attempted. Report the no-chain guidance instead.
+    2. The chain exists but EVERY entry resolves to the same backend as the
+       primary, so the agent's skip predicate (agent.backend_identity's
+       should_skip_candidate, MODEL scope — a timeout/429 kills one
+       deployment) skipped them all. Nothing was attempted either, and
+       "exhausted" sends the operator debugging a fallback that was never
+       tried (field-reported: job pinned to zai/glm-5.3 with its only
+       fallback ALSO zai/glm-5.3 → skipped as same-backend, alert still
+       claimed "exhausted or unavailable").
+
+    When at least one entry is a genuinely different backend, the chain was
+    really walked and the legacy wording is honest. When the job's backend
+    identity is unprovable (unpinned, no snapshot), fail open to the legacy
+    ambiguous-but-safe wording. A config-read error fails open the same way
+    — never let a lookup error crash failure-message generation itself.
     """
     try:
         cfg = load_config() or {}
-        chain = get_fallback_chain(cfg)
+        chain = _resolve_job_fallback_chain(job or {}, cfg)
     except Exception:
         return "Fallback chain was exhausted or unavailable."
-    if chain:
-        return "Fallback chain was exhausted or unavailable."
-    return (
-        "No fallback chain configured — add one with `hermes fallback add`, "
-        "or set a cron fleet default via `cron.model` + `cron.model_provider` "
-        "in config.yaml."
-    )
+    if not chain:
+        return (
+            "No fallback chain configured — add one with `hermes fallback add`, "
+            "or set a cron fleet default via `cron.model` + `cron.model_provider` "
+            "in config.yaml."
+        )
+    try:
+        from agent.backend_identity import BackendIdentity, should_skip_candidate
+
+        current = _job_backend_identity(job or {})
+        if current is not None:
+            alternates = 0
+            for entry in chain:
+                if not isinstance(entry, dict):
+                    continue
+                fb_ident = BackendIdentity.build(
+                    provider=entry.get("provider"),
+                    model=entry.get("model"),
+                    base_url=entry.get("base_url") or "",
+                )
+                if not should_skip_candidate(fb_ident, current):
+                    alternates += 1
+            if alternates == 0:
+                return (
+                    "Every configured fallback resolves to the SAME backend as "
+                    "the primary, so no fallback was ever tried — pin a fallback "
+                    "on a different provider/model (e.g. `hermes cron edit "
+                    "<job_id> --fallback-provider <provider> --fallback-model "
+                    "<model>`, or fix the global chain with `hermes fallback`)."
+                )
+    except Exception:
+        pass  # fail open to the legacy wording below
+    return "Fallback chain was exhausted or unavailable."
 
 
 def _failure_streak_nudge(job: dict) -> str:
@@ -282,7 +356,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             reason = "quota limit"
         return (
             f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            f"{_fallback_chain_phrase()} "
+            f"{_fallback_chain_phrase(job)} "
             "Full details saved in cron output."
         )
 
@@ -329,7 +403,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     ):
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            f"{_fallback_chain_phrase()} "
+            f"{_fallback_chain_phrase(job)} "
             "Full details saved in cron output."
         )
 
@@ -5107,9 +5181,12 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     auth-fallback path may legitimately rescue a missing primary key, so
     blocking here would break that contract (and burning zero LLM calls is
     already guaranteed by the fallback resolution being config-local).
+    The chain consulted is the JOB's effective chain: a per-job
+    ``fallback_provider`` + ``fallback_model`` pin counts as a configured
+    fallback even when no global ``fallback_providers`` chain exists.
     """
     try:
-        if get_fallback_chain(cfg):
+        if _resolve_job_fallback_chain(job, cfg):
             return None
     except Exception:
         return None  # fail-open: never block on a preflight-internal error
@@ -6174,7 +6251,7 @@ def run_job(
                 reason,
                 resolve_exc,
             )
-            fb_list = get_fallback_chain(_cfg)
+            fb_list = _resolve_job_fallback_chain(job, _cfg)
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):
@@ -6309,7 +6386,7 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_model = _resolve_job_fallback_chain(job, _cfg) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -6690,6 +6767,38 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+
+        # Monitor commit-on-success boundary (monitor_retry_on_failure
+        # opt-in): check_monitor only STASHED the detected change; commit
+        # it now that the agent run completed successfully. Deliberately
+        # BEFORE the caller's delivery step: a delivery error afterwards
+        # never un-commits — the agent already consumed the change, and
+        # replaying it would duplicate side effects. No-op for legacy
+        # monitor jobs (committed at detection) and non-monitor jobs.
+        #
+        # Empty-response parity: the caller reclassifies success=True with
+        # an empty final_response as a FAILURE (#8585), so for opt-in retry
+        # jobs an empty response must NOT commit — the change would be
+        # consumed by a run the scheduler contract itself reports as
+        # failed, and the retry would never fire. The pending slot is left
+        # in place so the next identical tick re-detects and re-runs.
+        if job_has_monitor(job):
+            from cron.monitor import (
+                commit_monitor_change,
+                job_retries_monitor_on_failure,
+            )
+
+            if job_retries_monitor_on_failure(job) and not (
+                final_response or ""
+            ).strip():
+                logger.info(
+                    "Job '%s': empty final response — leaving monitor "
+                    "change pending for retry (scheduler treats an empty "
+                    "response as a soft failure)",
+                    job_id,
+                )
+            else:
+                commit_monitor_change(job_id)
 
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
