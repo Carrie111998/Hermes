@@ -153,8 +153,8 @@ function useRecentActivity(): [boolean, () => void] {
  *
  * Pinning on busy was deliberately avoided while the band brought its tinted
  * sheet up with it — that put an opaque panel across the screen for as long as
- * the agent worked. The sheet is a translucent scrim now, so a held band is
- * legible text rather than a slab.
+ * the agent worked. The sheet is the HUD's own card now, so a held band is
+ * readable theme text on paper rather than overlay ink on someone else's UI.
  */
 function useHudHeld(gameUnder: boolean): boolean {
   const awaiting = useStore($activeSessionAwaitingInput)
