@@ -368,6 +368,25 @@ describe('durable projection', () => {
 
     expect(durable(room).Persist.stranded?.research).toBe(3)
   })
+
+  it('the awaited durability fence preserves session ownership and stop holds', async () => {
+    const room = await loadRoom()
+
+    await room.chat.persistGroupChatRooms({
+      Persist: {
+        holds: { research: { at: 42 } },
+        log: [],
+        members: [{ name: 'research' }],
+        sessionOwners: { research: { name: 'research' } },
+        sessions: { research: 'session-secret' },
+        stranded: { research: 3 },
+        watermarks: {}
+      }
+    } as unknown as Record<string, GroupChat>)
+
+    expect(durable(room).Persist.sessionOwners).toEqual({ research: { name: 'research' } })
+    expect(durable(room).Persist.holds).toEqual({ research: { at: 42 } })
+  })
 })
 
 describe('gateway mirror', () => {
@@ -433,6 +452,32 @@ describe('gateway mirror', () => {
 
     expect(chat.groupChatGatewayJsonSize(snapshot)).toBeLessThanOrEqual(48000)
     expect(snapshot.rooms['name:Unicode'].log.at(-1)?.thread).toBe('thread-15')
+  })
+
+  it('keeps recovery metadata out of the cross-client ui_meta projection', async () => {
+    const { chat } = await loadRoom()
+
+    const snapshot = chat.groupChatSyncSnapshot({
+      Private: {
+        log: [{ at: 1, from: { kind: 'user', name: 'You' }, text: 'keep working', thread: 't1' }],
+        sessions: { research: 'private-session-id' },
+        stranded: {
+          research: {
+            before: 0,
+            phase: 'submitted',
+            recoveryId: 'recovery-private',
+            thread: 't1'
+          }
+        },
+        watermarks: {}
+      }
+    } as unknown as Record<string, GroupChat>)
+
+    expect(snapshot.rooms['name:Private']).not.toHaveProperty('sessions')
+    expect(snapshot.rooms['name:Private']).not.toHaveProperty('stranded')
+    expect(JSON.stringify(snapshot)).not.toContain('private-session-id')
+    expect(JSON.stringify(snapshot)).not.toContain('recovery-private')
+    expect(chat.groupChatGatewayJsonSize(snapshot)).toBeLessThanOrEqual(48000)
   })
 
   it('omits empty runtime rooms', async () => {

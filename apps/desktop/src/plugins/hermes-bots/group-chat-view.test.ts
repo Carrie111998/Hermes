@@ -143,8 +143,17 @@ describe('disband', () => {
     room.chat.$groupChats.set({
       Gone: { log: [{ at: 2, from: { kind: 'user', name: 'You' }, id: 'g1', text: 'hello goners' }], watermarks: {} },
       Keep: {
+        holds: { remote: { at: 7 } },
         log: [{ at: 1, from: { kind: 'user', name: 'You' }, id: 'k1', text: 'hello keepers' }],
         members: [{ connectionId: 'remote-1', name: 'remote', remoteSource: true, sourceScoped: true }],
+        stranded: {
+          remote: {
+            before: 1,
+            phase: 'submitted',
+            recoveryId: 'recovery-keep',
+            thread: 't-keep'
+          }
+        },
         watermarks: {}
       }
     } as unknown as Record<string, GroupChat>)
@@ -171,6 +180,8 @@ describe('disband', () => {
     expect('Gone' in durable(room)).toBe(false)
     expect(durable(room).Keep.members).toHaveLength(1)
     expect(durable(room).Keep.members?.[0].connectionId).toBe('remote-1')
+    expect(durable(room).Keep.stranded?.remote).toMatchObject({ recoveryId: 'recovery-keep' })
+    expect(durable(room).Keep.holds?.remote).toEqual({ at: 7 })
   })
 
   it('cannot leave a metadata-only group row behind when the rendered roster is empty', async () => {

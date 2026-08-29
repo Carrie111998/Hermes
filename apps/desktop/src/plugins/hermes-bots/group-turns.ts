@@ -9,11 +9,27 @@
 import { host } from '@hermes/plugin-sdk'
 
 import { recordGroupActivity } from './group-activity'
-import { $groupChats, $groupClarify, $groupNeedsYou, appendGroupChatEntry, updateGroupChat } from './group-chat'
+import {
+  $groupChats,
+  $groupClarify,
+  $groupNeedsYou,
+  appendGroupChatEntry,
+  persistGroupChatRooms,
+  updateGroupChat
+} from './group-chat'
 import type { GroupChatRoom } from './group-chat'
 import { groupMemberKey, groupSessionOwner } from './group-membership'
+import { botsText } from './i18n'
 import { botConnectionRoute, requestForBot } from './routing'
-import type { Attachment, GroupMember, GroupPrompt, GroupPromptQuestion, ProfileRoute } from './types'
+import { getPluginCtx } from './shared'
+import type {
+  Attachment,
+  GroupMember,
+  GroupPrompt,
+  GroupPromptQuestion,
+  GroupTurnRecovery,
+  ProfileRoute
+} from './types'
 
 /** "(pass)" (loosely: pass / (pass) / pass.) or empty = the member stayed silent. */
 export function isGroupPassText(text: unknown) {
@@ -232,6 +248,396 @@ export async function ensureGroupChatSession(group: string, member: GroupMember)
 
 const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
+
+function mintGroupTurnRecoveryId(): string {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID()
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+function groupTurnRecovery(marker: unknown): GroupTurnRecovery | null {
+  if (!marker || typeof marker !== 'object') {
+    return null
+  }
+
+  const candidate = marker as Record<string, unknown>
+  const before = candidate.before
+  const phase = candidate.phase
+  const recoveryId = candidate.recoveryId
+  const thread = candidate.thread
+
+  if (
+    typeof before !== 'number' ||
+    !Number.isSafeInteger(before) ||
+    before < 0 ||
+    (phase !== 'prepared' && phase !== 'submitted' && phase !== 'timed-out') ||
+    typeof recoveryId !== 'string' ||
+    !recoveryId ||
+    recoveryId.length > 160 ||
+    recoveryId.trim() !== recoveryId ||
+    (thread !== undefined && (typeof thread !== 'string' || thread.length > 128))
+  ) {
+    return null
+  }
+
+  return {
+    before,
+    phase,
+    recoveryId,
+    ...(typeof thread === 'string' ? { thread } : {})
+  }
+}
+
+function isInvalidStructuredRecovery(marker: unknown): marker is Record<string, unknown> {
+  return Boolean(marker && typeof marker === 'object' && 'recoveryId' in marker && !groupTurnRecovery(marker))
+}
+
+function sameGroupTurnRecoveryMarker(current: unknown, expected: unknown): boolean {
+  const recovery = groupTurnRecovery(expected)
+
+  return recovery ? groupTurnRecovery(current)?.recoveryId === recovery.recoveryId : current === expected
+}
+
+function resolveGroupTurnRoom(
+  originalGroup: string,
+  roomId: null | string | undefined,
+  memberKey: string,
+  marker: unknown
+): string | null {
+  const rooms = $groupChats.get()
+
+  const matches = Object.entries(rooms).filter(([name, room]) => {
+    if (room.tombstone || !sameGroupTurnRecoveryMarker(room.stranded?.[memberKey], marker)) {
+      return false
+    }
+
+    return roomId ? room.roomId === roomId : name === originalGroup || !rooms[originalGroup]
+  })
+
+  return matches.length === 1 ? matches[0][0] : null
+}
+
+interface GroupTurnReservation {
+  done: Promise<void>
+  recoveryId: string
+  release: () => void
+}
+
+const groupTurnReservations = new Map<string, GroupTurnReservation>()
+
+function groupTurnReservationKey(group: string, memberKey: string): string {
+  const roomId = $groupChats.get()[group]?.roomId
+
+  return `${roomId ? `id:${roomId}` : `name:${group}`}\u0000${memberKey}`
+}
+
+async function reserveGroupTurn(group: string, memberKey: string, recoveryId: string): Promise<void> {
+  const key = groupTurnReservationKey(group, memberKey)
+
+  while (groupTurnReservations.has(key)) {
+    await groupTurnReservations.get(key)!.done
+  }
+
+  let finish: () => void = () => undefined
+
+  const done = new Promise<void>(resolve => {
+    finish = resolve
+  })
+
+  groupTurnReservations.set(key, {
+    done,
+    recoveryId,
+    release: finish
+  })
+}
+
+function releaseGroupTurnReservation(group: string, memberKey: string, recoveryId?: string): void {
+  let key = groupTurnReservationKey(group, memberKey)
+  let reservation = groupTurnReservations.get(key)
+
+  if (recoveryId && reservation?.recoveryId !== recoveryId) {
+    const match = [...groupTurnReservations.entries()].find(([, item]) => item.recoveryId === recoveryId)
+
+    if (match) {
+      key = match[0]
+      reservation = match[1]
+    }
+  }
+
+  if (!reservation || (recoveryId && reservation.recoveryId !== recoveryId)) {
+    return
+  }
+
+  groupTurnReservations.delete(key)
+  reservation.release()
+}
+
+function settleGroupTurnRecoveryKey(group: string, memberKey: string, recoveryId?: string): void {
+  if (!$groupChats.get()[group]) {
+    releaseGroupTurnReservation(group, memberKey, recoveryId)
+
+    return
+  }
+
+  let settledRecoveryId: string | undefined
+
+  updateGroupChat(
+    group,
+    room => {
+      const currentRecovery = groupTurnRecovery(room.stranded?.[memberKey])
+
+      if (recoveryId && currentRecovery?.recoveryId !== recoveryId) {
+        return room
+      }
+
+      settledRecoveryId = currentRecovery?.recoveryId
+
+      const stranded = {
+        ...(room.stranded || {})
+      }
+
+      delete stranded[memberKey]
+      room.stranded = stranded
+
+      return room
+    },
+    { sync: false }
+  )
+
+  if (settledRecoveryId || !recoveryId) {
+    releaseGroupTurnReservation(group, memberKey, recoveryId || settledRecoveryId)
+  }
+}
+
+function settleGroupTurnRecoveryMarker(group: string, memberKey: string, marker: unknown): void {
+  if (!$groupChats.get()[group]) {
+    return
+  }
+
+  updateGroupChat(
+    group,
+    room => {
+      if (room.stranded?.[memberKey] !== marker) {
+        return room
+      }
+
+      const stranded = {
+        ...(room.stranded || {})
+      }
+
+      delete stranded[memberKey]
+      room.stranded = stranded
+
+      return room
+    },
+    { sync: false }
+  )
+}
+
+/** Persist and read back the recovery boundary before prompt.submit can
+ *  outlive this renderer. Plugin storage is best-effort and can swallow a
+ *  quota/permission failure, so awaiting set alone is not a durability fence. */
+async function persistGroupTurnRecovery(
+  group: string,
+  memberKey: string,
+  recovery: GroupTurnRecovery,
+  { required = false }: { required?: boolean } = {}
+): Promise<void> {
+  updateGroupChat(
+    group,
+    room => {
+      room.stranded = {
+        ...(room.stranded || {}),
+        [memberKey]: recovery
+      }
+
+      return room
+    },
+    { sync: false }
+  )
+  await persistGroupChatRooms()
+
+  if (!required) {
+    return
+  }
+
+  const persisted = await Promise.resolve(
+    getPluginCtx()?.storage?.get<Record<string, GroupChatRoom>>('group-chats', {})
+  )
+
+  if (groupTurnRecovery(persisted?.[group]?.stranded?.[memberKey])?.recoveryId !== recovery.recoveryId) {
+    settleGroupTurnRecoveryKey(group, memberKey, recovery.recoveryId)
+    throw new Error('Hermes could not save reply recovery state; the turn was not sent.')
+  }
+}
+
+export function settleGroupTurnRecovery(group: string, member: GroupMember, recoveryId?: string): void {
+  settleGroupTurnRecoveryKey(group, groupMemberKey(member), recoveryId)
+}
+
+function appendGroupRecoveryUnknown(
+  group: string,
+  memberKey: string,
+  member: GroupMember,
+  recovery: GroupTurnRecovery
+): void {
+  appendGroupChatEntry(
+    group,
+    {
+      kind: 'member',
+      name: member.name,
+      ...(member.remoteSource
+        ? {
+            source: member.connectionLabel || member.connectionId
+          }
+        : {})
+    },
+    botsText().group.recoveryUnknown,
+    recovery.thread || 'legacy',
+    undefined,
+    recovery.recoveryId
+  )
+  settleGroupTurnRecoveryKey(group, memberKey, recovery.recoveryId)
+}
+
+function appendInvalidGroupRecoveryUnknown(
+  group: string,
+  memberKey: string,
+  member: GroupMember,
+  marker: unknown
+): void {
+  appendGroupChatEntry(
+    group,
+    {
+      kind: 'member',
+      name: member.name,
+      ...(member.remoteSource
+        ? {
+            source: member.connectionLabel || member.connectionId
+          }
+        : {})
+    },
+    botsText().group.recoveryUnknown,
+    'legacy',
+    undefined,
+    mintGroupTurnRecoveryId()
+  )
+  settleGroupTurnRecoveryMarker(group, memberKey, marker)
+}
+
+const INTERRUPTED_RECOVERY_POLL_MS = 5000
+const INTERRUPTED_RECOVERY_MAX_TRIES = 60
+let interruptedRecoveryGeneration = 0
+const interruptedRecoveryWaiters = new Set<() => void>()
+
+function waitForInterruptedRecoveryPoll(): Promise<void> {
+  return new Promise(resolve => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const finish = () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+      }
+
+      interruptedRecoveryWaiters.delete(finish)
+      resolve()
+    }
+
+    interruptedRecoveryWaiters.add(finish)
+    timer = setTimeout(finish, INTERRUPTED_RECOVERY_POLL_MS)
+  })
+}
+
+export function stopInterruptedGroupTurnRecovery(): void {
+  interruptedRecoveryGeneration += 1
+
+  for (const finish of [...interruptedRecoveryWaiters]) {
+    finish()
+  }
+
+  for (const [key, reservation] of [...groupTurnReservations]) {
+    groupTurnReservations.delete(key)
+    reservation.release()
+  }
+}
+
+/** Reconcile turns that survived the renderer process. Runs once immediately,
+ *  then polls boundedly while a member session is still working or its source
+ *  is reconnecting. Every exit is visible: reply, pass, or terminal unknown. */
+export async function recoverInterruptedGroupTurns(): Promise<void> {
+  const generation = ++interruptedRecoveryGeneration
+  const interrupted: Array<{ group: string; key: string; member: GroupMember; recovery: GroupTurnRecovery }> = []
+
+  for (const [group, room] of Object.entries($groupChats.get())) {
+    const candidates = [
+      ...(Array.isArray(room.members) ? room.members : []),
+      ...Object.values(room.sessionOwners || {})
+    ].filter(candidate => candidate && typeof candidate.name === 'string') as GroupMember[]
+
+    for (const [key, marker] of Object.entries(room.stranded || {})) {
+      const recovery = groupTurnRecovery(marker)
+      const member = candidates.find(candidate => groupMemberKey(candidate) === key) || { name: key }
+
+      if (!recovery) {
+        if (isInvalidStructuredRecovery(marker)) {
+          appendInvalidGroupRecoveryUnknown(group, key, member, marker)
+        }
+
+        continue
+      }
+
+      if (!candidates.some(candidate => groupMemberKey(candidate) === key)) {
+        appendGroupRecoveryUnknown(group, key, member, recovery)
+
+        continue
+      }
+
+      interrupted.push({ group, key, member, recovery })
+    }
+  }
+
+  for (let attempt = 0; attempt < INTERRUPTED_RECOVERY_MAX_TRIES; attempt++) {
+    const pending = interrupted.filter(item => {
+      const current = groupTurnRecovery($groupChats.get()[item.group]?.stranded?.[item.key])
+
+      return current?.recoveryId === item.recovery.recoveryId
+    })
+
+    if (!pending.length || generation !== interruptedRecoveryGeneration) {
+      return
+    }
+
+    for (const item of pending) {
+      await harvestStrandedGroupReply(item.group, item.member)
+    }
+
+    const remaining = pending.filter(item => {
+      const current = groupTurnRecovery($groupChats.get()[item.group]?.stranded?.[item.key])
+
+      return current?.recoveryId === item.recovery.recoveryId
+    })
+
+    if (!remaining.length || generation !== interruptedRecoveryGeneration) {
+      return
+    }
+
+    if (attempt === INTERRUPTED_RECOVERY_MAX_TRIES - 1) {
+      for (const item of remaining) {
+        const recovery = groupTurnRecovery($groupChats.get()[item.group]?.stranded?.[item.key])
+
+        if (recovery?.recoveryId === item.recovery.recoveryId) {
+          appendGroupRecoveryUnknown(item.group, item.key, item.member, recovery)
+        }
+      }
+
+      return
+    }
+
+    await waitForInterruptedRecoveryPoll()
+  }
+}
 
 // --- group-turn session-lease helpers (#93602) ------------------------------
 // A member turn is a session-scoped RPC SEQUENCE (resume → attach → submit →
@@ -512,26 +918,40 @@ export async function answerGroupClarify(
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
  *  reports work in flight the deadline extends (bounded by the hard cap),
- *  so slow models aren't cut off mid-run. A turn that still times out
- *  records a stranded marker so the finished reply can be harvested into
- *  the room at the member's next turn instead of being lost. */
+ *  so slow models aren't cut off mid-run. Every submitted turn records a
+ *  recovery marker before dispatch so a renderer restart can reconcile it
+ *  to one visible reply, pass, or terminal unknown state. */
 export async function runGroupChatMemberTurn(
   group: string,
   member: GroupMember,
   prompt: string,
   thread: string,
-  images?: Attachment[]
+  images?: Attachment[],
+  onRecovery?: (recovery: GroupTurnRecovery) => void
 ): Promise<null | string> {
+  const memberKey = groupMemberKey(member)
+  const recoveryId = mintGroupTurnRecoveryId()
+
+  await reserveGroupTurn(group, memberKey, recoveryId)
+
   // #93602: hold the member's route socket for the whole turn. Without the
   // lease, every RPC below rides its own request-scoped socket lease; the
   // socket that minted `runtime` can close between RPCs, the gateway reaps
   // the runtime session, and prompt.submit dies 4001 — the bot goes silent.
-  const releaseTurnLease = await retainGroupTurnRoute(member)
-
   try {
-    return await runGroupChatMemberTurnLeased(group, member, prompt, thread, images)
+    const releaseTurnLease = await retainGroupTurnRoute(member)
+
+    try {
+      return await runGroupChatMemberTurnLeased(group, member, prompt, thread, recoveryId, images, onRecovery)
+    } finally {
+      releaseTurnLease()
+    }
   } finally {
-    releaseTurnLease()
+    const current = groupTurnRecovery($groupChats.get()[group]?.stranded?.[memberKey])
+
+    if (current?.recoveryId !== recoveryId) {
+      releaseGroupTurnReservation(group, memberKey, recoveryId)
+    }
   }
 }
 
@@ -540,7 +960,9 @@ async function runGroupChatMemberTurnLeased(
   member: GroupMember,
   prompt: string,
   thread: string,
-  images?: Attachment[]
+  recoveryId: string,
+  images?: Attachment[],
+  onRecovery?: (recovery: GroupTurnRecovery) => void
 ): Promise<null | string> {
   const { runtime, stored } = await ensureGroupChatSession(group, member)
 
@@ -571,6 +993,16 @@ async function runGroupChatMemberTurnLeased(
   } catch {
     /* lazy session — zero messages */
   }
+
+  const recovery: GroupTurnRecovery = {
+    before,
+    phase: 'prepared',
+    recoveryId,
+    thread
+  }
+
+  await persistGroupTurnRecovery(group, memberKey, recovery, { required: true })
+  onRecovery?.({ ...recovery })
 
   // Stage this delta's attachments into the member's session so the model
   // receives the actual payload with the prompt — the same attach RPCs the
@@ -625,6 +1057,9 @@ async function runGroupChatMemberTurnLeased(
   // minting and submitting. Tracks the runtime id the submit landed on so
   // the poll fallback below targets a live session.
   const liveRuntime = await submitGroupTurnPrompt(member, runtime, stored, turnText)
+  recovery.phase = 'submitted'
+  await persistGroupTurnRecovery(group, memberKey, recovery)
+  onRecovery?.({ ...recovery })
   const started = Date.now()
   let deadline = started + GROUP_TURN_TIMEOUT_MS
 
@@ -702,17 +1137,12 @@ async function runGroupChatMemberTurnLeased(
     thread
   })
   syncGroupClarify(group, member, null)
-  updateGroupChat(group, (r: GroupChatRoom) => {
-    r.stranded = {
-      ...(r.stranded || {}),
-      [groupMemberKey(member)]: {
-        before,
-        thread
-      }
-    }
-
-    return r
-  })
+  recovery.phase = 'timed-out'
+  await persistGroupTurnRecovery(group, memberKey, recovery)
+  onRecovery?.({ ...recovery })
+  // The pre-submit recovery marker already carries the baseline + thread and
+  // is now durably `timed-out`; keep it until the room commits the late reply
+  // (or classifies the turn terminally).
 
   return null
 }
@@ -724,9 +1154,11 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
   const memberKey = groupMemberKey(member)
   const room = $groupChats.get()[group] || {}
   const marker = room.stranded?.[memberKey]
+  const roomId = room.roomId
   // Markers were a bare number before threads; normalize both shapes.
   const strandedBefore = typeof marker === 'number' ? marker : marker?.before
   const strandedThread = (typeof marker === 'object' && marker?.thread) || 'legacy'
+  const recovery = groupTurnRecovery(marker)
 
   if (typeof strandedBefore !== 'number') {
     return
@@ -744,43 +1176,54 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
     return // source unreachable — leave the marker for the next boundary
   }
 
+  const currentGroup = resolveGroupTurnRoom(group, roomId, memberKey, marker)
+
+  if (!currentGroup) {
+    return
+  }
+
   if (state?.inflight || state?.running) {
     return // still grinding — keep waiting
   }
 
   // A stranded member blocked on a clarify is not "grinding" — surface the
   // question card (#90694) and keep the marker until it resolves.
-  if (syncGroupClarify(group, member, state)) {
+  if (syncGroupClarify(currentGroup, member, state)) {
     return
   }
 
-  // Done (or dead): the marker is consumed either way.
-  updateGroupChat(group, (r: GroupChatRoom) => {
-    const next = {
-      ...(r.stranded || {})
-    }
-
-    delete next[memberKey]
-    r.stranded = next
-
-    return r
-  })
   const messages = Array.isArray(state?.messages) ? state.messages : []
 
   if (messages.length <= strandedBefore) {
+    if (recovery) {
+      appendGroupRecoveryUnknown(currentGroup, memberKey, member, recovery)
+    } else {
+      settleGroupTurnRecoveryMarker(currentGroup, memberKey, marker)
+    }
+
     return
   }
 
   const reply = pickGroupTurnReply(messages, strandedBefore)
 
-  if (reply && !isGroupPassText(reply)) {
-    recordGroupActivity(group, {
+  if (!reply) {
+    if (recovery) {
+      appendGroupRecoveryUnknown(currentGroup, memberKey, member, recovery)
+    } else {
+      settleGroupTurnRecoveryMarker(currentGroup, memberKey, marker)
+    }
+
+    return
+  }
+
+  if (!isGroupPassText(reply)) {
+    recordGroupActivity(currentGroup, {
       kind: 'delivered',
       member: member.name,
       thread: strandedThread
     })
     appendGroupChatEntry(
-      group,
+      currentGroup,
       {
         kind: 'member',
         name: member.name,
@@ -791,12 +1234,20 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
           : {})
       },
       reply,
-      strandedThread
+      strandedThread,
+      undefined,
+      recovery?.recoveryId
     )
-    updateGroupChat(group, (r: GroupChatRoom) => {
+    updateGroupChat(currentGroup, (r: GroupChatRoom) => {
       r.watermarks[`${strandedThread}::${memberKey}`] = r.log.length
 
       return r
     })
+  }
+
+  if (recovery) {
+    settleGroupTurnRecovery(currentGroup, member, recovery.recoveryId)
+  } else {
+    settleGroupTurnRecoveryMarker(currentGroup, memberKey, marker)
   }
 }

@@ -189,6 +189,153 @@ describe('session resolution', () => {
 })
 
 describe('session-gone classification', () => {
+  it('persists a recovery marker before a submitted turn can outlive the window', async () => {
+    const room = await loadRoom({ turn: () => 'finished while the window was gone' })
+    const request = host.request as (method: string, params: Record<string, unknown>) => Promise<unknown>
+
+    host.request = async (method: string, params: Record<string, unknown>) => {
+      if (method === 'prompt.submit') {
+        const durableBeforeSubmit = (room.gateway.storage.get('group-chats') || {}) as Record<string, GroupChat>
+
+        expect(durableBeforeSubmit.Room.stranded?.helper).toMatchObject({
+          before: 0,
+          phase: 'prepared',
+          thread: 't1'
+        })
+      }
+
+      return request(method, params)
+    }
+
+    const reply = await room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'keep working', 't1', [])
+
+    expect(reply).toBe('finished while the window was gone')
+    expect(room.gateway.calls).toHaveLength(1)
+
+    const durable = (room.gateway.storage.get('group-chats') || {}) as Record<string, GroupChat>
+    const marker = durable.Room.stranded?.helper
+
+    expect(marker).toMatchObject({
+      before: 0,
+      phase: 'submitted',
+      thread: 't1'
+    })
+    expect(typeof (marker as { recoveryId?: unknown }).recoveryId).toBe('string')
+  })
+
+  it('does not submit when the recovery boundary cannot be read back', async () => {
+    const room = await loadRoom({ turn: () => 'must never run' })
+    const shared = await import('./shared')
+
+    shared.setPluginCtx({
+      storage: {
+        get: async () => null,
+        set: async () => undefined
+      }
+    } as never)
+
+    await expect(room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'keep working', 't1', [])).rejects.toThrow(
+      /recovery state.*not sent/i
+    )
+    expect(room.gateway.calls).toHaveLength(0)
+  })
+
+  it('keeps polling when the post-submit persistence refresh fails', async () => {
+    const room = await loadRoom({ turn: () => 'already accepted' })
+    const shared = await import('./shared')
+    const storage = new Map<string, unknown>()
+
+    shared.setPluginCtx({
+      storage: {
+        get: async (key: string) => storage.get(key) ?? null,
+        set: async (key: string, value: Record<string, GroupChat>) => {
+          const marker = value?.Room?.stranded?.helper as { phase?: string } | undefined
+
+          if (marker?.phase === 'submitted') {
+            throw new Error('storage refresh failed')
+          }
+
+          storage.set(key, structuredClone(value))
+        }
+      }
+    } as never)
+
+    await expect(room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'keep working', 't1', [])).resolves.toBe(
+      'already accepted'
+    )
+    expect(room.gateway.calls).toHaveLength(1)
+    expect((storage.get('group-chats') as Record<string, GroupChat>).Room.stranded?.helper).toMatchObject({
+      phase: 'prepared'
+    })
+  })
+
+  it('reconciles a completed post-submit turn once after a simulated restart', async () => {
+    const room = await loadRoom({ turn: () => 'finished while the window was gone' })
+
+    await room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'keep working', 't1', [])
+
+    const marker = room.chat.$groupChats.get().Room.stranded?.helper as { recoveryId: string }
+
+    expect(log(room, 'Room')).toHaveLength(0)
+
+    // The process-local poller is gone; cold hydration sees only the durable
+    // room marker and the backend session that completed independently.
+    await room.turns.recoverInterruptedGroupTurns()
+    await room.turns.recoverInterruptedGroupTurns()
+
+    expect(log(room, 'Room')).toHaveLength(1)
+    expect(log(room, 'Room')[0]).toMatchObject({
+      from: { kind: 'member', name: 'helper' },
+      id: marker.recoveryId,
+      text: 'finished while the window was gone',
+      thread: 't1'
+    })
+    expect(room.chat.$groupChats.get().Room.stranded?.helper).toBeUndefined()
+  })
+
+  it('serializes overlapping turns for one room member until the first marker settles', async () => {
+    const room = await loadRoom({ turn: ({ n }) => `reply ${n}` })
+    const request = host.request as (method: string, params: Record<string, unknown>) => Promise<unknown>
+    let releaseStart: () => void = () => undefined
+
+    const blockedStart = new Promise<void>(resolve => {
+      releaseStart = resolve
+    })
+
+    let starts = 0
+
+    host.request = async (method: string, params: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        starts += 1
+
+        if (starts === 1) {
+          await blockedStart
+        }
+      }
+
+      return request(method, params)
+    }
+
+    const first = room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'first', 't1', [])
+
+    await new Promise(resolve => setImmediate(resolve))
+
+    const second = room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'second', 't1', [])
+
+    await new Promise(resolve => setImmediate(resolve))
+    expect(starts).toBe(1)
+
+    releaseStart()
+    await expect(first).resolves.toBe('reply 1')
+    expect(room.gateway.calls).toHaveLength(1)
+
+    const marker = room.chat.$groupChats.get().Room.stranded?.helper as { recoveryId: string }
+
+    room.turns.settleGroupTurnRecovery('Room', LOCAL_MEMBER, marker.recoveryId)
+    await expect(second).resolves.toBe('reply 2')
+    expect(room.gateway.calls).toHaveLength(2)
+  })
+
   it('treats 4001 and "not in memory" as recoverable, 4007 as not', async () => {
     const { turns } = await loadRoom()
 
@@ -544,6 +691,444 @@ describe('stranded harvest', () => {
     expect(log(room, 'Late')[0].from.name).toBe('research')
     expect(log(room, 'Late')[0].text).toMatch(/delivered late/)
     expect(room.chat.$groupChats.get().Late.stranded?.research).toBeUndefined()
+  })
+
+  it('recovers exactly once when the reply append persisted before marker cleanup', async () => {
+    const room = await loadRoom()
+    const recoveryId = 'recovery-cold-1'
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.log = [
+        {
+          at: 1,
+          from: { kind: 'member', name: 'research' },
+          id: recoveryId,
+          text: 'Recovered after restart.',
+          thread: 't-cold'
+        }
+      ]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 1,
+          phase: 'submitted',
+          recoveryId,
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [
+      ['user', 'the turn prompt'],
+      ['assistant', 'Recovered after restart.']
+    ])
+
+    await room.turns.harvestStrandedGroupReply('Cold', { name: 'research', title: '' })
+
+    expect(log(room, 'Cold')).toHaveLength(1)
+    expect(log(room, 'Cold')[0].id).toBe(recoveryId)
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toBeUndefined()
+  })
+
+  it('does not clear a newer turn marker while an older reply is being harvested', async () => {
+    const room = await loadRoom()
+    const request = host.request as (method: string, params: Record<string, unknown>) => Promise<unknown>
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 0,
+          phase: 'submitted',
+          recoveryId: 'recovery-old',
+          thread: 't-old'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [
+      ['user', 'the old prompt'],
+      ['assistant', 'the old reply']
+    ])
+
+    host.request = async (method: string, params: Record<string, unknown>) => {
+      const result = await request(method, params)
+
+      if (method === 'session.resume') {
+        room.chat.updateGroupChat('Cold', current => {
+          current.stranded = {
+            research: {
+              before: 2,
+              phase: 'submitted',
+              recoveryId: 'recovery-new',
+              thread: 't-new'
+            }
+          }
+
+          return current
+        })
+      }
+
+      return result
+    }
+
+    await room.turns.harvestStrandedGroupReply('Cold', { name: 'research', title: '' })
+
+    expect(log(room, 'Cold')).toHaveLength(0)
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toMatchObject({ recoveryId: 'recovery-new' })
+  })
+
+  it('only recovers markers that existed when cold reconciliation started', async () => {
+    const room = await loadRoom({ busyResumes: { research: 1 } })
+    let injected = false
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [
+        { name: 'research', title: '' },
+        { name: 'builder', title: '' }
+      ]
+      current.sessions = { research: 'sid-research', builder: 'sid-builder' }
+      current.stranded = {
+        research: {
+          before: 0,
+          phase: 'submitted',
+          recoveryId: 'recovery-on-hydrate',
+          thread: 't-old'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [])
+    seedSession(room, 'sid-builder', 'builder', 'Group: Cold', [])
+    vi.stubGlobal('setTimeout', (fn: () => void) => {
+      if (!injected) {
+        injected = true
+        room.chat.updateGroupChat('Cold', current => {
+          current.stranded = {
+            ...(current.stranded || {}),
+            builder: {
+              before: 0,
+              phase: 'submitted',
+              recoveryId: 'recovery-after-hydrate',
+              thread: 't-new'
+            }
+          }
+
+          return current
+        })
+      }
+
+      fn()
+
+      return 0
+    })
+
+    await room.turns.recoverInterruptedGroupTurns()
+
+    expect(log(room, 'Cold').map(entry => entry.id)).not.toContain('recovery-after-hydrate')
+    expect(room.chat.$groupChats.get().Cold.stranded?.builder).toMatchObject({
+      recoveryId: 'recovery-after-hydrate'
+    })
+  })
+
+  it('waits through a running submitted turn and recovers its reply once', async () => {
+    const room = await loadRoom({ busyResumes: { research: 2 } })
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 1,
+          phase: 'submitted',
+          recoveryId: 'recovery-running',
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [
+      ['user', 'the turn prompt'],
+      ['assistant', 'finished after reconnect']
+    ])
+
+    await room.turns.recoverInterruptedGroupTurns()
+
+    expect(room.gateway.rpcFor('session.resume')).toHaveLength(3)
+    expect(log(room, 'Cold').map(entry => entry.id)).toEqual(['recovery-running'])
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toBeUndefined()
+  })
+
+  it('ends a permanently busy recovery after the bounded poll budget', async () => {
+    const room = await loadRoom({ busyResumes: { research: 100 } })
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 0,
+          phase: 'submitted',
+          recoveryId: 'recovery-bounded',
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [])
+
+    await room.turns.recoverInterruptedGroupTurns()
+
+    expect(room.gateway.rpcFor('session.resume')).toHaveLength(60)
+    expect(log(room, 'Cold').map(entry => entry.id)).toEqual(['recovery-bounded'])
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toBeUndefined()
+  })
+
+  it('ends a permanently unreachable recovery after the same bounded poll budget', async () => {
+    const room = await loadRoom()
+    const request = host.request as (method: string, params: Record<string, unknown>) => Promise<unknown>
+    let resumes = 0
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 0,
+          phase: 'submitted',
+          recoveryId: 'recovery-unreachable',
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+
+    host.request = async (method: string, params: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        resumes += 1
+        throw new Error('source offline')
+      }
+
+      return request(method, params)
+    }
+
+    await room.turns.recoverInterruptedGroupTurns()
+
+    expect(resumes).toBe(60)
+    expect(log(room, 'Cold').map(entry => entry.id)).toEqual(['recovery-unreachable'])
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toBeUndefined()
+  })
+
+  it('cancels a pending recovery delay on plugin disposal', async () => {
+    const room = await loadRoom({ busyResumes: { research: 100 } })
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 0,
+          phase: 'submitted',
+          recoveryId: 'recovery-disposed',
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [])
+    vi.stubGlobal('setTimeout', () => 1)
+    vi.stubGlobal('clearTimeout', () => undefined)
+
+    const recovery = room.turns.recoverInterruptedGroupTurns()
+
+    await new Promise(resolve => setImmediate(resolve))
+    expect(room.gateway.rpcFor('session.resume')).toHaveLength(1)
+
+    room.turns.stopInterruptedGroupTurnRecovery()
+    await recovery
+
+    expect(room.gateway.rpcFor('session.resume')).toHaveLength(1)
+    expect(log(room, 'Cold')).toHaveLength(0)
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toMatchObject({
+      recoveryId: 'recovery-disposed'
+    })
+  })
+
+  it('rejects malformed recovery metadata without reading hidden session history', async () => {
+    const room = await loadRoom()
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: -1,
+          phase: 'submitted',
+          recoveryId: 'malformed-recovery',
+          thread: 't-cold'
+        }
+      } as never
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [
+      ['assistant', 'private prior session answer']
+    ])
+
+    await room.turns.recoverInterruptedGroupTurns()
+
+    expect(room.gateway.rpcFor('session.resume')).toHaveLength(0)
+    expect(log(room, 'Cold')).toHaveLength(1)
+    expect(log(room, 'Cold')[0].text).toMatch(/status is unknown/i)
+    expect(log(room, 'Cold')[0].text).not.toContain('private prior session answer')
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toBeUndefined()
+  })
+
+  it('classifies a pre-dispatch process loss as terminally unknown', async () => {
+    const room = await loadRoom()
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 0,
+          phase: 'prepared',
+          recoveryId: 'recovery-pre-dispatch',
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Cold', [])
+
+    await room.turns.recoverInterruptedGroupTurns()
+
+    expect(log(room, 'Cold')).toHaveLength(1)
+    expect(log(room, 'Cold')[0]).toMatchObject({
+      from: { kind: 'member', name: 'research' },
+      id: 'recovery-pre-dispatch',
+      thread: 't-cold'
+    })
+    expect(log(room, 'Cold')[0].text).toMatch(/status is unknown.*restarted/i)
+    expect(room.chat.$groupChats.get().Cold.stranded?.research).toBeUndefined()
+  })
+
+  it('commits a recovered reply to the immutable room after a rename', async () => {
+    const room = await loadRoom()
+    const request = host.request as (method: string, params: Record<string, unknown>) => Promise<unknown>
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.roomId = 'room-cold'
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 1,
+          phase: 'submitted',
+          recoveryId: 'recovery-renamed',
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: room-cold', [
+      ['user', 'the turn prompt'],
+      ['assistant', 'finished after rename']
+    ])
+
+    host.request = async (method: string, params: Record<string, unknown>) => {
+      const result = await request(method, params)
+
+      if (method === 'session.resume') {
+        const rooms = { ...room.chat.$groupChats.get() }
+
+        rooms.Renamed = rooms.Cold
+        delete rooms.Cold
+        room.chat.$groupChats.set(rooms)
+      }
+
+      return result
+    }
+
+    await room.turns.harvestStrandedGroupReply('Cold', { name: 'research', title: '' })
+
+    expect(room.chat.$groupChats.get().Cold).toBeUndefined()
+    expect(log(room, 'Renamed').map(entry => entry.id)).toEqual(['recovery-renamed'])
+    expect(room.chat.$groupChats.get().Renamed.stranded?.research).toBeUndefined()
+  })
+
+  it('does not recreate a room disbanded while recovery is awaiting the backend', async () => {
+    const room = await loadRoom()
+    const request = host.request as (method: string, params: Record<string, unknown>) => Promise<unknown>
+
+    room.chat.updateGroupChat('Cold', current => {
+      current.members = [{ name: 'research', title: '' }]
+      current.roomId = 'room-cold'
+      current.sessions = { research: 'sid-research' }
+      current.stranded = {
+        research: {
+          before: 1,
+          phase: 'submitted',
+          recoveryId: 'recovery-disbanded',
+          thread: 't-cold'
+        }
+      }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: room-cold', [
+      ['user', 'the turn prompt'],
+      ['assistant', 'must not resurrect']
+    ])
+
+    host.request = async (method: string, params: Record<string, unknown>) => {
+      const result = await request(method, params)
+
+      if (method === 'session.resume') {
+        room.chat.$groupChats.set({})
+      }
+
+      return result
+    }
+
+    await room.turns.harvestStrandedGroupReply('Cold', { name: 'research', title: '' })
+
+    expect(room.chat.$groupChats.get()).toEqual({})
+  })
+
+  it('persists a real timed-out phase before returning control to the room', async () => {
+    const room = await loadRoom({ turn: () => 'finished beyond the local deadline' })
+    let now = 0
+
+    vi.spyOn(Date, 'now').mockImplementation(() => {
+      now += 200000
+
+      return now
+    })
+
+    await expect(room.turns.runGroupChatMemberTurn('Room', LOCAL_MEMBER, 'keep working', 't1', [])).resolves.toBeNull()
+
+    expect(room.chat.$groupChats.get().Room.stranded?.helper).toMatchObject({
+      before: 0,
+      phase: 'timed-out',
+      thread: 't1'
+    })
+
+    await room.turns.harvestStrandedGroupReply('Room', LOCAL_MEMBER)
+
+    expect(log(room, 'Room')[0].text).toBe('finished beyond the local deadline')
+    expect(room.chat.$groupChats.get().Room.stranded?.helper).toBeUndefined()
   })
 
   it('prefers the substantive answer over a trailing synthetic (pass)', async () => {
