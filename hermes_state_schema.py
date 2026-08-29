@@ -555,10 +555,18 @@ class SessionSchemaMixin:
                     "search remain available."
                 )
                 return False
-            return self._recover_stale_fts_locked(cursor, legacy=legacy)
+            return self._recover_stale_fts_locked(
+                cursor,
+                legacy=legacy,
+                include_trigram_policy=include_trigram_policy,
+            )
 
     def _recover_stale_fts_locked(
-        self, cursor: sqlite3.Cursor, *, legacy: bool
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        legacy: bool,
+        include_trigram_policy: bool,
     ) -> bool:
         """Body of :meth:`_recover_stale_fts`; caller holds rebuild authority."""
         try:
