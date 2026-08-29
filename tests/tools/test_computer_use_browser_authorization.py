@@ -182,6 +182,49 @@ def test_isolated_prepare_forwards_supplied_pid_when_present():
     assert driver.calls[0][1]["pid"] == 321
 
 
+def test_isolated_prepare_refuses_malformed_pid_fail_closed():
+    """A supplied-but-malformed pid is not an absent pid: the caller meant
+    to target a browser, so refuse instead of silently launching a fresh
+    one (review point on #93783)."""
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid="abc",
+        profile_mode="isolated_new",
+        allow_launch=True,
+    )
+
+    assert result["status"] == "refused"
+    assert result["code"] == "browser_pid_invalid"
+    assert driver.calls == []
+
+
+def test_isolated_prepare_refuses_non_positive_pid_fail_closed():
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=-5,
+        profile_mode="isolated_new",
+        allow_launch=True,
+    )
+
+    assert result["status"] == "refused"
+    assert result["code"] == "browser_pid_invalid"
+    assert driver.calls == []
+
+
+def test_isolated_prepare_refuses_malformed_window_id_fail_closed():
+    driver = _PrepareDriver()
+    result = _route(driver).prepare(
+        pid=101,
+        window_id="not-a-number",
+        profile_mode="isolated_new",
+        allow_launch=True,
+    )
+
+    assert result["status"] == "refused"
+    assert result["code"] == "browser_window_id_invalid"
+    assert driver.calls == []
+
+
 def test_existing_profile_prepare_still_requires_pid():
     """The attachment contract is unchanged: existing_profile still demands
     an exact positive pid (and window_id) — the security floor the isolated

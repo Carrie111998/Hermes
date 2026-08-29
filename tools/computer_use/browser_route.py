@@ -465,12 +465,28 @@ class CuaTypedBrowserRoute:
             "allow_launch": True,
             "profile": profile,
         }
-        # A caller-supplied pid is forwarded when present but never
-        # required here: the driver owns the launch for these modes (#93763).
+        # A caller-supplied pid/window_id is forwarded when present but
+        # never required here: the driver owns the launch for these modes
+        # (#93763). A supplied-but-malformed value is different from an
+        # absent one — the caller meant to target a browser and the value
+        # got corrupted, so refuse rather than silently launch a fresh
+        # browser they didn't ask for.
         exact_pid = _positive_int(pid)
+        if pid is not None and exact_pid is None:
+            return _refusal(
+                "browser_pid_invalid",
+                "A pid was supplied but is not a positive integer; refusing "
+                "to launch a fresh browser for a malformed target.",
+            )
         if exact_pid is not None:
             args["pid"] = exact_pid
         exact_window = _positive_int(window_id)
+        if window_id is not None and exact_window is None:
+            return _refusal(
+                "browser_window_id_invalid",
+                "A window_id was supplied but is not a positive integer; "
+                "refusing to launch a fresh browser for a malformed target.",
+            )
         if exact_window is not None:
             args["window_id"] = exact_window
         # Preparation/reconnect may have side effects even if its transport
