@@ -21,7 +21,7 @@ Read-only cross-chain wallet permission audit.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `Security`, `Web3`, `Wallets`, `Permissions`, `Solana`, `XRPL`, `EVM`, `Privacy` |
-| Related skills | `blockchain/solana`, `blockchain/evm` |
+| Related skills | [`solana`](/docs/user-guide/skills/optional/blockchain/blockchain-solana), [`evm`](/docs/user-guide/skills/optional/blockchain/blockchain-evm) |
 
 ## Reference: full SKILL.md
 

@@ -55,7 +55,7 @@ def test_skill_uses_the_modern_instruction_contract():
     assert description.endswith(".")
     assert _frontmatter_value(text, "author").startswith("Ahmet Osrak")
     assert "Use the Hermes `terminal` tool" in text
-    assert "related_skills: [blockchain/solana, blockchain/evm]" in text
+    assert "related_skills: [solana, evm]" in text
     assert "--chain base" in text
     assert "blockchain/base" not in text
 

@@ -9,7 +9,7 @@ metadata:
   hermes:
     tags: [Security, Web3, Wallets, Permissions, Solana, XRPL, EVM, Privacy]
     category: security
-    related_skills: [blockchain/solana, blockchain/evm]
+    related_skills: [solana, evm]
     requires_toolsets: [terminal]
 ---
 
