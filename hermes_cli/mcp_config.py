@@ -25,7 +25,10 @@ from hermes_cli.config import (
 )
 from hermes_cli.colors import Colors, color
 from hermes_constants import display_hermes_home
-from hermes_cli.mcp_security import validate_mcp_server_entry
+from hermes_cli.mcp_security import (
+    redact_mcp_sensitive_text,
+    validate_mcp_server_entry,
+)
 from tools.mcp_tool import _ENV_VAR_PATTERN, _env_ref_name
 
 logger = logging.getLogger(__name__)
@@ -565,7 +568,7 @@ def cmd_mcp_add(args):
     try:
         tools = _probe_single_server(name, server_config)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        _error(f"Failed to connect: {redact_mcp_sensitive_text(exc)}")
         if _confirm("Save config anyway (you can test later)?", default=False):
             server_config["enabled"] = False
             if _save_mcp_server(name, server_config):
@@ -776,10 +779,9 @@ def cmd_mcp_test(args):
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
                 # Mask the value (accepts ${VAR} and Cursor-style ${env:VAR})
                 resolved = _ENV_VAR_PATTERN.sub(lambda m: os.getenv(_env_ref_name(m.group(1)), ""), v)
-                if len(resolved) > 8:
-                    masked = resolved[:4] + "***" + resolved[-4:]
-                else:
-                    masked = "***"
+                # MCP Authorization values must not retain a reusable
+                # prefix/suffix in diagnostics (#97460).
+                masked = "***"
                 print(f"    {k}: {masked}")
     else:
         _info("Auth: none")
@@ -791,7 +793,10 @@ def cmd_mcp_test(args):
         elapsed_ms = (time.monotonic() - start) * 1000
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
-        _error(f"Connection failed ({elapsed_ms:.0f}ms): {exc}")
+        _error(
+            f"Connection failed ({elapsed_ms:.0f}ms): "
+            f"{redact_mcp_sensitive_text(exc)}"
+        )
         return
 
     _success(f"Connected ({elapsed_ms:.0f}ms)")
@@ -1009,7 +1014,7 @@ def cmd_mcp_configure(args):
     try:
         all_tools = _probe_single_server(name, cfg)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        _error(f"Failed to connect: {redact_mcp_sensitive_text(exc)}")
         return
 
     if not all_tools:

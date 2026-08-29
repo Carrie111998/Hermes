@@ -302,6 +302,48 @@ class TestMcpTest:
         assert "Connected" in out
         assert "Tools discovered: 2" in out
 
+    def test_auth_display_fully_redacts_resolved_bearer_value(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        secret = "SYNTHETIC_MCP_BEARER_NOT_A_SECRET_123456"
+        monkeypatch.setenv("MCP_INK_API_KEY", secret)
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "headers": {"Authorization": "Bearer ${MCP_INK_API_KEY}"},
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [],
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="ink"))
+        out = capsys.readouterr().out
+        assert secret not in out
+        assert secret[:8] not in out
+        assert secret[-8:] not in out
+        assert "Authorization: ***" in out
+
+    def test_probe_error_fully_redacts_bearer_value(self, tmp_path, capsys, monkeypatch):
+        secret = "SYNTHETIC_MCP_BEARER_NOT_A_SECRET_123456"
+        _seed_config(tmp_path, {"ink": {"url": "https://mcp.ml.ink/mcp"}})
+
+        def mock_probe(name, config, **kw):
+            raise RuntimeError(f"upstream rejected Authorization: Bearer {secret}")
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", mock_probe)
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="ink"))
+        out = capsys.readouterr().out
+        assert secret not in out
+        assert secret[:8] not in out
+        assert secret[-8:] not in out
+        assert "Bearer ***" in out
+
     def test_probe_uses_configured_connect_timeout(self, monkeypatch):
         """OAuth-capable probes must not hard-code a short 30s timeout."""
         import asyncio

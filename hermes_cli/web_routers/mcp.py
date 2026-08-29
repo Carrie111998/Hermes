@@ -25,6 +25,7 @@ from hermes_cli.web_models import (
     MCPServerCreate,
     MCPServersReplace,
 )
+from hermes_cli.mcp_security import redact_mcp_sensitive_text
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -85,7 +86,9 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
     try:
         name, server_config, bearer_token = _normalize_mcp_server_create(body)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400, detail=redact_mcp_sensitive_text(exc)
+        ) from exc
 
     def _run():
         with _profile_scope(body.profile or profile):
@@ -112,7 +115,9 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
         raise
     except Exception as exc:
         _log.exception("POST /api/mcp/servers failed")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400, detail=redact_mcp_sensitive_text(exc)
+        ) from exc
 
     return _mcp_server_summary(name, server_config)
 
@@ -201,7 +206,7 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
     except Exception as exc:
         return {
             "ok": False,
-            "error": str(exc),
+            "error": redact_mcp_sensitive_text(exc),
             "tools": [],
         }
     if not token_present:
@@ -299,7 +304,7 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
     try:
         await flow.wait_for_authorization_url(timeout=30)
     except Exception as exc:
-        flow.mark_error(str(exc))
+        flow.mark_error(redact_mcp_sensitive_text(exc))
     return flow.snapshot()
 
 
@@ -362,7 +367,7 @@ async def mcp_oauth_callback(
     try:
         flow.deliver_callback(code=code, state=state, error=error)
     except ValueError as exc:
-        reason = str(exc)
+        reason = redact_mcp_sensitive_text(exc)
         status_code = 409 if "already received" in reason else 400
         return HTMLResponse(
             "<h1>OAuth callback rejected</h1>"
@@ -414,7 +419,10 @@ async def list_mcp_catalog(profile: Optional[str] = None):
         from hermes_cli import mcp_catalog
     except Exception as exc:
         _log.exception("mcp_catalog import failed")
-        raise HTTPException(status_code=500, detail=f"Catalog unavailable: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Catalog unavailable: {redact_mcp_sensitive_text(exc)}",
+        )
 
     entries = []
     try:
@@ -525,7 +533,9 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
         for key in body.env:
             validate_env_var_name_for_write(key)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=400, detail=redact_mcp_sensitive_text(exc)
+            ) from exc
 
     # Persist any supplied, declared env vars first.
     effective_profile = body.profile or profile
@@ -554,7 +564,10 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Install failed: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Install failed: {redact_mcp_sensitive_text(exc)}",
+            )
         return {"ok": True, "name": name, "background": True, "action": action}
 
     # No git step — install synchronously via the catalog API. install_entry
@@ -573,5 +586,7 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
         raise
     except Exception as exc:
         _log.exception("install_mcp_catalog_entry failed")
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(
+            status_code=400, detail=redact_mcp_sensitive_text(exc)
+        )
     return {"ok": True, "name": name, "background": False}

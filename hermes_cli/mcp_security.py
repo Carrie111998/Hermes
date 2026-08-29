@@ -30,6 +30,35 @@ import re
 import shlex
 from typing import Any
 
+
+_MCP_AUTH_HEADER_RE = re.compile(
+    r"((?:Proxy-)?Authorization\s*:\s*)"
+    r"([A-Za-z][\w.+-]*\s+)?([^\s\"']+)",
+    re.IGNORECASE,
+)
+_MCP_BEARER_RE = re.compile(
+    r"(\bBearer\s+)([^\s\"',;)}\]]+)",
+    re.IGNORECASE,
+)
+
+
+def redact_mcp_sensitive_text(value: Any) -> str:
+    """Fully redact MCP authorization values before display or API output.
+
+    The general redactor intentionally preserves a short prefix/suffix for
+    diagnostics. MCP probe errors and header displays are different: those
+    fragments are still credential material, so replace complete Authorization
+    and Bearer values first, then run the normal defense-in-depth redactor.
+    """
+    text = "" if value is None else str(value)
+    text = _MCP_AUTH_HEADER_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2) or ''}***", text
+    )
+    text = _MCP_BEARER_RE.sub(lambda m: f"{m.group(1)}***", text)
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text, force=True)
+
 _SHELL_INTERPRETERS = frozenset({
     "bash",
     "sh",
