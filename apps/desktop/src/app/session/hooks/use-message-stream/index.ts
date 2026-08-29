@@ -11,6 +11,7 @@ import {
   chatMessageText,
   completeOpenTimelineParts,
   type GatewayEventPayload,
+  hasVisibleAssistantText,
   mergeFinalAssistantText,
   reasoningPart,
   renderMediaTags,
@@ -725,6 +726,11 @@ export function useMessageStream({
         const hasInlineError = nextMessages.some(m => m.role === 'assistant' && m.error && !m.hidden)
         const lastVisible = [...nextMessages].reverse().find(m => !m.hidden)
         const unresolvedUserTail = lastVisible?.role === 'user'
+
+        const hasLocalAssistantText = streamId
+          ? hasVisibleAssistantText(nextMessages.filter(message => message.id === streamId))
+          : state.interimBoundaryPending && hasVisibleAssistantText(nextMessages)
+
         // Having streamed the reply normally means this window owns the whole
         // turn and re-reading stored history would be wasted work. That only
         // holds for a turn it STARTED: an adopted one (resumed onto a session
@@ -734,7 +740,7 @@ export function useMessageStream({
           !completionError &&
           !hasInlineError &&
           !unresolvedUserTail &&
-          (state.adoptedRunningTurn || !state.sawAssistantPayload || !finalText)
+          (state.adoptedRunningTurn || !state.sawAssistantPayload || (!finalText && !hasLocalAssistantText))
 
         return {
           ...state,

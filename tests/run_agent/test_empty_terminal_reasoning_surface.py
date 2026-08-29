@@ -7,8 +7,7 @@ labeled reasoning excerpt instead of a bare "(empty)" — the reasoning often
 contains the actual answer. Idea credit: PR #48795 (@ligl0325).
 
 Invariants pinned here:
-- The persisted assistant message keeps the "(empty)" sentinel and the
-  ``_empty_terminal_sentinel`` marker (replay semantics unchanged).
+- The persisted assistant message retains the delivered response for replay.
 - Raw reasoning is NEVER promoted earlier in the ladder — a reasoning-only
   response still goes through prefill continuation first.
 - A truly empty exhaustion (no reasoning either) still returns "(empty)".
@@ -83,8 +82,8 @@ def _truly_empty_response():
 
 def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch):
     """After the full ladder is exhausted on reasoning-only responses, the
-    delivered text is the labeled excerpt — not a bare '(empty)' — while the
-    transcript keeps its existing sentinel-scaffolding semantics."""
+    delivered text is the labeled excerpt — not a bare '(empty)' — and the
+    assistant transcript retains that response for replay."""
     agent = _build_agent(tmp_path, monkeypatch)
     monkeypatch.setattr(
         agent, "_interruptible_api_call",
@@ -98,13 +97,12 @@ def test_exhausted_reasoning_only_delivers_labeled_excerpt(tmp_path, monkeypatch
     assert "only internal reasoning" in final
     assert "The answer is 42" in final
 
-    # Persistence semantics unchanged: the delivered excerpt is
-    # delivery-only. The turn finalizer strips the "(empty)" terminal
-    # sentinel from the transcript tail (replay safety, existing design),
-    # and the labeled excerpt must never be persisted as assistant content.
-    assert not any(
+    # Persistence contract: the finalizer adopts the delivered excerpt into
+    # the active transcript row so replay retains the streamed assistant
+    # response instead of the "(empty)" sentinel.
+    assert any(
         m.get("role") == "assistant"
-        and "only internal reasoning" in (m.get("content") or "")
+        and m.get("content") == final
         for m in result["messages"]
     )
 

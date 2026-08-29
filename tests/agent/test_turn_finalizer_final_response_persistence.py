@@ -271,3 +271,82 @@ def test_final_response_fill_invalidates_flush_scan_cursor():
     )
 
     assert agent._db_flush_scan_prefix is None
+
+
+def test_streamed_text_is_persisted_when_final_response_is_empty():
+    """Delivered stream text must survive an empty terminal provider response.
+
+    A Desktop client can already have rendered the assistant's text when the
+    terminal response is empty or an interruption wins the finalization race.
+    The durable transcript must not end at the tool result in that case.
+    """
+    agent = FakeAgent()
+    agent._current_streamed_assistant_text = "The answer was already rendered."
+    agent._strip_think_blocks = lambda text: text
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": "ok"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="partial_stream_recovery",
+    )
+
+    assert result["final_response"] == "The answer was already rendered."
+    assert agent.persisted_messages[-1]["role"] == "assistant"
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+    assert sum(1 for message in agent.persisted_messages if message["role"] == "assistant") == 2
+
+
+def test_finalizer_adopts_concurrent_canonical_assistant_content():
+    """A concurrent winner must be reflected in the returned live transcript."""
+    agent = FakeAgent()
+    agent._current_streamed_assistant_text = "local response"
+    agent._strip_think_blocks = lambda text: text
+    agent._session_db = SimpleNamespace(
+        ensure_assistant_message_content=lambda *_args: "canonical response"
+    )
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "_row_id": 42},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="partial_stream_recovery",
+    )
+
+    assert result["final_response"] == "canonical response"
+    assert messages[-1]["content"] == "canonical response"
+    assert agent.persisted_messages[-1]["content"] == "canonical response"

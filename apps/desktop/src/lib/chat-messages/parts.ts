@@ -49,6 +49,13 @@ export function chatMessageText(message: ChatMessage): string {
     .join('')
 }
 
+/** Whether a message list already contains user-visible assistant text. */
+export function hasVisibleAssistantText(messages: ChatMessage[]): boolean {
+  return messages.some(
+    message => message.role === 'assistant' && !message.hidden && Boolean(chatMessageText(message).trim())
+  )
+}
+
 export interface UnspokenTurnSpeech {
   /** First unspoken assistant bubble — stable for the turn, the live speech session binds to it. */
   id: string
@@ -142,8 +149,9 @@ export function dedupeRepeatedTextInParts(parts: ChatMessagePart[]): ChatMessage
 /**
  * Merge the final assistant text into a message's parts.
  *
- * - Removes all existing `text` parts (they were streamed deltas, now superseded
- *   by the authoritative final response).
+ * - Removes all existing `text` parts when a non-empty authoritative final
+ *   response supersedes the streamed deltas.
+ * - Treats an empty final as a no-op, because it carries no replacement text.
  * - Keeps `reasoning` parts, but drops one that the final text fully covers
  *   (reasoning ⊆ final) — the final restates it. A short final ("Done.") must
  *   NOT swallow a longer reasoning block that merely starts with it (#61447).
@@ -156,6 +164,13 @@ export function mergeFinalAssistantText(
   fallbackTimestamp?: number
 ): ChatMessagePart[] {
   const dedupeReference = normalizeWs(finalText)
+
+  // An empty completion carries no authoritative replacement. Keep the
+  // streamed parts already visible to the user instead of turning a transport
+  // or provider-level empty final into a data-loss event.
+  if (!dedupeReference) {
+    return parts
+  }
 
   const streamedText = normalizeWs(
     parts

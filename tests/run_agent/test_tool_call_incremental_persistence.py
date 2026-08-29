@@ -220,6 +220,69 @@ def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_
     assert len(_durable_messages(db_path, session_id)) == 2
 
 
+def test_finalizer_updates_incrementally_persisted_empty_assistant_without_duplicate(tmp_path):
+    """Filling a persisted empty tail must not append a second assistant row."""
+    from agent.turn_finalizer import finalize_turn
+
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "empty-assistant-tail"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    agent._save_session_log = lambda _messages: None
+    agent._save_trajectory = lambda *_args: None
+    agent._cleanup_task_resources = lambda *_args: None
+    agent._current_streamed_assistant_text = "The answer was already rendered."
+
+    messages = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call-1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+        {"role": "assistant", "content": ""},
+    ]
+
+    try:
+        agent._flush_messages_to_session_db(messages, [])
+        before = _durable_messages(db_path, session_id)
+        assert before[-1]["role"] == "assistant"
+        assert before[-1]["content"] == ""
+
+        result = finalize_turn(
+            agent,
+            final_response="",
+            api_call_count=2,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="inspect",
+            original_user_message="inspect",
+            _should_review_memory=False,
+            _turn_exit_reason="partial_stream_recovery",
+        )
+
+        after = _durable_messages(db_path, session_id)
+        assert result["final_response"].startswith("The answer was already rendered.")
+        assert after[-1]["content"].startswith("The answer was already rendered.")
+        assert sum(1 for message in after if message["role"] == "assistant") == 2
+        assert not any(
+            message["role"] == "assistant"
+            and not message.get("tool_calls")
+            and not message["content"]
+            for message in after
+        )
+    finally:
+        db.close()
+
+
 def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     agent = _make_agent()
     tool_call = _mock_tool_call(call_id="must-not-run")
