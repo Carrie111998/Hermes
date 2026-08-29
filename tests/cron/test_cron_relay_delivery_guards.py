@@ -108,6 +108,24 @@ def _gateway_config(connected_values):
 
 
 class TestPreflightRelayFronted:
+    def test_satellite_profile_uses_default_gateway_delivery_config(self, monkeypatch, tmp_path):
+        """Satellite cron jobs use credentials from the multiplexing gateway."""
+        default_root = tmp_path / "hermes"
+        satellite = default_root / "profiles" / "grant"
+        satellite.mkdir(parents=True)
+        monkeypatch.setattr(sched, "_hermes_home", satellite)
+        monkeypatch.setattr(
+            "hermes_constants.get_default_hermes_root",
+            lambda: default_root,
+        )
+        with patch(
+            "gateway.config.load_gateway_config",
+            return_value=_gateway_config({"telegram"}),
+        ):
+            assert _preflight_check_delivery(
+                {"deliver": "telegram:-1004306455751:14"}
+            ) is None
+
     def test_relay_fronted_slack_accepted(self, monkeypatch):
         """Relay-only topology fronting slack: slack:CHAT passes preflight."""
         monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "slack")

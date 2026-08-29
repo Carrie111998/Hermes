@@ -5146,6 +5146,37 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
+def _load_delivery_gateway_config():
+    """Load gateway delivery config from the owning gateway process.
+
+    A multiplexed satellite profile owns its cron store but not the gateway
+    credentials.  Its local ``config.yaml`` intentionally omits credentials
+    when delivery is routed through ``gateway.profile_routes`` on the default
+    gateway.  In that topology, preflight must inspect the default root's
+    gateway config, just as fire-time routing does.
+    """
+    from gateway.config import load_gateway_config
+
+    active_home = _get_hermes_home().resolve()
+    try:
+        from hermes_constants import (
+            get_default_hermes_root,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        default_root = Path(get_default_hermes_root()).resolve()
+        active_home.relative_to(default_root / "profiles")
+    except (ImportError, ValueError, OSError):
+        return load_gateway_config()
+
+    token = set_hermes_home_override(str(default_root))
+    try:
+        return load_gateway_config()
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
@@ -5183,9 +5214,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             )
         if connected is None:
             try:
-                from gateway.config import load_gateway_config
-
-                gateway_config = load_gateway_config()
+                gateway_config = _load_delivery_gateway_config()
                 connected = {
                     p.value for p in gateway_config.get_connected_platforms()
                 }
