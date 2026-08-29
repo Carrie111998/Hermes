@@ -3734,6 +3734,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # against.
         branch = _m()._resolve_update_branch(args)
 
+        # One explicit tag/ref to merge from the fixed `upstream` remote,
+        # independent of the origin/<branch> pull below. Empty string (argparse
+        # default when unset) normalizes to None. This is not a general
+        # refs/remotes framework — a single fixed remote, one explicit ref per
+        # invocation.
+        merge_ref = str(getattr(args, "merge_ref", None) or "").strip() or None
+
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch", "origin", branch],
@@ -3833,7 +3840,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
+        # An explicit --merge-ref must never be swallowed by the "Already up to
+        # date!" early-return below — that path is scoped to the origin/<branch>
+        # comparison and says nothing about whether the requested upstream ref
+        # is merged.
+        if commit_count == 0 and not merge_ref:
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream
@@ -3934,7 +3945,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
+        if commit_count:
+            print(f"→ Found {commit_count} new commit(s)")
+        else:
+            # commit_count == 0 only reaches here via the merge_ref bypass
+            # above — origin/<branch> is current, but --merge-ref still runs.
+            print(f"→ origin/{branch} is current; proceeding with --merge-ref {merge_ref}")
 
         print("→ Pulling updates...")
         update_succeeded = False
@@ -3978,6 +3994,96 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
                     )
                     sys.exit(1)
+
+            # Explicit --merge-ref. Independent of the origin/<branch> ff-only
+            # merge above — runs whether or not that merge had any new commits
+            # (reachability bypass above). `branch` stays checked out; the ref
+            # merges INTO it, HEAD is never detached.
+            if merge_ref:
+                print(f"→ Fetching '{merge_ref}' from upstream...")
+                merge_ref_fetch = subprocess.run(
+                    git_cmd + ["fetch", "upstream", merge_ref],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                if merge_ref_fetch.returncode != 0:
+                    print(f"✗ Failed to fetch '{merge_ref}' from upstream.")
+                    stderr = merge_ref_fetch.stderr.strip()
+                    if stderr:
+                        print(f"  {stderr.splitlines()[0]}")
+                    if pre_pull_sha:
+                        subprocess.run(
+                            git_cmd + ["reset", "--hard", pre_pull_sha],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                    sys.exit(1)
+
+                # `^{commit}` is required (not just FETCH_HEAD) because the
+                # ref may be an annotated tag — the merge-base --is-ancestor
+                # check needs the actual commit SHA, not the tag object.
+                resolve_result = subprocess.run(
+                    git_cmd + ["rev-parse", "FETCH_HEAD^{commit}"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                if resolve_result.returncode != 0:
+                    print(f"✗ Could not resolve '{merge_ref}' to a commit.")
+                    if pre_pull_sha:
+                        subprocess.run(
+                            git_cmd + ["reset", "--hard", pre_pull_sha],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                    sys.exit(1)
+                merge_ref_sha = resolve_result.stdout.strip()
+
+                print(f"→ Merging '{merge_ref}' ({merge_ref_sha[:10]}) into {branch}...")
+                # --no-edit: this updater never has a human at the keyboard to
+                # write a merge-commit message (same non-interactivity
+                # assumption as every other git call in this function).
+                merge_ref_result = subprocess.run(
+                    git_cmd + ["merge", "--no-edit", merge_ref_sha],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                if merge_ref_result.returncode != 0:
+                    # Fail-closed: abandon the in-progress merge, restore HEAD
+                    # to EXACTLY the pre-update SHA, and exit non-zero. Falling
+                    # through past this sys.exit would reach the install/
+                    # dependency steps further down, which must not happen.
+                    print(f"✗ Merging '{merge_ref}' produced conflicts — aborting.")
+                    stderr = merge_ref_result.stderr.strip()
+                    if stderr:
+                        print(f"  {stderr.splitlines()[0]}")
+                    subprocess.run(
+                        git_cmd + ["merge", "--abort"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if pre_pull_sha:
+                        restore_result = subprocess.run(
+                            git_cmd + ["reset", "--hard", pre_pull_sha],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        if restore_result.returncode == 0:
+                            print(f"  ✓ Restored pre-update HEAD ({pre_pull_sha[:10]}).")
+                        else:
+                            print("  ✗ Failed to restore pre-update HEAD. Recover manually with:")
+                            print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
+                    else:
+                        print("  Could not capture pre-pull SHA — recover manually with:")
+                        print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
+                    sys.exit(1)
+                print(f"✓ Merged '{merge_ref}' into {branch}.")
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

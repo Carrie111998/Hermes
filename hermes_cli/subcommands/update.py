@@ -25,7 +25,11 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Gateway mode: use file-based IPC for prompts instead of stdin (used internally by /update)",
     )
-    update_parser.add_argument(
+    # --check (read-only status) and --merge-ref (apply-path ref/tag merge)
+    # are mutually exclusive — argparse rejects both at parse time rather than
+    # requiring runtime validation.
+    _check_or_merge_ref = update_parser.add_mutually_exclusive_group()
+    _check_or_merge_ref.add_argument(
         "--check",
         action="store_true",
         default=False,
@@ -59,6 +63,18 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "If the local checkout is on a different branch, hermes will "
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes)."
+        ),
+    )
+    _check_or_merge_ref.add_argument(
+        "--merge-ref",
+        default=None,
+        metavar="TAG_OR_REF",
+        help=(
+            "Merge this single tag or ref from the 'upstream' remote into the "
+            "current fork branch (fetch upstream <ref>, then merge the "
+            "resolved commit; runs even when origin has no new commits). "
+            "Fails closed on conflict: HEAD is restored to its exact "
+            "pre-update state and no install/dependency step runs."
         ),
     )
     update_parser.add_argument(
