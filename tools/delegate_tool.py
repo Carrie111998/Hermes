@@ -2451,6 +2451,15 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _is_terminal_child_result(result: Dict[str, Any]) -> bool:
+    """Return whether a child result must not be treated as usable output."""
+    return (
+        result.get("interrupted") is True
+        or result.get("failed") is True
+        or (bool(result.get("error")) and result.get("failed") is not False)
+    )
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2957,6 +2966,7 @@ def _run_single_child(
         # Pattern from: github/copilot-cli ctx.agent(prompt, {schema}) —
         # PATTERN ONLY, no code copied.
         _output_schema = getattr(child, "_delegate_output_schema", None)
+        _terminal_result = _is_terminal_child_result(result)
         _schema_valid: Optional[bool] = None
         _schema_errors: List[str] = []
         _schema_retries = 0
@@ -2973,7 +2983,7 @@ def _run_single_child(
             if (
                 not _schema_valid
                 and _first_text.strip()
-                and not result.get("interrupted", False)
+                and not _terminal_result
             ):
                 # Exactly one retry turn, carrying the validation errors
                 # verbatim (no schema re-paste — the child already holds
@@ -3007,6 +3017,16 @@ def _run_single_child(
                         result.get("messages"), list
                     ):
                         result["messages"] = result["messages"] + _retry_messages
+                    if _is_terminal_child_result(_retry_result):
+                        for _outcome_key in (
+                            "completed",
+                            "failed",
+                            "error",
+                            "failure_reason",
+                            "interrupted",
+                        ):
+                            if _outcome_key in _retry_result:
+                                result[_outcome_key] = _retry_result[_outcome_key]
                     _schema_valid, _schema_errors = validate_output(
                         _retry_text, _output_schema
                     )
@@ -3044,9 +3064,7 @@ def _run_single_child(
         # error text is carried in final_response.  Some older result builders
         # only stamped ``error``; an explicit failed=False remains a soft
         # outcome (for example compression_deferred), not a terminal failure.
-        terminal_failure = result.get("failed") is True or (
-            bool(result.get("error")) and result.get("failed") is not False
-        )
+        terminal_failure = _is_terminal_child_result(result)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
