@@ -5638,7 +5638,10 @@ def _maybe_warn_unknown_model_slug(
         from hermes_cli.models import cached_provider_model_ids
 
         catalog_ids = cached_provider_model_ids(canonical)
-    except Exception:
+    except Exception as e:
+        # Fail-open by design; debug-level so a broken catalog path stays
+        # distinguishable from the expected unknown-provider bail-outs.
+        logger.debug("model catalog guard skipped for %s/%s: %s", key, provider, e)
         return
     if not catalog_ids:
         return
