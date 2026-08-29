@@ -74,6 +74,90 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertFalse(r["success"])
         self.assertFalse(os.path.exists(os.path.join(self.home, "skills", "fresh")))
 
+    def test_failed_rollback_preserves_snapshot_for_recovery(self):
+        """(#97714) A restore that raises must not destroy both copies.
+
+        The old _rollback() removed the live skill directory BEFORE copying
+        the snapshot back; if the copy then raised (disk full, locked file,
+        Windows path limits), the finally deleted the snapshot too — the
+        skill and its only backup were both gone. A failed restore must
+        leave the operator a recoverable copy, and the error payload must
+        say so instead of implying the rollback ran.
+        """
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        smt = self.smt
+        real_copytree = shutil.copytree
+        skills_dir = os.path.join(self.home, "skills")
+        state = {"armed": False, "snap_dir": None}
+
+        real_rmtree = shutil.rmtree
+        surviving_snaps = []
+
+        def tracking_rmtree(path, *a, **k):
+            p = os.fspath(path).replace("\\", "/")
+            # record every snapshot dir that gets deleted, so the test can
+            # assert whether the backup survived
+            if "skill_batch_" in p:
+                surviving_snaps.append(p)
+            return real_rmtree(path, *a, **k)
+
+        def copytree_gated(src, dst, *a, **k):
+            dstp = os.fspath(dst).replace("\\", "/")
+            if dstp.startswith(skills_dir.replace("\\", "/")) and state["armed"]:
+                raise OSError("simulated restore failure (disk full)")
+            return real_copytree(src, dst, *a, **k)
+
+        real_skill_manage = smt.skill_manage
+
+        # The batch loop calls the module-global skill_manage per op; wrap it
+        # so the first failing op arms the restore failure (the rollback's
+        # copytree then raises on its way back into the skills dir).
+        def gated_skill_manage(*a, **k):
+            result_raw = real_skill_manage(*a, **k)
+            try:
+                ok = json.loads(result_raw).get("success")
+            except Exception:
+                ok = False
+            if not ok:
+                # this was the failing op — rollback runs next
+                state["armed"] = True
+            return result_raw
+
+        smt.shutil.copytree = copytree_gated
+        smt.shutil.rmtree = tracking_rmtree
+        smt.skill_manage = gated_skill_manage
+        try:
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+            ])
+        finally:
+            smt.shutil.copytree = real_copytree
+            smt.shutil.rmtree = real_rmtree
+            smt.skill_manage = real_skill_manage
+
+        self.assertFalse(r["success"])
+        self.assertIn("ROLLBACK FAILED", r["error"])
+        # The recoverable copy must still exist: a snapshot dir that was
+        # never deleted. surviving_snaps lists snapshot dirs rmtree touched.
+        # With the fix, the finally skips cleanup when rollback failed, so
+        # check: at least one skill_batch_* dir under temp remains alive.
+        import glob, tempfile as _tf
+        leftovers = [
+            d for d in glob.glob(os.path.join(_tf.gettempdir(), "skill_batch_*"))
+            if os.path.isdir(d) and os.path.exists(
+                os.path.join(d, "probe", "SKILL.md"))
+        ]
+        self.assertTrue(
+            leftovers,
+            "snapshot was deleted despite failed rollback — no recoverable copy left",
+        )
+        # and the payload must point the operator at it
+        self.assertTrue(
+            any("snapshot" in r["error"].lower() for _ in [0]),
+            "error payload should tell the operator a snapshot survives",
+        )
+
     def test_validation_rules(self):
         # delete as SOLE op routes to the real delete (works)
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])

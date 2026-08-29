@@ -1706,15 +1706,40 @@ def _skill_manage_batch(
                 post = _find_skill(nm)
                 post_dir = Path(post["path"]) if post else None
                 if snap is not None:
+                    # Restore INTO A STAGING COPY first, then swap. The old
+                    # order (rmtree live dir, then copytree back) destroyed
+                    # both copies when the restore raised — disk full, locked
+                    # file, Windows path limits (#97714). Copying beside the
+                    # target can still fail, but until it succeeds the live
+                    # dir is untouched and the snapshot stays in place.
+                    stage = Path(str(pre_dir) + ".rollback")
+                    if stage.is_dir():
+                        shutil.rmtree(stage)
+                    shutil.copytree(snap, stage)
                     if post_dir is not None and post_dir.is_dir():
                         shutil.rmtree(post_dir)
-                    shutil.copytree(snap, pre_dir)
+                    try:
+                        stage.rename(pre_dir)
+                    except OSError as exc:
+                        # Even the atomic swap back failed (e.g. something is
+                        # holding pre_dir on Windows): stop — never touch the
+                        # staged copy again, it is a second recoverable tree.
+                        raise RuntimeError(
+                            f"restore swap failed; recoverable copies at "
+                            f"'{stage}' and snapshot '{snap}'"
+                        ) from exc
                 elif post_dir is not None and post_dir.is_dir():
                     # Batch created this skill: remove the partial result.
                     shutil.rmtree(post_dir)
             except Exception as exc:  # noqa: BLE001
-                notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})")
+                notes.append(
+                    f"ROLLBACK FAILED for '{nm}' ({exc}); snapshot preserved at '{snap}'"
+                    if snap is not None
+                    else f"ROLLBACK FAILED for '{nm}' ({exc})"
+                )
         return "; ".join(notes) if notes else "all touched skills rolled back"
+
+    rollback_failed = False
 
     # --- execute ops through the normal single-op path (gate bypassed:
     #     the batch already cleared/staged it above; ledger + telemetry
@@ -1742,6 +1767,7 @@ def _skill_manage_batch(
                 parsed = {"success": False, "error": "unparseable op result"}
             if not parsed.get("success"):
                 note = _rollback()
+                rollback_failed = "ROLLBACK FAILED" in note
                 fail = {
                     "success": False,
                     "error": (
@@ -1765,7 +1791,11 @@ def _skill_manage_batch(
                             "success": True})
     finally:
         _skill_gate_bypass.reset(token)
-        shutil.rmtree(snap_root, ignore_errors=True)
+        # A failed rollback means the snapshot is the ONLY recoverable copy
+        # — never delete it (#97714: the old unconditional cleanup erased
+        # both the live dir and the backup on a restore error).
+        if not rollback_failed:
+            shutil.rmtree(snap_root, ignore_errors=True)
 
     return json.dumps(
         {"success": True, "operations_applied": len(results),
