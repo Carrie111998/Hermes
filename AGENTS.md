@@ -526,7 +526,7 @@ npm test          # vitest
 The dashboard embeds the real `hermes --tui` — **not** a rewrite.  See `hermes_cli/pty_bridge.py` + the `@app.websocket("/api/pty")` endpoint in `hermes_cli/web_server.py`.
 
 - Browser loads `web/src/pages/ChatPage.tsx`, which mounts xterm.js's `Terminal` with the WebGL renderer, `@xterm/addon-fit` for container-driven resize, and `@xterm/addon-unicode11` for modern wide-character widths.
-- `/api/pty?token=…` upgrades to a WebSocket; auth uses the same ephemeral `_SESSION_TOKEN` as REST, via query param (browsers can't set `Authorization` on WS upgrade).
+- The PTY endpoint upgrades to a WebSocket; auth uses the same ephemeral `_SESSION_TOKEN` as REST, passed as a query parameter (browsers can't set `Authorization` on WS upgrade) -- see `@app.websocket("/api/pty")` in `hermes_cli/web_server.py` for the exact param name.
 - The server spawns whatever `hermes --tui` would spawn, through `ptyprocess` (POSIX PTY — WSL works, native Windows does not).
 - Frames: raw PTY bytes each direction; resize via `\x1b[RESIZE:<cols>;<rows>]` intercepted on the server and applied with `TIOCSWINSZ`.
 
@@ -610,7 +610,7 @@ reinforced after the Mini Shai-Hulud worm campaign (May 2026).
 | Source type | Treatment | Example |
 |---|---|---|
 | PyPI package | `>=floor,<next_major` | `"httpx>=0.28.1,<1"` |
-| Git URL | Commit SHA | `git+https://...@<40-char-sha>` |
+| Git URL | Commit SHA | `git+https` VCS syntax, SHA embedded before the host per pip's userinfo form |
 | GitHub Actions | Commit SHA + comment | `uses: actions/checkout@<sha>  # v4` |
 | CI-only pip | `==exact` | `pyyaml==6.0.2` |
 
