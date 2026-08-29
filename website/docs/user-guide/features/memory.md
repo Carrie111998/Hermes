@@ -373,6 +373,8 @@ write_file / remove_file) **stage** for both origins. Existing-target background
 mutations must first prove the exact bytes were loaded in that review turn;
 otherwise they are refused before staging. Delete is also refused before staging
 because it cannot be replayed with a portable descriptor-bound directory unlink.
+One-operation `operations` arrays use the normal hardened pending record;
+multi-operation batches are refused before staging while approval is enabled.
 You review the one-line gist inline, but the full diff stays out-of-band:
 
 ```

@@ -598,6 +598,11 @@ record's integrity hash and survives approval in a fresh command context, while
 older background records without that proof remain fail-closed.
 Delete is refused before staging while the approval gate is enabled because a
 portable descriptor-bound directory unlink cannot be replayed safely.
+The modern `operations` array remains the normal call shape. A one-operation
+array is flattened into the same descriptor-bound pending record as the legacy
+single-operation call. Multi-operation batches remain atomic when approval is
+off, but are refused before staging when approval is on because the current
+pending format cannot safely replay a cross-skill rollback.
 Staged writes survive restarts under `~/.hermes/pending/skills/` and are
 reviewed with the same familiar approve/deny flow as dangerous commands:
 
