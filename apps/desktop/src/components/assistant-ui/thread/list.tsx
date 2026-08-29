@@ -140,6 +140,44 @@ export const shouldResettleTranscript = (previous: PaneLifecycle, next: PaneLife
 export const prependAnchorFromBottom = (loadSettled: boolean, scrollHeight: number, scrollTop: number): number =>
   loadSettled ? scrollHeight - scrollTop : 0
 
+/** Don't treat a boot-time 0-height window as a settled transcript. */
+export const TRANSCRIPT_MIN_VIEWPORT_PX = 2
+export const TRANSCRIPT_SETTLE_STABLE_FRAMES = 2
+/** Async markdown/images after backfill. The previous 15-frame cap handed
+ *  back during app reopen while the viewport was still empty or first-paint
+ *  had not caught up, so the thread painted at scrollTop 0. */
+export const TRANSCRIPT_SETTLE_MAX_FRAMES = 90
+
+export type TranscriptSettleTick = {
+  clientHeight: number
+  frame: number
+  lastHeight: number
+  paneBudget: number
+  renderBudget: number
+  scrollHeight: number
+  stableFrames: number
+}
+
+/** One rAF of the load settle loop. Pin to the end until the viewport has a
+ *  real box, first-paint backfill has caught up, and height is stable. */
+export const transcriptSettleAdvance = (
+  tick: TranscriptSettleTick
+): { done: boolean; frame: number; lastHeight: number; stableFrames: number } => {
+  if (tick.clientHeight < TRANSCRIPT_MIN_VIEWPORT_PX || tick.renderBudget < tick.paneBudget) {
+    return { done: false, frame: tick.frame, lastHeight: tick.scrollHeight, stableFrames: 0 }
+  }
+
+  const stableFrames = tick.scrollHeight === tick.lastHeight ? tick.stableFrames + 1 : 0
+  const frame = tick.frame + 1
+
+  return {
+    done: stableFrames >= TRANSCRIPT_SETTLE_STABLE_FRAMES || frame > TRANSCRIPT_SETTLE_MAX_FRAMES,
+    frame,
+    lastHeight: tick.scrollHeight,
+    stableFrames
+  }
+}
+
 // Browsers may quantize a requested scrollTop to a nearby device-pixel
 // boundary. use-stick-to-bottom otherwise compares the lower actual value to
 // the integer target forever, re-requesting the same instant scroll every
@@ -443,6 +481,10 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const paneBudget = transcriptPaneBudget(mountedPanes, paneLifecycle === 'hot-hidden')
 
   const [renderBudget, setRenderBudget] = useState(FIRST_PAINT_BUDGET)
+  const renderBudgetRef = useRef(renderBudget)
+  const paneBudgetRef = useRef(paneBudget)
+  renderBudgetRef.current = renderBudget
+  paneBudgetRef.current = paneBudget
 
   // Cut the budget during RENDER, not in the post-commit layout effect. An
   // effect-time cut is too late: React would first build the whole tree with
@@ -658,56 +700,60 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // lurch on every cold load. The empty→non-empty flip re-arms for the
   // transcript that actually arrived; being a boolean, it cannot re-fire on a
   // streaming append.
+  //
+  // App reopen is the same class with a different empty: the viewport exists
+  // but clientHeight is 0 until the window finishes showing, or first-paint
+  // has not backfilled yet. The 15-frame cap used to fire anyway, leaving
+  // scrollTop 0 on the real transcript. Wait for a real box + a full pane
+  // before counting stable frames (see transcriptSettleAdvance).
   useLayoutEffect(() => {
-    const el = scrollRef.current
-
-    if (!el) {
-      return
-    }
-
-    stopScroll()
-    el.scrollTop = el.scrollHeight
     loadSettledRef.current = false
+    stopScroll()
 
-    // An anchor captured for the OUTGOING transcript must not be applied to
-    // this one — a switch owns the position outright. The empty→non-empty
-    // re-arm is the SAME load, whose in-flight anchor is still correct.
     if (settleKeyRef.current !== sessionKey) {
       settleKeyRef.current = sessionKey
       restoreFromBottomRef.current = null
     }
 
+    let rafId = 0
     let frame = 0
     let stableFrames = 0
-    let lastHeight = el.scrollHeight
+    let lastHeight = 0
 
     const settle = () => {
       const node = scrollRef.current
 
       if (!node) {
+        rafId = requestAnimationFrame(settle)
         return
       }
 
-      const height = node.scrollHeight
+      node.scrollTop = node.scrollHeight
 
-      stableFrames = height === lastHeight ? stableFrames + 1 : 0
-      lastHeight = height
-      node.scrollTop = height
+      const next = transcriptSettleAdvance({
+        clientHeight: node.clientHeight,
+        frame,
+        lastHeight,
+        paneBudget: paneBudgetRef.current,
+        renderBudget: renderBudgetRef.current,
+        scrollHeight: node.scrollHeight,
+        stableFrames
+      })
 
-      // Most session switches are synchronous and stabilize within 2 frames;
-      // the old 90-frame ceiling was for slow async image loads. Cap at 15
-      // frames to minimize the settle-loop racing markdown paint on every switch.
-      if (stableFrames >= 2 || ++frame > 15) {
+      frame = next.frame
+      lastHeight = next.lastHeight
+      stableFrames = next.stableFrames
+
+      if (next.done) {
         void scrollToBottom('instant')
         loadSettledRef.current = true
-
         return
       }
 
       rafId = requestAnimationFrame(settle)
     }
 
-    let rafId = requestAnimationFrame(settle)
+    rafId = requestAnimationFrame(settle)
 
     return () => cancelAnimationFrame(rafId)
   }, [hasGroups, scrollRef, scrollToBottom, sessionKey, stopScroll])

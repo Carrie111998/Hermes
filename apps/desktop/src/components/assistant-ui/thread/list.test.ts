@@ -14,7 +14,8 @@ import {
   shouldResettleTranscript,
   subscribeToThreadForeground,
   transcriptBackfillFrameCount,
-  transcriptPaneBudget
+  transcriptPaneBudget,
+  transcriptSettleAdvance
 } from './list'
 
 afterEach(() => {
@@ -352,5 +353,41 @@ describe('prependAnchorFromBottom', () => {
   it('preserves a settled reading position through a prepend', () => {
     expect(prependAnchorFromBottom(true, 800, 200)).toBe(600)
     expect(prependAnchorFromBottom(true, 800, 0)).toBe(800)
+  })
+})
+
+describe('transcriptSettleAdvance', () => {
+  const filled = {
+    clientHeight: 800,
+    frame: 4,
+    lastHeight: 12_000,
+    paneBudget: 600,
+    renderBudget: 600,
+    scrollHeight: 12_000,
+    stableFrames: 1
+  }
+
+  it('does not settle while the window is still 0-tall (app reopen / boot)', () => {
+    const next = transcriptSettleAdvance({
+      ...filled,
+      clientHeight: 0,
+      frame: 20,
+      lastHeight: 0,
+      scrollHeight: 0,
+      stableFrames: 8
+    })
+
+    expect(next.done).toBe(false)
+    expect(next.frame).toBe(20)
+  })
+
+  it('does not settle while first-paint backfill is still catching up', () => {
+    const next = transcriptSettleAdvance({ ...filled, renderBudget: 20, stableFrames: 2 })
+
+    expect(next.done).toBe(false)
+  })
+
+  it('settles once the pane is filled and height holds', () => {
+    expect(transcriptSettleAdvance(filled).done).toBe(true)
   })
 })
