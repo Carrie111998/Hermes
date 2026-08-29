@@ -16,7 +16,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { useStoresSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
-import { collectWorkspaceSendInput, evaluateWorkspaceSend } from '@/lib/workspace-send-gate'
+import { blockedWorkspaceSendState, collectWorkspaceSendInput } from '@/lib/workspace-send-gate'
 import { sessionCompacting } from '@/store/compaction'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
@@ -228,7 +228,10 @@ export function ChatBar({
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
 
-  const sendVerdict = useStoresSelector(
+  // useStoresSelector is backed by useSyncExternalStore: its snapshot must be
+  // referentially stable. Select the blocked-state scalar, never a fresh
+  // verdict object, or React can enter a maximum-update-depth loop.
+  const sendBlockedState = useStoresSelector(
     [
       $activeGatewayProfile,
       $botChatSessionIds,
@@ -241,7 +244,7 @@ export function ChatBar({
       $sessionStates
     ],
     () =>
-      evaluateWorkspaceSend(
+      blockedWorkspaceSendState(
         collectWorkspaceSendInput({
           sessionId,
           storedSessionId: queueSessionKey
@@ -249,8 +252,7 @@ export function ChatBar({
       )
   )
 
-  const sendBlockedState = sendVerdict.allowed ? null : sendVerdict.state
-  const sendDisabled = disabled || !sendVerdict.allowed
+  const sendDisabled = disabled || sendBlockedState !== null
   const inputDisabled = disabled && !reconnecting
 
   // The draft engine — detached source of truth (DOM + draftRef + edge

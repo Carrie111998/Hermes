@@ -7,6 +7,7 @@ import { $connection, $gatewayState } from '@/store/session'
 import { clearAllSessionStates } from '@/store/session-states'
 
 import {
+  blockedWorkspaceSendState,
   collectWorkspaceSendInput,
   evaluateWorkspaceSend,
   isSubmitAccepted,
@@ -43,6 +44,12 @@ describe('workspace send surface states', () => {
       allowed: true,
       state: 'idle_fleet'
     })
+  })
+
+  it('projects verdicts to stable scalar snapshots for external-store subscriptions', () => {
+    expect(blockedWorkspaceSendState({ ...idle, isNewChat: true, ambientTupleValid: true })).toBeNull()
+    expect(blockedWorkspaceSendState({ ...idle, gatewaySwitching: true })).toBe('switching')
+    expect(blockedWorkspaceSendState({ ...idle, unreachable: true })).toBe('unreachable')
   })
 
   it('fails closed for a new chat when the ambient tuple is invalid', () => {

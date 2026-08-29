@@ -181,6 +181,15 @@ export function evaluateWorkspaceSend(input: WorkspaceSendInput): WorkspaceSendV
   return { allowed: false, state: 'route_invalid' }
 }
 
+/** Stable scalar for useSyncExternalStore selectors. Returning the verdict
+ * object itself would allocate a new snapshot on every read and can trigger a
+ * React maximum-update-depth loop. */
+export function blockedWorkspaceSendState(input: WorkspaceSendInput): null | WorkspaceSendBlockedState {
+  const verdict = evaluateWorkspaceSend(input)
+
+  return verdict.allowed ? null : verdict.state
+}
+
 /** Sessions-switch send barrier plus the fail-closed existing-surface set. */
 export function isWorkspaceSendBlocked(input: WorkspaceSendInput): boolean {
   return !evaluateWorkspaceSend(input).allowed
