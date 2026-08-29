@@ -72,6 +72,20 @@ class SanitizedSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class GeneratedContextSegment:
+    """Hermes-generated remote context after unsafe-text redaction."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedContextKey:
+    """Application-owned JSON key for generated provider tool schemas."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class UntrustedProvenanceSegment:
     """Content-free marker for tool bytes with no trusted origin proof."""
 
@@ -109,6 +123,7 @@ class OutboundText:
     segments: tuple[
         LiteralSegment
         | SanitizedSegment
+        | GeneratedContextSegment
         | ValidatedToolSyntaxSegment
         | SourceBoundSegment
         | SourcePresentationSegment
@@ -211,8 +226,26 @@ _BASE64_CANDIDATE = re.compile(
 )
 _HERMES_TASK_ID = re.compile(r"^t_[0-9a-f]{8}$")
 _PROMPT_CACHE_KEY = re.compile(r"^pck_[0-9a-f]{24}$")
+_BOUNDED_DURATION = re.compile(r"^(?:0|[1-9][0-9]{0,6})(?:ms|s|m|h)$")
+_BOUNDED_CLI_WORD = re.compile(r"^--[a-z]+(?:-[a-z]+)*$")
+# Any-case letters + optional trailing slash: GitHub-style org/repo slugs
+# ("NousResearch/hermes") and vault/skill paths ("Memories/Shared/") use
+# mixed case; a lone directory reference ("scripts/") has nothing after
+# its final slash. Hyphens are still excluded from segments here (a
+# repo/org segment containing one, like "hermes-agent", is handled by
+# _BOUNDED_KEBAB_WORD below and by the two combining at the call site).
+_BOUNDED_SLASH_WORDS = re.compile(
+    r"^(?://[A-Za-z]{2,}"
+    r"|(?:/{1,2})?[A-Za-z]{2,}(?:/[A-Za-z]{2,})+/?"
+    r"|[A-Za-z]{2,}/)$"
+)
 _MAX_BASE64_CANDIDATE_CHARS = 262_144
 _VALIDATED_TOOL_SYNTAX = {
+    "application_identifier": re.compile(
+        r"(?:t_[0-9a-f]{8}|[0-9a-f]{40}|[0-9a-f]{64}|"
+        r"[a-z][a-z0-9]{0,31}(?:[_-][a-z][a-z0-9]{0,31}){1,7}"
+        r"(?::v[0-9]{1,3})?)"
+    ),
     "separator": re.compile(r"[ \t\r\n,:=()\[\]{}]+"),
     "github_url": re.compile(
         r"https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}"
@@ -261,6 +294,20 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "BOTH",
         "COVERAGE",
         "EPUB",
+        "FTS5",
+        "FULL",
+        "GGUF",
+        "MMLU",
+        "OPTIONAL",
+        "RELATIVE",
+        "REPLACES",
+        "REST",
+        "SKIP",
+        "THAT",
+        "TODO",
+        "UNAVAILABLE",
+        "WAIT",
+        "WHEN",
         "HERMES_KANBAN_DB",
         "HERMES_KANBAN_BRANCH",
         "HERMES_KANBAN_CLAIM_LOCK",
@@ -273,24 +320,62 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "HERMES_TURN_LEASE_TIMEOUT",
         "HEAD",
         "LAST",
+        "MESSAGE",
         "MIME",
         "MODE",
         "MUTUALLY",
         "MUST",
         "NOTE",
         "ONLY",
+        "PARALLEL",
+        "PATH",
+        "PRAGMA",
         "REPL",
         "REPLACE",
         "REQUIRED",
         "SILENTLY",
+        "THIS",
+        "USER",
+        "WSL1",
+        "_is_git_worktree",
         "assistant",
         "already-resolved",
         "assignee/profile",
         "computer_call_output",
+        "claim/finalize/retry",
         "com/docs",
         "content",
         "developer",
         "doc/",
+        "dispatcher_current_directory",
+        "acceptance-valid",
+        "architecture-diagram",
+        "autonomous-ai-agents",
+        "available_skills",
+        "background-first",
+        "document-to-action-items",
+        "evaluating-llms-harness",
+        "filesystem-writing",
+        "find_referencing_symbols",
+        "get_symbols_overview",
+        "github-pr-workflow",
+        "google-workspace",
+        "hermes-agent-skill-authoring",
+        "match_message_id",
+        "meeting-action-items",
+        "merge-reconciler",
+        "p5js",
+        "popular-web-designs",
+        "requesting-code-review",
+        "software-development",
+        "songwriting-and-ai-music",
+        "systematic-debugging",
+        "weekly-review-planning",
+        "50KB",
+        "1800",
+        "8787",
+        "ids/goals/status/transcripts",
+        "references/templates/scripts",
         "echo/cat",
         "echo/heredoc",
         "environment-variable",
@@ -318,9 +403,11 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "parallel_tool_calls",
         "path/to/file",
         "ppt/",
+        "prepare_receipt_worktree",
         "prompt_cache_key",
         "protected-remote",
         "repository-owned",
+        "runtime-executed",
         "reasoning",
         "role",
         "sed/awk",
@@ -328,9 +415,11 @@ _PROTOCOL_GRAMMAR_ATOMS = frozenset(
         "servers/watchers/daemons",
         "session_resolver",
         "skills/plugins/cron/memories",
+        "logic-regression",
         "system",
         "tool",
         "user",
+        "workspace_access",
     }
 )
 
@@ -451,16 +540,21 @@ def _canonical_base64_candidate(candidate: str) -> bool:
 
     if candidate in _PROTOCOL_GRAMMAR_ATOMS:
         return False
+    if _BOUNDED_DURATION.fullmatch(candidate):
+        return False
     if not 4 <= len(candidate) <= _MAX_BASE64_CANDIDATE_CHARS:
         return False
-    # Short alphabetic words frequently round-trip mathematically as
-    # unpadded Base64 (for example "ordinary" and "review"). Require an
-    # encoding signal for short candidates; long all-alpha blobs remain
-    # suspicious even without padding.
-    if len(candidate) < 24 and not any(
-        character.isdigit() or character in "=+/-_" for character in candidate
-    ) and not candidate.isupper():
-        return False
+    # Short words and word-shaped structural fragments frequently round-trip
+    # mathematically as unpadded Base64. Their bounded lexical form is the
+    # disambiguating signal; padding, digits, mixed punctuation, and long
+    # ambiguous blobs remain eligible for canonical decoding below.
+    if len(candidate) < 24:
+        if candidate.isalpha() and not candidate.isupper():
+            return False
+        if _BOUNDED_CLI_WORD.fullmatch(candidate):
+            return False
+        if _BOUNDED_SLASH_WORDS.fullmatch(candidate):
+            return False
     # Short, word-like URL-safe slugs are common model/provider identifiers.
     # Keep genuinely encoding-shaped values such as ``-_8A`` eligible for the
     # canonical decoder below.
@@ -490,6 +584,37 @@ def _canonical_base64_candidate(candidate: str) -> bool:
         if candidate in {canonical_padded, canonical_padded.rstrip("=")} and decoded:
             return True
     return False
+
+
+# GitHub's legacy GraphQL global node id: base64 of a fixed
+# ``<digits>:<TypeName><digits>`` grammar (e.g. "05:Issue160502814" ->
+# "MDU6SXNzdWUxNjA1MDI4MTQ0"). `gh api` / `gh issue|pr list` return these in
+# every issue/PR/label/comment object's `node_id` field, so any tool-output
+# scan that fetches GitHub issue or PR data structurally contains them. They
+# are fixed, low-entropy protocol identifiers for public object identity —
+# not caller-supplied encoded content — so they get the same treatment as
+# the other bounded protocol grammars above (call_/fc_ ids, kanban task ids,
+# prompt cache keys). Investigation for t_80e6f80b: this pattern was
+# repeatedly and falsely flagged as ``base64_payload`` on every provider
+# fallback from a local model to a REMOTE one mid-scan, permanently
+# excluding cloud fallback for any GitHub-issue-reading profile.
+_GITHUB_LEGACY_NODE_ID_GRAMMAR = re.compile(r"\A\d{1,3}:[A-Za-z]{2,40}\d{1,20}\Z")
+
+
+def _looks_like_github_legacy_node_id(candidate: str) -> bool:
+    unpadded = candidate.rstrip("=")
+    if "=" in unpadded or len(unpadded) % 4 == 1:
+        return False
+    padded = unpadded + "=" * (-len(unpadded) % 4)
+    try:
+        decoded = base64.b64decode(padded.encode("ascii"), validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    try:
+        text = decoded.decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    return bool(_GITHUB_LEGACY_NODE_ID_GRAMMAR.fullmatch(text))
 
 
 def _contains_canonical_base64(value: Any, *, seen: set[int] | None = None) -> bool:
@@ -534,6 +659,9 @@ def _contains_canonical_base64(value: Any, *, seen: set[int] | None = None) -> b
             # Content-addressed cache routing is a fixed application protocol
             # value: the literal ``pck_`` prefix plus exactly 96 bits of hex.
             if _PROMPT_CACHE_KEY.fullmatch(candidate):
+                continue
+            # GitHub's legacy global node id (see helper docstring above).
+            if _looks_like_github_legacy_node_id(candidate):
                 continue
             if _canonical_base64_candidate(candidate):
                 return True
@@ -665,6 +793,66 @@ def _contains_private_absolute_path(value: Any, *, seen: set[int] | None = None)
     return False
 
 
+def redact_remote_unsafe_text(text: str) -> str:
+    """Redact non-secret unsafe text in Hermes-generated remote context.
+
+    Secrets intentionally remain a hard firewall denial. Private paths and
+    canonical base64-shaped protocol text can be replaced while preserving
+    the surrounding system/tool instructions needed by remote models.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("remote context must be text")
+
+    def replace_path(match: re.Match[str]) -> str:
+        value = match.group(0)
+        prefix_match = re.match(r"^[\s\"'`(]*", value)
+        prefix = prefix_match.group(0) if prefix_match else ""
+        return prefix + "<private-path>"
+
+    redacted = _PRIVATE_ABSOLUTE_PATH.sub(replace_path, text)
+    if redacted.startswith(("product=hermes-agent", "client=hermes-client-")):
+        return redacted
+
+    def replace_base64(match: re.Match[str]) -> str:
+        candidate = match.group(1)
+        if re.fullmatch(
+            r"[0-9a-f]{7,12}|[0-9a-f]{40}|[0-9a-f]{64}", candidate.lower()
+        ):
+            return match.group(0)
+        if candidate.isdigit():
+            before = redacted[: match.start(1)].rstrip()[-1:]
+            after = redacted[match.end(1) :].lstrip()[:1]
+            if before in {":", ",", "["} and after in {",", "]", "}"}:
+                return match.group(0)
+        if candidate in _PROTOCOL_GRAMMAR_ATOMS or _HERMES_TASK_ID.fullmatch(candidate):
+            return match.group(0)
+        if re.fullmatch(r"(?:call|fc)_[A-Za-z0-9_-]{8,128}", candidate):
+            return match.group(0)
+        if candidate in {
+            "HERMES_CONTROL_HOME",
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_PROFILE_HOME",
+        }:
+            return match.group(0)
+        if _PROMPT_CACHE_KEY.fullmatch(candidate) or _canonical_base64_candidate(candidate):
+            return "<redacted-base64>"
+        return match.group(0)
+
+    redacted = _BASE64_CANDIDATE.sub(replace_base64, redacted)
+    chunked = re.compile(
+        r"(?<![A-Za-z0-9_+/=-])(?:[A-Za-z0-9_+/=-]{2,4}\s+){2,}"
+        r"[A-Za-z0-9_+/=-]{2,4}(?![A-Za-z0-9_+/=-])"
+    )
+    return chunked.sub(
+        lambda match: "<redacted-base64>"
+        if _canonical_base64_candidate(re.sub(r"\s+", "", match.group(0)))
+        else match.group(0),
+        redacted,
+    )
+
+
 def content_free_violation_locations(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
     """Return structural indexes and reasons without returning request text."""
 
@@ -786,6 +974,10 @@ def _is_strict_sanitized_only_payload(
 
     if isinstance(value, SanitizedSegment):
         return isinstance(value.text, str), 1 if isinstance(value.text, str) else 0
+    if isinstance(value, GeneratedContextSegment):
+        return isinstance(value.text, str), 1 if isinstance(value.text, str) else 0
+    if isinstance(value, GeneratedContextKey):
+        return isinstance(value.text, str), 0
     if isinstance(value, UntrustedProvenanceSegment):
         return False, 0
     if isinstance(value, ValidatedToolSyntaxSegment):
@@ -825,7 +1017,7 @@ def _is_strict_sanitized_only_payload(
         seen.add(identity)
         count = 0
         for key, item in value.items():
-            if not isinstance(key, str):
+            if not isinstance(key, (str, GeneratedContextKey)):
                 return False, 0
             allowed, item_count = _is_strict_sanitized_only_payload(item, seen=seen)
             if not allowed:
@@ -1219,13 +1411,14 @@ class LLMEgressFirewall:
             frozenset(),
         )
 
-        def require_static_literal(text: str) -> None:
+        def require_static_literal(text: str, *, scan_base64: bool = True) -> None:
             # Provenance authorization and content safety are independent.
             # Every rendered text atom is scanned again immediately before
             # authorization, including exact policy-bound static literals and
             # structural keys/scalars.
             scan_values.append(text)
-            base64_scan_values.append(text)
+            if scan_base64:
+                base64_scan_values.append(text)
             if static_literal_sha256(text) not in allowed_static_hashes:
                 reasons.append("static_literal_not_allowed")
 
@@ -1233,6 +1426,7 @@ class LLMEgressFirewall:
             segment: (
                 LiteralSegment
                 | SanitizedSegment
+                | GeneratedContextSegment
                 | ValidatedToolSyntaxSegment
                 | SourceBoundSegment
                 | SourcePresentationSegment
@@ -1269,6 +1463,17 @@ class LLMEgressFirewall:
                     return segment.text
                 reasons.append("invalid_literal_segment")
                 return ""
+            if isinstance(segment, GeneratedContextSegment):
+                if not isinstance(segment.text, str):
+                    reasons.append("invalid_generated_context_segment")
+                    return ""
+                # The constructor redacts path/base64-shaped text. Keep the
+                # final scans, especially secret detection, as defense in
+                # depth, but do not charge generated context to the smaller
+                # untrusted-text budget.
+                scan_values.append(segment.text)
+                base64_scan_values.append(segment.text)
+                return segment.text
             if isinstance(segment, ValidatedToolSyntaxSegment):
                 try:
                     text = validate_tool_syntax(segment.text, segment.syntax_kind)
@@ -1339,6 +1544,7 @@ class LLMEgressFirewall:
                 (
                     LiteralSegment,
                     SanitizedSegment,
+                    GeneratedContextSegment,
                     ValidatedToolSyntaxSegment,
                     SourceBoundSegment,
                     SourcePresentationSegment,
@@ -1347,15 +1553,67 @@ class LLMEgressFirewall:
             ):
                 return render_text_segment(value)
             if isinstance(value, OutboundText):
-                return "".join(render_text_segment(segment) for segment in value.segments)
+                rendered_parts: list[str] = []
+                adjacent_sanitized: list[str] = []
+                adjacent_non_source: list[str] = []
+
+                def flush_adjacent_sanitized() -> None:
+                    if len(adjacent_sanitized) > 1:
+                        combined = "".join(adjacent_sanitized)
+                        # Segment caps are transport bounds, not scan
+                        # boundaries. Re-scan each reconstructed contiguous
+                        # sanitized span so splitting cannot conceal a secret,
+                        # private path, or encoding across adjacent pieces.
+                        scan_values.append(combined)
+                        base64_scan_values.append(combined)
+                    adjacent_sanitized.clear()
+
+                def flush_adjacent_non_source() -> None:
+                    if len(adjacent_non_source) > 1:
+                        # Structural typing may exclude an exact validated
+                        # atom from Base64 classification, but it must never
+                        # split a secret or private path across scan values.
+                        scan_values.append("".join(adjacent_non_source))
+                    adjacent_non_source.clear()
+
+                for segment in value.segments:
+                    rendered = render_text_segment(segment)
+                    rendered_parts.append(rendered)
+                    if isinstance(segment, SanitizedSegment):
+                        adjacent_sanitized.append(rendered)
+                    else:
+                        flush_adjacent_sanitized()
+                    if isinstance(
+                        segment,
+                        (
+                            LiteralSegment,
+                            SanitizedSegment,
+                            GeneratedContextSegment,
+                            ValidatedToolSyntaxSegment,
+                        ),
+                    ):
+                        adjacent_non_source.append(rendered)
+                    else:
+                        flush_adjacent_non_source()
+                flush_adjacent_sanitized()
+                flush_adjacent_non_source()
+                return "".join(rendered_parts)
             if isinstance(value, Mapping):
                 rendered: dict[str, Any] = {}
                 for key, item in value.items():
-                    if not isinstance(key, str):
+                    if isinstance(key, GeneratedContextKey):
+                        rendered_key = key.text
+                        if not isinstance(rendered_key, str):
+                            reasons.append("invalid_generated_context_key")
+                            continue
+                        require_static_literal(rendered_key, scan_base64=False)
+                    elif isinstance(key, str):
+                        rendered_key = key
+                        require_static_literal(rendered_key)
+                    else:
                         reasons.append("invalid_request_key")
                         continue
-                    require_static_literal(key)
-                    rendered[key] = render(item)
+                    rendered[rendered_key] = render(item)
                 return rendered
             if isinstance(value, (list, tuple)):
                 return [render(item) for item in value]
@@ -1363,8 +1621,16 @@ class LLMEgressFirewall:
                 reasons.append("non_finite_number")
                 return None
             if value is None or isinstance(value, (bool, int, float)):
+                # JSON scalar controls (for example ``max_tokens=4096``) are
+                # rendered as unquoted JSON values, never caller-supplied
+                # text.  Scanning their string representation as a standalone
+                # base64 candidate turns ordinary numeric limits into false
+                # egress blocks ("4096" is a valid four-character base64
+                # alphabet member).  Keep them policy-bound and in the secret
+                # scan, but do not apply a text-payload base64 heuristic.
                 require_static_literal(
-                    json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+                    json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":")),
+                    scan_base64=False,
                 )
                 return value
             # In particular, raw strings and bytes are not remote request
@@ -1485,6 +1751,8 @@ __all__ = [
     "DestinationClass",
     "EgressBlocked",
     "EgressDecision",
+    "GeneratedContextKey",
+    "GeneratedContextSegment",
     "LLMEgressFirewall",
     "LiteralSegment",
     "OutboundText",
@@ -1496,6 +1764,7 @@ __all__ = [
     "UntrustedProvenanceSegment",
     "ValidatedToolSyntaxSegment",
     "classify_destination",
+    "redact_remote_unsafe_text",
     "source_grant_digest",
     "static_literal_sha256",
     "validate_tool_syntax",

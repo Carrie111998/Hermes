@@ -623,6 +623,80 @@ def test_sha_and_commit_references_in_prose_are_not_base64_false_positives(tmp_p
     assert "base64_payload" not in decision.reason_codes
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Use systematic-debugging when a fix keeps not sticking.",
+        "Call get_symbols_overview before reading a large file.",
+        "The 50KB cap applies per attachment; retry after 1800 seconds.",
+        "Templates live under references/templates/scripts in this skill.",
+        "Bind ids/goals/status/transcripts before writing the summary.",
+        "TODO: revisit this once the WAIT state clears; do not SKIP the check.",
+    ],
+)
+def test_tool_and_skill_identifier_shapes_are_not_base64_false_positives(tmp_path, text):
+    """live incident, 2026-08-28: moving profiles from a local (loopback)
+    provider to a remote one (Nous) exposed them to egress scanning for the
+    first time, and every one of them failed on message 1 -- the shared
+    tool/skill descriptions are full of kebab-case slugs, snake_case
+    function names, bare small numbers, and all-caps emphasis words that
+    round-trip as valid unpadded Base64 by coincidence."""
+    decision = firewall(tmp_path).preflight(_sanitized_request(text), _route())
+    assert "base64_payload" not in decision.reason_codes
+
+
+def test_bounded_kanban_show_structural_atoms_with_exact_receipt_ids_are_not_base64(
+    tmp_path,
+):
+    tool_result = json.dumps(
+        {
+            "task": {
+                "body": (
+                    "expected head c2ba2e718019b2a9dbd044e89dd1d900290f5b5d; "
+                    "receipt 0123456789abcdef0123456789abcdef"
+                    "0123456789abcdef0123456789abcdef"
+                ),
+                "workspace_access": "dispatcher_current_directory",
+            }
+        },
+        sort_keys=True,
+    )
+
+    decision = firewall(tmp_path).preflight(_sanitized_request(tool_result), _route())
+
+    assert "base64_payload" not in decision.reason_codes
+
+
+def test_representative_kanban_worker_evidence_is_not_mistaken_for_base64(tmp_path):
+    tool_result = json.dumps(
+        {
+            "events": [{"payload": {"lock": 1831}}],
+            "runs": [{"error": "runtime-executed elapsed 903s > limit 900s"}],
+            "worker_context": (
+                "Use PRAGMA under WSL1. Check _is_git_worktree, then "
+                "claim/finalize/retry through prepare_receipt_worktree. "
+                "Classify a logic-regression."
+            ),
+        },
+        sort_keys=True,
+    )
+
+    decision = firewall(tmp_path).preflight(_sanitized_request(tool_result), _route())
+
+    assert "base64_payload" not in decision.reason_codes
+    assert "secret_detected" not in decision.reason_codes
+
+
+def test_similar_unrecognized_underscore_atom_remains_base64_blocked(tmp_path):
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).preflight(
+            _sanitized_request('{"workspace_access":"workspace_backup"}'),
+            _route(),
+        )
+
+    assert "base64_payload" in exc_info.value.decision.reason_codes
+
+
 def test_sanitized_proper_substring_of_grant_text_is_rejected(tmp_path):
     path = tmp_path / "source.txt"
     path.write_text("private source\n", encoding="utf-8")
@@ -798,6 +872,35 @@ def test_scanner_error_fails_closed(monkeypatch, tmp_path):
             grants=(object(),),
         )
     assert "redaction_failed" in exc_info.value.decision.reason_codes
+
+
+def test_adjacent_sanitized_segments_cannot_hide_base64_across_boundaries(tmp_path):
+    encoded = base64.b64encode(b"secret-material").decode("ascii")
+    assert len(encoded) == 20
+    request = TypedOutboundRequest(
+        payload={
+            "messages": [
+                {
+                    "role": LiteralSegment("user"),
+                    "content": OutboundText(
+                        tuple(
+                            SanitizedSegment(encoded[offset : offset + 5])
+                            for offset in range(0, len(encoded), 5)
+                        )
+                    ),
+                }
+            ]
+        },
+        session_id="session-1",
+        turn_id="turn-1",
+        request_id="req-1",
+        policy_digest="policy-1",
+    )
+
+    with pytest.raises(EgressBlocked) as exc_info:
+        firewall(tmp_path).authorize(request, _route())
+
+    assert "base64_payload" in exc_info.value.decision.reason_codes
 
 
 def test_byte_and_token_caps_fail_closed(tmp_path):
