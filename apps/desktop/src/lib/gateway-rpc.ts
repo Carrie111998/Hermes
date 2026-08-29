@@ -37,3 +37,17 @@ export function isBusySessionModelSwitch(error: unknown): boolean {
 
   return /session busy/i.test(message) && /switching models/i.test(message)
 }
+
+/** True when a session-scoped RPC was refused because the gateway no longer
+ *  holds that runtime — detached on WS disconnect and orphan-reaped, LRU
+ *  evicted, or torn down after an idle TTL. The backend answers 4001
+ *  "session not found" and expects the client to recover via session.resume
+ *  on the STORED id, not to retry the dead runtime id.
+ *
+ *  Deliberately narrow: transient failures (socket drops, timeouts) must NOT
+ *  match, or a blip would suppress a live session's recovery. */
+export function isDetachedSessionRpc(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return /\b4001\b/.test(message) || /session not found/i.test(message)
+}

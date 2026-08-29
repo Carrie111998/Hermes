@@ -1,5 +1,7 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
+import { isDetachedSessionRpc } from '@/lib/gateway-rpc'
+
 import { $clarifyRequest, $clarifyRequests } from './clarify'
 import { $activeSessionId } from './session'
 
@@ -126,14 +128,41 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
   }
 }
 
+/** Runtimes the gateway has told us it no longer holds (4001). replayPendingApproval
+ *  fires on EVERY session.info, and session.info arrives in bursts, so without
+ *  this a single detached tab polls approval.pending forever: gui.log recorded
+ *  5665 refusals at a steady 33-36/min for ~22h, one gateway WARNING each.
+ *
+ *  A refusal is a fact about THIS runtime id, not about the conversation — the
+ *  stored session resumes under a new runtime id, and that id is not in here.
+ *  Cleared wholesale on gateway.ready, when the runtime map is rebuilt. */
+const detachedApprovalSessions = new Set<string>()
+
+/** Re-arm approval replay for every runtime (gateway reconnect / rebuild). */
+export function forgetDetachedApprovalSessions(): void {
+  detachedApprovalSessions.clear()
+}
+
 export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
-  if (!gateway || !sessionId) {
+  if (!gateway || !sessionId || detachedApprovalSessions.has(sessionId)) {
     return
   }
 
-  const rawResult = await gateway.request('approval.pending', {
-    session_id: sessionId
-  })
+  let rawResult: unknown
+
+  try {
+    rawResult = await gateway.request('approval.pending', {
+      session_id: sessionId
+    })
+  } catch (error) {
+    // Callers already treat a replay failure as non-fatal. Read the refusal
+    // before it is discarded so a dead runtime stops being polled.
+    if (isDetachedSessionRpc(error)) {
+      detachedApprovalSessions.add(sessionId)
+    }
+
+    throw error
+  }
 
   const result =
     rawResult && typeof rawResult === 'object' ? (rawResult as { approvals?: PendingApprovalPayload[] }) : {}
@@ -242,6 +271,7 @@ export function clearAllPrompts(sessionId?: string | null): void {
     sudo.reset()
     secret.reset()
     $approvalInlineAnchors.set({})
+    detachedApprovalSessions.clear()
 
     return
   }

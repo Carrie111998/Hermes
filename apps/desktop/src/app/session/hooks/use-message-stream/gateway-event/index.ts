@@ -10,7 +10,7 @@ import {
 import { reconcileSessionCompacting } from '@/store/compaction'
 import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
-import { replayPendingApproval } from '@/store/prompts'
+import { forgetDetachedApprovalSessions, replayPendingApproval } from '@/store/prompts'
 import { setSessionProviderWait } from '@/store/provider-wait'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
 import type { RpcEvent } from '@/types/hermes'
@@ -194,6 +194,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       }
 
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
+
+      // A reconnect rebuilds the gateway's runtime map, so every runtime we
+      // had written off as detached deserves one more look.
+      if (event.type === 'gateway.ready') {
+        forgetDetachedApprovalSessions()
+      }
 
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
 

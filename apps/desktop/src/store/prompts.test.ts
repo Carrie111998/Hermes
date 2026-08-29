@@ -10,6 +10,7 @@ import {
   clearApprovalRequest,
   clearSecretRequest,
   clearSudoRequest,
+  forgetDetachedApprovalSessions,
   receiveApprovalRequest,
   replayPendingApproval,
   setApprovalRequest,
@@ -216,5 +217,101 @@ describe('$activeSessionAwaitingInput', () => {
 
     $activeSessionId.set('s2')
     expect($activeSessionAwaitingInput.get()).toBe(true)
+  })
+})
+
+describe('pending approval replay backoff', () => {
+  afterEach(() => {
+    forgetDetachedApprovalSessions()
+  })
+
+  // #90428 class: a detached/reaped runtime answers every session-scoped RPC
+  // with 4001 "session not found". replayPendingApproval fires on EVERY
+  // session.info (see approvalReplaySessionId), and session.info arrives in
+  // bursts, so swallowing the refusal turned one dead tab into a permanent
+  // poll: logs/gui.log recorded 5665 rejected approval.pending calls at a
+  // steady 33-36/min for ~22h, each one a gateway-side WARNING.
+  it('stops polling a runtime the gateway no longer holds', async () => {
+    const calls: string[] = []
+
+    const gateway = {
+      request: async (method: string) => {
+        calls.push(method)
+        throw new Error('4001: session not found')
+      }
+    }
+
+    for (let i = 0; i < 5; i++) {
+      await replayPendingApproval(gateway, 'dead-1').catch(() => undefined)
+    }
+
+    expect(calls).toEqual(['approval.pending'])
+  })
+
+  it('keeps polling every other runtime', async () => {
+    const calls: Array<string> = []
+
+    const gateway = {
+      request: async (_method: string, params: Record<string, unknown>) => {
+        calls.push(String(params.session_id))
+
+        if (params.session_id === 'dead-1') {
+          throw new Error('4001: session not found')
+        }
+
+        return { approvals: [] }
+      }
+    }
+
+    await replayPendingApproval(gateway, 'dead-1').catch(() => undefined)
+    await replayPendingApproval(gateway, 'dead-1').catch(() => undefined)
+    await replayPendingApproval(gateway, 'alive-1').catch(() => undefined)
+    await replayPendingApproval(gateway, 'alive-1').catch(() => undefined)
+
+    expect(calls).toEqual(['dead-1', 'alive-1', 'alive-1'])
+  })
+
+  it('does not latch on a transient failure', async () => {
+    const calls: string[] = []
+
+    const gateway = {
+      request: async (method: string) => {
+        calls.push(method)
+        throw new Error('websocket disconnected')
+      }
+    }
+
+    await replayPendingApproval(gateway, 's1').catch(() => undefined)
+    await replayPendingApproval(gateway, 's1').catch(() => undefined)
+
+    expect(calls).toHaveLength(2)
+  })
+
+  it('polls again once the runtime is reinstated', async () => {
+    const calls: string[] = []
+    let dead = true
+
+    const gateway = {
+      request: async (method: string) => {
+        calls.push(method)
+
+        if (dead) {
+          throw new Error('4001: session not found')
+        }
+
+        return { approvals: [] }
+      }
+    }
+
+    await replayPendingApproval(gateway, 's1').catch(() => undefined)
+    await replayPendingApproval(gateway, 's1').catch(() => undefined)
+    expect(calls).toHaveLength(1)
+
+    // gateway.ready / a fresh resume means the runtime map was rebuilt.
+    dead = false
+    forgetDetachedApprovalSessions()
+    await replayPendingApproval(gateway, 's1').catch(() => undefined)
+
+    expect(calls).toHaveLength(2)
   })
 })
