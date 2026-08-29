@@ -725,4 +725,37 @@ def test_reconstruct_all_garbage_timestamps_falls_back_to_zero(tmp_path):
     assert started == 0.0
 
 
+def test_reconstruct_corrupt_text_timestamp_falls_back_to_zero(tmp_path):
+    """A corrupt TEXT timestamp cell must not raise ValueError out of
+    _reconstruct_missing_sessions — damaged cells fall back to 0.0 like
+    the numeric garbage does."""
+    from hermes_state import SessionDB
+
+    source = tmp_path / "garbage-text.db"
+    output = tmp_path / "garbage-text-recovered.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("doomed", "cli")
+        db.append_message("doomed", "user", "m1")
+    finally:
+        db.close()
+
+    conn = sqlite3.connect(str(source), isolation_level=None)
+    try:
+        conn.execute("DELETE FROM sessions")
+        conn.execute("UPDATE messages SET timestamp=?", ("not-a-number",))
+    finally:
+        conn.close()
+
+    recover_session_database(
+        source, output, work_dir=tmp_path, chunk_size=16, allow_partial=True,
+    )
+
+    with sqlite3.connect(str(output)) as verify:
+        started = verify.execute(
+            "SELECT started_at FROM sessions WHERE source='recovered'"
+        ).fetchone()[0]
+    assert started == 0.0
+
+
 

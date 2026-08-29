@@ -188,7 +188,8 @@ def _sql_session_last_active(alias: str = "s") -> str:
 
     Both inputs are constrained to the sane epoch window: out-of-range
     values (corrupt salvage output) read as NULL here instead of poisoning
-    ``last_active`` (#91536).
+    ``last_active`` (#91536). The bounds are inclusive (SQL ``BETWEEN``):
+    a value exactly on either boundary survives.
     """
     msg_max = (
         f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "

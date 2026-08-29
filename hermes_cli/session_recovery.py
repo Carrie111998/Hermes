@@ -24,6 +24,8 @@ from hermes_state import (
     FTS_STORAGE_VERSION,
     SCHEMA_VERSION,
     SessionDB,
+    _SANE_EPOCH_MAX,
+    _SANE_EPOCH_MIN,
     _db_opens_cleanly,
 )
 
@@ -996,15 +998,16 @@ def _reconstruct_missing_sessions(
         # Salvage can leave garbage IEEE-754 doubles in messages.timestamp
         # (uninitialised-memory bit patterns); one such value as started_at
         # poisons every last_active consumer (#91536). 0.0 renders as a
-        # valid (1970) date, which is harmless, so out-of-window or absent
-        # timestamps fall back to it.
-        if (
-            first_timestamp is None
-            or not 1_000_000_000.0 <= float(first_timestamp) <= 4_200_000_000.0
-        ):
-            started_at = 0.0
-        else:
+        # valid (1970) date, which is harmless, so out-of-window, absent,
+        # or non-numeric timestamps fall back to it. The window constants
+        # are the ones the last_active SQL guard uses, so the two layers
+        # cannot drift apart.
+        try:
             started_at = float(first_timestamp)
+        except (TypeError, ValueError):
+            started_at = 0.0
+        if not _SANE_EPOCH_MIN <= started_at <= _SANE_EPOCH_MAX:
+            started_at = 0.0
         while True:
             title = (
                 f"[recovered {title_sequence}] "

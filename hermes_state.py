@@ -57,6 +57,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_RAW_SELECT,
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
+    _SANE_EPOCH_MAX,
+    _SANE_EPOCH_MIN,
     _ephemeral_child_sql,
     _legacy_reset_child_sql,
     _shape_preview,
