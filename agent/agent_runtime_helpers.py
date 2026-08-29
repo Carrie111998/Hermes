@@ -4267,8 +4267,9 @@ def looks_like_codex_intermediate_ack(
     future-ack and an action verb but no filesystem reference — are caught too.
     The short-content + no-prior-tools guardrails always apply. A response must
     then contain either a first-person future acknowledgement with an action
-    marker or a narrowly bounded pronounless action clause; this keeps ordinary
-    conversational replies such as "I'll help you brainstorm" from tripping it.
+    marker or a narrowly bounded pronounless action clause with an explicit
+    transition cue; this keeps ordinary conversational replies such as "I'll
+    help you brainstorm" from tripping it.
     """
     if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
         return False
@@ -4284,17 +4285,17 @@ def looks_like_codex_intermediate_ack(
     )
     # Some tool-using providers narrate the next action in terse log style
     # rather than with a first-person lead-in: "Brief written. Creating the
-    # session now." Keep this deliberately narrower than the general action
-    # vocabulary: a present-participle clause must begin the response or follow
-    # a sentence/status delimiter, completed-report predicates (for example,
-    # "Testing completed successfully") stay final, and questions are never
-    # auto-continued.
+    # session now." Bare gerunds are too ambiguous ("Reading the traceback
+    # explains the failure" is a final answer), so this path also requires an
+    # explicit transition cue such as "now", "via acpx", "actual log", or
+    # "then launching". Completed reports and questions stay final.
     action_clause_pattern = re.compile(
-        r"(?:^|[.!…—–]\s+|\n+\s*)(?P<action>(?:re)?launching|(?:re)?starting|creating|"
+        r"(?:^|[.!…—–]\s+|\n+\s*)(?:(?P<transition>then)\s+)?"
+        r"(?P<action>(?:re)?launching|(?:re)?starting|creating|"
         r"checking|running|writing|opening|reading|inspecting|reviewing|"
         r"testing|debugging|searching|fixing)\b"
     )
-    list_item_prefix_pattern = re.compile(r"(?:^|\s)(?:[-*+]|\d+[.)])\s*$")
+    list_item_prefix_pattern = re.compile(r"(?:^|\n)\s*(?:[-*+]|\d+[.)])\s*$")
     completion_predicate_pattern = re.compile(
         r"\b(?:completed|finished|succeeded|failed|passed|complete|done|successful)\b"
         r"(?=\s*(?:$|[)\],;:])|\s+(?:successfully|with|without|due|because|"
@@ -4304,14 +4305,34 @@ def looks_like_codex_intermediate_ack(
     declarative_predicate_pattern = re.compile(
         r"\b(?:is|are|was|were|would|could|should|can|will|tells?|shows?|helps?|"
         r"costs?|means?|takes?|requires?|seems?|appears?|fails?|gives?|"
-        r"reproduces?|adds?|generates?|consumes?|gave|found|made|reproduced|"
-        r"revealed|surfaced)\b"
+        r"reproduces?|adds?|generates?|consumes?|explains?|confirms?|breaks?|"
+        r"produces?|triggers?|ships?|prints?|parses?|builds?|reveals?|improves?|"
+        r"gave|found|made|"
+        r"reproduced|revealed|surfaced)\b"
     )
     question_pattern = re.compile(r"\?(?=\s|$|[\"'’”)\]])")
     sentence_boundary_pattern = re.compile(
         r"(?:[.!…](?=\s|$)|\?(?=\s|$|[\"'’”)\]])|\n+)"
     )
-    relative_clause_pattern = re.compile(r"\b(?:that|which|who)\b")
+    terminal_now_pattern = re.compile(
+        r"(?:\bnow\b\s*(?:\([^)]*\))?\s*$|"
+        r"\bnow\b\s*[—–-]\s*see\s+https?://\S+"
+        r"(?:\s+for\s+progress)?\s*$)"
+    )
+    provider_transition_pattern = re.compile(
+        r"\b(?:via\s+(?:copilot|acpx|codex|claude)|"
+        r"on\s+(?:copilot|acpx|codex|claude)"
+        r"(?:\s+via\s+\S+)?)\s*$"
+    )
+    explicit_action_detail_pattern = re.compile(
+        r"\bactual\s+(?:log|output)\s*$|"
+        r"\bwhether\b.*\b(?:healthy|ready|running|available|reachable|working)\s*$"
+    )
+    launch_with_pattern = re.compile(
+        r"\bwith\s+(?:(?:corrected|updated|new)\s+"
+        r"(?:arguments?|args?|options?|flags?|parameters?)|"
+        r"globals?\s+before\s+(?:the\s+)?agent\s+name)\s*$"
+    )
     has_pronounless_action = False
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
@@ -4321,33 +4342,29 @@ def looks_like_codex_intermediate_ack(
             clause_tail = assistant_text[action_match.end() :]
             boundary_match = sentence_boundary_pattern.search(clause_tail)
             if boundary_match:
-                if clause_tail[boundary_match.end() :].strip():
-                    continue
                 clause_tail = clause_tail[: boundary_match.start()]
+            action_word = action_match.group("action")
+            has_transition_cue = bool(
+                terminal_now_pattern.search(clause_tail)
+                or provider_transition_pattern.search(clause_tail)
+                or explicit_action_detail_pattern.search(clause_tail)
+                or (
+                    action_word.startswith(("launch", "relaunch", "start", "restart"))
+                    and launch_with_pattern.search(clause_tail)
+                )
+            )
+            if not has_transition_cue:
+                continue
             predicate_matches = [
-                (match.start(), "completion", match)
+                ("completion", match)
                 for match in completion_predicate_pattern.finditer(clause_tail)
             ]
             predicate_matches.extend(
-                (match.start(), "declarative", match)
+                ("declarative", match)
                 for match in declarative_predicate_pattern.finditer(clause_tail)
             )
-            relative_markers = list(relative_clause_pattern.finditer(clause_tail))
-            relative_index = 0
-            embedded_predicates = 0
             has_main_predicate = False
-            for predicate_start, predicate_kind, predicate_match in sorted(
-                predicate_matches, key=lambda item: item[0]
-            ):
-                while (
-                    relative_index < len(relative_markers)
-                    and relative_markers[relative_index].start() < predicate_start
-                ):
-                    embedded_predicates += 1
-                    relative_index += 1
-                if embedded_predicates:
-                    embedded_predicates -= 1
-                    continue
+            for predicate_kind, predicate_match in predicate_matches:
                 if predicate_kind == "declarative" and re.search(
                     r"\b(?:if|whether)\b", clause_tail[: predicate_match.start()]
                 ):
