@@ -161,6 +161,11 @@ gateway:
     subscribed_suffix:     "(feliratkozva — értesítést kapsz, ha a {task_id} befejeződik vagy elakad)"
     truncated_suffix:      "… (csonkítva; használd a `hermes kanban …` parancsot a terminálban a teljes kimenethez)"
     no_output:             "(nincs kimenet)"
+    gate:
+      plan_awaiting_approval: "emberi terv-döntésre vár ({plan}) — ügynök nem lépheti át ezt a kaput"
+      plan_approved:          "a(z) {plan} tervet {operator} jóváhagyta → ide kerül: {landing}"
+      plan_rejected:          "a(z) {plan} tervet {operator} elutasította → triage-ba került"
+      gate_release_refused:   "elutasítva a(z) {gate} kapu feloldására tett kísérlet ({via})"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

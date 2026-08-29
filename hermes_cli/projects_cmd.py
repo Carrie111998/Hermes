@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
 import sys
+from pathlib import Path
 
 from hermes_cli import projects_db as pdb
 
@@ -101,6 +103,60 @@ def build_parser(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
 
+    p_plan = sub.add_parser(
+        "plan", help="Draft the next plan revision for a project",
+        description=(
+            "Records a new plan revision. Drafting is not approving: this "
+            "writes an artifact and touches no task status or gate."
+        ),
+    )
+    p_plan.add_argument("project", help="Project id")
+    p_plan.add_argument("--body", default=None, help="Plan text")
+    p_plan.add_argument(
+        "--file", default=None,
+        help="Read the plan text from a file ('-' for stdin)",
+    )
+    p_plan.add_argument(
+        "--name", default=None,
+        help="Human name, used only when the project is created",
+    )
+
+    p_ps = sub.add_parser(
+        "plan-show", help="Show a plan revision (read-only)",
+        description=(
+            "Displays a plan straight from the database. Accepts a project id, "
+            "or a gated task id to show exactly what that gate is waiting on."
+        ),
+    )
+    p_ps.add_argument("target", help="Project id, or a gated task id (t_…)")
+    p_ps.add_argument(
+        "--revision", type=int, default=None,
+        help="Revision to show (default: the project's current one)",
+    )
+
+    sub.add_parser(
+        "status", help="Show what is waiting at a human gate",
+        description=(
+            "Read-only. Lists every task parked at a plan or deploy gate. "
+            "Reporting a gate is not releasing one."
+        ),
+    )
+
+    p_ap = sub.add_parser(
+        "approve-plan",
+        help="Show a gated plan (approval unavailable: no authenticated surface)",
+    )
+    p_ap.add_argument("task_id", help="The gated task id (t_…)")
+
+    p_rp = sub.add_parser(
+        "reject-plan",
+        help="Show a gated plan (rejection unavailable: no authenticated surface)",
+    )
+    p_rp.add_argument("task_id", help="The gated task id (t_…)")
+    p_rp.add_argument(
+        "--reason", default=None, help="Why the plan is being rejected"
+    )
+
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -133,12 +189,330 @@ def projects_command(args: argparse.Namespace) -> int:
         "archive": _cmd_archive,
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
+        "plan": _cmd_plan,
+        "plan-show": _cmd_plan_show,
+        "status": _cmd_status,
+        "approve-plan": _cmd_approve_plan,
+        "reject-plan": _cmd_reject_plan,
     }
     handler = handlers.get(action)
     if handler is None:
         print(f"Unknown project action: {action}", file=sys.stderr)
         return 1
     return handler(args)
+
+
+# ---------------------------------------------------------------------------
+# Human approval gate
+# ---------------------------------------------------------------------------
+#
+# These two commands CANNOT cross a plan gate. They display the authoritative
+# plan and then fail closed, because no separately authenticated approval
+# surface is configured and none ships.
+#
+# The earlier design read a confirmation phrase from /dev/tty and tried to
+# establish that the caller was not an agent. It was withdrawn: a process
+# running as the same user can allocate its own PTY, erase any local marker, and
+# orphan itself to shed its ancestry, so no local check distinguishes a human
+# from an agent. The refusal below therefore does not depend on recognising the
+# caller at all.
+#
+# Nothing about WHAT is displayed comes from the command line. The task id is a
+# lookup key; the project, revision, root task and plan body are all read from
+# the database, which is what a future authenticated adapter would bind to.
+
+
+def _print_plan(task_id: str, task, ctx: dict) -> None:
+    """Show the authoritative plan text for a gated task.
+
+    Read from the database, never from the caller, so what is displayed is what
+    a future authenticated adapter would bind an approval to.
+    """
+    print()
+    print(f"  Task     : {task_id}  {task.title}")
+    print(f"  Project  : {ctx['project_id']}")
+    print(f"  Revision : {ctx['revision']}")
+    print(f"  Proposed : {ctx['proposed_by'] or '(unknown)'}")
+    print()
+    print("  ---------------- plan ----------------")
+    for line in (ctx["body"] or "(empty plan)").splitlines() or ["(empty plan)"]:
+        print(f"  {line}")
+    print("  --------------------------------------")
+
+
+def _gate_decision(args, decision: str) -> int:
+    """Shared body for approve-plan / reject-plan."""
+    from hermes_cli import approval_broker as ab
+    from hermes_cli import kanban_db as kb
+
+    task_id = str(getattr(args, "task_id", "") or "").strip()
+    if not task_id:
+        print("project: a task id is required", file=sys.stderr)
+        return 2
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            print(f"project: no such task: {task_id}", file=sys.stderr)
+            return 1
+        if kb.gate_state_of(conn, task_id) != "plan":
+            print(
+                f"project: task {task_id} is not awaiting plan approval",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Resolve the artifact from the DATABASE, never from the caller.
+        ctx = kb.plan_gate_context(conn, task_id)
+        if ctx is None:
+            print(
+                f"project: task {task_id} has no resolvable plan for its gate",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Display the authoritative plan. This is the whole of what the local
+        # CLI can still do: it reads the artifact from the database so an
+        # operator can see exactly what is pending, and it decides nothing.
+        # Printing to stdout is safe precisely BECAUSE nothing is confirmed
+        # here — there is no prompt a redirect could hide.
+        _print_plan(task_id, task, ctx)
+
+        try:
+            attestation = ab.for_plan_decision(
+                project_id=ctx["project_id"],
+                revision=ctx["revision"],
+                plan_body=ctx["body"] or "",
+                decision=decision,
+                display_context={
+                    "task_id": task_id,
+                    "title": task.title,
+                    "proposed_by": ctx["proposed_by"] or "(unknown)",
+                },
+            )
+        except ab.NoApprovalSurfaceError as exc:
+            # The normal outcome in this release. Not a misconfiguration:
+            # local approval was removed as an authority because a same-user
+            # process can forge every local signal of human presence.
+            print(f"\nproject: {exc}", file=sys.stderr)
+            return 3
+        except ab.ApprovalProvenanceError as exc:
+            print(f"\nproject: {exc}", file=sys.stderr)
+            return 3
+        except ab.ApprovalSurfaceError as exc:
+            print(f"\nproject: {exc}", file=sys.stderr)
+            return 3
+
+        # The plan may have changed between display and confirmation. The
+        # release path recomputes the binding hash from the live row, so a
+        # stale display fails here rather than approving different words.
+        ok, why = kb.release_plan_gate(
+            conn, task_id,
+            attestation=attestation,
+            reason=getattr(args, "reason", None),
+        )
+        if not ok:
+            print(f"project: {why}", file=sys.stderr)
+            return 1
+
+        verb = "approved" if decision == "approved" else "rejected"
+        print(f"\nPlan {verb}. Task {task_id} is now "
+              f"{kb.get_task(conn, task_id).status}.")
+        return 0
+    finally:
+        conn.close()
+
+
+def _cmd_plan(args: argparse.Namespace) -> int:
+    """Draft the next plan revision. Writes an artifact and nothing else."""
+    from hermes_cli import kanban_db as kb
+
+    project = str(getattr(args, "project", "") or "").strip()
+    if not project:
+        print("project: a project id is required", file=sys.stderr)
+        return 2
+
+    body = getattr(args, "body", None)
+    source = getattr(args, "file", None)
+    if body is not None and source:
+        print("project: pass --body or --file, not both", file=sys.stderr)
+        return 2
+    if source:
+        try:
+            body = (sys.stdin.read() if source == "-"
+                    else Path(source).read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"project: cannot read {source}: {exc}", file=sys.stderr)
+            return 1
+    if body is None or not body.strip():
+        print(
+            "project: a plan body is required (--body TEXT or --file PATH)",
+            file=sys.stderr,
+        )
+        return 2
+
+    conn = kb.connect()
+    try:
+        kb.ensure_pm_project(
+            conn, project_id=project, name=getattr(args, "name", None),
+        )
+        try:
+            plan = kb.submit_plan(
+                conn, project_id=project, body=body,
+                proposed_by=_current_actor(),
+            )
+        except ValueError as exc:
+            print(f"project: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    print(
+        f"Recorded plan revision {plan['revision']} for {project}.\n"
+        f"Show it with:  hermes project plan-show {project}\n"
+        f"Approval is a separate, authenticated step and is not available "
+        f"from this CLI."
+    )
+    return 0
+
+
+def _cmd_plan_show(args: argparse.Namespace) -> int:
+    """Display a plan revision. Read-only; decides nothing."""
+    from hermes_cli import kanban_db as kb
+
+    target = str(getattr(args, "target", "") or "").strip()
+    if not target:
+        print("project: a project or task id is required", file=sys.stderr)
+        return 2
+    revision = getattr(args, "revision", None)
+
+    conn = kb.connect()
+    try:
+        # Resolve by LOOKUP, not by spelling. ``ensure_pm_project`` accepts any
+        # identifier, so a project may legitimately be called "t_portfolio";
+        # sniffing the "t_" prefix made such a project unreadable by the caller
+        # that had just created it.
+        task = kb.get_task(conn, target)
+        project_plan = kb.get_plan(conn, target, revision)
+        has_project = project_plan is not None or (
+            revision is not None and kb.get_plan(conn, target) is not None
+        )
+
+        if revision is not None:
+            # A revision is a property of a project. Asking for one against a
+            # task is a mistake worth naming rather than quietly showing the
+            # revision its gate happens to point at.
+            if project_plan is None and task is not None:
+                print(
+                    f"project: --revision selects a project revision, and "
+                    f"{target} is a task. Omit --revision to show the plan its "
+                    f"gate is waiting on.", file=sys.stderr,
+                )
+                return 2
+            if project_plan is None:
+                print(
+                    f"project: no plan revision {revision} for project "
+                    f"{target}", file=sys.stderr,
+                )
+                return 1
+
+        elif task is not None:
+            # The gate is the time-sensitive artifact, so a task wins a
+            # collision — and the collision is disclosed rather than hidden.
+            if kb.gate_state_of(conn, target) != "plan":
+                print(
+                    f"project: task {target} is not awaiting plan approval",
+                    file=sys.stderr,
+                )
+                return 1
+            ctx = kb.plan_gate_context(conn, target)
+            if ctx is None:
+                print(
+                    f"project: task {target} has no resolvable plan for its "
+                    f"gate", file=sys.stderr,
+                )
+                return 1
+            if has_project:
+                print(
+                    f"  Note     : {target} is also a project id; showing the "
+                    f"task's gate. Use --revision to read the project instead."
+                )
+            _print_plan(target, task, ctx)
+            return 0
+
+        plan = project_plan
+        if plan is None:
+            which = f" revision {revision}" if revision is not None else ""
+            print(
+                f"project: no plan{which} for {target} — it matches no task "
+                f"and no project on this board", file=sys.stderr,
+            )
+            return 1
+        print()
+        print(f"  Project  : {plan['project_id']}")
+        print(f"  Revision : {plan['revision']}")
+        print(f"  Proposed : {plan['proposed_by'] or '(unknown)'}")
+        if plan.get("approved_at"):
+            print(f"  Approved : {plan.get('approved_by') or '(unknown)'}")
+        elif plan.get("rejected_at"):
+            print(f"  Rejected : {plan.get('reject_reason') or '(no reason)'}")
+        print()
+        print("  ---------------- plan ----------------")
+        for line in (plan["body"] or "(empty plan)").splitlines() or ["(empty plan)"]:
+            print(f"  {line}")
+        print("  --------------------------------------")
+        return 0
+    finally:
+        conn.close()
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Report what is waiting on a human. Reporting is not releasing."""
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        gated = kb.list_gated_tasks(conn)
+    finally:
+        conn.close()
+
+    if not gated:
+        print("No tasks are waiting at a human gate.")
+        return 0
+
+    print(f"{len(gated)} task(s) waiting at a human gate:")
+    print()
+    for item in gated:
+        where = item.get("project_id") or "(no plan bound)"
+        rev = item.get("revision")
+        rev_txt = f" r{rev}" if rev is not None else ""
+        print(f"  {item['id']}  [{item['gate_state']}]  {item['title']}")
+        print(f"      project {where}{rev_txt}"
+              f"      assignee @{item.get('assignee') or '-'}")
+    print()
+    print("Inspect one with:  hermes project plan-show <task-id>")
+    print("Approval is a separate, authenticated step and is not available "
+          "from this CLI.")
+    return 0
+
+
+def _current_actor() -> str:
+    """A display label for who drafted a plan. NOT an identity boundary."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return str(get_active_profile_name() or "default")
+    except Exception:
+        return os.environ.get("HERMES_PROFILE") or "default"
+
+
+def _cmd_approve_plan(args: argparse.Namespace) -> int:
+    return _gate_decision(args, "approved")
+
+
+def _cmd_reject_plan(args: argparse.Namespace) -> int:
+    return _gate_decision(args, "rejected")
 
 
 def _resolve(conn, ident: str):

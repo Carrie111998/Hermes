@@ -961,6 +961,18 @@ class HermesConsoleEngine:
                 ("archive",),
                 ("restore",),
                 ("bind-board",),
+                # Commit 9. The Console is a real execution registry of its
+                # own, so a verb that exists in argparse but not here is
+                # simply missing from the Console — a cross-surface test now
+                # pins that they stay in step.
+                ("plan",),
+                ("plan-show",),
+                ("status",),
+                # Registered so the Console mirrors the CLI rather than
+                # answering "unknown command". They cannot cross a gate: both
+                # display the plan and fail closed, which a test pins.
+                ("approve-plan",),
+                ("reject-plan",),
             ],
             summaries=_builder_summaries("hermes_cli.projects_cmd", "build_parser"),
             mutating=[
@@ -973,6 +985,12 @@ class HermesConsoleEngine:
                 ("archive",),
                 ("restore",),
                 ("bind-board",),
+                # Writes a plan revision.
+                ("plan",),
+                # Attempt a state change, even though it fails closed — the
+                # Console's confirmation is the right gesture for that.
+                ("approve-plan",),
+                ("reject-plan",),
             ],
             handler_factory=lambda fixed: _builder_handler(
                 "project",

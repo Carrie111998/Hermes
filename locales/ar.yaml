@@ -184,6 +184,11 @@ gateway:
     subscribed_suffix:     "(مُشترك — ستُخطَر عند اكتمال {task_id} أو حجبها)"
     truncated_suffix:      "… (مقتطع؛ استخدم `hermes kanban …` في الطرفية للخرج الكامل)"
     no_output:             "(لا يوجد خرج)"
+    gate:
+      plan_awaiting_approval: "في انتظار قرار بشري بشأن الخطة ({plan}) — لا يمكن لأي وكيل تجاوز هذه البوابة"
+      plan_approved:          "تمت الموافقة على الخطة {plan} بواسطة {operator} ← الانتقال إلى {landing}"
+      plan_rejected:          "تم رفض الخطة {plan} بواسطة {operator} ← تمت إحالتها إلى الفرز"
+      gate_release_refused:   "تم رفض محاولة فتح بوابة {gate} عبر {via}"
     wake:
       completed:           "اكتملت"
       gave_up:             "استسلم (نفدت المحاولات)"

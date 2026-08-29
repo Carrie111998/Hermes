@@ -880,6 +880,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             payload.status == "review" and payload.assignee is not None
         )
 
+        # --- gate (must precede EVERY mutation below) ---------------------
+        # A combined {assignee, status} patch previously applied the assignee
+        # and only then refused the status, leaving the gated task reassigned
+        # behind a 409. The gate check therefore runs before any mutation
+        # whenever a status transition is requested, so the whole request is
+        # all-or-nothing. Assignee-only patches are still permitted: renaming
+        # the owner of a gated card does not release the gate.
+        if payload.status is not None:
+            _gate_early = _refuse_gated(conn, task_id, via="dashboard_patch")
+            if _gate_early:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Task is awaiting human {_gate_early} approval and cannot "
+                        f"be moved from the board. Approve or reject the "
+                        f"{_gate_early} to release it."
+                    ),
+                )
+
         # --- assignee ----------------------------------------------------
         # For a combined assignee+review patch, request_review must capture
         # the current implementer before routing the task to the reviewer.
@@ -896,6 +915,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            # A task parked at a HUMAN APPROVAL GATE is not movable from the
+            # board. Checked once here rather than per-branch because every
+            # branch below can release it: `ready` routes to unblock_task,
+            # todo/triage/scheduled route to the raw status writer, and
+            # done/archived/blocked would strand or bypass the gate outright.
+            # The only way out of a gate is the explicit release verb.
+            # Belt-and-braces: the early check above already refused this
+            # request. Kept so a future caller that reaches the status block by
+            # another route is still refused.
+            gate = _gate_state(conn, task_id)
+            if gate:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Task is awaiting human {gate} approval and cannot be "
+                        f"moved from the board. Approve or reject the {gate} to "
+                        f"release it."
+                    ),
+                )
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -1065,6 +1103,17 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # A gated task is present, not missing — 404 would be a lie and would
+        # invite the caller to retry or treat it as already gone.
+        gate = _refuse_gated(conn, task_id, via="dashboard_delete")
+        if gate:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Task is awaiting human {gate} approval and cannot be "
+                    f"deleted. Approve or reject the {gate} to release it."
+                ),
+            )
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1118,6 +1167,46 @@ def _invalidate_descendants_for_parent_reopen(
     terminations.extend(result["terminations"])
 
 
+def _row_get(row, key, default=None):
+    """Read an optional column from a sqlite3.Row without raising."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _gate_state(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The task's approval-gate state, or None. Tolerates pre-gate boards."""
+    try:
+        row = conn.execute(
+            "SELECT gate_state FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return _row_get(row, "gate_state") if row is not None else None
+
+
+def _refuse_gated(conn: sqlite3.Connection, task_id: str, via: str) -> Optional[str]:
+    """Audit and return the gate state when ``task_id`` is gated, else None.
+
+    Every dashboard route that could release a gate calls this, so the audit
+    trail names the exact route refused rather than recording only the DB-layer
+    verbs. Uses the same ``gate_release_refused`` event kind as kanban_db.
+    """
+    gate = _gate_state(conn, task_id)
+    if not gate:
+        return None
+    try:
+        kanban_db.record_gate_release_refusal(
+            conn, task_id, via=via, gate_state=gate
+        )
+    except Exception:
+        # Auditing must never turn a refusal into a 500. The refusal itself
+        # is what matters; a lost audit row is logged by the caller's response.
+        pass
+    return gate
+
+
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
@@ -1136,10 +1225,20 @@ def _set_status_direct(
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock "
+            "SELECT status, current_run_id, worker_pid, claim_lock, gate_state "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        # A drag-drop must never release a human approval gate. This is the raw
+        # status writer, reachable from the todo/triage/scheduled/ready
+        # branches, so the check belongs here as well as at the endpoint.
+        if prev is not None and _row_get(prev, "gate_state"):
+            kanban_db.record_gate_release_refusal(
+                conn, task_id,
+                via="dashboard_set_status_direct",
+                gate_state=_row_get(prev, "gate_state"),
+            )
+            return False
         if prev is None:
             return False
 
@@ -1285,6 +1384,19 @@ def delete_link(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # Removing an edge whose parent is gated releases the child without
+        # human approval. The parent is present and gated, not missing, so this
+        # is a conflict rather than a silent no-op.
+        gate = _refuse_gated(conn, parent_id, via="dashboard_unlink")
+        if gate:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Parent task is awaiting human {gate} approval; its "
+                    f"dependency edges cannot be removed. Approve or reject "
+                    f"the {gate} to release it."
+                ),
+            )
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
         return {"ok": bool(ok)}
     finally:
@@ -1331,6 +1443,17 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         for tid in ids:
             entry: dict[str, Any] = {"id": tid, "ok": True}
             try:
+                # Bulk actions do not reuse the PATCH handler, so the gate
+                # refusal is repeated here. A multi-select must not be able to
+                # do what a single drag cannot.
+                _bulk_gate = _refuse_gated(conn, tid, via="dashboard_bulk")
+                if _bulk_gate:
+                    entry.update(
+                        ok=False,
+                        error=f"awaiting human {_bulk_gate} approval",
+                    )
+                    results.append(entry)
+                    continue
                 task = kanban_db.get_task(conn, tid)
                 if task is None:
                     entry.update(ok=False, error="not found")

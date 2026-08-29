@@ -298,6 +298,55 @@ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 
+# Set once the worker's run has been stamped with its session, so the bind is
+# a one-shot per process without being rate-limited into a 60s delay.
+_session_bound_run_ids: set = set()
+
+
+def bind_worker_session_from_env() -> bool:
+    """Stamp ``task_runs.session_id`` for this worker's own run. Best-effort.
+
+    This is the cost JOIN KEY: with ``task_runs.profile`` it resolves to that
+    profile's ``state.db.session_model_usage``, where token and cost figures
+    already live. Called on every agent activity tick, but it writes at most
+    once per run per process, and the write itself is idempotent — a second
+    call is a no-op, so a retry can never corrupt the key.
+
+    It can never stamp a sibling run: ``_worker_run_id`` returns a run id only
+    when ``HERMES_KANBAN_RUN_ID`` belongs to the task this worker was spawned
+    for, and the UPDATE is keyed on that run id.
+
+    Emitting the run-linked routing record is deliberately NOT done here — it
+    belongs at the run's terminal point, where the outcome and the usage join
+    are actually known.
+    """
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return False
+    run_id = _worker_run_id(tid)
+    if run_id is None or run_id in _session_bound_run_ids:
+        return False
+    session_id = os.environ.get("HERMES_SESSION_ID")
+    if not session_id:
+        # The session is not bound yet. Return without marking the run done,
+        # so the next tick retries rather than losing the key for this run.
+        return False
+    try:
+        kb, conn = _connect()
+        try:
+            stored = kb.record_run_session_id(
+                conn, run_id, session_id, task_id=tid,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("session bind: failed", exc_info=True)
+        return False
+    if stored:
+        _session_bound_run_ids.add(run_id)
+    return stored
+
+
 def heartbeat_current_worker_from_env() -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
@@ -652,6 +701,19 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+def _drain_routing_outbox(kb, conn) -> None:
+    """Project any pending terminal routing record. Never raises.
+
+    Hangs off the worker's own terminal tool calls, which are the production
+    path a routed run actually ends through, so the record reaches its log
+    without anyone invoking a projector by hand.
+    """
+    try:
+        kb.drain_routing_outbox(conn)
+    except Exception:
+        logger.debug("routing outbox drain failed", exc_info=True)
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -804,6 +866,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            # The terminal write has committed; project its routing record.
+            _drain_routing_outbox(kb, conn)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -880,6 +944,7 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
+            _drain_routing_outbox(kb, conn)
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -2352,6 +2417,188 @@ KANBAN_LINK_SCHEMA = {
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# PM tools — project rows and plan revisions
+# ---------------------------------------------------------------------------
+#
+# Drafting a plan is not approving one. These two tools write the artifacts a
+# human gate is *about*; nothing here changes a task status, clears
+# ``gate_state``, or writes ``pm_approvals``. Crossing a plan gate requires an
+# ``Attestation``, and no authenticated approval surface ships today that can
+# mint one: ``resolve_plan_approval_adapter()`` returns ``None`` and
+# ``for_plan_decision()`` raises on every call — see
+# hermes_cli/approval_broker.py. Nothing shipped parks a task at a gate
+# either; ``park_for_plan_approval`` has no production caller.
+#
+# The wording below is load-bearing, not decoration. The same orchestrator that
+# reads these strings also carries ``PM_PLAN_GATE_GUIDANCE``, which says no
+# approval surface ships. Describing *how* a human approves would contradict
+# it, and a capable model resolves that contradiction by going to look for the
+# surface. ``tests/agent/test_pm_surface_contract.py`` holds the three surfaces
+# — prompt, schema, tool result — to one story.
+#
+# They are orchestrator-scoped (``_check_kanban_orchestrator_mode``): a
+# dispatcher-spawned worker closes its own task and has no business authoring
+# the project's plan. Delegated children are refused twice — by the check_fn
+# and again at the handler.
+
+PROJECT_ENSURE_SCHEMA = {
+    "name": "project_ensure",
+    "description": (
+        "Create or fetch a project row (id, name, current plan revision). "
+        "Idempotent: calling it again returns the existing row and never "
+        "renames it. Call this before plan_submit. This does NOT create tasks "
+        "and does not approve anything."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "project_id": {
+                "type": "string",
+                "description": "Stable project identifier, e.g. 'billing-v2'.",
+            },
+            "name": {
+                "type": "string",
+                "description": (
+                    "Human-readable name. Used ONLY when the project is "
+                    "created; an existing project is never renamed here."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["project_id"],
+    },
+}
+
+PLAN_SUBMIT_SCHEMA = {
+    "name": "plan_submit",
+    "description": (
+        "Record the next plan revision for a project and make it current. "
+        "Drafting is not approving: this writes an artifact and touches no "
+        "task, status, or gate. The revision is recorded for a human operator, "
+        "and for any approval adapter built later, to read — no authenticated "
+        "approval surface ships today, so nothing you can reach approves it. "
+        "Submitting a new revision supersedes the previous one, and a release "
+        "binds to one (project, revision) pair, so a superseded revision can "
+        "never be released."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "project_id": {
+                "type": "string",
+                "description": "Project id. Must already exist (project_ensure).",
+            },
+            "body": {
+                "type": "string",
+                "description": "The full plan text. Markdown is supported.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["project_id", "body"],
+    },
+}
+
+
+def _pm_actor() -> str:
+    """Display label for who drafted a plan. NOT an identity boundary.
+
+    Hermes runs as the same OS user as its agents, so this is provenance for a
+    human reader, exactly like ``pm_approvals.operator_display``.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return str(get_active_profile_name() or "default")
+    except Exception:
+        return os.environ.get("HERMES_PROFILE") or "default"
+
+
+def _handle_project_ensure(args: dict, **kw) -> str:
+    denial = _reject_delegated_child_mutation("project_ensure")
+    if denial:
+        return denial
+    project_id = str(args.get("project_id") or "").strip()
+    if not project_id:
+        return tool_error("project_ensure requires a non-empty project_id.")
+    name = args.get("name")
+    name = str(name).strip() if isinstance(name, str) and name.strip() else None
+
+    kb, conn = _connect(args.get("board"))
+    try:
+        row = kb.ensure_pm_project(conn, project_id=project_id, name=name)
+    except Exception as exc:
+        return tool_error(f"project_ensure failed: {exc}")
+    finally:
+        conn.close()
+    return _ok(
+        project_id=row["id"],
+        name=row["name"],
+        plan_revision=row["plan_revision"],
+    )
+
+
+def _handle_plan_submit(args: dict, **kw) -> str:
+    denial = _reject_delegated_child_mutation("plan_submit")
+    if denial:
+        return denial
+    project_id = str(args.get("project_id") or "").strip()
+    if not project_id:
+        return tool_error("plan_submit requires a non-empty project_id.")
+    body = args.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return tool_error(
+            "plan_submit requires a non-empty body: the full plan text."
+        )
+
+    kb, conn = _connect(args.get("board"))
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM pm_projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if exists is None:
+            return tool_error(
+                f"plan_submit: project {project_id!r} does not exist. "
+                f"Call project_ensure first."
+            )
+        plan = kb.submit_plan(
+            conn, project_id=project_id, body=body, proposed_by=_pm_actor(),
+        )
+    except Exception as exc:
+        return tool_error(f"plan_submit failed: {exc}")
+    finally:
+        conn.close()
+    return _ok(
+        project_id=plan["project_id"],
+        revision=plan["revision"],
+        proposed_by=plan["proposed_by"],
+        note=(
+            "Recorded for operator review. No authenticated approval surface "
+            "ships today: no tool, CLI command, or profile approves this "
+            "revision, and approval is never an agent's step. Do not poll or "
+            "resubmit — move on to work that is not blocked."
+        ),
+    )
+
+
+registry.register(
+    name="project_ensure",
+    toolset="kanban",
+    schema=PROJECT_ENSURE_SCHEMA,
+    handler=_handle_project_ensure,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="📁",
+)
+
+registry.register(
+    name="plan_submit",
+    toolset="kanban",
+    schema=PLAN_SUBMIT_SCHEMA,
+    handler=_handle_plan_submit,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="📝",
+)
 
 registry.register(
     name="kanban_show",

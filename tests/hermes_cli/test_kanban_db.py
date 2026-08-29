@@ -843,6 +843,9 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
+        # The workspace must exist: dispatch_preflight refuses rather than
+        # letting the worker inherit the dispatcher's directory.
+        (tmp_path / "ws").mkdir()
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]

@@ -176,6 +176,11 @@ gateway:
     subscribed_suffix:     "(subscribed — you'll be notified when {task_id} completes or blocks)"
     truncated_suffix:      "… (truncated; use `hermes kanban …` in your terminal for full output)"
     no_output:             "(no output)"
+    gate:
+      plan_awaiting_approval: "awaiting a human plan decision ({plan}) — an agent cannot cross this gate"
+      plan_approved:          "plan {plan} approved by {operator} → landing in {landing}"
+      plan_rejected:          "plan {plan} rejected by {operator} → routed to triage"
+      gate_release_refused:   "refused an attempt to release the {gate} gate via {via}"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

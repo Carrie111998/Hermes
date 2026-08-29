@@ -134,6 +134,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Human approval gates. A gated task is parked in the EXISTING ``scheduled``
+# status (already non-dispatchable) with ``tasks.gate_state`` set, so no new
+# status is added to VALID_STATUSES and none of the literal status guards
+# throughout this module change. ``gate_state IS NULL`` is an ordinary
+# time-parked ``scheduled`` task and behaves exactly as before.
+VALID_GATE_STATES = {"plan", "deploy"}
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1474,7 +1481,46 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Absolute directory the worker was actually launched in. Recorded at
+    -- spawn so confinement is auditable after the fact, not only asserted at
+    -- launch. NULL for runs that predate the column and for synthetic runs
+    -- (no process was started).
+    observed_cwd        TEXT,
+    -- The agent session that produced this run. With ``profile`` this is the
+    -- JOIN KEY into that profile's ``state.db.session_model_usage``, where
+    -- token counts and cost already live. Nothing here recomputes them.
+    session_id          TEXT
+);
+
+-- Terminal routing records staged INSIDE the transaction that ends a run, and
+-- projected to ``logs/routing.jsonl`` only after that transaction commits.
+--
+-- A JSONL append is an external side effect: it cannot roll back with SQLite.
+-- Writing it from inside ``_end_run`` meant a later failure in the same
+-- transaction rolled the run back to active while the log permanently claimed
+-- it had completed. Staging here makes the record share the run's fate.
+--
+-- ``run_id`` is UNIQUE so a retried terminal path stages once, and
+-- ``projected_at`` is the claim: a projector marks rows only after their lines
+-- are written, inside one BEGIN IMMEDIATE so concurrent projectors serialize.
+CREATE TABLE IF NOT EXISTS routing_outbox (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL UNIQUE,
+    -- The profile that OWNS this record. The board is shared, so whichever
+    -- process drains the outbox must still write to the originating profile's
+    -- log; a name (never a path) is stored so a payload can never redirect a
+    -- write somewhere of its choosing.
+    profile        TEXT,
+    payload        TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    projected_at   INTEGER,
+    -- Committed evidence that cannot be projected (unreadable payload,
+    -- unresolvable profile) is quarantined rather than deleted or replaced by
+    -- a synthetic "record". It stops blocking later rows and stays available
+    -- for an operator.
+    quarantined_at INTEGER,
+    error          TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1524,6 +1570,103 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- ---------------------------------------------------------------------
+-- Project-manager layer (plan gate). Additive: a board that never creates
+-- a pm_projects row behaves exactly as it did before these tables existed.
+--
+-- These live in kanban.db, NOT in the per-profile projects.db, because the
+-- approval transaction must be atomic with the task rows it materialises and
+-- because every profile's worker must read the same rows. projects.db stays
+-- the per-profile *workspace* store and gains only a pointer.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pm_projects (
+    id                TEXT PRIMARY KEY,
+    slug              TEXT NOT NULL UNIQUE,
+    name              TEXT NOT NULL,
+    parent_project_id TEXT,
+    objective         TEXT,
+    success_criteria  TEXT,          -- JSON array
+    lifecycle_status  TEXT,          -- NULL (legacy) | planning | awaiting_plan_approval | active | done | archived
+    plan_revision     INTEGER NOT NULL DEFAULT 0,
+    aliases           TEXT,          -- JSON array, for natural-language resolution
+    primary_repo_path TEXT,
+    obsidian_rel_path TEXT,
+    vault_state       TEXT,
+    archived          INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+
+-- One immutable row per plan revision. A rejected revision is never edited;
+-- the PM proposes revision N+1.
+CREATE TABLE IF NOT EXISTS pm_plans (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    body          TEXT NOT NULL,
+    proposed_by   TEXT,
+    proposed_at   INTEGER NOT NULL,
+    root_task_id  TEXT,
+    approved_by   TEXT,
+    approved_at   INTEGER,
+    rejected_at   INTEGER,
+    reject_reason TEXT,
+    UNIQUE (project_id, revision)
+);
+
+-- Append-only attestation ledger. Written in the SAME transaction as the state
+-- change it authorises, so a bare status flip with no approval row is
+-- impossible. UNIQUE(subject, binding_hash) is the replay defence.
+--
+-- operator_display is a human-readable label ONLY. It is NOT an identity
+-- boundary: Hermes runs as the same OS user as its agents, so this column
+-- records who the operator claims to be, not who they are proven to be.
+--
+-- ASSURANCE STATEMENT (canonical — see approval_broker.ASSURANCE_STATEMENT)
+--
+-- Hermes approval gates are an integrity control, not a security boundary
+-- against arbitrary code execution as your own user account.
+--
+-- Hermes workers run as the same OS user as you, with terminal and filesystem
+-- access. Any process running as that user can read the credentials on disk.
+-- Approval gates therefore provide strong, tested protection against:
+--
+-- - a worker or agent approving its own plan (accidental self-approval),
+-- - approval reached through ordinary tool invocation, on any surface,
+-- - prompt injection that emits an approval command,
+-- - approval of a stale plan whose text has since changed,
+-- - replay of a previous approval,
+-- - confused-deputy approval of a different project or board.
+--
+-- They do not provide a cryptographic boundary against a deliberately
+-- adversarial process running as your user. Production deployment additionally
+-- requires an authenticated surface whose credentials are not deliberately
+-- exposed to workers, which raises the cost of bypass without eliminating it
+-- under full local compromise.
+--
+-- A genuine adversarial-agent boundary requires an independent security domain:
+-- separate OS identities, an external approval service the agent cannot reach,
+-- or hardware-backed confirmation. None of these is in Phase 1.
+CREATE TABLE IF NOT EXISTS pm_approvals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject          TEXT NOT NULL,
+    binding_hash     TEXT NOT NULL,
+    decision         TEXT NOT NULL,   -- approved | rejected
+    reason           TEXT,
+    operator_display TEXT,
+    os_user          TEXT,
+    os_uid           INTEGER,
+    host_id          TEXT,
+    tty_path         TEXT,
+    surface          TEXT,            -- 'cli-tty' in this slice
+    nonce            TEXT UNIQUE,
+    created_at       INTEGER NOT NULL,
+    UNIQUE (subject, binding_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pm_plans_proj  ON pm_plans(project_id, revision);
+CREATE INDEX IF NOT EXISTS idx_pm_appr_subj   ON pm_approvals(subject);
 """
 
 
@@ -2621,6 +2764,28 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+    if "gate_state" not in cols:
+        # Which human gate this task is parked at, or NULL when it is not
+        # gated. A gated task sits in the existing ``scheduled`` status, which
+        # is already non-dispatchable, so no new status is introduced and no
+        # existing status guard changes. ``gate_state`` is what distinguishes
+        # "waiting on a human" from "waiting on a clock".
+        _add_column_if_missing(conn, "tasks", "gate_state", "gate_state TEXT")
+
+    # Routing lane (M3A-ROUTING-POLICY §4.1): an explicit human or PM-agent
+    # choice recorded on the card, never inferred from prompt text. Additive
+    # and NULL by default, so a board that records no lane behaves exactly as
+    # it did before — the profile's own config decides, unchanged.
+    if "routing_lane" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "routing_lane", "routing_lane TEXT"
+        )
+
+    # Indexed here rather than in SCHEMA_SQL: on a legacy DB the column does not
+    # exist when SCHEMA_SQL runs, and CREATE INDEX over a missing column aborts
+    # initialization. Same reason idx_tasks_tenant / idx_tasks_session_id live
+    # in this function.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_gate ON tasks(gate_state)")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -2710,6 +2875,61 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    # task_runs gained observed_cwd: the directory the worker was actually
+    # launched in. Historical runs get NULL — the value was never captured and
+    # must not be guessed, because the whole point of the column is that the
+    # launch directory is recorded rather than assumed.
+    # Guarded on the table's existence: a legacy DB predating task_runs
+    # entirely would otherwise take an ALTER on a table that is not there.
+    # PRAGMA table_info returns no rows for a missing table, so the column
+    # check alone cannot tell "absent table" from "absent column".
+    has_runs = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone()
+    if has_runs:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "observed_cwd" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "observed_cwd", "observed_cwd TEXT"
+            )
+        # Same shape, same reason: the session that produced a run is the join
+        # key for its cost. Historical runs get NULL — the value was never
+        # captured and guessing it would fabricate an accounting join.
+        if "session_id" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "session_id", "session_id TEXT"
+            )
+
+    has_outbox = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='routing_outbox'"
+    ).fetchone()
+    if has_outbox:
+        outbox_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(routing_outbox)")
+        }
+        for col, decl in (
+            ("profile", "profile TEXT"),
+            ("quarantined_at", "quarantined_at INTEGER"),
+            ("error", "error TEXT"),
+        ):
+            if col not in outbox_cols:
+                _add_column_if_missing(conn, "routing_outbox", col, decl)
+        # Partial index for the projector's hot query
+        #   WHERE projected_at IS NULL AND quarantined_at IS NULL ORDER BY id
+        # Created HERE rather than in SCHEMA_SQL because a legacy outbox lacks
+        # both columns when SCHEMA_SQL runs, and CREATE INDEX over a missing
+        # column aborts initialization. Partial, so it only ever holds the
+        # pending rows: projected and quarantined history stays on disk without
+        # growing the index or the per-tick scan.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_routing_outbox_pending "
+            "ON routing_outbox(id) "
+            "WHERE projected_at IS NULL AND quarantined_at IS NULL"
+        )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -2887,7 +3107,12 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        # observed_cwd (commit-7 confinement evidence) and session_id (the
+        # cost join key) were absent here while present in SCHEMA_SQL, so a
+        # drift rebuild silently DROPPED both and their data. The copy is
+        # ``old ∩ new``: every column a fresh board has must appear here.
+        # test_rebuilt_schema_matches_fresh now enforces that for every table.
+        " error TEXT, observed_cwd TEXT, session_id TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -3892,7 +4117,24 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    """Remove a dependency edge.
+
+    Refuses while the PARENT is parked at a human approval gate. Removing that
+    edge is a gate release by another name: the parent stays gated but stops
+    blocking the child, and the ``recompute_ready`` below then promotes the
+    child if this was its last blocking dependency — with no human approval.
+
+    POLICY — a gated CHILD's edges are deliberately NOT frozen (see the route
+    inventory in ``M3B-SLICE-1-RESULT.md``). Editing them cannot release
+    anything: the child remains gated either way, and ``release_plan_gate``
+    re-evaluates ``_parents_satisfied`` at approval time, so the human's
+    decision is applied against the graph as it stands when they approve. The
+    calculus changes only once an attestation binds the task graph rather than
+    the plan text; at that point both directions should freeze.
+    """
     with write_txn(conn):
+        if _refuse_if_gated(conn, parent_id, via="unlink_tasks"):
+            return False
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -4332,6 +4574,240 @@ def _append_event(
     )
 
 
+def _stage_terminal_routing_record(
+    conn: sqlite3.Connection, task_id: str, run_id: int, outcome: str,
+) -> None:
+    """Append the run-linked routing record when the task declared a lane.
+
+    M3A-ROUTING-POLICY §4.3: every substantial routed run appends one line to
+    ``logs/routing.jsonl``. This is that line, and it is written at the run's
+    terminal point because that is where the outcome and the usage join are
+    both known.
+
+    Token and cost figures are **joined, never recomputed**: the run's
+    ``session_id`` (stamped at worker bind) resolves against this profile's
+    ``state.db.session_model_usage``. When the join is unavailable the record
+    still lands with ``cost_status: "unavailable"`` — a routed run with no
+    numbers is more honest than a routed run with invented ones.
+
+    Best-effort throughout: a record must never fail the run it describes.
+    """
+    try:
+        row = conn.execute(
+            "SELECT t.routing_lane AS lane, t.project_id AS project_id, "
+            "       r.profile AS profile, r.session_id AS session_id, "
+            "       r.started_at AS started_at, r.ended_at AS ended_at "
+            "  FROM tasks t JOIN task_runs r ON r.id = ? "
+            " WHERE t.id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if row is None or not row["lane"]:
+            return
+        runtime = None
+        if row["started_at"] and row["ended_at"]:
+            runtime = int(row["ended_at"]) - int(row["started_at"])
+
+        from hermes_cli import routing_audit
+
+        usage = routing_audit.usage_for_session(row["session_id"] or "")
+        payload = {
+            "task_id": task_id,
+            "project_id": row["project_id"],
+            "lane": row["lane"],
+            "run_ref": f"task_run:{run_id}",
+            "session_id": row["session_id"],
+            "profile": row["profile"],
+            "outcome": outcome,
+            "runtime_seconds": runtime,
+        }
+        if usage:
+            payload.update(usage)
+        else:
+            payload["cost_status"] = "unavailable"
+        # Staged in the CALLER's transaction, so it commits or rolls back with
+        # the run it describes. INSERT OR IGNORE on the UNIQUE run_id makes a
+        # retried terminal path stage exactly once.
+        conn.execute(
+            "INSERT OR IGNORE INTO routing_outbox "
+            "(run_id, profile, payload, created_at) VALUES (?, ?, ?, ?)",
+            (run_id, row["profile"],
+             json.dumps(payload, ensure_ascii=False, default=str),
+             int(time.time())),
+        )
+    except Exception:
+        # Never raise out of a run's terminal path for an audit record.
+        pass
+
+
+# SQLite's INTEGER is 64-bit. A value outside that range did not come from a
+# real identifier, and printing it would only widen the log line.
+_MIN_DIAG_ID = -(2 ** 63)
+_MAX_DIAG_ID = 2 ** 63 - 1
+
+
+def _diag_id(value: Any) -> "int | str":
+    """An outbox identifier safe to interpolate into a log line.
+
+    A total function: a genuine in-range integer is returned as itself, and
+    everything else is the fixed marker ``"?"``.
+
+    It does not coerce, because coercion is what broke. The columns are
+    declared INTEGER, but SQLite is dynamically typed and the outbox is
+    same-user writable, so a row can hold a REAL, TEXT or BLOB id.
+    ``int(float("inf"))`` raises ``OverflowError`` — which the previous
+    ``except (TypeError, ValueError)`` did not catch, so it escaped this
+    helper, rolled the projector's transaction back, and left the entire batch
+    pending behind the poisoned row on every future drain.
+
+    ``type(value) is int`` rather than ``isinstance``: it excludes ``bool``,
+    which is an ``int`` in Python but never a record identity, and it excludes
+    ``int`` subclasses, whose ``__str__`` we would otherwise call during
+    formatting. Nothing here invokes a conversion or formatting hook on the
+    value, so a hostile scalar has no way to run code or raise.
+    """
+    if type(value) is int and _MIN_DIAG_ID <= value <= _MAX_DIAG_ID:
+        return value
+    return "?"
+
+
+def _diag_warn(message: str, *args: Any) -> None:
+    """Emit a quarantine diagnostic that can never undo the quarantine.
+
+    The ``UPDATE`` recording the quarantine has already run inside the open
+    transaction. A failure in the logging stack — a broken handler, a full
+    disk — must not roll that back and re-poison the queue head, which is the
+    failure mode this correction exists to repair.
+    """
+    try:
+        _log.warning(message, *args)
+    except Exception:
+        pass
+
+
+def project_routing_outbox(
+    conn: sqlite3.Connection, *, limit: int = 50,
+) -> int:
+    """Write staged terminal routing records to their owners' logs.
+
+    Runs AFTER the staging transaction has committed, so a line can only
+    describe a run that really ended. Called from the production paths that
+    follow a terminal write — the worker's kanban tools, the ``hermes kanban``
+    CLI, and every dispatcher tick — so a completed routed run reaches its log
+    without anyone invoking a helper by hand, and a gateway restart drains
+    whatever an earlier process left pending.
+
+    **Each record goes to its OWNING profile's log**, resolved from the profile
+    NAME recorded at staging time. The board is shared: a PM or default process
+    draining it must not divert a coder's accounting into its own log, and a
+    payload must never be able to name an output path.
+
+    **Committed evidence is never destroyed.** A payload that cannot be parsed,
+    or a profile that cannot be resolved, is *quarantined* — marked with the
+    reason, left out of future batches so it cannot block later valid records,
+    and still there for an operator. It is never replaced by a synthetic
+    "record" and never counted as a success.
+
+    The claim-and-write happens inside one ``BEGIN IMMEDIATE``: concurrent
+    projectors serialize, and a failed write rolls the claim back so a log
+    outage retries rather than loses. Returns the number of records written.
+
+    Best-effort by contract: never raises, so draining can hang off ordinary
+    board activity without becoming a new failure mode.
+    """
+    from hermes_cli import routing_audit
+
+    written = 0
+    try:
+        with write_txn(conn):
+            rows = conn.execute(
+                "SELECT id, run_id, profile, payload FROM routing_outbox "
+                " WHERE projected_at IS NULL AND quarantined_at IS NULL "
+                " ORDER BY id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            if not rows:
+                return 0
+            now = int(time.time())
+            projected: list = []
+            for row in rows:
+                try:
+                    fields = json.loads(row["payload"])
+                    if not isinstance(fields, dict):
+                        raise ValueError("payload is not an object")
+                    # Underscore-prefixed names are this module's private
+                    # channel to the writer (``_log_path``). A stored payload
+                    # must not be able to occupy one — neither to redirect the
+                    # write nor to collide with the keyword and stall the batch.
+                    fields = {k: v for k, v in fields.items()
+                              if not str(k).startswith("_")}
+                except (ValueError, TypeError) as exc:
+                    conn.execute(
+                        "UPDATE routing_outbox SET quarantined_at = ?, error = ? "
+                        " WHERE id = ?",
+                        (now, f"unreadable payload: {type(exc).__name__}",
+                         row["id"]),
+                    )
+                    _diag_warn(
+                        "routing outbox: quarantined record %s (run %s): "
+                        "payload is unreadable",
+                        _diag_id(row["id"]), _diag_id(row["run_id"]),
+                    )
+                    continue
+                destination, reason = routing_audit.resolve_profile_log_owner(
+                    row["profile"]
+                )
+                if destination is None:
+                    # Neither sink repeats the rejected owner. It is untrusted
+                    # input — a credential shape and a local path both fit
+                    # inside any length bound — and both the quarantine column
+                    # and the application log are persistent. A stable reason
+                    # code plus the record and run ids says what happened; the
+                    # value stays only in the row's own ``profile`` column,
+                    # where recovery needs it and no diagnostic reader lands
+                    # by accident.
+                    code = reason or routing_audit.OWNER_UNRESOLVABLE
+                    conn.execute(
+                        "UPDATE routing_outbox SET quarantined_at = ?, error = ? "
+                        " WHERE id = ?",
+                        (now, code, row["id"]),
+                    )
+                    _diag_warn(
+                        "routing outbox: quarantined record %s (run %s): %s",
+                        _diag_id(row["id"]), _diag_id(row["run_id"]), code,
+                    )
+                    continue
+                if not routing_audit.record_routing_decision(
+                    record_id=row["id"], _log_path=destination, **fields
+                ):
+                    # The log is unavailable. Abort the whole claim so every
+                    # row in this batch — including the quarantines above — is
+                    # reconsidered later.
+                    raise RuntimeError("routing log unavailable")
+                projected.append(row["id"])
+                written += 1
+            if projected:
+                conn.execute(
+                    "UPDATE routing_outbox SET projected_at = ? "
+                    " WHERE id IN (%s)" % ",".join("?" * len(projected)),
+                    [now, *projected],
+                )
+    except Exception:
+        return 0
+    return written
+
+
+def drain_routing_outbox(conn: sqlite3.Connection) -> int:
+    """Production hook: project anything pending. Never raises, never blocks.
+
+    Attached to the paths that follow a committed terminal write. Kept separate
+    from :func:`project_routing_outbox` so the call sites read as what they are
+    — opportunistic recovery, not part of the operation they follow.
+    """
+    try:
+        return project_routing_outbox(conn)
+    except Exception:
+        return 0
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4386,6 +4862,11 @@ def _end_run(
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
+    # The run's terminal point: outcome is known and the session key is
+    # stamped, so the run-linked routing record can be joined and written.
+    # Emitted only for a task that declared a lane (§4.3), and never allowed
+    # to fail the run it describes.
+    _stage_terminal_routing_record(conn, task_id, run_id, outcome)
     return run_id
 
 
@@ -6911,9 +7392,24 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, gate_state FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        # A task parked at a HUMAN APPROVAL GATE must not be released by the
+        # ordinary resume path. ``unblock_task`` is reachable from the CLI, the
+        # ``/kanban unblock`` slash command, cron automation, and the dashboard
+        # — none of which carries proof of human approval. The only way out of
+        # a gate is ``release_plan_gate``.
+        #
+        # This lives at the DB layer on purpose: the tool and dashboard guards
+        # above it are UX, not trust boundaries. Anything that reaches this
+        # function — including a worker shelling out to the CLI — is refused.
+        if current is not None and current["gate_state"]:
+            record_gate_release_refusal(
+                conn, task_id,
+                via="unblock_task", gate_state=current["gate_state"],
+            )
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -7523,6 +8019,12 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        # A gated task must not become terminal. ``archived`` counts as
+        # satisfied in ``_parents_satisfied``, so archiving a gated PARENT
+        # would let ``recompute_ready`` (called at the end of this function)
+        # advance its children without the human approval the gate requires.
+        if _refuse_if_gated(conn, task_id, via="archive_task"):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7564,6 +8066,12 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        # Defence in depth. A correctly gated task stays ``scheduled`` and can
+        # never reach this function, but a legacy, hand-edited, or corrupted
+        # archived row that still carries ``gate_state`` must not be purgeable
+        # either — purging it would silently drop the gate along with the row.
+        if _refuse_if_gated(conn, task_id, via="delete_archived_task"):
+            return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -7587,6 +8095,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        # Deleting a gated task drops its task_links rows, so its children stop
+        # being gated at all, and the recompute_ready below then advances them.
+        # That is the same bypass as archiving, by a more destructive route.
+        if _refuse_if_gated(conn, task_id, via="delete_task"):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -7968,6 +8481,710 @@ def schedule_task(
         return True
 
 
+# ---------------------------------------------------------------------------
+# Human approval gates (Option B: scheduled-parking + gate_state)
+# ---------------------------------------------------------------------------
+#
+# A gated task parks in the EXISTING ``scheduled`` status — already documented
+# as "intentionally not dispatchable" — with ``tasks.gate_state`` set. No new
+# status is introduced, so none of the literal status guards in this module
+# change, and a downgrade to a Hermes without this slice simply sees an
+# ordinary time-parked ``scheduled`` task that ``unblock_task`` can recover.
+#
+# The gate holds because of properties this module already has:
+#   * ``claim_task`` selects ``WHERE ... status = 'ready'`` — a parked task can
+#     never be claimed, so no worker is ever spawned on one.
+#   * ``recompute_ready`` reads ``status IN ('todo', 'blocked')`` — ``scheduled``
+#     is absent, so a gated task is never auto-promoted.
+#   * ``_parents_satisfied`` requires ``status IN ('done', 'archived')`` — a
+#     gated PARENT therefore does not satisfy its children's dependencies.
+#   * nothing auto-releases on ``scheduled_at``.
+#
+# AUTHORITY NOTE — READ BEFORE DESCRIBING THIS AS A CONTROL.
+#
+# ``release_plan_gate`` requires an ``Attestation`` produced by
+# ``hermes_cli.approval_broker``. That object binds a decision to one plan
+# revision's exact bytes, is single-use, and expires — and every one of those
+# properties is enforced here, inside this transaction.
+#
+# It is NOT an authentication boundary, and this gate must not be described as
+# one. No authenticated approval adapter ships, so the sanctioned surface
+# refuses every request. Beyond that:
+#
+#   * same-user Python can call ``issue_attestation_for_adapter`` directly, or
+#     monkeypatch the adapter seam, and mint an attestation this function will
+#     accept;
+#   * same-user processes can modify this database directly and clear
+#     ``gate_state`` without calling anything here at all.
+#
+# What this gate provides is COOPERATIVE WORKFLOW INTEGRITY: an agent following
+# the sanctioned path cannot advance a gated task, cannot replay or re-target an
+# approval, and cannot approve a plan whose text has since changed — and every
+# refusal is audited. It is not enforcement against arbitrary same-user code.
+#
+# A secure boundary requires the authoritative state and the authentication to
+# live outside the agent-writable trust domain — a separately authenticated
+# remote service, or a separate operating-system identity. See
+# ``planning/APPROVAL-SURFACE-DESIGN-NOTE.md``.
+#
+# The DB-layer guard below still refuses delegated-child callers, matching every
+# other mutator here.
+
+
+def _audit_gate_refusal(
+    conn: sqlite3.Connection, task_id: str, reason: str
+) -> None:
+    """Record a refused gate release in its own transaction.
+
+    Separate from the release txn on purpose: a post-write failure rolls that
+    transaction back, which would take the audit row with it. Never records the
+    attestation nonce — events are user-facing and the nonce is single-use
+    secret material.
+    """
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "gate_release_refused",
+                {"via": "release_plan_gate", "reason": reason},
+            )
+    except Exception:
+        # Auditing must never turn a refusal into an exception for the caller.
+        pass
+
+
+class _GateReleaseAborted(Exception):
+    """Internal: abort a gate release so ``write_txn`` rolls the whole thing back.
+
+    Returning ``False`` from inside ``write_txn`` COMMITS the transaction. Any
+    failure discovered after a write must therefore raise, not return, or the
+    partial state becomes durable — which is exactly how a replayed attestation
+    once released a gate while reporting that it had refused it.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def gate_state_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the task's ``gate_state``, or ``None`` when it is not gated."""
+    row = conn.execute(
+        "SELECT gate_state FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return row["gate_state"] if row else None
+
+
+def record_gate_release_refusal(
+    conn: sqlite3.Connection, task_id: str, *, via: str, gate_state: str
+) -> None:
+    """Append the audit row for a refused gate release.
+
+    One helper so every refusing path — DB verbs and the dashboard alike —
+    emits the same ``gate_release_refused`` event kind with a ``via`` tag
+    naming the route that was refused. Callers inside a ``write_txn`` get the
+    row in their own transaction; the dashboard calls it standalone.
+    """
+    _append_event(
+        conn, task_id, "gate_release_refused",
+        {"via": via, "gate_state": gate_state},
+    )
+
+
+def _refuse_if_gated(
+    conn: sqlite3.Connection, task_id: str, *, via: str
+) -> bool:
+    """True (and audited) when ``task_id`` is parked at a human approval gate.
+
+    Every terminal or destructive verb calls this. A gate is only worth having
+    if NO ordinary path can make a gated task terminal, gone, or otherwise
+    stop blocking its children: archiving a gated parent would let
+    ``recompute_ready`` advance its children, and deleting one would drop the
+    dependency links entirely. Both bypass the human approval the gate exists
+    to require.
+    """
+    row = conn.execute(
+        "SELECT gate_state FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["gate_state"]:
+        return False
+    record_gate_release_refusal(
+        conn, task_id, via=via, gate_state=row["gate_state"]
+    )
+    return True
+
+
+def ensure_pm_project(
+    conn: sqlite3.Connection, *, project_id: str, name: Optional[str] = None,
+) -> dict:
+    """Return the ``pm_projects`` row for *project_id*, creating it if absent.
+
+    Requesting a project is not crossing a gate, so this is safe for a PM agent
+    to call. Idempotent: a second call with the same id returns the existing
+    row untouched — the name is never silently rewritten, because the row's
+    ``plan_revision`` is the authority ``release_plan_gate`` checks against and
+    quietly mutating a project record around it would be surprising.
+    """
+    _assert_not_delegated_child_mutation()
+    pid = str(project_id or "").strip()
+    if not pid:
+        raise ValueError("project_id is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, slug, name, plan_revision FROM pm_projects WHERE id = ?",
+            (pid,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO pm_projects (id, slug, name, plan_revision, "
+                " lifecycle_status, created_at) "
+                "VALUES (?, ?, ?, 0, 'planning', ?)",
+                (pid, pid, (name or pid).strip() or pid, int(time.time())),
+            )
+            row = conn.execute(
+                "SELECT id, slug, name, plan_revision FROM pm_projects "
+                "WHERE id = ?", (pid,),
+            ).fetchone()
+    return dict(row)
+
+
+def submit_plan(
+    conn: sqlite3.Connection, *, project_id: str, body: str,
+    proposed_by: Optional[str] = None,
+) -> dict:
+    """Record the next plan revision for a project. Returns the new row.
+
+    Drafting a plan is not approving one: this writes an artifact and nothing
+    else. It never touches ``tasks.status`` or ``gate_state``, so a PM agent
+    may call it freely — parking the task at the gate is a separate step, and
+    crossing the gate is not available locally at all.
+
+    The insert and the ``pm_projects.plan_revision`` bump share one
+    ``write_txn``, and the revision is derived from the project row under that
+    lock rather than from a caller-supplied number. ``release_plan_gate``
+    refuses any revision that is not the project's current one, so two
+    concurrent drafts cannot both remain approvable.
+    """
+    _assert_not_delegated_child_mutation()
+    pid = str(project_id or "").strip()
+    if not pid:
+        raise ValueError("project_id is required")
+    text = body if isinstance(body, str) else ""
+    if not text.strip():
+        raise ValueError("a plan body is required")
+    with write_txn(conn):
+        proj = conn.execute(
+            "SELECT plan_revision FROM pm_projects WHERE id = ?", (pid,),
+        ).fetchone()
+        if proj is None:
+            raise ValueError(f"project {pid} not found")
+        revision = int(proj["plan_revision"] or 0) + 1
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO pm_plans (project_id, revision, body, proposed_by, "
+            " proposed_at) VALUES (?, ?, ?, ?, ?)",
+            (pid, revision, text, proposed_by, now),
+        )
+        bumped = conn.execute(
+            "UPDATE pm_projects SET plan_revision = ? "
+            "WHERE id = ? AND plan_revision = ?",
+            (revision, pid, revision - 1),
+        )
+        if bumped.rowcount != 1:
+            # Another writer advanced the project inside this transaction's
+            # window. Raising rolls the insert back with it, so a revision
+            # never outlives the bump that made it current.
+            raise ValueError("plan revision advanced concurrently; retry")
+    return {"project_id": pid, "revision": revision, "body": text,
+            "proposed_by": proposed_by, "proposed_at": now}
+
+
+def get_plan(
+    conn: sqlite3.Connection, project_id: str,
+    revision: Optional[int] = None,
+) -> Optional[dict]:
+    """Read one plan revision, or the project's current one. Read-only."""
+    pid = str(project_id or "").strip()
+    if not pid:
+        return None
+    if revision is None:
+        proj = conn.execute(
+            "SELECT plan_revision FROM pm_projects WHERE id = ?", (pid,),
+        ).fetchone()
+        if proj is None or not int(proj["plan_revision"] or 0):
+            return None
+        revision = int(proj["plan_revision"])
+    row = conn.execute(
+        "SELECT project_id, revision, body, proposed_by, proposed_at, "
+        " root_task_id, approved_by, approved_at, rejected_at, reject_reason "
+        "FROM pm_plans WHERE project_id = ? AND revision = ?",
+        (pid, int(revision)),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_gated_tasks(conn: sqlite3.Connection) -> list:
+    """Every task currently parked at a human gate. Read-only.
+
+    The one query a human needs to answer "what is waiting on me?" without
+    being able to act on the answer from here.
+    """
+    rows = conn.execute(
+        "SELECT id, title, assignee, status, gate_state, created_at "
+        "FROM tasks WHERE gate_state IS NOT NULL AND gate_state != '' "
+        "ORDER BY created_at DESC, id"
+    ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        ctx = plan_gate_context(conn, row["id"])
+        item["project_id"] = (ctx or {}).get("project_id")
+        item["revision"] = (ctx or {}).get("revision")
+        out.append(item)
+    return out
+
+
+def set_routing_lane(
+    conn: sqlite3.Connection, task_id: str, lane: Optional[str], *,
+    selected_by: Optional[str] = None,
+) -> bool:
+    """Record an explicit routing lane on a card. False when the task is unknown.
+
+    A lane is a **declared choice**, never an inference: M3b ships no
+    classifier (M3A-ROUTING-POLICY §4.2), so ``selection`` is always
+    ``manual``. Recording one changes nothing else — not status, not assignee,
+    not scheduling. Absent a lane the profile's own configuration decides
+    exactly as it does today, which is why a blank lane clears the column
+    rather than storing an empty string.
+
+    Emits a ``routing_decided`` task event so the decision reaches the board
+    timeline, and appends the same decision to ``logs/routing.jsonl``. The log
+    append is best-effort by design: losing an audit line must never fail the
+    board write it describes.
+    """
+    _assert_not_delegated_child_mutation()
+    normalized = str(lane).strip() if isinstance(lane, str) else None
+    if not normalized:
+        normalized = None
+    row = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, project_id, assignee, current_run_id FROM tasks "
+            "WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE tasks SET routing_lane = ? WHERE id = ?",
+            (normalized, task_id),
+        )
+        _append_event(
+            conn, task_id, "routing_decided",
+            {"lane": normalized, "selection": "manual",
+             "selected_by": selected_by, "project_id": row["project_id"]},
+            run_id=row["current_run_id"],
+        )
+
+    try:
+        from hermes_cli import routing_audit
+
+        routing_audit.record_routing_decision(
+            task_id=task_id,
+            project_id=row["project_id"],
+            lane=normalized,
+            selected_by=selected_by,
+            profile=row["assignee"],
+            run_ref=(f"task_run:{row['current_run_id']}"
+                     if row["current_run_id"] else None),
+        )
+    except Exception:
+        # Never raise out of the audit path — see routing_audit's docstring.
+        pass
+    # Opportunistic drain: any terminal record staged by an earlier run (or
+    # left behind by a log outage or a restart) reaches the log here.
+    project_routing_outbox(conn)
+    return True
+
+
+def record_run_session_id(
+    conn: sqlite3.Connection, run_id: Optional[int], session_id: Optional[str],
+    *, task_id: Optional[str] = None,
+) -> bool:
+    """Stamp the agent session that produced a run. **Set-once, verified.**
+
+    This is the cost join key: with ``task_runs.profile`` it resolves to that
+    profile's ``state.db.session_model_usage``, where the token and cost
+    figures already are. Nothing here recomputes them, and no part of the run's
+    own lifecycle state changes.
+
+    Two properties the first version did not have, both reproduced by review:
+
+    * **The relationship is verified in the database**, not inferred from
+      environment variables. A caller's ``task_id`` (when given) must match
+      ``task_runs.task_id``, the task's ``current_run_id`` must still be this
+      run, and the run must not have ended. A stale, reclaimed, superseded,
+      ended, or *sibling* run is refused — previously a worker holding one
+      task's id and another task's run id could stamp the sibling.
+    * **Set-once.** NULL may become the authoritative session. An identical
+      retry is idempotent and returns True. A *different* non-NULL session is
+      refused without mutation, because silently re-pointing the key moves a
+      run's whole accounting onto another transcript. The ``session_id IS
+      NULL`` guard inside ``BEGIN IMMEDIATE`` makes that atomic across
+      processes, so two competing binders yield exactly one winner.
+    """
+    if run_id is None:
+        return False
+    text = str(session_id).strip() if isinstance(session_id, str) else ""
+    if not text:
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT r.task_id AS run_task, r.session_id AS session_id, "
+            "       r.ended_at AS ended_at, t.current_run_id AS current_run_id "
+            "  FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            " WHERE r.id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if task_id is not None and row["run_task"] != task_id:
+            return False
+        if row["current_run_id"] != run_id:
+            return False
+        if row["ended_at"] is not None:
+            return False
+        existing = row["session_id"]
+        if existing:
+            # Idempotent retry, or a refused re-point. Either way: no mutation.
+            return str(existing) == text
+        cur = conn.execute(
+            "UPDATE task_runs SET session_id = ? "
+            " WHERE id = ? AND session_id IS NULL",
+            (text, run_id),
+        )
+        return cur.rowcount == 1
+
+
+def plan_gate_context(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Resolve the plan a gated task is waiting on, straight from the database.
+
+    Read-only. Exists so a human-facing surface can DISPLAY the authoritative
+    plan text, without the caller supplying — or being able to influence — which
+    artifact is shown. ``release_plan_gate`` re-reads all of this independently,
+    so an attestation minted against a stale display is refused rather than
+    applied to different words.
+
+    Display only: no surface currently consumes this to ask for a confirmation,
+    because none can. See the AUTHORITY NOTE above ``release_plan_gate``.
+    """
+    ev = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'plan_awaiting_approval' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if ev is None or not ev["payload"]:
+        return None
+    try:
+        payload = json.loads(ev["payload"])
+        project_id = str(payload["project_id"])
+        revision = int(payload["revision"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    plan = conn.execute(
+        "SELECT body, proposed_by, root_task_id FROM pm_plans "
+        "WHERE project_id = ? AND revision = ?",
+        (project_id, revision),
+    ).fetchone()
+    if plan is None:
+        return None
+    return {
+        "project_id": project_id,
+        "revision": revision,
+        "body": plan["body"],
+        "proposed_by": plan["proposed_by"],
+        "root_task_id": plan["root_task_id"],
+    }
+
+
+def park_for_plan_approval(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    project_id: str,
+    revision: int,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park a task at the human plan gate.
+
+    Requesting a gate is not crossing one, so this is safe for a PM agent to
+    call. Returns False when the task is not in a parkable status, which makes
+    a double-park a no-op rather than an error, and False when the plan is
+    already bound to a different task.
+    """
+    _assert_not_delegated_child_mutation()
+    try:
+        with write_txn(conn):
+            params: list[Any] = [task_id]
+            sql = """
+                UPDATE tasks
+                   SET status       = 'scheduled',
+                       gate_state   = 'plan',
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND gate_state IS NULL
+                   AND status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review')
+            """
+            if expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params.append(int(expected_run_id))
+            if conn.execute(sql, params).rowcount != 1:
+                raise _GateReleaseAborted("task is not in a parkable state")
+
+            # Bind the plan row to this task at park time so the release
+            # boundary has an authoritative link to verify. Adopt-or-refuse: an
+            # unbound plan is claimed, a plan already bound elsewhere is refused
+            # rather than silently re-pointed. The release path enforces the
+            # match again independently — this is convenience, not the boundary.
+            prow = conn.execute(
+                "SELECT id, root_task_id FROM pm_plans "
+                "WHERE project_id = ? AND revision = ?",
+                (project_id, int(revision)),
+            ).fetchone()
+            if prow is not None:
+                if not prow["root_task_id"]:
+                    conn.execute(
+                        "UPDATE pm_plans SET root_task_id = ? "
+                        "WHERE id = ? AND root_task_id IS NULL",
+                        (task_id, prow["id"]),
+                    )
+                elif prow["root_task_id"] != task_id:
+                    raise _GateReleaseAborted(
+                        "plan is already bound to a different root task"
+                    )
+
+            run_id = _end_run(
+                conn, task_id,
+                outcome="gated", status="scheduled", summary=reason,
+            )
+            _append_event(
+                conn, task_id, "plan_awaiting_approval",
+                {"project_id": project_id, "revision": int(revision),
+                 "reason": reason},
+                run_id=run_id,
+            )
+    except _GateReleaseAborted:
+        return False
+    return True
+
+
+def release_plan_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    attestation,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Release a task from the plan gate. The ONLY way out of ``gate_state='plan'``.
+
+    Requires an ``approval_broker.Attestation``, which carries the decision the
+    human actually confirmed. There is no ``decision`` parameter and no
+    ``expected_revision`` parameter: both were caller-supplied, and an
+    authoritative check must never be optional or overridable.
+
+    EVERYTHING is re-derived from the database inside the transaction and
+    compared to the attestation before any write:
+
+      * the project and revision come from the task's own latest
+        ``plan_awaiting_approval`` event, not from the caller;
+      * the plan text comes from the immutable ``pm_plans`` row;
+      * the expected subject and binding hash are recomputed from those;
+      * the project's current ``plan_revision`` must still equal the gated
+        revision, so a superseded plan is always refused.
+
+    An attestation for another project, another revision, or a plan whose body
+    has since changed therefore cannot release this gate.
+
+    On success, in one transaction: ``pm_approvals`` row inserted,
+    ``pm_plans`` CAS-updated with the decision, task gate released, event
+    appended. Every failure after the first write raises so the whole release
+    rolls back; the refusal is then audited in its own transaction.
+    """
+    _assert_not_delegated_child_mutation()
+
+    from hermes_cli import approval_broker as _ab
+
+    if not isinstance(attestation, _ab.Attestation):
+        raise TypeError(
+            "release_plan_gate requires an approval_broker.Attestation; "
+            "a caller-supplied actor string is not evidence of human approval"
+        )
+    decision = attestation.decision
+    if decision not in ("approved", "rejected"):
+        raise ValueError("attestation carries an unknown decision")
+    try:
+        with write_txn(conn):
+            # One authoritative clock reading, taken AFTER the write lock is
+            # held, and used for the expiry check and every timestamp written
+            # below. Checking expiry before the lock let an attestation be
+            # valid at the check, wait behind another writer, expire, and still
+            # authorise the transaction.
+            now = int(time.time())
+            if attestation.expired(now=now):
+                raise _GateReleaseAborted("attestation expired")
+
+            row = conn.execute(
+                "SELECT status, gate_state FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise _GateReleaseAborted("task not found")
+            if row["gate_state"] != "plan":
+                raise _GateReleaseAborted("task is not parked at the plan gate")
+            if row["status"] != "scheduled":
+                raise _GateReleaseAborted(
+                    f"gated task in unexpected status {row['status']!r}"
+                )
+
+            # --- authoritative project + revision, from the task's own event --
+            ev = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'plan_awaiting_approval' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if ev is None or not ev["payload"]:
+                raise _GateReleaseAborted("no plan_awaiting_approval event for this gate")
+            try:
+                payload = json.loads(ev["payload"])
+                project_id = str(payload["project_id"])
+                revision = int(payload["revision"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                raise _GateReleaseAborted("gate event payload is malformed")
+            if not project_id:
+                raise _GateReleaseAborted("gate event names no project")
+
+            proj = conn.execute(
+                "SELECT plan_revision FROM pm_projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if proj is None:
+                raise _GateReleaseAborted(f"project {project_id} not found")
+            # Always enforced, never optional: a superseded plan cannot be
+            # approved even if the caller says nothing about revisions.
+            if int(proj["plan_revision"]) != revision:
+                raise _GateReleaseAborted(
+                    f"stale plan: gate is revision {revision}, project is at "
+                    f"{proj['plan_revision']}"
+                )
+
+            plan = conn.execute(
+                "SELECT id, body, root_task_id, approved_at, rejected_at "
+                "FROM pm_plans WHERE project_id = ? AND revision = ?",
+                (project_id, revision),
+            ).fetchone()
+            if plan is None:
+                raise _GateReleaseAborted(
+                    f"no plan row for {project_id} revision {revision}"
+                )
+            # An ABSENT binding is not a satisfied binding. `if x and x != y`
+            # made NULL mean "skip verification", which let an arbitrary task
+            # be parked against a valid project/revision and approved. For an
+            # artifact-bound approval the authoritative task link must be
+            # present AND match.
+            if not plan["root_task_id"]:
+                raise _GateReleaseAborted(
+                    "plan has no root task binding; refusing to approve an "
+                    "unbound plan"
+                )
+            if plan["root_task_id"] != task_id:
+                raise _GateReleaseAborted(
+                    "plan is bound to a different root task"
+                )
+            if plan["approved_at"] is not None or plan["rejected_at"] is not None:
+                raise _GateReleaseAborted("plan already has a decision")
+
+            # --- the binding check the attestation exists for -----------------
+            expected_subject = _ab.plan_subject(project_id, revision)
+            expected_hash = _ab.plan_binding_hash(
+                project_id, revision, plan["body"] or ""
+            )
+            if attestation.subject != expected_subject:
+                raise _GateReleaseAborted(
+                    "attestation is for a different plan "
+                    f"({attestation.subject!r} != {expected_subject!r})"
+                )
+            if attestation.binding_hash != expected_hash:
+                raise _GateReleaseAborted(
+                    "plan text changed since the attestation was issued"
+                )
+
+            # --- writes begin here; every failure below must RAISE ------------
+            af = attestation.audit_fields()
+            try:
+                conn.execute(
+                    "INSERT INTO pm_approvals "
+                    "(subject, binding_hash, decision, reason, operator_display, "
+                    " os_user, os_uid, host_id, tty_path, surface, nonce, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        af["subject"], af["binding_hash"], decision, reason,
+                        af["operator_display"], af["os_user"], af["os_uid"],
+                        af["host_id"], af["tty_path"], af["surface"], af["nonce"],
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise _GateReleaseAborted("attestation already used")
+
+            if decision == "approved":
+                plan_cur = conn.execute(
+                    "UPDATE pm_plans SET approved_at = ?, approved_by = ? "
+                    "WHERE id = ? AND approved_at IS NULL AND rejected_at IS NULL",
+                    (now, af["operator_display"], plan["id"]),
+                )
+            else:
+                plan_cur = conn.execute(
+                    "UPDATE pm_plans SET rejected_at = ?, reject_reason = ? "
+                    "WHERE id = ? AND approved_at IS NULL AND rejected_at IS NULL",
+                    (now, reason, plan["id"]),
+                )
+            if plan_cur.rowcount != 1:
+                raise _GateReleaseAborted("plan decision was recorded concurrently")
+
+            landing = (
+                ("ready" if _parents_satisfied(conn, task_id) else "todo")
+                if decision == "approved" else "triage"
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, gate_state = NULL "
+                "WHERE id = ? AND status = 'scheduled' AND gate_state = 'plan'",
+                (landing, task_id),
+            )
+            if cur.rowcount != 1:
+                raise _GateReleaseAborted("gate was released concurrently")
+
+            _append_event(
+                conn, task_id,
+                "plan_approved" if decision == "approved" else "plan_rejected",
+                {
+                    "operator": af["operator_display"],
+                    "surface": af["surface"],
+                    "subject": af["subject"],
+                    "project_id": project_id,
+                    "revision": revision,
+                    "reason": reason,
+                    "landing_status": landing,
+                },
+            )
+    except _GateReleaseAborted as exc:
+        # The transaction rolled back, taking any audit row with it, so the
+        # refusal is recorded in its own transaction. The nonce is deliberately
+        # NOT included: events are user-facing and a nonce is single-use secret
+        # material.
+        _audit_gate_refusal(conn, task_id, exc.reason)
+        return False, exc.reason
+    return True, None
+
+
 # Dispatcher (one-shot pass)
 # ---------------------------------------------------------------------------
 
@@ -8045,6 +9262,16 @@ class DispatchResult:
     Surfaces the auto-assignment to telemetry / CLI / dashboard so the
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
+    refused_confinement: list[str] = field(default_factory=list)
+    """Task ids refused by the confinement preflight BEFORE anything was
+    created. Invariant C1: no claim, no ``task_runs`` row, no session, no
+    worker — the task stays dispatchable and is retried next tick once the
+    operator fixes its workspace. Distinct from ``spawn_failed``, which means a
+    worker was attempted and something went wrong after claiming."""
+    unverified_launch: list[str] = field(default_factory=list)
+    """Task ids whose worker started but whose launch directory could NOT be
+    observed. These are explicitly **not** confirmed confined; the audit column
+    stays NULL rather than recording an assumption."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -9895,6 +11122,10 @@ def dispatch_once(
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    # Every tick projects whatever terminal routing records are pending —
+    # including any a previous process committed before it stopped, which is
+    # how a gateway restart recovers them. Never raises.
+    drain_routing_outbox(conn)
     return result
 
 
@@ -10238,6 +11469,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        # C1: decide the launch directory BEFORE claiming. Claiming creates
+        # the task_runs row, so a refusal after it would leave a spawn_failed
+        # run behind for a worker that never existed.
+        if not _confinement_preflight_or_refuse(
+            conn, row["id"], board=board, spawn_fn=spawn_fn, result=result
+        ):
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -10260,22 +11498,11 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            pid = _spawn_verified(
+                conn, claimed, workspace,
+                board=board, spawn_fn=spawn_fn, result=result,
+            )
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10365,6 +11592,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
+        # C1: decide the launch directory BEFORE claiming. Claiming creates
+        # the task_runs row, so a refusal after it would leave a spawn_failed
+        # run behind for a worker that never existed.
+        if not _confinement_preflight_or_refuse(
+            conn, row["id"], board=board, spawn_fn=spawn_fn, result=result
+        ):
+            continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -10395,19 +11629,14 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            # SAME path as the ready lane. This lane used to call the spawner
+            # directly, so a custom review spawn_fn bypassed every confinement
+            # check — the review-lane bypass an independent review found.
+            pid = _spawn_verified(
+                conn, claimed, workspace,
+                board=board, spawn_fn=spawn_fn, result=result,
+            )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -10717,11 +11946,365 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+# Re-exported so callers keep one exception type across the confinement
+# surface. ``dispatch_confinement.PreflightRefusal`` is the definition.
+from hermes_cli.dispatch_confinement import (  # noqa: E402
+    PreflightRefusal as DispatchPreflightError,
+)
+
+
+def dispatch_preflight(task: "Task", workspace: str) -> str:
+    """Spawn-site confinement check. Returns the directory to launch in.
+
+    A WORKFLOW-SAFETY GUARD, NOT A SECURITY BOUNDARY. It protects against
+    accidental escape and cooperative execution, not arbitrary malicious
+    same-UID activity: a running worker can ``chdir``, read elsewhere, or write
+    the database directly.
+
+    This is the SECOND of two checks. The dispatcher runs
+    :func:`_confinement_preflight_or_refuse` before claiming a task, which is
+    what satisfies invariant C1. This one runs at the spawn site so a caller
+    that reaches ``_default_spawn`` by another route still cannot inherit the
+    dispatcher's directory — the failure that let a worker escape into a live
+    production checkout during M2a.
+
+    No warn tier and no override argument: a gate that can be waived is not a
+    gate.
+    """
+    from hermes_cli import dispatch_confinement as _dc
+
+    intended = _dc.preflight_workspace(task.id, workspace)
+    # At the spawn site the directory must exist and is pinned by identity, so
+    # a symlink retargeted after provisioning is caught rather than followed.
+    authorized = _dc.authorize_workspace(task.id, intended)
+    _dc.revalidate_at_spawn(task.id, authorized)
+    return authorized.path
+
+
+def record_observed_cwd(
+    conn: sqlite3.Connection, run_id: Optional[int], cwd: Optional[str]
+) -> None:
+    """Record the VERIFIED directory a run was observed to start in.
+
+    Raises on failure. It used to swallow every error "best-effort", which meant
+    a successful launch could end up with no audit record while the dispatcher
+    reported success — auditability claimed but not delivered. If this value
+    cannot be persisted, the caller must fail the dispatch closed rather than
+    claim a confined launch it cannot evidence.
+
+    The value must come from :func:`dispatch_confinement.verify_launch`, never
+    from the path handed to the spawner. That distinction is the whole point:
+    a spawner that ignores its workspace argument is only detectable by
+    observing the process.
+    """
+    if not run_id:
+        raise ValueError("cannot record observed_cwd without a run id")
+    if not cwd:
+        raise ValueError("cannot record an empty observed_cwd")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET observed_cwd = ? WHERE id = ?",
+            (str(cwd), int(run_id)),
+        )
+    if cur.rowcount != 1:
+        raise RuntimeError(
+            f"observed_cwd was not recorded for run {run_id} "
+            f"(no such run row)"
+        )
+
+
+def _record_confinement_event(
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict, *,
+    required: bool = False,
+) -> None:
+    """Append a confinement event in its own transaction.
+
+    Deliberately event-only: a refusal must not create a run row (C1), and an
+    unverified launch must not be dressed up as a confined one.
+    """
+    try:
+        with write_txn(conn):
+            _append_event(conn, task_id, kind, payload)
+    except Exception:
+        if required:
+            raise
+        _log.warning("could not record %s for task %s", kind, task_id,
+                     exc_info=True)
+
+
+def _confinement_preflight_or_refuse(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str],
+    spawn_fn,
+    result: "DispatchResult",
+) -> bool:
+    """Decide a task's launch directory BEFORE claiming it. True to proceed.
+
+    This runs ahead of ``claim_task`` / ``claim_review_task`` on purpose.
+    Claiming creates the ``task_runs`` row, so a refusal afterwards leaves a
+    ``spawn_failed`` run behind — which is exactly what invariant C1 forbids and
+    what commit 7 did. Refusing here creates nothing: no claim, no run row, no
+    session, no worker. The task stays ``ready``/``review`` and is retried next
+    tick once its workspace is fixed.
+
+    The refusal event says only that a dispatch was refused and why. It does not
+    claim the task is contained.
+    """
+    from hermes_cli import dispatch_confinement as _dc
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    try:
+        intended = _dc.plan_workspace_path(task, board=board)
+        _dc.preflight_workspace(task_id, intended)
+        # The board's confinement policy. In `open` mode this is only the
+        # protected-path denials; in `sandbox` mode it is the full contract
+        # assertion set (authorized root, origin-less fixture, no alternates,
+        # no secrets, no untracked source, confined HERMES_HOME with no live
+        # key material, single_query_mode=deny, required deny globs, and the
+        # prohibited-command matrix) — re-run on EVERY dispatch, not once at
+        # setup, so a config edit between two dispatches cannot silently widen
+        # what a worker may do.
+        from hermes_cli import workspace_policy as _wp
+
+        policy = _wp.resolve_policy(board)
+        if policy.is_sandbox and spawn_fn is not None:
+            raise _dc.PreflightRefusal(
+                f"task {task_id}: sandbox mode does not accept custom "
+                f"spawners; the start-barrier handshake is available only "
+                f"through the shipped worker launcher"
+            )
+        _wp.enforce(task_id, intended, board=board, policy=policy)
+    except _dc.PreflightRefusal as exc:
+        _record_confinement_event(
+            conn, task_id, "confinement_refused",
+            {"reason": str(exc), "stage": "preflight"},
+        )
+        result.refused_confinement.append(task_id)
+        return False
+    except Exception as exc:                      # pragma: no cover - defensive
+        _record_confinement_event(
+            conn, task_id, "confinement_refused",
+            {"reason": f"workspace could not be planned: {exc}",
+             "stage": "preflight"},
+        )
+        result.refused_confinement.append(task_id)
+        return False
+    return True
+
+
+def _spawn_verified(
+    conn: sqlite3.Connection,
+    claimed: "Task",
+    workspace,
+    *,
+    board: Optional[str],
+    spawn_fn,
+    result: "DispatchResult",
+):
+    """Spawn a worker, prove where it started, and only then let it run.
+
+    ONE path for both dispatch lanes.
+
+    SANDBOX vs OPEN — the difference is the whole point:
+
+    * ``sandbox`` is **fail-closed**. The worker is launched already waiting at a
+      cooperative start barrier and is released only after its final workspace
+      and root identities revalidate, its actual working directory is observed
+      from the OS, an owned process handle is bound, and the audit row is
+      durably stored. Any failure — including an unobservable launch, a
+      self-reported one, a malformed spawn result, or a persistence error —
+      terminates the entire owned worker tree before the claim is released.
+    * ``open`` is **explicitly unconfined legacy behaviour**. There is no
+      barrier, and an unobservable launch is recorded as unverified and allowed
+      to continue. Boards in this mode do not satisfy the confinement contract
+      and every status surface says so.
+
+    Returns the pid. Raises to the caller's spawn-failure handler on refusal,
+    after cleanup.
+    """
+    from hermes_cli import dispatch_confinement as _dc
+    from hermes_cli import workspace_policy as _wp
+
+    policy = _wp.resolve_policy(board)
+    sandbox = policy.is_sandbox
+
+    authorized = _dc.authorize_workspace(claimed.id, workspace)
+    _dc.revalidate_at_spawn(claimed.id, authorized)
+    # Pin the authorized roots BEFORE the spawn so a root symlink retargeted
+    # afterwards is detected rather than followed.
+    pinned_roots = _wp.pin_allowed_roots(policy) if sandbox else None
+
+    barrier = None
+    spawn_env = {}
+    if sandbox:
+        barrier = _dc.StartBarrier.create(
+            str(kanban_home() / "run" / "barriers"), claimed.id
+        )
+        spawn_env = barrier.env()
+
+    _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    if sandbox and spawn_fn is not None:
+        # A callable accepting **kwargs does not prove it passes the barrier to
+        # the process it returns. Until spawners have an authenticated launch
+        # capability, sandbox boards use the one shipped path whose worker-side
+        # acknowledgement is defined and tested.
+        barrier.abort()
+        raise _dc.PreflightRefusal(
+            f"task {claimed.id}: sandbox mode does not accept custom spawners; "
+            f"the start-barrier handshake is available only through the "
+            f"shipped worker launcher"
+        )
+    import inspect
+    try:
+        params = inspect.signature(_spawn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kwargs = {}
+    if "board" in params:
+        kwargs["board"] = board
+    if spawn_env and "env_vars" in params:
+        kwargs["env_vars"] = dict(spawn_env)
+    elif spawn_env:
+        # A spawner that cannot carry the barrier env cannot be held. Rather
+        # than silently starting an unbarriered worker in sandbox mode, refuse.
+        if sandbox:
+            barrier.abort()
+            raise _dc.PreflightRefusal(
+                f"task {claimed.id}: sandbox mode requires a spawner that "
+                f"accepts env_vars so the start barrier can be passed; "
+                f"{getattr(_spawn, '__name__', _spawn)!r} does not"
+            )
+
+    owned = None
+    final_report = None
+    try:
+        raw = _spawn(claimed, authorized.path, **kwargs)
+        pid, reported_cwd = _dc.normalize_spawn_result(raw)
+
+        if sandbox and not pid:
+            raise _dc.LaunchVerificationError(
+                f"task {claimed.id}: spawner returned no usable pid "
+                f"({raw!r}); a worker that cannot be identified cannot be "
+                f"contained"
+            )
+
+        owned = _dc.own_process(pid)
+        if sandbox and owned is None:
+            raise _dc.LaunchVerificationError(
+                f"task {claimed.id}: the spawned process could not be bound to "
+                f"an owned handle (pid={pid}); it cannot be verified or cleaned "
+                f"up"
+            )
+
+        if sandbox and not barrier.wait_until_waiting(owned.pid):
+            raise _dc.LaunchVerificationError(
+                f"task {claimed.id}: worker never acknowledged the run-unique "
+                f"start barrier; the spawner may have ignored env_vars"
+            )
+
+        verification = _dc.verify_launch(
+            claimed.id, authorized, pid, reported_cwd
+        )
+
+        if verification.status == _dc.MISMATCH:
+            raise _dc.LaunchVerificationError(verification.detail)
+
+        if sandbox and verification.status != _dc.VERIFIED:
+            # unobservable, or self-reported with no corroboration.
+            raise _dc.LaunchVerificationError(verification.detail)
+
+        # Final revalidation while the worker is still held: the workspace and
+        # the authorized root must still be what policy approved.
+        _dc.revalidate_at_spawn(claimed.id, authorized)
+        if sandbox:
+            _wp.revalidate_allowed_roots(
+                claimed.id, authorized, policy, pinned_roots)
+            final_report = _wp.enforce_final(
+                claimed.id, authorized.path, policy=policy,
+                launch=verification, pinned_roots=pinned_roots,
+            )
+            if not final_report.contract_satisfied:
+                raise _dc.PreflightRefusal(
+                    f"task {claimed.id}: the confinement contract was not "
+                    f"satisfied for the final workspace: "
+                    f"{final_report.summary()}"
+                )
+        if pid:
+            _set_worker_pid(conn, claimed.id, int(pid))
+
+        if verification.status == _dc.VERIFIED:
+            run_id = claimed.current_run_id
+            if run_id is None:
+                row = conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id = ?", (claimed.id,)
+                ).fetchone()
+                run_id = row["current_run_id"] if row else None
+            record_observed_cwd(conn, run_id, verification.observed_cwd)
+        else:
+            _record_confinement_event(
+                conn, claimed.id, "confinement_unverified",
+                {"reason": verification.detail,
+                 "authorized_cwd": authorized.path,
+                 "mode": policy.mode},
+            )
+            result.unverified_launch.append(claimed.id)
+
+        if sandbox:
+            # Final liveness/handshake check: policy evaluation can be slower
+            # than the worker-side timeout. Never write GO for a process that
+            # already exited or stopped advertising that it is waiting.
+            if not owned.is_alive() or not barrier.is_waiting(owned.pid):
+                raise _dc.LaunchVerificationError(
+                    f"task {claimed.id}: worker exited or its start-barrier "
+                    f"acknowledgement disappeared before release"
+                )
+            _record_confinement_event(
+                conn, claimed.id, "confinement_verified",
+                final_report.summary(), required=True,
+            )
+            if not owned.is_alive() or not barrier.is_waiting(owned.pid):
+                raise _dc.LaunchVerificationError(
+                    f"task {claimed.id}: worker exited or its start-barrier "
+                    f"acknowledgement disappeared after audit persistence"
+                )
+
+        # Release remains inside the owned cleanup boundary. A failed release
+        # must abort and terminate the worker rather than strand it waiting.
+        if barrier is not None:
+            barrier.release()
+
+    except Exception as exc:
+        # A process may already exist. Every failure after that point owns the
+        # cleanup: reporting a dispatch closed while a worker keeps running is
+        # the outcome this exists to prevent.
+        if barrier is not None:
+            barrier.abort()
+        termination = _dc.terminate_worker_tree(owned) if owned else None
+        detail = str(exc)
+        if termination is not None and not termination.ok:
+            detail = f"{detail}; CLEANUP INCOMPLETE: {termination.detail}"
+        _record_confinement_event(
+            conn, claimed.id, "confinement_violation",
+            {"reason": detail,
+             "authorized_cwd": authorized.path,
+             "mode": policy.mode,
+             "cleanup_ok": bool(termination.ok) if termination else None},
+        )
+        raise type(exc)(detail) if isinstance(exc, _dc.LaunchVerificationError) else exc
+
+    return pid
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    env_vars: Optional[dict] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10738,6 +12321,11 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Fail closed BEFORE any worker process exists. Raises rather than
+    # returning a fallback: see dispatch_preflight for why there is no
+    # inherit-the-dispatcher's-directory path any more.
+    launch_cwd = dispatch_preflight(task, workspace)
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -10841,6 +12429,11 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # Extra env from the dispatcher — currently the cooperative start barrier,
+    # which holds a sandbox worker at CLI entry until confinement is proven.
+    for key, value in (env_vars or {}).items():
+        env[str(key)] = str(value)
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -10910,7 +12503,9 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            # Never None: dispatch_preflight refused above if the workspace
+            # could not be resolved, so there is no inherit-the-parent case.
+            cwd=launch_cwd,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
@@ -10929,6 +12524,10 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+
+    # The audit row is written by the dispatcher, on the connection it already
+    # holds. Opening a second write connection here would contend with it for
+    # SQLite's writer lock for the sake of one column.
     return proc.pid
 
 

@@ -38,6 +38,7 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
     KANBAN_GUIDANCE,
+    PM_PLAN_GATE_GUIDANCE,
     MEMORY_GUIDANCE,
     USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -453,6 +454,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
+    # Plan-gate guidance: orchestrator surface only. Same resolve-once shape,
+    # same fallback, so a path that bypasses agent_init still gets it right.
+    _pm_guidance = getattr(agent, "_pm_plan_gate_guidance", None)
+    if _pm_guidance:
+        tool_guidance.append(_pm_guidance)
+    elif _pm_guidance is None and "plan_submit" in agent.valid_tool_names:
+        tool_guidance.append(PM_PLAN_GATE_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 

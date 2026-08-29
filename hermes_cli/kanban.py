@@ -843,6 +843,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    p_lane = sub.add_parser(
+        "routing-lane",
+        help="Record the routing lane for a task (manual choice, never inferred)",
+        description=(
+            "Declare which configured routing lane a task belongs to. The "
+            "choice is yours or a PM agent's; Hermes never infers a lane from "
+            "prompt text. Recording one changes no status and schedules "
+            "nothing — it labels the card and writes an audit record."
+        ),
+    )
+    p_lane.add_argument("task_id", help="Task id (t_…)")
+    p_lane.add_argument(
+        "lane", nargs="?", default=None,
+        help="Configured lane name (omit with --clear to remove one)",
+    )
+    p_lane.add_argument(
+        "--clear", action="store_true", help="Remove the task's lane",
+    )
+    p_lane.add_argument(
+        "--selected-by", default=None,
+        help="Who chose it. A display label, not an identity claim.",
+    )
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1060,6 +1083,86 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 # Command dispatch
 # ---------------------------------------------------------------------------
 
+def _configured_routing_lanes() -> "tuple[list[str], bool]":
+    """``(lane names, routing_is_configured)`` from config.yaml.
+
+    Read here rather than in ``kanban_db`` on purpose: the database primitive
+    stays config-independent, and the SURFACE is what tells an operator whether
+    the lane they typed is a real configured route.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        routing = (load_config() or {}).get("routing") or {}
+        lanes = routing.get("lanes") or {}
+        if isinstance(lanes, dict):
+            return sorted(str(k) for k in lanes), bool(routing)
+        if isinstance(lanes, list):
+            return sorted(str(x) for x in lanes), bool(routing)
+        return [], bool(routing)
+    except Exception:
+        return [], False
+
+
+def _cmd_routing_lane(args: argparse.Namespace) -> int:
+    """Record a manual routing lane. Never infers, never schedules."""
+    from hermes_cli import kanban_db as kb
+
+    task_id = str(getattr(args, "task_id", "") or "").strip()
+    lane = getattr(args, "lane", None)
+    clearing = bool(getattr(args, "clear", False))
+    if clearing:
+        lane = None
+    elif not (isinstance(lane, str) and lane.strip()):
+        print(
+            "kanban routing-lane: give a lane name, or --clear to remove one",
+            file=sys.stderr,
+        )
+        return 2
+
+    if lane is not None:
+        configured, has_routing = _configured_routing_lanes()
+        if has_routing and lane not in configured:
+            # An empty or malformed ``routing.lanes`` means NO lane is valid.
+            # Accepting anything there silently presented an invented lane as a
+            # configured route.
+            listed = (", ".join(configured) if configured
+                      else "(none — routing.lanes is empty or malformed)")
+            print(
+                f"kanban routing-lane: {lane!r} is not a configured lane. "
+                f"Configured lanes: {listed}",
+                file=sys.stderr,
+            )
+            return 2
+        if not has_routing:
+            # Visible diagnostic rather than silence: the lane is recorded,
+            # but the operator must not be left believing it names a route
+            # that config.yaml actually defines.
+            print(
+                "kanban routing-lane: warning — config.yaml has no `routing:` "
+                "section, so this lane is recorded but names no configured "
+                "route.",
+                file=sys.stderr,
+            )
+
+    conn = kb.connect(board=getattr(args, "board", None))
+    try:
+        ok = kb.set_routing_lane(
+            conn, task_id, lane,
+            selected_by=getattr(args, "selected_by", None),
+        )
+    finally:
+        conn.close()
+    if not ok:
+        print(f"kanban routing-lane: no such task: {task_id}", file=sys.stderr)
+        return 1
+    if lane is None:
+        print(f"Cleared the routing lane for {task_id}.")
+    else:
+        print(f"Recorded lane {lane!r} for {task_id} (manual selection).")
+    return 0
+
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …`` argparse dispatch.
 
@@ -1178,6 +1281,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
+            "routing-lane": _cmd_routing_lane,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -1195,7 +1299,21 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
         try:
-            return int(handler(args) or 0)
+            rc = int(handler(args) or 0)
+            # Any kanban CLI action may have committed a terminal run. Project
+            # whatever is pending afterwards — this is the human production
+            # path, and it recovers records an earlier process left behind.
+            try:
+                from hermes_cli import kanban_db as _kb
+
+                _conn = _kb.connect(board=getattr(args, "board", None))
+                try:
+                    _kb.drain_routing_outbox(_conn)
+                finally:
+                    _conn.close()
+            except Exception:
+                pass
+            return rc
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
@@ -3470,7 +3588,22 @@ def run_slash(rest: str) -> str:
     ``rest`` is everything after ``/kanban`` (may be empty).  Used from
     both the interactive CLI (``self._handle_kanban_command``) and the
     gateway (``_handle_kanban_command``) so formatting is identical.
+
+    The capture below swaps PROCESS-GLOBAL ``sys.stdout``/``sys.stderr``, and
+    does so twice with logic in between that reads the first buffer. Two
+    concurrent gateway requests would therefore interleave into each other's
+    replies, so the whole region runs under the shared boundary in
+    ``hermes_cli.cli_capture`` — the same lock ``/project`` takes, because a
+    per-command lock would leave the cross-command leak open.
     """
+    from hermes_cli.cli_capture import cli_output_lock
+
+    with cli_output_lock():
+        return _run_slash_captured(rest)
+
+
+def _run_slash_captured(rest: str) -> str:
+    """``run_slash`` body. Call it only with the capture boundary held."""
     import io
     import contextlib
 
@@ -3499,6 +3632,11 @@ def run_slash(rest: str) -> str:
                 _choice.prog = f"/kanban {_name}"
                 _choice.exit_on_error = False  # type: ignore[attr-defined]
 
+    # Everything below captures process-global stdout/stderr, twice, with
+    # logic in between that reads the first buffer. Hold the shared boundary
+    # across the WHOLE region: a per-block lock would let another gateway
+    # request redirect in the gap. Same lock /project takes, so the two
+    # commands cannot interleave with each other either.
     def _usage_for_error() -> str:
         if tokens:
             for _action in kanban_parser._actions:

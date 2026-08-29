@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import sqlite3
 import time
 from contextvars import Context
@@ -21,32 +20,92 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from hermes_cli import kanban_gate_events as _gate_events
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
 
-_LOCAL_PATH_RE = re.compile(
-    r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
-    r"[A-Za-z]:\\[^\s,;]+)"
+# ---------------------------------------------------------------------------
+# Notifier event vocabulary (G11)
+# ---------------------------------------------------------------------------
+#
+# Three sets, one derivation. ``TERMINAL_KINDS`` is what the notifier CLAIMS
+# from the event log — claiming is what makes an event visible to a human and
+# what advances the per-subscription cursor past it. ``NEVER_WAKE_KINDS`` is
+# what must not additionally hand a turn back to an agent. ``WAKE_KINDS`` is
+# derived from the two, never hand-maintained, so a kind added to the human
+# side cannot be forgotten on the agent side.
+
+# Human plan/deploy gate events, emitted by ``kanban_db``:
+# ``park_for_plan_approval`` → ``plan_awaiting_approval``;
+# ``release_plan_gate`` → ``plan_approved`` / ``plan_rejected``;
+# ``record_gate_release_refusal`` / ``_audit_gate_refusal`` →
+# ``gate_release_refused``.
+#
+# A human gate exists to STOP an agent. Waking one because a gate was reached,
+# crossed, or refused would drive it straight back at the boundary it is
+# forbidden to cross — and a refusal event is precisely the record of an agent
+# having already tried. So these are passive ``notify`` only: claimed and
+# delivered so a person sees and can audit them, never a wake, never a
+# dispatch, never a promotion. (G11.)
+# Defined in hermes_cli.kanban_gate_events so the gateway and the Desktop/TUI
+# surface share one vocabulary and one safe renderer. Re-exported here because
+# this module's own derivation below reads it.
+PLAN_GATE_NOTIFY_KINDS = _gate_events.PLAN_GATE_NOTIFY_KINDS
+
+# "status" covers dashboard drag-drop and ``_set_status_direct()`` writes —
+# surface those transitions to subscribers too. ``review_requested`` wakes the
+# origin subscriber like a block does, but is not a block (see
+# kanban_db.request_review); the task is not archived, so the subscription
+# stays alive and later review cycles keep notifying.
+TERMINAL_KINDS: tuple[str, ...] = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "archived", "unblocked", "block_loop_detected", "review_requested",
+    "changes_requested",
+    *PLAN_GATE_NOTIFY_KINDS,
 )
+
+# Claimed, but they must never make an agent take a turn.
+#
+# ``status`` / ``archived`` / ``unblocked`` are bookkeeping: an archive needs no
+# ping and ``unblocked`` is an internal transition. The gate kinds are here for
+# the different, load-bearing reason above.
+NEVER_WAKE_KINDS: tuple[str, ...] = (
+    "status", "archived", "unblocked",
+    *PLAN_GATE_NOTIFY_KINDS,
+)
+
+# Kinds that hand a decision back to the origin, so the origin has to take a
+# turn. ``review_requested`` (the implementation is done and waits for a
+# reviewer), ``changes_requested`` (a reviewer BLOCKed and work returns to the
+# implementer) and ``block_loop_detected`` (routed to triage) belong here for
+# the same reason ``blocked`` does.
+#
+# DERIVED. Membership order is irrelevant — this is only ever used as a set
+# test — but derivation is not: it is what makes G11 structural rather than a
+# convention someone has to remember.
+WAKE_KINDS: tuple[str, ...] = tuple(
+    kind for kind in TERMINAL_KINDS if kind not in NEVER_WAKE_KINDS
+)
+
+if not set(WAKE_KINDS).isdisjoint(PLAN_GATE_NOTIFY_KINDS):  # pragma: no cover
+    # Not an ``assert``: ``python -O`` strips those, and this invariant is the
+    # whole point of the module.
+    raise RuntimeError(
+        "G11 violated: a human-gate notification kind reached WAKE_KINDS"
+    )
 
 
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
-    """Return a mobile-friendly review reason safe for external delivery."""
-    from agent.redact import redact_sensitive_text
+    """Return a mobile-friendly review reason safe for external delivery.
 
-    reason = redact_sensitive_text(
-        "" if value is None else str(value),
-        force=True,
-        redact_url_credentials=True,
-    )
-    reason = _LOCAL_PATH_RE.sub("[local path]", reason)
-    reason = " ".join(reason.split())
-    if len(reason) > limit:
-        reason = reason[: limit - 1].rstrip() + "…"
-    return reason
+    One implementation, shared with the Desktop/TUI surface: secret redaction,
+    local-path redaction, control-character removal, whitespace collapse, and a
+    bound. See ``hermes_cli.kanban_gate_events.safe_display_value``.
+    """
+    return _gate_events.safe_display_value(value, limit=limit)
 
 
 def _resolve_auto_decompose_settings(
@@ -257,13 +316,9 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
-        # ``review_requested`` wakes the origin subscriber like a block does,
-        # but is not a block (see kanban_db.request_review); the task is not
-        # archived, so the subscription stays alive and later review
-        # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        # The claimed vocabulary — including the human plan/deploy gate kinds —
+        # is defined once at module scope so the G11 wake exclusion can be
+        # derived from it rather than restated here. See PLAN_GATE_NOTIFY_KINDS.
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -571,6 +626,14 @@ class GatewayKanbanWatchersMixin:
                     # exists on the board.
                     wake_handoff = ""
                     wake_review_detail = ""
+                    # Batch-level, and needed BEFORE the per-event send below:
+                    # a non-push adapter may only skip its doomed passive send
+                    # when a wake self-post will actually replace it.
+                    batch_wake_kinds = (
+                        {ev.kind for ev in d["events"] if ev.kind in WAKE_KINDS}
+                        if wake_agent
+                        else set()
+                    )
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -687,6 +750,23 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind in PLAN_GATE_NOTIFY_KINDS:
+                            # A human plan/deploy gate. Rendered for a person by
+                            # the shared renderer — which sanitizes EVERY
+                            # event-derived value, not just free text — and
+                            # deliberately NOT in WAKE_KINDS: the decision this
+                            # event reports is one no agent may make, so handing
+                            # an agent a turn here would point it at the
+                            # boundary it is forbidden to cross. (G11.)
+                            msg = _gate_events.render_gate_event(
+                                kind, ev.payload,
+                                task_id=sub["task_id"],
+                                board_slug=board_slug,
+                                assignee=who or "",
+                                translate=t,
+                            )
+                            if not msg:
+                                continue
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -720,7 +800,88 @@ class GatewayKanbanWatchersMixin:
                         # creator is woken via the self-post below instead.
                         from gateway.wake import adapter_supports_push
 
-                        if not adapter_supports_push(adapter) and wake_agent:
+                        _push_ok = adapter_supports_push(adapter)
+                        # A gate event is passive by construction: it is never
+                        # carried by the wake self-post, and the self-post is
+                        # the ONLY channel a non-push adapter has. So on such a
+                        # subscription there is no way to deliver it, and on a
+                        # ``wake``-only subscription the subscriber has declined
+                        # the only channel there is.
+                        #
+                        # Do not attempt a send that cannot succeed: an
+                        # ApiServerAdapter refuses by design, so twelve doomed
+                        # attempts would trip MAX_SEND_FAILURES and DELETE a
+                        # live subscription. Do not silently consume it either.
+                        #
+                        # What happens instead is explicit audited
+                        # NON-DELIVERY, and the distinction matters: the row
+                        # written below records that nobody was told through
+                        # this channel. It is not a notification and must never
+                        # be counted as one. The gate event itself stays in
+                        # ``task_events``, so the board remains the record a
+                        # human actually reads. (G11.)
+                        _undeliverable = ""
+                        if kind in PLAN_GATE_NOTIFY_KINDS:
+                            if not _push_ok:
+                                _undeliverable = (
+                                    "adapter has no passive channel and a gate "
+                                    "event is never carried by a wake"
+                                )
+                            elif not send_passive:
+                                _undeliverable = (
+                                    "wake-only subscription declined passive "
+                                    "delivery and a gate event never wakes"
+                                )
+                        if _undeliverable:
+                            # Recording the non-delivery is the ONLY thing that
+                            # happens for this event, so it is not best-effort:
+                            # if the row cannot be written, the claimed cursor
+                            # must not advance, or the event is consumed with
+                            # nothing to show for it — the exact absence this
+                            # disposition exists to prevent. Raising here lands
+                            # in the shared failure handler below, which rewinds
+                            # the claim and retries on the next tick.
+                            _recorded = await _to_thread_process_service(
+                                self._kanban_record_undeliverable,
+                                sub, int(getattr(ev, "id", 0) or 0), kind,
+                                platform_str, _undeliverable, board_slug,
+                            )
+                            if not _recorded:
+                                # Fail CLOSED. The row is the only outcome this
+                                # event gets, so if it cannot be written the
+                                # claim must be given back. Unlike a failed
+                                # send this is never a dead chat — the board's
+                                # own database is what failed — so the
+                                # subscription is rewound and retried, never
+                                # dropped.
+                                logger.warning(
+                                    "kanban notifier: could not record %s for "
+                                    "%s as undeliverable; rewinding the claim "
+                                    "rather than consuming it",
+                                    kind, sub["task_id"],
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                                break
+                            logger.info(
+                                "kanban notifier: gate event %s for %s could "
+                                "NOT be notified on %s (%s); recorded the "
+                                "non-delivery on the task",
+                                kind, sub["task_id"], platform_str,
+                                _undeliverable,
+                            )
+                            # A recorded disposition is a resolved outcome for
+                            # this event, so the dead-chat counter resets.
+                            sub_fail_counts.pop(sub_key, None)
+                            continue
+
+                        if (not _push_ok and wake_agent
+                                and batch_wake_kinds):
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
                                 "channel; skipping text ping for %s, relying "
@@ -831,24 +992,12 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        # Kinds that hand a decision back to the origin, so the
-                        # origin has to take a turn. ``review_requested`` (the
-                        # implementation is done and waits for a reviewer),
-                        # ``changes_requested`` (a reviewer BLOCKed and work
-                        # returns to the implementer) and ``block_loop_detected``
-                        # (routed to triage) belong here for the same reason
-                        # ``blocked`` does. ``status`` / ``archived`` /
-                        # ``unblocked`` stay out: bookkeeping.
-                        _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
-                        )
-                        _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
-                            else set()
-                        )
+                        # Derived at module scope from TERMINAL_KINDS minus
+                        # NEVER_WAKE_KINDS. Human plan/deploy gate events are
+                        # structurally absent from it (G11), so no gate event
+                        # can hand a turn to an agent here.
+                        _WAKE_KINDS = WAKE_KINDS
+                        _wake_kinds = batch_wake_kinds
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
@@ -1122,6 +1271,82 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
             )
+        finally:
+            conn.close()
+
+    def _kanban_record_undeliverable(
+        self, sub: dict, source_event_id: int, kind: str, platform: str,
+        reason: str, board: Optional[str] = None,
+    ) -> bool:
+        """Sync helper: record that a gate notification could not be delivered.
+
+        Returns True only when a row for this (source event, subscription) pair
+        is durably present — either written here or already there. The caller
+        treats False as a refusal to consume the event.
+
+        NOT best-effort. This row is the entire outcome of the event on this
+        subscription, so a swallowed write would recreate exactly the silent
+        consumption it exists to prevent.
+
+        Idempotent per (source event id, subscription). The existence check and
+        the insert share one ``write_txn`` (BEGIN IMMEDIATE), so a concurrent
+        gateway cannot double-insert, and a cursor rewind — which reprocesses
+        the whole claimed batch after an unrelated failure later in it — cannot
+        append a second row on the next tick, nor can a fresh runner after a
+        restart. The subscription is identified by a short digest rather than
+        its raw ``chat_id``: enough to key on, and it puts no new addressable
+        identifier into a user-facing event.
+
+        The kind is deliberately absent from ``TERMINAL_KINDS``, so no notifier
+        claims it and this cannot recurse.
+        """
+        import hashlib
+
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_gate_events import GATE_UNDELIVERABLE_KIND
+
+        sub_digest = hashlib.sha256(
+            "\x1f".join((
+                str(sub.get("platform") or ""),
+                str(sub.get("chat_id") or ""),
+                str(sub.get("thread_id") or ""),
+            )).encode("utf-8")
+        ).hexdigest()[:16]
+        try:
+            conn = _kb.connect(board=board)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: cannot open board %s to record a "
+                "non-delivery for %s: %s", board, sub.get("task_id"), exc,
+            )
+            return False
+        try:
+            with _kb.write_txn(conn):
+                existing = conn.execute(
+                    "SELECT 1 FROM task_events "
+                    "WHERE task_id = ? AND kind = ? "
+                    "AND json_extract(payload, '$.source_event_id') = ? "
+                    "AND json_extract(payload, '$.subscription') = ? LIMIT 1",
+                    (sub["task_id"], GATE_UNDELIVERABLE_KIND,
+                     int(source_event_id), sub_digest),
+                ).fetchone()
+                if existing is not None:
+                    return True
+                _kb._append_event(
+                    conn, sub["task_id"], GATE_UNDELIVERABLE_KIND,
+                    {"event_kind": kind, "platform": platform,
+                     "reason": reason,
+                     "delivery_mode": sub.get("delivery_mode") or "notify",
+                     "source_event_id": int(source_event_id),
+                     "subscription": sub_digest},
+                )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: could not record a non-delivery for %s: %s",
+                sub.get("task_id"), exc,
+            )
+            return False
         finally:
             conn.close()
 
