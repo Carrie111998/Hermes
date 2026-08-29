@@ -583,6 +583,17 @@ DEFAULT_CONTEXT_LENGTHS = {
     "hy3-preview": 262144,
     # Tencent — Hy3 (GA successor to Hy3 Preview), same 256K window.
     "hy3": 262144,
+    # WorkBuddy tier slots — these are aliases resolved server-side to
+    # whatever model currently backs each slot, so the real window moves
+    # without a Hermes release. Values are the /v3/config advertised
+    # maxInputTokens as of 2026-08-29; they are conservative ceilings for
+    # token budgeting, not a guarantee. hy4-preview / hy3 above already
+    # cover the two named Tencent models WorkBuddy also exposes.
+    "default-model": 176000,
+    "fast-model": 200000,
+    "balanced-model": 256000,
+    "primary-model": 272000,
+    "deep-model": 176000,
     # OpenCode Zen — "Ox Alpha" stealth model (x-preview-f-free). 1M context
     # per OpenCode's launch announcement (2026-08-20); free, ZDR.
     "x-preview-f": 1_048_576,
@@ -766,6 +777,8 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "api.novita.ai": "novita",
     "tokenhub.tencentmaas.com": "tencent-tokenhub",
     "api.lkeap.cloud.tencent.com": "tencent-tokenplan",
+    "www.workbuddy.ai": "workbuddy",
+    "workbuddy.ai": "workbuddy",
     "ollama.com": "ollama-cloud",
 }
 
