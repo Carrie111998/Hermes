@@ -2051,6 +2051,8 @@ export interface Translations {
     queueSendNext: string
     queueSend: string
     queueSteer: string
+    steerImagesUnsupportedTitle: string
+    steerImagesUnsupported: string
     queueDelete: string
     queueResume: string
     queueResumeTip: string
