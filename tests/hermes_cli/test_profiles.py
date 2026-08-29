@@ -1050,15 +1050,20 @@ class TestEdgeCases:
         recovery = default_home / "portal-recovery" / "snapshots" / "last-ready"
         recovery.mkdir(parents=True)
         (recovery / "config.yaml").write_text("root:root 0640 in reality")
-        lost.chmod(0o000)
-        (default_home / "portal-recovery" / "snapshots").chmod(0o000)
+        # Mode-tightening only simulates the unreadable shape on POSIX; on
+        # Windows chmod(0o000) does not block reads, so there this test
+        # exercises the name-exclusion logic only.
+        if os.name == "posix":
+            lost.chmod(0o000)
+            (default_home / "portal-recovery" / "snapshots").chmod(0o000)
 
         try:
             profile_dir = create_profile("luna", clone_config=True, no_alias=True)
         finally:
             # Restore modes so tmp_path cleanup can delete the tree.
-            lost.chmod(0o700)
-            (default_home / "portal-recovery" / "snapshots").chmod(0o700)
+            if os.name == "posix":
+                lost.chmod(0o700)
+                (default_home / "portal-recovery" / "snapshots").chmod(0o700)
 
         # The clone succeeded and carried the readable config…
         cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())

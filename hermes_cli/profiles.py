@@ -110,10 +110,11 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "lost+found",
 })
 
-# Per-profile history artifacts excluded from --clone-all regardless of the
-# source profile.  A new profile is a fresh workspace — inheriting the source
-# profile's session history, backup archives, or quick-backup snapshots is
-# never useful (restoring one inside the clone would resurrect the SOURCE
+# Per-profile artifacts excluded from --clone-all regardless of the source
+# profile — mostly session/backup history, plus platform-managed recovery
+# trees (portal-recovery) that ride the same per-name mechanism.  A new
+# profile is a fresh workspace — inheriting the source profile's session
+# history, backup archives, or quick-backup snapshots is never useful (restoring one inside the clone would resurrect the SOURCE
 # profile's state) and can balloon the copy by tens of GB.  Unlike
 # ``_CLONE_ALL_DEFAULT_EXCLUDE_ROOT`` this set is NOT gated on the default
 # profile: named profiles accumulate the same artifacts.
