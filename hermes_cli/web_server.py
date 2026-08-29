@@ -326,8 +326,8 @@ def _warm_gateway_module() -> None:
     RPC burst (``setup.status``, ``setup.runtime_check``,
     ``gateway.ready``→``resolve_skin``) pull in several *other* heavy
     chains that were still imported on the loop thread, contributing to
-    the ~14s cold-start stall (#60800). Warm them all here so the cost
-    is paid in a worker thread while the server socket is already open.
+    the ~14s cold-start stall (#60800). Warm them all before the lifespan
+    yields so the first connection is never exposed to that import cost.
     """
     for mod in (
         "hermes_cli.gateway",

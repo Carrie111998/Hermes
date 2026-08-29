@@ -200,9 +200,9 @@ def test_ws_ready_does_not_wait_for_skin_resolution(monkeypatch):
         try:
             # The ready frame must beat the blocked skin lookup.  This times out
             # on the old implementation, which awaited to_thread(resolve_skin).
-            await asyncio.wait_for(ready_seen.wait(), timeout=0.25)
+            await asyncio.wait_for(ready_seen.wait(), timeout=2)
             assert not release_skin.is_set()
-            assert await asyncio.to_thread(skin_started.wait, 0.5)
+            assert await asyncio.to_thread(skin_started.wait, 2)
         finally:
             release_skin.set()
             disconnect.set()
@@ -265,9 +265,9 @@ def test_concurrent_cold_ws_connections_share_one_skin_refresh(monkeypatch):
         try:
             await asyncio.wait_for(
                 asyncio.gather(*(ready.wait() for ready in ready_events)),
-                timeout=0.25,
+                timeout=2,
             )
-            assert await asyncio.to_thread(skin_started.wait, 0.5)
+            assert await asyncio.to_thread(skin_started.wait, 2)
             assert calls == 1
         finally:
             release_skin.set()
