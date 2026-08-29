@@ -191,11 +191,13 @@ MEMORY_GUIDANCE = (
     "You have persistent memory across sessions, injected into every turn; "
     "the memory tool's schema defines what belongs there. Write entries as "
     "declarative facts, not instructions to yourself: 'User prefers concise "
-    "responses' \u2713 \u2014 'Always respond concisely' \u2717. Imperative "
+    "responses' ✓ — 'Always respond concisely' ✗. Imperative "
     "phrasing gets re-read as a directive in later sessions and can override "
     "the user's current request. If a fact will be stale within a week it "
     "belongs in session history, not memory; procedures and workflows belong "
-    "in skills."
+    "in skills. Memory has a hard character budget: save proactively, and "
+    "when it fills, replace or consolidate stale entries in the same batch "
+    "rather than skipping the save."
 )
 
 USER_PROFILE_GUIDANCE = (
@@ -205,9 +207,12 @@ USER_PROFILE_GUIDANCE = (
     "turn; save durable facts about the user with the memory tool "
     "(target='user') — the built-in notes store is disabled, so never "
     "target='memory'. Write entries as declarative facts, not instructions "
-    "to yourself: 'User prefers concise responses' \u2713 \u2014 'Always "
-    "respond concisely' \u2717. Imperative phrasing gets re-read as a "
-    "directive in later sessions and can override the user's current request."
+    "to yourself: 'User prefers concise responses' ✓ — 'Always "
+    "respond concisely' ✗. Imperative phrasing gets re-read as a "
+    "directive in later sessions and can override the user's current request. "
+    "The profile has a hard character budget: save proactively, and when it "
+    "fills, replace or consolidate stale entries in the same batch rather "
+    "than skipping the save."
 )
 
 SESSION_SEARCH_GUIDANCE = (
