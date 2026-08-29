@@ -1419,6 +1419,10 @@ class TestUnknownPlatformLogging:
             and rec.levelno == _logging.WARNING
             for rec in caplog.records
         ), "dropped platform must be named in a warning"
+        assert any(
+            "not a built-in platform or malformed config" in rec.getMessage()
+            for rec in caplog.records
+        ), "both drop warnings must share the same reason wording"
 
     def test_unknown_reset_by_platform_logs_warning(self, caplog):
         import logging as _logging
@@ -1438,6 +1442,10 @@ class TestUnknownPlatformLogging:
             and rec.levelno == _logging.WARNING
             for rec in caplog.records
         ), "dropped reset policy must be named in a warning"
+        assert any(
+            "not a built-in platform or malformed config" in rec.getMessage()
+            for rec in caplog.records
+        ), "both drop warnings must share the same reason wording"
 
     def test_known_platform_still_silent(self, caplog):
         """Legitimate built-in entries keep loading without noise."""

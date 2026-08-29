@@ -1196,7 +1196,8 @@ class GatewayConfig:
                 reset_by_platform[platform] = SessionResetPolicy.from_dict(policy_data)
             except ValueError as exc:
                 logger.warning(
-                    "gateway config: dropping reset_by_platform entry %r (%s: %s)",
+                    "gateway config: dropping reset_by_platform entry %r (%s: %s) — "
+                    "not a built-in platform or malformed config",
                     platform_name, type(exc).__name__, exc,
                 )
         
