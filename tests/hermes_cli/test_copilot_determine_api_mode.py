@@ -48,6 +48,16 @@ class TestCopilotDualWire:
             == "codex_responses"
         )
 
+    @pytest.mark.parametrize(
+        "model",
+        ["copilot/gpt-5.6-sol", "github-copilot/gpt-5.5"],
+    )
+    def test_qualified_form_normalized_before_pattern_check(self, model):
+        # The switch flow can derive api_mode before its own id resolution
+        # strips the provider prefix; the raw prefix must not make the
+        # pattern check miss and stamp chat_completions.
+        assert determine_api_mode("copilot", COPILOT_HOST, model) == "codex_responses"
+
     def test_nous_carve_out_unchanged(self):
         assert (
             determine_api_mode("nous", "", "anthropic/claude-sonnet-4")

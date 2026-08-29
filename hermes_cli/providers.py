@@ -756,9 +756,18 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     # anthropic_messages): Copilot's token/header scheme is handled by the
     # OpenAI client path — see copilot_model_api_mode().
     if provider_norm in {"copilot", "github-copilot", "github_copilot"}:
-        from hermes_cli.models import _should_use_copilot_responses_api
+        from hermes_cli.models import (
+            _should_use_copilot_responses_api,
+            normalize_copilot_model_id,
+        )
 
-        if _should_use_copilot_responses_api(str(model or "").strip()):
+        # Normalize first: the switch flow can hand a qualified form
+        # (`copilot/gpt-5.6-sol`) to this path before its own id resolution
+        # runs, and the raw prefix would make the pattern check miss and
+        # stamp chat_completions — the exact failure #94881 fixes. The
+        # no-argument normalize is local-only (no catalog fetch).
+        _normalized = normalize_copilot_model_id(model)
+        if _should_use_copilot_responses_api(_normalized):
             return "codex_responses"
         return "chat_completions"
 
