@@ -47,14 +47,32 @@ _WS_LOG_PAYLOAD_PREVIEW = 240
 # sockets. Keep one process-wide fallback refresh for standalone/test entry
 # paths so a reconnect burst cannot enqueue one resolve_skin job per peer.
 _skin_refresh_task: asyncio.Task[dict] | None = None
+_skin_refresh_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _refresh_skin_cache() -> dict:
+    payload, revision = await asyncio.to_thread(server.resolve_skin_snapshot)
+    if payload and server._note_cached_skin_broadcast(revision):
+        # The transport is registered before this fallback is scheduled, so
+        # every cold-cache peer receives the resolved skin after readiness.
+        # The revision guard suppresses a result superseded by config.set or
+        # the watcher while this worker was queued.
+        server._broadcast_global_event("skin.changed", payload)
+    return payload
 
 
 def _ensure_skin_cache_refresh() -> asyncio.Task[dict]:
     """Start (or reuse) one non-blocking skin-cache refresh on this loop."""
-    global _skin_refresh_task
-    if _skin_refresh_task is None or _skin_refresh_task.done():
+    global _skin_refresh_loop, _skin_refresh_task
+    loop = asyncio.get_running_loop()
+    if (
+        _skin_refresh_task is None
+        or _skin_refresh_task.done()
+        or _skin_refresh_loop is not loop
+    ):
+        _skin_refresh_loop = loop
         _skin_refresh_task = asyncio.create_task(
-            asyncio.to_thread(server.resolve_skin),
+            _refresh_skin_cache(),
             name="gateway-skin-cache-refresh",
         )
     return _skin_refresh_task

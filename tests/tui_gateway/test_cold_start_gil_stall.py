@@ -86,18 +86,28 @@ def test_cold_skin_refresh_runs_off_the_loop_thread():
 
     idents = {}
 
-    def _fake_resolve_skin():
+    def _fake_resolve_skin_snapshot():
         idents["skin_thread"] = threading.get_ident()
-        return {"palette": "test"}
+        return {"palette": "test"}, 1
 
     async def _scenario():
         idents["loop_thread"] = threading.get_ident()
         ws_mod._skin_refresh_task = None
+        ws_mod._skin_refresh_loop = None
         try:
-            with patch.object(server_mod, "resolve_skin", _fake_resolve_skin):
+            with (
+                patch.object(
+                    server_mod,
+                    "resolve_skin_snapshot",
+                    _fake_resolve_skin_snapshot,
+                ),
+                patch.object(server_mod, "_note_cached_skin_broadcast", return_value=True),
+                patch.object(server_mod, "_broadcast_global_event"),
+            ):
                 return await ws_mod._ensure_skin_cache_refresh()
         finally:
             ws_mod._skin_refresh_task = None
+            ws_mod._skin_refresh_loop = None
 
     payload = _asyncio.run(_scenario())
 
@@ -115,7 +125,7 @@ def test_handle_ws_ready_payload_uses_no_io_skin_snapshot(monkeypatch):
     frames = []
     resolver = MagicMock(side_effect=AssertionError("ready path resolved skin"))
     monkeypatch.setattr(server_mod, "get_cached_skin_payload", lambda: {"name": "cached"})
-    monkeypatch.setattr(server_mod, "resolve_skin", resolver)
+    monkeypatch.setattr(server_mod, "resolve_skin_snapshot", resolver)
     monkeypatch.setattr(server_mod, "_WS_ORPHAN_REAP_GRACE_S", 0)
 
     class FakeWS:

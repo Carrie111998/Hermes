@@ -337,10 +337,9 @@ def _warm_gateway_module() -> None:
         "hermes_cli.auth",
         "hermes_cli.copilot_auth",
         "hermes_cli.runtime_provider",
-        # resolve_skin() reads config + initialises the skin engine.
-        # Even though handle_ws now calls it via asyncio.to_thread
-        # (see tui_gateway/ws.py), warming it here avoids the first-call
-        # import cost inside that thread.
+        # resolve_skin() reads config + initialises the skin engine. Standalone
+        # cold-cache paths still resolve it in a background thread; warming the
+        # module here avoids first-call import cost inside that fallback.
         "hermes_cli.skin_engine",
         # model.options / picker context — parses provider catalogs and
         # the models.dev cache on first use.
