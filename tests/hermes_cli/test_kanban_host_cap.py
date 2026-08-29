@@ -210,8 +210,10 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 # ---------------------------------------------------------------------------
 
 
-def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
-    tid = kb.create_task(conn, title=title, assignee=assignee)
+def _park_in_review(
+    conn: sqlite3.Connection, title: str, assignee: str, *, owner_kind: str | None = None,
+) -> str:
+    tid = kb.create_task(conn, title=title, assignee=assignee, owner_kind=owner_kind)
     _set_task_status(conn, tid, "review")
     return tid
 
@@ -281,7 +283,7 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     with kb.connect() as conn:
         for title in ("ready-1", "ready-2"):
             kb.create_task(conn, title=title, assignee="alice")
-        _park_in_review(conn, "human-review", "some-human")
+        _park_in_review(conn, "human-review", "some-human", owner_kind="no_agent")
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )

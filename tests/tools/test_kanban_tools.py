@@ -40,6 +40,15 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     )
 
 
+def test_kanban_create_schema_exposes_execution_owner_and_provenance_fields():
+    """Model callers receive the complete durable create contract."""
+    from tools import kanban_tools as kt
+
+    props = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert {"owner_kind", "task_kind", "purpose", "created_by_task_id", "created_by_run_id", "creation_authority"} <= set(props)
+    assert props["owner_kind"]["enum"] == ["agent", "external", "no_agent"]
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -50,7 +59,10 @@ def worker_env(monkeypatch, tmp_path):
     after we've created the task."""
     home = tmp_path / ".hermes"
     home.mkdir()
-    for profile in ("test-worker", "peer", "qa"):
+    for profile in (
+        "test-worker", "peer", "qa", "factory", "reviewer", "worker",
+        "worker-a", "worker-d", "x",
+    ):
         (home / "profiles" / profile).mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
@@ -98,6 +110,162 @@ def test_configured_orchestrator_worker_can_fan_out(worker_env):
     assert out["ok"] is True
 
 
+def test_orchestrator_tool_omits_owner_kind_without_making_it_explicit(worker_env):
+    """An omitted model-tool owner_kind reaches the DB as None, not agent."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  orchestrator_profile: test-worker\n", encoding="utf-8",
+    )
+    implicit = json.loads(kt._handle_create({"title": "implicit agent", "assignee": "peer"}))
+    explicit = json.loads(kt._handle_create({
+        "title": "manual lane", "assignee": "peer", "owner_kind": "no_agent",
+    }))
+    assert implicit["ok"] is True and explicit["ok"] is True
+    with kb.connect_closing() as conn:
+        implicit_task = kb.get_task(conn, implicit["task_id"])
+        explicit_task = kb.get_task(conn, explicit["task_id"])
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 123, default_assignee="peer")
+        explicit_after_dispatch = kb.get_task(conn, explicit["task_id"])
+    assert implicit_task is not None and (implicit_task.owner_kind, implicit_task.owner_kind_explicit) == ("agent", False)
+    assert explicit_task is not None and (explicit_task.owner_kind, explicit_task.owner_kind_explicit) == ("no_agent", True)
+    assert explicit["task_id"] not in result.auto_assigned_default
+    assert all(task_id != explicit["task_id"] for task_id, _profile, *_rest in result.spawned)
+    assert explicit_after_dispatch is not None and explicit_after_dispatch.assignee == "peer"
+
+
+def test_orchestrator_tool_persists_explicit_external_owner_and_provenance(worker_env):
+    """An orchestrator can deliberately create a non-dispatchable external lane."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  orchestrator_profile: test-worker\n",
+        encoding="utf-8",
+    )
+    out = json.loads(kt._handle_create({
+        "title": "human release handoff",
+        "assignee": "release-operator",
+        "owner_kind": "external",
+        "task_kind": "ordinary",
+        "purpose": "operator handoff",
+        "created_by_task_id": worker_env,
+        "creation_authority": "test-worker",
+    }))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, out["task_id"])
+    assert task is not None
+    assert task.owner_kind == "external"
+    assert task.task_kind == "ordinary"
+    assert task.purpose == "operator handoff"
+    assert task.created_by_task_id == worker_env
+    assert task.creation_authority == "test-worker"
+
+
+def test_orchestrator_tool_creates_explicit_no_agent_card(worker_env):
+    """A no-agent card keeps its lane label but has no dispatchable owner."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  orchestrator_profile: test-worker\n",
+        encoding="utf-8",
+    )
+    out = json.loads(kt._handle_create({
+        "title": "manual approval",
+        "assignee": "release-manager",
+        "owner_kind": "no_agent",
+    }))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, out["task_id"])
+    assert task is not None and task.owner_kind == "no_agent"
+    assert task.assignee == "release-manager"
+
+
+def test_orchestrator_tool_rejects_unknown_agent_profile(worker_env, monkeypatch):
+    """An agent-owned model-tool task fails before a nonexistent profile is queued."""
+    from pathlib import Path
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: False)
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  orchestrator_profile: test-worker\n",
+        encoding="utf-8",
+    )
+    out = json.loads(kt._handle_create({
+        "title": "missing executor",
+        "assignee": "does-not-exist",
+        "owner_kind": "agent",
+    }))
+    assert "does not exist" in out["error"]
+
+
+def test_orchestrator_tool_rejects_gate_with_spoofed_authority(worker_env):
+    """A configured orchestrator cannot bypass a mandatory gate's authority."""
+    from pathlib import Path
+    from tools import kanban_tools as kt
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  orchestrator_profile: test-worker\n",
+        encoding="utf-8",
+    )
+    out = json.loads(kt._handle_create({
+        "title": "review gate",
+        "assignee": "qa",
+        "task_kind": "reviewer",
+        "creation_authority": "spoofed-worker",
+    }))
+    assert "must match the calling profile" in out["error"]
+
+
+def test_configured_orchestrator_tool_creates_authorized_gate(worker_env):
+    """The configured orchestrator can create a gate when its authority matches."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n  orchestrator_profile: test-worker\n",
+        encoding="utf-8",
+    )
+    sha = "c" * 40
+    evidence = home / "gate-evidence.txt"
+    evidence.write_bytes(b"gate evidence")
+    with kb.connect_closing() as conn:
+        attachment = kb.add_attachment(conn, worker_env, filename="gate-evidence.txt", stored_path=str(evidence), content_type="text/plain", size=len(b"gate evidence"))
+        kb.create_candidate(conn, worker_env, sha=sha, source_receipt={"candidate_sha": sha, "subject": "worker scratch artifact", "provenance": "test orchestrator receipt", "producer_profile": "worker"})
+        manifest = kb.freeze_evidence_manifest(conn, worker_env, sha=sha, manifest={"required_slots": ["evidence"], "entries": [{"attachment_id": attachment, "sha256": __import__("hashlib").sha256(b"gate evidence").hexdigest(), "content_type": "text/plain", "cardinality": 1, "slot": "evidence", "mode": "required"}]}, verdict="pass", authority="test-worker")
+    out = json.loads(kt._handle_create({
+        "title": "independent review",
+        "assignee": "qa",
+        "owner_kind": "agent",
+        "task_kind": "reviewer",
+        "creation_authority": "test-worker",
+        "gate_candidate_sha": sha,
+        "gate_manifest_hash": manifest["manifest_hash"],
+    }))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, out["task_id"])
+    assert task is not None and task.task_kind == "reviewer"
+    assert task.creation_authority == "test-worker"
+    assert (task.owner_kind, task.gate_candidate_sha, task.gate_manifest_hash) == ("agent", sha, manifest["manifest_hash"])
+
+
 def test_worker_cannot_create_or_self_dispatch_gate_children(worker_env):
     """Implementation workers hand off via review; only orchestrators fan out."""
     from tools import kanban_tools as kt
@@ -105,6 +273,7 @@ def test_worker_cannot_create_or_self_dispatch_gate_children(worker_env):
     out = json.loads(kt._handle_create({
         "title": "self-created review gate",
         "assignee": "peer",
+        "task_kind": "reviewer",
     }))
     assert "error" in out
     assert "orchestrator-only" in out["error"]

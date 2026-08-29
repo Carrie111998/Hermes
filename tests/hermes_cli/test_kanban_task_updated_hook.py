@@ -8,13 +8,19 @@ call sites short-circuit when nothing subscribes.
 
 from __future__ import annotations
 
+import importlib
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+
+
+def _live_plugin_manager():
+    """Return the manager used by kanban_db's runtime lifecycle imports."""
+    importlib.import_module("hermes_cli.lifecycle")
+    return importlib.import_module("hermes_cli.plugins").get_plugin_manager()
 
 
 @pytest.fixture
@@ -23,13 +29,15 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for profile in ("alice", "bob"):
+        (home / "profiles" / profile).mkdir(parents=True, exist_ok=True)
     kb.init_db()
     return home
 
 
 @pytest.fixture
 def captured_updates(monkeypatch):
-    mgr = get_plugin_manager()
+    mgr = _live_plugin_manager()
     events: list[dict] = []
     saved = {k: list(v) for k, v in mgr._hooks.items()}
     mgr._hooks.setdefault("on_kanban_task_updated", []).append(
@@ -56,7 +64,7 @@ def test_assign_fires_updated_with_changed_fields(kanban_home, captured_updates)
         finally:
             c2.close()
 
-    mgr = get_plugin_manager()
+    mgr = _live_plugin_manager()
     mgr._hooks.setdefault("on_kanban_task_updated", []).append(_read_assignee)
 
     conn = kb.connect()
@@ -78,7 +86,7 @@ def test_assign_fires_updated_with_changed_fields(kanban_home, captured_updates)
     assert assignee_at_fire_time == ["bob"]
 
 def test_raising_callback_does_not_break_assign(kanban_home):
-    mgr = get_plugin_manager()
+    mgr = _live_plugin_manager()
     saved = {k: list(v) for k, v in mgr._hooks.items()}
 
     def _boom(**kw):
@@ -98,7 +106,7 @@ def test_raising_callback_does_not_break_assign(kanban_home):
 
 
 def test_no_subscriber_short_circuits_task_updated(kanban_home, monkeypatch):
-    from hermes_cli import lifecycle
+    lifecycle = importlib.import_module("hermes_cli.lifecycle")
 
     invoked: list[str] = []
     real_invoke = lifecycle.invoke_hook

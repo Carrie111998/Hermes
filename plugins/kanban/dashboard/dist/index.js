@@ -2992,6 +2992,39 @@
     return "";
   }
 
+  function ExternalRunDetails(props) {
+    const run = props.run;
+    if (!run) return null;
+    const progress = (run.current != null && run.total != null)
+      ? `${run.current}/${run.total}` : null;
+    const heartbeat = run.heartbeat_status || "stale";
+    const phase = run.phase || "external";
+    return h("div", {
+      className: cn(
+        props.compact ? "hermes-kanban-external-run-card" : "hermes-kanban-external-run-detail",
+        "hermes-kanban-external-run--" + heartbeat,
+      ),
+      title: `External run ${run.external_id || run.id || ""}: ${heartbeat}`,
+    },
+      props.compact
+        ? [
+            h("span", { key: "phase", className: "hermes-kanban-external-run-phase" }, phase),
+            progress ? h("span", { key: "progress", className: "hermes-kanban-external-run-progress" }, progress) : null,
+            h("span", { key: "heartbeat", className: "hermes-kanban-external-run-heartbeat" }, heartbeat),
+          ]
+        : [
+            h("div", { key: "head", className: "hermes-kanban-external-run-head" }, "External run"),
+            run.owner ? h("div", { key: "owner" }, `Owner: ${run.owner}`) : null,
+            run.external_id ? h("div", { key: "id" }, `ID: ${run.external_id}`) : null,
+            h("div", { key: "phase" }, `Phase: ${phase}`),
+            progress ? h("div", { key: "progress" }, `Progress: ${progress}`) : null,
+            h("div", { key: "heartbeat" }, `Heartbeat: ${heartbeat}`),
+            run.log_ref ? h("div", { key: "log" }, "Log reference: ", h("code", null, run.log_ref)) : null,
+            run.result_ref ? h("div", { key: "result" }, "Result reference: ", h("code", null, run.result_ref)) : null,
+          ],
+    );
+  }
+
   function TaskCard(props) {
     const { t: i18n } = useI18n();
     const t = props.task;
@@ -3122,6 +3155,7 @@
                   title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile."),
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
               : null,
+            t.external_run ? h(ExternalRunDetails, { run: t.external_run, compact: true }) : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
@@ -3914,6 +3948,7 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
+      t.external_run ? h(ExternalRunDetails, { run: t.external_run }) : null,
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,
@@ -4125,6 +4160,7 @@
             h("span", { className: "hermes-kanban-run-ago" },
               timeAgo ? timeAgo(r.started_at) : ""),
           ),
+          r.external_run ? h(ExternalRunDetails, { run: r.external_run }) : null,
           r.summary
             ? h("div", { className: "hermes-kanban-run-summary" }, r.summary)
             : null,

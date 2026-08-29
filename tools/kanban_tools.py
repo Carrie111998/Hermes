@@ -1567,7 +1567,19 @@ def _handle_create(args: dict, **kw) -> str:
     )
     if external_bool_error:
         return tool_error(external_bool_error)
-    if not external_assignee:
+    # Preserve an omitted owner_kind as None for DB-side legacy inference.
+    # external_assignee remains an explicit alias for the external lane.
+    owner_kind = args.get("owner_kind")
+    if owner_kind is not None:
+        owner_kind = str(owner_kind).strip().lower()
+        if owner_kind not in {"agent", "external", "no_agent"}:
+            return tool_error("owner_kind must be agent, external, or no_agent")
+    if owner_kind is None and external_assignee:
+        owner_kind = "external"
+    effective_owner_kind = owner_kind or "agent"
+    # Explicit external ownership is the same deliberate human-pulled lane as
+    # external_assignee. Never make a caller provide both spellings.
+    if effective_owner_kind == "agent" and not external_assignee:
         from hermes_cli import profiles as profiles_mod
 
         canonical_assignee = profiles_mod.normalize_profile_name(str(assignee))
@@ -1578,9 +1590,22 @@ def _handle_create(args: dict, **kw) -> str:
             return tool_error(
                 f"assignee profile {canonical_assignee!r} does not exist. "
                 f"Available profiles: {available}. Create that profile first, "
-                "choose an existing profile, or set external_assignee=true "
-                "only for an intentionally human-pulled external lane."
+                "choose an existing profile, or set owner_kind=external "
+                "(or external_assignee=true) only for an intentionally human-pulled external lane."
             )
+    task_kind = str(args.get("task_kind") or "ordinary").strip().lower()
+    caller_authority = os.environ.get("HERMES_PROFILE") or "worker"
+    supplied_authority = args.get("creation_authority")
+    if task_kind in {"reviewer", "visualqa", "release"}:
+        if supplied_authority and str(supplied_authority) != caller_authority:
+            return tool_error("mandatory gate creation_authority must match the calling profile")
+        try:
+            configured = (load_config() or {}).get("kanban") or {}
+            trusted_authority = configured.get("coordinator_profile") or configured.get("orchestrator_profile")
+        except Exception:
+            trusted_authority = None
+        if not trusted_authority or str(trusted_authority) != caller_authority:
+            return tool_error("mandatory gates require the configured trusted orchestrator authority")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1684,6 +1709,14 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                owner_kind=owner_kind,
+                task_kind=task_kind,
+                purpose=args.get("purpose"),
+                created_by_task_id=(args.get("created_by_task_id") or os.environ.get("HERMES_KANBAN_TASK")),
+                created_by_run_id=args.get("created_by_run_id"),
+                creation_authority=(args.get("creation_authority") or os.environ.get("HERMES_PROFILE") or "worker"),
+                gate_candidate_sha=args.get("gate_candidate_sha"),
+                gate_manifest_hash=args.get("gate_manifest_hash"),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2390,6 +2423,21 @@ KANBAN_CREATE_SCHEMA = {
                     "a misspelled or missing profile."
                 ),
             },
+            "owner_kind": {
+                "type": "string",
+                "enum": ["agent", "external", "no_agent"],
+                "description": "Optional durable execution owner. Omit it to preserve DB inference (assigned tasks become agent-owned; unassigned cards are implicit no_agent). Use external only for a deliberate human-pulled lane, or no_agent for a non-dispatchable card.",
+            },
+            "task_kind": {
+                "type": "string",
+                "description": "Immutable task category. reviewer, visualqa, and release require the configured trusted orchestrator authority.",
+            },
+            "purpose": {"type": "string", "description": "Immutable creation-purpose provenance."},
+            "created_by_task_id": {"type": "string", "description": "Immutable creating task id; defaults to this worker's task."},
+            "created_by_run_id": {"type": "integer", "description": "Immutable creating run id when known."},
+            "creation_authority": {"type": "string", "description": "Immutable authority; defaults to the caller profile and must match configured coordinator/orchestrator for mandatory gates."},
+            "gate_candidate_sha": {"type": "string", "description": "Required for reviewer/visualqa: exact frozen source candidate SHA."},
+            "gate_manifest_hash": {"type": "string", "description": "Required for reviewer/visualqa: exact frozen source evidence manifest hash."},
             "body": {
                 "type": "string",
                 "description": (

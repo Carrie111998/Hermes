@@ -1752,3 +1752,53 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+# Legacy Kanban tests use these established, readable agent identities without
+# defining a local profile fixture. Keep that compatibility setup finite: profile
+# admission tests must exercise the real absence of every name not listed here.
+# In particular, never derive this set from a task's assignee or a queried value.
+_KANBAN_TEST_PROFILE_ALLOWLIST = frozenset({
+    "a", "alice", "alpha", "b", "beta", "bob", "builder", "coder",
+    "coordinator", "dashboard", "default", "dev", "elias", "engineer", "factory",
+    "fallback", "implementer", "independent-reviewer", "known", "orch",
+    "manual-reviewer", "ops", "orchestrator", "peer", "planner", "qa",
+    "release", "release-operator", "researcher", "researcher-a", "researcher-b",
+    "reviewer", "security", "setup", "some-profile", "swarm-orchestrator",
+    "test-worker", "w", "w1", "worker", "worker-a", "worker-b", "worker-d",
+    "worker1", "writer", "x", "broken", "ccreviewer", "operator", "publisher",
+})
+
+
+@pytest.fixture(autouse=True)
+def _materialize_kanban_assignee_profiles(request, monkeypatch, _hermetic_environment):
+    """Create only established positive-test Kanban profiles in each test home.
+
+    This fixture deliberately does not intercept ``profile_exists``. An
+    unlisted name, including malformed, traversal, missing, or random input,
+    remains absent so profile-admission tests exercise production behavior.
+    Some local fixtures replace HERMES_HOME after autouse setup; mirror the
+    same finite profiles into that new test home at the moment it is selected.
+    Tests needing another positive identity should create it in a local fixture
+    or add a deliberate, established name to the finite allowlist above.
+    """
+    if "test_kanban" not in request.node.fspath.basename:
+        yield
+        return
+
+    from hermes_cli import profiles
+
+    def materialize_allowlisted_profiles() -> None:
+        for profile_name in _KANBAN_TEST_PROFILE_ALLOWLIST - {"default"}:
+            profiles.get_profile_dir(profile_name).mkdir(parents=True, exist_ok=True)
+
+    materialize_allowlisted_profiles()
+    original_setenv = pytest.MonkeyPatch.setenv
+
+    def setenv_and_materialize(self, name, value, *args, **kwargs):
+        original_setenv(self, name, value, *args, **kwargs)
+        if name == "HERMES_HOME":
+            materialize_allowlisted_profiles()
+
+    monkeypatch.setattr(pytest.MonkeyPatch, "setenv", setenv_and_materialize)
+    yield

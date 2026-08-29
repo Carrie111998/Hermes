@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -213,6 +214,34 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
     }
 
 
+def _external_run_view(r: kanban_db.Run, *, now: Optional[int] = None) -> Optional[dict[str, Any]]:
+    """Return the safe durable identity for an external run, or ``None``.
+
+    This is deliberately built from persisted DB facts rather than process
+    registry state: a board remains truthful after the initiating worker exits.
+    """
+    if r.owner_kind != "external":
+        return None
+    now = int(time.time()) if now is None else now
+    heartbeat_age = max(0, now - r.last_heartbeat_at) if r.last_heartbeat_at else None
+    heartbeat_status = (
+        "finished" if r.ended_at is not None
+        else ("stale" if heartbeat_age is None or heartbeat_age > 300 else "healthy")
+    )
+    policy = r.metadata or {}
+    return {
+        "id": r.id, "owner": r.owner, "external_id": r.external_id,
+        "pid": r.worker_pid, "phase": r.phase, "current": r.progress_current,
+        "total": r.progress_total, "last_heartbeat_at": r.last_heartbeat_at,
+        "heartbeat_age_seconds": heartbeat_age, "heartbeat_status": heartbeat_status,
+        "log_ref": r.log_ref, "result_ref": r.result_ref,
+        "retry_policy": {"max_retries": policy.get("max_retries")},
+        "success_failure_policy": {
+            "on_success": policy.get("on_success"), "on_failure": policy.get("on_failure"),
+        },
+    }
+
+
 def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
     """Serialise a Run for the drawer's Run history section."""
     return {
@@ -232,6 +261,15 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "summary": r.summary,
         "metadata": r.metadata,
         "error": r.error,
+        "owner_kind": r.owner_kind,
+        "owner": r.owner,
+        "external_id": r.external_id,
+        "phase": r.phase,
+        "current": r.progress_current,
+        "total": r.progress_total,
+        "log_ref": r.log_ref,
+        "result_ref": r.result_ref,
+        "external_run": _external_run_view(r),
     }
 
 
@@ -461,6 +499,13 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        active_external_by_task = {
+            row["task_id"]: _external_run_view(kanban_db.Run.from_row(row))
+            for row in conn.execute(
+                "SELECT r.* FROM task_runs r JOIN tasks t ON t.current_run_id=r.id "
+                "WHERE r.owner_kind='external' AND r.ended_at IS NULL"
+            ).fetchall()
+        }
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -468,6 +513,7 @@ def get_board(
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
+            d["external_run"] = active_external_by_task.get(t.id)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -549,6 +595,11 @@ def get_task(
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
         task_d = _task_dict(task, latest_summary=full_summary)
+        active_run = (
+            kanban_db.get_external_run(conn, task.current_run_id)
+            if task.current_run_id is not None else None
+        )
+        task_d["external_run"] = _external_run_view(active_run) if active_run else None
         links = _links_for(conn, task_id)
         child_ids = links["children"]
         child_summaries = kanban_db.latest_summaries(conn, child_ids)
@@ -596,6 +647,152 @@ def get_task(
 # POST /tasks
 # ---------------------------------------------------------------------------
 
+class ExternalRunStartBody(BaseModel):
+    owner: str
+    external_id: str
+    pid: Optional[int] = None
+    phase: Optional[str] = None
+    current: Optional[int] = None
+    total: Optional[int] = None
+    log_ref: Optional[str] = None
+    result_ref: Optional[str] = None
+    max_retries: Optional[int] = None
+    on_success: str = "complete"
+    on_failure: str = "block"
+
+
+class ExternalRunHeartbeatBody(BaseModel):
+    owner: str
+    phase: Optional[str] = None
+    current: Optional[int] = None
+    total: Optional[int] = None
+    log_ref: Optional[str] = None
+    result_ref: Optional[str] = None
+
+
+class ExternalRunTransferBody(BaseModel):
+    from_owner: str
+    to_owner: str
+
+
+class ExternalRunFinishBody(BaseModel):
+    owner: str
+    outcome: str
+    result_ref: Optional[str] = None
+
+
+def _external_run_or_404(conn: sqlite3.Connection, run_id: int) -> kanban_db.Run:
+    run = kanban_db.get_external_run(conn, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="external run not found on this board")
+    return run
+
+
+@router.get("/tasks/{task_id}/external-runs")
+def list_task_external_runs(task_id: str, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        rows = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? AND owner_kind='external' ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        return {"runs": [_external_run_view(kanban_db.Run.from_row(row)) for row in rows]}
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/external-runs")
+def start_external_run_endpoint(task_id: str, payload: ExternalRunStartBody, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        run = kanban_db.start_external_run(
+            conn, task_id, owner=payload.owner, external_id=payload.external_id,
+            pid=payload.pid, phase=payload.phase, current=payload.current, total=payload.total,
+            log_ref=payload.log_ref, result_ref=payload.result_ref,
+            max_retries=payload.max_retries, on_success=payload.on_success, on_failure=payload.on_failure,
+        )
+        return {"run": _external_run_view(run)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/external-runs/reconcile")
+def reconcile_external_runs_endpoint(stale_after: int = Query(300, ge=1), board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"reconciled": kanban_db.reconcile_stale_external_runs(conn, stale_after_seconds=stale_after)}
+    finally:
+        conn.close()
+
+
+@router.get("/external-runs/{run_id}")
+def show_external_run_endpoint(run_id: int, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"run": _external_run_view(_external_run_or_404(conn, run_id))}
+    finally:
+        conn.close()
+
+
+@router.post("/external-runs/{run_id}/heartbeat")
+def heartbeat_external_run_endpoint(run_id: int, payload: ExternalRunHeartbeatBody, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        _external_run_or_404(conn, run_id)
+        ok = kanban_db.heartbeat_external_run(
+            conn, run_id, owner=payload.owner, phase=payload.phase, current=payload.current,
+            total=payload.total, log_ref=payload.log_ref, result_ref=payload.result_ref,
+        )
+        if not ok:
+            raise HTTPException(status_code=409, detail="external run is terminal or not owned by supplied owner")
+        return {"run": _external_run_view(_external_run_or_404(conn, run_id))}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/external-runs/{run_id}/transfer")
+def transfer_external_run_endpoint(run_id: int, payload: ExternalRunTransferBody, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        _external_run_or_404(conn, run_id)
+        ok = kanban_db.transfer_external_run_owner(conn, run_id, from_owner=payload.from_owner, to_owner=payload.to_owner)
+        if not ok:
+            raise HTTPException(status_code=409, detail="external run is terminal or not owned by supplied owner")
+        return {"run": _external_run_view(_external_run_or_404(conn, run_id))}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/external-runs/{run_id}/finish")
+def finish_external_run_endpoint(run_id: int, payload: ExternalRunFinishBody, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        _external_run_or_404(conn, run_id)
+        ok = kanban_db.finish_external_run(conn, run_id, owner=payload.owner, outcome=payload.outcome, result_ref=payload.result_ref)
+        if not ok:
+            raise HTTPException(status_code=409, detail="external run is terminal or not owned by supplied owner")
+        return {"run": _external_run_view(_external_run_or_404(conn, run_id))}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
 class CreateTaskBody(BaseModel):
     title: str
     body: Optional[str] = None
@@ -619,10 +816,31 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # None means the shipped UI omitted this field. Preserve that omission so
+    # create_task can infer agent ownership for assigned cards and implicit
+    # no_agent ownership for unassigned cards.
+    owner_kind: Optional[str] = None
+    task_kind: str = "ordinary"
+    purpose: Optional[str] = None
+    created_by_task_id: Optional[str] = None
+    created_by_run_id: Optional[int] = None
+    creation_authority: Optional[str] = None
+    gate_candidate_sha: Optional[str] = None
+    gate_manifest_hash: Optional[str] = None
 
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+    # Public JSON is never an authority channel. Bind this dashboard process to
+    # its real runtime profile; a supplied field can only assert that identity.
+    task_kind = str(payload.task_kind or "ordinary").strip().lower()
+    runtime_profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    if payload.creation_authority and payload.creation_authority != runtime_profile:
+        raise HTTPException(
+            status_code=400,
+            detail="creation_authority must equal dashboard runtime HERMES_PROFILE",
+        )
+    creation_authority = runtime_profile or None
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -647,6 +865,14 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            owner_kind=payload.owner_kind,
+            task_kind=task_kind,
+            purpose=payload.purpose,
+            created_by_task_id=payload.created_by_task_id,
+            created_by_run_id=payload.created_by_run_id,
+            creation_authority=creation_authority,
+            gate_candidate_sha=payload.gate_candidate_sha,
+            gate_manifest_hash=payload.gate_manifest_hash,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -829,6 +1055,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
     assignee: Optional[str] = None
+    owner_kind: Optional[str] = None  # immutable; checked when assignment changes
     priority: Optional[int] = None
     title: Optional[str] = None
     body: Optional[str] = None
@@ -880,16 +1107,32 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             payload.status == "review" and payload.assignee is not None
         )
 
+        # An explicit owner_kind is never a harmless ignored PATCH field. Route
+        # it through the DB boundary even when the assignee is unchanged.
+        if payload.owner_kind is not None and payload.assignee is None:
+            try:
+                ok = kanban_db.assign_task(
+                    conn, task_id, task.assignee, owner_kind=payload.owner_kind,
+                )
+            except RuntimeError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
+
         # --- assignee ----------------------------------------------------
         # For a combined assignee+review patch, request_review must capture
         # the current implementer before routing the task to the reviewer.
         if payload.assignee is not None and not review_assignee_deferred:
             try:
                 ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
+                    conn, task_id, payload.assignee or None, owner_kind=payload.owner_kind,
                 )
             except RuntimeError as e:
                 raise HTTPException(status_code=409, detail=str(e))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
 
@@ -1844,7 +2087,11 @@ def specify_task_endpoint(
 
 class ReassignBody(BaseModel):
     profile: Optional[str] = None  # "" or None = unassign
+    owner_kind: Optional[str] = None  # immutable; explicit value is verified
     reclaim_first: bool = False
+    # Explicit trusted routing action: only an implicit, intentionally
+    # unassigned manual lane may become dispatchable agent work again.
+    activate_agent: bool = False
     reason: Optional[str] = None
 
 
@@ -1864,12 +2111,17 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reassign_task(
-            conn, task_id,
-            payload.profile or None,
-            reclaim_first=bool(payload.reclaim_first),
-            reason=payload.reason,
-        )
+        try:
+            ok = kanban_db.reassign_task(
+                conn, task_id,
+                payload.profile or None,
+                reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason,
+                owner_kind=payload.owner_kind,
+                activate_agent=bool(payload.activate_agent),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         if not ok:
             raise HTTPException(
                 status_code=409,
