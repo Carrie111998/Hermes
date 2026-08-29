@@ -10929,6 +10929,23 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+
+    # Isolate this dispatched worker into a lower-weighted child cgroup so
+    # the gateway's asyncio event loop is not starved by its own workers
+    # (jarvis-os t_4ae8a651 / t_5c779aae). The worker and its whole process
+    # tree land in <unit>.service/workers/ (cpu.weight 10) while the gateway
+    # main process sits in <unit>.service/main/ (cpu.weight 200), letting the
+    # kernel arbitrate between them instead of pitting the loop against its
+    # own workers in one flat cgroup. Best-effort: if cgroup placement is
+    # unavailable (standalone daemon, no Delegate, no permission) the worker
+    # simply runs in the unit cgroup exactly as before.
+    try:
+        from gateway.cgroup_worker import place_worker_in_child_cgroup
+
+        place_worker_in_child_cgroup(proc.pid)
+    except Exception:  # noqa: BLE001 - a cgroup failure must never break dispatch
+        pass
+
     return proc.pid
 
 
