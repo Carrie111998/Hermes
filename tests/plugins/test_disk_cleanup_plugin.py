@@ -134,6 +134,15 @@ class TestGuessCategory:
         p.write_text("[]")
         assert dg.guess_category(p) is None
 
+    def test_kanban_workspace_test_file_not_tracked(self, _isolate_env):
+        dg = _load_lib()
+        workspace = _isolate_env / "kanban" / "workspaces" / "t_active"
+        workspace.mkdir(parents=True)
+        p = workspace / "test_probe.py"
+        p.write_text("x")
+
+        assert dg.guess_category(p) is None
+
     def test_ordinary_file_returns_none(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "notes.md"
@@ -226,6 +235,47 @@ class TestStaleCronEntryMigration:
 
 
 class TestTrackForgetQuick:
+    def test_quick_preserves_empty_kanban_workspace(self, _isolate_env):
+        dg = _load_lib()
+        workspace = _isolate_env / "kanban" / "workspaces" / "t_active"
+        workspace.mkdir(parents=True)
+
+        dg.quick()
+
+        assert workspace.is_dir()
+
+    def test_quick_drops_stale_kanban_test_entry_without_deleting_file(
+        self, _isolate_env
+    ):
+        dg = _load_lib()
+        workspace = _isolate_env / "kanban" / "workspaces" / "t_active"
+        workspace.mkdir(parents=True)
+        p = workspace / "test_probe.py"
+        p.write_text("x")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(p),
+            "category": "test",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "size": 1,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert p.is_file()
+        assert json.loads(tracked_file.read_text()) == []
+
+    def test_quick_removes_disposable_empty_directory(self, _isolate_env):
+        dg = _load_lib()
+        disposable = _isolate_env / "scratch" / "empty"
+        disposable.mkdir(parents=True)
+
+        dg.quick()
+
+        assert not disposable.exists()
+
     def test_track_then_quick_deletes_test(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "test_a.py"

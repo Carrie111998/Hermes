@@ -147,7 +147,7 @@ ALLOWED_CATEGORIES = {
 _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "logs", "memories", "sessions", "cron", "cronjobs",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
-    "hermes-agent", "backups", "profiles", ".worktrees",
+    "hermes-agent", "backups", "profiles", "kanban", ".worktrees",
     # User-authored project trees — never sweep empty directories
     # inside these (#75403).
     "patches", "projects", "skins", "themes", "contributors",
@@ -585,7 +585,7 @@ def guess_category(path: Path) -> Optional[str]:
             # inside these just because they happen to be named test_* or
             # tmp_* (#75403, also #32164, #37721).
             "patches", "projects", "skins", "themes", "contributors",
-            "profiles", "backups", "optional-skills",
+            "profiles", "backups", "optional-skills", "kanban",
         }:
             return None
         if top == "cron" or top == "cronjobs":
