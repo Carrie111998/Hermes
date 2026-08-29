@@ -1037,6 +1037,32 @@ def _render_todo_checklist(result_str: str) -> str:
     return "\n".join(lines)
 
 
+def _dispatch_todo_progress(
+    progress_queue: "queue.Queue",
+    event_type: str,
+    tool_name: str,
+    result_str: str,
+    logger: logging.Logger,
+) -> bool:
+    """Handle todo-checklist progress — called by progress_callback.
+
+    Returns True if the event was consumed (todo checklist rendered and
+    pushed onto the queue), False if it should fall through.
+
+    Extracted as a module-level function so tests can exercise the
+    actual dispatch path without duplicating callback logic.
+    """
+    if event_type == "tool.completed" and tool_name == "todo":
+        try:
+            checklist = _render_todo_checklist(result_str)
+            if checklist:
+                progress_queue.put(checklist)
+        except Exception:
+            logger.debug("Failed to render todo checklist", exc_info=True)
+        return True
+    return False
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
@@ -30017,11 +30043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # editable checklist in the progress message bubble.  Must run
             # BEFORE the onboarding early-return below so it is not blocked
             # by that handler's blanket return for tool.completed events.
-            if event_type == "tool.completed" and tool_name == "todo":
-                try:
-                    progress_queue.put(_render_todo_checklist(kwargs.get("result", "")))
-                except Exception:
-                    logger.debug("Failed to render todo checklist", exc_info=True)
+            if _dispatch_todo_progress(progress_queue, event_type, tool_name, kwargs.get("result", ""), logger):
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
