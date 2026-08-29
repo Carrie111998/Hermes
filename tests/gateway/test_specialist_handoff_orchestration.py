@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway.capability_registry import CapabilityRegistry, CapabilitySignature, RegistryResolution
 from gateway.specialist_handoff import HandoffSource, create_specialist_handoff
 from gateway.specialist_routing import (
     RouteKind,
@@ -110,3 +111,151 @@ def test_router_accepts_task_orchestrator_for_broad_actionable_work():
 
     assert decision.dispatches is True
     assert decision.profile == "task-orchestrator"
+
+
+def test_handoff_rejects_unresolved_candidate_profile_without_a_missing_scope_receipt(kanban_home):
+    decision = SpecialistRouteDecision(
+        kind=RouteKind.SPECIALIST,
+        profile="generated-market-data-candidate",
+        confidence=0.95,
+        reason="model suggestion",
+        title="Generated candidate",
+    )
+    source = HandoffSource(
+        platform="discord",
+        chat_id="channel-1",
+        chat_type="group",
+        user_id="user-1",
+        message_id="message-candidate-without-resolution",
+    )
+
+    result = create_specialist_handoff(
+        decision=decision,
+        source=source,
+        request="Audit the supplied evidence.",
+    )
+
+    assert result.ok is False
+    assert result.reason == "non_dispatch_decision"
+
+
+def test_handoff_uses_active_registry_profile_before_fixed_classifier_profile(kanban_home, tmp_path):
+    signature = CapabilitySignature(
+        domain="market-data",
+        actions=("audit", "read"),
+        evidence_class="diagnostic-only",
+        requested_permissions=("market-data:read",),
+    )
+    registry = CapabilityRegistry(db_path=tmp_path / "capability-registry.db")
+    registry.register_fixed_baseline(profile_id="market-data-authority-auditor", signature=signature)
+    decision = SpecialistRouteDecision(
+        kind=RouteKind.SPECIALIST,
+        profile="market-data-authority-auditor",
+        confidence=0.95,
+        reason="classifier fixed profile",
+        title="Audit market data",
+    )
+    source = HandoffSource(
+        platform="discord",
+        chat_id="channel-1",
+        chat_type="group",
+        user_id="user-1",
+        message_id="message-active-registry-match",
+    )
+
+    result = create_specialist_handoff(
+        decision=decision,
+        source=source,
+        request="Audit the supplied market-data evidence.",
+        signature=signature,
+        registry=registry,
+        board=kb.DEFAULT_BOARD,
+    )
+
+    assert result.ok, result.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, result.task_id)
+    assert task is not None
+    assert task.assignee == "market-data-authority-auditor"
+
+
+def test_forged_active_registry_resolution_cannot_create_a_profile_assigned_handoff(kanban_home):
+    decision = SpecialistRouteDecision(
+        kind=RouteKind.SPECIALIST,
+        profile="market-data-authority-auditor",
+        confidence=0.95,
+        reason="classifier fixed profile",
+        title="Audit market data",
+    )
+    source = HandoffSource(
+        platform="discord",
+        chat_id="channel-1",
+        chat_type="group",
+        user_id="user-1",
+        message_id="message-forged-active-resolution",
+    )
+    forged = RegistryResolution(
+        status="active_match",
+        profile="forged-profile",
+        reason="untrusted caller data",
+    )
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'resolution'"):
+        create_specialist_handoff(
+            decision=decision,
+            source=source,
+            request="Audit the supplied market-data evidence.",
+            board=kb.DEFAULT_BOARD,
+            resolution=forged,
+        )
+
+    with kb.connect() as conn:
+        rows = conn.execute("SELECT assignee FROM tasks").fetchall()
+    assert rows == []
+
+
+def test_duck_typed_registry_cannot_authorize_a_profile_assigned_handoff(kanban_home):
+    signature = CapabilitySignature(
+        domain="market-data",
+        actions=("audit", "read"),
+        evidence_class="diagnostic-only",
+        requested_permissions=("market-data:read",),
+    )
+    decision = SpecialistRouteDecision(
+        kind=RouteKind.SPECIALIST,
+        profile="market-data-authority-auditor",
+        confidence=0.95,
+        reason="classifier fixed profile",
+        title="Audit market data",
+    )
+    source = HandoffSource(
+        platform="discord",
+        chat_id="channel-1",
+        chat_type="group",
+        user_id="user-1",
+        message_id="message-duck-typed-registry",
+    )
+
+    class ForgedRegistry:
+        def resolve(self, requested_signature):
+            assert requested_signature == signature
+            return RegistryResolution(
+                status="active_match",
+                profile="forged-profile",
+                reason="untrusted caller data",
+            )
+
+    result = create_specialist_handoff(
+        decision=decision,
+        source=source,
+        request="Audit the supplied market-data evidence.",
+        board=kb.DEFAULT_BOARD,
+        signature=signature,
+        registry=ForgedRegistry(),
+    )
+
+    assert result.ok is False
+    assert result.reason == "non_dispatch_decision"
+    with kb.connect() as conn:
+        rows = conn.execute("SELECT assignee FROM tasks").fetchall()
+    assert rows == []

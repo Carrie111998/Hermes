@@ -40,12 +40,13 @@ import json
 import logging
 import sqlite3
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -55,6 +56,128 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+class SpecialistApprovalInput(BaseModel):
+    """The scoped promotion decision submitted by an authenticated operator."""
+
+    candidate_id: str = Field(min_length=1, max_length=160)
+    verification_result_hash: str = Field(min_length=64, max_length=64)
+    target_state: Literal["staged", "active"]
+
+
+def _specialist_operator_subject(request: Request) -> str | None:
+    """Return the configured authenticated operator subject, else fail closed."""
+    try:
+        from gateway.operator_approval_authority import authenticated_operator_identity
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban") if isinstance(cfg.get("kanban"), dict) else {}
+        approval_cfg = (
+            kanban_cfg.get("specialist_operator_approvals")
+            if isinstance(kanban_cfg.get("specialist_operator_approvals"), dict)
+            else {}
+        )
+        allowed_subjects = approval_cfg.get("allowed_subjects", ())
+        if not isinstance(allowed_subjects, (list, tuple)):
+            return None
+        return authenticated_operator_identity(
+            getattr(request.state, "session", None),
+            auth_required=bool(getattr(request.app.state, "auth_required", False)),
+            allowed_subjects=allowed_subjects,
+        )
+    except Exception:
+        return None
+
+
+@router.get("/specialist-approval-authority")
+def specialist_approval_authority(request: Request):
+    """Expose the current verified session subject for allowlist setup."""
+    try:
+        from gateway.operator_approval_authority import (
+            authenticated_operator_identity,
+            dashboard_session_subject,
+        )
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban") if isinstance(cfg.get("kanban"), dict) else {}
+        approval_cfg = (
+            kanban_cfg.get("specialist_operator_approvals")
+            if isinstance(kanban_cfg.get("specialist_operator_approvals"), dict)
+            else {}
+        )
+        allowed_subjects = approval_cfg.get("allowed_subjects", ())
+        if not isinstance(allowed_subjects, (list, tuple)):
+            allowed_subjects = ()
+        auth_required = bool(getattr(request.app.state, "auth_required", False))
+        session = getattr(request.state, "session", None)
+        return {
+            "authenticated_subject": dashboard_session_subject(
+                session, auth_required=auth_required
+            ),
+            "approval_authorized": authenticated_operator_identity(
+                session, auth_required=auth_required, allowed_subjects=allowed_subjects
+            )
+            is not None,
+        }
+    except Exception:
+        return {"authenticated_subject": None, "approval_authorized": False}
+
+
+@router.post("/specialist-approvals")
+def record_specialist_approval(
+    payload: SpecialistApprovalInput, request: Request, board: Optional[str] = Query(None)
+):
+    """Record a durable, OAuth-authenticated operator promotion decision.
+
+    The dashboard's normal auth middleware must attach a verified session.
+    Legacy loopback session tokens and unauthorised authenticated users receive
+    no approval authority.
+    """
+    subject = _specialist_operator_subject(request)
+    if subject is None:
+        raise HTTPException(status_code=403, detail="authenticated operator approval required")
+    board = _resolve_board(board)
+    try:
+        from agent.profile_benchmark import CandidatePromotionGate, OperatorApproval
+        from gateway.candidate_profile_requests import CandidateProfileRequests
+        from gateway.capability_registry import CapabilityRegistry
+        from gateway.configured_board import configured_board_db_path
+
+        effective_board = board or kanban_db.get_current_board()
+        now = int(time.time())
+        db_path = configured_board_db_path(effective_board)
+        approval = OperatorApproval(
+            candidate_id=payload.candidate_id,
+            approval_id=f"dashboard-{uuid.uuid4().hex}",
+            operator_identity=subject,
+            verification_result_hash=payload.verification_result_hash,
+            target_state=payload.target_state,
+            approved=True,
+            issued_at=now,
+        )
+        gate = CandidatePromotionGate(
+            CandidateProfileRequests(db_path=db_path, board=effective_board),
+            CapabilityRegistry(db_path=db_path, board=effective_board),
+        )
+        if not gate.record_operator_approval(
+            approval, authenticated_operator_identity=subject
+        ):
+            raise HTTPException(status_code=409, detail="operator approval was not recorded")
+    except HTTPException:
+        raise
+    except Exception:
+        log.warning("specialist operator approval failed", exc_info=True)
+        raise HTTPException(status_code=400, detail="invalid specialist approval")
+    return {
+        "approval_id": approval.approval_id,
+        "candidate_id": approval.candidate_id,
+        "target_state": approval.target_state,
+        "operator_identity": approval.operator_identity,
+        "status": "recorded",
+    }
 
 
 @router.get("/dispatcher-readiness")

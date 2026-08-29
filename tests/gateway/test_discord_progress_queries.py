@@ -11,6 +11,8 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
+from gateway.specialist_handoff import HandoffResult
+from gateway.specialist_routing import RouteKind, SpecialistRouteDecision
 
 
 @pytest.fixture
@@ -100,3 +102,52 @@ def test_specialist_routing_configuration_requires_nonempty_explicit_board(adapt
 
     adapter.config.extra["specialist_routing"]["board"] = ""
     assert adapter._specialist_routing_settings()["enabled"] is False
+
+
+def _specialist_decision() -> SpecialistRouteDecision:
+    return SpecialistRouteDecision(
+        kind=RouteKind.SPECIALIST,
+        profile="market-data-authority-auditor",
+        confidence=0.95,
+        reason="market-data audit",
+        title="Audit market-data evidence",
+        audit_reason="specialist",
+    )
+
+
+def test_discord_specialist_ingress_passes_fixed_local_signature_and_registry(adapter, monkeypatch):
+    captured = {}
+
+    def fake_handoff(**kwargs):
+        captured.update(kwargs)
+        return HandoffResult(False, reason="registry_unavailable")
+
+    adapter._classify_specialist_event = AsyncMock(return_value=_specialist_decision())
+    monkeypatch.setattr("gateway.specialist_handoff.create_specialist_handoff", fake_handoff)
+
+    handled = asyncio.run(adapter._maybe_route_specialist_event(_event("Audit market data.")))
+
+    assert handled is False
+    assert captured["board"] == "exampleproject-burndown"
+    assert captured["signature"].domain == "market-data"
+    assert captured["signature"].actions == ("audit", "inspect", "read", "review", "validate")
+    assert captured["signature"].requested_permissions == ("market-data:read",)
+    assert captured["registry"]._board == "exampleproject-burndown"
+    adapter.send.assert_not_awaited()
+
+
+def test_discord_specialist_registry_unavailable_falls_through_to_normal_chat(adapter, monkeypatch):
+    from gateway.capability_registry import RegistryResolution
+
+    adapter._classify_specialist_event = AsyncMock(return_value=_specialist_decision())
+    monkeypatch.setattr(
+        "gateway.specialist_handoff.resolve_registry",
+        lambda signature, registry: RegistryResolution(
+            status="unavailable", profile=None, reason="database unavailable"
+        ),
+    )
+
+    handled = asyncio.run(adapter._maybe_route_specialist_event(_event("Audit market data.")))
+
+    assert handled is False
+    adapter.send.assert_not_awaited()

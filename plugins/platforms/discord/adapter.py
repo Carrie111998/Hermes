@@ -7139,7 +7139,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not decision.dispatches:
             return False
         try:
+            from gateway.capability_registry import CapabilityRegistry
             from gateway.specialist_handoff import HandoffSource, create_specialist_handoff
+            from gateway.specialist_routing import capability_signature_for_profile
+
+            signature = capability_signature_for_profile(decision.profile)
+            if signature is None:
+                logger.warning("[Discord] specialist route had no fixed capability signature")
+                return False
 
             platform = getattr(event.source.platform, "value", event.source.platform)
             source = HandoffSource(
@@ -7155,7 +7162,8 @@ class DiscordAdapter(BasePlatformAdapter):
             result = await asyncio.to_thread(
                 create_specialist_handoff, decision=decision, source=source,
                 request=event.text, router_model=settings["model"] or "configured_auxiliary",
-                board=settings["board"],
+                board=settings["board"], signature=signature,
+                registry=CapabilityRegistry(board=settings["board"]),
             )
         except Exception:
             logger.warning("[Discord] specialist routing handoff failed", exc_info=True)
