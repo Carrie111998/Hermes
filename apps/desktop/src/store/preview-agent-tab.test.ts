@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import { selectRightRailTab } from './layout'
 import {
+  $dockedPreviewTabs,
   $previewTabs,
   closeRightRail,
   decodePreviewTabs,
@@ -174,6 +175,24 @@ describe('agent browser tabs', () => {
     openPreview(file, 'tool-result', { newTab: true })
 
     expect($previewTabs.get()).toHaveLength(1)
+  })
+
+  // A second tab must be a TAB — another row in the strip of the browser
+  // already on screen — not a second pane splitting the width, and not a
+  // separate window. `$dockedPreviewTabs` is what the tile strip renders
+  // from; a tab missing from it has been popped out into its own window,
+  // which only the pop-out button does. Nothing on the agent's path calls it.
+  it('opens a tab in the same browser, not a window', () => {
+    openPreview(url('first.com'), 'tool-result')
+    openPreview(url('second.com'), 'tool-result', { newTab: true })
+
+    const docked = $dockedPreviewTabs.get()
+
+    expect(docked).toHaveLength(2)
+    expect(docked.map(tab => tab.target.url)).toEqual(['https://first.com', 'https://second.com'])
+    // Both are browser tabs, so the strip stacks them into the pane that is
+    // already open instead of splitting a new zone off the edge (#93610).
+    expect(docked.every(tab => tab.target.kind === 'url')).toBe(true)
   })
 
   // `openBrowserTab` is the hotkey: "show me the browser". With only the
