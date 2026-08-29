@@ -3356,12 +3356,13 @@ def _current_checkout_sha() -> str | None:
 
 def _receipt_looks_unfinished(receipt: dict) -> bool:
     """True when *receipt* is from an update that did not finish cleanly."""
-    if receipt.get("stop_reason"):
+    stop_reason = receipt.get("stop_reason")
+    if stop_reason and stop_reason != "completed at command boundary":
         return True
     exit_code = receipt.get("exit_code")
+    outcome = receipt.get("outcome")
     if exit_code not in (0, None):
         return True
-    outcome = receipt.get("outcome")
     if outcome in ("failed", "partial", "running"):
         return True
     gateway_restart = receipt.get("gateway_restart")
