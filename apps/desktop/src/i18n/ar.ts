@@ -1833,6 +1833,9 @@ export const ar = defineLocale({
     transcribingDictation: 'جار تفريغ الإملاء',
     voiceControls: 'صوت',
     voiceDictation: 'إملاء صوتي',
+    delegationRoutingOn: 'تغييرات المستودع عبر Delegate Wave — انقر للسماح لـ Hermes بالتعديل مباشرة',
+    delegationRoutingOff: 'يعدّل Hermes المستودعات مباشرة — انقر لتوجيه التغييرات عبر Delegate Wave',
+    delegationRoutingSaveFailed: 'تعذّر حفظ توجيه المستودع',
     lookupLoading: 'جار البحث...',
     lookupNoMatches: 'لا توجد نتائج',
     lookupTry: 'جرب',
@@ -2500,6 +2503,16 @@ export const ar = defineLocale({
       branchNewChat: 'تفريع إلى محادثة جديدة',
       react: 'تفاعل',
       dismissError: 'تجاهل الخطأ',
+      delegateWave: {
+        completedLabel: 'اكتمل',
+        questionLabel: 'يحتاج إلى إدخال',
+        readyLabel: 'جاهز للمراجعة',
+        failedLabel: 'متوقف',
+        completedSummary: task => `اكتملت ${task} ونُشرت النتيجة.`,
+        questionFallback: task => `يلزم اتخاذ قرار بشأن ${task}.`,
+        readySummary: task => `تم التحقق من ${task}؛ النتيجة المرشحة بانتظار المراجعة.`,
+        failedFallback: task => `تعذّر إكمال ${task}.`
+      },
       errorLayers: {
         auth: 'خطأ في المصادقة',
         billing: 'نفاد الرصيد',

@@ -2334,6 +2334,7 @@ export const en: Translations = {
     voiceDictation: 'Voice dictation',
     delegationRoutingOn: 'Repository changes go to Delegate Wave — click to let Hermes edit directly',
     delegationRoutingOff: 'Hermes edits repositories directly — click to route changes to Delegate Wave',
+    delegationRoutingSaveFailed: 'Could not save repository routing',
     speakReplies: 'Read replies aloud',
     stopSpeakingReplies: 'Stop reading replies aloud',
     wakeWordListening: phrase => `Wake word: "${phrase}" — listening`,
@@ -3152,6 +3153,16 @@ export const en: Translations = {
       branchNewChat: 'Branch in new chat',
       react: 'React',
       dismissError: 'Dismiss error',
+      delegateWave: {
+        completedLabel: 'Completed',
+        questionLabel: 'Needs input',
+        readyLabel: 'Ready for review',
+        failedLabel: 'Stopped',
+        completedSummary: task => `Finished ${task} and published the result.`,
+        questionFallback: task => `A decision is needed for ${task}.`,
+        readySummary: task => `Validated ${task}; the candidate is waiting for review.`,
+        failedFallback: task => `Could not finish ${task}.`
+      },
       errorLayers: {
         auth: 'Authentication error',
         billing: 'Out of credits',

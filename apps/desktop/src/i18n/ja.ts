@@ -2033,6 +2033,7 @@ export const ja = defineLocale({
     voiceDictation: '音声口述',
     delegationRoutingOn: 'リポジトリの変更は Delegate Wave 経由 — クリックで Hermes が直接編集',
     delegationRoutingOff: 'Hermes がリポジトリを直接編集 — クリックで Delegate Wave 経由に',
+    delegationRoutingSaveFailed: 'リポジトリのルーティングを保存できませんでした',
     speakReplies: '返信を読み上げる',
     stopSpeakingReplies: '返信の読み上げを停止',
     wakeWordListening: phrase => `ウェイクワード:「${phrase}」— 待機中`,
@@ -2804,6 +2805,16 @@ export const ja = defineLocale({
       branchNewChat: '新しいチャットでブランチ',
       react: 'リアクション',
       dismissError: 'エラーを閉じる',
+      delegateWave: {
+        completedLabel: '完了',
+        questionLabel: '入力が必要',
+        readyLabel: 'レビュー待ち',
+        failedLabel: '停止',
+        completedSummary: task => `${task}を完了し、結果を公開しました。`,
+        questionFallback: task => `${task}について判断が必要です。`,
+        readySummary: task => `${task}を検証済みです。候補はレビュー待ちです。`,
+        failedFallback: task => `${task}を完了できませんでした。`
+      },
       errorLayers: {
         auth: '認証エラー',
         billing: 'クレジット不足',

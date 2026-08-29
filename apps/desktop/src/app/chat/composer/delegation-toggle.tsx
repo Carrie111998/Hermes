@@ -67,9 +67,17 @@ export function DelegationToggle({ disabled }: { disabled: boolean }) {
     setHermesConfigCache(next)
 
     try {
-      await saveHermesConfig(next)
+      const result = await saveHermesConfig(next)
+
+      if (!result.ok) {
+        throw new Error(c.delegationRoutingSaveFailed)
+      }
     } catch (error) {
-      notifyError(error, label)
+      // Roll back immediately. Invalidation may fail for the same reason as
+      // the save and cannot be the only correction for a safety switch that
+      // never persisted.
+      setHermesConfigCache(config)
+      notifyError(error, c.delegationRoutingSaveFailed)
     } finally {
       void invalidateHermesConfig()
       setSaving(false)

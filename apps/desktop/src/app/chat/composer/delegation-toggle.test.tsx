@@ -74,6 +74,29 @@ describe('DelegationToggle', () => {
     )
   })
 
+  it('rolls back when the backend rejects the config without throwing', async () => {
+    saveHermesConfig.mockResolvedValueOnce({ ok: false })
+    renderToggle()
+    await waitFor(() => expect(button().getAttribute('aria-pressed')).toBe('false'))
+
+    button().click()
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    await waitFor(() => expect(button().getAttribute('aria-pressed')).toBe('false'))
+  })
+
+  it('rolls back when saving and the follow-up refetch both fail', async () => {
+    saveHermesConfig.mockRejectedValueOnce(new Error('offline'))
+    getHermesConfigRecord.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('still offline'))
+    renderToggle()
+    await waitFor(() => expect(button().getAttribute('aria-pressed')).toBe('false'))
+
+    button().click()
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    await waitFor(() => expect(button().getAttribute('aria-pressed')).toBe('false'))
+  })
+
   it('renders nothing until the config has loaded, rather than guessing a state', () => {
     getHermesConfigRecord.mockReturnValue(new Promise(() => {}))
     renderToggle()

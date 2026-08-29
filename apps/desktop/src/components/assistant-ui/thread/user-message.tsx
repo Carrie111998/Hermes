@@ -262,6 +262,9 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
 }
 
 const DelegateWaveWakeCard: FC<{ wake: DelegateWaveWake }> = ({ wake }) => {
+  const { t } = useI18n()
+  const copy = t.assistant.thread.delegateWave
+
   const styles = {
     completed: { icon: 'check', surface: 'border-emerald-500/35 bg-emerald-500/8', tone: 'text-emerald-500' },
     question: { icon: 'question', surface: 'border-amber-500/35 bg-amber-500/8', tone: 'text-amber-500' },
@@ -270,6 +273,20 @@ const DelegateWaveWakeCard: FC<{ wake: DelegateWaveWake }> = ({ wake }) => {
   } as const
 
   const style = styles[wake.kind]
+
+  const labels = {
+    completed: copy.completedLabel,
+    question: copy.questionLabel,
+    ready: copy.readyLabel,
+    failed: copy.failedLabel
+  }
+
+  const summaries = {
+    completed: copy.completedSummary(wake.task),
+    question: wake.detail || copy.questionFallback(wake.task),
+    ready: copy.readySummary(wake.task),
+    failed: wake.detail || copy.failedFallback(wake.task)
+  }
 
   return (
     <div
@@ -285,10 +302,10 @@ const DelegateWaveWakeCard: FC<{ wake: DelegateWaveWake }> = ({ wake }) => {
       </span>
       <span className="min-w-0">
         <span className={cn('block text-[0.6875rem] font-semibold uppercase tracking-[0.08em]', style.tone)}>
-          Delegate Wave · {wake.label}
+          Delegate Wave · {labels[wake.kind]}
         </span>
         <span className="mt-0.5 block wrap-anywhere text-[0.8125rem] leading-5 text-foreground/85">
-          {wake.summary}
+          {summaries[wake.kind]}
         </span>
       </span>
     </div>

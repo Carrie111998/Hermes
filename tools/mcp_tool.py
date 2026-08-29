@@ -7615,6 +7615,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            repo_access=_resolve_mcp_repo_access(config, raw_name, registry_name),
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
@@ -7648,6 +7649,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
+            repo_access=_resolve_mcp_repo_access(config, handler_key, util_name),
         )
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue

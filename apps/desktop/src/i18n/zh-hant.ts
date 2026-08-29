@@ -1966,6 +1966,7 @@ export const zhHant = defineLocale({
     voiceDictation: '語音聽寫',
     delegationRoutingOn: '儲存庫變更經由 Delegate Wave — 點擊改為 Hermes 直接編輯',
     delegationRoutingOff: 'Hermes 直接編輯儲存庫 — 點擊改為經由 Delegate Wave',
+    delegationRoutingSaveFailed: '無法儲存儲存庫路由設定',
     speakReplies: '朗讀回覆',
     stopSpeakingReplies: '停止朗讀回覆',
     wakeWordListening: phrase => `喚醒詞:「${phrase}」— 正在聆聽`,
@@ -2709,6 +2710,16 @@ export const zhHant = defineLocale({
       branchNewChat: '在新聊天中分支',
       react: '回應',
       dismissError: '关闭错误',
+      delegateWave: {
+        completedLabel: '已完成',
+        questionLabel: '需要輸入',
+        readyLabel: '等待審查',
+        failedLabel: '已停止',
+        completedSummary: task => `已完成${task}並發佈結果。`,
+        questionFallback: task => `${task}需要作出決定。`,
+        readySummary: task => `${task}已驗證；候選結果正在等待審查。`,
+        failedFallback: task => `無法完成${task}。`
+      },
       errorLayers: {
         auth: '認證錯誤',
         billing: '額度不足',

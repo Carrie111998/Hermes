@@ -166,7 +166,6 @@ export function sectionFieldEntries(
       s.id,
       s.keys.flatMap(k => {
         const value = getNested(config, k)
-
         const field = schema[k] ?? (value === undefined ? undefined : inferFieldSchema(value))
 
         return field ? [[k, field] as [string, ConfigFieldSchema]] : []

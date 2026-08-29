@@ -2,8 +2,8 @@ export type DelegateWaveWakeKind = 'completed' | 'failed' | 'question' | 'ready'
 
 export type DelegateWaveWake = {
   kind: DelegateWaveWakeKind
-  label: string
-  summary: string
+  task: string
+  detail?: string
 }
 
 const MARKER_RE = /\[delegate-wave-wake:wake_[^\]]+\]/i
@@ -27,17 +27,17 @@ export function parseDelegateWaveWake(text: string): DelegateWaveWake | null {
   if (question) {
     return {
       kind: 'question',
-      label: 'Needs input',
-      summary: question[1]?.trim() || `A decision is needed for ${task}.`
+      task,
+      detail: question[1]?.trim() || undefined
     }
   }
 
   if (/finished and its result is on the branch/i.test(text)) {
-    return { kind: 'completed', label: 'Completed', summary: `Finished ${task} and published the result.` }
+    return { kind: 'completed', task }
   }
 
   if (/has a finished, validated candidate/i.test(text)) {
-    return { kind: 'ready', label: 'Ready for review', summary: `Validated ${task}; the candidate is waiting for review.` }
+    return { kind: 'ready', task }
   }
 
   if (/delegate-wave session[\s\S]* failed\./i.test(text)) {
@@ -45,8 +45,8 @@ export function parseDelegateWaveWake(text: string): DelegateWaveWake | null {
 
     return {
       kind: 'failed',
-      label: 'Stopped',
-      summary: outcome?.[1]?.trim() || `Could not finish ${task}.`
+      task,
+      detail: outcome?.[1]?.trim() || undefined
     }
   }
 

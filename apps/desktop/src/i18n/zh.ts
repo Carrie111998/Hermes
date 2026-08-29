@@ -2514,6 +2514,7 @@ export const zh: Translations = {
     voiceDictation: '语音听写',
     delegationRoutingOn: '仓库更改经由 Delegate Wave — 点击改为 Hermes 直接编辑',
     delegationRoutingOff: 'Hermes 直接编辑仓库 — 点击改为经由 Delegate Wave',
+    delegationRoutingSaveFailed: '无法保存仓库路由设置',
     speakReplies: '朗读回复',
     stopSpeakingReplies: '停止朗读回复',
     wakeWordListening: phrase => `唤醒词:"${phrase}" — 正在监听`,
@@ -3311,6 +3312,16 @@ export const zh: Translations = {
       branchNewChat: '在新对话中分支',
       react: '回应',
       dismissError: '关闭错误',
+      delegateWave: {
+        completedLabel: '已完成',
+        questionLabel: '需要输入',
+        readyLabel: '等待审核',
+        failedLabel: '已停止',
+        completedSummary: task => `已完成${task}并发布结果。`,
+        questionFallback: task => `${task}需要作出决定。`,
+        readySummary: task => `${task}已验证；候选结果正在等待审核。`,
+        failedFallback: task => `无法完成${task}。`
+      },
       errorLayers: {
         auth: '认证错误',
         billing: '额度不足',
