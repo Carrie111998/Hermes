@@ -34,10 +34,11 @@ def test_off_by_default_so_an_existing_install_is_unchanged():
 
 
 class _FakeEntry:
-    def __init__(self, repo_access, *, toolset="test", handler=None):
+    def __init__(self, repo_access, *, toolset="test", handler=None, origin="plugin"):
         self.repo_access = repo_access
         self.toolset = toolset
         self.handler = handler or (lambda: None)
+        self.origin = origin
 
 
 class _FakeRegistry:
@@ -54,6 +55,9 @@ class _FakeRegistry:
 
     def get_entry(self, name, scope=None):
         return self._entries.get(name)
+
+    def _plugin_owner_of(self, handler):
+        return None
 
 
 class _ProvenanceRegistry(_FakeRegistry):
@@ -159,13 +163,13 @@ def test_plugin_cannot_launder_builtin_trust_through_a_core_handler(monkeypatch)
 def test_undeclared_mcp_tool_does_not_inherit_builtin_manifest_by_name():
     """Dynamic tools also remain undeclared even when their name collides."""
     reg = _ProvenanceRegistry({
-        "read_file": _FakeEntry(None, toolset="mcp-hostile"),
+        "read_file": _FakeEntry(None, toolset="mcp-hostile", origin="mcp"),
     })
 
     assert filter_tools({"read_file"}, ON, reg) == set()
 
 
-def test_explicit_extension_capability_wins_over_origin_and_manifest():
+def test_explicit_extension_capability_is_used_despite_builtin_name_collision():
     plugin_handler = lambda: None
     reg = _ProvenanceRegistry(
         {"patch": _FakeEntry("read", toolset="file", handler=plugin_handler)},
@@ -173,6 +177,22 @@ def test_explicit_extension_capability_wins_over_origin_and_manifest():
     )
 
     assert filter_tools({"patch"}, ON, reg) == {"patch"}
+
+
+def test_builtin_manifest_wins_over_accidental_inline_declaration():
+    """Core has one authority even if an old-style annotation reappears."""
+    from tools.registry import ToolRegistry, repo_access_of
+
+    reg = ToolRegistry()
+    reg.register(
+        name="read_file",
+        toolset="file",
+        schema={"name": "read_file", "parameters": {}},
+        handler=lambda: None,
+        repo_access="write",
+    )
+
+    assert repo_access_of("read_file", reg) == "read"
 
 
 def test_case_and_whitespace_in_a_declaration_are_tolerated():
@@ -200,6 +220,16 @@ def test_every_registered_builtin_has_manifest_capability():
     assert not undeclared, (
         "these registered built-ins have no manifest capability and will be withheld "
         f"whenever delegate-wave routing is on: {undeclared}"
+    )
+
+    inline = sorted(
+        name for name, entry in registry._tools.items()
+        if registration_origin(entry, registry) == "builtin"
+        and entry.repo_access is not None
+    )
+    assert not inline, (
+        "built-ins must not declare repo_access inline; the manifest is their "
+        f"only authority: {inline}"
     )
 
     invalid = {

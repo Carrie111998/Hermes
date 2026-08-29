@@ -274,25 +274,28 @@ def registration_origin(entry, registry_obj=None):
 
 
 def repo_access_of(name, registry_obj=None):
-    """Resolve explicit metadata, then the built-in manifest, else undeclared."""
+    """Resolve capability from the sole authority for an entry's provenance.
+
+    Core tools use the built-in manifest only. Plugins and MCP tools use only
+    their explicit registration metadata. Unknown provenance fails closed.
+    """
     reg = registry_obj if registry_obj is not None else registry
     entry = reg.get_entry(name)
     if entry is None:
         return None
 
-    explicit = getattr(entry, "repo_access", None)
-    if explicit is not None:
-        return explicit
-
     # Test registries and third-party registry implementations have no trusted
     # provenance resolver. Failing closed is safer than assuming they are core.
     if not hasattr(reg, "_plugin_owner_of"):
         return None
-    if registration_origin(entry, reg) != "builtin":
-        return None
 
-    from tools.repo_access import BUILTIN_REPO_ACCESS
-    return BUILTIN_REPO_ACCESS.get(name)
+    origin = registration_origin(entry, reg)
+    if origin == "builtin":
+        from tools.repo_access import BUILTIN_REPO_ACCESS
+        return BUILTIN_REPO_ACCESS.get(name)
+    if origin in {"plugin", "mcp"}:
+        return getattr(entry, "repo_access", None)
+    return None
 
 
 class _PluginOverridePolicy:

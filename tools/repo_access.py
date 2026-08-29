@@ -32,6 +32,7 @@ BUILTIN_REPO_ACCESS = {
     "close_preview": "none",
     "close_terminal": "none",
     "computer_use": "write",
+    # Schedules commands, so it is deferred shell access.
     "cronjob": "write",
     "delegate_task": "none",
     "discord": "none",
@@ -66,6 +67,11 @@ BUILTIN_REPO_ACCESS = {
     "memory": "none",
     "open_preview": "none",
     "patch": "write",
+    # `write` and `submit` send arbitrary stdin to an attached process. A shell
+    # may have started before routing was enabled or through another surface,
+    # so withholding only `terminal` would still leave a command path. This
+    # withholds read-only process actions too; splitting the tool is the route
+    # to finer access because capability is not currently per action.
     "process": "write",
     "project_create": "none",
     "project_list": "none",
