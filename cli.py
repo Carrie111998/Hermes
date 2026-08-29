@@ -6363,6 +6363,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "active_background_tasks": 0,
             "active_background_processes": 0,
             "active_background_subagents": 0,
+            # Session-scoped /fast state. ``self.service_tier`` is the
+            # canonical toggle and remains available while /fast rebuilds the
+            # agent, so the badge updates immediately instead of disappearing
+            # during that transition.
+            "fast_mode": getattr(self, "service_tier", None) == "priority",
             "battery_label": "",
             "battery_category": "dim",
             # Focus view badge (/focus). Persistent indicator so the reduced
@@ -7183,11 +7188,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_prefix = f"{battery_label} │ " if battery_label else ""
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
+            fast_label = "⚡ FAST" if snapshot.get("fast_mode") else ""
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
             if width < 52:
-                text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
+                text = f"{battery_prefix}⚕ {snapshot['model_short']}"
+                if fast_label:
+                    text += f" · {fast_label}"
+                text += f" · {duration_label}"
                 if goal_segment:
                     text += f" · {goal_segment}"
                 if focus_label:
@@ -7196,7 +7205,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     text += " · ⚠ YOLO"
                 return self._right_align_status_title(text, session_title, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [f"⚕ {snapshot['model_short']}"]
+                if fast_label:
+                    parts.append(fast_label)
+                parts.append(percent_label)
                 if battery_label:
                     parts.insert(0, battery_label)
                 compressions = snapshot.get("compressions", 0)
@@ -7228,7 +7240,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [f"⚕ {snapshot['model_short']}"]
+            if fast_label:
+                parts.append(fast_label)
+            parts.extend([context_label, percent_label])
             if battery_label:
                 parts.insert(0, battery_label)
             if compressions:
@@ -7277,14 +7292,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
+            fast_label = "⚡ FAST" if snapshot.get("fast_mode") else ""
 
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
+                ]
+                if fast_label:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-strong", fast_label))
+                frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
-                ]
+                ])
                 if goal_segment:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-strong", goal_segment))
@@ -7306,9 +7327,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if fast_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-strong", fast_label))
+                    frags.extend([
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
-                    ]
+                    ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -7351,13 +7377,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if fast_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", fast_label))
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
-                    ]
+                    ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
