@@ -125,22 +125,21 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("grok-4.5", 300),
     ("grok-4.6", 300),
     ("grok-4-fast-non-reasoning", 180),
-    # Z.AI GLM-5 series.  GLM-5.3 (released 2026-08-14) always thinks:
-    # there is no off switch — ``thinking: {"type": "disabled"}`` is
-    # silently ignored on the Coding Plan endpoint and rejected with
-    # HTTP 400 (error 1210) on the standard PaaS endpoint.  The Z.AI
-    # Coding endpoint also serves ``glm-5.2`` requests with a
-    # ``glm-5.3`` backend when 5.2 capacity is tight (observed
-    # 2026-08-16+: response ``model`` field returns ``glm-5.3``), so a
-    # user who explicitly selected the toggleable 5.2 can still get a
-    # always-thinking backend.  Measured TTFB on 14k-44k token
-    # contexts: 91-97s before first content token — past the 90s
-    # non-stream default, so the stale detector killed healthy calls
-    # after 3 retries.  240s floor matches the Claude thinking tier
-    # (measured headroom ~2.5x; real answers arrived in 28-33s once
-    # the detector stopped killing them).
-    ("glm-5", 240),
-    ("glm-4.6", 240),
+    ("glm-5", 300),
+    ("glm-4.6", 300),
+    # "Ox Alpha" stealth reasoning model (stealth/ox-alpha on OpenRouter,
+    # x-preview-f-free on OpenCode Zen).  Marketed as a reasoning model for
+    # long-horizon coding/agentic work; 1M context — same tier as the Grok
+    # reasoning variants.
+    ("ox-alpha", 300),
+    ("x-preview-f-free", 300),
+    # Thinking Machines Inkling (thinkingmachines/inkling[-small][:free]
+    # on OpenRouter).  Reasoning model (OpenRouter supported_parameters
+    # includes "reasoning"); 1M context — same tier as the Grok
+    # reasoning variants and Ox Alpha.  "inkling" left-anchors on the
+    # slug after the aggregator prefix and the right anchor accepts the
+    # "-" separator, so inkling-small and the :free SKUs all match.
+    ("inkling", 300),
 )
 
 
@@ -171,7 +170,12 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
 # in each entry for debuggability (log/inspection), even though _match_any
 # only consumes floor + pattern.
 _SORTED_REASONING_FLOORS: list[tuple[str, float, re.Pattern[str]]] = [
-    (slug, floor, re.compile(r"^" + re.escape(slug) + r"(?:$|[\-._])"))
+    # Right anchor: end-of-string or a slug separator.  ``:`` is in the
+    # separator class because OpenRouter SKU/routing suffixes
+    # (``:free``, ``:batch``, ``:nitro``, ``:floor``) attach directly to
+    # the slug — ``thinkingmachines/inkling:free`` must match the
+    # ``inkling`` entry the same way ``inkling-small`` does.
+    (slug, floor, re.compile(r"^" + re.escape(slug) + r"(?:$|[\-._:])"))
     for slug, floor in sorted(
         _REASONING_STALE_TIMEOUT_FLOORS, key=lambda kv: -len(kv[0])
     )

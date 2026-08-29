@@ -85,12 +85,18 @@ import pytest
     ("x-ai/grok-4.5", 300.0),
     ("x-ai/grok-4.6", 300.0),
     ("x-ai/grok-4-fast-non-reasoning", 180.0),
-    # Z.AI GLM-5 series — GLM-5.3 always thinks; the Coding endpoint
+    # Z.AI GLM-5 series - GLM-5.3 always thinks; the Coding endpoint
     # also reroutes glm-5.2 requests to the 5.3 backend under load.
-    ("glm-5.2", 240.0),
-    ("glm-5.3", 240.0),
-    ("zai/glm-5.3", 240.0),
-    ("glm-4.6", 240.0),
+    ("glm-5.2", 300.0),
+    ("glm-5.3", 300.0),
+    ("zai/glm-5.3", 300.0),
+    ("glm-4.6", 300.0),
+    # Thinking Machines Inkling — family entry covers -small and the
+    # OpenRouter :free / :batch SKU suffixes (":" is a slug separator
+    # in the right anchor, same as "-").
+    ("thinkingmachines/inkling", 300.0),
+    ("thinkingmachines/inkling:free", 300.0),
+    ("thinkingmachines/inkling-small:free", 300.0),
 ])
 def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
@@ -164,7 +170,7 @@ def test_pre_glm5_variants_keep_default():
 
     ``glm-5`` and ``glm-4.6`` are the thinking-capable families (per the
     zai provider profile); ``glm-4-9b`` and other pre-4.6 slugs must not
-    inherit the floor — the right anchor requires ``glm-5`` or ``glm-4.6``
+    inherit the floor - the right anchor requires ``glm-5`` or ``glm-4.6``
     at the start of the slug.
     """
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
