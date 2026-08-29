@@ -806,8 +806,9 @@ def test_tombstone_pruning_owns_only_room_log_driver_and_policy_tables(tmp_path)
     rooms.disband_room(db, room_id="room-1", now=50)
     with sqlite3.connect(db) as conn:
         conn.execute(
-            """INSERT INTO hosted_room_policy_cursors
-               VALUES ('room-1', 1, 0, 50)"""
+            """INSERT INTO hosted_room_policy_cursors(
+                   room_id, through_seq, stopped_through_seq, updated_at
+               ) VALUES ('room-1', 1, 0, 50)"""
         )
         conn.execute(
             """INSERT INTO hosted_room_policy_threads
@@ -826,10 +827,20 @@ def test_tombstone_pruning_owns_only_room_log_driver_and_policy_tables(tmp_path)
                VALUES ('room-1', 'task-1', 'turn.settled', 0, 1)"""
         )
         conn.execute(
+            """INSERT INTO hosted_room_policy_transcript
+               VALUES (
+                   'room-1', 'thread-1', 1, 'message.user', NULL
+               )"""
+        )
+        conn.execute(
             """CREATE TABLE hosted_room_messaging_refs (
                 room_id TEXT NOT NULL,
                 marker TEXT NOT NULL
             )"""
+        )
+        conn.execute(
+            """INSERT INTO hosted_room_policy_transcript_state
+               VALUES ('room-1', 1)"""
         )
         conn.execute(
             """INSERT INTO hosted_room_messaging_refs
@@ -854,12 +865,54 @@ def test_tombstone_pruning_owns_only_room_log_driver_and_policy_tables(tmp_path)
             "hosted_room_policy_events",
             "hosted_room_policy_watermarks",
             "hosted_room_policy_publications",
+            "hosted_room_policy_transcript",
+            "hosted_room_policy_transcript_state",
         ):
             assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
         assert (
             conn.execute("SELECT marker FROM hosted_room_messaging_refs").fetchone()[0]
             == "outside-pr-b"
         )
+
+
+def test_policy_sync_cannot_recreate_projection_after_room_pruning(
+    tmp_path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    _create(db)
+    rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "hello", "thread_id": "thread-1"},
+        now=11,
+    )
+    checkpoint = HostedRoomPolicyCheckpoint(db)
+    original_read = rooms.read_events
+
+    def read_then_prune(*args, **kwargs):
+        page = original_read(*args, **kwargs)
+        rooms.disband_room(db, room_id="room-1", now=20)
+        rooms.prune_disbanded_rooms(
+            db,
+            now=20 + rooms.DISBANDED_ROOM_RETENTION_SECONDS + 1,
+        )
+        return page
+
+    monkeypatch.setattr(rooms, "read_events", read_then_prune)
+    with pytest.raises(rooms.RoomNotFoundError, match="not found"):
+        checkpoint.sync(room_id="room-1", latest_seq=1)
+    with sqlite3.connect(db) as conn:
+        for table in (
+            "hosted_room_policy_cursors",
+            "hosted_room_policy_events",
+            "hosted_room_policy_transcript",
+            "hosted_room_policy_transcript_state",
+        ):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
 def test_pre_actor_draft_database_migrates_with_explicit_legacy_identity(tmp_path):

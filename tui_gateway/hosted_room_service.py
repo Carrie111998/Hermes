@@ -218,6 +218,15 @@ class HostedRoomService:
                 room_id=binding.room_id,
                 clock=self.runtime.clock,
             )
+            if any(
+                driver.list_tasks(
+                    self.db_path,
+                    room_id=binding.room_id,
+                    status=status,
+                )
+                for status in ("queued", "running", "stopping")
+            ):
+                return
             decision = discussion.plan_next_task(
                 room,
                 events,

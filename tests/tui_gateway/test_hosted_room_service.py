@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import hosted_room_driver as driver
+from gateway import hosted_room_discussion as discussion
 from gateway import hosted_rooms
 from gateway.hosted_room_policy_checkpoint import MAX_ACTIVE_POLICY_EVENTS
 from tui_gateway.hosted_room_service import HostedRoomService
@@ -54,6 +55,44 @@ class _FakeRPC:
 
     def interrupt(self, *, profile, session_id, source, expected_task_id):
         return {"interrupted": True}
+
+
+class _PromptRecordingRPC(_FakeRPC):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompts: list[tuple[str, str]] = []
+
+    def submit(
+        self,
+        *,
+        profile,
+        session_id,
+        prompt,
+        source,
+        task,
+        execution_generation,
+        on_terminal,
+    ):
+        self.prompts.append((profile, prompt))
+        on_terminal({"status": "settled", "text": f"reply from {profile}"})
+        return {"accepted": True}
+
+
+class _BlockingFirstRPC(_PromptRecordingRPC):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def submit(self, **kwargs):
+        self.prompts.append((kwargs["profile"], kwargs["prompt"]))
+        if len(self.prompts) == 1:
+            self.first_started.set()
+            assert self.release_first.wait(timeout=2)
+        kwargs["on_terminal"](
+            {"status": "settled", "text": f"reply from {kwargs['profile']}"}
+        )
+        return {"accepted": True}
 
 
 def _server():
@@ -269,6 +308,153 @@ def test_policy_checkpoint_bounds_replay_after_completed_room_history(
     reads.update(calls=0, rows=0)
     service.prepare_room(binding)
     assert reads == {"calls": 0, "rows": 0}
+
+
+def test_same_thread_followup_migrates_and_delivers_committed_peer_reply(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.rpc = _PromptRecordingRPC()
+    service.runtime.rpc = service.rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Shared context room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "@ops provide the marker", "thread_id": "thread-1"},
+    )
+    _wait_for(lambda: len(service.rpc.prompts) == 1)
+    _wait_for(
+        lambda: any(
+            event["kind"] == "room.activity"
+            and event["payload"]["discussion_event_id"] == "user-1"
+            for event in service._events("room-1")
+        )
+    )
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            """SELECT COUNT(*) FROM hosted_room_policy_transcript
+               WHERE room_id='room-1' AND thread_id='thread-1'"""
+        ).fetchone()[0] == 2
+        conn.execute("DELETE FROM hosted_room_policy_transcript")
+        conn.execute(
+            """DELETE FROM hosted_room_policy_transcript_state
+               WHERE room_id='room-1'"""
+        )
+    service.send(
+        room_id="room-1",
+        event_id="user-2",
+        payload={"text": "@hermes continue", "thread_id": "thread-1"},
+    )
+    _wait_for(lambda: len(service.rpc.prompts) == 2)
+    assert service.stop(timeout=1.0)
+
+    profile, prompt = service.rpc.prompts[1]
+    assert profile == "default"
+    assert "@ops: reply from ops" in prompt
+    assert "User (user): @hermes continue" in prompt
+
+
+def test_active_same_thread_followup_waits_for_current_task(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.rpc = _BlockingFirstRPC()
+    service.runtime.rpc = service.rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Serialized room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "@ops start", "thread_id": "thread-1"},
+    )
+    assert service.rpc.first_started.wait(timeout=2)
+    service.send(
+        room_id="room-1",
+        event_id="user-2",
+        payload={"text": "@hermes follow up", "thread_id": "thread-1"},
+    )
+    assert len(service.rpc.prompts) == 1
+    service.rpc.release_first.set()
+    _wait_for(lambda: len(service.rpc.prompts) == 2)
+    _wait_for(
+        lambda: any(
+            event["kind"] == "room.activity"
+            and event["payload"]["discussion_event_id"] == "user-2"
+            for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+    assert "User (user): @hermes follow up" in service.rpc.prompts[1][1]
+
+
+def test_thread_transcript_prunes_committed_message_and_settlement_together(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.rpc = _FakeRPC()
+    service.runtime.rpc = service.rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Bounded room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-first",
+        payload={"text": "@ops old", "thread_id": "thread-1"},
+    )
+    _wait_for(
+        lambda: any(
+            event["kind"] == "room.activity"
+            for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+    for index in range(24):
+        hosted_rooms.append_event(
+            db,
+            room_id="room-1",
+            event_id=f"user-tail-{index}",
+            kind="message.user",
+            actor={"kind": "user", "id": "desktop"},
+            payload={"text": f"tail {index}", "thread_id": "thread-1"},
+        )
+
+    room = hosted_rooms.room_state(db, room_id="room-1")
+    snapshot = service._policy_snapshot(room)
+    assert len(snapshot.events) == 24
+    assert {event["kind"] for event in snapshot.events} == {"message.user"}
+    discussion.plan_next_task(
+        room,
+        snapshot.events,
+        local_profiles=service.local_profiles(),
+        initial_watermarks=snapshot.watermarks,
+    )
 
 
 def test_service_publishes_deferred_turn_continues_and_retries_new_generation(

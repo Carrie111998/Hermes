@@ -604,6 +604,8 @@ def _prune_disbanded_rooms_locked(
         room_ids,
     )
     dependent_tables = (
+        "hosted_room_policy_transcript_state",
+        "hosted_room_policy_transcript",
         "hosted_room_policy_publications",
         "hosted_room_policy_watermarks",
         "hosted_room_policy_events",
