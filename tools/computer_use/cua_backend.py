@@ -236,18 +236,21 @@ def _cua_no_overlay() -> bool:
     Reads ``computer_use.no_overlay``. Default ``None`` (auto-detect):
     disable the overlay where idle CPU burn or an X11 desktop wedge is a
     known failure mode — macOS (cursor-overlay vImage redraw loop,
-    #28152/#47032), headless Linux / WSL2 / containers, and Linux X11
-    (fullscreen always-on-top overlay window that can get stuck over every
-    workspace after an unclean session end) — and keep it on Windows and
-    Linux Wayland. Explicit ``True`` / ``False`` overrides auto-detection.
+    #28152/#47032), Windows (an elevated scheduled-task daemon can leave an
+    overlay that a normal-integrity Hermes process cannot dismiss), headless
+    Linux / WSL2 / containers, and Linux X11 (fullscreen always-on-top overlay
+    window that can get stuck over every workspace after an unclean session
+    end) — and keep it on Linux Wayland. Explicit ``True`` / ``False``
+    overrides auto-detection.
     """
     val = _computer_use_cfg().get("no_overlay")
     if val is not None:
         return bool(val)
-    # Auto-detect: macOS overlay can peg a core indefinitely after a
-    # computer_use session (#47032). Prefer off until the driver teardown
-    # is solid; set computer_use.no_overlay: false to keep the cursor.
-    if sys.platform == "darwin":
+    # macOS can peg a core indefinitely (#47032). On Windows, an elevated
+    # autostart daemon can orphan a fullscreen overlay that the normal-
+    # integrity Hermes process cannot dismiss (#98052). Prefer off until
+    # driver-owned teardown is reliable; explicit false keeps the cursor.
+    if sys.platform in {"darwin", "win32"}:
         return True
     if sys.platform != "linux":
         return False

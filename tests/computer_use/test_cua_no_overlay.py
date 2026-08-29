@@ -4,7 +4,8 @@ cua-driver's cursor overlay rendering loop can consume CPU indefinitely when
 idle (#28152, #47032), and on Linux/X11 its fullscreen always-on-top overlay
 window can wedge the desktop when a session ends uncleanly. Hermes passes
 ``--no-overlay`` to suppress it when the ``computer_use.no_overlay`` config is
-enabled (or auto-detected on macOS, headless Linux / WSL2, and Linux X11).
+enabled (or auto-detected on macOS, Windows, headless Linux / WSL2, and Linux
+X11).
 
 These assert the behavior contract (auto-detect, explicit override, version
 probe), not specific config snapshots.
@@ -28,6 +29,19 @@ class TestNoOverlayFlag:
         with patch("hermes_cli.config.load_config",
                    return_value={"computer_use": {"no_overlay": True}}):
             assert cua_backend._cua_no_overlay() is True
+
+    @pytest.mark.windows_only
+    def test_windows_auto_detects_off(self):
+        """Windows defaults off so an elevated orphan cannot pin the desktop."""
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert cua_backend._cua_no_overlay() is True
+
+    @pytest.mark.windows_only
+    def test_windows_explicit_false_restores_cursor(self):
+        """Users may explicitly opt back into the cosmetic Windows cursor."""
+        with patch("hermes_cli.config.load_config",
+                   return_value={"computer_use": {"no_overlay": False}}):
+            assert cua_backend._cua_no_overlay() is False
 
 
     @pytest.mark.macos_only
