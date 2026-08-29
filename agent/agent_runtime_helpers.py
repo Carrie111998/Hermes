@@ -4265,9 +4265,10 @@ def looks_like_codex_intermediate_ack(
     is ``true`` or a model-list), so general autonomous workflows ("I'll run a
     health check on the server", "I'll start the deployment") — which carry a
     future-ack and an action verb but no filesystem reference — are caught too.
-    The future-ack + short-content + no-prior-tools + action-verb requirements
-    always apply, which is what keeps conversational "I'll help you brainstorm"
-    replies from tripping it.
+    The short-content + no-prior-tools guardrails always apply. A response must
+    then contain either a first-person future acknowledgement with an action
+    marker or a narrowly bounded pronounless action clause; this keeps ordinary
+    conversational replies such as "I'll help you brainstorm" from tripping it.
     """
     if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
         return False
