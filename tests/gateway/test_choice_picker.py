@@ -8,7 +8,7 @@ command, so picker and typed arguments can never diverge.
 """
 
 import asyncio
-from types import SimpleNamespace
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -166,7 +166,7 @@ class TestFastChoicePicker:
         self._patch_fast_support(monkeypatch, default_home)
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
-        runner.config = SimpleNamespace(multiplex_profiles=True)
+        runner.config = types.SimpleNamespace(multiplex_profiles=True)
         runner._resolve_profile_home_for_source = lambda _source: named_home
         event = _make_event("/fast --global")
         event.source.profile = "work"

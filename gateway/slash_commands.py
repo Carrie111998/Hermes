@@ -3646,16 +3646,12 @@ class GatewaySlashCommandsMixin:
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
     def _save_gateway_config_key(
-        self,
-        key_path: str,
-        value,
-        config_home: Optional[Path] = None,
+        self, key_path: str, value, *, config_home: Optional[Path] = None
     ) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
         and their interactive pickers)."""
         from gateway.run import _hermes_home
         from hermes_cli.config import read_user_config_raw
-
         config_path = (config_home or _hermes_home) / "config.yaml"
         try:
             # Write-back round-trip: raw read is correct (merged defaults must
