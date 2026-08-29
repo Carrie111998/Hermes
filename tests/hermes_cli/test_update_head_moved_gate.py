@@ -100,6 +100,10 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
     )
+    # This fixture validates the HEAD gate, not updater module-generation
+    # refresh. Disabling the purge keeps gateway mocks attached to the module
+    # object the test configured instead of rediscovering live gateways.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     # Short-circuit the long tail: dependency install + desktop build.
     monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
