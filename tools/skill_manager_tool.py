@@ -1299,8 +1299,8 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
 
     if curator_pass:
         try:
-            from tools.skill_usage import archive_skill
-            ok, archive_msg = archive_skill(name)
+            from tools.skill_usage import archive_skill_with_path
+            ok, archive_msg, archive_dest = archive_skill_with_path(name)
         except Exception as e:
             return {"success": False, "error": f"failed to archive '{name}': {e}"}
         if not ok:
@@ -1321,8 +1321,19 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             except Exception as e:
                 _restored, _restore_msg = False, ""
                 try:
-                    from tools.skill_usage import restore_skill
-                    _restored, _restore_msg = restore_skill(name)
+                    # Bound to the EXACT directory archive_skill_with_path()
+                    # just created — never restore_skill(name), which
+                    # disambiguates by name and would resurrect an unrelated
+                    # PRE-EXISTING ".archive/<name>/" (from an earlier,
+                    # unrelated prune) instead of undoing THIS archive if one
+                    # happened to collide and push this one to the
+                    # timestamped fallback path. That would silently swap in
+                    # stale content while leaving the actual rollback target
+                    # orphaned in the archive.
+                    from tools.skill_usage import restore_skill_from_path
+                    _restored, _restore_msg = restore_skill_from_path(
+                        name, archive_dest
+                    )
                 except Exception as e2:
                     _restore_msg = str(e2)
                 if _restored:
@@ -1341,9 +1352,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
                     "error": (
                         f"failed to migrate cron job references from '{name}' to "
                         f"'{absorbed_target}': {e}. Rolling back the archive ALSO "
-                        f"failed: {_restore_msg}. '{name}' is archived but any "
-                        "enabled cron job referencing it may now fail to load it — "
-                        "this needs manual attention."
+                        f"failed: {_restore_msg}. '{name}' is archived at "
+                        f"{archive_dest} but any enabled cron job referencing it "
+                        "may now fail to load it — this needs manual attention."
                     ),
                 }
 

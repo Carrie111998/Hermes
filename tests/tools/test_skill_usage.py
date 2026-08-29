@@ -347,6 +347,90 @@ def test_restoring_from_archive_clears_timestamp(skills_home):
     assert get_record("x")["archived_at"] is None
 
 
+# ---------------------------------------------------------------------------
+# archive_skill_with_path / restore_skill_from_path — exact-path binding
+# ---------------------------------------------------------------------------
+
+
+def test_archive_skill_with_path_returns_exact_destination(skills_home):
+    from tools.skill_usage import archive_skill_with_path
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "narrow")
+
+    ok, msg, dest = archive_skill_with_path("narrow")
+
+    assert ok is True, msg
+    assert dest == skills_dir / ".archive" / "narrow"
+    assert dest.exists()
+    assert not (skills_dir / "narrow").exists()
+
+
+def test_restore_skill_from_path_restores_the_exact_directory_given(skills_home):
+    from tools.skill_usage import archive_skill_with_path, restore_skill_from_path
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "narrow")
+    ok, _msg, dest = archive_skill_with_path("narrow")
+    assert ok
+
+    ok, msg = restore_skill_from_path("narrow", dest)
+
+    assert ok, msg
+    assert (skills_dir / "narrow" / "SKILL.md").exists()
+    assert not dest.exists()
+
+
+def test_restore_skill_from_path_ignores_a_colliding_older_archive(skills_home):
+    """The exact rollback-binding hole flagged in PR review: a pre-existing
+    archive already sitting at ``.archive/<name>/`` (from an earlier,
+    unrelated prune) must NOT be resurrected when restoring a different,
+    newer archive generation that ``archive_skill_with_path()`` was forced
+    to push to the timestamped collision path (``.archive/<name>-<ts>/``)
+    because that slot was already taken.
+    """
+    from tools.skill_usage import archive_skill_with_path, restore_skill_from_path
+    skills_dir = skills_home / "skills"
+    archive_root = skills_dir / ".archive"
+
+    # Stale, unrelated archive already occupying the exact-name slot.
+    _write_skill(archive_root, "narrow")
+    stale_md = archive_root / "narrow" / "SKILL.md"
+    stale_md.write_text(stale_md.read_text() + "\nSTALE MARKER\n")
+
+    # This call's own live skill, archived into the same, now-colliding name.
+    _write_skill(skills_dir, "narrow")
+    live_md = skills_dir / "narrow" / "SKILL.md"
+    live_md.write_text(live_md.read_text() + "\nCURRENT MARKER\n")
+
+    ok, msg, dest = archive_skill_with_path("narrow")
+    assert ok, msg
+    assert dest != archive_root / "narrow", (
+        "test setup didn't actually trigger the collision path — "
+        "archive_skill_with_path() landed on the exact-name slot"
+    )
+
+    ok, msg = restore_skill_from_path("narrow", dest)
+    assert ok, msg
+
+    restored = (skills_dir / "narrow" / "SKILL.md").read_text()
+    assert "CURRENT MARKER" in restored
+    assert "STALE MARKER" not in restored
+    # The stale archive must be untouched — this restore did not consume it.
+    assert (archive_root / "narrow").exists()
+    assert "STALE MARKER" in (archive_root / "narrow" / "SKILL.md").read_text()
+
+
+def test_restore_skill_from_path_refuses_a_path_outside_the_archive(skills_home):
+    from tools.skill_usage import restore_skill_from_path
+    skills_dir = skills_home / "skills"
+    outside = skills_dir.parent / "not_the_archive"
+    outside.mkdir()
+
+    ok, msg = restore_skill_from_path("narrow", outside)
+
+    assert ok is False
+    assert "outside" in msg.lower()
+
+
 def test_forget_removes_record(skills_home):
     from tools.skill_usage import bump_view, forget, load_usage
     bump_view("x")

@@ -958,6 +958,64 @@ class TestCuratorConsolidationDeleteGuard:
         assert (skills_root / "narrow").exists()
         assert (skills_root / "narrow" / "SKILL.md").exists()
 
+    def test_rollback_does_not_resurrect_a_stale_pre_existing_archive(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression for the rollback-binding hole flagged in review: when
+        a PRE-EXISTING archive of the same skill name already sits at
+        ``.archive/<name>/`` (from an earlier, unrelated prune),
+        archive_skill_with_path() pushes THIS run's archive to the
+        timestamped collision path (``.archive/<name>-<ts>/``) instead. If
+        the cron-ref migration then fails, the rollback must restore from
+        THAT exact path — not from name-based restore_skill(), which would
+        happily resurrect the older, unrelated ``.archive/<name>/`` and
+        silently swap in stale content while leaving this run's real
+        rollback target orphaned in the archive.
+        """
+        from tools.skill_usage import _archive_dir
+
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
+            _create_curator_skill("umbrella", _skill_content("umbrella"))
+
+            # A stale archive from an unrelated, earlier prune — same name,
+            # different (identifiably OLD) content.
+            stale_archive = _archive_dir() / "narrow"
+            stale_archive.mkdir(parents=True)
+            (stale_archive / "SKILL.md").write_text(
+                _skill_content("narrow").replace(
+                    "Step 1: Do the thing.", "STALE: from an old prune."
+                )
+            )
+
+            # The current, live "narrow" this delete call actually targets —
+            # distinguishably NEW content.
+            _create_curator_skill(
+                "narrow",
+                _skill_content("narrow").replace(
+                    "Step 1: Do the thing.", "CURRENT: this run's content."
+                ),
+            )
+
+            with patch(
+                "cron.jobs.rewrite_skill_refs",
+                side_effect=RuntimeError("jobs.json is corrupt"),
+            ):
+                result = _delete_skill("narrow", absorbed_into="umbrella")
+
+        assert result["success"] is False
+        assert "rolled back" in result["error"].lower(), result
+
+        # The live skill must be back with THIS run's content, not the
+        # stale pre-existing archive's content.
+        restored_content = (skills_root / "narrow" / "SKILL.md").read_text()
+        assert "CURRENT: this run's content." in restored_content
+        assert "STALE" not in restored_content
+
+        # The pre-existing archive must be untouched — the rollback did not
+        # consume it.
+        assert stale_archive.exists()
+        assert "STALE" in (stale_archive / "SKILL.md").read_text()
+
     def test_background_review_read_survives_copied_tool_contexts(
         self, tmp_path, monkeypatch
     ):

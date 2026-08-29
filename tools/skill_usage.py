@@ -1079,35 +1079,53 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     built-ins are only archivable when ``curator.prune_builtins`` is enabled;
     when one is archived, its name is added to the suppression list so the
     update-time re-seeder leaves it archived instead of restoring it.
+
+    Thin wrapper over :func:`archive_skill_with_path` for callers that don't
+    need the exact destination back. See that function if you do (e.g. to
+    later undo precisely THIS archive via ``restore_skill_from_path``).
+    """
+    ok, msg, _dest = archive_skill_with_path(skill_name)
+    return ok, msg
+
+
+def archive_skill_with_path(skill_name: str) -> Tuple[bool, str, Optional[Path]]:
+    """Same as :func:`archive_skill`, but also returns the exact destination
+    directory on success (``None`` on failure).
+
+    ``archive_skill``'s message embeds the destination path as free text
+    ("archived to <path>") for human/log consumption only — it is not meant
+    to be parsed back out programmatically. A caller that may need to undo
+    precisely this archive later (see :func:`restore_skill_from_path`) needs
+    the real path, not a string to re-parse.
     """
     local_skill_dir = _find_skill_dir(skill_name)
     if local_skill_dir is None and _find_external_skill_dir(skill_name) is not None:
-        return False, _external_read_only_message(skill_name)
+        return False, _external_read_only_message(skill_name), None
 
     if not is_curation_eligible(skill_name, local_skill_dir):
         if is_protected_builtin(skill_name):
             return False, (
                 f"skill '{skill_name}' is a protected built-in; it backs "
                 "load-bearing UX and is never archived or consolidated"
-            )
+            ), None
         if is_hub_installed(skill_name):
-            return False, f"skill '{skill_name}' is hub-installed; never archive"
+            return False, f"skill '{skill_name}' is hub-installed; never archive", None
         return False, (
             f"skill '{skill_name}' is a bundled built-in; enable "
             "curator.prune_builtins to allow pruning it"
-        )
+        ), None
 
     skill_dir = local_skill_dir
     if skill_dir is None:
-        return False, f"skill '{skill_name}' not found"
+        return False, f"skill '{skill_name}' not found", None
     if is_external_skill_path(skill_dir):
-        return False, _external_read_only_message(skill_name)
+        return False, _external_read_only_message(skill_name), None
 
     archive_root = _archive_dir()
     try:
         archive_root.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return False, f"failed to create archive dir: {e}"
+        return False, f"failed to create archive dir: {e}", None
 
     # Flatten any category nesting into a single ".archive/<skill>/" so restores
     # are simple. If a collision exists, append a timestamp.
@@ -1131,7 +1149,7 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         try:
             shutil.move(str(skill_dir), str(dest))
         except Exception as e2:
-            return False, f"failed to archive: {e2}"
+            return False, f"failed to archive: {e2}", None
 
     # Pruning a built-in only sticks if the re-seeder is told to leave it alone.
     if is_bundled(skill_name):
@@ -1148,7 +1166,52 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
             )
     except Exception:
         pass
-    return True, f"archived to {dest}"
+    return True, f"archived to {dest}", dest
+
+
+def _finish_restore(skill_name: str, src: Path) -> Tuple[bool, str]:
+    """Move an already-resolved archive directory ``src`` back into the live
+    skills tree as ``skill_name``. Shared tail for :func:`restore_skill`
+    (which resolves ``src`` by searching the archive for ``skill_name``) and
+    :func:`restore_skill_from_path` (which is handed the exact archive
+    directory to restore, no search involved).
+    """
+    dest = _skills_dir() / skill_name
+    if dest.exists():
+        return False, f"destination already exists: {dest}"
+
+    # Audit ledger pre-capture (best-effort; never blocks the restore).
+    _ledger_before = None
+    try:
+        from tools import skill_ledger as _ledger
+        _ledger_before = _ledger.capture_before(src)
+    except Exception:
+        _ledger = None  # type: ignore[assignment]
+
+    try:
+        src.rename(dest)
+    except OSError:
+        import shutil
+        try:
+            shutil.move(str(src), str(dest))
+        except Exception as e:
+            return False, f"failed to restore: {e}"
+
+    # Restoring a pruned built-in lifts its suppression so updates can manage it.
+    remove_suppressed_name(skill_name)
+
+    set_state(skill_name, STATE_ACTIVE)
+    try:
+        if _ledger is not None:
+            _ledger.record_mutation(
+                "restore",
+                skill_name,
+                before=_ledger_before if _ledger_before is not None else [],
+                after_root=dest,
+            )
+    except Exception:
+        pass
+    return True, f"restored to {dest}"
 
 
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
@@ -1161,6 +1224,11 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     which case built-ins are curator-managed and restoring is the documented
     way to lift a prune). Restoring clears any suppression entry so future
     updates may re-seed the built-in again.
+
+    Disambiguates by NAME when more than one archived generation of
+    ``skill_name`` could exist (see the docstring on
+    :func:`restore_skill_from_path` for why that's occasionally the wrong
+    tool and what to use instead).
     """
     # Hub skills always have an external upstream owner — never shadow them.
     if is_hub_installed(skill_name):
@@ -1205,43 +1273,52 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     if not candidates:
         return False, f"skill '{skill_name}' not found in archive"
 
-    src = candidates[0]
-    dest = _skills_dir() / skill_name
-    if dest.exists():
-        return False, f"destination already exists: {dest}"
+    return _finish_restore(skill_name, candidates[0])
 
-    # Audit ledger pre-capture (best-effort; never blocks the restore).
-    _ledger_before = None
+
+def restore_skill_from_path(skill_name: str, archive_path: Path) -> Tuple[bool, str]:
+    """Restore ``skill_name`` from the EXACT archive directory
+    ``archive_path``, bypassing :func:`restore_skill`'s name-based search
+    entirely.
+
+    ``restore_skill(name)`` disambiguates by name: an exact ``.archive/name``
+    match wins, otherwise it falls back to the newest ``name-<timestamp>``
+    sibling. That's the right default for a human-directed
+    ``hermes curator restore <name>``, but it is the WRONG tool for undoing
+    one *specific* :func:`archive_skill_with_path` call: if an older archive
+    of the same name already exists (e.g. ``.archive/foo/`` from an earlier,
+    unrelated prune) and THIS call's archive landed at the timestamped
+    fallback path (``.archive/foo-<ts>/``) because of that collision,
+    ``restore_skill(name)`` would resurrect the OLD archive — not the one
+    being undone — leaving the actual rollback target orphaned in the
+    archive and silently swapping in stale content instead. Passing the
+    exact path this call's own ``archive_skill_with_path()`` returned
+    sidesteps that ambiguity completely.
+    """
+    archive_path = Path(archive_path)
+    archive_root = _archive_dir()
     try:
-        from tools import skill_ledger as _ledger
-        _ledger_before = _ledger.capture_before(src)
-    except Exception:
-        _ledger = None  # type: ignore[assignment]
+        archive_path.resolve().relative_to(archive_root.resolve())
+    except (OSError, ValueError):
+        return False, f"archive path is outside the archive directory: {archive_path}"
+    if not archive_path.is_dir():
+        return False, f"archive path does not exist or is not a directory: {archive_path}"
 
-    try:
-        src.rename(dest)
-    except OSError:
-        import shutil
-        try:
-            shutil.move(str(src), str(dest))
-        except Exception as e:
-            return False, f"failed to restore: {e}"
+    # Same destination-side guards as restore_skill() — restoring to the
+    # live skills tree is disallowed under the same conditions regardless
+    # of how the source archive directory was found.
+    if is_hub_installed(skill_name):
+        return False, (
+            f"skill '{skill_name}' is now hub-installed; "
+            "restore would shadow the upstream version"
+        )
+    if is_bundled(skill_name) and not _prune_builtins_enabled():
+        return False, (
+            f"skill '{skill_name}' is now bundled; "
+            "restore would shadow the upstream version"
+        )
 
-    # Restoring a pruned built-in lifts its suppression so updates can manage it.
-    remove_suppressed_name(skill_name)
-
-    set_state(skill_name, STATE_ACTIVE)
-    try:
-        if _ledger is not None:
-            _ledger.record_mutation(
-                "restore",
-                skill_name,
-                before=_ledger_before if _ledger_before is not None else [],
-                after_root=dest,
-            )
-    except Exception:
-        pass
-    return True, f"restored to {dest}"
+    return _finish_restore(skill_name, archive_path)
 
 
 def _find_skill_dir(skill_name: str) -> Optional[Path]:
