@@ -1823,7 +1823,7 @@ def _bundled_default_on(dir_path) -> bool:
     try:
         import yaml
 
-        with open(manifest_file, encoding="utf-8") as f:
+        with open(manifest_file, encoding="utf-8-sig") as f:
             manifest = yaml.safe_load(f) or {}
         kind = str(manifest.get("kind", "standalone")).strip().lower()
         return kind in _BUNDLED_DEFAULT_ON_KINDS

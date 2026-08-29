@@ -135,7 +135,7 @@ def _profile_role(profile_dir: Path) -> str:
     try:
         if not meta.is_file():
             return ""
-        raw = meta.read_text(encoding="utf-8", errors="replace")
+        raw = meta.read_text(encoding="utf-8-sig", errors="replace")
         import yaml
 
         data = yaml.safe_load(raw)

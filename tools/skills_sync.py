@@ -612,7 +612,7 @@ def _read_hub_install_paths() -> Set[str]:
     if not lock_path.exists():
         return set()
     try:
-        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        data = json.loads(lock_path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError):
         return set()
     paths: Set[str] = set()

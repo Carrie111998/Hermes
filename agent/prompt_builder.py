@@ -2019,7 +2019,7 @@ def _build_skills_system_prompt_inner(
         # External category descriptions
         for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
             try:
-                content = desc_file.read_text(encoding="utf-8")
+                content = desc_file.read_text(encoding="utf-8-sig")
                 fm, _ = parse_frontmatter(content)
                 cat_desc = fm.get("description")
                 if not cat_desc:
@@ -2324,7 +2324,7 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         candidate = cwd_path / name
         if candidate.exists():
             try:
-                content = candidate.read_text(encoding="utf-8").strip()
+                content = candidate.read_text(encoding="utf-8-sig").strip()
                 if content:
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"

@@ -2403,7 +2403,7 @@ def _read_http_listen_from_config() -> Optional[Tuple[str, int]]:
     except ImportError:
         return None
     try:
-        data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+        data = yaml.safe_load(cfg.read_text(encoding="utf-8-sig"))
     except (OSError, yaml.YAMLError):
         return None
     proxy_block = (data or {}).get("proxy") or {}
