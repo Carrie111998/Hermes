@@ -130,11 +130,57 @@ class TestTodoToolFunction:
         result = json.loads(todo_tool(store=store))
         assert result["summary"]["total"] == 1
         assert result["summary"]["pending"] == 1
+        assert result["revision"] == 1
 
 
     def test_no_store_returns_error(self):
         result = json.loads(todo_tool())
         assert "error" in result
+
+
+class TestTodoStoreSnapshots:
+    def test_revision_only_advances_when_state_changes(self):
+        store = TodoStore()
+        items = [{"id": "1", "content": "Task", "status": "pending"}]
+
+        store.write(items)
+        first = store.snapshot()
+        store.write(items)
+
+        assert first["revision"] == 1
+        assert store.snapshot() == first
+
+    def test_loads_and_persists_revisioned_snapshots(self):
+        writes = []
+        initial = {
+            "todos": [{"id": "1", "content": "Task", "status": "pending"}],
+            "revision": 7,
+        }
+
+        def save(todos, revision):
+            writes.append((todos, revision))
+            return {"todos": todos, "revision": revision}
+
+        store = TodoStore(load_state=lambda: initial, save_state=save)
+        store.write([{"id": "1", "content": "Task", "status": "completed"}])
+
+        assert writes[-1][1] == 8
+        assert store.snapshot()["revision"] == 8
+
+    def test_missing_session_retries_the_same_revision(self):
+        attempts = []
+
+        def save(todos, revision):
+            attempts.append(revision)
+            return None if len(attempts) == 1 else {"todos": todos, "revision": revision}
+
+        store = TodoStore(save_state=save)
+        items = [{"id": "1", "content": "Task", "status": "pending"}]
+
+        store.write(items)
+        store.write(items)
+
+        assert attempts == [1, 1]
 
 
 class TestTodoStoreBounds:

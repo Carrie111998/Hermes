@@ -2,10 +2,10 @@
 """
 Todo Tool Module - Planning & Task Management
 
-Provides an in-memory task list the agent uses to decompose complex tasks,
-track progress, and maintain focus across long conversations. The state
-lives on the AIAgent instance (one per session) and is re-injected into
-the conversation after context compression events.
+Provides a session-scoped task list the agent uses to decompose complex tasks,
+track progress, and maintain focus across long conversations. The active copy
+lives on the AIAgent instance and revisioned snapshots can persist through the
+session state database. It is re-injected after context compression events.
 
 Design:
 - Single `todo` tool: provide `todos` param to write, omit to read
@@ -15,7 +15,11 @@ Design:
 """
 
 import json
-from typing import Dict, Any, List, Optional
+import logging
+from typing import Any, Callable, Dict, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 # Valid status values for todo items
@@ -45,7 +49,7 @@ TODO_INJECTION_HEADER = (
 
 class TodoStore:
     """
-    In-memory todo list. One instance per AIAgent (one per session).
+    Session todo list with an in-memory working copy and optional persistence.
 
     Items are ordered -- list position is priority. Each item has:
       - id: unique string identifier (agent-chosen)
@@ -53,8 +57,29 @@ class TodoStore:
       - status: pending | in_progress | completed | cancelled
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        load_state: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+        save_state: Optional[
+            Callable[[List[Dict[str, str]], int], Optional[Dict[str, Any]]]
+        ] = None,
+    ):
         self._items: List[Dict[str, str]] = []
+        self._revision = 0
+        self._persisted_revision = 0
+        self._save_state = save_state
+
+        if load_state is not None:
+            try:
+                state = load_state()
+                if isinstance(state, dict) and isinstance(state.get("todos"), list):
+                    self.restore(
+                        state["todos"],
+                        revision=state.get("revision", 0),
+                        persisted=True,
+                    )
+            except Exception:
+                logger.warning("Failed to load persisted todo state", exc_info=True)
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
@@ -65,6 +90,7 @@ class TodoStore:
             merge: if False, replace the entire list. If True, update
                    existing items by id and append new ones.
         """
+        before = self.read()
         if not merge:
             # Replace mode: new list entirely
             self._items = self._normalize_order(
@@ -105,6 +131,11 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        if self._items != before:
+            self._revision += 1
+        # Retry a previously failed persistence attempt even when the model
+        # repeats an identical full snapshot on its next call.
+        self.persist_current()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
@@ -114,6 +145,54 @@ class TodoStore:
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
         return bool(self._items)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return the full state clients can reconcile atomically."""
+        return {"todos": self.read(), "revision": self._revision}
+
+    def restore(
+        self,
+        todos: List[Dict[str, Any]],
+        *,
+        revision: Any = 0,
+        persisted: bool = False,
+    ) -> List[Dict[str, str]]:
+        """Restore a trusted snapshot without manufacturing a new revision."""
+        self._items = self._normalize_order(
+            [self._validate(t) for t in self._dedupe_by_id(todos)]
+        )[:MAX_TODO_ITEMS]
+        try:
+            self._revision = max(0, int(revision or 0))
+        except (TypeError, ValueError):
+            self._revision = 0
+        self._persisted_revision = self._revision if persisted else -1
+        return self.read()
+
+    def persist_current(self) -> None:
+        """Persist the current snapshot once and adopt backend authority.
+
+        Persistence is optional so standalone stores and tests keep their
+        original in-memory behavior. A stale concurrent writer receives the
+        already-committed snapshot from the backend and reconciles to it.
+        """
+        if self._save_state is None or self._persisted_revision == self._revision:
+            return
+        try:
+            state = self._save_state(self.read(), self._revision)
+            if isinstance(state, dict) and isinstance(state.get("todos"), list):
+                self.restore(
+                    state["todos"],
+                    revision=state.get("revision", self._revision),
+                    persisted=True,
+                )
+            # A missing database/session is not a successful write. Leave the
+            # revision dirty so turn-start persistence can retry after the
+            # session row exists.
+        except Exception:
+            # The canonical tool result is still persisted in conversation
+            # history, so a transient state-store failure must not fail the
+            # agent's task-management call. The next turn retries.
+            logger.warning("Failed to persist todo state", exc_info=True)
 
     def format_for_injection(self) -> Optional[str]:
         """
@@ -270,6 +349,7 @@ def todo_tool(
 
     return json.dumps({
         "todos": items,
+        "revision": store.snapshot()["revision"],
         "summary": {
             "total": len(items),
             "pending": pending,
@@ -278,6 +358,35 @@ def todo_tool(
             "cancelled": cancelled,
         },
     }, ensure_ascii=False)
+
+
+def create_session_todo_store(agent: Any) -> TodoStore:
+    """Create a todo store bound to an agent's current durable session.
+
+    The closures resolve ``agent.session_id`` and ``agent._session_db`` at
+    call time. Compression and session switches can therefore re-home the same
+    agent without leaving todo writes pinned to an obsolete physical segment.
+    """
+
+    def _load_state() -> Optional[Dict[str, Any]]:
+        db = getattr(agent, "_session_db", None)
+        session_id = str(getattr(agent, "session_id", "") or "")
+        getter = getattr(db, "get_session_todo_state", None)
+        if not session_id or not callable(getter):
+            return None
+        return getter(session_id)
+
+    def _save_state(
+        todos: List[Dict[str, str]], revision: int
+    ) -> Optional[Dict[str, Any]]:
+        db = getattr(agent, "_session_db", None)
+        session_id = str(getattr(agent, "session_id", "") or "")
+        saver = getattr(db, "save_session_todo_state", None)
+        if not session_id or not callable(saver):
+            return None
+        return saver(session_id, todos, revision)
+
+    return TodoStore(load_state=_load_state, save_state=_save_state)
 
 
 def check_todo_requirements() -> bool:

@@ -494,6 +494,17 @@ CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     failure_streak INTEGER NOT NULL DEFAULT 0
 );
 
+-- Authoritative todo snapshot for one physical session segment. Compression
+-- continuations and branches inherit the nearest ancestor snapshot until they
+-- write their own copy, so state follows a conversation without coupling
+-- sibling branches together.
+CREATE TABLE IF NOT EXISTS session_todo_state (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 0,
+    todos_json TEXT NOT NULL DEFAULT '[]',
+    updated_at REAL NOT NULL
+);
+
 -- Per-backend liveness heartbeat (#94895). Each serve / tui_gateway process
 -- registers a row at startup and refreshes ``last_heartbeat`` periodically.
 -- The startup orphan sweep (sessions.startup_orphan_reap) consults this

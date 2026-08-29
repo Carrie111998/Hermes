@@ -1790,9 +1790,10 @@ def init_agent(
     except Exception:
         pass
     
-    # In-memory todo list for task planning (one per agent/session)
-    from tools.todo_tool import TodoStore
-    agent._todo_store = TodoStore()
+    # Session-scoped todo list. The active copy stays in memory for fast tool
+    # calls while revisioned snapshots persist through the existing state DB.
+    from tools.todo_tool import create_session_todo_store
+    agent._todo_store = create_session_todo_store(agent)
     
     # Load config once for memory, skills, and compression sections
     try:

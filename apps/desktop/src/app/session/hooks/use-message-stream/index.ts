@@ -23,7 +23,7 @@ import {
   generatedImageEchoSources,
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
-import { parseTodos } from '@/lib/todos'
+import { parseTodoRevision, parseTodos } from '@/lib/todos'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notifyError } from '@/store/notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
@@ -465,7 +465,7 @@ export function useMessageStream({
         const todos = parseTodos(payload.todos) ?? parseTodos(payload.result) ?? parseTodos(payload.args)
 
         if (todos) {
-          setSessionTodos(sessionId, todos)
+          setSessionTodos(sessionId, todos, parseTodoRevision(payload))
         }
       }
 

@@ -7668,6 +7668,119 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    @staticmethod
+    def _todo_state_from_row(row) -> Optional[Dict[str, Any]]:
+        """Decode one persisted todo-state row, failing closed on corruption."""
+        if row is None:
+            return None
+        try:
+            raw = row["todos_json"] if isinstance(row, sqlite3.Row) else row[0]
+            revision = row["revision"] if isinstance(row, sqlite3.Row) else row[1]
+            updated_at = row["updated_at"] if isinstance(row, sqlite3.Row) else row[2]
+            owner = row["owner_session_id"] if isinstance(row, sqlite3.Row) else row[3]
+            todos = json.loads(raw)
+            if not isinstance(todos, list):
+                return None
+            return {
+                "todos": todos,
+                "revision": max(0, int(revision or 0)),
+                "updated_at": float(updated_at or 0),
+                "owner_session_id": str(owner or ""),
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _select_session_todo_state(conn, session_id: str):
+        """Return the nearest copy-on-write todo snapshot in a lineage."""
+        return conn.execute(
+            """WITH RECURSIVE lineage(id, parent_session_id, depth) AS (
+                   SELECT id, parent_session_id, 0
+                     FROM sessions
+                    WHERE id = ?
+                   UNION ALL
+                   SELECT parent.id, parent.parent_session_id, lineage.depth + 1
+                     FROM sessions AS parent
+                     JOIN lineage ON parent.id = lineage.parent_session_id
+               )
+               SELECT state.todos_json,
+                      state.revision,
+                      state.updated_at,
+                      lineage.id AS owner_session_id
+                 FROM lineage
+                 JOIN session_todo_state AS state
+                   ON state.session_id = lineage.id
+                ORDER BY lineage.depth ASC
+                LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+
+    def get_session_todo_state(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current todo snapshot, inheriting through session lineage.
+
+        A compression child or manual branch starts from its nearest ancestor's
+        snapshot. Its first write creates an independent row for the child, so
+        later updates never mutate the parent or a sibling branch.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            if conn is None:
+                return None
+            row = self._select_session_todo_state(conn, session_id)
+        state = self._todo_state_from_row(row)
+        if row is not None and state is None:
+            logger.warning("Ignoring malformed todo state for session %s", session_id)
+        return state
+
+    def save_session_todo_state(
+        self,
+        session_id: str,
+        todos: List[Dict[str, Any]],
+        revision: int,
+    ) -> Dict[str, Any]:
+        """Persist a full revisioned todo snapshot with stale-writer rejection.
+
+        The caller supplies the next revision from its in-memory store. A
+        concurrent writer that already committed that revision wins; the stale
+        caller receives the winning snapshot and can reconcile immediately.
+        """
+        if not session_id:
+            return {"todos": [], "revision": 0, "updated_at": 0}
+        if not isinstance(todos, list):
+            raise TypeError("todos must be a list")
+
+        normalized_revision = max(0, int(revision))
+        encoded = json.dumps(todos, ensure_ascii=False, separators=(",", ":"))
+
+        def _do(conn):
+            current = self._todo_state_from_row(
+                self._select_session_todo_state(conn, session_id)
+            )
+            if current is not None and current["revision"] >= normalized_revision:
+                return current
+
+            updated_at = time.time()
+            conn.execute(
+                """INSERT INTO session_todo_state
+                       (session_id, revision, todos_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                       revision = excluded.revision,
+                       todos_json = excluded.todos_json,
+                       updated_at = excluded.updated_at
+                   WHERE excluded.revision > session_todo_state.revision""",
+                (session_id, normalized_revision, encoded, updated_at),
+            )
+            return {
+                "todos": json.loads(encoded),
+                "revision": normalized_revision,
+                "updated_at": updated_at,
+                "owner_session_id": session_id,
+            }
+
+        return self._execute_write(_do)
+
     def get_compression_ineffective_count(self, session_id: str) -> int:
         """Return the persisted ineffective-compaction strike count.
 

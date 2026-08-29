@@ -854,6 +854,12 @@ def build_turn_context(
         else:
             with persist_lock:
                 agent._ensure_db_session()
+        # History hydration runs before the first-row create above. Persist its
+        # revisioned todo snapshot now that the FK target is guaranteed to
+        # exist; already-persisted stores make this a no-op.
+        persist_todos = getattr(agent._todo_store, "persist_current", None)
+        if callable(persist_todos):
+            persist_todos()
     except Exception:
         logger.warning(
             "Turn-start session row creation failed for session=%s",
