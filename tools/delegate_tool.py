@@ -3004,7 +3004,8 @@ def _run_single_child(
                     )
                 if isinstance(_retry_result, dict):
                     _retry_text = _retry_result.get("final_response") or ""
-                    if _retry_text.strip():
+                    _retry_is_terminal = _is_terminal_child_result(_retry_result)
+                    if _retry_text.strip() or _retry_is_terminal:
                         result["final_response"] = _retry_text
                     try:
                         result["api_calls"] = int(
@@ -3017,7 +3018,7 @@ def _run_single_child(
                         result.get("messages"), list
                     ):
                         result["messages"] = result["messages"] + _retry_messages
-                    if _is_terminal_child_result(_retry_result):
+                    if _retry_is_terminal:
                         for _outcome_key in (
                             "completed",
                             "failed",
