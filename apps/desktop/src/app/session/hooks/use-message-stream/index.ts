@@ -17,6 +17,7 @@ import {
   sealOpenToolParts,
   upsertToolPart
 } from '@/lib/chat-messages'
+import type { ErrorSurface } from '@/lib/error-surface'
 import {
   dedupeGeneratedImageEchoesInParts,
   generatedImageEchoSources,
@@ -561,7 +562,7 @@ export function useMessageStream({
       sessionId: string,
       text: string,
       responsePreviewed?: boolean,
-      failure?: { error: string; partial: boolean },
+      failure?: { error: string; partial: boolean; surface?: ErrorSurface | null },
       occurredAt = Date.now() / 1000
     ) => {
       let shouldHydrate = false
@@ -579,7 +580,8 @@ export function useMessageStream({
             needsInput: false,
             pendingBranchGroup: null,
             streamId: null,
-            turnStartedAt: null
+            turnStartedAt: null,
+            turnLive: false
           }
         }
 
@@ -593,6 +595,12 @@ export function useMessageStream({
         // bubble failed, instead of stripping the text.
         const keepFailedPartialText = Boolean(failure?.partial && finalText)
         const interimBoundaryPending = state.interimBoundaryPending
+
+        // Wall-clock seconds this turn actually ran (message.start stamped
+        // turnStartedAt). Read BEFORE the state return below nulls it.
+        const durationS = state.turnStartedAt
+          ? Math.max(1, Math.round((Date.now() - state.turnStartedAt) / 1000))
+          : undefined
 
         const replaceTextPart = (parts: ChatMessagePart[]) => {
           const visibleFinalText = stripGeneratedImageEchoes(finalText, generatedImageEchoSources(parts)).trim()
@@ -608,7 +616,9 @@ export function useMessageStream({
             completedAt: occurredAt,
             parts: completeOpenTimelineParts(message.parts, occurredAt),
             pending: false,
-            interim: false
+            interim: false,
+            ...(durationS !== undefined ? { durationS } : {}),
+            ...(completionError && failure?.surface ? { errorSurface: failure.surface } : {})
           }
 
           if (completionError && !keepFailedPartialText) {
@@ -632,7 +642,9 @@ export function useMessageStream({
           timestamp: occurredAt,
           completedAt: occurredAt,
           branchGroupId: state.pendingBranchGroup ?? undefined,
-          ...(completionError && { error: completionError })
+          ...(durationS !== undefined ? { durationS } : {}),
+          ...(completionError && { error: completionError }),
+          ...(completionError && failure?.surface ? { errorSurface: failure.surface } : {})
         })
 
         const prev = state.messages
@@ -713,15 +725,27 @@ export function useMessageStream({
         const hasInlineError = nextMessages.some(m => m.role === 'assistant' && m.error && !m.hidden)
         const lastVisible = [...nextMessages].reverse().find(m => !m.hidden)
         const unresolvedUserTail = lastVisible?.role === 'user'
+
+        const sameTurnAssistant = streamId
+          ? nextMessages.find(m => m.id === streamId)
+          : [...nextMessages].reverse().find(m => m.role === 'assistant' && !m.hidden)
+
+        const localVisibleText = sameTurnAssistant ? chatMessageText(sameTurnAssistant).trim() : ''
         // Having streamed the reply normally means this window owns the whole
         // turn and re-reading stored history would be wasted work. That only
         // holds for a turn it STARTED: an adopted one (resumed onto a session
         // already running elsewhere) arrives reply-first, with no prompt row,
         // so it has to hydrate or the user's own message never shows up.
+        // Adopted turns still hydrate so a resume-onto-running session can
+        // pick up the user's prompt row — unless this window already has
+        // visible assistant text and the terminal frame is empty. In that
+        // case hydrate would replace the live bubble with a stored empty
+        // row (#95514; adoptedRunningTurn must not short-circuit).
         shouldHydrate =
           !completionError &&
           !hasInlineError &&
           !unresolvedUserTail &&
+          !(localVisibleText && !finalText) &&
           (state.adoptedRunningTurn || !state.sawAssistantPayload || !finalText)
 
         return {
@@ -734,7 +758,8 @@ export function useMessageStream({
           busy: false,
           needsInput: false,
           interimBoundaryPending: false,
-          turnStartedAt: null
+          turnStartedAt: null,
+          turnLive: false
         }
       })
 
@@ -777,6 +802,10 @@ export function useMessageStream({
         const prev = state.messages
         const error = errorMessage.trim() || 'Hermes reported an error'
 
+        const durationS = state.turnStartedAt
+          ? Math.max(1, Math.round((Date.now() - state.turnStartedAt) / 1000))
+          : undefined
+
         const nextMessages = prev.some(m => m.id === streamId)
           ? prev.map(message =>
               message.id === streamId
@@ -785,7 +814,8 @@ export function useMessageStream({
                     completedAt: occurredAt,
                     error,
                     parts: completeOpenTimelineParts(message.parts, occurredAt),
-                    pending: false
+                    pending: false,
+                    ...(durationS !== undefined ? { durationS } : {})
                   }
                 : message
             )
@@ -799,7 +829,8 @@ export function useMessageStream({
                 completedAt: occurredAt,
                 error,
                 pending: false,
-                branchGroupId: groupId
+                branchGroupId: groupId,
+                ...(durationS !== undefined ? { durationS } : {})
               }
             ]
 
@@ -813,7 +844,8 @@ export function useMessageStream({
           busy: false,
           needsInput: false,
           interimBoundaryPending: false,
-          turnStartedAt: null
+          turnStartedAt: null,
+          turnLive: false
         }
       })
     },
@@ -832,8 +864,10 @@ export function useMessageStream({
     failAssistantMessage,
     flushQueuedDeltas,
     finalizeInterimAssistantMessage,
+    hydrateFromStoredSession,
     queryClient,
     refreshHermesConfig,
+    scheduleSessionsRefresh,
     sessionInterrupted,
     sessionStateByRuntimeIdRef,
     updateSessionState,
