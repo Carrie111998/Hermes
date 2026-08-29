@@ -24,10 +24,11 @@ from pathlib import Path
 from ..config import get_settings
 from .graph import WikiGraph
 from .lint import apply_supersession, lint
-from .note import CASE, COMMENTARY, FORM, PRACTICE, STATUTE, WikiNote
+from .note import CASE, COMMENTARY, CONSULT, FORM, PRACTICE, STATUTE, WikiNote
 from .sources import main_law_of, read_source
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "wiki_prompt.md"
+AGENTS_PATH = Path(__file__).resolve().parent.parent.parent / "wiki_agents.md"
 
 # 폴더 이름으로 자료의 성격을 짐작합니다. 틀리면 노트에서 고치시면 됩니다.
 _KIND_HINTS: tuple[tuple[str, str], ...] = (
@@ -42,6 +43,8 @@ _KIND_HINTS: tuple[tuple[str, str], ...] = (
     ("practice", PRACTICE),
     ("서식", FORM),
     ("forms", FORM),
+    ("상담사례", CONSULT),
+    ("casefiles", CONSULT),
 )
 
 
@@ -168,7 +171,8 @@ def main(argv: list[str] | None = None) -> int:
         description="위키 볼트 → 그래프 · 허브노트 · lint",
     )
     parser.add_argument(
-        "command", choices=("stub", "index", "hubs", "lint", "related", "stats", "prompt")
+        "command",
+        choices=("stub", "index", "hubs", "lint", "related", "stats", "prompt", "schema"),
     )
     parser.add_argument("query", nargs="?", default="", help="related 에서 쓸 노트 경로/제목")
     parser.add_argument("--raw", default="./vault/raw")
@@ -185,6 +189,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     wiki_dir = Path(args.wiki)
+
+    if args.command == "schema":
+        # 볼트의 스키마 층 — 에이전트 작업 규칙(AGENTS.md)을 볼트 루트에.
+        vault = wiki_dir.parent
+        vault.mkdir(parents=True, exist_ok=True)
+        target = vault / "AGENTS.md"
+        target.write_text(AGENTS_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        for name in ("raw", "wiki", "hubs"):
+            (vault / name).mkdir(exist_ok=True)
+        index_md = vault / "index.md"
+        if not index_md.exists():
+            index_md.write_text("# 목차\n\n(ingest 때마다 노트를 한 줄씩 추가)\n", encoding="utf-8")
+        log_md = vault / "log.md"
+        if not log_md.exists():
+            log_md.write_text("# 작업 일지\n", encoding="utf-8")
+        print(f"볼트 스키마 준비됨: {target}")
+        print("코덱스를 이 폴더에서 실행하면 AGENTS.md 규칙대로 움직입니다.")
+        print("(Claude Code 를 쓰신다면 AGENTS.md 를 CLAUDE.md 로 복사하세요)")
+        return 0
 
     if args.command == "stub":
         raw_dir = Path(args.raw)

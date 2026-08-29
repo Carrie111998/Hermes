@@ -97,6 +97,9 @@ class Settings:
     archive_retention_days: int = field(
         default_factory=lambda: _env_int("ARCHIVE_RETENTION_DAYS", 0)
     )
+    # 문서 발송이 끝난 사건은 상담보고서+대화 전체+LLM 초안+변호사 최종본을
+    # 한 파일(사건파일)로 묶어 raw 로 남기고, 상담사례 검색 색인에 넣습니다.
+    casefile_enabled: bool = field(default_factory=lambda: _env_bool("CASEFILE_ENABLED", True))
 
     # ── Iris (KakaoTalk bridge running on the rooted emulator) ───────────
     iris_base_url: str = field(default_factory=lambda: _env("IRIS_BASE_URL").rstrip("/"))
@@ -313,6 +316,11 @@ class Settings:
     def archive_dir(self) -> Path:
         """내보낸 상담 기록 .md 파일이 놓이는 곳."""
         return self.data_dir / "archive"
+
+    @property
+    def casefile_dir(self) -> Path:
+        """완결 사건의 4종 합본(사건파일) .md 가 쌓이는 raw 폴더."""
+        return self.data_dir / "casefiles"
 
     @property
     def wiki_graph_path(self) -> Path:

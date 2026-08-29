@@ -41,8 +41,10 @@ COMMENTARY = "주석서"
 BOOK = "서적"
 PRACTICE = "실무편람"
 FORM = "서식"
+# 우리 사무실의 실제 상담·수임 사례 (사건파일 원문 → 가명화 요약 노트).
+CONSULT = "상담사례"
 OTHER = "기타"
-KINDS = (CASE, STATUTE, COMMENTARY, BOOK, PRACTICE, FORM, OTHER)
+KINDS = (CASE, STATUTE, COMMENTARY, BOOK, PRACTICE, FORM, CONSULT, OTHER)
 
 _LIST_FIELDS = ("statutes", "cases", "keywords", "tags", "sources")
 _DATE_FIELDS = ("written_on", "effective_on", "promulgated_on", "decided_on", "amended_on")

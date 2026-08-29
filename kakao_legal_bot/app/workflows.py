@@ -261,4 +261,19 @@ async def send_draft(
     await asyncio.to_thread(
         db.update_draft, draft_id, status="sent", sent_at=time.time(), client_email=email
     )
-    return True, f"#{draft_id} 을 {email} 로 발송했습니다."
+
+    # 발송 완료 = 상담보고서·대화·초안·최종본이 모두 존재하는 유일한 순간.
+    # 네 가지를 사건파일 한 장으로 묶어 raw 보관하고, 가명화 사본을
+    # 상담사례 검색 색인에 넣습니다. 실패해도 발송 결과는 그대로 보고합니다.
+    casefile_note = ""
+    if settings.casefile_enabled:
+        try:
+            from .casefile import archive_case  # local import: avoids a cycle
+
+            path = await asyncio.to_thread(archive_case, db, settings, draft_id)
+            if path is not None:
+                casefile_note = f"\n📁 사건파일 보관: {path.name} (상담사례 검색에 반영)"
+        except Exception:  # noqa: BLE001
+            log.exception("casefile build failed for draft %s", draft_id)
+
+    return True, f"#{draft_id} 을 {email} 로 발송했습니다.{casefile_note}"

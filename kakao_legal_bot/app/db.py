@@ -32,6 +32,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("drafts", "attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("drafts", "last_error", "TEXT NOT NULL DEFAULT ''"),
     ("drafts", "claimed_at", "REAL"),
+    ("drafts", "llm_body", "TEXT NOT NULL DEFAULT ''"),
     ("intakes", "track", "TEXT NOT NULL DEFAULT 'civil'"),
 )
 
@@ -109,6 +110,9 @@ CREATE TABLE IF NOT EXISTS drafts (
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_error   TEXT NOT NULL DEFAULT '',
     claimed_at   REAL,
+    -- LLM(또는 PC 워커)이 낸 초안 원본. 변호사가 body 를 고쳐도 이건 남아,
+    -- 사건파일에 "초안 vs 최종본"이 나란히 실립니다.
+    llm_body     TEXT NOT NULL DEFAULT '',
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
     sent_at      REAL
@@ -204,6 +208,7 @@ class Draft:
     transcript: str = ""
     attempts: int = 0
     last_error: str = ""
+    llm_body: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Draft:
@@ -225,6 +230,7 @@ class Draft:
             transcript=row["transcript"] if "transcript" in keys else "",
             attempts=row["attempts"] if "attempts" in keys else 0,
             last_error=row["last_error"] if "last_error" in keys else "",
+            llm_body=row["llm_body"] if "llm_body" in keys else "",
         )
 
     @property
@@ -519,8 +525,9 @@ class Database:
         cur = self._exec(
             """
             INSERT INTO drafts(consult_id, room_id, kind, title, body, client_email,
-                               status, instructions, transcript, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               status, instructions, transcript, llm_body,
+                               created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 consult_id,
@@ -532,6 +539,7 @@ class Database:
                 status,
                 instructions,
                 transcript,
+                body,  # 초안 원본 스냅샷 — 변호사가 body 를 고쳐도 남는다
                 now,
                 now,
             ),
@@ -642,8 +650,8 @@ class Database:
 
     def complete_draft_generation(self, draft_id: int, body: str, title: str = "") -> bool:
         """Worker delivered a document — move it into the review queue."""
-        fields: list[Any] = [body]
-        assignments = "body = ?"
+        fields: list[Any] = [body, body]
+        assignments = "body = ?, llm_body = ?"
         if title:
             assignments += ", title = ?"
             fields.append(title)
