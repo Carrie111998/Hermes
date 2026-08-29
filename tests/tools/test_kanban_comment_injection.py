@@ -99,6 +99,36 @@ def test_seed_then_inject_new_comment(worker_home, monkeypatch):
     assert len(agent.steers) == 1
 
 
+def test_other_profile_comment_not_framed_as_operator(worker_home, monkeypatch):
+    """A comment from another agent profile carries its real author and the
+    intro sentence must not blanket-attribute it to "the operator" — the
+    only filter is same-vs-different HERMES_PROFILE, not human-vs-agent."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cross-profile note")
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    agent = FakeAgent()
+
+    _unthrottle()
+    kt.inject_new_comments_from_env(agent)  # seed
+
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, tid, author="orchestrator-profile", body="switch to plan B")
+    finally:
+        conn.close()
+
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is True
+    note = agent.steers[0]
+    assert "orchestrator-profile" in note
+    assert "from the operator" not in note
+
+
 def test_skips_own_authored_comments(worker_home, monkeypatch):
     conn = kb.connect()
     try:
