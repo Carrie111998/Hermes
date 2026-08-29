@@ -2277,11 +2277,12 @@ class _CompressionLockLeaseRefresher:
         if refresh_interval_seconds is None:
             refresh_interval_seconds = max(1.0, min(60.0, ttl_seconds / 2.0))
         self._refresh_interval_seconds = max(0.1, float(refresh_interval_seconds))
-        # Tolerate transient refresh failures for at most one lease's worth of
-        # time, so the give-up window is genuinely bounded by the TTL the
-        # acquirer set (a single blip recovers on the next tick; a persistent
-        # failure stops before the lease could outlive its TTL). Floor of 1 so a
-        # degenerate interval >= ttl still tolerates one blip.
+        # Transient blips are tolerated indefinitely while the holder still owns
+        # the row (holder-only semantics guarantee an expired-but-unreclaimed
+        # row revives as ``renewed``). ``_max_consecutive_failures`` is the
+        # interval-bounded log threshold (ttl/interval, e.g. 5 for 300/60) —
+        # reaching it logs "continuing to probe" but does not stop the loop.
+        # Only a proven ``ownership_lost`` stops the thread.
         self._max_consecutive_failures = max(
             1, int(self._ttl_seconds / self._refresh_interval_seconds)
         )
@@ -2309,13 +2310,15 @@ class _CompressionLockLeaseRefresher:
     def _run(self) -> None:
         # A single falsy refresh must NOT permanently kill the lease: a
         # transient DB blip (write contention escaping _execute_write's retry
-        # budget, a momentary "database is locked") returns False just like a
-        # genuine lost-ownership, but only the latter should stop the loop.
-        # Tolerate consecutive failures for at most one lease's worth of time
-        # (_max_consecutive_failures = ttl / interval), so a one-off blip
-        # recovers on the next tick while the total give-up window stays bounded
-        # by the TTL the acquirer set — the lock can never be held past its TTL
-        # by a stuck refresher.
+        # budget, a momentary "database is locked") returns ``transient_failure``
+        # just like a genuine lost-ownership ``ownership_lost``, but only the
+        # latter should stop the loop.
+        # ``_max_consecutive_failures`` still caps the consecutive transient
+        # window: a one-off blip recovers on the next tick, but a persistent
+        # transient burst is logged and probed with bounded backoff. Only a
+        # proven ``ownership_lost`` stops the thread immediately — holder-only
+        # semantics guarantee a revivable expired-but-unreclaimed row returns
+        # ``renewed`` even past its TTL.
         consecutive_failures = 0
         # First refresh happens immediately, not one interval late. Everything
         # between try_acquire() and start() (the rotation-ownership lookup, the
@@ -2336,18 +2339,42 @@ class _CompressionLockLeaseRefresher:
                 )
             except Exception as exc:
                 logger.debug("compression lock refresh raised: %s", exc)
-                refreshed = False
-            if refreshed:
+                refreshed = "transient_failure"
+            # Backward-compat: old mocks / callers may return bool
+            if refreshed is True or refreshed == "renewed":
                 consecutive_failures = 0
                 continue
-            consecutive_failures += 1
-            if consecutive_failures >= self._max_consecutive_failures:
+            if refreshed == "ownership_lost":
                 logger.debug(
-                    "compression lock refresh failed %d times in a row; "
-                    "stopping lease refresher for session %s",
-                    consecutive_failures, self._session_id,
+                    "compression lock ownership lost for session %s (holder %s); "
+                    "stopping lease refresher",
+                    self._session_id,
+                    self._holder,
                 )
                 break
+            # ``transient_failure`` (or legacy ``False``/``None``)
+            if refreshed == "transient_failure" or refreshed is False or refreshed is None:
+                consecutive_failures += 1
+                if consecutive_failures >= self._max_consecutive_failures:
+                    logger.debug(
+                        "compression lock refresh transient %d times in a row; "
+                        "continuing to probe (holder %s still owns row) for session %s",
+                        consecutive_failures,
+                        self._holder,
+                        self._session_id,
+                    )
+                # Do NOT break — keep probing while holder still owns the row.
+                # The interval wait at the top of the loop bounds the retry.
+                continue
+            # Unknown string — treat as transient to avoid silently holding a
+            # stolen lease, but log and continue.
+            logger.debug(
+                "compression lock refresh unknown result %r for session %s; treating as transient",
+                refreshed,
+                self._session_id,
+            )
+            consecutive_failures += 1
+            continue
 
 
 def check_compression_model_feasibility(agent: Any) -> None:
@@ -4714,6 +4741,8 @@ def compress_context(
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
+                        require_lease_refresh=_lock_holder is not None,
+                        lease_ttl_seconds=_lock_ttl,
                         watermark=(
                             _commit_watermark
                             if _foreign_tail_ceiling is not None
@@ -4992,6 +5021,9 @@ def compress_context(
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+                agent.context_compressor.record_timeout_failure(
+                    f"session_split_failed: {e}", failure_kind="session_split_failed"
+                )
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`

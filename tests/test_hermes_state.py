@@ -4335,14 +4335,14 @@ def test_refresh_compression_lock_requires_holder_and_preserves_reclaimability(d
     ).fetchone()[0]
 
     monkeypatch.setattr(hermes_state.time, "time", lambda: 1005.0)
-    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) is True
+    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) == "renewed"
     refreshed_expires = db._conn.execute(
         "SELECT expires_at FROM compression_locks WHERE session_id = ?",
         ("s1",),
     ).fetchone()[0]
     assert refreshed_expires > original_expires
 
-    assert db.refresh_compression_lock("s1", "holder-b", ttl_seconds=10.0) is False
+    assert db.refresh_compression_lock("s1", "holder-b", ttl_seconds=10.0) == "ownership_lost"
 
     monkeypatch.setattr(hermes_state.time, "time", lambda: 1016.0)
     assert db.try_acquire_compression_lock("s1", "holder-b", ttl_seconds=10.0) is True
@@ -4366,7 +4366,7 @@ def test_refresh_cannot_resurrect_a_lock_already_reclaimed(db, monkeypatch):
     assert db.try_acquire_compression_lock("s1", "holder-b", ttl_seconds=10.0) is True
 
     # holder-a coming back late must NOT steal it back.
-    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) is False
+    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) == "ownership_lost"
     current = db._conn.execute(
         "SELECT holder FROM compression_locks WHERE session_id = ?",
         ("s1",),

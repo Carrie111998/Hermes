@@ -1674,7 +1674,7 @@ class _FlakyRefreshDB:
         self.calls += 1
         if self._results:
             return self._results.pop(0)
-        return True  # steady-state success after the scripted prefix
+        return "renewed"  # steady-state success after the scripted prefix
 
 
 def _no_sleep(refresher) -> None:
@@ -1694,18 +1694,19 @@ def _no_sleep(refresher) -> None:
 
 
 
-def test_lease_refresher_failure_window_is_bounded_by_ttl() -> None:
-    """Persistent failure stops within one lease's worth of time, not forever.
+def test_refresher_stops_immediately_on_ownership_lost() -> None:
+    """Proven ownership loss stops immediately — not after a cap window.
 
-    The contract (not a magic count): the give-up window
-    ``cap * refresh_interval`` must be <= the TTL, so a stuck refresher can
-    never hold the lock past its TTL. We assert that relationship directly
-    rather than freezing a literal cap (behavior contract over snapshot).
+    ``ownership_lost`` (holder verified via rowcount==0) means another holder
+    already owns the row. The refresher must exit on the first such result
+    and must not spin cap*interval while another holder holds the lock.
+    ``_max_consecutive_failures`` is now the transient log threshold, not a
+    hard give-up bound.
     """
     from agent.conversation_compression import _CompressionLockLeaseRefresher
 
     ttl, interval = 10.0, 2.0  # cap should be int(10/2) = 5
-    db = _FlakyRefreshDB([False] * 50)  # never recovers (lost ownership)
+    db = _FlakyRefreshDB(["ownership_lost"] * 50)  # never recovers (lost ownership)
     refresher = _CompressionLockLeaseRefresher(
         db, "sess", "holder", ttl_seconds=ttl, refresh_interval_seconds=interval
     )
@@ -1714,8 +1715,11 @@ def test_lease_refresher_failure_window_is_bounded_by_ttl() -> None:
 
     cap = refresher._max_consecutive_failures
     assert cap == int(ttl / interval), "cap must derive from ttl/interval"
-    # Stops at the cap — not on the first failure, not forever.
-    assert db.calls == cap
+    # Typed refresher: ownership_lost exits immediately (holder verified via follow-up SELECT)
+    # — must not spin cap*interval while another holder already owns the row.
+    assert db.calls == 1
+    # Transient failures still use the cap window (verified separately below)
+    assert cap == int(ttl / interval)
     # The invariant that makes the cap honest: total tolerance <= one TTL.
     assert cap * interval <= ttl, (
         f"give-up window {cap * interval}s must not exceed the lease TTL {ttl}s"

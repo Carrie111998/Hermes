@@ -183,7 +183,7 @@ def test_reopen_orphaned_compression_session_reclaims_expired_lease(
     assert db.reopen_orphaned_compression_session("expired-lease-parent") is True
     assert db.refresh_compression_lock(
         "expired-lease-parent", "old-compressor"
-    ) is False
+    ) == "ownership_lost"
     assert db.get_compression_lock_holder("expired-lease-parent") is None
 
 
@@ -201,7 +201,7 @@ def test_reopen_orphaned_compression_session_loses_to_expired_lease_refresh(
 
     assert db.refresh_compression_lock(
         "refreshed-lease-parent", "live-compressor"
-    ) is True
+    ) == "renewed"
     assert db.reopen_orphaned_compression_session("refreshed-lease-parent") is False
     assert db.get_session("refreshed-lease-parent")["end_reason"] == "compression"
 
