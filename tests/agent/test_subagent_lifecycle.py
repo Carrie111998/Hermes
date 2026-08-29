@@ -178,3 +178,31 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     assert agent.run_conversation("hello") == {"final_response": "ok"}
     assert observed == [agent]
     assert get_active_subagent_parent() is None
+
+
+def test_launch_rejects_toolsets_in_parent_disabled_toolsets():
+    """Requesting toolsets that are disabled on the parent must raise SubagentLifecycleError."""
+    parent = SimpleNamespace(
+        session_id="parent-sec",
+        enabled_toolsets=None,
+        disabled_toolsets=["terminal", "web"],
+    )
+    service = SubagentLifecycleService(lambda: parent)
+    with pytest.raises(SubagentLifecycleError, match="Requested toolsets would broaden parent permissions"):
+        service.launch(
+            SubagentLaunchRequest(
+                goal="do something",
+                allowed_toolsets=("terminal", "file"),
+            )
+        )
+
+    # Allowed when requested toolsets are disjoint from disabled_toolsets
+    # (will proceed past validation to child agent build)
+    with pytest.raises(Exception) as exc_info:
+        service.launch(
+            SubagentLaunchRequest(
+                goal="do something",
+                allowed_toolsets=("file",),
+            )
+        )
+    assert not isinstance(exc_info.value, SubagentLifecycleError) or "broaden" not in str(exc_info.value)
