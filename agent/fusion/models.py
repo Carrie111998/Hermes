@@ -1,10 +1,46 @@
-"""Small JSON-friendly models for Fusion artifact tests."""
+"""Data models for Fusion v2.
+
+Fusion is artifact-first: every public model can be serialized to JSON so
+CLI, gateway, and tests inspect the same run contract.
+"""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal
+
+FusionStatus = Literal[
+    "converged",
+    "operator_decision",
+    "write_leak",
+    "failed",
+    "model_diversity_error",
+    "degraded_insufficient_participants",
+    "blocked",
+]
+
+FUSION_STATUSES: set[str] = {
+    "converged",
+    "operator_decision",
+    "write_leak",
+    "failed",
+    "model_diversity_error",
+    "degraded_insufficient_participants",
+    "blocked",
+}
+
+MATERIAL_AXES: tuple[str, ...] = (
+    "architecture",
+    "approach",
+    "key_assumptions",
+    "repo_facts",
+    "api_flag_config_claims",
+    "risks_blockers",
+    "implementation_sequence",
+    "test_strategy",
+    "migration_backcompat_claims",
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -12,7 +48,7 @@ def _jsonable(value: Any) -> Any:
         return str(value)
     if is_dataclass(value):
         return {k: _jsonable(v) for k, v in asdict(value).items()}
-    if isinstance(value, Mapping):
+    if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_jsonable(v) for v in value]
@@ -31,7 +67,7 @@ class FusionRequest(JsonModel):
     task: str
     participants: int = 3
     roster: str = "planning"
-    timeout_seconds: int | None = None
+    timeout_seconds: int = 300
     repo_path: str | None = None
     output_root: str | None = None
     min_successful_participants: int = 2
@@ -42,7 +78,6 @@ class FusionRequest(JsonModel):
     debate_rounds: int = 5
     convergence_rounds: int = 5
     reasoning_effort: str | None = None
-    spike_worktrees: bool = True
 
 
 @dataclass(slots=True)
@@ -60,9 +95,7 @@ class FusionParticipantSpec(JsonModel):
 
     @property
     def runtime_label(self) -> str:
-        provider = (
-            self.provider or self.requested_provider or "inherit"
-        ).strip() or "inherit"
+        provider = (self.provider or self.requested_provider or "inherit").strip() or "inherit"
         model = (self.model or self.requested_model or "inherit").strip() or "inherit"
         return f"{provider}:{model}"
 
@@ -85,18 +118,38 @@ class FusionParticipantResult(JsonModel):
     def ok(self) -> bool:
         return self.status == "completed" and bool(self.output.strip())
 
-    @property
-    def failure_reason(self) -> str:
-        return (
-            self.error
-            or self.metadata.get("reason")
-            or self.metadata.get("fail_fast_reason")
-            or "no usable output"
-        )
+
+@dataclass(slots=True)
+class FusionFinding(JsonModel):
+    axis: str
+    participant: str
+    claim: str
+    support: str = ""
+    confidence: str = ""
 
 
-def count_successful(results: Sequence[FusionParticipantResult]) -> int:
-    return sum(1 for result in results if result.ok)
+@dataclass(slots=True)
+class FusionRecommendation(JsonModel):
+    participant: str
+    text: str
+    axis: str | None = None
+
+
+@dataclass(slots=True)
+class FusionConflict(JsonModel):
+    axis: str
+    summary: str
+    claims: dict[str, str]
+    participants: list[str]
+    material: bool = True
+
+
+@dataclass(slots=True)
+class FusionConsensusItem(JsonModel):
+    axis: str
+    agreed: bool
+    summary: str
+    participants: list[str]
 
 
 @dataclass(slots=True)
@@ -120,32 +173,6 @@ class FusionCandidate(JsonModel):
 
 
 @dataclass(slots=True)
-class FusionConsensusItem(JsonModel):
-    axis: str
-    agreed: bool
-    summary: str
-    participants: list[str]
-
-
-@dataclass(slots=True)
-class FusionConflict(JsonModel):
-    axis: str
-    summary: str
-    claims: dict[str, str]
-    participants: list[str]
-    material: bool = True
-
-
-@dataclass(slots=True)
-class FusionFinding(JsonModel):
-    axis: str
-    participant: str
-    claim: str
-    support: str = ""
-    confidence: str = ""
-
-
-@dataclass(slots=True)
 class FusionVerificationReport(JsonModel):
     matrix: dict[str, dict[str, str]] = field(default_factory=dict)
     consensus_items: list[FusionConsensusItem] = field(default_factory=list)
@@ -161,10 +188,39 @@ class FusionVerificationReport(JsonModel):
 
 
 @dataclass(slots=True)
+class FusionGateResult(JsonModel):
+    passed: bool
+    status: str
+    reasons: list[str] = field(default_factory=list)
+    conflicts: list[FusionConflict] = field(default_factory=list)
+    candidate_id: str | None = None
+
+
+@dataclass(slots=True)
 class FusionOperatorDecision(JsonModel):
     summary: str
     fork_options: list[str]
     conflicts: list[FusionConflict] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class FusionRepoSnapshot(JsonModel):
+    repo_root: str | None
+    available: bool
+    tracked_status: list[str] = field(default_factory=list)
+    digest: str = ""
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class FusionRepoGuardResult(JsonModel):
+    repo_root: str | None
+    available: bool
+    before: FusionRepoSnapshot | None = None
+    after: FusionRepoSnapshot | None = None
+    write_leak: bool = False
+    diff_summary: list[str] = field(default_factory=list)
+    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -176,12 +232,18 @@ class FusionResult(JsonModel):
     phases: dict[str, list[FusionParticipantResult]] = field(default_factory=dict)
     candidates: list[FusionCandidate] = field(default_factory=list)
     votes: list[FusionConvergenceVote] = field(default_factory=list)
+    model_diversity: dict[str, Any] = field(default_factory=dict)
     routing: dict[str, Any] = field(default_factory=dict)
     brief: dict[str, Any] = field(default_factory=dict)
     coverage: dict[str, Any] = field(default_factory=dict)
     decision: str = ""
+    repo_guard: FusionRepoGuardResult | None = None
     verification: FusionVerificationReport | None = None
+    gate: FusionGateResult | None = None
     operator_decision: FusionOperatorDecision | None = None
     artifacts: dict[str, str] = field(default_factory=dict)
     error: str | None = None
 
+    @property
+    def write_leak(self) -> bool:
+        return bool(self.repo_guard and self.repo_guard.write_leak)

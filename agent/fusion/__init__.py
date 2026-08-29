@@ -1,6 +1,6 @@
-"""Fusion artifact compatibility surface."""
+"""Fusion v2 orchestration package."""
 
-from .models import FusionCandidate, FusionRequest, FusionResult
+from .models import FusionRequest, FusionResult
+from .orchestrator import run_fusion
 
-__all__ = ["FusionCandidate", "FusionRequest", "FusionResult"]
-
+__all__ = ["FusionRequest", "FusionResult", "run_fusion"]

@@ -365,6 +365,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc"),
                busy_policy="dispatch", desktop="advanced"),
+    CommandDef(
+        "fusion",
+        "Heterogeneous multi-LLM planning/review with debate and hard consensus gate",
+        "Tools & Skills",
+        args_hint="[plan|review|findings|recommend] <task> [--models provider:model,...] [--participants N] [--timeout S]",
+        subcommands=("plan", "review", "findings", "recommend"),
+    ),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True, desktop="terminal"),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",

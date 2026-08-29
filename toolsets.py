@@ -107,6 +107,15 @@ TOOLSETS = {
         "tools": ["web_search", "web_extract"],
         "includes": []  # No other toolsets included
     },
+
+    "fusion_readonly": {
+        "description": "Read-only repo/context access for Fusion participants",
+        "tools": [
+            "read_file", "search_files", "web_search", "web_extract",
+            "skills_list", "skill_view", "session_search", "todo",
+        ],
+        "includes": [],
+    },
     
     "search": {
         "description": "Web search only (no content extraction/scraping)",

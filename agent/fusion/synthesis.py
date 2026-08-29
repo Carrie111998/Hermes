@@ -1,9 +1,4 @@
-"""Deterministic Fusion artifact synthesis.
-
-The full orchestration runtime is not present in this checkout; this module
-keeps the tracked artifact contract importable without wiring any live command
-surface.
-"""
+"""Artifact synthesis for Fusion v2."""
 
 from __future__ import annotations
 
@@ -15,7 +10,6 @@ from .models import (
     FusionRequest,
     FusionResult,
     FusionVerificationReport,
-    count_successful,
 )
 
 
@@ -26,123 +20,48 @@ def _short(text: str, limit: int = 1600) -> str:
     return text[:limit].rstrip() + "\n...[truncated]"
 
 
-def _summarize_results(
-    title: str,
-    results: list[FusionParticipantResult] | None,
-    *,
-    limit: int = 900,
-) -> list[str]:
+def _summarize_results(title: str, results: list[FusionParticipantResult] | None, *, limit: int = 900) -> list[str]:
     lines = [f"## {title}"]
     if not results:
         lines.append("- <none>")
         return lines
     for result in results:
-        lines.extend(
-            [
-                f"### {result.spec.slug} ({result.phase}, {result.status})",
-                _short(result.output or result.error or "", limit),
-                "",
-            ]
-        )
+        status = result.status
+        lines.extend([f"### {result.spec.slug} ({result.phase}, {status})", _short(result.output or result.error or "", limit), ""])
     return lines
 
 
-def _task_has_pending_probe_list(task: str) -> bool:
-    lowered = (task or "").lower()
-    return "missing probes" in lowered or "pending probes" in lowered
+def _coverage_line(result: FusionResult | None) -> str:
+    if result is None:
+        return "unknown"
+    coverage = result.coverage or {}
+    requested = coverage.get("requested") or result.request.participants
+    successful = coverage.get("draft_successful") or len([p for p in result.participants if p.ok])
+    degraded = bool(coverage.get("degraded"))
+    suffix = " (degraded)" if degraded else ""
+    return f"{successful}/{requested}{suffix}"
 
 
-def _user_mandates(task: str) -> list[str]:
-    task = task or ""
-    markers = ("ЖЕСТКИЕ РЕШЕНИЯ:", "HARD REQUIREMENTS:", "MANDATORY:")
-    for marker in markers:
-        if marker in task:
-            tail = task.split(marker, 1)[1]
-            tail = tail.split("=== END ===", 1)[0]
-            return [line.strip() for line in tail.splitlines() if line.strip()]
-    return []
+def _decision_for(result: FusionResult | None, status: str) -> str:
+    if result and result.decision:
+        return result.decision
+    if status == "converged":
+        return "consensus"
+    if status == "operator_decision":
+        return "operator_decision"
+    return status
 
 
-def _feedback_rows(report: FusionVerificationReport | None) -> list[str]:
-    if report is None:
-        return []
-    rows: list[str] = []
-    for vote in report.votes:
-        for change in vote.required_changes:
-            rows.append(f"- {vote.participant} required change: {change}")
-        for dissent in vote.material_dissent:
-            rows.append(f"- {vote.participant} material dissent: {dissent}")
-        for claim in vote.unsupported_claims:
-            rows.append(f"- {vote.participant} unsupported claim: {claim}")
-    return rows
-
-
-def _is_gbrain_phase_runbook_request(
-    request: FusionRequest,
-    vote_feedback: FusionVerificationReport | None,
-) -> bool:
-    task = (request.task or "").lower()
-    if "gbrain" in task and "phase 0" in task and "phase 9" in task:
-        return True
-    for row in _feedback_rows(vote_feedback):
-        lowered = row.lower()
-        if "phase 0-9 runbook" in lowered or "phase 0 through phase 9" in lowered:
-            return True
-    return False
-
-
-def _gbrain_phase_runbook(candidate_id: str, round_index: int) -> FusionCandidate:
-    lines = [
-        f"# Fusion Candidate Plan ({candidate_id})",
-        "",
-        "## Proposed Plan",
-        "### Phase 0 — Private manifest / preflight",
-        "- Bind `GBRAIN_HOME=/home/nick` and `DRAINED_UNITS_FILE` in a private manifest with mode `0600`.",
-        "- Refuse to continue unless runtime, schema, tokens, and service names exactly match the private manifest without printing secrets.",
-        "- Run a harmless admin MCP auth probe over HTTP and stdio before schema/binary mutation.",
-        "- abort if inherited `GBRAIN_CONTOUR`; use `env -u GBRAIN_CONTOUR` for raw upstream stdio probes.",
-        "- Keep `GBRAIN_DATABASE_URL=<same literal secret value as CORP_GBRAIN_DATABASE_URL>` scoped to the intended contour.",
-        "- locate the actual schema_version check before claiming the target schema is ready.",
-        "",
-        "### Phase 1 — Drain and freeze",
-        "- Drain only the Phase 0 manifest-listed services and record every stopped unit in `DRAINED_UNITS_FILE`.",
-        "- resume only the Phase 0 manifest-listed units during recovery.",
-        "",
-        "### Phase 2 — Pre-mutation transport-exposure gate",
-        "- Run the pre-mutation transport-exposure gate before schema/binary mutation.",
-        "- stop before schema/binary mutation if raw `tools/call ontology_propose` or `ontology_propose` behavior differs between HTTP and stdio.",
-        "",
-        "### Phase 3 — Schema migration",
-        "- Apply schema migration only after the stop gates pass; verify `schema_version` immediately afterward.",
-        "",
-        "### Phase 4 — Binary rollout",
-        "- Replace binaries only after schema verification and keep the previous tuple intact.",
-        "",
-        "### Phase 5 — Broker configuration",
-        "- unset `GBRAIN_DIRECT_DATABASE_URL` by default and route writes through the broker-governed path.",
-        "",
-        "### Phase 6 — Transport probes",
-        "- Probe HTTP and stdio with the same manifest-bound credentials.",
-        "",
-        "### Phase 7 — Runtime smoke",
-        "- Run read, propose, and recall smoke checks without printing secrets.",
-        "",
-        "### Phase 8 — Observation",
-        "- Watch logs, source scopes, and auth boundaries before declaring the cutover complete.",
-        "",
-        "### Phase 9 — Rollback",
-        "- On any failure after Phase 2 drain, restore the exact previous tuple and resume only the Phase 0 manifest-listed units.",
-        "- Treat failures before schema/binary mutation as no-mutation aborts.",
-        "",
-        "## Alternatives",
-        "- Do not replace this runbook with an evidence bundle; the previous vote required a single Phase 0-9 sequence.",
-    ]
-    return FusionCandidate(
-        id=candidate_id,
-        round_index=round_index,
-        content="\n".join(lines).rstrip() + "\n",
-        source_phases=["draft", "debate", "vote-feedback"],
-    )
+def _root_cause_marker(result: FusionResult | None) -> str:
+    if not result:
+        return "hypothesis"
+    routing = result.routing or {}
+    if routing.get("task_kind") == "bug_unknown_root":
+        # Hermes-native Fusion does not currently execute write-enabled repro/spikes.
+        # LOCATE evidence can raise confidence but should not be laundered into a
+        # confirmed runtime root cause unless the model record explicitly says so.
+        return "hypothesis"
+    return "not-applicable"
 
 
 def synthesize_candidate_plan(
@@ -156,27 +75,22 @@ def synthesize_candidate_plan(
     cross_verifications: list[FusionParticipantResult] | None = None,
     wrong_layer_results: list[FusionParticipantResult] | None = None,
     probe_results: list[FusionParticipantResult] | None = None,
-    spike_results: list[FusionParticipantResult] | None = None,
     premortem_results: list[FusionParticipantResult] | None = None,
     brief: dict | None = None,
 ) -> FusionCandidate:
     candidate_id = f"candidate-r{round_index}"
-    if _is_gbrain_phase_runbook_request(request, vote_feedback):
-        return _gbrain_phase_runbook(candidate_id, round_index)
-
     routing = (brief or {}).get("routing") or {}
     layers = (brief or {}).get("layers") or {}
-    not_covered = ", ".join(layers.get("not_covered") or [])
-    if not not_covered and _task_has_pending_probe_list(request.task):
-        not_covered = "user-supplied task/evidence lists pending probes"
-
     lines = [
         f"# Fusion Candidate Plan ({candidate_id})",
+        "",
+        "This candidate is mechanically synthesized from the shared evidence brief, independent drafts, cross-verification, wrong-layer challenge, debate, and read-only probe artifacts. It is not final until every successful participant approves it with no material dissent.",
         "",
         "## Decision State",
         f"- candidate_id: `{candidate_id}`",
         f"- round: `{round_index}`",
         f"- route: `{routing.get('task_kind', 'unknown')}`",
+        f"- root-cause: `{ 'hypothesis' if routing.get('task_kind') == 'bug_unknown_root' else 'not-applicable' }`",
         "",
         "## Task",
         request.task,
@@ -184,80 +98,66 @@ def synthesize_candidate_plan(
         "## Evidence Snapshot",
         f"- git_head: `{(brief or {}).get('git_head', 'unknown')}`",
         "- layers covered: " + (", ".join(layers.get("covered") or []) or "none detected"),
-        "- layers NOT covered: " + (not_covered or "none flagged"),
+        "- layers NOT covered: " + (", ".join(layers.get("not_covered") or []) or "none flagged"),
         "",
         "## Participant Runtimes",
     ]
     for result in drafts:
-        lines.append(
-            f"- {result.spec.slug}: `{result.spec.runtime_label}` "
-            f"reasoning=`{result.spec.reasoning_effort or request.reasoning_effort or 'inherit'}`"
-        )
+        lines.append(f"- {result.spec.slug}: `{result.spec.runtime_label}` reasoning=`{result.spec.reasoning_effort or request.reasoning_effort or 'inherit'}`")
     lines.extend(["", "## Draft Inputs"])
     for result in drafts:
         lines.extend([f"### {result.spec.slug}", _short(result.output), ""])
-    lines.extend(_summarize_results("Cross-verification Findings", cross_verifications))
-    lines.append("")
-    lines.extend(_summarize_results("Wrong-layer / Wrong-abstraction Findings", wrong_layer_results))
-    lines.append("")
+    lines.extend(_summarize_results("Cross-verification Findings", cross_verifications, limit=900))
+    lines.extend([""])
+    lines.extend(_summarize_results("Wrong-layer / Wrong-abstraction Findings", wrong_layer_results, limit=800))
+    lines.extend([""])
+    if probe_results:
+        lines.extend(_summarize_results("Read-only Probe Results", probe_results, limit=800))
+        lines.append("")
     if debates:
         lines.append("## Debate Findings")
         for result in debates:
             lines.extend([f"### {result.spec.slug}", _short(result.output, 1000), ""])
-    if premortem_results:
-        lines.extend(_summarize_results("Pre-mortem Residual Risks", premortem_results))
+    if previous_candidate and vote_feedback:
+        lines.append("## Revision Feedback")
+        for vote in vote_feedback.votes:
+            if vote.required_changes or vote.material_dissent or vote.unsupported_claims:
+                lines.append(
+                    f"- {vote.participant}: required_changes={vote.required_changes or []}; "
+                    f"material_dissent={vote.material_dissent or []}; unsupported_claims={vote.unsupported_claims or []}"
+                )
         lines.append("")
-
-    lines.extend(
-        [
-            "## Proposed Plan",
-            "### Mandatory Corrections From Previous Vote",
-        ]
-    )
-    feedback = _feedback_rows(vote_feedback)
-    lines.extend(feedback or ["- No previous vote corrections supplied."])
-    mandates = _user_mandates(request.task)
-    if mandates:
-        lines.extend(["", "### User-Mandated Runbook Requirements"])
-        lines.extend(f"- {mandate}" for mandate in mandates)
-    if drafts:
-        lines.extend(["", "### Candidate Runbook Evidence To Execute Or Refine"])
-        for result in drafts:
-            if result.output.strip():
-                lines.append(_short(result.output, 1200))
-    if debates:
-        lines.extend(["", "### Debate Evidence"])
-        for result in debates:
-            if result.output.strip():
-                lines.append(_short(result.output, 800))
-    lines.extend(
-        [
-            "",
-            "## Alternatives",
-            "- See draft and verification sections above; no alternative is silently discarded without artifact support.",
-            "",
-            "## Verification",
-            "- Run the targeted tests named by participants.",
-        ]
-    )
+    if premortem_results:
+        lines.extend(_summarize_results("Pre-mortem Residual Risks", premortem_results, limit=700))
+        lines.append("")
+    lines.extend([
+        "## Proposed Plan",
+        "- Use only claims supported by the evidence brief, participant drafts, cross-verification, debate, probes, or explicitly listed hypotheses.",
+        "- Preserve all repo read-only and write-leak safeguards named by the participants.",
+        "- Prefer the implementation sequence that is supported by the strongest shared repo evidence and has no unresolved material dissent.",
+        "- Treat every unresolved material dissent, unsupported claim, or live pre-mortem blocker as blocking until a later candidate resolves it or the operator decides.",
+        "",
+        "## Alternatives And Why Rejected",
+        "- See draft and cross-verification sections above; no alternative is silently discarded without artifact support.",
+        "",
+        "## Ranked Assumptions",
+        "- HIGH: claims explicitly backed by cited repo evidence or unanimous participant agreement.",
+        "- MED: claims supported by multiple participant artifacts but without direct repo proof.",
+        "- LOW: claims requiring operator/live-system probes; keep as hypotheses.",
+        "",
+        "## Operator Unknowns / Pending Probes",
+        "- Any missing layer, missing live log/repro, unsupported claim, or unresolved pre-mortem blocker must be surfaced before execution.",
+        "",
+        "## Verification",
+        "- Run the targeted tests named by participants.",
+        "- Confirm artifacts expose routing, brief, participant model identities, cross-verification, debate outputs, pre-mortem, votes, and final gate status.",
+    ])
     return FusionCandidate(
         id=candidate_id,
         round_index=round_index,
         content="\n".join(lines).rstrip() + "\n",
-        source_phases=["brief", "draft", "cross-verify", "wrong-layer", "debate"],
+        source_phases=["brief", "draft", "cross-verify", "wrong-layer", "debate", "probe", "premortem"],
     )
-
-
-def _coverage_line(result: FusionResult | None) -> str:
-    if result is None:
-        return "unknown"
-    requested = result.coverage.get("requested", result.request.participants)
-    successful = result.coverage.get(
-        "draft_successful",
-        count_successful(result.participants),
-    )
-    suffix = " (degraded)" if result.coverage.get("degraded") else ""
-    return f"{successful}/{requested}{suffix}"
 
 
 def synthesize_final_plan(
@@ -267,91 +167,136 @@ def synthesize_final_plan(
     *,
     result: FusionResult | None = None,
 ) -> str:
+    decision = _decision_for(result, "converged")
     lines = [
         f"# Fusion Final {request.mode.title()}",
         "",
-        "## Decision",
-        f"- consensus: `{_coverage_line(result)}`",
-        f"- candidate: `{report.candidate_id or (candidate.id if candidate else 'unknown')}`",
+        "Fusion emitted this final artifact because the hard consensus gate passed for the current candidate.",
         "",
-        "## Consensus by Material Axis",
+        "## Decision",
+        f"- decision: `{decision}`",
+        f"- consensus: `{_coverage_line(result)}`",
+        f"- root-cause: `{_root_cause_marker(result)}`",
+        f"- candidate: `{report.candidate_id or (candidate.id if candidate else 'unknown')}`",
+        f"- approved_participants: {', '.join(report.approved_participants or report.successful_participants) or 'none'}",
+        "",
+        "## Task",
+        request.task,
+        "",
+        "## Evidence And Coverage",
     ]
+    if result:
+        routing = result.routing or {}
+        brief = result.brief or {}
+        layers = brief.get("layers") or {}
+        lines.extend([
+            f"- route: `{routing.get('task_kind', 'unknown')}`",
+            f"- git_head: `{brief.get('git_head', 'unknown')}`",
+            "- layers covered: " + (", ".join(layers.get("covered") or []) or "none detected"),
+            "- layers NOT covered: " + (", ".join(layers.get("not_covered") or []) or "none flagged"),
+        ])
+    else:
+        lines.append("- <coverage unavailable>")
+    lines.extend(["", "## Consensus by Material Axis"])
     if report.consensus_items:
-        lines.extend(f"- **{item.axis}:** {item.summary}" for item in report.consensus_items)
+        for item in report.consensus_items:
+            lines.append(f"- **{item.axis}:** {item.summary}")
     else:
         lines.append("- Structured convergence votes passed with no material dissent.")
     if candidate is not None:
         lines.extend(["", "## Approved Candidate Content", candidate.content.rstrip()])
+    lines.extend([
+        "",
+        "## Gate",
+        "- Passed: unanimous approval across all successful participants on the current candidate.",
+        "- Majority voting was not used; any material dissent would have blocked final emission.",
+        "",
+        "## Handoff Boundary",
+        "- This is a plan artifact, not an implementation. Execute with normal repo tests and stop if assumptions marked LOW/HYPOTHESIS are invalidated.",
+    ])
     return "\n".join(lines).rstrip() + "\n"
 
 
-def synthesize_recommendations(
-    request: FusionRequest,
-    report: FusionVerificationReport,
-) -> str:
-    del request
-    lines = ["# Fusion Recommendations", ""]
-    lines.extend(
-        f"- **{item.axis}:** {item.summary}" for item in report.consensus_items
-    )
-    if len(lines) == 2:
+def synthesize_recommendations(request: FusionRequest, report: FusionVerificationReport) -> str:
+    lines = [
+        "# Fusion Recommendations",
+        "",
+        "These recommendations are derived only from the candidate approved by every successful participant.",
+        "",
+    ]
+    for item in report.consensus_items:
+        lines.append(f"- **{item.axis}:** {item.summary}")
+    if len(lines) == 4:
         lines.append("- No separate recommendations beyond the final consensus artifact.")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def operator_decision_from_conflicts(
-    conflicts: list[FusionConflict],
-) -> FusionOperatorDecision:
-    fork_options = []
+def operator_decision_from_conflicts(conflicts: list[FusionConflict]) -> FusionOperatorDecision:
+    fork_options: list[str] = []
     for conflict in conflicts:
-        variants = [
-            f"{participant}: {claim.strip()}"
-            for participant, claim in conflict.claims.items()
-            if claim.strip()
-        ]
+        variants = []
+        seen: set[str] = set()
+        for participant, claim in conflict.claims.items():
+            normalized = claim.strip()
+            if normalized and normalized not in seen:
+                variants.append(f"{participant}: {normalized}")
+                seen.add(normalized)
         if variants:
             fork_options.append(f"{conflict.axis}: " + " | ".join(variants))
     if not fork_options:
-        fork_options.append("Ask participants to rerun with more evidence.")
+        fork_options.append("Ask participants to rerun with more evidence; no concrete fork options were extracted.")
     return FusionOperatorDecision(
-        summary="Fusion found unresolved material disagreement.",
+        summary="Fusion found unresolved material disagreement. No final plan was emitted.",
         fork_options=fork_options,
         conflicts=conflicts,
     )
 
 
-def synthesize_operator_decision(
-    decision: FusionOperatorDecision,
-    *,
-    result: FusionResult | None = None,
-) -> str:
+def synthesize_operator_decision(decision: FusionOperatorDecision, *, result: FusionResult | None = None) -> str:
     lines = [
         "# Fusion Operator Decision Required",
         "",
         decision.summary,
         "",
         "## Decision",
+        f"- decision: `operator_decision`",
         f"- consensus: `{_coverage_line(result)}`",
+        f"- root-cause: `{_root_cause_marker(result)}`",
         "",
         "## Fork Options",
     ]
     lines.extend(f"- {option}" for option in decision.fork_options)
+    lines.extend(["", "## Material Conflicts"])
+    for conflict in decision.conflicts:
+        lines.append(f"### {conflict.axis}")
+        lines.append(conflict.summary)
+        for participant, claim in conflict.claims.items():
+            lines.append(f"- **{participant}:** {claim}")
+        lines.append("")
+    lines.extend([
+        "",
+        "## Handoff Boundary",
+        "- No final plan was emitted. The operator must decide, provide missing evidence, or rerun Fusion with additional context.",
+    ])
     return "\n".join(lines).rstrip() + "\n"
 
 
 def synthesize_fork_options(decision: FusionOperatorDecision) -> str:
-    return "# Fusion Fork Options\n\n" + "\n".join(
-        f"- {option}" for option in decision.fork_options
-    ) + "\n"
+    lines = ["# Fusion Fork Options", ""]
+    lines.extend(f"- {option}" for option in decision.fork_options)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def synthesize_write_leak_report(diff_summary: list[str]) -> str:
     lines = [
         "# Fusion Write Leak Report",
         "",
+        "Fusion detected tracked repository mutation during the participant workflow. The run stopped immediately and no final plan was emitted.",
+        "",
         "## Tracked-state delta",
     ]
-    lines.extend(f"- `{line}`" for line in diff_summary)
-    if len(lines) == 3:
-        lines.append("- Tracked state digest changed.")
+    if diff_summary:
+        lines.extend(f"- `{line}`" for line in diff_summary)
+    else:
+        lines.append("- Tracked state digest changed, but no line-level summary was available.")
     return "\n".join(lines).rstrip() + "\n"
