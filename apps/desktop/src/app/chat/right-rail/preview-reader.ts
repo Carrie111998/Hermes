@@ -12,8 +12,7 @@
  * directly (read_file / the conversation's artifact).
  */
 
-import { $rightRailActiveTabId } from '@/store/layout'
-import { $previewTabs } from '@/store/preview'
+import { $previewTabs, agentPreviewTabId } from '@/store/preview'
 
 import { type ConsoleDigest, consoleDigest } from './preview-console-digest'
 import { nudgeOverlay } from './preview-nudge'
@@ -80,10 +79,24 @@ function windowText(
   return { ...base, end: to, start: from, text: text.slice(from, to), total_chars: total }
 }
 
-/** Read the ACTIVE preview tab. Null only when no tab is open at all. */
+/**
+ * Read the tab the agent is working in. Null only when no tab is open at all.
+ *
+ * NOT the active tab. Reads used to follow focus, which was right while the
+ * agent had no tab of its own — "what does this page say?" meant the one on
+ * screen. Once it got its own tab that stopped being true and started being
+ * dangerous: `drive_preview` acted on the agent's tab while `read_preview`
+ * answered from whichever tab the user had clicked, so the agent could click
+ * in one page and then read, reason about and report on another, silently.
+ *
+ * `agentPreviewTabId` still falls back to the active tab when the agent owns
+ * none, so the focus-following behaviour survives for exactly the case it was
+ * written for.
+ */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
-  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get()) ?? tabs[0]
+  const tabId = agentPreviewTabId()
+  const tab = tabs.find(t => t.id === tabId) ?? tabs[0]
 
   if (!tab) {
     return null

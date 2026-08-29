@@ -28,7 +28,7 @@
  */
 
 import type { ConsoleEntry } from './preview-console-state'
-import { previewConsoleState } from './preview-console-store'
+import { existingPreviewConsole } from './preview-console-store'
 
 /** Chromium's console levels, as the panel already names them. */
 const LEVEL_NAME: Record<number, string> = { 0: 'log', 1: 'info', 2: 'warn', 3: 'error' }
@@ -36,7 +36,7 @@ const LEVEL_NAME: Record<number, string> = { 0: 'log', 1: 'info', 2: 'warn', 3: 
 /** Cap on messages returned in one digest. A page in a render loop can emit
  *  thousands of identical errors, and this crosses into model context. The
  *  NEWEST are kept: the last error is the one that describes where the page
- *  ended up, and the counts still report the true total. */
+ *  ended up. */
 const MAX_ENTRIES = 60
 
 /** Cap on a single message. Stack traces and serialized objects run long. */
@@ -55,10 +55,16 @@ export interface ConsoleDigestEntry {
 }
 
 export interface ConsoleDigest extends ConsoleCounts {
+  /** True when the console has overflowed its buffer, so `errors`, `warnings`
+   *  and `total` are floors rather than totals — the page logged AT LEAST this
+   *  many. Distinct from `truncated`, which is only about `entries`. */
+  buffer_overflowed: boolean
   entries: ConsoleDigestEntry[]
-  /** True when `entries` is a tail of a longer run. */
+  /** True when `entries` is a tail of what the buffer holds. */
   truncated: boolean
-  /** Everything the console holds, not just errors and warnings. */
+  /** Messages the buffer holds, of every level. NOT the number the page has
+   *  logged: the store keeps a bounded tail, so a page in a render loop reports
+   *  the cap. See `buffer_overflowed`. */
   total: number
 }
 
@@ -76,13 +82,23 @@ function count(logs: readonly ConsoleEntry[]): ConsoleCounts {
 /** Everything the console holds for a tab, shaped for a tool result. Reading
  *  the details also settles the breadcrumb — the agent has now seen them. */
 export function consoleDigest(tabId: string): ConsoleDigest {
-  const state = previewConsoleState(tabId)
+  const state = existingPreviewConsole(tabId)
+
+  if (!state) {
+    return { buffer_overflowed: false, entries: [], errors: 0, total: 0, truncated: false, warnings: 0 }
+  }
+
   const logs = state.$logs.get()
 
   state.drainUnreported()
 
   return {
     ...count(logs),
+    // A page that has overflowed the buffer has logged more than these counts
+    // say, and by an unbounded amount. Reporting `errors: 200` for a page
+    // throwing five thousand times reads as "a few problems" rather than
+    // "this page is on fire", so the overflow is stated rather than implied.
+    buffer_overflowed: state.overflowed(),
     entries: logs.slice(-MAX_ENTRIES).map(log => ({
       level: LEVEL_NAME[log.level] ?? 'log',
       line: log.line,
@@ -98,7 +114,13 @@ export function consoleDigest(tabId: string): ConsoleDigest {
  *  there were none — callers omit the field entirely rather than decorating
  *  every result with a pair of zeroes. */
 export function consoleSince(tabId: string): ConsoleCounts | null {
-  const counts = count(previewConsoleState(tabId).drainUnreported())
+  const state = existingPreviewConsole(tabId)
+
+  if (!state) {
+    return null
+  }
+
+  const counts = count(state.drainUnreported())
 
   return counts.errors === 0 && counts.warnings === 0 ? null : counts
 }

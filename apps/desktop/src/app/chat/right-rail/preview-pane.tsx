@@ -245,7 +245,10 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   /** null = fill the pane, which is what this did before emulation existed. */
   const [viewport, setViewport] = useState<null | Viewport>(null)
   const [viewportScale, setViewportScale] = useState(1)
-  /** Read by the INPUT channel below without re-registering it on every zoom. */
+  /** Read by the INPUT channel below without re-registering it on every zoom.
+   *  Written during render, like `liveUrlRef` below: mirroring it in an effect
+   *  is what the `no-restricted-syntax` rule here forbids, because it lands a
+   *  render late and the channel would scale by the PREVIOUS viewport. */
   const viewportScaleRef = useRef(1)
   viewportScaleRef.current = viewportScale
   const [currentUrl, setCurrentUrl] = useState(target.url)

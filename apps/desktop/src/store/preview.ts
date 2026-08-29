@@ -135,6 +135,11 @@ export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
   decode: decodePreviewTabs,
   // Inline bytes are not restorable. Strip them from images, and skip remote
   // HTML and artifact tabs that cannot render without their in-memory payload.
+  // `agent` is dropped on the way out. Ownership is a claim by the session that
+  // is running, not a property of the tab: persisted, it never expires, and a
+  // tab the user adopted as their own weeks ago would still answer to the next
+  // session's agent — the #93190 clobber, deferred rather than removed. Losing
+  // it across a restart costs one extra tab and cannot cost a page.
   encode: tabs =>
     JSON.stringify(
       tabs.filter(
@@ -143,7 +148,7 @@ export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
           !tab.target.transient &&
           !(tab.target.previewKind === 'html' && tab.target.dataUrl)
       ),
-      (key, value) => (key === 'dataUrl' ? undefined : value)
+      (key, value) => (key === 'agent' || key === 'dataUrl' ? undefined : value)
     )
 })
 
@@ -166,6 +171,11 @@ function activePreviewTab(): PreviewTab | null {
   return resolveActiveTab($previewTabs.get(), $rightRailActiveTabId.get())
 }
 
+/** Which of its own tabs the agent is working in. Module state, not persisted:
+ *  it is a property of the turn in flight, and a restored one would point the
+ *  agent at a tab it has no memory of opening. */
+let agentTabId: null | RightRailTabId = null
+
 /** The tab an AGENT ACTION operates on — clicking, typing, navigating.
  *
  *  Not the active tab. Resolving a write by "what's on screen" means the agent
@@ -175,12 +185,24 @@ function activePreviewTab(): PreviewTab | null {
  *
  *  Falls back to the active tab only when the agent has no tab of its own —
  *  "click the button on this page" about the page you are looking at. READS
- *  keep using the active tab unconditionally: answering "what does this page
- *  say?" about the one on screen is right, and a read cannot damage it. */
+ *  resolve through here too: `read_preview` answering from a different tab than
+ *  `drive_preview` acted on let the agent click one page and report another. */
 export function agentPreviewTabId(): RightRailTabId | null {
   const tabs = $previewTabs.get()
 
-  return (tabs.findLast(tab => isBrowserTab(tab) && tab.agent) ?? resolveActiveTab(tabs, $rightRailActiveTabId.get()))?.id ?? null
+  return (agentTab(tabs) ?? resolveActiveTab(tabs, $rightRailActiveTabId.get()))?.id ?? null
+}
+
+/** The agent's CURRENT tab, or the newest it owns if that one has been closed.
+ *
+ *  Tracked rather than derived: resolving by "the newest agent tab" alone made
+ *  `new_tab` one-way — once the agent opened a second tab, every later action
+ *  went there and the first was unreachable for the rest of the session, since
+ *  no tool selects a browser tab. */
+function agentTab(tabs: PreviewTab[]): PreviewTab | undefined {
+  const current = tabs.find(tab => tab.id === agentTabId && isBrowserTab(tab) && tab.agent)
+
+  return current ?? tabs.findLast(tab => isBrowserTab(tab) && tab.agent)
 }
 
 // A restored active id whose tab didn't survive validation would leave the rail
@@ -383,9 +405,14 @@ function mintBrowserTabId(): RightRailTabId {
  *  agent open resolves against the agent's OWN tab and mints one when it has
  *  none — it browses beside you rather than over you. It still re-uses that
  *  one tab across a task, because a tab per navigation would bury the strip. */
-function browserTabId(tabs: PreviewTab[], source: PreviewRecordSource): RightRailTabId {
+function browserTabId(tabs: PreviewTab[], source: PreviewRecordSource, url?: string): RightRailTabId {
   if (source === 'tool-result') {
-    return tabs.findLast(tab => isBrowserTab(tab) && tab.agent)?.id ?? mintBrowserTabId()
+    // Opening a page one of its own tabs already shows means "go back to that
+    // one" — the only way the agent can re-target a tab, and the reason
+    // `new_tab` is no longer a one-way door.
+    const holding = url ? tabs.find(tab => isBrowserTab(tab) && tab.agent && tab.target.url === url) : undefined
+
+    return (holding ?? agentTab(tabs))?.id ?? mintBrowserTabId()
   }
 
   const active = tabs.find(tab => tab.id === $rightRailActiveTabId.get())
@@ -429,7 +456,7 @@ export function openPreview(
   const id = fresh
     ? mintBrowserTabId()
     : resolved.kind === 'url'
-      ? browserTabId(current, source)
+      ? browserTabId(current, source, resolved.url)
       : previewTabId(resolved)
 
   const index = current.findIndex(tab => tab.id === id)
@@ -438,6 +465,10 @@ export function openPreview(
   // person opening a link in the agent's tab is visiting, not taking it over.
   const owned = current[index]?.agent || (resolved.kind === 'url' && source === 'tool-result')
   const tab: PreviewTab = owned ? { agent: true, id, target: resolved } : { id, target: resolved }
+
+  if (owned) {
+    agentTabId = id
+  }
 
   $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
   selectRightRailTab(id)
@@ -453,7 +484,7 @@ export function openBrowserTab() {
   const tabs = $previewTabs.get()
   const current = tabs.find(tab => tab.id === browserTabId(tabs, 'manual'))
 
-  openPreview(current?.target ?? blankPage())
+  openPreview(current?.target ?? blankPage(), 'manual')
 }
 
 /** Another Browser, always — the strip's "+". */

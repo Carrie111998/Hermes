@@ -16374,10 +16374,17 @@ ipcMain.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
  * Chromium divides INJECTED input coordinates by this same scale — see
  * `src/lib/preview-viewport.ts`, which is where the compensation lives.
  */
-ipcMain.handle('hermes:preview:emulate-device', (_event, payload) => {
+ipcMain.handle('hermes:preview:emulate-device', (event, payload) => {
   const guest = electronWebContents.fromId(Number(payload?.webContentsId))
 
   if (!guest || guest.isDestroyed()) {
+    return false
+  }
+
+  // A renderer may only resize a guest it actually hosts. The id arrives from
+  // the caller, so without this any window could letterbox another window's
+  // preview — or the main renderer itself — by guessing a number.
+  if (guest.hostWebContents?.id !== event.sender.id) {
     return false
   }
 

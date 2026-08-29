@@ -44,8 +44,12 @@ interface BackgroundQueueDrainOptions {
  * seconds — shorter than a gateway bounce or a session resume, so an ordinary
  * hiccup was enough to declare the queue stuck and alarm the user. Backing off
  * gives the common transient time to clear before anyone is interrupted.
+ *
+ * One entry per RETRY, so MAX_AUTO_DRAIN_ATTEMPTS - 1 of them: the last failure
+ * raises the alarm instead of scheduling anything. A fourth entry here would be
+ * dead config that silently ignored every edit made to it.
  */
-const BACKGROUND_DRAIN_RETRY_MS = [1_000, 4_000, 10_000, 20_000]
+const BACKGROUND_DRAIN_RETRY_MS = [1_000, 4_000, 10_000]
 
 /**
  * Drain queued prompts for sessions that are not currently rendered by ChatBar.
@@ -83,6 +87,8 @@ export function useBackgroundQueueDrain({
       return
     }
 
+    // `failures` is 1-based and never reaches MAX_AUTO_DRAIN_ATTEMPTS here, so
+    // the clamp is belt-and-braces against a future caller, not live logic.
     const delay = BACKGROUND_DRAIN_RETRY_MS[Math.min(failures, BACKGROUND_DRAIN_RETRY_MS.length) - 1] ?? 1_000
 
     const timer = window.setTimeout(() => {

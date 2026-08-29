@@ -8,6 +8,9 @@ interface WritableStore<T> {
 }
 
 const DEFAULT_CONSOLE_HEIGHT = 240
+/** How many messages one tab's console keeps. A page in a render loop is
+ *  unbounded; this is not. */
+const MAX_LOGS = 200
 
 export interface ConsoleEntry {
   id: number
@@ -69,6 +72,10 @@ export function createPreviewConsoleState() {
   const $open = atom(false)
   const $selectedLogIds = atom<ReadonlySet<number>>(new Set())
   let nextLogId = 0
+  // Whether anything has ever been dropped off the front. `nextLogId` alone
+  // cannot say: `clear` empties the log without resetting it, so a cleared
+  // console would look overflowed forever.
+  let overflowed = false
   // How much of this console the AGENT has been told about. It lives here
   // rather than beside the reporter because only this store knows when the log
   // restarts: both `clear` and `reset` make every later message new again, and
@@ -83,12 +90,19 @@ export function createPreviewConsoleState() {
     $open,
     $selectedLogIds,
     append(entry: ConsoleEntryInput) {
-      $logs.set([...$logs.get().slice(-199), { ...entry, id: ++nextLogId }])
+      const logs = $logs.get()
+
+      if (logs.length >= MAX_LOGS) {
+        overflowed = true
+      }
+
+      $logs.set([...logs.slice(-(MAX_LOGS - 1)), { ...entry, id: ++nextLogId }])
     },
     clear() {
       $logs.set([])
       $selectedLogIds.set(new Set())
       reportedId = 0
+      overflowed = false
     },
     clearSelection() {
       if ($selectedLogIds.get().size === 0) {
@@ -106,11 +120,15 @@ export function createPreviewConsoleState() {
 
       return fresh
     },
+    /** Whether messages have been dropped off the front, so the counts a caller
+     *  computes over `$logs` are floors rather than totals. */
+    overflowed: () => overflowed,
     reset() {
       nextLogId = 0
       $logs.set([])
       $selectedLogIds.set(new Set())
       reportedId = 0
+      overflowed = false
     },
     setHeight(next: Updater<number>) {
       updateAtom($height, next)

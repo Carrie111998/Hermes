@@ -15,12 +15,19 @@ import { selectRightRailTab } from './layout'
 import {
   $dockedPreviewTabs,
   $previewTabs,
+  agentPreviewTabId,
   closeRightRail,
   decodePreviewTabs,
   newBrowserTab,
   openBrowserTab,
   openPreview
 } from './preview'
+
+/** What the persisted tab list actually looks like on disk — the encoder is
+ *  where ownership is dropped, so a plain JSON.stringify would not see it. */
+function previewTabsStorage(): string {
+  return localStorage.getItem('hermes.desktop.previewTabs.v2') ?? '[]'
+}
 
 const url = (host: string) => ({
   kind: 'url' as const,
@@ -113,31 +120,36 @@ describe('agent browser tabs', () => {
     expect(tabs[0]?.agent).toBeFalsy()
   })
 
-  // Ownership is persisted, and the restore path validates tabs field by
-  // field. If the flag were dropped on the way back in, the agent would come
-  // up after a restart believing it owned nothing — and take the first browser
-  // tab it found, which is the original bug wearing a hat.
-  it('still owns its tab after a restart', () => {
+  // Ownership is a claim by the session that is running, not a property of the
+  // tab. Persisted it would never expire: a tab the user adopted as their own
+  // weeks ago would still answer to a later session's agent — the same clobber,
+  // deferred. Losing it costs one extra tab and cannot cost a page.
+  it('does not carry ownership across a restart', () => {
     openPreview(url('agent.com'), 'tool-result')
-    newBrowserTab()
 
-    const saved = JSON.stringify($previewTabs.get())
-    const restored = decodePreviewTabs(saved)
+    const restored = decodePreviewTabs(previewTabsStorage())
 
-    expect(restored).toHaveLength(2)
-    expect(restored[0]?.agent).toBe(true)
-    expect(restored[1]?.agent).toBeFalsy()
+    expect(restored).toHaveLength(1)
+    expect(restored[0]?.agent).toBeFalsy()
+  })
 
-    // And the rule still holds against the restored list.
-    $previewTabs.set(restored)
-    selectRightRailTab(restored[1]!.id)
-    openPreview(url('after-restart.com'), 'tool-result')
+  // The user's tab, adopted long ago, comes back with no owner — so the next
+  // session's agent opens beside it instead of taking it.
+  it('leaves a restored tab alone and opens its own', () => {
+    openPreview(url('mine.com'), 'tool-result')
+    $previewTabs.set(decodePreviewTabs(previewTabsStorage()))
+
+    const mine = $previewTabs.get()[0]
+
+    expect(mine?.agent).toBeFalsy()
+    selectRightRailTab(mine!.id)
+    openPreview(url('agent-next.com'), 'tool-result')
 
     const tabs = $previewTabs.get()
 
     expect(tabs).toHaveLength(2)
-    expect(tabs[0]?.target.url).toBe('https://after-restart.com')
-    expect(tabs[1]?.target.url).toBe('about:blank')
+    expect(tabs[0]?.target.url).toBe('https://mine.com')
+    expect(tabs[1]?.target.url).toBe('https://agent-next.com')
   })
 
   // Two pages side by side — comparing them, or holding a reference open.
@@ -150,6 +162,28 @@ describe('agent browser tabs', () => {
     expect(tabs).toHaveLength(2)
     expect(tabs.map(tab => tab.target.url)).toEqual(['https://first.com', 'https://second.com'])
     expect(tabs.every(tab => tab.agent)).toBe(true)
+  })
+
+  // Without a way back, new_tab is a one-way door: every later action goes to
+  // the newest tab and the first is unreachable, since no tool selects one.
+  // Re-opening a page it already holds is that way back.
+  it('returns to an earlier tab by opening the page it holds', () => {
+    openPreview(url('docs.com'), 'tool-result')
+    openPreview(url('app.com'), 'tool-result', { newTab: true })
+
+    openPreview(url('docs.com'), 'tool-result')
+
+    expect($previewTabs.get()).toHaveLength(2)
+    expect(agentPreviewTabId()).toBe($previewTabs.get()[0]?.id)
+
+    // And work now lands there rather than in the newest tab.
+    openPreview(url('docs.com/page2'), 'tool-result')
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(2)
+    expect(tabs[0]?.target.url).toBe('https://docs.com/page2')
+    expect(tabs[1]?.target.url).toBe('https://app.com')
   })
 
   // Having asked for a second, plain opens must land in it rather than

@@ -92,7 +92,7 @@ describe('consoleDigest', () => {
   })
 
   // A render loop emits thousands of identical errors; the newest describe
-  // where the page actually ended up, and the counts stay honest.
+  // where the page actually ended up.
   it('keeps the newest when a page floods, and says it truncated', () => {
     for (let i = 0; i < 200; i += 1) {
       log(ERROR, `boom ${i}`)
@@ -103,9 +103,62 @@ describe('consoleDigest', () => {
     expect(digest.truncated).toBe(true)
     expect(digest.entries).toHaveLength(60)
     expect(digest.entries.at(-1)?.message).toBe('boom 199')
-    // The store itself keeps a bounded tail, so `total` is that, not 200 —
-    // what matters is that it reports the run it actually holds.
-    expect(digest.total).toBe(digest.entries.length + (digest.truncated ? digest.total - 60 : 0))
+    // The buffer holds 200, so that is what `total` and the counts report.
+    expect(digest.total).toBe(200)
+    expect(digest.errors).toBe(200)
+  })
+
+  // The counts are computed over a bounded buffer. Reporting 200 for a page
+  // that threw five thousand times reads as "a few problems" rather than
+  // "this page is on fire", so overflow has to be stated, not implied.
+  it('admits when the counts are floors, not totals', () => {
+    for (let i = 0; i < 199; i += 1) {
+      log(ERROR, `boom ${i}`)
+    }
+
+    expect(consoleDigest(id).buffer_overflowed).toBe(false)
+
+    for (let i = 0; i < 5_000; i += 1) {
+      log(ERROR, `flood ${i}`)
+    }
+
+    const digest = consoleDigest(id)
+
+    expect(digest.buffer_overflowed).toBe(true)
+    // Still 200 — the point is that the flag says so rather than the number.
+    expect(digest.errors).toBe(200)
+    expect(digest.entries.at(-1)?.message).toBe('flood 4999')
+  })
+
+  // Clearing empties the log without resetting the id counter, so an overflow
+  // flag derived from ids alone would stick forever.
+  it('stops claiming overflow once the console is cleared', () => {
+    for (let i = 0; i < 5_000; i += 1) {
+      log(ERROR, `boom ${i}`)
+    }
+
+    expect(consoleDigest(id).buffer_overflowed).toBe(true)
+
+    previewConsoleState(id).clear()
+    log(ERROR, 'fresh')
+
+    expect(consoleDigest(id).buffer_overflowed).toBe(false)
+  })
+
+  // The digest is asked about whatever tab the agent resolved to, which can be
+  // a file tab or an artifact. Answering must not leave a store behind.
+  it('answers empty for a tab with no console, without creating one', () => {
+    const digest = consoleDigest('file:/nowhere.ts')
+
+    expect(digest).toEqual({
+      buffer_overflowed: false,
+      entries: [],
+      errors: 0,
+      total: 0,
+      truncated: false,
+      warnings: 0
+    })
+    expect(consoleSince('file:/nowhere.ts')).toBeNull()
   })
 
   it('clamps a single runaway message', () => {

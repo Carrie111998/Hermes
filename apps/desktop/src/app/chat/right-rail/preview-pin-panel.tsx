@@ -144,8 +144,6 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
 
     if (!sending.length) {return}
 
-    let delivered = 0
-
     /**
      * Put the chip where the composer actually is.
      *
@@ -155,19 +153,27 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
      * composer, and the chip belongs in THAT one: relaying from there would
      * hand it to the primary window, which is not the window the user is
      * looking at.
+     *
+     * Posts immediately and hands back the acknowledgement to await LATER.
+     * Awaiting each one here instead cost a full relay timeout per attachment
+     * — a review with eight pictures spent nearly four seconds deciding it had
+     * failed. Order is unaffected: the posts still leave in call order, and a
+     * BroadcastChannel delivers them in that order.
      */
-    const deliver = async (attachment: Parameters<typeof addComposerAttachment>[0]) => {
+    const acks: Promise<boolean>[] = []
+
+    const deliver = (attachment: Parameters<typeof addComposerAttachment>[0]) => {
       if (isBrowserWindow()) {
-        if (await relayComposerAttachment(attachment)) {delivered += 1}
+        acks.push(relayComposerAttachment(attachment))
 
         return
       }
 
       addComposerAttachment(attachment)
-      delivered += 1
+      acks.push(Promise.resolve(true))
     }
 
-    await deliver({
+    deliver({
       detail: JSON.stringify(sending),
       // Derived from the pins alone: once a batch spans pages, no single url
       // identifies it.
@@ -195,7 +201,7 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
 
         if (!path) {continue}
 
-        await deliver({
+        deliver({
           detail: path,
           id: `pin-image:${shot.id}`,
           kind: 'image',
@@ -211,6 +217,8 @@ export function PreviewPinPanel({ open, url }: { open: boolean; url: string }) {
         continue
       }
     }
+
+    const delivered = (await Promise.all(acks)).filter(Boolean).length
 
     // Say so either way. The chip lands in a composer that may be scrolled out
     // of sight or in another window entirely, and a button that looks inert is
