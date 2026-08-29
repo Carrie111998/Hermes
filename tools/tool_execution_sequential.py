@@ -558,7 +558,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 ))
                 _ce_result = function_result
             except Exception as tool_error:
-                function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
+                function_result = json.dumps({
+                    "error": (
+                        f"Context engine tool '{function_name}' failed: "
+                        f"{sanitize_exception_for_sink(tool_error)}"
+                    )
+                })
                 logger.error(
                     "context_engine.handle_tool_call raised for %s: %s",
                     function_name,
@@ -601,7 +606,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 ))
                 _mem_result = function_result
             except Exception as tool_error:
-                function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
+                function_result = json.dumps({
+                    "error": (
+                        f"Memory tool '{function_name}' failed: "
+                        f"{sanitize_exception_for_sink(tool_error)}"
+                    )
+                })
                 logger.error(
                     "memory_manager.handle_tool_call raised for %s: %s",
                     function_name,
@@ -699,7 +709,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
+                function_result = (
+                    f"Error executing tool '{function_name}': "
+                    f"{sanitize_exception_for_sink(tool_error)}"
+                )
                 logger.error(
                     "handle_function_call raised for %s: %s",
                     function_name,
@@ -785,7 +798,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
+                function_result = (
+                    f"Error executing tool '{function_name}': "
+                    f"{sanitize_exception_for_sink(tool_error)}"
+                )
                 logger.error(
                     "handle_function_call raised for %s: %s",
                     function_name,
@@ -860,7 +876,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name, function_args, function_result, _is_error_result,
                 )
             except Exception as _ver_err:
-                logging.debug("file-mutation verifier record failed: %s", _ver_err)
+                logging.debug(
+                    "file-mutation verifier record failed: %s",
+                    sanitize_exception_for_sink(_ver_err),
+                )
 
         agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""
@@ -917,7 +936,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     result=display_function_result,
                 )
             except Exception as cb_err:
-                logging.debug("Tool progress callback error: %s", cb_err)
+                logging.debug(
+                    "Tool progress callback error: %s",
+                    sanitize_exception_for_sink(cb_err),
+                )
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:
@@ -932,7 +954,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     display_function_result,
                 )
             except Exception as cb_err:
-                logging.debug("Tool complete callback error: %s", cb_err)
+                logging.debug(
+                    "Tool complete callback error: %s",
+                    sanitize_exception_for_sink(cb_err),
+                )
 
         if (
             risk_metadata is not None
@@ -949,7 +974,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     risk_metadata=risk_metadata,
                 )
             except Exception as cb_err:
-                logging.debug("Tool output risk callback error: %s", cb_err)
+                logging.debug(
+                    "Tool output risk callback error: %s",
+                    sanitize_exception_for_sink(cb_err),
+                )
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:

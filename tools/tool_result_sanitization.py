@@ -55,6 +55,42 @@ def _safe_type_name(value: Any) -> str:
     return name if isinstance(name, str) and name else "object"
 
 
+def sanitize_exception_for_sink(error: BaseException) -> str:
+    """Return safe exception diagnostics without exposing exception text.
+
+    Exception messages can contain tool output, credentials, URLs, or request
+    bodies, and logging's ``exc_info`` would reintroduce that text even when
+    the log message itself was sanitized. Preserve only stable diagnostic
+    classes and bounded numeric status fields so operators retain useful
+    failure classification without receiving attacker-controlled bytes.
+    """
+    classes: list[str] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(classes) < 8:
+        seen.add(id(current))
+        classes.append(_safe_type_name(current))
+        try:
+            cause = current.__cause__
+            if cause is None and not current.__suppress_context__:
+                cause = current.__context__
+        except Exception:
+            cause = None
+        current = cause
+
+    if not classes:
+        classes.append(_safe_type_name(error))
+    diagnostics = ["exception=" + " <- ".join(classes)]
+    for attr in ("errno", "status_code", "code"):
+        try:
+            value = getattr(error, attr, None)
+        except Exception:
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool):
+            diagnostics.append(f"{attr}={value}")
+    return " ".join(diagnostics)
+
+
 def _safe_key(value: Any) -> str:
     """Convert a mapping key without allowing hostile ``__str__`` to escape."""
     if isinstance(value, str):

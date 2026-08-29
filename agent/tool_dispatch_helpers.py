@@ -37,7 +37,10 @@ from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
 from tools.threat_patterns import scan_for_threats
-from tools.tool_result_sanitization import sanitize_tool_result_for_sink
+from tools.tool_result_sanitization import (
+    sanitize_exception_for_sink,
+    sanitize_tool_result_for_sink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -634,7 +637,11 @@ def make_tool_result_message(
     try:
         risk_metadata = _tool_output_risk_metadata(name, content)
     except Exception as exc:
-        logger.debug("Tool output risk scan failed for %s: %s", name, exc)
+        logger.debug(
+            "Tool output risk scan failed for %s: %s",
+            name,
+            sanitize_exception_for_sink(exc),
+        )
     else:
         if risk_metadata is not None:
             message["_tool_output_risk"] = risk_metadata
