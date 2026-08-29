@@ -4813,9 +4813,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         Splits the region into ``_LEAN_DIGEST_CHUNK_CHARS`` chunks (capped at
         ``_LEAN_DIGEST_MAX_CHUNKS`` — beyond that, earliest chunks are merged
         coarser) and digests each with the compression LLM. Any chunk failure
-        degrades to a placeholder naming the message range; the whole call
-        never raises. Chunks run sequentially on the same transport as the
-        main summary.
+        degrades to a placeholder naming the message range. Explicit attempt
+        cancellation still propagates to the host. Chunks run sequentially on
+        the same transport as the main summary.
         """
         text = _serialize_turns_for_digest(
             turns, getattr(self, "_lean_pristine_tools", None),
@@ -4842,7 +4842,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if not _start_compression_provider_call():
                 logger.info(
                     "Stopping lean chunk digests after %d/%d segment(s): "
-                    "compression attempt provider budget cancelled or exhausted",
+                    "compression attempt provider budget exhausted",
                     ci,
                     n_chunks,
                 )
