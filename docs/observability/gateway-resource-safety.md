@@ -26,6 +26,11 @@ Admission uses the tighter of host `MemAvailable` and finite gateway-cgroup
 headroom (`MemoryMax - MemoryCurrent`). Structured admission logs expose both
 witnesses and the effective value used for the decision.
 
+The persisted top-level `active_agents` count and graceful shutdown drain
+include normal chat turns, API runs, cron jobs, and admitted `/background`
+agents. Do not treat a host as drained using process counts alone; require both
+`active_agents: 0` and `admission.queued_tasks: 0` from the runtime snapshot.
+
 Correlate the timestamp with both service and kernel evidence:
 
 ```bash
@@ -102,12 +107,30 @@ The repository stress command is deliberately capped (`<=12` workers, `<=6`
 parallel, `<=64 MiB` per worker, `<=15s`) and does not contact Telegram:
 
 ```bash
-python3 scripts/stress_gateway_admission.py --workers 4 --parallel 2 --memory-mb 16 --seconds 1
+python3 scripts/stress_gateway_admission.py \
+  --workers 6 --parallel 3 --memory-mb 16 --seconds 1 --crash-worker 1
 ```
 
 Pass requires `peak_active <= parallel_limit`, at least one queue notice when
-workers exceed the limit, no subprocess failures, and the parent/gateway test
-process surviving.
+workers exceed the limit, exactly one expected worker crash, the queued work
+resuming and draining, no unexpected subprocess failures, and the
+parent/control-plane test process surviving.
+
+On a cgroups-v2 VM, run the separately bounded worker-boundary proof only when
+the gateway is active and host `MemAvailable` is comfortably above 1 GiB:
+
+```bash
+sudo -u hermes-runtime /usr/bin/python3 \
+  scripts/stress_gateway_worker_scope.py \
+  --backend system --memory-max-mb 16 --allocation-mb 64
+```
+
+The script refuses a worker limit below 16 or above 64 MiB, or an allocation
+above 128 MiB. It stops only its unique disposable scope if the proof times out
+or the child unexpectedly survives.
+Pass requires an OOM/SIGKILL only in the disposable worker scope and an
+unchanged active gateway PID and restart count. It never stops, restarts, or
+changes the gateway service.
 
 ## Rollout and rollback
 

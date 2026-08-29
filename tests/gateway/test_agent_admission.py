@@ -194,6 +194,49 @@ async def test_async_and_scheduler_surfaces_share_one_global_limit():
         clear_gateway_admission(controller)
 
 
+@pytest.mark.asyncio
+async def test_background_surface_reports_queue_and_resumes_without_prompt_leak():
+    controller = AgentAdmissionController(
+        max_parallel=1, queue_limit=2, poll_interval_seconds=0.01
+    )
+    install_gateway_admission(controller, asyncio.get_running_loop())
+    await controller.acquire("existing")
+    notices: list[tuple[str, str, str]] = []
+
+    class BackgroundSurface:
+        async def queue_notice(self, message: str, *, source: str, task_id: str):
+            notices.append((source, task_id, message))
+
+        @gateway_admitted_async(
+            "background",
+            id_kwargs=("task_id",),
+            queued_notice_method="queue_notice",
+            queued_notice_kwargs=("source", "task_id"),
+        )
+        async def run(self, prompt: str, source: str, task_id: str):
+            return prompt
+
+    try:
+        queued = asyncio.create_task(
+            BackgroundSurface().run("private prompt", "telegram:123", "bg-safe")
+        )
+        await asyncio.sleep(0.03)
+        assert notices == [
+            (
+                "telegram:123",
+                "bg-safe",
+                "Queued: system at parallel-agent capacity (1/1); position 1.",
+            )
+        ]
+        assert "private prompt" not in " ".join(controller.snapshot().queued_task_ids)
+
+        await controller.release("existing")
+        assert await asyncio.wait_for(queued, timeout=0.2) == "private prompt"
+        assert controller.snapshot().active == 0
+    finally:
+        clear_gateway_admission(controller)
+
+
 def test_all_gateway_agent_entry_points_declare_global_admission():
     from cron.scheduler import run_job
     from gateway.platforms.api_server import APIServerAdapter

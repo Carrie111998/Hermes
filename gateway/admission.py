@@ -81,8 +81,16 @@ def gateway_admitted_async(
     prefix: str,
     *,
     id_kwargs: tuple[str, ...],
+    queued_notice_method: Optional[str] = None,
+    queued_notice_kwargs: tuple[str, ...] = (),
 ):
-    """Decorate an async gateway agent entry point with global admission."""
+    """Decorate an async gateway agent entry point with global admission.
+
+    ``queued_notice_method`` names an async method on the decorated object's
+    first (``self``) argument.  Only the explicitly named context arguments
+    are forwarded, which prevents prompts or other sensitive call arguments
+    from leaking into queue-status delivery.
+    """
     def decorate(func):
         signature = inspect.signature(func)
 
@@ -92,7 +100,22 @@ def gateway_admitted_async(
             if controller is None:
                 return await func(*args, **kwargs)
             task_id = _decorated_task_id(prefix, id_kwargs, signature, args, kwargs)
-            await controller.acquire(task_id)
+            on_queued = None
+            if queued_notice_method:
+                bound = signature.bind_partial(*args, **kwargs)
+                instance = bound.arguments.get("self")
+                handler = getattr(instance, queued_notice_method)
+                context = {
+                    name: bound.arguments.get(name)
+                    for name in queued_notice_kwargs
+                }
+
+                async def on_queued(message: str) -> None:
+                    result = handler(message, **context)
+                    if inspect.isawaitable(result):
+                        await result
+
+            await controller.acquire(task_id, on_queued=on_queued)
             outcome = "finished"
             try:
                 return await func(*args, **kwargs)
