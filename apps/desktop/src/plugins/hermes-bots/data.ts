@@ -7,8 +7,15 @@
  */
 
 import { atom, host, queryClient, useQuery, useValue } from '@hermes/plugin-sdk'
+import type { PluginContext } from '@hermes/plugin-sdk'
 
 import { displayName } from './labels'
+import {
+  EMPTY_ROSTER_SNAPSHOT,
+  normalizeRosterSnapshot,
+  ROSTER_SNAPSHOT_KEY,
+  updateRosterSnapshot
+} from './roster-snapshot'
 import {
   aliasIdentityFor,
   beginAliasRouteIndex,
@@ -38,6 +45,8 @@ export const ROSTER_KEY = [ID, 'roster']
 // flap) leaves the Bots sidebar on a spinner with no error card. The 5s
 // refetchInterval and the gateway-open effect already recover drops.
 const ROSTER_QUERY_RETRY = 2
+const ROSTER_VISIBLE_REFRESH_MS = 5000
+const ROSTER_BACKGROUND_REFRESH_MS = 30000
 
 export const BOT_META_V1_KEY = 'bot-meta'
 const BOT_META_V2_KEY = 'bot-meta-v2'
@@ -48,6 +57,10 @@ const migratedLocalRoutes = new Map<string, ProfileRoute>()
 
 /** Live roster snapshot for imperative handlers (context menus). */
 export const $lastRoster = atom<RosterRow[]>([])
+let rosterSnapshotCache = EMPTY_ROSTER_SNAPSHOT
+let rosterSnapshotCommit = Promise.resolve()
+let rosterSnapshotReady = Promise.resolve(false)
+const coldRosterConnections = new Set<string>()
 
 // ── needs-attention badge (#93091 item 3) ───────────────────────────────────
 // Attention-worthy failure classes — matches the #93091 item-1 reason-code
@@ -603,11 +616,13 @@ export let serverInjectsProtocol = false
  *  multi-source merge and the roster query stamp on afterwards. Not in
  *  types.ts: this is the query-cache envelope around RosterRow, not a domain
  *  object. */
-interface RosterSnapshot {
+export interface RosterSnapshot {
   /** Newer backends inject the teammate protocol into the system prompt. */
   bot_mode_protocol?: boolean
   /** Time the request was ISSUED, the conservative bound mergeServerMeta wants. */
   fetchedAt?: number
+  /** Presentation-only data that must be replaced by the rich gateway answer. */
+  partial?: boolean
   primaryConnectionId?: string
   profiles?: RosterRow[]
   sources?: GatewaySource[]
@@ -631,11 +646,141 @@ interface UnionRoster {
   sources?: GatewaySource[]
 }
 
-export function useRoster() {
+export function rosterRefreshInterval(paneVisible: boolean): number {
+  return paneVisible ? ROSTER_VISIBLE_REFRESH_MS : ROSTER_BACKGROUND_REFRESH_MS
+}
+
+function publishPartialRoster(queryKey: unknown[], snapshot: RosterSnapshot): boolean {
+  if (!Array.isArray(snapshot.profiles)) {
+    return false
+  }
+
+  const current = queryClient.getQueryData<RosterSnapshot>(queryKey)
+
+  if (current && current.partial !== true) {
+    return false
+  }
+
+  if (current?.partial && Number(current.fetchedAt || 0) >= Number(snapshot.fetchedAt || 0)) {
+    return false
+  }
+
+  queryClient.setQueryData(queryKey, snapshot)
+
+  return true
+}
+
+export function publishColdRosterSnapshot(queryKey: unknown[], response: RosterSnapshot, fetchedAt: number): boolean {
+  return publishPartialRoster(queryKey, {
+    ...(response && typeof response === 'object' ? response : {}),
+    fetchedAt,
+    partial: true
+  })
+}
+
+export async function publishColdRosterOnce(
+  activeBot: Partial<RosterRow>,
+  activeConnectionId: unknown,
+  queryKey: unknown[],
+  fetchedAt: number,
+  request: (bot: Partial<RosterRow>, method: string, params: Record<string, unknown>) => Promise<RosterSnapshot> = (
+    bot,
+    method,
+    params
+  ) => requestForBot<RosterSnapshot>(bot, method, params)
+): Promise<boolean> {
+  const connectionId = String(activeConnectionId || 'local').trim() || 'local'
+
+  if (coldRosterConnections.has(connectionId)) {
+    return false
+  }
+
+  coldRosterConnections.add(connectionId)
+
+  try {
+    const light = await request(activeBot, 'profiles.list', { include_sessions: false })
+    serverInjectsProtocol = Boolean(light?.bot_mode_protocol)
+
+    return publishColdRosterSnapshot(queryKey, light, fetchedAt)
+  } catch {
+    // The rich request owns retries and the terminal error state.
+    return false
+  }
+}
+
+/** Restore every connection-scoped snapshot into the query cache. Mark each
+ *  entry stale immediately so the live rich request still starts on mount. */
+export function hydrateRosterSnapshot(storage: PluginContext['storage'] | undefined = getPluginCtx()?.storage) {
+  const hydration = Promise.resolve()
+    .then(() => storage?.get(ROSTER_SNAPSHOT_KEY, null))
+    .then(stored => {
+      rosterSnapshotCache = normalizeRosterSnapshot(stored)
+      let restored = false
+
+      for (const [connectionId, entry] of Object.entries(rosterSnapshotCache.entries)) {
+        const queryKey = [...ROSTER_KEY, connectionId]
+
+        const published = publishPartialRoster(queryKey, {
+          ...entry,
+          partial: true
+        })
+
+        if (published) {
+          restored = true
+          void queryClient.invalidateQueries({ exact: true, queryKey, refetchType: 'none' })
+        }
+      }
+
+      return restored
+    })
+    .catch(() => false)
+
+  rosterSnapshotReady = hydration
+
+  return hydration
+}
+
+export function persistRosterSnapshot(
+  connectionId: unknown,
+  profiles: unknown,
+  sources: unknown,
+  fetchedAt: unknown,
+  storage: PluginContext['storage'] | undefined = getPluginCtx()?.storage
+): Promise<boolean> {
+  if (!storage) {
+    return Promise.resolve(false)
+  }
+
+  const commit = rosterSnapshotCommit
+    .then(() => rosterSnapshotReady)
+    .then(async () => {
+      const next = updateRosterSnapshot(rosterSnapshotCache, connectionId, profiles, sources, fetchedAt)
+
+      if (next === rosterSnapshotCache) {
+        return false
+      }
+
+      rosterSnapshotCache = next
+      await Promise.resolve(storage.set(ROSTER_SNAPSHOT_KEY, rosterSnapshotCache))
+
+      return true
+    })
+
+  rosterSnapshotCommit = commit.then(
+    () => undefined,
+    () => undefined
+  )
+
+  return commit.catch(() => false)
+}
+
+export function useRoster(paneVisible = true) {
   const activeConnectionId = useValue(host.state.connectionId)
+  const rosterConnectionId = String(activeConnectionId || host.activeConnectionId?.() || 'local').trim() || 'local'
+  const queryKey = [...ROSTER_KEY, rosterConnectionId]
 
   return useQuery({
-    queryKey: [...ROSTER_KEY, activeConnectionId],
+    queryKey,
     queryFn: async () => {
       // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
       // against each bot's last local meta write, and a fetch issued before
@@ -652,15 +797,16 @@ export function useRoster() {
       // keep its configured friendly identity after activation (#89131).
       // Best-effort and feature-detected — a failed read keeps the last
       // good index rather than dropping identities mid-session.
-      if (typeof host.profileRoutes === 'function') {
-        const epoch = beginAliasRouteIndex()
+      const aliasRoutes =
+        typeof host.profileRoutes === 'function'
+          ? (() => {
+              const epoch = beginAliasRouteIndex()
 
-        try {
-          indexAliasRoutes(await host.profileRoutes(), epoch)
-        } catch {
-          /* keep the previous alias index */
-        }
-      }
+              return Promise.resolve(host.profileRoutes())
+                .then(routes => indexAliasRoutes(routes, epoch))
+                .catch(() => undefined)
+            })()
+          : Promise.resolve()
 
       // Owner routing is ambient in the SDK now (post-#92731): requestForBot
       // resolves the active owner itself, no captured route needed here.
@@ -668,7 +814,10 @@ export function useRoster() {
         name: String(host.state.profile?.get?.() || 'default').trim() || 'default'
       }
 
-      const local = await requestForBot<RosterSnapshot>(activeBot, 'profiles.list', {})
+      // Start the lightweight and rich reads together. The lightweight result
+      // can paint first, but it is never allowed to overwrite a rich answer.
+      void publishColdRosterOnce(activeBot, rosterConnectionId, queryKey, issuedAt)
+      const [local] = await Promise.all([requestForBot<RosterSnapshot>(activeBot, 'profiles.list', {}), aliasRoutes])
       // Newer backends inject the teammate-messaging protocol into every
       // session's system prompt (agent.bot_mode_protocol) — SOUL.md must not
       // carry a second copy. Older gateways lack the flag: keep appending.
@@ -686,24 +835,32 @@ export function useRoster() {
           const merged = mergeMultiSourceRoster(local, union, activeConnectionId, previous)
           const sources = Array.isArray(union?.sources) ? union.sources : []
 
-          return {
+          const snapshot = {
             ...merged,
             profiles: (merged?.profiles || []).map(row => annotateBotSource(row, sources)),
             sources,
             fetchedAt: issuedAt
           }
+
+          void persistRosterSnapshot(rosterConnectionId, snapshot.profiles, snapshot.sources, snapshot.fetchedAt)
+
+          return snapshot
         } catch {
           /* older build or roster failure — single-source list stands */
         }
       }
 
-      return {
+      const snapshot = {
         ...(local && typeof local === 'object' ? local : {}),
         fetchedAt: issuedAt
       }
+
+      void persistRosterSnapshot(rosterConnectionId, snapshot.profiles, snapshot.sources, snapshot.fetchedAt)
+
+      return snapshot
     },
-    refetchInterval: 5000,
-    staleTime: 5000,
+    refetchInterval: rosterRefreshInterval(paneVisible),
+    staleTime: rosterRefreshInterval(paneVisible),
     retry: ROSTER_QUERY_RETRY,
     retryDelay: attempt => Math.min(15000, 1000 * 2 ** attempt)
   })

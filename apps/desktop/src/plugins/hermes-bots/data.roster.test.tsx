@@ -21,21 +21,22 @@
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { renderHook, waitFor } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $lastRoster, useRoster } from './data'
 import type { RosterRow } from './types'
 
-const { hostMock } = vi.hoisted(() => ({
+const { hostMock, queryBridge } = vi.hoisted(() => ({
   hostMock: {
     agents: vi.fn(),
     profileRoutes: undefined as unknown,
     request: vi.fn(),
     requestProfile: vi.fn(),
     state: { connectionId: { get: vi.fn(() => 'local') }, profile: { get: () => 'default' } }
-  }
+  },
+  queryBridge: { client: null as null | QueryClient }
 }))
 
 vi.mock('@hermes/plugin-sdk', async () => {
@@ -45,7 +46,11 @@ vi.mock('@hermes/plugin-sdk', async () => {
   return {
     atom,
     host: hostMock,
-    queryClient: { getQueryData: vi.fn(), invalidateQueries: vi.fn() },
+    queryClient: {
+      getQueryData: (key: unknown[]) => queryBridge.client?.getQueryData(key),
+      invalidateQueries: (filters: object) => queryBridge.client?.invalidateQueries(filters),
+      setQueryData: (key: unknown[], value: unknown) => queryBridge.client?.setQueryData(key, value)
+    },
     useQuery,
     useValue: (store: { get: () => unknown }) => store.get()
   }
@@ -90,6 +95,7 @@ async function mergedRoster(
   }
 
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  queryBridge.client = client
 
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -106,6 +112,7 @@ const identities = (rows: RowFixture[]) => rows.map(row => `${row.connectionId}:
 
 beforeEach(() => {
   vi.clearAllMocks()
+  queryBridge.client = null
   $lastRoster.set([])
 })
 
@@ -574,6 +581,46 @@ describe('connect-on-demand sources', () => {
   })
 })
 
+describe('progressive roster hydration', () => {
+  it('publishes lightweight rows while the rich session scan is still pending', async () => {
+    hostMock.state.connectionId.get.mockReturnValue('progressive-test')
+    let resolveRich: ((value: { profiles: RowFixture[] }) => void) | undefined
+
+    const rich = new Promise<{ profiles: RowFixture[] }>(resolve => {
+      resolveRich = resolve
+    })
+
+    hostMock.request.mockImplementation((_method: string, params: Record<string, unknown>) => {
+      if (params.include_sessions === false) {
+        return Promise.resolve({ profiles: [{ display_name: 'Writer', name: 'writer' }] })
+      }
+
+      return rich
+    })
+    hostMock.agents.mockRejectedValue(new Error('no union roster on this build'))
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    queryBridge.client = client
+
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+
+    const { result } = renderHook(() => useRoster(), { wrapper })
+
+    await waitFor(() => expect(result.current.data).toMatchObject({ partial: true }))
+    expect(result.current.data?.profiles).toEqual([{ display_name: 'Writer', name: 'writer' }])
+
+    await act(async () => {
+      resolveRich?.({ profiles: [{ canonical_session: { id: 'live' }, name: 'writer' }] })
+    })
+    await waitFor(() => expect(result.current.data?.partial).not.toBe(true))
+    expect(result.current.data?.profiles?.[0]?.canonical_session?.id).toBe('live')
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.list', { include_sessions: false })
+    expect(hostMock.request).toHaveBeenCalledWith('profiles.list', {})
+  })
+})
+
 describe('a stalled profiles.list cannot pin the spinner forever', () => {
   it('gives up after bounded retries and surfaces the error', async () => {
     // `retry: true` keeps React Query in isLoading until the first success, so
@@ -584,6 +631,7 @@ describe('a stalled profiles.list cannot pin the spinner forever', () => {
     hostMock.request.mockRejectedValue(new Error('state.db is locked'))
 
     const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } })
+    queryBridge.client = client
 
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>

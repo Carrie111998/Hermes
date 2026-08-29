@@ -85,3 +85,108 @@ describe('cachedUnionRoster', () => {
     expect(cachedUnionRoster()).toBeNull()
   })
 })
+
+describe('progressive roster cache', () => {
+  it('hydrates bounded connection-scoped rows without a gateway request', async () => {
+    const { hydrateRosterSnapshot } = await import('./data')
+
+    const stored = {
+      entries: {
+        local: {
+          fetchedAt: 1234,
+          profiles: [
+            {
+              canonical_session: { id: 'must-not-survive' },
+              display_name: 'Writer',
+              last_session: { preview: 'private text' },
+              name: 'writer'
+            }
+          ],
+          sources: [{ connectionId: 'local', kind: 'local', label: 'This device', reachable: true }]
+        }
+      },
+      version: 1
+    }
+
+    const set = vi.fn()
+
+    const storage = {
+      get<T>(_key: string, _fallback: T): T {
+        return stored as T
+      },
+      remove: vi.fn(),
+      set
+    }
+
+    await expect(hydrateRosterSnapshot(storage)).resolves.toBe(true)
+    expect(cache.get(JSON.stringify(['hermes-bots', 'roster', 'local']))?.value).toEqual({
+      fetchedAt: 1234,
+      partial: true,
+      profiles: [{ display_name: 'Writer', name: 'writer' }],
+      sources: [{ connectionId: 'local', kind: 'local', label: 'This device', reachable: true }]
+    })
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('never lets a late lightweight response overwrite rich roster data', async () => {
+    const { publishColdRosterSnapshot } = await import('./data')
+    const key = ['hermes-bots', 'roster', 'local']
+    const rich = { fetchedAt: 2000, profiles: [{ canonical_session: { id: 'live' }, name: 'writer' }] }
+
+    seed(key, rich)
+
+    expect(publishColdRosterSnapshot(key, { profiles: [{ name: 'stale' }] }, 3000)).toBe(false)
+    expect(cache.get(JSON.stringify(key))?.value).toBe(rich)
+  })
+
+  it('persists sanitized rows after hydration has settled', async () => {
+    const { persistRosterSnapshot } = await import('./data')
+    const writes: Array<{ key: string; value: unknown }> = []
+
+    const storage = {
+      get<T>(_key: string, fallback: T): T {
+        return fallback
+      },
+      remove: vi.fn(),
+      set: vi.fn((key: string, value: unknown) => {
+        writes.push({ key, value })
+      })
+    }
+
+    await expect(
+      persistRosterSnapshot(
+        'remote-a',
+        [
+          {
+            canonical_session: { id: 'must-not-persist', preview: 'private text' },
+            connectionId: 'remote-a',
+            name: 'writer'
+          }
+        ],
+        [],
+        4321,
+        storage
+      )
+    ).resolves.toBe(true)
+
+    expect(writes.at(-1)?.key).toBe('roster-snapshot-v1')
+    expect(writes.at(-1)?.value).toMatchObject({
+      entries: {
+        'remote-a': {
+          fetchedAt: 4321,
+          profiles: [{ connectionId: 'remote-a', name: 'writer' }]
+        }
+      },
+      version: 1
+    })
+    expect(JSON.stringify(writes.at(-1)?.value)).not.toContain('must-not-persist')
+    expect(JSON.stringify(writes.at(-1)?.value)).not.toContain('private text')
+  })
+
+  it('uses a slower rich-roster interval while the pane is hidden', async () => {
+    const { rosterRefreshInterval } = await import('./data')
+
+    expect(rosterRefreshInterval(true)).toBe(5000)
+    expect(rosterRefreshInterval(false)).toBe(30000)
+  })
+})

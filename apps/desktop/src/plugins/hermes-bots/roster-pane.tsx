@@ -240,7 +240,8 @@ interface RosterGroupRow {
 export function BotsPane() {
   const { t } = useI18n()
   const b = useBots()
-  const { data, error, isLoading, refetch } = useRoster()
+  const paneVisible = useValue($botsPaneVisible)
+  const { data, error, isLoading, refetch } = useRoster(paneVisible)
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
@@ -483,10 +484,15 @@ export function BotsPane() {
       $lastSources.set(data.sources)
     }
 
-    mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
-    pullServerAvatars(activeSourceRoster)
-    trackInboundActivity(roster)
-    backfillMessagingProtocol(activeSourceRoster)
+    // Cached and lightweight rows are presentation-only. They deliberately
+    // omit ui_meta, session activity and other server-owned fields, so none of
+    // the rich reconciliation side effects may run until the full answer wins.
+    if (!data?.partial) {
+      mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
+      pullServerAvatars(activeSourceRoster)
+      trackInboundActivity(roster)
+      backfillMessagingProtocol(activeSourceRoster)
+    }
     // React Query owns the stable server snapshot; derived arrays intentionally
     // follow that snapshot rather than retriggering on their own atom writes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
