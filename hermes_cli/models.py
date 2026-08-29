@@ -3468,6 +3468,16 @@ _LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset(
     {"opencode-zen", "opencode-go"}
 )
 
+# Providers whose curated _PROVIDER_MODELS entry is a hand-picked MEMBERSHIP
+# filter (which agentic models to allow) rather than a deliberate ORDER.
+# Contrast with zai/kimi-coding/minimax/vertex/bedrock, whose curated lists
+# are visibly version-descending (newest first) -- reordering those would
+# destroy real signal. HuggingFace's curated list has no such structure (it
+# reads as models added over time, not ranked), so unlike the general
+# curated-first rule above, sort its ENTIRE merged result -- curated head
+# included -- rather than just the live-only tail appended after it.
+_FULLY_ALPHABETIZE_PICKER_PROVIDERS: frozenset[str] = frozenset({"huggingface"})
+
 
 def _resolve_static_model_alias(
     name_lower: str,
@@ -4271,6 +4281,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                         for m in extra:
                             merged.append(m)
                             merged_lower.add(_model_dedup_key(m))
+                        if normalized in _FULLY_ALPHABETIZE_PICKER_PROVIDERS:
+                            # Unlike the general case, this provider's curated
+                            # head isn't a deliberate ranking either -- sort
+                            # everything, not just the appended tail.
+                            merged.sort(key=str.lower)
                         return merged
                     # No curated list at all — the live catalog IS the whole
                     # picker, so there's no hand-picked order to preserve;
