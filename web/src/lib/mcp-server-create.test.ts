@@ -89,6 +89,7 @@ describe("buildMcpServerCreate", () => {
       url: "https://mcp.example/mcp",
       auth: "service_account",
       service_account: {
+        grant_type: "authentik_app_password",
         token_url: "https://idp.example/o/toolhive/token/",
         client_id: "toolhive",
         username: "svc-user",
@@ -114,6 +115,9 @@ describe("buildMcpServerCreate", () => {
     });
 
     expect(server.service_account).toEqual({
+      // Always emitted: the strategy is stated, never left to be inferred
+      // from which fields the form happened to fill in.
+      grant_type: "authentik_app_password",
       token_url: "https://idp.example/token/",
       client_id: "client",
       username: "user",
@@ -121,6 +125,23 @@ describe("buildMcpServerCreate", () => {
     });
     expect(server.service_account && "scope" in server.service_account).toBe(false);
     expect(server.service_account && "client_secret_env" in server.service_account).toBe(false);
+  });
+
+  it("rejects a plaintext http:// token URL", () => {
+    // The token request carries the service-account password, so a plaintext
+    // endpoint must be refused before the request is ever built.
+    expect(() =>
+      buildMcpServerCreate({
+        ...emptyMcpServerDraft(),
+        name: "sa",
+        url: "https://mcp.example/mcp",
+        httpAuth: "service_account",
+        saTokenUrl: "http://idp.example/token/",
+        saClientId: "client",
+        saUsername: "user",
+        saPasswordEnv: "PWD_ENV",
+      }),
+    ).toThrow("https://");
   });
 
   it("rejects service_account with missing required fields", () => {

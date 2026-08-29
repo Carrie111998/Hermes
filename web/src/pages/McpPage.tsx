@@ -452,7 +452,7 @@ export default function McpPage() {
                       <SelectOption value="none">None</SelectOption>
                       <SelectOption value="header">Bearer token</SelectOption>
                       <SelectOption value="oauth">OAuth</SelectOption>
-                      <SelectOption value="service_account">Service account (M2M OAuth)</SelectOption>
+                      <SelectOption value="service_account">Service account (Authentik app password)</SelectOption>
                     </Select>
                   </div>
                   {httpAuth === "header" && (
@@ -481,6 +481,13 @@ export default function McpPage() {
                   )}
                   {httpAuth === "service_account" && (
                     <>
+                      <p className="text-xs text-muted-foreground">
+                        Exchanges an Authentik service-account app password for a
+                        short-lived Bearer token. This is Authentik&apos;s
+                        service-account extension — providers whose M2M flow is
+                        plain client authentication (Keycloak service accounts,
+                        Auth0 M2M) are not supported here.
+                      </p>
                       <div className="grid gap-2">
                         <Label htmlFor="sa-token-url">Token URL</Label>
                         <Input
@@ -489,6 +496,10 @@ export default function McpPage() {
                           value={saTokenUrl}
                           onChange={(e) => setSaTokenUrl(e.target.value)}
                         />
+                        <p className="text-xs text-muted-foreground">
+                          Must be <code>https://</code> — the token request carries
+                          the service-account password.
+                        </p>
                       </div>
                       <div className="grid gap-2">
                         <Label htmlFor="sa-client-id">Client ID</Label>

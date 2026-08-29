@@ -71,7 +71,13 @@ export function buildMcpServerCreate(draft: McpServerDraft): McpServerCreate {
       throw new Error("Bearer token required");
     }
     if (draft.httpAuth === "service_account") {
-      if (!draft.saTokenUrl.trim()) throw new Error("Token URL required");
+      const tokenUrl = draft.saTokenUrl.trim();
+      if (!tokenUrl) throw new Error("Token URL required");
+      // The token request carries the service-account password, so refuse a
+      // plaintext endpoint here rather than letting the backend reject it later.
+      if (!tokenUrl.startsWith("https://")) {
+        throw new Error("Token URL must be an https:// URL");
+      }
       if (!draft.saClientId.trim()) throw new Error("Client ID required");
       if (!draft.saUsername.trim()) throw new Error("Username required");
       if (!draft.saPasswordEnv.trim()) throw new Error("Password env-var name required");
@@ -84,6 +90,9 @@ export function buildMcpServerCreate(draft: McpServerDraft): McpServerCreate {
     }
     if (draft.httpAuth === "service_account") {
       const sa: McpServiceAccountConfig = {
+        // The form collects Authentik service-account fields, so it states
+        // that strategy outright instead of leaving it to be inferred.
+        grant_type: "authentik_app_password",
         token_url: draft.saTokenUrl.trim(),
         client_id: draft.saClientId.trim(),
         username: draft.saUsername.trim(),

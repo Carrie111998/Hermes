@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
-"""Service-account (M2M) OAuth credential provider for MCP HTTP servers.
+"""Service-account (M2M) credential provider for MCP HTTP servers.
 
 Exchanges a long-lived service-account password for a short-lived Bearer
-access token via the OAuth 2.0 ``client_credentials`` grant, injects
-``Authorization: Bearer <access_token>`` into MCP requests, and renews
-automatically.  This is distinct from the browser-based PKCE flow
-(``auth: oauth``) — no user interaction is required.
+access token, injects ``Authorization: Bearer <access_token>`` into MCP
+requests, and renews automatically.  This is distinct from the
+browser-based PKCE flow (``auth: oauth``) — no user interaction is
+required.
+
+Grant strategy is **explicit**, never inferred from which fields happen to
+be present.  ``service_account.grant_type`` selects it and is required.
+
+Supported strategies
+--------------------
+``authentik_app_password``
+    Authentik's service-account extension.  Posts ``grant_type=
+    client_credentials`` together with a resource-owner ``username`` /
+    ``password`` pair.  Note this is *not* the RFC 6749 §4.4.2
+    client-credentials request, which carries no username/password — it is
+    a provider extension that happens to reuse the same wire grant name.
+    Providers whose M2M flow is plain client authentication (Keycloak
+    service accounts, Auth0 M2M) are **not** supported by this strategy;
+    adding a standards-conforming ``client_credentials`` strategy is a
+    separate, additive change.
 
 Configuration in config.yaml::
 
@@ -14,6 +30,7 @@ Configuration in config.yaml::
         url: https://mcp.example/mcp
         auth: service_account
         service_account:
+          grant_type: authentik_app_password         # required, explicit
           token_url: https://idp.example/application/o/toolhive/token/
           client_id: toolhive
           username: zug
@@ -50,6 +67,15 @@ httpx.Auth)`` object and therefore acceptable to ``AsyncClient(auth=...)``.
 
 Security
 --------
+- The token endpoint must be ``https://``.  This is enforced both when the
+  config is validated and again immediately before every token request, so
+  a credential-bearing form can never be sent in the clear.
+- Token-endpoint redirects are **not** followed.  A 307/308 is
+  method-preserving, so an authorization server (or a compromised or
+  misconfigured one) could otherwise redirect the POST — password and
+  client secret included — to an origin the config never authorised.  The
+  config proves exactly one secret sink; runtime does not widen it.  A 3xx
+  from the token endpoint is surfaced as an error.
 - TLS verification is always on; no way to disable it from config.
 - Passwords, access tokens, Authorization header values, and token
   responses are never logged.  Errors are redacted before surfacing.
@@ -81,6 +107,31 @@ _PROACTIVE_RENEW_BUFFER_SECONDS = 60
 
 # ── Env-var name validation — same rule as shell identifier.
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# ── Grant strategies.  The config value is a Hermes-level discriminator, not
+#    the OAuth wire ``grant_type`` — see GRANT_WIRE_TYPES below.
+GRANT_AUTHENTIK_APP_PASSWORD = "authentik_app_password"
+
+#: Config-level grant strategies this provider implements.  Adding a
+#: standards-conforming ``client_credentials`` strategy is additive: extend
+#: this set, GRANT_WIRE_TYPES, and _build_exchange_form.
+SUPPORTED_GRANT_TYPES: frozenset[str] = frozenset({GRANT_AUTHENTIK_APP_PASSWORD})
+
+#: Config strategy → the ``grant_type`` value actually sent on the wire.
+#: Authentik's service-account extension reuses the ``client_credentials``
+#: wire name while adding a resource-owner username/password pair, so the
+#: two names deliberately differ here.
+GRANT_WIRE_TYPES: dict[str, str] = {
+    GRANT_AUTHENTIK_APP_PASSWORD: "client_credentials",
+}
+
+#: Fields required per grant strategy, on top of the common ones.
+_GRANT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    GRANT_AUTHENTIK_APP_PASSWORD: ("username", "password_env"),
+}
+
+#: Required regardless of strategy.
+_COMMON_REQUIRED_FIELDS: tuple[str, ...] = ("token_url", "client_id")
 
 
 # ---------------------------------------------------------------------------
@@ -136,15 +187,33 @@ def validate_service_account_config(name: str, cfg: dict) -> list[str]:
     if not isinstance(cfg, dict):
         return [f"MCP server '{name}': service_account must be a mapping"]
 
-    required = ("token_url", "client_id", "username", "password_env")
+    # Grant strategy is explicit — never inferred from field presence.
+    grant_type = cfg.get("grant_type")
+    if not grant_type:
+        errors.append(
+            f"MCP server '{name}': service_account.grant_type is required. "
+            f"Supported: {', '.join(sorted(SUPPORTED_GRANT_TYPES))}"
+        )
+    elif str(grant_type) not in SUPPORTED_GRANT_TYPES:
+        errors.append(
+            f"MCP server '{name}': service_account.grant_type "
+            f"'{grant_type}' is not supported. "
+            f"Supported: {', '.join(sorted(SUPPORTED_GRANT_TYPES))}"
+        )
+
+    required = _COMMON_REQUIRED_FIELDS + _GRANT_REQUIRED_FIELDS.get(
+        str(grant_type), ()
+    )
     for field in required:
         if not cfg.get(field):
             errors.append(f"MCP server '{name}': service_account.{field} is required")
 
     token_url = cfg.get("token_url", "")
-    if token_url and not str(token_url).startswith(("https://", "http://")):
+    if token_url and not str(token_url).startswith("https://"):
         errors.append(
-            f"MCP server '{name}': service_account.token_url must be an HTTP(S) URL"
+            f"MCP server '{name}': service_account.token_url must be an "
+            "https:// URL — the token request carries the service-account "
+            "password and must not be sent over plaintext HTTP"
         )
 
     for env_field in ("password_env", "client_secret_env"):
@@ -316,7 +385,22 @@ async def _post_token_request(
 
     Never logs form values (which include the password).  Raises ``ValueError``
     with a redacted error message on any failure.
+
+    The ``https://`` requirement is re-checked here rather than trusted from
+    validation time: this is the last point before a credential-bearing body
+    leaves the process, and the caller may have been handed a config that
+    never passed through :func:`validate_service_account_config`.
+
+    The caller must supply a client with redirects disabled; a 3xx from the
+    token endpoint therefore falls through to the non-2xx branch and is
+    reported as an error rather than replaying the form at a new origin.
     """
+    if not str(token_url).startswith("https://"):
+        raise ValueError(
+            f"MCP service-account '{server_name}': refusing to send "
+            "credentials to a non-https:// token endpoint"
+        )
+
     try:
         resp = await http_client.post(
             token_url,
@@ -328,6 +412,17 @@ async def _post_token_request(
         raise ValueError(
             f"MCP service-account '{server_name}': token endpoint request failed"
         ) from exc
+
+    if 300 <= resp.status_code < 400:
+        # Redirects are deliberately not followed: replaying a
+        # password-bearing POST at a Location the config never authorised is
+        # credential egress to an unproven sink.  Never log the Location.
+        raise ValueError(
+            f"MCP service-account '{server_name}': token endpoint returned a "
+            f"redirect (HTTP {resp.status_code}); redirects are not followed "
+            "because the request carries credentials. Point token_url at the "
+            "authorization server's final https:// token endpoint."
+        )
 
     if not (200 <= resp.status_code < 300):
         # Never include the response body — it may echo back the error_description
@@ -490,22 +585,46 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             return disk
         return None
 
-    async def _exchange_service_account(self, http_client: Any) -> _CachedToken:
-        """Perform a client_credentials grant using the service-account password."""
+    def _build_exchange_form(
+        self, password: str, client_secret: Optional[str]
+    ) -> dict:
+        """Build the token-request form for this server's grant strategy.
+
+        Dispatch is on the explicit ``grant_type`` discriminator, so a new
+        strategy adds a branch here rather than changing meaning for existing
+        configs.
+        """
         cfg = self._cfg
-        password = _resolve_password(cfg, self._server_name)
-        client_secret = _resolve_client_secret(cfg)
+        grant = str(cfg.get("grant_type", ""))
+        if grant not in SUPPORTED_GRANT_TYPES:
+            raise ValueError(
+                f"MCP service-account '{self._server_name}': unsupported "
+                f"service_account.grant_type '{grant}'. "
+                f"Supported: {', '.join(sorted(SUPPORTED_GRANT_TYPES))}"
+            )
 
         form: dict = {
-            "grant_type": "client_credentials",
+            "grant_type": GRANT_WIRE_TYPES[grant],
             "client_id": cfg["client_id"],
-            "username": cfg["username"],
-            "password": password,
         }
+        if grant == GRANT_AUTHENTIK_APP_PASSWORD:
+            # Authentik's service-account extension: client_credentials on the
+            # wire plus a resource-owner username/password pair.
+            form["username"] = cfg["username"]
+            form["password"] = password
         if cfg.get("scope"):
             form["scope"] = cfg["scope"]
         if client_secret:
             form["client_secret"] = client_secret
+        return form
+
+    async def _exchange_service_account(self, http_client: Any) -> _CachedToken:
+        """Exchange the service-account credential for an access token."""
+        cfg = self._cfg
+        password = _resolve_password(cfg, self._server_name)
+        client_secret = _resolve_client_secret(cfg)
+
+        form = self._build_exchange_form(password, client_secret)
 
         body = await _post_token_request(
             http_client, cfg["token_url"], form, self._server_name
@@ -623,7 +742,11 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             except ImportError:
                 import httpx as _httpx_mod  # type: ignore[no-redef]
 
-        async with _httpx_mod.AsyncClient(follow_redirects=True) as token_client:
+        # follow_redirects=False is a security requirement, not a default:
+        # 307/308 preserve the method and body, so following one would replay
+        # the service-account password at whatever origin the token endpoint
+        # names.  _post_token_request turns any 3xx into an error.
+        async with _httpx_mod.AsyncClient(follow_redirects=False) as token_client:
             token = await self._acquire_token(token_client)
 
             # Inject Authorization header without logging the value.
