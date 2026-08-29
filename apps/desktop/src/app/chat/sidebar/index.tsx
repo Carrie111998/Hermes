@@ -95,6 +95,7 @@ import {
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
+  openFolderAsProject,
   openProjectCreate,
   refreshProjects,
   refreshProjectTree,
@@ -1768,6 +1769,26 @@ export function ChatSidebar({
                       </div>
                     ) : (
                       <>
+                        {agentsGrouped && !showAllProfiles ? (
+                          <Tip
+                            label={
+                              <TipKeybindLabel actionId="workspace.openFolder" text={t.commandCenter.openFolder} />
+                            }
+                          >
+                            <Button
+                              aria-label={t.commandCenter.openFolder}
+                              className={HEADER_ACTION_BTN}
+                              onClick={event => {
+                                event.stopPropagation()
+                                void openFolderAsProject()
+                              }}
+                              size="icon-xs"
+                              variant="ghost"
+                            >
+                              <Codicon name="folder-opened" size="0.75rem" />
+                            </Button>
+                          </Tip>
+                        ) : null}
                         {!showAllProfiles ? (
                           <Tip label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}>
                             <Button
