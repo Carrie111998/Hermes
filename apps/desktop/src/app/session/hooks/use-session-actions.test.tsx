@@ -1612,6 +1612,55 @@ describe('branchStoredSession desktop source tagging', () => {
     expect($sessionTiles.get().some(tile => tile.storedSessionId === 'branch-stored')).toBe(false)
   })
 
+  it('routes the main workspace to the branch session (branch window renders without a manual away-and-back)', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 0,
+          messages: [],
+          resumed: 'branch-stored',
+          session_id: 'branch-runtime',
+          session_key: 'branch-stored'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
+    setSelectedStoredSessionId('stored-parent')
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    const navigate = vi.fn()
+    let branchStoredSession: ((storedSessionId: string) => Promise<boolean>) | null = null
+    render(
+      <BranchHarness
+        navigate={navigate}
+        onReady={branch => (branchStoredSession = branch)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-parent"
+      />
+    )
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
+
+    // resumeSession swaps the selection but never the URL. Without a navigate
+    // here the route stays on the PARENT while the selection is the CHILD, so
+    // isRouteSessionMismatch stays true: the transcript is suppressed and the
+    // routed loader never retires — the branched window stays blank until the
+    // user switches away and back. The URL must follow the selection.
+    expect(navigate).toHaveBeenCalledWith(sessionRoute('branch-stored'), { replace: true })
+  })
+
   it('keeps the current view when branching a different session from the sidebar (does not reintroduce #69750)', async () => {
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.create') {
