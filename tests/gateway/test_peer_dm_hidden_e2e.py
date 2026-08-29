@@ -33,6 +33,7 @@ def _build_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
 
 
