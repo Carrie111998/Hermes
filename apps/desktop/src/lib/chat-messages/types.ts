@@ -93,6 +93,8 @@ export type GatewayEventPayload = {
   // clarify.request
   request_id?: string
   question?: string
+  // background.complete — id of the prompt.background task that finished
+  task_id?: string
   choices?: string[] | null
   multi_select?: boolean
   // clarify.request batch form: questions replaces question/choices, and

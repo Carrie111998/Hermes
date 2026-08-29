@@ -229,8 +229,11 @@ describe('desktop slash command curation', () => {
   })
 
   it('still routes commands without dedicated RPCs through exec()', () => {
+    // /background deliberately NOT here — it has the dedicated
+    // prompt.background RPC since #97635 (the slash worker's completion
+    // print lands after the capture window closes, so the result never
+    // reached the originating conversation).
     const execNames = [
-      '/background',
       '/debug',
       '/goal',
       '/personality',
@@ -251,6 +254,7 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashCommandArgumentMode('/goal')).toBe('mixed')
     expect(desktopSlashCommandArgumentMode('/steer')).toBe('text')
     expect(desktopSlashCommandArgumentMode('/queue')).toBe('text')
+    expect(desktopSlashCommandArgumentMode('/background')).toBe('text')
     expect(desktopSlashCommandArgumentMode('/personality')).toBe('options')
     expect(desktopSlashCommandArgumentMode('/handoff')).toBe('options')
     expect(desktopSlashCommandArgumentMode('/version')).toBeNull()
