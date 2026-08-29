@@ -68,6 +68,14 @@ def test_capabilities_are_honest_about_the_driver_boundary(home):
     assert "groups.send" in result["methods"]
     assert "groups.retry" in result["methods"]
     assert "groups.approve" in result["methods"]
+    advertised = [
+        str(value).lower() for value in (*result["features"], *result["methods"])
+    ]
+    assert not any(
+        token in value
+        for token in ("attachment", "desktop", "messaging", "peer", "roomlink")
+        for value in advertised
+    )
 
 
 def test_create_list_send_and_log_roundtrip(home):

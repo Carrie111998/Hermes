@@ -465,6 +465,16 @@ def _raise_room_not_found(conn: sqlite3.Connection, room_id: str) -> None:
     raise RoomNotFoundError("hosted room not found")
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _room_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, Any]:
     room = {
         "room_id": row["room_id"],
@@ -593,10 +603,22 @@ def _prune_disbanded_rooms_locked(
              WHERE room_id IN ({placeholders}) AND disbanded_at IS NOT NULL""",
         room_ids,
     )
-    conn.execute(
-        f"DELETE FROM hosted_room_events WHERE room_id IN ({placeholders})",
-        room_ids,
+    dependent_tables = (
+        "hosted_room_policy_publications",
+        "hosted_room_policy_watermarks",
+        "hosted_room_policy_events",
+        "hosted_room_policy_threads",
+        "hosted_room_policy_cursors",
+        "hosted_room_driver_tasks",
+        "hosted_room_driver_leases",
+        "hosted_room_events",
     )
+    for table in dependent_tables:
+        if _table_exists(conn, table):
+            conn.execute(
+                f"DELETE FROM {table} WHERE room_id IN ({placeholders})",
+                room_ids,
+            )
     conn.execute(
         f"DELETE FROM hosted_rooms WHERE room_id IN ({placeholders})",
         room_ids,

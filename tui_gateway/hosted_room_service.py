@@ -30,6 +30,7 @@ class HostedRoomService:
     ) -> None:
         self.server = server
         self.db_path = Path(db_path or hosted_rooms.default_db_path())
+        hosted_rooms.prune_disbanded_rooms(self.db_path)
         self._policy_lock = threading.RLock()
         self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
         self.policy_checkpoint = HostedRoomPolicyCheckpoint(self.db_path)
@@ -211,6 +212,12 @@ class HostedRoomService:
                 )
                 snapshot = self._policy_snapshot(room)
                 events = list(snapshot.events)
+            self.policy_checkpoint.compact_completed(room_id=binding.room_id)
+            driver.prune_published_terminal_tasks(
+                self.db_path,
+                room_id=binding.room_id,
+                clock=self.runtime.clock,
+            )
             decision = discussion.plan_next_task(
                 room,
                 events,

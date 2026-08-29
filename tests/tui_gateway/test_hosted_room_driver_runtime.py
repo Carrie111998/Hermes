@@ -253,6 +253,24 @@ class FakeSessionRPC:
         return {"interrupted": True}
 
 
+class SelectiveCompletionRPC(FakeSessionRPC):
+    """Keep selected local profiles running while peers complete normally."""
+
+    def __init__(self, *, waiting_profiles: set[str]) -> None:
+        super().__init__()
+        self.waiting_profiles = waiting_profiles
+        self._submit_mode_lock = threading.Lock()
+
+    def submit(self, **kwargs):
+        with self._submit_mode_lock:
+            original = self.auto_complete
+            self.auto_complete = kwargs["profile"] not in self.waiting_profiles
+            try:
+                return super().submit(**kwargs)
+            finally:
+                self.auto_complete = original
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Path:
     path = tmp_path / "state.db"
@@ -328,6 +346,106 @@ def test_runtime_uses_unique_process_generation(db: Path):
     assert len(first.process_generation) == 32
 
 
+@pytest.mark.parametrize("value", [0, True])
+def test_room_concurrency_bound_must_be_a_positive_integer(db: Path, value):
+    with pytest.raises(ValueError, match="max_concurrent_rooms"):
+        _runtime(db, FakeSessionRPC(), max_concurrent_rooms=value)
+
+
+def test_waiting_room_does_not_block_an_independent_local_room(tmp_path: Path):
+    db = tmp_path / "state.db"
+    bindings = [
+        HostedRoomBinding("room-waiting", "gateway-a", 1),
+        HostedRoomBinding("room-healthy", "gateway-a", 1),
+    ]
+    identities = [
+        state.TaskIdentity("room-waiting", "task-waiting", "thread-a", "turn-a"),
+        state.TaskIdentity("room-healthy", "task-healthy", "thread-b", "turn-b"),
+    ]
+    profiles = ["profile-waiting", "profile-healthy"]
+    for binding, identity, profile in zip(bindings, identities, profiles):
+        hosted_rooms.create_room(
+            db,
+            room_id=binding.room_id,
+            name=binding.room_id,
+            members=[{"profile": profile, "handle": profile}],
+            authority_gateway_id=binding.gateway_id,
+            now=time.time(),
+        )
+        state.admit_task(
+            db,
+            identity,
+            payload={
+                "target_profile": profile,
+                "prompt": f"Run {binding.room_id}.",
+                "source_event_seq": 1,
+            },
+            clock=time.time,
+        )
+
+    rpc = SelectiveCompletionRPC(waiting_profiles={"profile-waiting"})
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=bindings,
+        rpc=rpc,
+        turn_lock=RecordingTurnLocks(),
+        lease_ttl_seconds=0.4,
+        poll_interval_seconds=0.01,
+        max_concurrent_rooms=2,
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
+    assert state.get_task(db, identities[0])["status"] == "running"
+    assert len(runtime.status()["current_tasks"]) == 1
+    assert runtime.stop(timeout=1.0)
+
+
+def test_rotated_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
+    db = tmp_path / "state.db"
+    bindings = [
+        HostedRoomBinding(f"room-{index}", "gateway-a", 1) for index in range(1, 4)
+    ]
+    for binding in bindings:
+        hosted_rooms.create_room(
+            db,
+            room_id=binding.room_id,
+            name=binding.room_id,
+            members=[{"profile": PROFILE, "handle": PROFILE}],
+            authority_gateway_id=binding.gateway_id,
+            now=time.time(),
+        )
+    identity = state.TaskIdentity(
+        "room-3",
+        "task-room-3",
+        "thread-room-3",
+        "turn-room-3",
+    )
+    state.admit_task(
+        db,
+        identity,
+        payload={
+            "target_profile": PROFILE,
+            "prompt": "Run the later room.",
+            "source_event_seq": 1,
+        },
+        clock=time.time,
+    )
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=bindings,
+        rpc=FakeSessionRPC(),
+        turn_lock=RecordingTurnLocks(),
+        lease_ttl_seconds=0.4,
+        poll_interval_seconds=0.01,
+        max_concurrent_rooms=2,
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    assert runtime.stop(timeout=1.0)
+
+
 def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
     identity = _identity()
     _admit(db, identity, prompt="Use the configured profile credentials.")
@@ -393,37 +511,6 @@ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
 
     assert prepared
     assert published == [(ROOM_ID, identity.task_id, "settled")]
-
-
-def test_transport_resolver_selects_member_transport_without_forking_state(
-    db: Path,
-):
-    identity = _identity()
-    _admit(db, identity)
-    selected = FakeSessionRPC()
-    resolutions = []
-
-    def resolve_transport(binding, task):
-        resolutions.append((binding, task["identity"], task["payload"]))
-        return selected
-
-    runtime = HostedRoomRuntime(
-        db_path=db,
-        rooms=[BINDING],
-        transport_resolver=resolve_transport,
-        turn_lock=RecordingTurnLocks(),
-        lease_ttl_seconds=0.4,
-        poll_interval_seconds=0.01,
-    )
-
-    runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=1.0)
-
-    assert resolutions
-    assert all(binding == BINDING for binding, _, _ in resolutions)
-    assert all(task_identity == identity for _, task_identity, _ in resolutions)
-    assert any(method == "submit" for method, _ in selected.calls)
 
 
 def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):

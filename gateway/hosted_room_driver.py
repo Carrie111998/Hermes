@@ -35,6 +35,9 @@ TerminalStatus = Literal["settled", "failed"]
 MAX_IDENTIFIER_CHARS = 128
 MAX_PROMPT_BYTES = 128 * 1024
 MAX_RESULT_JSON_BYTES = 256 * 1024
+TERMINAL_TASK_RETENTION_SECONDS = 30 * 24 * 60 * 60
+MAX_RETAINED_TERMINAL_TASKS = 2048
+MAX_TASK_PRUNE_BATCH = 1000
 TASK_STATUSES = frozenset({
     "queued",
     "running",
@@ -1587,3 +1590,60 @@ def list_tasks(
         return [_task_from_row(row) for row in rows]
     finally:
         conn.close()
+
+
+def prune_published_terminal_tasks(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    clock: Clock,
+    retention_seconds: float = TERMINAL_TASK_RETENTION_SECONDS,
+    retain: int = MAX_RETAINED_TERMINAL_TASKS,
+) -> int:
+    """Bound execution rows after outcomes are durable in the room log."""
+
+    room_id = _identifier(room_id, label="room_id")
+    now = _timestamp(clock)
+    if retention_seconds <= 0:
+        raise DriverValidationError("retention_seconds must be positive")
+    if isinstance(retain, bool) or not isinstance(retain, int) or retain < 0:
+        raise DriverValidationError("retain must be a non-negative integer")
+
+    with _transaction(db_path) as conn:
+        publications = conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='hosted_room_policy_publications'"""
+        ).fetchone()
+        if publications is None:
+            return 0
+        rows = conn.execute(
+            """SELECT t.task_id, t.terminal_at
+                 FROM hosted_room_driver_tasks t
+                WHERE t.room_id=?
+                  AND t.status IN ('settled', 'failed', 'cancelled')
+                  AND EXISTS (
+                      SELECT 1 FROM hosted_room_policy_publications p
+                       WHERE p.room_id=t.room_id AND p.task_id=t.task_id
+                         AND p.kind IN (
+                             'turn.settled', 'turn.failed', 'turn.cancelled'
+                         )
+                  )
+                ORDER BY t.terminal_at DESC, t.task_id ASC""",
+            (room_id,),
+        ).fetchall()
+        cutoff = now - float(retention_seconds)
+        candidates = [
+            str(row["task_id"])
+            for index, row in enumerate(rows)
+            if index >= retain
+            or (row["terminal_at"] is not None and float(row["terminal_at"]) <= cutoff)
+        ][:MAX_TASK_PRUNE_BATCH]
+        if not candidates:
+            return 0
+        placeholders = ",".join("?" for _ in candidates)
+        deleted = conn.execute(
+            f"""DELETE FROM hosted_room_driver_tasks
+                WHERE room_id=? AND task_id IN ({placeholders})""",
+            (room_id, *candidates),
+        )
+        return max(0, int(deleted.rowcount))

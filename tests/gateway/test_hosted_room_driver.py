@@ -753,6 +753,59 @@ def test_state_survives_sqlite_reopen_and_concurrent_duplicate_admission(db):
     assert listed[0]["payload"] == _payload()
 
 
+def test_prune_removes_only_old_published_terminal_tasks(db):
+    clock = FakeClock()
+    lease = _lease(db, clock)
+    published = _identity("task-published", turn_id="turn-published")
+    unpublished = _identity("task-unpublished", turn_id="turn-unpublished")
+    for identity in (published, unpublished):
+        _admit(db, identity, clock)
+        attempt = driver.start_task(
+            db,
+            identity,
+            lease,
+            expected_cancel_generation=0,
+            clock=clock,
+        )
+        driver.settle_task(
+            db,
+            attempt,
+            settlement_id=f"result:{identity.task_id}",
+            status="settled",
+            result={"text": "done"},
+            clock=clock,
+        )
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """CREATE TABLE hosted_room_policy_publications (
+                room_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                execution_generation INTEGER NOT NULL DEFAULT 0,
+                seq INTEGER NOT NULL,
+                PRIMARY KEY(room_id, task_id, kind, execution_generation)
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO hosted_room_policy_publications
+               VALUES ('room-1', 'task-published', 'turn.settled', 0, 3)"""
+        )
+
+    clock.advance(driver.TERMINAL_TASK_RETENTION_SECONDS + 1)
+    assert (
+        driver.prune_published_terminal_tasks(
+            db,
+            room_id="room-1",
+            clock=clock,
+        )
+        == 1
+    )
+    assert [
+        task["identity"].task_id for task in driver.list_tasks(db, room_id="room-1")
+    ] == ["task-unpublished"]
+
+
 def test_unpublished_legacy_driver_schema_fails_closed(db):
     conn = sqlite3.connect(db)
     try:

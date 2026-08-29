@@ -32,22 +32,12 @@ MAX_DISCUSSION_ROUNDS = 3
 MAX_DISCUSSION_MESSAGES = 10
 MAX_DISCUSSION_DELTA_LINES = 24
 MAX_USER_TEXT_BYTES = 64 * 1024
-MAX_ATTACHMENTS = 8
-MAX_ATTACHMENT_NAME_CHARS = 255
-MAX_ATTACHMENT_MIME_CHARS = 127
-MAX_ATTACHMENT_REF_CHARS = 256
-MAX_ATTACHMENT_SIZE_BYTES = 100 * 1024 * 1024
-MAX_ATTACHMENT_MANIFEST_BYTES = 32 * 1024
 
 DecisionStatus = Literal["idle", "task", "settled", "bounded"]
 TerminalKind = Literal["settled", "failed", "cancelled", "deferred"]
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
-_MIME_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"
-)
-_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$")
 _TURN_ID_RE = re.compile(
     r"^d(?P<source>[1-9][0-9]*)\.r(?P<round>[0-2])\."
     r"p(?P<position>[0-5])\.s(?P<seen>[1-9][0-9]*)\."
@@ -71,9 +61,6 @@ _REMOTE_MEMBER_FIELDS = frozenset({
     "target_profile",
 })
 _USER_PAYLOAD_FIELDS = frozenset({"text", "thread_id"})
-_USER_PAYLOAD_OPTIONAL_FIELDS = frozenset({"attachments"})
-_ATTACHMENT_FIELDS = frozenset({"kind", "name", "size", "mime", "refs"})
-_ATTACHMENT_KINDS = frozenset({"image", "pdf", "file"})
 _MEMBER_MESSAGE_FIELDS = frozenset({
     "discussion_event_id",
     "member_id",
@@ -268,167 +255,13 @@ def _exact_fields(
     return value
 
 
-def _attachment_name(value: Any, *, index: int) -> str:
-    if not isinstance(value, str):
-        raise DiscussionValidationError(f"attachment {index} name must be a string")
-    name = value.strip()
-    if (
-        not name
-        or len(name) > MAX_ATTACHMENT_NAME_CHARS
-        or name in {".", ".."}
-        or "/" in name
-        or "\\" in name
-        or "\x00" in name
-        or "\n" in name
-        or "\r" in name
-    ):
-        raise DiscussionValidationError(
-            f"attachment {index} name must be a bounded basename"
-        )
-    return name
-
-
-def _attachment_mime(value: Any, *, index: int, kind: str) -> str:
-    if not isinstance(value, str):
-        raise DiscussionValidationError(f"attachment {index} mime must be a string")
-    mime = value.strip().lower()
-    if (
-        not mime
-        or len(mime) > MAX_ATTACHMENT_MIME_CHARS
-        or _MIME_RE.fullmatch(mime) is None
-    ):
-        raise DiscussionValidationError(f"attachment {index} has invalid mime metadata")
-    if kind == "image" and not mime.startswith("image/"):
-        raise DiscussionValidationError(
-            f"attachment {index} image kind requires image mime"
-        )
-    if kind == "pdf" and mime != "application/pdf":
-        raise DiscussionValidationError(
-            f"attachment {index} pdf kind requires application/pdf"
-        )
-    return mime
-
-
-def _safe_attachment_ref(value: Any, *, index: int, member_id: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise DiscussionValidationError(
-            f"attachment {index} ref for '{member_id}' must be a string or null"
-        )
-    ref = value.strip()
-    lowered = ref.casefold()
-    if (
-        not ref
-        or len(ref) > MAX_ATTACHMENT_REF_CHARS
-        or _SAFE_REF_RE.fullmatch(ref) is None
-        or lowered.startswith(("data:", "base64:", "file:", "path:"))
-        or ref.startswith((".", "~"))
-    ):
-        raise DiscussionValidationError(
-            f"attachment {index} ref for '{member_id}' is not a safe opaque ref"
-        )
-    return ref
-
-
-def _validate_attachments(
-    value: Any,
-    *,
-    member_ids: Iterable[str] | None,
-) -> list[dict[str, Any]]:
-    if member_ids is None:
-        raise DiscussionValidationError(
-            "attachment validation requires the frozen room member ids"
-        )
-    if not isinstance(value, list):
-        raise DiscussionValidationError("attachments must be a list")
-    if len(value) > MAX_ATTACHMENTS:
-        raise DiscussionValidationError(
-            f"attachments must contain at most {MAX_ATTACHMENTS} entries"
-        )
-    expected_member_ids = tuple(
-        _identifier(member_id, label="attachment member_id") for member_id in member_ids
-    )
-    expected_keys = frozenset(expected_member_ids)
-    normalized: list[dict[str, Any]] = []
-    for index, raw in enumerate(value):
-        attachment = _exact_fields(
-            raw,
-            label=f"attachment {index}",
-            required=_ATTACHMENT_FIELDS,
-        )
-        kind = attachment["kind"]
-        if not isinstance(kind, str) or kind not in _ATTACHMENT_KINDS:
-            raise DiscussionValidationError(
-                f"attachment {index} kind must be image, pdf, or file"
-            )
-        name = _attachment_name(attachment["name"], index=index)
-        size = attachment["size"]
-        if (
-            isinstance(size, bool)
-            or not isinstance(size, int)
-            or not 0 <= size <= MAX_ATTACHMENT_SIZE_BYTES
-        ):
-            raise DiscussionValidationError(
-                f"attachment {index} size must be between 0 and "
-                f"{MAX_ATTACHMENT_SIZE_BYTES} bytes"
-            )
-        mime = _attachment_mime(attachment["mime"], index=index, kind=kind)
-        refs = attachment["refs"]
-        if not isinstance(refs, Mapping):
-            raise DiscussionValidationError(
-                f"attachment {index} refs must be an object"
-            )
-        ref_keys = frozenset(refs)
-        missing = expected_keys - ref_keys
-        unknown = ref_keys - expected_keys
-        if missing:
-            raise DiscussionValidationError(
-                f"attachment {index} refs are missing member ids: "
-                f"{', '.join(sorted(missing))}"
-            )
-        if unknown:
-            raise DiscussionValidationError(
-                f"attachment {index} refs contain unknown member ids: "
-                f"{', '.join(sorted(str(key) for key in unknown))}"
-            )
-        normalized.append({
-            "kind": kind,
-            "name": name,
-            "size": size,
-            "mime": mime,
-            "refs": {
-                member_id: _safe_attachment_ref(
-                    refs[member_id],
-                    index=index,
-                    member_id=member_id,
-                )
-                for member_id in expected_member_ids
-            },
-        })
-    encoded = json.dumps(
-        normalized,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    if len(encoded.encode("utf-8")) > MAX_ATTACHMENT_MANIFEST_BYTES:
-        raise DiscussionValidationError("attachment manifest is too large")
-    return normalized
-
-
-def validate_user_payload(
-    value: Any,
-    *,
-    member_ids: Iterable[str] | None = None,
-) -> dict[str, Any]:
+def validate_user_payload(value: Any) -> dict[str, Any]:
     """Validate and normalize the exact ``message.user`` Discussion payload."""
 
     payload = _exact_fields(
         value,
         label="user payload",
         required=_USER_PAYLOAD_FIELDS,
-        optional=_USER_PAYLOAD_OPTIONAL_FIELDS,
     )
     text = payload["text"]
     if not isinstance(text, str):
@@ -439,13 +272,7 @@ def validate_user_payload(
     if len(text.encode("utf-8")) > MAX_USER_TEXT_BYTES:
         raise DiscussionValidationError("user payload text is too large")
     thread_id = _identifier(payload["thread_id"], label="thread_id")
-    normalized: dict[str, Any] = {"text": text, "thread_id": thread_id}
-    if "attachments" in payload:
-        normalized["attachments"] = _validate_attachments(
-            payload["attachments"],
-            member_ids=member_ids,
-        )
-    return normalized
+    return {"text": text, "thread_id": thread_id}
 
 
 def validate_roster(
@@ -650,10 +477,7 @@ def _validate_event(
         raise DiscussionValidationError("event payload must be an object")
 
     if kind == "message.user":
-        payload = validate_user_payload(
-            payload,
-            member_ids=(member.member_id for member in room.members),
-        )
+        payload = validate_user_payload(payload)
         if actor.get("kind") != "user":
             raise DiscussionValidationError("message.user requires a user actor")
     elif kind == "message.member":
@@ -928,40 +752,6 @@ def _format_message(event: _ValidatedEvent, room: DiscussionRoom) -> str:
     return f"@{member.handle}: {text}"
 
 
-def _attachment_prompt_lines(
-    messages: Sequence[_ValidatedEvent],
-    member: DiscussionMember,
-) -> list[str]:
-    entries: list[str] = []
-    queued_media = False
-    for event in messages:
-        if event.kind != "message.user":
-            continue
-        for attachment in event.payload.get("attachments", []):
-            ref = attachment["refs"][member.member_id]
-            name = json.dumps(attachment["name"], ensure_ascii=True)
-            metadata = f"{attachment['mime']}, {attachment['size']} bytes"
-            if attachment["kind"] == "file":
-                if ref is not None:
-                    entries.append(f"- Staged file {name} ({metadata}): {ref}")
-                continue
-            queued_media = True
-            label = "image" if attachment["kind"] == "image" else "PDF"
-            ref_note = f" Staged ref: {ref}." if ref is not None else ""
-            entries.append(
-                f"- Queued {label} {name} ({metadata}) for this turn.{ref_note}"
-            )
-    if not entries:
-        return []
-    lines = ["", "Attachments available to you for this turn:", *entries]
-    if queued_media:
-        lines.append(
-            "Queued image/PDF attachments are staged separately for this turn; "
-            "inspect the supplied media rather than treating its filename as content."
-        )
-    return lines
-
-
 def _build_prompt(
     *,
     room: DiscussionRoom,
@@ -984,7 +774,6 @@ def _build_prompt(
         "",
         "New messages in this thread since your last turn (oldest first):",
         *[f"  {_format_message(event, room)}" for event in delta],
-        *_attachment_prompt_lines(delta, member),
         "",
         "Rules for this Discussion:",
         "- Reply with one conversational message only when you have something new worth adding.",

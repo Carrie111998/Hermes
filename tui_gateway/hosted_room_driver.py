@@ -9,11 +9,11 @@ The adapter normalizes existing internal session RPCs into seven methods. A
 future server integration can implement those methods with the in-process
 handlers while tests use deterministic fakes and no models or network.
 
-One worker serializes rooms deliberately in this first slice. That keeps lease
-and recovery behavior auditable; per-room workers are a later scalability
-change, not an implicit guarantee here. Hosted member sessions intentionally
-reuse ``Group: <room_id>`` so a local-to-hosted migration preserves the same
-canonical transcript instead of forking a second conversation.
+One bounded supervisor schedules independent room workers. Profile turn locks
+still serialize Bots that share one profile, while a room waiting for approval
+cannot stop unrelated rooms from progressing. Hosted member sessions
+intentionally reuse ``Group: <room_id>`` so a local-to-hosted migration
+preserves the same canonical transcript instead of forking a second conversation.
 """
 
 from __future__ import annotations
@@ -81,17 +81,6 @@ class InternalSessionRPC(Protocol):
         """Interrupt only when the current turn still matches the expected task."""
 
 
-class MemberTransportResolver(Protocol):
-    """Resolve the session transport for one durable room task."""
-
-    def __call__(
-        self,
-        binding: "HostedRoomBinding",
-        task: Mapping[str, Any],
-    ) -> InternalSessionRPC:
-        """Return a local or peer transport without changing task identity."""
-
-
 @dataclass(frozen=True)
 class HostedRoomBinding:
     """Current server-issued authority coordinate for one hosted room."""
@@ -124,8 +113,7 @@ class HostedRoomRuntime:
         db_path: Path | str,
         rooms: Iterable[HostedRoomBinding] | Callable[[], Iterable[HostedRoomBinding]],
         turn_lock: Callable[[str], ContextManager[Any]],
-        rpc: InternalSessionRPC | None = None,
-        transport_resolver: MemberTransportResolver | None = None,
+        rpc: InternalSessionRPC,
         prepare_room: Callable[[HostedRoomBinding], None] | None = None,
         publish_terminal: Callable[[HostedRoomBinding, Mapping[str, Any]], None]
         | None = None,
@@ -135,6 +123,7 @@ class HostedRoomRuntime:
         lease_ttl_seconds: float = 30.0,
         poll_interval_seconds: float = 0.1,
         indeterminate_defer_seconds: float = 60.0,
+        max_concurrent_rooms: int = 4,
         process_generation: str | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
@@ -143,12 +132,14 @@ class HostedRoomRuntime:
             raise ValueError("poll_interval_seconds must be positive")
         if indeterminate_defer_seconds <= 0:
             raise ValueError("indeterminate_defer_seconds must be positive")
-        if rpc is None and transport_resolver is None:
-            raise ValueError("rpc or transport_resolver is required")
-
+        if (
+            isinstance(max_concurrent_rooms, bool)
+            or not isinstance(max_concurrent_rooms, int)
+            or max_concurrent_rooms < 1
+        ):
+            raise ValueError("max_concurrent_rooms must be a positive integer")
         self.db_path = Path(db_path)
         self.rpc = rpc
-        self.transport_resolver = transport_resolver
         self.turn_lock = turn_lock
         self.prepare_room = prepare_room
         self.publish_terminal = publish_terminal
@@ -157,6 +148,7 @@ class HostedRoomRuntime:
         self.lease_ttl_seconds = float(lease_ttl_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.indeterminate_defer_seconds = float(indeterminate_defer_seconds)
+        self.max_concurrent_rooms = max_concurrent_rooms
         self.process_generation = process_generation or uuid.uuid4().hex
         self._rooms_provider: Callable[[], Iterable[HostedRoomBinding]]
         if callable(rooms):
@@ -170,17 +162,19 @@ class HostedRoomRuntime:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._room_threads: dict[str, threading.Thread] = {}
         self._leases: dict[str, state.DriverLease] = {}
         self._recovered_leases: set[tuple[str, int]] = set()
         self._ambiguous_rooms: dict[str, float] = {}
         self._blocked_rooms: set[str] = set()
         self._status_lock = threading.Lock()
-        self._current_task: state.TaskIdentity | None = None
+        self._current_tasks: dict[str, state.TaskIdentity] = {}
+        self._room_schedule_cursor = 0
         self._last_error: str | None = None
         self._cycles = 0
 
     def start(self) -> None:
-        """Start the single dedicated worker thread idempotently."""
+        """Start the bounded room-worker supervisor idempotently."""
         with self._status_lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -188,7 +182,7 @@ class HostedRoomRuntime:
             self._wake.set()
             self._thread = threading.Thread(
                 target=self._worker_loop,
-                name="hosted-room-driver",
+                name="hosted-room-driver-supervisor",
                 daemon=True,
             )
             self._thread.start()
@@ -201,8 +195,15 @@ class HostedRoomRuntime:
             thread = self._thread
         if thread is None:
             return True
-        thread.join(max(0.0, timeout))
-        return not thread.is_alive()
+        deadline = time.monotonic() + max(0.0, timeout)
+        thread.join(max(0.0, deadline - time.monotonic()))
+        with self._status_lock:
+            room_threads = tuple(self._room_threads.values())
+        for room_thread in room_threads:
+            room_thread.join(max(0.0, deadline - time.monotonic()))
+        return not thread.is_alive() and all(
+            not room_thread.is_alive() for room_thread in room_threads
+        )
 
     def wakeup(self) -> None:
         """Wake the worker after task admission or a room-state change."""
@@ -212,12 +213,13 @@ class HostedRoomRuntime:
         """Return a transport-neutral snapshot of runtime health."""
         with self._status_lock:
             thread = self._thread
-            current = self._current_task
+            current_tasks = tuple(self._current_tasks.values())
             return {
                 "running": bool(thread and thread.is_alive()),
                 "stopping": self._stop.is_set(),
                 "process_generation": self.process_generation,
-                "current_task": current,
+                "current_task": current_tasks[0] if current_tasks else None,
+                "current_tasks": current_tasks,
                 "leased_rooms": tuple(sorted(self._leases)),
                 "blocked_rooms": tuple(sorted(self._blocked_rooms)),
                 "last_error": self._last_error,
@@ -315,7 +317,7 @@ class HostedRoomRuntime:
         binding: HostedRoomBinding,
         task: Mapping[str, Any],
     ) -> bool:
-        transport = self._transport_for(binding, task)
+        transport = self.rpc
         if transport is None:
             return False
         profile = task["payload"]["target_profile"]
@@ -327,8 +329,8 @@ class HostedRoomRuntime:
         if session is None:
             # A local accepted turn cannot survive without its canonical
             # session. Resolution errors raise; an authoritative absence is a
-            # safe Stop acknowledgement. A peer remains uncertain instead.
-            return transport is self.rpc
+            # safe Stop acknowledgement.
+            return True
         resumed = transport.resume(
             profile=profile,
             session_id=_session_id(session),
@@ -345,11 +347,8 @@ class HostedRoomRuntime:
             # History was checked immediately before this probe. An exact
             # local session that is no longer active cannot keep executing, and
             # after a restart its process-local task marker is expected to be
-            # absent. A peer transport never gets this shortcut: an unreachable
-            # remote run stays uncertain until its own durable status acks Stop.
-            if transport is self.rpc:
-                return True
-            return False
+            # absent.
+            return True
         if not _info_is_active_for(info, task["identity"], require_exact=True):
             return False
         result = transport.interrupt(
@@ -373,7 +372,7 @@ class HostedRoomRuntime:
         lease: state.DriverLease,
     ) -> bool:
         """Publish a terminal receipt that arrived before Stop was acknowledged."""
-        transport = self._transport_for(binding, task)
+        transport = self.rpc
         if transport is None:
             return False
         profile = task["payload"]["target_profile"]
@@ -488,23 +487,76 @@ class HostedRoomRuntime:
                 self._wake.wait(self.poll_interval_seconds)
                 self._wake.clear()
         finally:
+            while True:
+                with self._status_lock:
+                    room_threads = tuple(
+                        thread
+                        for thread in self._room_threads.values()
+                        if thread.is_alive()
+                    )
+                if not room_threads:
+                    break
+                for room_thread in room_threads:
+                    room_thread.join(self.poll_interval_seconds)
             self._release_idle_leases()
 
     def _run_cycle(self) -> None:
-        for binding in tuple(self._rooms_provider()):
-            if self._stop.is_set():
+        with self._status_lock:
+            supervisor = self._thread
+        if threading.current_thread() is not supervisor:
+            for binding in tuple(self._rooms_provider()):
+                if self._stop.is_set():
+                    return
+                self._run_room_once(binding)
+            return
+
+        with self._status_lock:
+            self._room_threads = {
+                room_id: thread
+                for room_id, thread in self._room_threads.items()
+                if thread.is_alive()
+            }
+            available = self.max_concurrent_rooms - len(self._room_threads)
+            active_rooms = set(self._room_threads)
+        if available <= 0:
+            return
+
+        bindings = tuple(self._rooms_provider())
+        if not bindings:
+            return
+        start = self._room_schedule_cursor % len(bindings)
+        ordered_bindings = bindings[start:] + bindings[:start]
+        self._room_schedule_cursor = (start + 1) % len(bindings)
+
+        for binding in ordered_bindings:
+            if self._stop.is_set() or available <= 0:
                 return
-            try:
-                self._process_room(binding)
-            except state.LeaseHeldError:
+            if binding.room_id in active_rooms:
                 continue
-            except (state.RoomUnavailableError, state.StaleLeaseError) as exc:
-                self._drop_lease(binding.room_id)
-                with self._status_lock:
-                    self._blocked_rooms.discard(binding.room_id)
-                self._record_error(f"room {binding.room_id}: {exc}")
-            except Exception as exc:
-                self._record_error(f"room {binding.room_id}: {exc}")
+            room_thread = threading.Thread(
+                target=self._run_room_once,
+                args=(binding,),
+                name=f"hosted-room-{binding.room_id[:24]}",
+                daemon=True,
+            )
+            with self._status_lock:
+                self._room_threads[binding.room_id] = room_thread
+            active_rooms.add(binding.room_id)
+            available -= 1
+            room_thread.start()
+
+    def _run_room_once(self, binding: HostedRoomBinding) -> None:
+        try:
+            self._process_room(binding)
+        except state.LeaseHeldError:
+            return
+        except (state.RoomUnavailableError, state.StaleLeaseError) as exc:
+            self._drop_lease(binding.room_id)
+            with self._status_lock:
+                self._blocked_rooms.discard(binding.room_id)
+            self._record_error(f"room {binding.room_id}: {exc}")
+        except Exception as exc:
+            self._record_error(f"room {binding.room_id}: {exc}")
 
     def _process_room(self, binding: HostedRoomBinding) -> None:
         if self.prepare_room is not None:
@@ -608,10 +660,10 @@ class HostedRoomRuntime:
         attempt: state.TaskAttempt,
     ) -> None:
         profile = task["payload"]["target_profile"]
-        transport = self._transport_for(binding, task)
+        transport = self.rpc
         submit_attempted = False
         with self._status_lock:
-            self._current_task = attempt.identity
+            self._current_tasks[binding.room_id] = attempt.identity
         try:
             with self.turn_lock(profile):
                 session = self._resolve_or_create(transport, profile, binding.room_id)
@@ -731,7 +783,7 @@ class HostedRoomRuntime:
                 self._settle_failure_if_current(attempt, exc)
         finally:
             with self._status_lock:
-                self._current_task = None
+                self._current_tasks.pop(binding.room_id, None)
 
     def _wait_for_terminal(
         self,
@@ -808,61 +860,12 @@ class HostedRoomRuntime:
                 # lease or submit a duplicate prompt.
                 raise state.LeaseHeldError("recovered session turn is still active")
 
-    def _inspect_recovery_session(
-        self,
-        binding: HostedRoomBinding,
-        task: Mapping[str, Any],
-    ) -> _RecoveryInspection:
-        profile = task["payload"]["target_profile"]
-        transport = self._transport_for(binding, task)
-        with self.turn_lock(profile):
-            session = transport.resolve_exact(
-                profile=profile,
-                title=room_session_title(task["identity"].room_id),
-                source=ROOM_SESSION_SOURCE,
-            )
-            if session is None:
-                return _RecoveryInspection(
-                    terminal=None,
-                    active=False,
-                    status=None,
-                )
-            session_id = _session_id(session)
-            resumed = transport.resume(
-                profile=profile,
-                session_id=session_id,
-                source=ROOM_SESSION_SOURCE,
-            )
-            session_id = _session_id(resumed)
-            receipt = _find_terminal_receipt(
-                transport.history(
-                    profile=profile,
-                    session_id=session_id,
-                    source=ROOM_SESSION_SOURCE,
-                ),
-                task["identity"],
-                task["execution_generation"],
-            )
-            info = transport.info(
-                profile=profile,
-                session_id=session_id,
-                source=ROOM_SESSION_SOURCE,
-            )
-            self._report_pending_action(task, session_id=session_id, info=info)
-            return _RecoveryInspection(
-                terminal=receipt,
-                active=_info_is_active_for(info, task["identity"]),
-                status=str(info.get("status") or "") or None,
-            )
-
     def _inspect_local_recovery_session(
         self,
         task: Mapping[str, Any],
     ) -> _RecoveryInspection:
         """Check live local state without resuming an indeterminate session."""
 
-        if self.rpc is None:
-            return _RecoveryInspection(terminal=None, active=False, status=None)
         profile = task["payload"]["target_profile"]
         with self.turn_lock(profile):
             session = self.rpc.resolve_exact(
@@ -971,17 +974,6 @@ class HostedRoomRuntime:
             ),
             None,
         )
-
-    def _transport_for(
-        self,
-        binding: HostedRoomBinding,
-        task: Mapping[str, Any],
-    ) -> InternalSessionRPC:
-        if self.transport_resolver is not None:
-            return self.transport_resolver(binding, task)
-        if self.rpc is None:  # guarded by __init__
-            raise RuntimeError("hosted room transport is unavailable")
-        return self.rpc
 
     def _resolve_or_create(
         self,
