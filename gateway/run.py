@@ -7146,6 +7146,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._draining = False
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
+        from gateway.admission import AgentAdmissionController
+        _admission_max = getattr(self.config, "max_parallel_agents", None)
+        if _admission_max is None:
+            _admission_max = getattr(self.config, "max_concurrent_sessions", None)
+        self._agent_admission = AgentAdmissionController(
+            max_parallel=_admission_max,
+            min_headroom_mb=getattr(self.config, "min_host_memory_headroom_mb", 0),
+            queue_limit=getattr(self.config, "agent_queue_limit", 32),
+            poll_interval_seconds=getattr(
+                self.config, "admission_poll_interval_seconds", 2.0
+            ),
+        )
+        self._admission_waiting_sessions: set[str] = set()
         # External (NAS-driven) drain state — distinct from the shutdown
         # ``_draining`` flag above. Set by ``_drain_control_watcher`` when the
         # ``.drain_request.json`` marker is present: the gateway flips
@@ -9393,9 +9406,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._active_work_count())
+            admission = getattr(self, "_agent_admission", None)
+            snapshot = admission.snapshot() if admission is not None else None
+            admission_payload = (
+                {
+                    "active_workers": snapshot.active,
+                    "queued_tasks": snapshot.queued,
+                    "max_parallel": snapshot.max_parallel,
+                    "effective_available_memory_mb": snapshot.available_memory_mb,
+                    "host_available_memory_mb": snapshot.host_available_memory_mb,
+                    "cgroup_available_memory_mb": snapshot.cgroup_available_memory_mb,
+                    "min_headroom_mb": snapshot.min_headroom_mb,
+                    "active_task_ids": list(snapshot.active_task_ids),
+                    "queued_task_ids": list(snapshot.queued_task_ids),
+                }
+                if snapshot is not None
+                else {}
+            )
+            write_runtime_status(
+                active_agents=self._active_work_count(),
+                admission=admission_payload,
+            )
         except Exception:
             pass
+
+    async def _send_admission_queue_notice(self, source: Any, message: str) -> None:
+        self._persist_active_agents()
+        await self._send_goal_status_notice(source, message)
 
     # ------------------------------------------------------------------
     # External drain control (NAS-driven quiesce-without-restart, Phase 2).
@@ -15489,6 +15526,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._clear_plugin_message_injector()
             self._draining = True
 
+            admission = getattr(self, "_agent_admission", None)
+            if admission is not None:
+                reconciled = await admission.close(
+                    "Gateway is restarting; this queued task was not started. "
+                    "Please resend after the gateway is back online."
+                )
+                if reconciled:
+                    logger.warning(
+                        "Shutdown reconciled %d queued agent task(s): %s",
+                        len(reconciled),
+                        ", ".join(reconciled),
+                    )
+                self._persist_active_agents()
+
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
                 await stop_watchdog()
@@ -18939,11 +18990,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
+        _admission = getattr(self, "_agent_admission", None)
+        _admission_acquired = False
+        if _admission is not None and not self._is_session_running(_quick_key):
+            from gateway.admission import AdmissionRejected
+            waiting_sessions = getattr(self, "_admission_waiting_sessions", set())
+            if _quick_key in waiting_sessions:
+                return "This session already has a queued task. Use /status to check capacity."
+            waiting_sessions.add(_quick_key)
+            try:
+                await _admission.acquire(
+                    _quick_key,
+                    on_queued=lambda message: self._send_admission_queue_notice(
+                        source, message
+                    ),
+                )
+                _admission_acquired = True
+                self._persist_active_agents()
+            except AdmissionRejected as exc:
+                return str(exc)
+            finally:
+                waiting_sessions.discard(_quick_key)
+
         _active_session_lease, _limit_message = self._claim_active_session_slot(
             _quick_key,
             source,
         )
         if _limit_message is not None:
+            if _admission_acquired:
+                await _admission.release(_quick_key, outcome="lease_rejected")
+                self._persist_active_agents()
             logger.info(
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
@@ -19015,6 +19091,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            if _admission_acquired:
+                await _admission.release(_quick_key)
+                self._persist_active_agents()
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -31929,7 +32008,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 snapshot_shutdown_context,
                 spawn_async_diagnostic,
             )
-            _shutdown_ctx = snapshot_shutdown_context(received_signal)
+            _admission = getattr(runner, "_agent_admission", None)
+            _admission_snapshot = _admission.snapshot() if _admission else None
+            try:
+                from tools.process_registry import process_registry
+                _worker_pids = [
+                    int(session["pid"])
+                    for session in process_registry.list_sessions()
+                    if session.get("pid") and session.get("status") == "running"
+                ]
+            except Exception:
+                _worker_pids = []
+            _shutdown_ctx = snapshot_shutdown_context(
+                received_signal,
+                shutdown_reason=(
+                    "planned_takeover" if planned_takeover else
+                    "planned_stop" if planned_stop else
+                    "unexpected_external_signal"
+                ),
+                active_task_ids=(
+                    list(_admission_snapshot.active_task_ids)
+                    if _admission_snapshot else list(runner._snapshot_running_agents())
+                ),
+                queued_task_ids=(
+                    list(_admission_snapshot.queued_task_ids)
+                    if _admission_snapshot else []
+                ),
+                worker_pids=_worker_pids,
+            )
         except Exception as _e:
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)

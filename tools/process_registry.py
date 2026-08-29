@@ -110,6 +110,7 @@ _SYSTEMD_SCOPE_AVAILABLE: Optional[bool] = None
 _SYSTEMD_SCOPE_PROBE_LOCK = threading.Lock()
 _SYSTEMD_SCOPE_PROBED_AT = 0.0
 _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS = 60.0
+_SYSTEMD_SYSTEM_SCOPE_AVAILABLE: Optional[bool] = None
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
@@ -127,7 +128,19 @@ def _worker_memory_max_bytes() -> int:
     consume memory up to the enclosing user slice or host limit.
     """
     override_bound: Optional[int] = None
-    override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
+    override = ""
+    try:
+        from hermes_cli.config import read_raw_config
+        terminal_cfg = (read_raw_config() or {}).get("terminal", {})
+        configured = terminal_cfg.get("local_memory_max_mb") if isinstance(terminal_cfg, dict) else None
+        if configured is not None:
+            override = str(configured).strip()
+    except Exception:
+        pass
+    # Backward compatibility for deployments that predate the canonical
+    # config key. New installations should use terminal.local_memory_max_mb.
+    if not override:
+        override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
     if override:
         override_valid = False
         try:
@@ -175,6 +188,62 @@ def _worker_memory_max_bytes() -> int:
 
     safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
     return min(override_bound, safe_bound) if override_bound else safe_bound
+
+
+def _worker_cgroup_mode() -> str:
+    try:
+        from hermes_cli.config import read_raw_config
+        terminal_cfg = (read_raw_config() or {}).get("terminal", {})
+        raw = terminal_cfg.get("worker_cgroup_mode", "auto") if isinstance(terminal_cfg, dict) else "auto"
+    except Exception:
+        raw = "auto"
+    mode = str(raw or "auto").strip().lower()
+    return mode if mode in {"auto", "required", "user", "system", "off"} else "auto"
+
+
+def _systemd_run_system_scope_available() -> bool:
+    """Probe the root system manager without granting the worker root."""
+    global _SYSTEMD_SYSTEM_SCOPE_AVAILABLE
+    if _SYSTEMD_SYSTEM_SCOPE_AVAILABLE is not None:
+        return _SYSTEMD_SYSTEM_SCOPE_AVAILABLE
+    available = False
+    try:
+        import shutil
+
+        sudo = shutil.which("sudo")
+        systemd_run = shutil.which("systemd-run")
+        if sudo and systemd_run and not _IS_WINDOWS:
+            user = str(os.getuid())
+            group = str(os.getgid())
+            unit = f"hermes-worker-system-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            result = subprocess.run(
+                [
+                    sudo, "-n", systemd_run, "--system", "--scope", "--quiet",
+                    "--unit", unit, "--collect", "--uid", user, "--gid", group,
+                    "--property", "MemoryAccounting=yes",
+                    "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+                    "--property", "MemorySwapMax=0",
+                    "--", "/bin/true",
+                ],
+                capture_output=True,
+                timeout=3,
+            )
+            available = result.returncode == 0
+    except Exception as exc:
+        logger.debug("systemd system-scope probe error: %s", exc)
+    _SYSTEMD_SYSTEM_SCOPE_AVAILABLE = available
+    return available
+
+
+def _worker_scope_backend() -> Optional[str]:
+    mode = _worker_cgroup_mode()
+    if mode == "off":
+        return None
+    if mode in {"auto", "user", "required"} and _systemd_run_user_scope_available():
+        return "user"
+    if mode in {"system", "required"} and _systemd_run_system_scope_available():
+        return "system"
+    return None
 
 
 def _systemd_run_user_scope_available() -> bool:
@@ -231,7 +300,7 @@ def _systemd_run_user_scope_available() -> bool:
                             "--collect",
                             "--property", "MemoryAccounting=yes",
                             "--property", f"MemoryMax={_worker_memory_max_bytes()}",
-                            "--property", "OOMPolicy=kill",
+                            "--property", "MemorySwapMax=0",
                             "--",
                             "/bin/true",
                         ],
@@ -283,6 +352,7 @@ def _is_supervised_gateway_process() -> bool:
 def _build_systemd_scope_argv(
     shell_argv: List[str],
     unit_suffix: str,
+    backend: str = "user",
 ) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation.
 
@@ -298,11 +368,16 @@ def _build_systemd_scope_argv(
         # Caller should have checked _systemd_run_user_scope_available();
         # guard anyway so we never pass None into Popen.
         return shell_argv
-    unit_name = f"hermes-worker-{unit_suffix}"
+    unit_name = f"hermes-worker-{'system-' if backend == 'system' else ''}{unit_suffix}"
     memory_max = _worker_memory_max_bytes()
-    return [
-        binary,
-        "--user",
+    prefix = [binary, "--user"]
+    if backend == "system":
+        sudo = shutil.which("sudo")
+        if sudo is None:
+            return shell_argv
+        prefix = [sudo, "-n", binary, "--system"]
+    argv = [
+        *prefix,
         "--scope",
         "--quiet",
         "--unit",
@@ -313,10 +388,14 @@ def _build_systemd_scope_argv(
         "--property",
         f"MemoryMax={memory_max}",
         "--property",
-        "OOMPolicy=kill",
-        "--",
-        *shell_argv,
+        f"MemoryHigh={max(_MIN_WORKER_MEMORY_MAX_BYTES, memory_max * 9 // 10)}",
+        "--property",
+        "MemorySwapMax=0",
     ]
+    if backend == "system":
+        argv.extend(["--uid", str(os.getuid()), "--gid", str(os.getgid())])
+    argv.extend(["--", *shell_argv])
+    return argv
 
 
 def _stop_systemd_unit(unit_name: str) -> bool:
@@ -336,9 +415,16 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     binary = shutil.which("systemctl")
     if binary is None:
         return False
+    system_scope = unit_name.startswith("hermes-worker-system-")
+    command = [binary, "--user", "stop", unit_name]
+    if system_scope:
+        sudo = shutil.which("sudo")
+        if sudo is None:
+            return False
+        command = [sudo, "-n", binary, "--system", "stop", unit_name]
     try:
         result = subprocess.run(
-            [binary, "--user", "stop", unit_name],
+            command,
             capture_output=True,
             timeout=15,
         )
@@ -1091,19 +1177,28 @@ class ProcessRegistry:
                 pty_in_supervised_gateway = (
                     not _IS_WINDOWS and _is_supervised_gateway_process()
                 )
+                pty_cgroup_mode = _worker_cgroup_mode()
+                pty_scope_backend = _worker_scope_backend() if pty_in_supervised_gateway else None
                 pty_use_systemd_scope = (
-                    pty_in_supervised_gateway and _systemd_run_user_scope_available()
+                    pty_in_supervised_gateway
+                    and pty_cgroup_mode != "off"
+                    and pty_scope_backend is not None
                 )
 
                 if pty_use_systemd_scope:
                     pty_argv = _build_systemd_scope_argv(
                         pty_argv,
                         unit_suffix=session.id,
+                        backend=pty_scope_backend,
                     )
-                    session.systemd_unit = f"hermes-worker-{session.id}.scope"
+                    session.systemd_unit = f"hermes-worker-{'system-' if pty_scope_backend == 'system' else ''}{session.id}.scope"
                     pty_scope_attempted = True
                 elif pty_in_supervised_gateway:
-                    logger.debug(
+                    if pty_cgroup_mode == "required":
+                        raise RuntimeError(
+                            "Worker cgroup isolation is required but systemd user scopes are unavailable"
+                        )
+                    logger.warning(
                         "PTY background executor not isolated in a "
                         "systemd scope (systemd-run --user unavailable); "
                         "worker shares the gateway cgroup."
@@ -1168,8 +1263,12 @@ class ProcessRegistry:
         # both pipe mode and the PTY path above.
         shell_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
         in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
+        cgroup_mode = _worker_cgroup_mode()
+        scope_backend = _worker_scope_backend() if in_supervised_gateway else None
         use_systemd_scope = (
-            in_supervised_gateway and _systemd_run_user_scope_available()
+            in_supervised_gateway
+            and cgroup_mode != "off"
+            and scope_backend is not None
         )
 
         if use_systemd_scope:
@@ -1179,8 +1278,9 @@ class ProcessRegistry:
             spawn_argv = _build_systemd_scope_argv(
                 shell_argv,
                 unit_suffix=unit_suffix,
+                backend=scope_backend,
             )
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+            session.systemd_unit = f"hermes-worker-{'system-' if scope_backend == 'system' else ''}{unit_suffix}.scope"
             # CRITICAL (#70716 regression): systemd-run --scope does NOT give
             # the worker a new session — the invoked process keeps the
             # parent's session and inherits its controlling terminal.  From an
@@ -1196,10 +1296,14 @@ class ProcessRegistry:
             spawn_argv = shell_argv
             popen_start_new_session = True
             if in_supervised_gateway:
+                if cgroup_mode == "required":
+                    raise RuntimeError(
+                        "Worker cgroup isolation is required but systemd user scopes are unavailable"
+                    )
                 # Running under a supervisor but could not get a private
                 # cgroup — the worker shares the gateway cgroup, so an OOM
                 # in the worker can still kill the whole gateway (#70716).
-                logger.debug(
+                logger.warning(
                     "Local background executor not isolated in a systemd scope "
                     "(in_supervised_gateway=%s, systemd-run --user available=%s); "
                     "worker shares the gateway cgroup.",
