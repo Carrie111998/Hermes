@@ -340,6 +340,61 @@ class TestCustomProviderModelSwitch:
         # The synthesized template is also redundant here — key_env owns it.
         assert "${HERMES_CRS_HENKEE_KEY}" not in saved_text
 
+    def test_builtin_provider_key_keeps_canonical_id(self, config_home):
+        """Regression for #97544: a ``providers:`` entry keyed by a built-in
+        provider id must keep that canonical id on save.
+
+        Before the fix, ``_model_flow_named_custom`` unconditionally wrote
+        ``custom:<key>``. Runtime resolution deliberately skips the built-in
+        lookup for ``custom:``-prefixed ids, so the provider was routed
+        through the generic custom-endpoint path and lost provider-specific
+        credential/transport handling (upstream 401s for ``ollama-cloud``).
+        """
+        import yaml
+        from hermes_cli.main import _model_flow_named_custom
+
+        config_path = config_home / "config.yaml"
+        config_path.write_text(
+            "model:\n"
+            "  default: kimi-k2.7-code\n"
+            "  provider: ollama-cloud\n"
+            "providers:\n"
+            "  ollama-cloud:\n"
+            "    api: https://ollama.com/v1\n"
+            "    default_model: kimi-k2.7-code\n"
+            "custom_providers: []\n"
+        )
+
+        # provider_info as built by _named_custom_provider_map for the
+        # ``providers:`` entry above.
+        provider_info = {
+            "name": "Ollama Cloud",
+            "base_url": "https://ollama.com/v1",
+            "api_key": "",
+            "key_env": "",
+            "model": "kimi-k2.7-code",
+            "api_mode": "",
+            "provider_key": "ollama-cloud",
+            "api_key_ref": "",
+        }
+
+        with patch(
+            "hermes_cli.models.fetch_api_models",
+            return_value=["glm-5.2", "kimi-k2.7-code"],
+        ), \
+             patch("hermes_cli.curses_ui.curses_radiolist", side_effect=ImportError), \
+             patch("builtins.input", return_value="1"), \
+             patch("builtins.print"):
+            _model_flow_named_custom({}, provider_info)
+
+        saved = yaml.safe_load(config_path.read_text()) or {}
+        # The canonical built-in id must survive the switch untouched.
+        assert saved["model"]["provider"] == "ollama-cloud"
+        assert "base_url" not in saved["model"]
+        assert "api_key" not in saved["model"]
+        # The selected model is persisted back to the providers entry.
+        assert saved["providers"]["ollama-cloud"]["default_model"] == "glm-5.2"
+
     @pytest.mark.parametrize(
         "stored_provider",
         [
