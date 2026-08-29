@@ -3820,7 +3820,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             auth_store = _load_auth_store()
     else:
         auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+    state, source_path = _load_provider_state_with_source(auth_store, "openai-codex")
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3855,6 +3855,9 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
+        # Refresh tokens are single-use. Keep the store that supplied this
+        # pair so rotation does not create a profile-local global fallback.
+        "source_path": source_path,
     }
 
 
@@ -3959,12 +3962,24 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: str = None,
+    label: str = None,
+    *,
+    source_path: Optional[Path] = None,
+) -> None:
+    """Save Codex OAuth tokens to the supplied Hermes auth store.
+
+    Explicit login/import callers leave ``source_path`` unset and write to the
+    active Hermes scope. Runtime refresh supplies the store that yielded the
+    token pair, preserving profile/global scope.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    target_path = source_path or _auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         state = _load_provider_state(auth_store, "openai-codex") or {}
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
@@ -3984,23 +3999,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
-
-
-def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
-    """Adopt a valid Codex CLI token pair into Hermes auth, if available."""
-    imported = _import_codex_cli_tokens()
-    # Require BOTH tokens before adopting: persisting a payload without a
-    # usable refresh_token would only break the next refresh cycle.
-    if not (
-        imported
-        and str(imported.get("access_token", "") or "").strip()
-        and str(imported.get("refresh_token", "") or "").strip()
-    ):
-        return None
-    logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported)
-    return dict(imported)
+        _save_auth_store(auth_store, target_path)
 
 
 def refresh_codex_oauth_pure(
@@ -4140,45 +4139,38 @@ def refresh_codex_oauth_pure(
 def _refresh_codex_auth_tokens(
     tokens: Dict[str, str],
     timeout_seconds: float,
+    *,
+    source_path: Optional[Path] = None,
 ) -> Dict[str, str]:
-    """Refresh Codex access token using the refresh token.
-    
-    Saves the new tokens to Hermes auth store automatically.
-    """
-    try:
+    """Refresh a Codex token pair and rotate the auth store that supplied it."""
+    # Serialize against the source store, not merely the active profile. A
+    # global fallback credential may be shared by many profile processes.
+    target_path = source_path or _auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        source_store = _load_auth_store(target_path)
+        providers = source_store.get("providers")
+        source_state = providers.get("openai-codex") if isinstance(providers, dict) else None
+        source_tokens = source_state.get("tokens") if isinstance(source_state, dict) else None
+        if (
+            isinstance(source_tokens, dict)
+            and str(source_tokens.get("access_token", "") or "").strip()
+            and str(source_tokens.get("refresh_token", "") or "").strip()
+            and source_tokens != tokens
+        ):
+            # Another process already consumed and rotated this single-use
+            # chain. Reuse its replacement instead of making a second call.
+            return dict(source_tokens)
+
         refreshed = refresh_codex_oauth_pure(
             str(tokens.get("access_token", "") or ""),
             str(tokens.get("refresh_token", "") or ""),
             timeout_seconds=timeout_seconds,
         )
-    except AuthError as exc:
-        # Self-heal cross-store refresh_token rotation. Hermes keeps its OWN
-        # Codex OAuth token (per profile + top-level), separate from the Codex
-        # CLI's ~/.codex/auth.json. OAuth refresh_tokens are single-use, so when
-        # the Codex CLI (or another Hermes process) rotates the shared token,
-        # this frozen copy's refresh_token goes stale and the refresh fails with
-        # a relogin-required error (invalid_grant / refresh_token_reused / 401).
-        # Before surfacing that as a hard 401 to the turn, adopt the canonical
-        # fresh token from ~/.codex/auth.json (the Codex CLI keeps it current) so
-        # idle profiles / desktop sessions recover automatically instead of
-        # 401'ing until a manual re-auth. Transient failures (e.g. 429 quota)
-        # keep relogin_required=False — the stored token is still valid there, so
-        # we never self-heal those and re-raise unchanged.
-        if not getattr(exc, "relogin_required", False):
-            raise
-        imported = _recover_codex_tokens_from_cli(
-            f"refresh_token rejected: {getattr(exc, 'code', None) or 'auth_error'}"
-        )
-        if not imported:
-            raise
-        return imported
-
-    updated_tokens = dict(tokens)
-    updated_tokens["access_token"] = refreshed["access_token"]
-    updated_tokens["refresh_token"] = refreshed["refresh_token"]
-
-    _save_codex_tokens(updated_tokens)
-    return updated_tokens
+        updated_tokens = dict(tokens)
+        updated_tokens["access_token"] = refreshed["access_token"]
+        updated_tokens["refresh_token"] = refreshed["refresh_token"]
+        _save_codex_tokens(updated_tokens, source_path=target_path)
+        return updated_tokens
 
 
 def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
@@ -4237,18 +4229,7 @@ def resolve_codex_runtime_credentials(
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
-            if imported:
-                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
-            else:
-                data = None
-        else:
-            data = None
+        data = None
 
     if data is None:
         pool_token = _pool_codex_access_token()
@@ -4341,7 +4322,11 @@ def resolve_codex_runtime_credentials(
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                tokens = _refresh_codex_auth_tokens(
+                    tokens,
+                    refresh_timeout_seconds,
+                    source_path=data.get("source_path"),
+                )
                 access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (

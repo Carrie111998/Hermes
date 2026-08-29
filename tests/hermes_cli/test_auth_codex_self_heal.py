@@ -1,13 +1,10 @@
-"""Regression tests for Codex refresh_token self-heal (cross-store rotation).
+"""Regression tests for Codex OAuth store isolation.
 
-Hermes keeps its OWN copy of the Codex OAuth token (per profile + top-level),
-separate from the Codex CLI's ``~/.codex/auth.json``. OAuth refresh_tokens are
-single-use, so when the Codex CLI (or another Hermes process) rotates the shared
-token, the frozen copy's refresh_token goes stale and ``refresh_codex_oauth_pure``
-fails with a relogin-required error. ``_refresh_codex_auth_tokens`` must then
-recover by re-importing the canonical token from ``~/.codex/auth.json`` instead of
-surfacing a hard 401 — but ONLY for relogin-required failures, never for transient
-ones (e.g. 429 quota, where the stored token is still valid).
+Hermes runtime credentials are scoped to the Hermes auth store they came from:
+a profile-local store or the global fallback store. Codex CLI credentials are
+only adopted by the explicit interactive import/login flow; runtime resolution
+must never copy ``~/.codex/auth.json`` into a Hermes profile because OAuth
+refresh tokens are single-use.
 """
 
 import json
@@ -20,15 +17,21 @@ from hermes_cli.auth import AuthError, _refresh_codex_auth_tokens, resolve_codex
 STALE = {"access_token": "stale-access", "refresh_token": "stale-refresh"}
 
 
-def test_self_heals_on_stale_refresh_token(monkeypatch):
-    """invalid_grant (relogin-required) → reimport from ~/.codex and persist it."""
-    saved = {}
-    fresh = {
-        "access_token": "fresh-access",
-        "refresh_token": "fresh-refresh",
-        "last_refresh": "2026-06-12T00:00:00Z",
+def _store(tokens):
+    return {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": dict(tokens),
+                "last_refresh": "2026-06-01T00:00:00Z",
+                "auth_mode": "chatgpt",
+            },
+        },
     }
 
+
+def test_rejected_refresh_does_not_adopt_codex_cli_tokens(monkeypatch):
+    """Runtime failures require explicit Hermes re-auth, never a CLI import."""
     def _rejected(*_a, **_k):
         raise AuthError(
             "refresh token rejected",
@@ -38,57 +41,96 @@ def test_self_heals_on_stale_refresh_token(monkeypatch):
         )
 
     monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
-    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: dict(fresh))
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
+    monkeypatch.setattr(
+        auth,
+        "_import_codex_cli_tokens",
+        lambda: pytest.fail("runtime refresh must not import Codex CLI credentials"),
+    )
 
-    out = _refresh_codex_auth_tokens(STALE, 20.0)
-
-    assert out["access_token"] == "fresh-access"
-    assert out["refresh_token"] == "fresh-refresh"
-    # the recovered token was persisted to the Hermes auth store
-    assert saved["access_token"] == "fresh-access"
-
+    with pytest.raises(AuthError, match="refresh token rejected"):
+        _refresh_codex_auth_tokens(STALE, 20.0)
 
 
-
-
-
-
-
-
-
-def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monkeypatch):
-    """Exact cron failure path: Hermes auth has refresh_token but missing access_token."""
+def test_missing_profile_token_does_not_adopt_codex_cli_tokens(tmp_path, monkeypatch):
+    """A malformed profile store stays malformed until explicit auth/import."""
     hermes_home = tmp_path / "hermes"
     codex_home = tmp_path / "codex"
     hermes_home.mkdir()
     codex_home.mkdir()
-    (hermes_home / "auth.json").write_text(json.dumps({
-        "version": 1,
-        "providers": {
-            "openai-codex": {
-                "tokens": {"refresh_token": "stale-refresh"},
-                "last_refresh": "2026-06-01T00:00:00Z",
-                "auth_mode": "chatgpt",
-            },
-        },
-    }))
+    (hermes_home / "auth.json").write_text(json.dumps(_store({"refresh_token": "stale-refresh"})))
     (codex_home / "auth.json").write_text(json.dumps({
-        "tokens": {
-            "access_token": "fresh-access",
-            "refresh_token": "fresh-refresh",
-        },
+        "tokens": {"access_token": "cli-access", "refresh_token": "cli-refresh"},
     }))
+    before = (hermes_home / "auth.json").read_text()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-    resolved = resolve_codex_runtime_credentials()
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
 
-    assert resolved["api_key"] == "fresh-access"
-    assert resolved["source"] == "hermes-auth-store"
-    stored = json.loads((hermes_home / "auth.json").read_text())
-    tokens = stored["providers"]["openai-codex"]["tokens"]
-    assert tokens["access_token"] == "fresh-access"
-    assert tokens["refresh_token"] == "fresh-refresh"
+    assert exc.value.code == "codex_auth_missing_access_token"
+    assert (hermes_home / "auth.json").read_text() == before
 
 
+def test_refresh_keeps_profile_local_source_store(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "darla"
+    global_home = tmp_path / "global"
+    profile_home.mkdir(parents=True)
+    global_home.mkdir()
+    (profile_home / "auth.json").write_text(json.dumps(_store(STALE)))
+    (global_home / "auth.json").write_text(json.dumps(_store({
+        "access_token": "global-access", "refresh_token": "global-refresh",
+    })))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: global_home / "auth.json")
+    monkeypatch.setattr(auth, "_load_global_auth_store", lambda: json.loads((global_home / "auth.json").read_text()))
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", lambda *_a, **_k: {
+        "access_token": "profile-fresh", "refresh_token": "profile-rotated",
+    })
+
+    resolved = resolve_codex_runtime_credentials(force_refresh=True)
+
+    assert resolved["api_key"] == "profile-fresh"
+    assert json.loads((profile_home / "auth.json").read_text())["providers"]["openai-codex"]["tokens"]["refresh_token"] == "profile-rotated"
+    assert json.loads((global_home / "auth.json").read_text())["providers"]["openai-codex"]["tokens"]["refresh_token"] == "global-refresh"
+
+
+def test_global_fallback_refreshes_global_source_store(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "darla"
+    global_home = tmp_path / "global"
+    profile_home.mkdir(parents=True)
+    global_home.mkdir()
+    (profile_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    (global_home / "auth.json").write_text(json.dumps(_store(STALE)))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: global_home / "auth.json")
+    monkeypatch.setattr(auth, "_load_global_auth_store", lambda: json.loads((global_home / "auth.json").read_text()))
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", lambda *_a, **_k: {
+        "access_token": "global-fresh", "refresh_token": "global-rotated",
+    })
+
+    resolved = resolve_codex_runtime_credentials(force_refresh=True)
+
+    assert resolved["api_key"] == "global-fresh"
+    assert "openai-codex" not in json.loads((profile_home / "auth.json").read_text())["providers"]
+    assert json.loads((global_home / "auth.json").read_text())["providers"]["openai-codex"]["tokens"]["refresh_token"] == "global-rotated"
+
+
+def test_concurrent_global_fallback_reuses_rotated_source_token(tmp_path, monkeypatch):
+    """A second reader must observe the first writer's rotation, not reuse it."""
+    global_auth = tmp_path / "auth.json"
+    global_auth.write_text(json.dumps(_store(STALE)))
+    calls = []
+
+    def _refresh(*_a, **_k):
+        calls.append(1)
+        return {"access_token": "rotated-access", "refresh_token": "rotated-refresh"}
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _refresh)
+
+    first = _refresh_codex_auth_tokens(STALE, 20.0, source_path=global_auth)
+    second = _refresh_codex_auth_tokens(STALE, 20.0, source_path=global_auth)
+
+    assert first["refresh_token"] == "rotated-refresh"
+    assert second["refresh_token"] == "rotated-refresh"
+    assert len(calls) == 1
