@@ -27,6 +27,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
 | **Kimi / Moonshot (China)** | `KIMI_CN_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding-cn`; aliases: `kimi-cn`, `moonshot-cn`) |
 | **Arcee AI** | `ARCEEAI_API_KEY` in `~/.hermes/.env` (provider: `arcee`; aliases: `arcee-ai`, `arceeai`) |
+| **Melious** | `MELIOUS_API_KEY` in `~/.hermes/.env` (provider: `melious`; alias: `melious-ai`) — open-weight models on European infrastructure (GDPR/TTDSG), including Hermes 4 |
 | **GMI Cloud** | `GMI_API_KEY` in `~/.hermes/.env` (provider: `gmi`; aliases: `gmi-cloud`, `gmicloud`) |
 | **Actual Computer** | `ACTUAL_API_KEY` in `~/.hermes/.env` for the hosted relay, or `ACTUAL_BASE_URL=http://127.0.0.1:8080` for the local daemon — no key needed on loopback (provider: `actual`; aliases: `actual-computer`, `actualcomputer`, `aci`) |
 | **MiniMax** | `MINIMAX_API_KEY` in `~/.hermes/.env` (provider: `minimax`) |
@@ -297,6 +298,10 @@ hermes chat --provider meta-ai --model muse-spark-1.2
 # Use the exact model ID returned by GMI's /v1/models endpoint.
 hermes chat --provider gmi --model zai-org/GLM-5.1-FP8
 # Requires: GMI_API_KEY in ~/.hermes/.env
+
+# Melious (European infrastructure, GDPR/TTDSG)
+hermes chat --provider melious --model hermes-4-405b
+# Requires: MELIOUS_API_KEY in ~/.hermes/.env
 ```
 
 Fireworks uses its native slash-form catalog IDs, such as `accounts/fireworks/models/kimi-k2p6`. Run `hermes model`, choose **Fireworks AI**, and select from the live catalog or enter another Fireworks model ID. The default endpoint is `https://api.fireworks.ai/inference/v1`; configure a different endpoint through `model.base_url` in `config.yaml`, not `.env`.
@@ -308,7 +313,11 @@ model:
   default: "zai-org/GLM-5.1-FP8"
 ```
 
-Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, `META_BASE_URL`, or `TOKENHUB_BASE_URL` environment variables.
+Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, `MELIOUS_BASE_URL`, `META_BASE_URL`, or `TOKENHUB_BASE_URL` environment variables.
+
+:::note Melious model catalog
+Melious serves embedding, image, audio, and guardrail models from the same `/v1/models` endpoint as its chat models. Hermes filters the catalog to chat models that support tool calling, so `hermes model` lists only what an agent can actually run. `hermes-4-405b` and `hermes-4-70b` are Nous Research's own Hermes 4 weights, served in the EU.
+:::
 
 :::note Meta contributor tier
 `muse-spark-1.2-contributor` is Meta's discounted tier — Meta may train on your prompts and completions, so [interactive model selection asks for confirmation](../user-guide/configuring-models.md) before using it. Use `muse-spark-1.2` (standard pricing, no training) for confidential work.

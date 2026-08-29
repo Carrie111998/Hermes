@@ -400,6 +400,9 @@ ALIASES: Dict[str, str] = {
     # upstage
     "solar": "upstage",
 
+    # melious
+    "melious-ai": "melious",
+
     # Actual Computer
     "actual-computer": "actual",
     "actualcomputer": "actual",

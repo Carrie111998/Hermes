@@ -48,6 +48,8 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `KILOCODE_BASE_URL` | 覆盖 Kilo Code base URL（默认：`https://api.kilo.ai/api/gateway`） |
 | `XIAOMI_API_KEY` | 小米 MiMo API 密钥（[platform.xiaomimimo.com](https://platform.xiaomimimo.com)） |
 | `XIAOMI_BASE_URL` | 覆盖小米 MiMo base URL（默认：`https://api.xiaomimimo.com/v1`） |
+| `MELIOUS_API_KEY` | Melious API 密钥——部署在欧洲基础设施上的开放权重模型，符合 GDPR/TTDSG（[melious.ai/account/api/keys](https://melious.ai/account/api/keys)） |
+| `MELIOUS_BASE_URL` | 覆盖 Melious base URL（默认：`https://api.melious.ai/v1`） |
 | `TOKENHUB_API_KEY` | 腾讯 TokenHub API 密钥（[tokenhub.tencentmaas.com](https://tokenhub.tencentmaas.com)） |
 | `TOKENHUB_BASE_URL` | 覆盖腾讯 TokenHub base URL（默认：`https://tokenhub.tencentmaas.com/v1`） |
 | `AZURE_FOUNDRY_API_KEY` | Microsoft Foundry / Azure OpenAI API 密钥（[ai.azure.com](https://ai.azure.com/)）。当 `model.auth_mode: entra_id` 时不需要 |

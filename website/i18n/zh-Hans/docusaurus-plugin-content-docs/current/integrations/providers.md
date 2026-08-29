@@ -27,6 +27,7 @@ sidebar_position: 1
 | **Kimi / Moonshot（中国）** | `~/.hermes/.env` 中的 `KIMI_CN_API_KEY`（provider: `kimi-coding-cn`；别名：`kimi-cn`、`moonshot-cn`） |
 | **Arcee AI** | `~/.hermes/.env` 中的 `ARCEEAI_API_KEY`（provider: `arcee`；别名：`arcee-ai`、`arceeai`） |
 | **GMI Cloud** | `~/.hermes/.env` 中的 `GMI_API_KEY`（provider: `gmi`；别名：`gmi-cloud`、`gmicloud`） |
+| **Melious** | `~/.hermes/.env` 中的 `MELIOUS_API_KEY`（provider: `melious`；别名：`melious-ai`）——部署在欧洲基础设施上的开放权重模型（符合 GDPR/TTDSG），包含 Hermes 4 |
 | **MiniMax** | `~/.hermes/.env` 中的 `MINIMAX_API_KEY`（provider: `minimax`） |
 | **MiniMax 中国** | `~/.hermes/.env` 中的 `MINIMAX_CN_API_KEY`（provider: `minimax-cn`） |
 | **xAI（Grok）— Responses API** | `~/.hermes/.env` 中的 `XAI_API_KEY`（provider: `xai`） |
@@ -246,6 +247,10 @@ hermes chat --provider arcee --model trinity-large-thinking
 # 使用 GMI /v1/models 端点返回的精确模型 ID。
 hermes chat --provider gmi --model zai-org/GLM-5.1-FP8
 # 需要：~/.hermes/.env 中的 GMI_API_KEY
+
+# Melious（欧洲基础设施，符合 GDPR/TTDSG）
+hermes chat --provider melious --model hermes-4-405b
+# 需要：~/.hermes/.env 中的 MELIOUS_API_KEY
 ```
 
 或在 `config.yaml` 中永久设置提供商：
@@ -255,7 +260,11 @@ model:
   default: "zai-org/GLM-5.1-FP8"
 ```
 
-基础 URL 可通过 `NOVITA_BASE_URL`、`GLM_BASE_URL`、`KIMI_BASE_URL`、`MINIMAX_BASE_URL`、`MINIMAX_CN_BASE_URL`、`DASHSCOPE_BASE_URL`、`XIAOMI_BASE_URL`、`GMI_BASE_URL` 或 `TOKENHUB_BASE_URL` 环境变量覆盖。
+基础 URL 可通过 `NOVITA_BASE_URL`、`GLM_BASE_URL`、`KIMI_BASE_URL`、`MINIMAX_BASE_URL`、`MINIMAX_CN_BASE_URL`、`DASHSCOPE_BASE_URL`、`XIAOMI_BASE_URL`、`GMI_BASE_URL`、`MELIOUS_BASE_URL` 或 `TOKENHUB_BASE_URL` 环境变量覆盖。
+
+:::note Melious 模型目录
+Melious 的嵌入、图像、音频和护栏模型与聊天模型共用同一个 `/v1/models` 端点。Hermes 会把目录过滤为支持工具调用的聊天模型，因此 `hermes model` 只列出智能体真正能用的模型。`hermes-4-405b` 和 `hermes-4-70b` 是 Nous Research 自家的 Hermes 4 权重，在欧盟境内提供服务。
+:::
 
 :::note Z.AI 端点自动检测
 使用 Z.AI / GLM 提供商时，Hermes 会自动探测多个端点（全球版、中国版、编程版）以找到接受你 API key 的端点。无需手动设置 `GLM_BASE_URL`——可用端点会被自动检测并缓存。

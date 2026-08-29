@@ -1,0 +1,5 @@
+name: melious-provider
+kind: model-provider
+version: 1.0.0
+description: Melious — open-weight models on European infrastructure (GDPR/TTDSG)
+author: Melious
