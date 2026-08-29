@@ -58,6 +58,10 @@ export interface PreviewServerRestart {
 export type PreviewRecordSource = 'explicit-link' | 'file-browser' | 'manual' | 'tool-result'
 
 export interface PreviewTab {
+  /** Opened by the agent, and so the tab it browses in. The agent re-uses this
+   *  tab across a whole task instead of stacking one per navigation, and never
+   *  reaches for a tab without it — see `browserTabId`. */
+  agent?: boolean
   id: RightRailTabId
   target: PreviewTarget
 }
@@ -354,8 +358,19 @@ function mintBrowserTabId(): RightRailTabId {
 /** The Browser a URL should open in: the one you're looking at, else the one
  *  you used last. A link from chat navigates the browser you already have
  *  rather than stacking another identical tab — new tabs are something you
- *  ask for (the strip's "+"), the way they are in a real browser. */
-function browserTabId(tabs: PreviewTab[]): RightRailTabId {
+ *  ask for (the strip's "+"), the way they are in a real browser.
+ *
+ *  THE AGENT IS NOT YOU. Re-using "the tab you're looking at" is right for a
+ *  link you clicked and wrong for a tool call: it silently replaced the page
+ *  the person was reading with wherever the agent went next (#93190). So an
+ *  agent open resolves against the agent's OWN tab and mints one when it has
+ *  none — it browses beside you rather than over you. It still re-uses that
+ *  one tab across a task, because a tab per navigation would bury the strip. */
+function browserTabId(tabs: PreviewTab[], source: PreviewRecordSource): RightRailTabId {
+  if (source === 'tool-result') {
+    return tabs.findLast(tab => isBrowserTab(tab) && tab.agent)?.id ?? mintBrowserTabId()
+  }
+
   const active = tabs.find(tab => tab.id === $rightRailActiveTabId.get())
 
   if (active && isBrowserTab(active)) {
@@ -385,9 +400,13 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
 export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual') {
   const resolved = previewTargetForSource(target, source)
   const current = $previewTabs.get()
-  const id = resolved.kind === 'url' ? browserTabId(current) : previewTabId(resolved)
+  const id = resolved.kind === 'url' ? browserTabId(current, source) : previewTabId(resolved)
   const index = current.findIndex(tab => tab.id === id)
-  const tab: PreviewTab = { id, target: resolved }
+  // Ownership is the tab's, not the target's: it decides who may navigate this
+  // tab later, so it has to outlive the open that created it. Sticky, because a
+  // person opening a link in the agent's tab is visiting, not taking it over.
+  const owned = current[index]?.agent || (resolved.kind === 'url' && source === 'tool-result')
+  const tab: PreviewTab = owned ? { agent: true, id, target: resolved } : { id, target: resolved }
 
   $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
   selectRightRailTab(id)
