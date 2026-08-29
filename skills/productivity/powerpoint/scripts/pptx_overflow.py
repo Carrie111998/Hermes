@@ -1,10 +1,11 @@
-"""Text-overflow estimation for pptx body placeholders.
+"""Nominal text-capacity estimation for pptx body placeholders.
 
-python-pptx cannot measure rendered text, and rendered overflow is silent:
-the outline reads fine while PowerPoint clips whatever extends past the
-placeholder frame. This module provides a conservative *estimate* of the
-rendered height of bullet text in a body placeholder so callers (and the
-agent) get an explicit warning instead of a silently clipped slide.
+python-pptx cannot measure rendered text, and overfilling a placeholder is
+silent in the outline. PowerPoint normally auto-shrinks fixed-placeholder
+text to fit; other renderers or templates may clip it. This module provides
+a conservative *estimate* of the unscaled rendered height of bullet text so
+callers (and the agent) get an explicit warning before either failure mode
+produces an unreadable slide.
 
 The estimate is heuristic on purpose: it uses per-character width factors
 (no font files needed) and mirrors the default python-pptx template's
@@ -138,8 +139,10 @@ def estimate_bullets_overflow(bullets, frame_width_in=None,
     title_content body placeholder (9.0in wide x 4.95in tall).
 
     Returns None when there is nothing to report (no bullets, no known
-    frame, or the estimate fits), otherwise a dict with the estimated
-    vs. fitted heights and a remediation hint.
+    frame, or the unscaled estimate fits), otherwise a dict with the
+    estimated vs. fitted heights and a remediation hint. The warning is a
+    nominal-capacity guardrail: PowerPoint may shrink the text rather than
+    clip it, so callers must verify the rendered slide.
     """
     # Default template content placeholder: 9.0in wide x 4.95in tall.
     width_in = frame_width_in if frame_width_in else 9.0
@@ -160,15 +163,15 @@ def estimate_bullets_overflow(bullets, frame_width_in=None,
 
     # Usable frame height subtracts the 0.05in top/bottom text insets.
     # Warn slightly BEFORE the theoretical fit (2% early) so borderline
-    # slides surface instead of silently clipping.
+    # overfill surfaces instead of silently shrinking or clipping.
     fitted = max(height_in * 72.0 - 0.1 * 72.0, 1.0)
     if total <= fitted * 0.98:
         return None
     return {
         "estimated_text_height_pt": round(total, 1),
         "frame_usable_height_pt": round(fitted, 1),
-        "hint": ("content likely overflows the body placeholder and will be "
-                 "clipped in PowerPoint; verify with a render, then split "
-                 "across slides, shorten bullets, or set smaller per-bullet "
-                 "\"size\" values"),
+        "hint": ("content exceeds the body placeholder's nominal text "
+                 "capacity and may be auto-shrunk or clipped; verify with a "
+                 "render, then split across slides, shorten bullets, or set "
+                 "smaller per-bullet \"size\" values"),
     }

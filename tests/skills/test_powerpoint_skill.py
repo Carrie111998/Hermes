@@ -1,5 +1,5 @@
 """Tests for the pptx overflow estimator (issue #91967: pptx_create.py
-silently clips dense bullet text past the body placeholder).
+silently overfills dense body-placeholder content).
 
 Behavior contracts, not snapshots: assertions pin relations that must
 hold (warnings fire on known-overflow corpora, stay silent on known-safe
@@ -22,6 +22,7 @@ SCRIPTS = SKILL / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from pptx_overflow import (  # noqa: E402
+    INHERITED_INDENT_IN,
     INHERITED_SIZE_PT,
     effective_size_pt,
     estimate_bullets_overflow,
@@ -65,6 +66,29 @@ def test_inherited_sizes_match_default_master():
         assert actual == size, (
             f"level {level}: estimator assumes {size}pt, master says "
             f"{actual}pt — update INHERITED_SIZE_PT")
+        actual_indent = int(lvl.get("marL")) / 914400.0
+        assert actual_indent == pytest.approx(
+            INHERITED_INDENT_IN[level], abs=0.0001
+        ), (
+            f"level {level}: estimator assumes "
+            f"{INHERITED_INDENT_IN[level]}in, master says "
+            f"{actual_indent}in — update INHERITED_INDENT_IN"
+        )
+
+
+def test_title_content_layout_does_not_override_master_body_levels():
+    # The estimator uses master bodyStyle sizes/indents only for this
+    # layout. Pin the OOXML cascade assumption: its content placeholder's
+    # list style must not introduce per-level overrides.
+    prs = Presentation()
+    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+          "p": "http://schemas.openxmlformats.org/presentationml/2006/main"}
+    body = next(ph for ph in prs.slide_layouts[1].placeholders
+                if ph.placeholder_format.idx == 1)
+    layout_style = body._element.find("p:txBody/a:lstStyle", ns)
+    assert layout_style is not None
+    assert not any(child.tag.rsplit("}", 1)[-1].startswith("lvl")
+                   for child in layout_style)
 
 
 def test_effective_size_uses_level_inheritance_when_unspecified():
@@ -164,7 +188,7 @@ def test_dense_slide_warns_with_heights_ordered():
     est = estimate_bullets_overflow(bullets)
     assert est is not None
     assert est["estimated_text_height_pt"] > est["frame_usable_height_pt"]
-    assert "hint" in est
+    assert "auto-shrunk or clipped" in est["hint"]
 
 
 def test_smaller_font_monotonically_reduces_estimate():
