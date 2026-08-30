@@ -60,6 +60,21 @@ while [ $# -gt 0 ]; do
 done
 [ "$SELF_TEST_UI" -eq 1 ] || [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
 
+# Interpreter-poison guard: the Desktop app's process chain can carry
+# __PYVENV_LAUNCHER__ / PYTHONHOME / PYTHONPATH (a venv python propagates the
+# first to its children; the others ride inherited shells). Inside this
+# hand-off every interpreter must resolve against INSTALL_ROOT's own venv —
+# the shim server, the venv python helpers below, and `hermes update` itself
+# — and a poisoned var makes them resolve against a foreign prefix instead:
+# "Could not find platform dependent libraries <exec_prefix>" then
+# ModuleNotFoundError from venv/bin/hermes before a single byte is fetched,
+# twice per attempt (2026-08-22..24 macOS fleet: Desktop-initiated updates
+# died exit 1 on the first try AND its retry, while terminal `hermes update`
+# through ~/.local/bin/hermes — which unsets exactly this trio since
+# 2026-08-22 — kept working). Unset BEFORE the setsid re-exec so the detached
+# orchestrator inherits an already-clean environment.
+unset __PYVENV_LAUNCHER__ PYTHONHOME PYTHONPATH
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}"
 HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
