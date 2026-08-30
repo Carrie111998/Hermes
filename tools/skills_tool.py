@@ -1285,8 +1285,9 @@ def skill_view(
 
         # Explicit-path lookups (e.g. ".archive/2026-08/old-skill") may address
         # excluded storage dirs for one-off previews; bare names never resolve
-        # into excluded dirs (.archive/.library/...).
-        _explicit_lookup = "/" in name or "\\" in name or name.startswith(".")
+        # into excluded dirs (.archive/.library/...). A path separator is what
+        # makes a lookup "explicit" — a bare dot-prefixed name is still a name.
+        _explicit_lookup = "/" in name or "\\" in name
 
         for search_dir in all_dirs:
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"

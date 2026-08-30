@@ -91,6 +91,12 @@ class TestSkillViewExcludedByName:
         assert result["success"] is True
         assert "Archived" in result.get("content", "")
 
+    def test_root_excluded_dir_names_not_resolved(self, fake_skills):
+        """The excluded dirs themselves are not addressable as bare names."""
+        for bare in (".archive", ".library"):
+            result = json.loads(skill_view(bare))
+            assert result["success"] is False, bare
+
     def test_skill_view_file_path_restricted_inside_excluded_dir(self, fake_skills):
         """file_path within an explicitly-addressed excluded skill stays inside it."""
         result = json.loads(
