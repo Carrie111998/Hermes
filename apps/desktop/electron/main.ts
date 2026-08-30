@@ -121,6 +121,7 @@ import {
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview,
+  withRegistryBackendScope,
   withTransientRetries
 } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
@@ -11127,11 +11128,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
   })
 
   if (primary) {
-    return {
-      ...primary,
-      profile: profileKey,
-      connectionId: id
-    }
+    return withRegistryBackendScope(primary, profileKey, id, source.kind)
   }
 
   // The v1 primary and the registry primary can describe the same remote
@@ -11144,11 +11141,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     const primaryDescriptor = await ensureBackend(profile)
 
     if (registrySourceOwnsPrimaryBackend(registry, id, primaryDescriptor)) {
-      return {
-        ...primaryDescriptor,
-        profile: profileKey,
-        connectionId: id
-      }
+      return withRegistryBackendScope(primaryDescriptor, profileKey, id, source.kind)
     }
   }
 
@@ -11334,17 +11327,20 @@ async function connectRegistryBackend(
 
     poolEntry.remoteBaseUrl = connection.baseUrl
 
-    return {
-      ...connection,
-      profile: profileKey,
-      connectionId: source.id,
-      // The remote process runs as this profile; the desktop-side profile key
-      // is only the routing label. hermes:api uses it to translate explicit
-      // self-profile query filters into the backend's namespace.
-      remoteProfile: sshConfig.remoteProfile || '',
-      logs: hermesLog.slice(-80),
-      ...getWindowState()
-    }
+    return withRegistryBackendScope(
+      {
+        ...connection,
+        // The remote process runs as this profile; the desktop-side profile key
+        // is only the routing label. hermes:api uses it to translate explicit
+        // self-profile query filters into the backend's namespace.
+        remoteProfile: sshConfig.remoteProfile || '',
+        logs: hermesLog.slice(-80),
+        ...getWindowState()
+      },
+      profileKey,
+      source.id,
+      source.kind
+    )
   }
 
   // remote / cloud: one gateway host serves every profile of that source,
@@ -11366,16 +11362,16 @@ async function connectRegistryBackend(
   await waitForHermes(connection.baseUrl, connection.token, undefined, connection.authMode, connection.headers)
   poolEntry.remoteBaseUrl = connection.baseUrl
 
-  return {
-    ...connection,
-    profile: profileKey,
-    connectionId: source.id,
-    // One host, many profiles: REST paths must carry ?profile= (same contract
-    // as the global-remote shared-primary route).
-    sharedRemote: true,
-    logs: hermesLog.slice(-80),
-    ...getWindowState()
-  }
+  return withRegistryBackendScope(
+    {
+      ...connection,
+      logs: hermesLog.slice(-80),
+      ...getWindowState()
+    },
+    profileKey,
+    source.id,
+    source.kind
+  )
 }
 
 // Restore one scope while its connection-wide managed-update gate is still

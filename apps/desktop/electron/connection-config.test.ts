@@ -51,6 +51,7 @@ import {
   savedProfileSsh,
   tokenPreview,
   translateSelfProfileQuery,
+  withRegistryBackendScope,
   withTransientRetries
 } from './connection-config'
 
@@ -511,6 +512,44 @@ test('pathForRegistryBackendRequest uses the resolved registry backend scope', (
       { remoteProfile: 'remote-research' }
     ),
     '/api/profiles/sessions/sidebar?recents_profile=remote-research&recents_exclude=cron%2Cdesktop'
+  )
+})
+
+test('registry remote descriptors preserve request profile scope across primary reuse', () => {
+  for (const kind of ['remote', 'cloud'] as const) {
+    const descriptor = withRegistryBackendScope(
+      { baseUrl: 'https://shared.example', mode: 'remote' },
+      'architect',
+      'shared-primary',
+      kind
+    )
+
+    assert.equal(descriptor.profile, 'architect')
+    assert.equal(descriptor.connectionId, 'shared-primary')
+    assert.equal(descriptor.sharedRemote, true)
+    assert.equal(
+      pathForRegistryBackendRequest('/api/model/options', 'architect', descriptor),
+      '/api/model/options?profile=architect'
+    )
+    assert.equal(
+      pathForRegistryBackendRequest('/api/model/auxiliary', 'coder', descriptor),
+      '/api/model/auxiliary?profile=coder'
+    )
+  }
+})
+
+test('registry SSH descriptors remain backend-scoped when reused', () => {
+  const descriptor = withRegistryBackendScope(
+    { mode: 'remote', remoteProfile: 'default' },
+    'architect',
+    'ssh-primary',
+    'ssh'
+  )
+
+  assert.equal(descriptor.sharedRemote, undefined)
+  assert.equal(
+    pathForRegistryBackendRequest('/api/model/options?profile=architect', 'architect', descriptor),
+    '/api/model/options?profile=default'
   )
 })
 

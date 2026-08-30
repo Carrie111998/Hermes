@@ -835,6 +835,30 @@ export interface RegistryBackendRequestScope {
   sharedRemote?: boolean
 }
 
+type RegistryConnectionKind = 'cloud' | 'local' | 'remote' | 'ssh'
+
+/**
+ * Qualify a registry backend descriptor with both routing identity and request
+ * scope. Remote/cloud registry sources are shared gateways, including when the
+ * registry primary reuses the already-running legacy descriptor; SSH and local
+ * descriptors already belong to one backend profile.
+ */
+function withRegistryBackendScope<T extends object>(
+  backend: T,
+  profile: null | string,
+  connectionId: string,
+  sourceKind: RegistryConnectionKind
+) {
+  const requestScope = sourceKind === 'remote' || sourceKind === 'cloud' ? { sharedRemote: true as const } : {}
+
+  return {
+    ...backend,
+    profile: String(profile ?? '').trim() || 'default',
+    connectionId,
+    ...requestScope
+  }
+}
+
 /**
  * Scope a REST path for a resolved registry backend. Shared remotes serve
  * multiple profiles from one process and need an explicit profile query;
@@ -1039,5 +1063,6 @@ export {
   savedProfileSsh,
   tokenPreview,
   translateSelfProfileQuery,
+  withRegistryBackendScope,
   withTransientRetries
 }
