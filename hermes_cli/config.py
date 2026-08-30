@@ -1896,7 +1896,11 @@ def get_custom_provider_context_length(
     Matches any entry whose normalized route identity equals ``base_url`` and
     returns ``custom_providers[i].models.<model>.context_length`` if present and
     valid; when the per-model key is absent, falls back to the matched entry's
-    provider-level ``context_length``.  Returns ``None`` when neither applies.
+    provider-level ``context_length``, provided the entry either declares no
+    ``model`` pin or its pin equals ``model`` (a pinned entry is scoped to its
+    own id, so sibling models on the same route cannot inherit it).  Values are
+    accepted only as true positive integers — ``bool`` is rejected because it
+    is an ``int`` subclass in Python.  Returns ``None`` when neither applies.
 
     This is the single source of truth for custom-provider context overrides,
     used by:
@@ -1946,8 +1950,19 @@ def get_custom_provider_context_length(
             # fallback the /model-switch re-derivation — which consults this
             # helper instead of ``model.context_length`` — silently drops the
             # user's override and lands on the hardcoded catalog (#98387).
+            # An entry that pins a specific ``model`` is scoped to that id:
+            # its entry-level value must not leak into a sibling model that
+            # merely shares the same normalized route.
+            declared = entry.get("model")
+            if isinstance(declared, str) and declared and declared != model:
+                continue
             raw_ctx = entry.get("context_length")
         if raw_ctx is None:
+            continue
+        if isinstance(raw_ctx, bool):
+            # bool is an int subclass: int(True) == 1 would silently turn a
+            # true/false typo into a 1-token (or 0) context window instead
+            # of falling through to the catalog chain.
             continue
         try:
             ctx = int(raw_ctx)

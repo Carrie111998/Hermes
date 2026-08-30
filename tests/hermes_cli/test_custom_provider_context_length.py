@@ -105,9 +105,12 @@ class TestEntryLevelContextLengthFallback:
         )
 
     def test_invalid_entry_level_value_falls_through(self):
-        """Zero/negative/non-int entry-level values stay ignored instead of
-        poisoning resolution — resolver falls back to the catalog chain."""
-        for bad in (0, -5, "huge"):
+        """Zero/negative/non-int/boolean entry-level values stay ignored
+        instead of poisoning resolution — resolver falls back to the catalog
+        chain. ``True``/``False`` must be rejected explicitly: bool is an int
+        subclass in Python, so a true/false typo would otherwise parse as a
+        1-token (or 0) window instead of falling through."""
+        for bad in (0, -5, "huge", True, False):
             custom = [{"base_url": "https://x.invalid/v1", "context_length": bad}]
             assert (
                 get_custom_provider_context_length(
@@ -115,6 +118,20 @@ class TestEntryLevelContextLengthFallback:
                 )
                 is None
             ), bad
+
+    def test_boolean_per_model_value_falls_through(self):
+        """The strict non-boolean integer contract applies to per-model
+        overrides too — the two levels share one validation chain."""
+        custom = [
+            {
+                "base_url": "https://x.invalid/v1",
+                "models": {"m": {"context_length": True}},
+            }
+        ]
+        assert (
+            get_custom_provider_context_length("m", "https://x.invalid/v1", custom)
+            is None
+        )
 
     def test_entry_level_is_route_isolated(self):
         """The entry-level override must not leak across routes."""
@@ -129,6 +146,72 @@ class TestEntryLevelContextLengthFallback:
                 "m", "https://example.invalid/v1", custom
             )
             is None
+        )
+
+    def test_same_route_pinned_entries_are_model_isolated(self):
+        """Two entries sharing one normalized route, each pinning a different
+        ``model`` with its own entry-level ``context_length``: each id must
+        resolve to its own entry's value, never the sibling's — otherwise the
+        first matching entry leaks its context limit into the other model
+        during a /model switch."""
+        def resolve(entries, model):
+            return get_custom_provider_context_length(
+                model, "https://relay.example.invalid/v1", entries
+            )
+
+        forward = [
+            {
+                "base_url": "https://relay.example.invalid/v1",
+                "model": "model-a",
+                "context_length": 100_000,
+            },
+            {
+                "base_url": "https://relay.example.invalid/v1",
+                "model": "model-b",
+                "context_length": 200_000,
+            },
+        ]
+        assert resolve(forward, "model-a") == 100_000
+        assert resolve(forward, "model-b") == 200_000
+
+        reversed_order = list(reversed(forward))
+        assert resolve(reversed_order, "model-a") == 100_000
+        assert resolve(reversed_order, "model-b") == 200_000
+
+    def test_unpinned_entry_level_applies_route_wide(self):
+        """Documented counterpart of the isolation rule: an entry with no
+        ``model`` pin makes its entry-level value apply to every model on
+        that route, because the entry claims the whole route."""
+        custom = [{"base_url": "https://x.invalid/v1", "context_length": 150_000}]
+        assert (
+            get_custom_provider_context_length(
+                "model-a", "https://x.invalid/v1", custom
+            )
+            == 150_000
+        )
+        assert (
+            get_custom_provider_context_length(
+                "model-b", "https://x.invalid/v1", custom
+            )
+            == 150_000
+        )
+
+    def test_pinned_sibling_does_not_shadow_unpinned_entry(self):
+        """A pinned sibling must not consume the lookup for other models:
+        resolution continues to a later unpinned entry on the same route."""
+        custom = [
+            {
+                "base_url": "https://x.invalid/v1",
+                "model": "model-a",
+                "context_length": 100_000,
+            },
+            {"base_url": "https://x.invalid/v1", "context_length": 300_000},
+        ]
+        assert (
+            get_custom_provider_context_length(
+                "model-b", "https://x.invalid/v1", custom
+            )
+            == 300_000
         )
 
 
@@ -267,6 +350,56 @@ class TestGetModelContextLengthHonorsOverride:
             for p in patches:
                 p.stop()
         assert ctx == 1_000_000
+
+    def test_same_route_entry_level_keeps_model_identity_through_resolver(self):
+        """End-to-end for the same-route fixture: with ``config_context_length``
+        unset (the /model-switch shape) each model's entry-level override must
+        survive the full resolver chain — with every catalog probe mocked —
+        proving the caller keeps model identity, not just the helper's local
+        return value. An explicit top-level value (cold-startup shape) still
+        wins per the documented precedence."""
+        from agent.model_metadata import get_model_context_length
+        custom = [
+            {
+                "base_url": "https://relay.example.invalid/v1",
+                "model": "model-a",
+                "context_length": 100_000,
+            },
+            {
+                "base_url": "https://relay.example.invalid/v1",
+                "model": "model-b",
+                "context_length": 200_000,
+            },
+        ]
+        patches = self._mock_all_probes()
+        for p in patches:
+            p.start()
+        try:
+            for model_id, expected in (("model-a", 100_000), ("model-b", 200_000)):
+                ctx = get_model_context_length(
+                    model_id,
+                    base_url="https://relay.example.invalid/v1",
+                    provider="custom",
+                    config_context_length=None,
+                    custom_providers=custom,
+                )
+                assert ctx == expected, model_id
+        finally:
+            for p in patches:
+                p.stop()
+
+        # Cold-startup shape: an explicit top-level model.context_length
+        # still outranks the entry-level override (documented precedence).
+        assert (
+            get_model_context_length(
+                "model-b",
+                base_url="https://relay.example.invalid/v1",
+                provider="custom",
+                config_context_length=500_000,
+                custom_providers=custom,
+            )
+            == 500_000
+        )
 
     def test_explicit_config_context_length_still_wins(self):
         """Top-level model.context_length (step 0) outranks custom_providers (step 0b).
