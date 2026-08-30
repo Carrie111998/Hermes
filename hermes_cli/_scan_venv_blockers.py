@@ -234,6 +234,33 @@ def _is_pausable_gateway(cmdline: str) -> bool:
     return looks_like_gateway_command_line(cmdline)
 
 
+def _ledgered_manual_serve_pids(matches: list[tuple[int, str, str]]) -> set[int]:
+    """Return the PIDs of venv holders the updater's serve rung owns.
+
+    Same dead-end shape as the gateway exemption above, for MANUAL
+    ``serve``/``dashboard`` backends: the CLI updater's venv guard stops a
+    self-ledgered backend whose recorded spawner is not alive and relaunches
+    it on its recorded endpoint (``_ledger_manual_serve_holders`` rung,
+    #63206).  Reporting those as blockers aborts the Desktop preflight with
+    ``venv-blocked`` before ``hermes-setup`` spawns the updater, so the rung
+    that exists precisely to handle them never runs (#98336).
+
+    Delegates to ``update_cmd._ledger_manual_serve_holders`` — the canonical
+    positive-identity matcher (spawn-ledger ``(pid, create_time)`` for THIS
+    install, spawner provably not alive) — so the preflight exemption, the
+    updater's stop rung, and the relauncher share one parser.  A
+    Desktop-owned backend (live spawner) and an unledgered ``serve`` never
+    appear here and keep blocking.  An import failure counts as no manual
+    serves, which is exactly the pre-exemption behavior.
+    """
+    try:
+        from hermes_cli.update_cmd import _ledger_manual_serve_holders  # noqa: PLC0415
+
+        return {int(entry["pid"]) for entry in _ledger_manual_serve_holders(matches)}
+    except Exception:
+        return set()
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -248,9 +275,12 @@ def main() -> None:
     except Exception as exc:
         _emit_probe_fail(f"scan aborted: {exc}")
 
+    manual_serve_pids = _ledgered_manual_serve_pids(matches)
     processes = []
     for pid, name, cmdline in matches:
         if _is_pausable_gateway(cmdline):
+            continue
+        if pid in manual_serve_pids:
             continue
         process = {
             "pid": pid,
@@ -271,6 +301,9 @@ def main() -> None:
         # Diagnostic only: gateway processes present but not counted as
         # blockers because the downstream updater pauses them itself.
         "pausable_gateways": exempted,
+        # Diagnostic only: manual serve/dashboard backends the downstream
+        # updater stops and relaunches on their recorded endpoints.
+        "ledgered_manual_serves": len(manual_serve_pids),
     }
     print(json.dumps(data))
     sys.exit(0)

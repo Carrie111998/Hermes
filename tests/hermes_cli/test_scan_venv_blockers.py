@@ -368,3 +368,86 @@ def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, caps
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [92]
     assert len(data["processes"][0]["cmdline"]) <= 120
+
+
+# ---------------------------------------------------------------------------
+# manual serve/dashboard exemption — the ledger rung mirror
+#
+# `hermes update`'s venv guard stops a self-ledgered serve/dashboard backend
+# whose recorded spawner is not alive and relaunches it on its recorded
+# endpoint (#63206). The Desktop preflight must therefore not report those
+# as blockers either, or the handoff dead-ends before the updater runs.
+# ---------------------------------------------------------------------------
+
+
+def _patch_manual_serve_ledger(monkeypatch, entries):
+    """Point the canonical matcher at *entries* (list of ledger dicts)."""
+    import hermes_cli.update_cmd as update_cmd_module
+
+    monkeypatch.setattr(update_cmd_module, "_ledger_manual_serve_holders", lambda matches: entries)
+
+
+def test_main_ledgered_manual_serve_is_exempt(monkeypatch, capsys):
+    """A serve/dashboard backend the updater's ledger rung owns (positive
+    identity, spawner not alive) must scan clear instead of dead-ending the
+    Desktop update (#98336)."""
+    serve = (
+        78,
+        "python.exe",
+        r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve --host 10.0.0.1 --port 9119",
+    )
+    _patch_manual_serve_ledger(monkeypatch, [{"pid": 78, "purpose": "serve", "port": 9119}])
+
+    code, data = _run_main_with_detector(monkeypatch, capsys, [serve])
+    assert code == 0
+    assert data["ok"] is True
+    assert data["blocked"] is False
+    assert data["processes"] == []
+    assert data["ledgered_manual_serves"] == 1
+
+
+def test_main_ledgered_serve_alongside_unledgered_holder_still_blocks(monkeypatch, capsys):
+    """Only the ledgered manual serve is exempt; a serve the ledger does not
+    vouch for (Desktop-owned, live spawner, foreign install) keeps blocking
+    and is the only reported PID."""
+    ledgered = (
+        78,
+        "python.exe",
+        r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve --host 10.0.0.1 --port 9119",
+    )
+    desktop_owned = (
+        79,
+        "python.exe",
+        r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve --host 127.0.0.1 --port 0",
+    )
+    _patch_manual_serve_ledger(monkeypatch, [{"pid": 78, "purpose": "serve", "port": 9119}])
+
+    code, data = _run_main_with_detector(monkeypatch, capsys, [ledgered, desktop_owned])
+    assert code == 0
+    assert data["blocked"] is True
+    assert [p["pid"] for p in data["processes"]] == [79]
+    assert data["ledgered_manual_serves"] == 1
+
+
+def test_main_ledger_matcher_failure_keeps_serve_blocking(monkeypatch, capsys):
+    """Fail-closed: when the canonical matcher cannot run (import/ledger
+    error), the preflight reports the serve as a blocker — the pre-exemption
+    behavior — instead of guessing."""
+
+    def _boom(_matches):
+        raise RuntimeError("ledger unreadable")
+
+    import hermes_cli.update_cmd as update_cmd_module
+
+    monkeypatch.setattr(update_cmd_module, "_ledger_manual_serve_holders", _boom)
+    serve = (
+        78,
+        "python.exe",
+        r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve --host 10.0.0.1 --port 9119",
+    )
+
+    code, data = _run_main_with_detector(monkeypatch, capsys, [serve])
+    assert code == 0
+    assert data["blocked"] is True
+    assert [p["pid"] for p in data["processes"]] == [78]
+    assert data["ledgered_manual_serves"] == 0
