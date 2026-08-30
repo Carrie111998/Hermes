@@ -2784,12 +2784,15 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_model: Optional[str],
         requested_provider: Optional[str],
         route: Optional[Dict[str, Any]],
+        allow_session_override: bool = True,
     ) -> Optional[str]:
         """Return a 400-worthy conflict string for ambiguous route/provider mixes."""
         request_provider = _clean_request_string(requested_provider)
         if not request_provider or not isinstance(route, dict):
             return None
-        if self._session_model_override_for(gateway_session_key or session_id):
+        if allow_session_override and self._session_model_override_for(
+            gateway_session_key or session_id
+        ):
             # Session /model wins over both the route and the request override, so
             # there is no ambiguity to reject on this request path.
             return None
@@ -2826,6 +2829,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        persist_session: bool = True,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2859,6 +2863,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        When ``persist_session`` is false, the agent does not open or write the
+        local SessionDB.  This supports callers that manage their own durable
+        transcript and pass it in explicitly for each run.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2953,7 +2961,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
         session_override = None
-        if not confirmed_runtime_lock:
+        if not confirmed_runtime_lock and persist_session:
             session_override = self._session_model_override_for(session_key)
         # Model-string precedence delegates to the shared owner
         # hermes_cli.model_switch.resolve_effective_model (session /model
@@ -3132,7 +3140,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            "session_db": self._ensure_session_db() if persist_session else None,
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
@@ -3141,6 +3149,10 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if not persist_session:
+            # Set before run_conversation() so every persistence chokepoint,
+            # including lazy SessionDB recall, observes the opt-out.
+            agent._persist_disabled = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3347,6 +3359,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
+                "run_store_control": True,
                 "run_stop": True,
                 "run_steer": True,
                 "run_approval_response": True,
@@ -7619,6 +7632,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        # ``store: false`` makes the run caller-managed: Hermes executes the
+        # turn but does not write its transcript to local state.db or session
+        # snapshots.  In-memory run status/events remain available for the
+        # lifetime of this API-server process.  This is deliberately not a
+        # general side-effect switch: memory providers, lifecycle hooks, and
+        # enabled tools retain their configured behavior.
+        store = _coerce_request_bool(body.get("store"), default=True)
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -7643,11 +7663,21 @@ class APIServerAdapter(BasePlatformAdapter):
         stored_session_id = None
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
-            if stored:
-                conversation_history = list(stored.get("conversation_history", []))
-                stored_session_id = stored.get("session_id")
-                if instructions is None:
-                    instructions = stored.get("instructions")
+            if stored is None:
+                # Never turn a broken continuation into a fresh conversation.
+                # This is especially important for caller-managed runs after a
+                # restart: run ids/status are process-local, and only an extant
+                # Responses API record can satisfy previous_response_id.
+                return web.json_response(
+                    _openai_error(
+                        f"Previous response not found: {previous_response_id}"
+                    ),
+                    status=404,
+                )
+            conversation_history = list(stored.get("conversation_history", []))
+            stored_session_id = stored.get("session_id")
+            if instructions is None:
+                instructions = stored.get("instructions")
 
         # When input is a multi-message array, extract all but the last
         # message as conversation history (the last becomes user_message).
@@ -7673,6 +7703,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_model=agent_overrides.get("requested_model"),
             requested_provider=agent_overrides.get("requested_provider"),
             route=route,
+            allow_session_override=store,
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
@@ -7760,6 +7791,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        persist_session=store,
                     )
                 self._active_run_agents[run_id] = agent
 
