@@ -344,6 +344,12 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    global _last_resolved_tool_names
+    if enabled_toolsets is not None and not enabled_toolsets:
+        # Empty is deny-all, including in worker contexts.
+        _last_resolved_tool_names = []
+        return []
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -380,14 +386,17 @@ def get_tool_definitions(
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
-            global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+    )
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -396,9 +405,8 @@ def get_tool_definitions(
         # agent inits and providers that enforce unique tool names
         # (DeepSeek, Xiaomi MiMo, Moonshot Kimi) reject the request with
         # HTTP 400. Mirrors the cache-hit path above. (issue #17335)
-        # Bound the cache with LRU eviction so a long-lived Gateway process
-        # doesn't accumulate entries unboundedly across the many distinct
-        # toolset/config fingerprints it sees over its lifetime (#19251).
+        # Bound the cache with insertion-order eviction so a long-lived Gateway
+        # doesn't accumulate entries across distinct toolset/config fingerprints.
         with _tool_defs_cache_lock:
             # Another thread may have populated this exact key while this
             # thread computed. Reuse it and serialize capacity eviction.
@@ -432,11 +440,8 @@ def _compute_tool_definitions(
             and _is_dispatcher_owned_worker()
             and "kanban" not in effective_enabled_toolsets
         ):
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
+            # Non-empty worker policies retain the lifecycle handoff tools even
+            # when an assignee profile restricts its normal chat toolsets.
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):

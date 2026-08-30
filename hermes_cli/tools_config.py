@@ -2655,6 +2655,10 @@ def _get_platform_tools(
     # Normalise to str so downstream sorted() never mixes types.
     toolset_names = [str(ts) for ts in toolset_names]
 
+    # An explicitly configured empty list is deny-all.
+    if explicitly_configured and not toolset_names:
+        return set()
+
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()
     platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}

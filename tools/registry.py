@@ -1267,12 +1267,17 @@ class ToolRegistry:
                     result[ts]["env_vars"].append(env)
         return result
 
-    def check_tool_availability(self, quiet: bool = False):
-        """Return (available_toolsets, unavailable_info) like the old function."""
+    def check_tool_availability(
+        self, quiet: bool = False, toolsets: Optional[Set[str]] = None
+    ):
+        """Return available toolset names and unavailable details."""
         available = []
         unavailable = []
         entries, _ = self._snapshot_state()
-        for ts in sorted({entry.toolset for entry in entries}):
+        registered_toolsets = {entry.toolset for entry in entries}
+        if toolsets is not None:
+            registered_toolsets &= toolsets
+        for ts in sorted(registered_toolsets):
             ts_entries = [entry for entry in entries if entry.toolset == ts]
             if self._toolset_has_exposable_tools(ts, entries):
                 available.append(ts)
