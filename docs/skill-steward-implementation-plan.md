@@ -38,11 +38,13 @@ Usage counters cannot answer whether a skill helped. A skill with no recorded us
 
 ### Routing lane
 
-Extend `skills_list` with an optional natural-language query. It returns a bounded ranked list of compact skill cards. `skill_view` remains the exact loader. Ranking is deterministic and local. No new permanent model tool is added.
+Extend `skills_list` with an optional natural-language query. It returns a bounded ranked list of compact skill cards. `skill_view` remains the exact loader. Ranking is deterministic and local. Outcome reporting extends the existing skills toolset rather than adding a new standalone toolset; the tool schema stays fixed for the conversation.
 
 ### Stewardship lane
 
-Record a bounded local outcome for a loaded skill: success, failure, or unknown. Keep only the task identifier and coarse error type. Do not store task text. Use a confidence floor before utility affects ranking. Low-utility skills produce review proposals, never automatic edits.
+Record a bounded local outcome for a loaded skill: success, failure, or unknown. Keep only the task identifier and coarse error type. Do not store task text. Use a confidence floor before global per-skill utility affects ranking. Low-utility skills produce review proposals, never automatic edits.
+
+This PR establishes routing, local outcomes, review proposals, dashboard visibility, and archive safety. It does not yet ship the full opportunity→surface→follow funnel or automatic service loop from the design; those remain follow-up work after the event contract proves useful.
 
 ### Curation lane
 
@@ -125,6 +127,14 @@ Run the focused Python suites for skill routing, skill outcomes, skill reflectio
 3. Keep utility re-ranking confidence-gated.
 4. Keep reflection proposals and consolidation review-only.
 5. Measure missed-route rate, top-k acceptance, outcome coverage, false archive attempts, latency, and index rebuild time.
+
+## Explicitly not in this PR
+
+- Automatic pre-task loading of a ranked skill.
+- The full opportunity→surface→load→follow→completed event stream.
+- Automatic readiness testing or mutation of underused skills.
+- Task-class-specific utility. Outcome storage deliberately omits raw task text, so utility is global per skill.
+- Automatic bundle creation.
 
 ## Definition of done
 
