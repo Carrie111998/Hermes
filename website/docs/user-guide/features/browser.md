@@ -201,6 +201,18 @@ browser:
 A pin naming a profile directory that doesn't exist fails closed with a
 fixable message — it never silently falls back to the last-used profile.
 
+The real-profile browser opens a visible window by default, since it's driving
+your actual login session. To run it hidden instead — so the agent can browse
+with your real logins in the background without interrupting your screen —
+turn off `real_profile_headed`:
+
+```yaml
+# ~/.hermes/config.yaml
+browser:
+  use_real_profile: true
+  real_profile_headed: false
+```
+
 When you turn the toggle back off, Hermes deletes the snapshot store
 (`~/.hermes/browser-profile/`) on the next browser use, so the copied
 credentials don't linger after you revoke consent.

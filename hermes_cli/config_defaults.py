@@ -619,6 +619,13 @@ DEFAULT_CONFIG = {
         # naming a directory that doesn't exist FAILS CLOSED with a fixable
         # message rather than falling back to last-used.
         "real_profile_pin": "",
+        # Whether the real-profile browser opens a visible window. Default
+        # True preserves today's behavior (a real window, so a real login
+        # session is usable interactively). Set False to run it hidden —
+        # mirrors "headed" above, but scoped to the real-profile launch path
+        # since that one drives the user's actual logins rather than a
+        # throwaway profile.
+        "real_profile_headed": True,
         "allow_unsafe_evaluate": False,  # Legacy override: when true, browser_console(expression=...) bypasses the restrict_evaluate denylist entirely
         "restrict_evaluate": False,  # Opt-in denylist blocking sensitive JS primitives (cookies/storage/clipboard/network/form values) in browser_console(expression=...)
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
