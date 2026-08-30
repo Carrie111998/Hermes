@@ -55,6 +55,8 @@ from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from pathlib import Path
 from utils import is_truthy_value
+from agent.skill_preprocessing import run_onload_script
+from agent.skill_utils import parse_frontmatter
 
 logger = logging.getLogger(__name__)
 _PLUGIN_SECTION_FRAME_RE = re.compile(
@@ -551,8 +553,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             compact_categories=_compact_cats or None,
             skills_dir_override=_agent_skills_dir(agent),
         )
+        # Unpack onload entries (new-style tuple) with backward compat for
+        # cached strings from v2 snapshots.
+        onload_entries: list[dict] = []
+        if isinstance(skills_prompt, tuple):
+            skills_prompt, onload_entries = skills_prompt
     else:
         skills_prompt = ""
+        onload_entries = []
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
@@ -816,6 +824,55 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # system message is one cache unit regardless of internal order.)
     if skills_prompt:
         volatile_parts.append(skills_prompt)
+
+    # ── Onload skill body injection ──────────────────────────────────────
+    # Skills with an ``onload:`` frontmatter field register a script that
+    # runs at session init.  If it returns ``INJECT``, the skill body is
+    # pre-loaded into the system prompt volatile tier — before the model
+    # sees any user message.  This lets environment-triggered skills
+    # (e.g. model-specific behavior mandates) fire without depending on
+    # conversational keyword matching.
+    if onload_entries:
+        _onload_env: dict[str, str] = {}
+        _model = getattr(agent, "model", "") or ""
+        _provider = getattr(agent, "provider", "") or ""
+        if _model:
+            _onload_env["HERMES_MODEL"] = _model
+        if _provider:
+            _onload_env["HERMES_PROVIDER"] = _provider
+        for _entry in onload_entries:
+            _script = (_entry.get("onload") or "").strip()
+            _skill_dir = (_entry.get("skill_dir") or "")
+            _skill_md = (_entry.get("skill_md_path") or "")
+            _name = (_entry.get("skill_name") or "?")
+            if not _script or not _skill_dir or not _skill_md:
+                continue
+            _dir_path = Path(_skill_dir)
+            if not _dir_path.exists():
+                continue
+            try:
+                _output = run_onload_script(
+                    _script, _dir_path,
+                    extra_env=_onload_env or None,
+                )
+            except Exception as _exc:
+                logger.warning("onload script error for %s: %s", _name, _exc)
+                continue
+            if not _output or _output.strip().upper() != "INJECT":
+                continue
+            # Load skill body, strip frontmatter, inject into volatile tier
+            try:
+                _raw = Path(_skill_md).read_text(encoding="utf-8")
+                _fm, _body = parse_frontmatter(_raw)
+                _body = _body.strip()
+                if _body:
+                    volatile_parts.append(
+                        f"## Onload: {_name}\n\n{_body}"
+                    )
+            except Exception as _exc:
+                logger.warning(
+                    "Failed to load onload skill body %s: %s", _name, _exc
+                )
 
     if agent._memory_store:
         if agent._memory_enabled:

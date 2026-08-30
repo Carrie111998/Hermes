@@ -1,18 +1,20 @@
 """Shared SKILL.md preprocessing helpers."""
 
 import logging
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 logger = logging.getLogger(__name__)
 
-# Matches ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} tokens in SKILL.md.
+# Matches ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} / ${HERMES_HOME} tokens in SKILL.md.
 # Tokens that don't resolve (e.g. ${HERMES_SESSION_ID} with no session) are
 # left as-is so the user can debug them.
-_SKILL_TEMPLATE_RE = re.compile(r"\$\{(HERMES_SKILL_DIR|HERMES_SESSION_ID)\}")
+_SKILL_TEMPLATE_RE = re.compile(r"\$\{(HERMES_SKILL_DIR|HERMES_SESSION_ID|HERMES_HOME)\}")
 
 # Matches inline shell snippets like:  !`date +%Y-%m-%d`
 # Non-greedy, single-line only -- no newlines inside the backticks.
@@ -41,7 +43,7 @@ def substitute_template_vars(
     skill_dir: Path | None,
     session_id: str | None,
 ) -> str:
-    """Replace ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in skill content.
+    """Replace ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} / ${HERMES_HOME} in skill content.
 
     Only substitutes tokens for which a concrete value is available --
     unresolved tokens are left in place so the author can spot them.
@@ -50,6 +52,7 @@ def substitute_template_vars(
         return content
 
     skill_dir_str = str(skill_dir) if skill_dir else None
+    hermes_home = os.environ.get("HERMES_HOME")
 
     def _replace(match: re.Match) -> str:
         token = match.group(1)
@@ -57,6 +60,8 @@ def substitute_template_vars(
             return skill_dir_str
         if token == "HERMES_SESSION_ID" and session_id:
             return str(session_id)
+        if token == "HERMES_HOME" and hermes_home:
+            return hermes_home
         return match.group(0)
 
     return _SKILL_TEMPLATE_RE.sub(_replace, content)
@@ -142,3 +147,72 @@ def preprocess_skill_content(
         timeout = int(cfg.get("inline_shell_timeout", 10) or 10)
         content = expand_inline_shell(content, skill_dir, timeout)
     return content
+
+
+def run_onload_script(
+    script_rel_path: str,
+    skill_dir: Path,
+    extra_env: dict | None = None,
+    timeout: int = 30,
+) -> str:
+    """Run a skill's onload script and return its stdout (stripped).
+
+    The script is expected to print ``INJECT`` (case-insensitive, trimmed)
+    to signal that the skill body should be pre-loaded into the system
+    prompt.  Any other output (or an empty string) means "skip".
+
+    Supports ``.sh`` (bash) and ``.py`` (python) scripts.  Falls back to
+    running the command directly via bash for unrecognised extensions.
+
+    Reuses the same subprocess machinery as ``run_inline_shell`` so any
+    platform quirks (Windows hide-console flags) are already handled.
+    """
+    script_path = skill_dir / script_rel_path
+    if not script_path.exists():
+        logger.warning(
+            "onload script %s not found for skill at %s",
+            script_rel_path, skill_dir,
+        )
+        return ""
+
+    # Normalise to forward slashes so bash doesn't interpret backslashes
+    # as escape characters on Windows.
+    script_path_str = str(script_path).replace("\\", "/")
+
+    ext = script_path.suffix.lower()
+    if ext == ".py":
+        # Run Python scripts via python directly to avoid bash PATH
+        # resolution issues on Windows (git-bash vs WSL relay).
+        _python = sys.executable or "python"
+        args = [_python, script_path_str]
+    elif ext == ".sh":
+        args = ["bash", script_path_str]
+    else:
+        args = ["bash", script_path_str]  # default fallback
+
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
+    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(skill_dir).replace("\\", "/"),
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=max(1, int(timeout)),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            **_popen_kwargs,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("onload script %s timed out after %ss", script_path, timeout)
+        return "[TIMEOUT]"
+    except Exception as exc:
+        logger.warning("onload script %s failed: %s", script_path, exc)
+        return ""
+
+    output = (completed.stdout or "").strip()
+    return output
