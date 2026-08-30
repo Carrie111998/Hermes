@@ -1988,7 +1988,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         return platform_config
     
     # Telegram
-    telegram_token = getenv("TELEGRAM_BOT_TOKEN")
+    # Prefer a per-profile scoped token (TELEGRAM_BOT_TOKEN_<PROFILE>) when
+    # set, then fall back to the legacy TELEGRAM_BOT_TOKEN. The resolver
+    # lives in hermes_cli.telegram_managed_bot so it stays a single source of
+    # truth; import inline to avoid a circular import at module load time.
+    telegram_token = None
+    try:
+        from hermes_cli.telegram_managed_bot import resolve_telegram_token
+        telegram_token = resolve_telegram_token()
+    except Exception:
+        telegram_token = getenv("TELEGRAM_BOT_TOKEN")
+    if not telegram_token:
+        telegram_token = getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:
         telegram_config = _enable_from_env(Platform.TELEGRAM)
         telegram_config.token = telegram_token

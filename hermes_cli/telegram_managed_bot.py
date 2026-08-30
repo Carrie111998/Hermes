@@ -68,6 +68,32 @@ def is_valid_telegram_bot_token(token: object) -> bool:
     return isinstance(token, str) and bool(_TELEGRAM_BOT_TOKEN_RE.match(token))
 
 
+def resolve_telegram_token(profile: Optional[str] = None) -> Optional[str]:
+    """Resolve a Telegram bot token, preferring a per-profile override.
+
+    When ``profile`` (or the active ``HERMES_PROFILE`` / ``HERMES_ACTIVE_PROFILE``
+    env var, upper-cased) has a ``TELEGRAM_BOT_TOKEN_<PROFILE>`` env entry set,
+    that scoped value wins. Otherwise, falls back to the legacy
+    ``TELEGRAM_BOT_TOKEN`` env var. Returns ``None`` when neither is set.
+
+    This is non-breaking: callers that only set ``TELEGRAM_BOT_TOKEN`` see no
+    change. Multi-account setups get a deterministic way to give one profile
+    its own token without colliding with the others.
+    """
+    env = os.environ
+    if not profile:
+        profile = (
+            env.get("HERMES_ACTIVE_PROFILE")
+            or env.get("HERMES_PROFILE")
+            or ""
+        ).strip()
+    if profile:
+        scoped = env.get(f"TELEGRAM_BOT_TOKEN_{profile.upper()}")
+        if scoped:
+            return scoped
+    return env.get("TELEGRAM_BOT_TOKEN")
+
+
 def _parse_owner_user_id(value: object) -> int | None:
     if isinstance(value, bool):
         return None
