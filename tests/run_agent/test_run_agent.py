@@ -4467,6 +4467,167 @@ class TestRunConversation:
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/thinkon" in result["final_response"]
 
+    # ------------------------------------------------------------------
+    # Regression tests for #98406 — heuristic-guided stop->length rewrite
+    # ------------------------------------------------------------------
+
+    def test_suspicious_stop_flag_lifecycle(self, agent):
+        """The _suspicious_stop_rewrite flag is stamped only on a real rewrite."""
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.3-flash:cloud"
+
+        def _normalized(content, tool_calls=None):
+            # Shape produced by the chat-completions transport's
+            # normalize_response — what the predicate actually receives.
+            return SimpleNamespace(content=content, tool_calls=tool_calls)
+
+        # Stale True must be cleared by any fresh evaluation.
+        agent._suspicious_stop_rewrite = True
+
+        # (1) Non-GLM model: cleared, no rewrite.
+        agent.model = "llama3:8b"
+        tool_msg = {"role": "tool", "content": "result"}
+        assert agent._should_treat_stop_as_truncated(
+            "stop", _normalized("a complete sentence."), [tool_msg]
+        ) is False
+        assert agent._suspicious_stop_rewrite is False
+
+        # (2) GLM + unpunctuated tail after tool turn: rewrite + flag set.
+        agent.model = "glm-5.3-flash:cloud"
+        suspicious = _normalized(
+            "Based on the results the best next step is to configure now"
+        )
+        assert agent._should_treat_stop_as_truncated(
+            "stop", suspicious, [tool_msg]
+        ) is True
+        assert agent._suspicious_stop_rewrite is True
+
+        # (3) Punctuated ending: no rewrite, flag stays False.
+        agent._suspicious_stop_rewrite = True
+        natural = _normalized("Based on the results, the best next step is clear.")
+        assert agent._should_treat_stop_as_truncated(
+            "stop", natural, [tool_msg]
+        ) is False
+        assert agent._suspicious_stop_rewrite is False
+
+        # (4) Genuine length truncation path: no suspicious-stop stamp.
+        agent._suspicious_stop_rewrite = True
+        genuine_length = _normalized("A long response cut off mid-sent")
+        assert agent._should_treat_stop_as_truncated(
+            "length", genuine_length, [tool_msg]
+        ) is False
+        assert agent._suspicious_stop_rewrite is False
+
+    def test_pure_genuine_length_cap_still_gets_full_continuation_loop(self, agent):
+        """A genuine finish_reason='length' (never stop) keeps the 4-attempt loop."""
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.3-flash:cloud"
+
+        truncated = _mock_response(
+            content="Let me explain the whole architecture step by step, the first",
+            finish_reason="length",
+        )
+        continued = _mock_response(
+            content=" component is the router. Done.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [truncated, continued]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Genuine cap: the loop requests a continuation with the nudge.
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == (
+            "Let me explain the whole architecture step by step, the first"
+            " component is the router. Done."
+        )
+        second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        assert second_call_messages[-1]["role"] == "user"
+        assert "truncated by the output length limit" in second_call_messages[-1]["content"]
+
+    def test_think_only_response_never_triggers_heuristic(self, agent):
+        """Reasoning-only content cannot fire the heuristic (#98406 safety).
+
+        The predicate requires ≥20 visible chars after stripping think blocks,
+        so a think-only response can never be rewritten stop→length — the
+        structural guarantee that the convergent path can never mark an empty
+        stitch as complete.
+        """
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.3-flash:cloud"
+
+        think_only = _mock_response(
+            content=" analysing the request now",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.return_value = think_only
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Heuristic must not have fired: visible stitch is empty → finish
+        # reason stays stop, no truncation error raised.
+        assert agent._suspicious_stop_rewrite is False
+        assert result.get("error") is None
+        # The turn completes normally (no continuation churn).
+        assert result["completed"] is True
+
+    def test_second_suspicious_event_converges_not_third_retry(self, agent):
+        """Two suspicious stops → converge; never a second full-budget retry (#98406)."""
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.3-flash:cloud"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        first_stop = _mock_response(
+            content="Based on the search results, the best next",
+            finish_reason="stop",
+        )
+        second_stop = _mock_response(
+            content=" step is to restart. Also check the config file",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn, first_stop, second_stop,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Converged on the 3rd API call, not a 4th retry.
+        assert result["api_calls"] == 3
+        assert result["completed"] is True
+        assert result.get("error") is None
+        assert result.get("partial") is not True
+        # The stitched response is delivered.
+        assert "restart" in (result["final_response"] or "")
+
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)

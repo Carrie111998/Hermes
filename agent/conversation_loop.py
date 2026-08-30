@@ -3611,6 +3611,14 @@ def run_conversation(
                     _finish_result = _cc_fr.normalize_response(response)
                     finish_reason = _finish_result.finish_reason
                     assistant_message = _finish_result
+                    # A clean slate for the per-API-call heuristic marker:
+                    # _should_treat_stop_as_truncated below stamps it True only
+                    # when IT rewrites stop→length, and the truncation handler
+                    # consumes it right after.  Clearing here (before the
+                    # evaluation, not after) guarantees no stale True from a
+                    # previous call can leak into this response's handler
+                    # branch (#98406).
+                    agent._suspicious_stop_rewrite = False
                     if agent._should_treat_stop_as_truncated(
                         finish_reason,
                         assistant_message,
@@ -4027,10 +4035,17 @@ def run_conversation(
                             # cap, so "still truncated" is wrong framing — the
                             # stitched partial IS the model's answer.  Complete
                             # the turn instead of reporting a truncation error
-                            # (#98406).  A genuine cap that follows later marks
-                            # itself with _suspicious_stop_rewrite=False and
-                            # runs the full 4-attempt loop as before.
-                            _converged_heuristic = not _should_request_continuation and _heuristic_truncation
+                            # (#98406).  Gated on a non-empty stitch: an empty
+                            # result is NOT a complete answer and belongs to the
+                            # empty-response recovery upstream.  A genuine cap
+                            # that follows later marks itself with
+                            # _suspicious_stop_rewrite=False and runs the full
+                            # 4-attempt loop as before.
+                            _converged_heuristic = (
+                                not _should_request_continuation
+                                and _heuristic_truncation
+                                and bool(truncated_response_parts)
+                            )
                             if partial_response and not _converged_heuristic:
                                 agent._vprint(
                                     f"{agent.log_prefix}⚠️  Response still truncated "
