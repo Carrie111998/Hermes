@@ -185,6 +185,46 @@ class TestGitHubSourceFileFetch:
             "skill/references/foo%23bar.md"
         )
 
+    def test_full_directory_fetch_includes_dotfiles(self):
+        src = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        src._tree_revisions["owner/repo"] = "abc123"
+        src._get_repo_tree = MagicMock(return_value=(
+            "main",
+            [
+                {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "skills/demo/.env.example", "type": "blob", "mode": "100644"},
+            ],
+        ))
+        src._fetch_file_content = MagicMock(return_value=(
+            "---\nname: demo\ndescription: demo\n---\n"
+        ))
+        src._fetch_file_bytes = MagicMock(return_value=b"KEY=example\n")
+
+        bundle = src.fetch("owner/repo/skills/demo")
+
+        assert bundle is not None
+        assert bundle.files[".env.example"] == b"KEY=example\n"
+        src._fetch_file_bytes.assert_called_once_with(
+            "owner/repo", "skills/demo/.env.example", ref="abc123"
+        )
+
+    def test_full_directory_fetch_fails_on_missing_tree_listed_blob(self):
+        src = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        src._tree_revisions["owner/repo"] = "abc123"
+        src._get_repo_tree = MagicMock(return_value=(
+            "main",
+            [
+                {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "skills/demo/config.json", "type": "blob", "mode": "100644"},
+            ],
+        ))
+        src._fetch_file_content = MagicMock(return_value=(
+            "---\nname: demo\ndescription: demo\n---\n"
+        ))
+        src._fetch_file_bytes = MagicMock(return_value=None)
+
+        assert src.fetch("owner/repo/skills/demo") is None
+
 
 # ---------------------------------------------------------------------------
 # SkillsShSource

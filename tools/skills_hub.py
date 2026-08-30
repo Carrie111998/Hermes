@@ -821,7 +821,7 @@ class GitHubSource(SkillSource):
                 if rel_path == "SKILL.md":
                     continue
                 base = rel_path.rsplit("/", 1)[-1]
-                if base.startswith(".") or base.endswith(".pyc") or "__pycache__" in rel_path.split("/"):
+                if base.endswith(".pyc") or "__pycache__" in rel_path.split("/"):
                     continue
                 try:
                     rel_path = _validate_bundle_rel_path(rel_path)
@@ -830,9 +830,10 @@ class GitHubSource(SkillSource):
                     return None
                 content = self._fetch_file_bytes(repo, item_path, ref=pinned_ref)
                 if content is None:
-                    logger.warning("Failed to fetch referenced skill support "
-                                   "file; continuing without it: %s", item_path)
-                    continue
+                    logger.warning(
+                        "Failed to fetch tree-listed skill file: %s", item_path
+                    )
+                    return None
                 files[rel_path] = content
             # A SKILL.md-linked support path that isn't in the tree is a
             # dangling link — a repo-only dev tool, prose over-match, or a
