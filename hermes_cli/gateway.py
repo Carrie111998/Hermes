@@ -7973,7 +7973,14 @@ def _gateway_command_inner(args):
             os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
         verbose = getattr(args, "verbose", 0)
         quiet = getattr(args, "quiet", False)
-        replace = getattr(args, "replace", False)
+        # An explicitly marked external supervisor is authoritative for this
+        # process slot, matching the systemd/launchd/s6 commands that already
+        # pass --replace. If its previous child outlives SIGTERM briefly, use
+        # the existing identity-checked takeover path instead of making every
+        # bounded supervisor retry fail against the same live lock (#98625).
+        replace = getattr(args, "replace", False) or _truthy_env(
+            os.getenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV)
+        )
         force = getattr(args, "force", False)
         run_gateway(verbose, quiet=quiet, replace=replace, force=force)
         return

@@ -14,12 +14,21 @@
 
 set -e
 
+STAGE2="${HERMES_ENTRYPOINT_STAGE2:-/opt/hermes/docker/stage2-hook.sh}"
+WRAPPER="${HERMES_ENTRYPOINT_WRAPPER:-/opt/hermes/docker/main-wrapper.sh}"
+
 if [ "$$" -eq 1 ]; then
-    exec /init /opt/hermes/docker/main-wrapper.sh "$@"
+    exec /init "$WRAPPER" "$@"
 fi
 
 echo "[hermes] WARNING: container entrypoint is not PID 1; skipping s6-overlay /init and falling back to direct bootstrap. Supervised services are unavailable in this runtime, but the requested command will still run." >&2
 # /init normally seeds PATH with s6's helpers; the non-PID-1 fallback skips it.
 export PATH="/command:/package/admin/s6/command:${PATH}"
-/opt/hermes/docker/stage2-hook.sh
-exec /opt/hermes/docker/main-wrapper.sh "$@"
+# The platform wrapper owns this process slot just as systemd/launchd/s6 own
+# theirs. Mark that ownership so a restarted ``gateway run`` may use the
+# hardened takeover path when the previous process has not released its
+# runtime lock yet, rather than repeating the same duplicate-instance failure
+# until the platform exhausts its retry budget (#98625).
+export HERMES_GATEWAY_EXTERNAL_SUPERVISOR=1
+"$STAGE2"
+exec "$WRAPPER" "$@"
