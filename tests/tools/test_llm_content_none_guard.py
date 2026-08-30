@@ -159,6 +159,17 @@ class TestExtractContentOrReasoning:
         response = _make_response(None)
         assert extract_content_or_reasoning(response) == ""
 
+    def test_list_content_returns_joined_text_parts(self):
+        response = _make_response([
+            {"type": "text", "text": "  First observation  "},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+            {"type": "output_text", "text": "Second observation"},
+        ])
+
+        assert extract_content_or_reasoning(response) == (
+            "First observation  \nSecond observation"
+        )
+
 
     def test_think_blocks_stripped_with_remaining_content(self):
         response = _make_response("<think>internal reasoning</think>The answer is 42.")
