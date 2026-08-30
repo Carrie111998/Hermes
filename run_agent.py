@@ -1795,10 +1795,21 @@ class AIAgent:
         (LiteLLM/sglang/vLLM/LM Studio proxies, Tailscale boxes), which
         report finish_reason correctly and were the source of #13971's
         false-positive truncation continuations.
+
+        Cloud-backed Ollama models (model name contains ":cloud") run
+        generation server-side and report finish_reason correctly — the
+        local 11434 endpoint is only a proxy.  Applying the stop→length
+        rewrite to them manufactures false truncations and causes the
+        continuation nudge to consume the model's output budget on the
+        next retry, making further false-positives more likely (#98406).
         """
         model_lower = (self.model or "").lower()
         provider_lower = (self.provider or "").lower()
         if "glm" not in model_lower and provider_lower != "zai":
+            return False
+        # Cloud-backed models: finish_reason is forwarded faithfully from the
+        # upstream server; the local proxy is transparent.  Do not rewrite.
+        if ":cloud" in model_lower:
             return False
         if "ollama" in self._base_url_lower or ":11434" in self._base_url_lower:
             return True
