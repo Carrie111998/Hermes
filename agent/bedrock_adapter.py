@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -59,6 +60,7 @@ except Exception:
 
 _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
+_bedrock_client_cache_lock = threading.Lock()
 
 # Bedrock-hosted OpenAI GPT-5.5 is not exposed through the native Converse
 # runtime. AWS serves it from the Bedrock Mantle OpenAI-compatible Responses
@@ -115,21 +117,23 @@ def _get_bedrock_runtime_client(region: str):
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    if region not in _bedrock_runtime_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
-        )
+    with _bedrock_client_cache_lock:
+        if region not in _bedrock_runtime_client_cache:
+            boto3 = _require_boto3()
+            _bedrock_runtime_client_cache[region] = boto3.client(
+                "bedrock-runtime", region_name=region,
+            )
     return _bedrock_runtime_client_cache[region]
 
 
 def _get_bedrock_control_client(region: str):
     """Get or create a cached ``bedrock`` control-plane client for model discovery."""
-    if region not in _bedrock_control_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_control_client_cache[region] = boto3.client(
-            "bedrock", region_name=region,
-        )
+    with _bedrock_client_cache_lock:
+        if region not in _bedrock_control_client_cache:
+            boto3 = _require_boto3()
+            _bedrock_control_client_cache[region] = boto3.client(
+                "bedrock", region_name=region,
+            )
     return _bedrock_control_client_cache[region]
 
 
