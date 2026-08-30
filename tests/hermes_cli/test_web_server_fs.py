@@ -45,6 +45,25 @@ def test_fs_list_sorts_and_hides_noise(client, tmp_path):
     assert all(entry["name"] not in {".git", "node_modules"} for entry in entries)
 
 
+def test_fs_list_reports_symlinked_directory_as_directory(client, tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    target = tmp_path / "shared"
+    target.mkdir()
+    link = root / "linked-dir"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable on this host: {exc}")
+
+    response = client.get("/api/fs/list", params={"path": str(root)})
+
+    assert response.status_code == 200
+    assert response.json()["entries"] == [
+        {"name": "linked-dir", "path": str(link), "isDirectory": True}
+    ]
+
+
 def test_fs_read_data_url_rejects_over_cap(client, tmp_path, monkeypatch):
     monkeypatch.setattr(web_server, "_FS_DATA_URL_MAX_BYTES", 3)
     target = tmp_path / "image.png"

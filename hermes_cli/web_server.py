@@ -3050,7 +3050,11 @@ async def fs_list(path: str):
                 entries.append({
                     "name": entry.name,
                     "path": str(target / entry.name),
-                    "isDirectory": entry.is_dir(follow_symlinks=False),
+                    # The read/write endpoints resolve symlinks before
+                    # classifying the target.  Follow them here as well so a
+                    # directory link is navigable instead of being exposed as
+                    # a file that immediately fails /api/fs/read-text.
+                    "isDirectory": entry.is_dir(follow_symlinks=True),
                 })
         entries.sort(key=lambda item: (not item["isDirectory"], item["name"].lower(), item["name"]))
         return {"entries": entries}
