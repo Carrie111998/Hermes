@@ -22,6 +22,7 @@
 
 import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
+import { createRequire } from 'node:module'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
@@ -287,19 +288,29 @@ export function findElectron(): string {
   // In dev mode, we use the `electron` binary directly (not the packaged app).
   // The dev:electron script in package.json does exactly this: `electron .`
   // after building. We replicate that here.
-  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
+  //
+  // Let the package resolve its own binary instead of reconstructing its
+  // platform-specific dist path. This also follows npm workspace resolution,
+  // whether Electron is installed under apps/desktop or hoisted to the root.
+  try {
+    const require_ = createRequire(import.meta.url)
+    const localElectron = require_('electron') as unknown
 
-  if (fs.existsSync(localElectron)) {
-    return localElectron
+    if (typeof localElectron === 'string' && fs.existsSync(localElectron)) {
+      return localElectron
+    }
+  } catch {
+    // Electron is not installed locally — fall through to PATH.
   }
 
   // Fall back to PATH
-  const result = spawnSync('which', ['electron'], {
+  const result = spawnSync(process.platform === 'win32' ? 'where.exe' : 'which', ['electron'], {
     encoding: 'utf8',
   })
+  const electronOnPath = result.stdout?.split(/\r?\n/, 1)[0]?.trim()
 
-  if (result.status === 0 && result.stdout.trim()) {
-    return result.stdout.trim()
+  if (result.status === 0 && electronOnPath) {
+    return electronOnPath
   }
 
   throw new Error(
