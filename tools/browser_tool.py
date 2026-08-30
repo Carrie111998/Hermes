@@ -56,6 +56,7 @@ import logging
 import os
 import signal
 import re
+import sqlite3
 import subprocess
 import shutil
 import sys
@@ -1454,6 +1455,51 @@ def _use_real_profile() -> bool:
 _REAL_PROFILE_SESSION = "hermes-real-profile"
 _real_profile_cdp_lock = threading.Lock()
 _real_profile_cdp_cache: dict = {}
+# One-shot notice set when a freshly launched copy-browser is detected to have
+# purged the cookies the snapshot just copied in (Chrome ≥151 on Windows binds
+# cookie encryption to the original profile and deletes copied entries on first
+# launch, #96993). Consumed by the next real-profile session creation so the
+# first navigation can tell the agent why sites start signed out.
+_real_profile_purge_notice: dict = {}
+
+
+def _count_real_profile_cookies(copy_dir: str) -> Optional[int]:
+    """Count cookies in a real-profile copy's cookie DB, best-effort.
+
+    Reads the copy's ``Default/Network/Cookies`` (falling back to the legacy
+    ``Default/Cookies`` location) with a short-timeout read-only SQLite
+    connection. Any failure (missing DB, locked by the running copy-browser,
+    non-SQLite file) returns ``None`` — callers treat that as "cannot tell"
+    and skip the purge check rather than guess.
+    """
+    for rel in ("Network/Cookies", "Cookies"):
+        db = os.path.join(copy_dir, "Default", *rel.split("/"))
+        if not os.path.isfile(db):
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", timeout=1.0, uri=True)
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM cookies").fetchone()
+            finally:
+                conn.close()
+            return int(row[0]) if row else 0
+        except (sqlite3.Error, OSError, ValueError):
+            return None
+    return None
+
+
+def _cookies_purged_after_launch(before: Optional[int], after: Optional[int]) -> bool:
+    """True when the post-launch cookie count shows an active purge.
+
+    Chrome's app-bound-encryption purge wipes essentially the whole jar (556 → 6
+    and 3507 → ~0 in the #96993 reports), so a >50% drop from a non-trivial
+    baseline is unambiguous; normal startup work (expired-cookie sweeping,
+    fresh visitor cookies) moves counts by a handful. Counts below 5 are
+    ignored — a near-empty jar has nothing worth warning about.
+    """
+    if before is None or after is None or before < 5:
+        return False
+    return after * 2 < before
 
 
 def _agent_browser_argv(browser_cmd: str) -> list:
@@ -1650,6 +1696,11 @@ def _real_profile_cdp() -> tuple:
                 )
             return None, f"browser.use_real_profile is on, but {err}"
         copy_dir = snap_dir
+        # Baseline cookie count while nothing holds the copy's DBs: after the
+        # launch below, a Chromium that purges copied cookies (Chrome ≥151 on
+        # Windows, #96993) will have rewritten the jar down to ~zero, and the
+        # drop is what we warn on — not the copy, which this just verified.
+        cookies_before_launch = _count_real_profile_cookies(copy_dir)
 
         # Launch agent-browser's packaged Chromium on the profile COPY. This is
         # the same launch path Hermes' built-in local browsing already uses,
@@ -1703,6 +1754,24 @@ def _real_profile_cdp() -> tuple:
                 "the toggle off."
             )
         _real_profile_cdp_cache["cdp"] = cdp
+        cookies_after_launch = _count_real_profile_cookies(copy_dir)
+        if _cookies_purged_after_launch(cookies_before_launch, cookies_after_launch):
+            notice = (
+                "Chrome deleted the cookies copied from your real profile on "
+                "this copy browser's first launch (current Chrome binds cookie "
+                "encryption to the original profile, so copies are purged; "
+                "#96993). Sites will start signed out even though you are "
+                "signed in locally. Logins created inside this copy browser do "
+                "persist across sessions, but sites that refuse automated "
+                "browsers (e.g. Google sign-in) may reject a login here."
+            )
+            _real_profile_purge_notice["msg"] = notice
+            logger.warning(
+                "real-profile cookie purge detected: %d cookies copied, %d "
+                "survived the copy-browser launch — sessions will start "
+                "signed out (#96993)",
+                cookies_before_launch, cookies_after_launch,
+            )
         logger.info("real-profile browser ready for %s at %s (%s)", browser, cdp, copy_dir)
         return cdp, None
 
@@ -2716,12 +2785,22 @@ def _create_local_session(task_id: str, allow_real_profile: bool = True) -> Dict
             logger.info(
                 "Created real-profile local session %s for task %s", session_name, task_id
             )
-            return {
+            features = {"local": True, "real_profile": True}
+            session = {
                 "session_name": session_name,
                 "bb_session_id": None,
                 "cdp_url": _resolve_cdp_override(cdp_url),
-                "features": {"local": True, "real_profile": True},
+                "features": features,
             }
+            # One-shot: if this launch was detected to have purged the copied
+            # cookies (#96993), carry the notice on the session so the first
+            # navigation can explain the signed-out state instead of the agent
+            # discovering it as mysterious login failures, site by site.
+            purge_notice = _real_profile_purge_notice.pop("msg", None)
+            if purge_notice:
+                features["real_profile_cookies_purged"] = True
+                session["real_profile_purge_warning"] = purge_notice
+            return session
 
     session_name = f"h_{uuid.uuid4().hex[:10]}"
     logger.info("Created local browser session %s for task %s",
@@ -4097,6 +4176,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                     "Consider upgrading Browserbase plan for proxy support."
                 )
             response["stealth_features"] = active_features
+            # Set when the copy-browser's first launch purged the copied
+            # cookies (#96993): the agent needs to know up front why every
+            # site starts signed out before it burns turns probing logins.
+            purge_warning = session_info.get("real_profile_purge_warning")
+            if purge_warning:
+                response["real_profile_purge_warning"] = purge_warning
 
         # Auto-take a compact snapshot so the model can act immediately
         # without a separate browser_snapshot call.
