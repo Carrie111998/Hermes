@@ -3487,7 +3487,10 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 if result.get("repaired"):
                     result["journal_mode_before"] = before_mode
                     _restore_journal_mode_after_repair(db_path, before_mode)
-                    if not _finalize_structural_repair(db_path):
+                    active_quarantine = _active_structural_quarantine_path(db_path)
+                    if active_quarantine.exists() and not _finalize_structural_repair(
+                        db_path
+                    ):
                         result["repaired"] = False
                         result["error"] = (
                             "state.db was repaired, but its structural-quarantine "
