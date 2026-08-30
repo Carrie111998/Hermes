@@ -1,26 +1,29 @@
 ---
 title: "Hermes Architecture Study Progress"
 status: active
-source_commit: dd0827710
-updated_at: 2026-08-11
+source_commit: 26350357d7
+previous_commit: dd0827710
+updated_at: 2026-08-30
 ---
 
 # 研究进度
 
 ## 当前里程碑
 
-**M3 — Agent Loop 与回合可靠性**
+**M3 — Agent Loop 与回合可靠性**（前置：基线重验）
 
-当前目标：把已追踪的 canonical text/tool turn提升为完整状态机，系统覆盖 retry、fallback、empty recovery、budget、interrupt 和 crash matrix。
+2026-08-30 已将研究基线从 `dd0827710` 推进到 `26350357d7`（上游 5,922 个 commit）。M1/M2 结论仍锚定旧 commit，全部转为 `needs revalidation`。
+
+当前目标：先按新基线复核 M1/M2 的入口与回合结论，再把 canonical text/tool turn 提升为完整状态机，系统覆盖 retry、fallback、empty recovery、budget、interrupt 和 crash matrix。
 
 ## 里程碑状态
 
 | 里程碑 | 状态 | 置信度 | 说明 |
 |---|---|---:|---|
 | M0 研究基线与工作协议 | completed | high | 分支、恢复协议、计划、基线、模板和索引已建立 |
-| M1 系统全景架构 | completed | high | 系统上下文、进程模型、一级模块图与顶层数据流均已有源码证据 |
-| M2 Canonical Turn | completed | high | 无工具回合、工具回合、入口 ownership 与 delivery 对照均已有源码/测试证据 |
-| M3 Agent Loop | in progress | medium | 下一单元建立 conversation loop 状态机和 exit-reason taxonomy |
+| M1 系统全景架构 | needs revalidation | — | 结论在 `dd0827710` 成立；新基线下 `agent/` `hermes_cli/` `gateway/` `apps/desktop/` 均大幅变更，待复核 |
+| M2 Canonical Turn | needs revalidation | — | 结论在 `dd0827710` 成立；`cli.py` +4,346 行、`tools/` 637 commits，符号与行号引用待复核 |
+| M3 Agent Loop | blocked | — | 等待 M1/M2 按 `26350357d7` 复核；`agent/conversation_loop.py` 自旧基线起被 90 个 commit 修改 |
 | M4 Prompt/Context/Provider | pending | — | — |
 | M5 Tool Runtime | pending | — | — |
 | M6 Memory/Session | pending | — | — |
@@ -34,13 +37,24 @@ updated_at: 2026-08-11
 
 ## 当前研究单元
 
+**先做（基线重验）：**
+
+- 按 `26350357d7` 复核 M1 的进程/入口边界：`hermes_cli/`（1,118 commits）与 `apps/desktop/`（1,708 commits）是重灾区。
+- 按 `26350357d7` 复核 M2 的双持久化门与 batch segmentation：`cli.py`、`tools/`、`agent/` 均已实质改写。
+- 逐条复核 `INVARIANTS.md`，区分仍成立、已变更和已失效。
+
+**再做（M3 本体）：**
+
 - 枚举 `conversation_loop` 的状态、transition 和所有 terminal `turn_exit_reason`。
 - 将 retry/fallback、tool continuation、compression、interrupt 和 grace-call 画成状态机。
 - 建立成功/失败/partial/interrupted/completed 返回字段的真值矩阵。
 
 ## 已确认事实
 
-- 当前研究基线为 commit `dd0827710`。
+> ⚠️ 除前两条外，以下全部结论是在旧基线 `dd0827710` 上逐符号验证的，**尚未按 `26350357d7` 复核**。引用其中的符号名、调用顺序或行号前，先在新代码中确认。
+
+- 当前研究基线为 commit `26350357d7`（2026-08-30 同步自上游 `main`）。
+- 上一基线为 `dd0827710`；以下第 3 条起的结论均在该 commit 上验证。
 - 研究分支为 `docs/hermes-architecture-deep-dive`。
 - Hermes 使用共享 Agent 核心服务多个入口，但 TUI、Dashboard 和 Desktop 的呈现/进程边界不同。
 - “共享 Agent Core”表示共享代码内核，不是所有入口调用一个中央 Agent 服务。
@@ -81,8 +95,11 @@ updated_at: 2026-08-11
 1. `conversation_loop` 的所有 exit reason 如何映射到 completed/failed/partial/interrupted？
 2. retry、credential rotation、fallback model 与 one-turn grace call 的优先级是什么？
 3. empty response、dropped tool call、verification nudge 与 max-iteration recovery 如何保持角色交替？
-4. `OPEN-M2-001` 能否由 real SessionDB cold-resume test 稳定复现？
+4. `OPEN-M2-001` 能否由 real SessionDB cold-resume test 稳定复现？该问题在 `26350357d7` 上是否依然存在？
+5. 旧基线的哪些 INVARIANTS 在新基线下已失效？
 
 ## 下一步
 
-创建 M3 Agent Loop 状态机和 exit-reason/return-field 矩阵；将 `OPEN-M2-001` 纳入 crash recovery matrix。
+1. 按 `26350357d7` 复核 M1/M2 结论，逐份文档推进 `source_commit` 并移除 `revalidation_target`。
+2. 复核完成后再创建 M3 Agent Loop 状态机和 exit-reason/return-field 矩阵。
+3. 将 `OPEN-M2-001` 在新基线上重新取证，并纳入 crash recovery matrix。

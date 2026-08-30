@@ -1,7 +1,8 @@
 ---
 title: "Hermes Canonical Tool Turn"
-status: draft
+status: needs revalidation
 source_commit: dd0827710
+revalidation_target: 26350357d7
 verified_at: 2026-08-11
 confidence: high
 ---

@@ -1,8 +1,8 @@
 ---
 title: "Hermes Agent 完整架构研究计划"
 status: active
-source_commit: dd0827710
-verified_at: 2026-08-11
+source_commit: 26350357d7
+verified_at: 2026-08-30
 confidence: high
 ---
 
