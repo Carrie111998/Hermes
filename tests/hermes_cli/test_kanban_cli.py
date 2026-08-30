@@ -77,6 +77,33 @@ def test_kanban_list_json_handles_bytes_fields_in_db(kanban_home):
     )
 
 
+def test_kanban_list_json_handles_numeric_blob_fields_in_db(kanban_home):
+    """Regression: tasks with BLOBs in numeric/timestamp columns (e.g. priority=b'7',
+    created_at=b'1000', started_at=b'1010', completed_at=b'1020', max_retries=b'3')
+    must not crash `hermes kanban list --status archived --json` with TypeError."""
+    with kb.connect() as conn:
+        conn.execute(
+            "INSERT INTO tasks ("
+            "  id, title, body, assignee, status, priority, workspace_kind, "
+            "  created_at, started_at, completed_at, max_retries, created_by"
+            ") VALUES (?, ?, ?, ?, 'archived', ?, 'scratch', ?, ?, ?, ?, 'user')",
+            ("t_numblob1", "num blob task", "body", "coder", b"7", b"1000", b"1010", b"1020", b"3"),
+        )
+        conn.commit()
+
+    raw = kc.run_slash("list --status archived --json")
+    payload = json.loads(raw)
+    matched = [row for row in payload if row.get("id") == "t_numblob1"]
+    assert len(matched) == 1
+    t = matched[0]
+    assert t["priority"] == 7
+    assert t["created_at"] == 1000
+    assert t["started_at"] == 1010
+    assert t["completed_at"] == 1020
+    assert t["max_retries"] == 3
+
+
+
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:

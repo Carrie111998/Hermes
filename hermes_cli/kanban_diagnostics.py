@@ -1102,6 +1102,28 @@ _ROLE_PREFIX_PATTERN = re.compile(
 )
 
 
+def _discover_installed_profiles() -> set[str]:
+    """Discover installed profile names from disk."""
+    profiles: set[str] = set()
+    try:
+        from hermes_cli.kanban_db import list_profiles_on_disk
+        for p in list_profiles_on_disk():
+            s = str(p).strip().lower()
+            if s:
+                profiles.add(s)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.profiles import list_profile_names
+        for p in list_profile_names():
+            s = str(p).strip().lower()
+            if s:
+                profiles.add(s)
+    except Exception:
+        pass
+    return profiles
+
+
 def _rule_role_assignee_mismatch(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Detect when a recognized role prefix in the title disagrees with the task's assignee.
 
@@ -1126,52 +1148,70 @@ def _rule_role_assignee_mismatch(task, events, runs, now, cfg) -> list[Diagnosti
         return []
 
     role_norm = role_prefix.strip().lower()
-    known_roles = set(COMMON_ROLE_PREFIXES)
-    if isinstance(cfg, dict):
+
+    installed_profiles: set[str] = set()
+    cfg_has_explicit_profiles = False
+    if isinstance(cfg, dict) and "profiles" in cfg:
+        cfg_has_explicit_profiles = True
         profiles_cfg = cfg.get("profiles")
         if isinstance(profiles_cfg, (list, set, tuple, dict)):
             for p in profiles_cfg:
                 try:
                     s = str(p).strip().lower()
                     if s:
-                        known_roles.add(s)
+                        installed_profiles.add(s)
                 except Exception:
                     continue
 
+    if not cfg_has_explicit_profiles:
+        installed_profiles = _discover_installed_profiles()
+
+    known_roles = set(COMMON_ROLE_PREFIXES) | installed_profiles
     if role_norm not in known_roles:
         return []
 
     if role_norm == assignee.lower():
         return []
 
+    is_spawnable = role_norm in installed_profiles
     task_id = str(_task_field(task, "id") or "")
-    actions: list[DiagnosticAction] = [
-        DiagnosticAction(
-            kind="reassign",
-            label=f"Reassign to @{role_norm}",
-            payload={"suggested_assignee": role_norm, "current_assignee": assignee},
-            suggested=True,
-        )
-    ]
-    if task_id:
+    actions: list[DiagnosticAction] = []
+    if is_spawnable:
         actions.append(
             DiagnosticAction(
-                kind="cli_hint",
-                label=f"Reassign via CLI: hermes kanban assign {task_id} {role_norm}",
-                payload={"command": f"hermes kanban assign {task_id} {role_norm}"},
+                kind="reassign",
+                label=f"Reassign to @{role_norm}",
+                payload={"suggested_assignee": role_norm, "current_assignee": assignee},
+                suggested=True,
             )
         )
+        if task_id:
+            actions.append(
+                DiagnosticAction(
+                    kind="cli_hint",
+                    label=f"Reassign via CLI: hermes kanban assign {task_id} {role_norm}",
+                    payload={"command": f"hermes kanban assign {task_id} {role_norm}"},
+                )
+            )
+
+    detail = (
+        f"Task title begins with role prefix '{role_prefix}', but is currently "
+        f"assigned to '{assignee}'. If this task belongs to the {role_prefix} role, "
+        f"reassign it to @{role_norm}; otherwise update the title to avoid confusion."
+        if is_spawnable
+        else (
+            f"Task title begins with role prefix '{role_prefix}', but is currently "
+            f"assigned to '{assignee}'. Profile '{role_norm}' is not currently installed; "
+            f"update the title or install the profile to avoid confusion."
+        )
+    )
 
     return [
         Diagnostic(
             kind="role_assignee_mismatch",
             severity="warning",
             title=f"Title role prefix '{role_prefix}' mismatches assignee '{assignee}'",
-            detail=(
-                f"Task title begins with role prefix '{role_prefix}', but is currently "
-                f"assigned to '{assignee}'. If this task belongs to the {role_prefix} role, "
-                f"reassign it to @{role_norm}; otherwise update the title to avoid confusion."
-            ),
+            detail=detail,
             actions=actions,
             first_seen_at=now,
             last_seen_at=now,
@@ -1270,7 +1310,7 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
     if isinstance(kanban_cfg, dict):
         cfg.update(config_from_kanban_config(kanban_cfg))
         cfg["kanban"] = kanban_cfg
-    for key in ("auxiliary", "model"):
+    for key in ("auxiliary", "model", "profiles"):
         value = raw_config.get(key)
         if value is not None:
             cfg[key] = value

@@ -1531,10 +1531,14 @@
   function DiagnosticCard(props) {
     const { t } = useI18n();
     const { diag, task, boardSlug, assignees, onRefresh } = props;
+    const reassignAction = (diag.actions || []).find(function (a) {
+      return a.kind === "reassign";
+    });
+    const defaultReassignProfile = (reassignAction && reassignAction.payload && reassignAction.payload.suggested_assignee) || task.assignee || "";
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState(null);
     const [copiedKey, setCopiedKey] = useState(null);
-    const [reassignProfile, setReassignProfile] = useState(task.assignee || "");
+    const [reassignProfile, setReassignProfile] = useState(defaultReassignProfile);
 
     const execAction = function (action) {
       if (busy) return;
@@ -1610,14 +1614,15 @@
         return;
       }
       if (action.kind === "reassign") {
-        if (!reassignProfile) {
+        const targetProfile = reassignProfile || (action.payload && action.payload.suggested_assignee);
+        if (!targetProfile) {
           setMsg({ ok: false, text: tx(t, "pickProfileFirst", "Pick a profile first.") });
           return;
         }
         setBusy(true); setMsg(null);
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/reassign`, boardSlug);
         const body = {
-          profile: reassignProfile || null,
+          profile: targetProfile || null,
           reclaim_first: !!(action.payload && action.payload.reclaim_first),
           reason: `recovery action for ${diag.kind}`,
         };
@@ -1629,7 +1634,7 @@
           setMsg({
             ok: true,
             text: tx(t, "reassignedMessage", "Reassigned {id} to {profile}.",
-              { id: task.id, profile: reassignProfile }),
+              { id: task.id, profile: targetProfile }),
           });
           if (onRefresh) onRefresh();
         }).catch(function (err) {
@@ -1638,11 +1643,6 @@
         return;
       }
     };
-
-    // Pull out the reassign action so we can render its picker inline.
-    const reassignAction = (diag.actions || []).find(function (a) {
-      return a.kind === "reassign";
-    });
 
     const sevClass = "hermes-kanban-diag--" + (diag.severity || "warning");
     return h("div", { className: cn("hermes-kanban-diag", sevClass) },

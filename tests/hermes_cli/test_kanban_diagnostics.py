@@ -241,9 +241,10 @@ def test_role_assignee_mismatch_fires_on_common_prefixes():
         ("[Coder]: handle bytes body", "devops", "Coder", "coder"),
     ]
     now = int(time.time())
+    cfg = {"profiles": ["coder", "reviewer", "devops"]}
     for title, assignee, expected_prefix, expected_role in cases:
         task = _task(title=title, assignee=assignee, status="ready")
-        diags = kd.compute_task_diagnostics(task, [], [], now=now)
+        diags = kd.compute_task_diagnostics(task, [], [], now=now, config=cfg)
         mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
         assert len(mismatches) == 1, f"Failed for title={title!r}, assignee={assignee!r}"
         d = mismatches[0]
@@ -296,3 +297,47 @@ def test_role_assignee_mismatch_exempt_for_terminal_status():
         mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
         assert len(mismatches) == 0, f"Terminal task ({status}) should not fire role_assignee_mismatch"
 
+
+def test_role_assignee_mismatch_suppresses_suggested_reassign_for_uninstalled_role(monkeypatch):
+    """When a title has a role prefix for an uninstalled/non-spawnable role (e.g. architect),
+    the diagnostic fires as advisory warning but does NOT suggest reassigning to a non-spawnable target."""
+    now = int(time.time())
+    # Set known installed profiles to only ['coder', 'reviewer', 'devops']
+    cfg = {"profiles": ["coder", "reviewer", "devops"]}
+    task = _task(title="Architect: design system", assignee="reviewer", status="ready")
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=cfg)
+    mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+    assert len(mismatches) == 1
+    d = mismatches[0]
+    assert d.severity == "warning"
+    assert d.data["role_prefix"] == "Architect"
+    assert d.data["expected_assignee"] == "architect"
+    # Reassign action must not be suggested when architect is not installed
+    suggested_actions = [a for a in d.actions if a.suggested]
+    assert len(suggested_actions) == 0, f"Uninstalled profile must not have suggested action: {suggested_actions}"
+
+
+def test_role_assignee_mismatch_recognizes_installed_custom_profiles(tmp_path, monkeypatch):
+    """Custom installed profiles (e.g. fable) discovered dynamically on disk
+    are recognized as role prefixes and generate suggested reassignments."""
+    now = int(time.time())
+    # Create fake custom profile on disk
+    hermes_root = tmp_path / ".hermes"
+    fable_dir = hermes_root / "profiles" / "fable"
+    fable_dir.mkdir(parents=True)
+    (fable_dir / "config.yaml").write_text("model: custom-model\n")
+
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: hermes_root)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_root)
+
+    task = _task(title="Fable: generate world lore", assignee="reviewer", status="ready")
+    # Call compute_task_diagnostics with default config (no explicit profiles passed)
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+    assert len(mismatches) == 1
+    d = mismatches[0]
+    assert d.data["role_prefix"] == "Fable"
+    assert d.data["expected_assignee"] == "fable"
+    reassign_actions = [a for a in d.actions if a.kind == "reassign" and a.suggested]
+    assert len(reassign_actions) == 1
+    assert reassign_actions[0].payload["suggested_assignee"] == "fable"

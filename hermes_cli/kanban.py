@@ -57,36 +57,45 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    def _coerce_val(val: Any) -> Any:
+    def _coerce_json_safe(val: Any) -> Any:
+        if val is None:
+            return None
         if isinstance(val, bytes):
             return val.decode("utf-8", errors="replace")
-        return val
+        if isinstance(val, (int, float, bool, str)):
+            return val
+        if isinstance(val, (list, tuple, set)):
+            return [_coerce_json_safe(item) for item in val]
+        if isinstance(val, dict):
+            return {str(k): _coerce_json_safe(v) for k, v in val.items()}
+        return str(val)
 
-    return {
-        "id": _coerce_val(t.id),
-        "title": _coerce_val(t.title),
-        "body": _coerce_val(t.body),
-        "assignee": _coerce_val(t.assignee),
-        "status": _coerce_val(t.status),
+    raw_dict = {
+        "id": t.id,
+        "title": t.title,
+        "body": t.body,
+        "assignee": t.assignee,
+        "status": t.status,
         "priority": t.priority,
-        "tenant": _coerce_val(t.tenant),
-        "workspace_kind": _coerce_val(t.workspace_kind),
-        "workspace_path": _coerce_val(t.workspace_path),
-        "branch_name": _coerce_val(t.branch_name),
-        "project_id": _coerce_val(t.project_id),
-        "created_by": _coerce_val(t.created_by),
+        "tenant": t.tenant,
+        "workspace_kind": t.workspace_kind,
+        "workspace_path": t.workspace_path,
+        "branch_name": t.branch_name,
+        "project_id": t.project_id,
+        "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
         "completed_at": t.completed_at,
-        "result": _coerce_val(t.result),
+        "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
-        "model_override": _coerce_val(t.model_override),
-        "provider_override": _coerce_val(t.provider_override),
-        "session_id": _coerce_val(t.session_id),
-        "workflow_template_id": _coerce_val(t.workflow_template_id),
-        "current_step_key": _coerce_val(t.current_step_key),
+        "model_override": t.model_override,
+        "provider_override": t.provider_override,
+        "session_id": t.session_id,
+        "workflow_template_id": t.workflow_template_id,
+        "current_step_key": t.current_step_key,
     }
+    return {k: _coerce_json_safe(v) for k, v in raw_dict.items()}
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:

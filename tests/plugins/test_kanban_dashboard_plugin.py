@@ -1172,6 +1172,48 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     assert "t_ffff00001234" in row["diagnostics"][0]["data"]["phantom_ids"]
 
 
+def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clears_it(client, kanban_home):
+    """Consumer contract: task with role prefix gets suggested_assignee in diagnostic action,
+    posting that suggested assignee updates durable state and clears the diagnostic."""
+    # Ensure coder profile exists on disk so it is recognized as spawnable
+    coder_dir = kanban_home / "profiles" / "coder"
+    coder_dir.mkdir(parents=True, exist_ok=True)
+    (coder_dir / "config.yaml").write_text("model: test\n")
+
+    conn = kb.connect()
+    try:
+        t = kb.create_task(conn, title="Coder: fix bug", assignee="reviewer")
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    mismatch_rows = [row for row in data["diagnostics"] if row["task_id"] == t]
+    assert len(mismatch_rows) == 1
+    diag = mismatch_rows[0]["diagnostics"][0]
+    assert diag["kind"] == "role_assignee_mismatch"
+    reassign_actions = [a for a in diag["actions"] if a["kind"] == "reassign"]
+    assert len(reassign_actions) == 1
+    suggested = reassign_actions[0]["payload"]["suggested_assignee"]
+    assert suggested == "coder"
+
+    # Simulate UI execution: POST /reassign using suggested_assignee target
+    post_r = client.post(
+        f"/api/plugins/kanban/tasks/{t}/reassign",
+        json={"profile": suggested, "reclaim_first": False},
+    )
+    assert post_r.status_code == 200, post_r.text
+    assert post_r.json()["assignee"] == "coder"
+
+    # Re-check diagnostics — warning should now be cleared
+    r2 = client.get("/api/plugins/kanban/diagnostics")
+    assert r2.status_code == 200
+    mismatch_rows2 = [row for row in r2.json()["diagnostics"] if row["task_id"] == t]
+    assert len(mismatch_rows2) == 0
+
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks/:id/specify — triage specifier endpoint
 # ---------------------------------------------------------------------------

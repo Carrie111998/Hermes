@@ -1153,6 +1153,27 @@ class Task:
                 return v.decode("utf-8", errors="replace")
             return str(v)
 
+        def _int_val(v: Any, default: Optional[int] = None) -> Optional[int]:
+            if v is None:
+                return default
+            if isinstance(v, bytes):
+                try:
+                    return int(v.decode("utf-8", errors="replace").strip())
+                except Exception:
+                    return default
+            try:
+                return int(v)
+            except Exception:
+                return default
+
+        def _bool_val(v: Any, default: bool = False) -> bool:
+            if v is None:
+                return default
+            if isinstance(v, bytes):
+                s = v.decode("utf-8", errors="replace").strip().lower()
+                return s in ("1", "true", "yes", "t")
+            return bool(v)
+
         # Parse skills JSON blob if present
         skills_value: Optional[list] = None
         if "skills" in keys and row["skills"]:
@@ -1171,42 +1192,42 @@ class Task:
             body=_str_val(row["body"]),
             assignee=_str_val(row["assignee"]),
             status=_str_val(row["status"]) or "",
-            priority=row["priority"],
+            priority=_int_val(row["priority"], 0) or 0,
             created_by=_str_val(row["created_by"]),
-            created_at=row["created_at"],
-            started_at=row["started_at"],
-            completed_at=row["completed_at"],
+            created_at=_int_val(row["created_at"], 0) or 0,
+            started_at=_int_val(row["started_at"]),
+            completed_at=_int_val(row["completed_at"]),
             workspace_kind=(_str_val(row["workspace_kind"]) or "scratch") if "workspace_kind" in keys else "scratch",
             workspace_path=_str_val(row["workspace_path"]) if "workspace_path" in keys else None,
             branch_name=_str_val(row["branch_name"]) if "branch_name" in keys else None,
             project_id=_str_val(row["project_id"]) if "project_id" in keys else None,
             claim_lock=_str_val(row["claim_lock"]),
-            claim_expires=row["claim_expires"],
+            claim_expires=_int_val(row["claim_expires"]),
             tenant=_str_val(row["tenant"]) if "tenant" in keys else None,
             result=_str_val(row["result"]) if "result" in keys else None,
             idempotency_key=_str_val(row["idempotency_key"]) if "idempotency_key" in keys else None,
             consecutive_failures=(
-                row["consecutive_failures"] if "consecutive_failures" in keys
+                _int_val(row["consecutive_failures"], 0) or 0 if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
                 # adds ``consecutive_failures`` now, so this branch is only reachable
                 # on a DB that was never opened since pre-#20410 code ran. Keep for
                 # belt-and-suspenders safety; in practice it is dead code post-migration.
-                else (row["spawn_failures"] if "spawn_failures" in keys else 0)
+                else (_int_val(row["spawn_failures"], 0) or 0 if "spawn_failures" in keys else 0)
             ),
-            worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_pid=_int_val(row["worker_pid"]) if "worker_pid" in keys else None,
             last_failure_error=(
                 _str_val(row["last_failure_error"]) if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
                 else (_str_val(row["last_spawn_error"]) if "last_spawn_error" in keys else None)
             ),
             max_runtime_seconds=(
-                row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
+                _int_val(row["max_runtime_seconds"]) if "max_runtime_seconds" in keys else None
             ),
             last_heartbeat_at=(
-                row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
+                _int_val(row["last_heartbeat_at"]) if "last_heartbeat_at" in keys else None
             ),
             current_run_id=(
-                row["current_run_id"] if "current_run_id" in keys else None
+                _int_val(row["current_run_id"]) if "current_run_id" in keys else None
             ),
             workflow_template_id=(
                 _str_val(row["workflow_template_id"]) if "workflow_template_id" in keys else None
@@ -1227,13 +1248,13 @@ class Task:
                 else None
             ),
             max_retries=(
-                row["max_retries"] if "max_retries" in keys else None
+                _int_val(row["max_retries"]) if "max_retries" in keys else None
             ),
             goal_mode=(
-                bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
+                _bool_val(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
             ),
             goal_max_turns=(
-                row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
+                _int_val(row["goal_max_turns"]) if "goal_max_turns" in keys and row["goal_max_turns"] else None
             ),
             session_id=(
                 _str_val(row["session_id"]) if "session_id" in keys else None
@@ -1242,7 +1263,7 @@ class Task:
                 _str_val(row["block_kind"]) if "block_kind" in keys and row["block_kind"] else None
             ),
             block_recurrences=(
-                int(row["block_recurrences"])
+                _int_val(row["block_recurrences"], 0) or 0
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
