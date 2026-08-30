@@ -759,6 +759,60 @@ class TestExternalSkillMutations:
         assert not (local / "ext-skill").exists()
 
 
+    def test_find_skill_resolves_categorized_path_under_external_dir(self, tmp_path):
+        """The categorized form (category/skill-name) must resolve for a
+        skill living under skills.external_dirs, not just the local skills
+        dir.
+
+        Regression: _find_skill's categorized-path matching resolved every
+        candidate skill's relative path against the FIXED local skills root
+        regardless of which directory get_all_skills_dirs() actually found
+        it under. relative_to() raises ValueError for a path outside that
+        root, so an external-dir skill's categorized path never matched —
+        only its bare name did — even though skill_view's own categorized
+        resolution has no such restriction (the "parity with skill_view"
+        this lookup exists for).
+        """
+        local = tmp_path / "local"
+        external = tmp_path / "vault"
+        local.mkdir(); external.mkdir()
+        skill_dir = external / "mlops" / "axolotl"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: axolotl\ndescription: An external categorized skill.\n---\n\nBody.\n"
+        )
+
+        with _two_roots(local, external):
+            found_categorized = _find_skill("mlops/axolotl")
+            found_bare = _find_skill("axolotl")
+
+        assert found_categorized is not None, (
+            "categorized path must resolve for an external-dir skill"
+        )
+        assert found_categorized["path"] == skill_dir
+        assert found_bare is not None
+        assert found_bare["path"] == skill_dir
+
+    def test_patch_external_skill_by_categorized_path(self, tmp_path):
+        """skill_manage's categorized-path resolution must work end-to-end
+        for a skill under skills.external_dirs — not just the ability to
+        locate it (previous test), but to actually patch it in place."""
+        local = tmp_path / "local"
+        external = tmp_path / "vault"
+        local.mkdir(); external.mkdir()
+        skill_dir = external / "mlops" / "axolotl"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: axolotl\ndescription: An external categorized skill.\n---\n\n"
+            "Body with OLD_MARKER here.\n"
+        )
+
+        with _two_roots(local, external):
+            result = _patch_skill("mlops/axolotl", "OLD_MARKER", "NEW_MARKER")
+
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text()
+
     def test_background_review_refuses_to_patch_pinned_skill(self, tmp_path):
         """#25839: the autonomous review fork respects pin like the curator
         does — a pinned skill is off-limits to background maintenance, even
