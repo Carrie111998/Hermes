@@ -811,6 +811,7 @@ def _run_command_stt(
             continue
         if chunk is None:
             open_streams.discard(name)
+            deadline = time.monotonic() + timeout
             continue
         chunks[name].append(chunk)
         deadline = time.monotonic() + timeout
