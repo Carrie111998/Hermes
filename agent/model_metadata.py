@@ -2133,6 +2133,20 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
     if _endpoint_blackholed(server_url):
         return None
 
+    # Ollama's native /api/show only exists on actual Ollama servers. Probing
+    # every unrecognized endpoint 404s forever on OpenAI-compatible local
+    # servers (llama.cpp / Lemonade / LM Studio) because failures are
+    # deliberately never cached — every fresh process re-paid the probe.
+    # Mirror the server-type guard query_ollama_num_ctx() already uses.
+    # ollama.com (hosted Ollama) bypasses the local-type detection: it is
+    # definitively Ollama and detection adds nothing but latency there.
+    if "ollama.com" not in server_url:
+        try:
+            if detect_local_server_type(base_url, api_key=api_key) != "ollama":
+                return None
+        except Exception:
+            return None
+
     headers = _auth_headers(api_key)
 
     try:

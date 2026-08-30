@@ -130,3 +130,74 @@ class TestQueryOllamaSupportsVision:
         with patch("agent.model_metadata.detect_local_server_type", return_value="vllm"):
             result = query_ollama_supports_vision("llava", "http://localhost:8000/v1")
         assert result is None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# _query_ollama_api_show_uncached — server-type guard (#96054)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestQueryOllamaApiShowServerTypeGuard:
+    """The provider-agnostic /api/show probe must not spray 404s at
+    OpenAI-compatible local servers (llama.cpp / Lemonade / LM Studio).
+    Failures are deliberately never cached, so without the guard every
+    fresh process re-paid the probe against a server that can never
+    answer it."""
+
+    def test_returns_none_for_non_ollama_local_server(self):
+        from agent.model_metadata import _query_ollama_api_show_uncached
+
+        with patch(
+            "agent.model_metadata.detect_local_server_type",
+            return_value="lm-studio",
+        ), patch("httpx.Client") as client_cls:
+            result = _query_ollama_api_show_uncached(
+                "Qwen3-30B-A3B-Instruct-2507-GGUF", "http://localhost:13305/api/v1"
+            )
+        assert result is None
+        client_cls.assert_not_called()  # the POST never happens
+
+    def test_returns_none_when_detection_fails(self):
+        from agent.model_metadata import _query_ollama_api_show_uncached
+
+        with patch(
+            "agent.model_metadata.detect_local_server_type",
+            side_effect=RuntimeError("boom"),
+        ), patch("httpx.Client") as client_cls:
+            result = _query_ollama_api_show_uncached(
+                "some-model", "http://localhost:8000/v1"
+            )
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_probes_when_server_is_ollama(self):
+        from agent.model_metadata import _query_ollama_api_show_uncached
+
+        mock_ctx, mock_client = _mock_httpx_client(
+            {"model_info": {"qwen3.context_length": 40960}}
+        )
+        with patch(
+            "agent.model_metadata.detect_local_server_type",
+            return_value="ollama",
+        ), patch("httpx.Client", return_value=mock_ctx):
+            result = _query_ollama_api_show_uncached(
+                "qwen3", "http://localhost:11434/v1"
+            )
+        assert result == 40960
+        mock_client.post.assert_called_once()
+
+    def test_ollama_com_bypasses_local_detection(self):
+        from agent.model_metadata import _query_ollama_api_show_uncached
+
+        mock_ctx, mock_client = _mock_httpx_client(
+            {"model_info": {"deepseek.context_length": 163840}}
+        )
+        with patch(
+            "agent.model_metadata.detect_local_server_type",
+            side_effect=AssertionError("must not be called for ollama.com"),
+        ), patch("httpx.Client", return_value=mock_ctx):
+            result = _query_ollama_api_show_uncached(
+                "deepseek-v4", "https://ollama.com/v1", api_key="k"
+            )
+        assert result == 163840
+        mock_client.post.assert_called_once()
