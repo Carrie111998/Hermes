@@ -4778,6 +4778,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     resp.choices[0].message.content
                     if hasattr(resp, "choices") else str(resp)
                 ) or ""
+                # 2026-08-30 修复 (推理模型 content 空——与主摘要同一 bug):
+                # deepseek-v4-flash 等推理模型 content 空时答案在 reasoning_content,
+                # 裸读 .content 会得到空 digest → "[digest unavailable]" 降级。
+                if not body.strip():
+                    from agent.auxiliary_client import extract_content_or_reasoning
+                    body = extract_content_or_reasoning(resp) or ""
                 from agent.agent_runtime_helpers import strip_think_blocks
 
                 body = strip_think_blocks(None, body).strip()
@@ -5280,6 +5286,23 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""
+            # 2026-08-30 修复 (推理模型 content 空——与 agent 侧同一 bug):
+            # deepseek-v4-flash / kimi-k3 等推理模型总结大会话时 content 常为空, 答案在
+            # reasoning / reasoning_content 结构化字段。此前只读 content → 误判 "empty content"
+            # → raise → fallback 重试 → 每次 100s+ 压缩白做 (Summarizing thread 慢的根因)。
+            # 语义同 auxiliary_client.extract_content_or_reasoning()——此处三态兼容 (dict/对象/str)。
+            if not content.strip():
+                _reasoning_parts: list[str] = []
+                for _field in ("reasoning", "reasoning_content"):
+                    _val = (
+                        message.get(_field)
+                        if isinstance(message, dict)
+                        else getattr(message, _field, None)
+                    )
+                    if _val and isinstance(_val, str) and _val.strip() and _val not in _reasoning_parts:
+                        _reasoning_parts.append(_val.strip())
+                if _reasoning_parts:
+                    content = "\n\n".join(_reasoning_parts)
             # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels)
             # return a well-formed HTTP 200 with an empty or whitespace-only
             # ``content`` instead of an error or empty ``choices``. That payload
