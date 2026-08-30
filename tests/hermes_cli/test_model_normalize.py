@@ -223,3 +223,30 @@ class TestLMStudioMatchingPrefixStrip:
             == "qwen3.8-flash-next"
         )
 
+    @pytest.mark.parametrize("model", [
+        "openai/gpt-4",
+        "z-ai/glm-5.2",
+        "ollama/qwen3",
+    ])
+    def test_foreign_prefix_untouched(self, model):
+        """Only the *matching* prefix is stripped.
+
+        An LM Studio endpoint can front a proxy whose route requires a
+        foreign prefix (LiteLLM-style ``ollama/…``), so a non-matching prefix
+        must survive — adding ``lmstudio`` to the strip set must not widen
+        into a general slash-stripper.
+        """
+        assert normalize_model_for_provider(model, "lmstudio") == model
+
+    @pytest.mark.parametrize("model,expected", [
+        ("lmstudio/lmstudio/qwen3-27b", "lmstudio/qwen3-27b"),
+        ("lmstudio/openai/gpt-4", "openai/gpt-4"),
+    ])
+    def test_exactly_one_prefix_level_is_stripped(self, model, expected):
+        """A stacked id loses only its own leading ``lmstudio/``.
+
+        Matches the one-level scope the other strip paths use: a leftover
+        prefix chain means the id was namespaced elsewhere, and guessing
+        further would mangle a legitimate route.
+        """
+        assert normalize_model_for_provider(model, "lmstudio") == expected
