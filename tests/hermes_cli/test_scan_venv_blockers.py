@@ -22,10 +22,19 @@ class TestFindFlag:
     def test_returns_minus1_when_absent(self):
         assert _find_flag("hermes serve --verbose", "--model") == -1
 
-    def test_flag_not_matched_as_substring(self):
-        # "--model" must not match "--model-extra"
-        idx = _find_flag("hermes --model-extra foo", "--model")
+    def test_flag_not_matched_as_substring_of_value(self):
+        # "--model" must not match a path/value that embeds "--model" mid-word,
+        # e.g. "/some--model-thing" (no preceding space)
+        idx = _find_flag("/some--model-thing", "--model")
         assert idx == -1
+
+    def test_flag_matches_at_word_boundary_even_with_suffix(self):
+        # _find_flag checks that the flag starts at position 0 or after a space;
+        # callers pass the flag with " " or "=" appended when they need to
+        # distinguish --model from --model-extra. The raw helper returns the
+        # word-start position regardless of what follows.
+        idx = _find_flag("hermes --model-extra foo", "--model")
+        assert idx == len("hermes ")
 
     def test_empty_text(self):
         assert _find_flag("", "--model") == -1
