@@ -156,6 +156,57 @@ class TestPseudoSchemePrefixStripping:
         with pytest.raises(isrc.SourceNotFound):
             await isrc.resolve_image_source("path:pic.png", isrc.ResolveContext())
 
+    @pytest.mark.parametrize(
+        "raw,stripped",
+        [
+            pytest.param("path:/abs/img.png", "/abs/img.png", id="posix-abs"),
+            pytest.param("LOCAL:~/img.png", "~/img.png", id="home-case-insensitive"),
+            pytest.param("path: ./rel.png", "./rel.png", id="equals-space-separator"),
+            pytest.param(r"path:C:\Users\me\img.png", r"C:\Users\me\img.png",
+                         id="windows-drive-backslash"),
+            pytest.param("local:C:/Users/me/img.png", "C:/Users/me/img.png",
+                         id="windows-drive-forward-slash"),
+            pytest.param(r"path:\\server\share\img.png", r"\\server\share\img.png",
+                         id="unc-root"),
+        ],
+    )
+    def test_windows_path_shapes_stripped(self, tmp_path, monkeypatch, raw, stripped):
+        """Windows drive-absolute and UNC spellings are real absolute paths and
+        must be stripped too. The strip is pure string work, so it is pinned at
+        the regex level where it stays testable on POSIX CI."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        assert isrc._PSEUDO_SCHEME_RE.sub("", raw, count=1) == stripped
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("path://host/img.png", id="authority-form-path"),
+            pytest.param("local://host/img.png", id="authority-form-local"),
+            pytest.param("paths://x.png", id="different-scheme-name"),
+            pytest.param("path:pic.png", id="bare-relative-name"),
+            pytest.param(r"path:C:relative.png", id="drive-relative"),
+        ],
+    )
+    def test_uri_and_ambiguous_forms_left_untouched(
+            self, tmp_path, monkeypatch, raw):
+        """The "//" authority form ("path://host") is a structurally complete
+        URI, not a decorated path; drive-relative spellings are cwd-dependent
+        and ambiguous. Neither is rewritten."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        assert isrc._PSEUDO_SCHEME_RE.sub("", raw, count=1) == raw
+
+    @pytest.mark.asyncio
+    async def test_uri_authority_form_still_unsupported_scheme(
+            self, tmp_path, monkeypatch):
+        """Pins the "path://host" decision end to end: the authority form must
+        flow into the existing unsupported-scheme branch instead of being
+        rewritten to a "//host" POSIX path."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        with pytest.raises(isrc.UnsupportedScheme):
+            await isrc.resolve_image_source(
+                "path://host/img.png", isrc.ResolveContext())
+
 
 class TestNonLocalBackendConfinement:
     """The security model: under a sandbox backend, host reads are confined to

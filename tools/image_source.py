@@ -96,9 +96,16 @@ _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 # "path:"/"local:" pseudo-scheme prefixed ("path:/home/.../img.jpg"). That is
 # not a real URI (no "//"), so _SCHEME_RE doesn't match and the whole string
 # falls through to the path branch, failing as "media file not found". Strip
-# the pseudo-scheme only when a path character follows; real schemes
-# ("paths://x") and bare relative names ("path:foo.png") keep their old shape.
-_PSEUDO_SCHEME_RE = re.compile(r"^(?:path|local)\s*[:=]\s*(?=[/~.])", re.IGNORECASE)
+# the pseudo-scheme only when a path shape follows: POSIX absolute/home/dot
+# ("/", "~", "."), a Windows drive-absolute root ("C:\", "C:/"), or a UNC
+# root ("\\server\share"). Real schemes ("paths://x", "path://host" — the
+# "//" authority form is a genuine URI), bare relative names ("path:foo.png")
+# and drive-relative spellings ("path:C:img.png" — cwd-dependent, ambiguous)
+# keep their old shape.
+_PSEUDO_SCHEME_RE = re.compile(
+    r"^(?:path|local)\s*[:=]\s*(?=[/~.]|[A-Za-z]:[\\/]|\\\\)(?!//)",
+    re.IGNORECASE,
+)
 
 
 async def resolve_image_source(
