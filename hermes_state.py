@@ -3952,7 +3952,9 @@ def is_zeroed_state_db(
         size = path.stat().st_size
     except OSError:
         return False
-    if size <= 0:
+    if size == 0:
+        return True
+    if size < 0:
         return False
     from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
 
