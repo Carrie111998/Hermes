@@ -12,6 +12,7 @@ entries that still carry an origin source are re-armed, and every failure
 mode degrades to "no watches" instead of breaking startup.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -140,5 +141,101 @@ async def test_restore_survives_db_read_failure(monkeypatch):
     await r._restore_heartbeat_watches()
     try:
         assert r._heartbeat_watch == {}
+    finally:
+        await _shutdown(r)
+
+
+@pytest.mark.asyncio
+async def test_restart_end_to_end_delivers_active_without_resume(monkeypatch):
+    """Startup path: after a restart, an active heartbeat delivers via the
+    poller with no manual /heartbeat resume, while a paused one never
+    registers a watch (#98298)."""
+    active = SimpleNamespace(
+        status="active", prompt="Check CI", interval_seconds=600
+    )
+    paused = SimpleNamespace(
+        status="paused", prompt="Check mail", interval_seconds=300
+    )
+    by_sid = {"sid-active": active, "sid-paused": paused}
+    monkeypatch.setattr(
+        "hermes_cli.heartbeat.load_heartbeat", lambda sid: by_sid.get(sid)
+    )
+    # Restore starts the poller, so shorten its cadence before it closes
+    # over POLL_SECONDS.
+    monkeypatch.setattr("hermes_cli.heartbeat.POLL_SECONDS", 0.05)
+
+    delivered = []
+
+    class _DueManager:
+        def __init__(self, session_id):
+            self._sid = session_id
+
+        def has_heartbeat(self):
+            return True
+
+        def due_prompt(self):
+            # Fire once, then stay quiet: delivery cadence is the poller's
+            # contract with the real HeartbeatManager, not this test's.
+            if self._sid == "sid-active" and not delivered:
+                return "Check CI"
+            return None
+
+    monkeypatch.setattr("hermes_cli.heartbeat.HeartbeatManager", _DueManager)
+
+    r = _runner(
+        _StubStore(
+            [
+                _entry("telegram:dm:111", "sid-active", _source("111")),
+                _entry("telegram:dm:222", "sid-paused", _source("222")),
+            ]
+        )
+    )
+
+    async def _warm(_label):
+        return None
+
+    r._warm_goals_session_db = _warm
+    r._adapter_for_source = lambda source: object()
+    r._enqueue_fifo = lambda quick_key, event, adapter: delivered.append(
+        (quick_key, event)
+    )
+
+    # Simulated restart: persisted state in the store above, empty
+    # in-memory registry, restore called from the startup path.
+    await r._restore_heartbeat_watches()
+    try:
+        assert set(r._heartbeat_watch) == {"telegram:dm:111"}
+        for _ in range(200):
+            if delivered:
+                break
+            await asyncio.sleep(0.01)
+        assert [(key, event.text) for key, event in delivered] == [
+            ("telegram:dm:111", "Check CI")
+        ]
+    finally:
+        await _shutdown(r)
+
+
+@pytest.mark.asyncio
+async def test_repeated_restore_does_not_duplicate_registrations(monkeypatch):
+    """Repeated startup/recovery passes must not stack registrations for
+    the same session_key: the registry overwrites by key and the poller is
+    a gateway-wide singleton."""
+    active = SimpleNamespace(
+        status="active", prompt="Check CI", interval_seconds=600
+    )
+    monkeypatch.setattr(
+        "hermes_cli.heartbeat.load_heartbeat", lambda sid: active
+    )
+    r = _runner(_StubStore([_entry("telegram:dm:111", "sid-1", _source("111"))]))
+
+    await r._restore_heartbeat_watches()
+    try:
+        first_task = r._heartbeat_poll_task
+        assert first_task is not None and not first_task.done()
+
+        await r._restore_heartbeat_watches()
+        assert set(r._heartbeat_watch) == {"telegram:dm:111"}
+        assert r._heartbeat_poll_task is first_task
     finally:
         await _shutdown(r)
