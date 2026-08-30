@@ -1092,3 +1092,81 @@ class TestDefaultDowngradeNotice:
         )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         assert bu_cli.default_downgrade_notice() is None
+
+
+def test_browser_exec_fails_closed_when_backend_off(monkeypatch):
+    """#94702: browser.backend=off is an invocation-time kill switch.
+
+    A conversation's tool schema is intentionally stable, so browser_exec can
+    stay advertised after the operator disables the backend. The handler must
+    refuse before any CLI lookup or subprocess launch — mirroring the issue's
+    deterministic repro (a disabled backend with a _find_cli that must never
+    run).
+    """
+    monkeypatch.setattr(
+        bu_cli, "get_browser_backend", lambda: bu_cli.BACKEND_DISABLED
+    )
+
+    def must_not_run():
+        raise AssertionError(
+            "disabled browser_exec still tried to resolve the CLI"
+        )
+
+    monkeypatch.setattr(bu_cli, "_find_cli", must_not_run)
+
+    out = bu_cli.browser_exec("print(page_info())")
+
+    assert isinstance(out, str)
+    assert "browser.backend is off" in out
+
+
+def test_browser_exec_kill_switch_precedes_url_blocklist(monkeypatch):
+    """When the backend is off and the code also carries a blocked URL, the
+    backend-off refusal wins: the kill switch runs first, and the reply must
+    not leak that the URL blocklist would also have fired (#94702 review)."""
+    monkeypatch.setattr(
+        bu_cli, "get_browser_backend", lambda: bu_cli.BACKEND_DISABLED
+    )
+
+    def must_not_run():
+        raise AssertionError(
+            "disabled browser_exec still tried to resolve the CLI"
+        )
+
+    monkeypatch.setattr(bu_cli, "_find_cli", must_not_run)
+
+    def blocklist_must_not_run(code):
+        raise AssertionError(
+            "URL blocklist was consulted while the kill switch had already refused"
+        )
+
+    monkeypatch.setattr(bu_cli, "_blocked_url_in_code", blocklist_must_not_run)
+
+    out = bu_cli.browser_exec('new_tab("https://definitely-blocked.example")')
+
+    assert isinstance(out, str)
+    assert "browser.backend is off" in out
+
+
+def test_browser_exec_still_runs_when_backend_enabled(monkeypatch):
+    """The kill switch must not fire for an enabled backend: resolve the
+    CLI path normally (the exec itself is stubbed at the subprocess seam)."""
+    import subprocess
+
+    monkeypatch.setattr(bu_cli, "get_browser_backend", lambda: "browser-use")
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+
+    ran = {}
+
+    def fake_run(cmd, **kwargs):
+        ran["cmd"] = cmd
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"ok": true}', stderr=""
+        )
+
+    monkeypatch.setattr(bu_cli.subprocess, "run", fake_run)
+
+    out = bu_cli.browser_exec("print(page_info())")
+
+    assert ran["cmd"] == ["browser-use"]
+    assert "ok" in out

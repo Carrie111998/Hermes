@@ -687,6 +687,18 @@ def browser_exec(
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
+    # ``browser.backend=off`` is an invocation-time kill switch, not just a
+    # schema-time filter. A conversation's tool schema is intentionally
+    # stable (prompt caching), so browser_exec can stay advertised after the
+    # operator disables the backend — the handler must fail closed before
+    # any CLI lookup or subprocess launch (#94702).
+    if get_browser_backend() == BACKEND_DISABLED:
+        return tool_error(
+            "browser_exec is disabled: browser.backend is off. Re-enable a "
+            "backend (e.g. `hermes config set browser.backend browser-use`) "
+            "to use browser automation."
+        )
+
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)
