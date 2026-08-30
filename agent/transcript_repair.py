@@ -16,20 +16,42 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 
 
 def is_content_blank(content: Any) -> bool:
-    """True when decoded message content is None, whitespace-only, or has no visible text parts."""
+    """True when decoded message content is None, whitespace-only, or has no visible text or media parts."""
     if content is None:
         return True
     if isinstance(content, str):
         return not content.strip()
+    if isinstance(content, dict):
+        if content.get("type") == "text":
+            return not str(content.get("text", "")).strip()
+        return False
     if isinstance(content, list):
         if not content:
             return True
-        texts = [
-            p.get("text", "")
-            for p in content
-            if isinstance(p, dict) and p.get("type") == "text"
-        ]
-        return not "".join(texts).strip()
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    return False
+            elif isinstance(part, dict):
+                part_type = part.get("type")
+                if part_type == "text":
+                    if str(part.get("text", "")).strip():
+                        return False
+                elif part_type is not None:
+                    # Non-text typed part (e.g. image, image_url, input_audio, document) is non-blank
+                    return False
+                else:
+                    # Dict without a "type" field: check if text-only or multimodal payload
+                    if any(k in part for k in ("image_url", "image", "source", "data", "audio", "document")):
+                        return False
+                    if "text" in part:
+                        if str(part.get("text", "")).strip():
+                            return False
+                    else:
+                        return False
+            else:
+                return False
+        return True
     return False
 
 
@@ -94,6 +116,10 @@ def resolve_and_repair_transcript_batch(
                         msg["_row_id"] = target_id
                         msg["_canonical_content"] = decoded
                 repaired = True
+            else:
+                # Target row is not in SQLite (e.g. purged/uncommitted); strip stale in-memory row id
+                if isinstance(msg, dict) and "_row_id" in msg:
+                    msg.pop("_row_id", None)
         if not repaired:
             inserted_rows.append(msg)
     return inserted_rows
@@ -105,8 +131,10 @@ def sync_flushed_message_markers(
 ) -> None:
     """Stamp _DB_PERSISTED_MARKER and sync canonical row ID / content onto live dicts after commit."""
     for written, row in zip(batch_msgs, batch_rows):
-        written[_DB_PERSISTED_MARKER] = True
-        if isinstance(row.get("_row_id"), int):
-            written["_row_id"] = row["_row_id"]
-        if "_canonical_content" in row:
-            written["content"] = row["_canonical_content"]
+        if isinstance(written, dict):
+            written[_DB_PERSISTED_MARKER] = True
+            if isinstance(row, dict):
+                if isinstance(row.get("_row_id"), int):
+                    written["_row_id"] = row["_row_id"]
+                if "_canonical_content" in row:
+                    written["content"] = row["_canonical_content"]
