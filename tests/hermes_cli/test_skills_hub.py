@@ -283,10 +283,79 @@ def test_resolve_keeps_catalog_meta_when_later_sources_do_not_fetch():
 
 
 
-# ---------------------------------------------------------------------------
-# UrlSource-specific install paths: --name override, interactive prompts,
-# non-interactive error, existing-category scan.
-# ---------------------------------------------------------------------------
+def test_do_install_returns_false_when_fetch_fails(hub_env, tmp_path):
+    """do_install must return False (not raise, not return None) when every
+    source fails to fetch the identifier -- this is what lets the CLI set a
+    non-zero exit code on a failed `hermes skills install` instead of
+    silently reporting success (#98725)."""
+    import tools.skills_hub as hub
+
+    class _DeadSource:
+        def inspect(self, identifier):
+            return None
+
+        def fetch(self, identifier):
+            return None
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=80)
+
+    monkeypatch_ctx = [
+        ("ensure_hub_dirs", lambda: None),
+        ("create_source_router", lambda auth: [_DeadSource()]),
+    ]
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        for attr, val in monkeypatch_ctx:
+            mp.setattr(hub, attr, val)
+        result = do_install(
+            "someorg/some-skill", console=console, skip_confirm=True,
+        )
+    finally:
+        mp.undo()
+
+    assert result is False
+    assert "Could not fetch" in sink.getvalue()
+
+
+def test_skills_command_install_failure_propagates_false(hub_env, tmp_path):
+    """skills_command's `install` branch must surface a False do_install
+    return so cmd_skills (hermes_cli/main.py) can turn it into exit code 1
+    instead of the process always exiting 0 (#98725)."""
+    from hermes_cli.skills_hub import skills_command
+
+    class _Args:
+        skills_action = "install"
+        identifier = "someorg/some-skill"
+        category = ""
+        force = False
+        yes = True
+        name = ""
+
+    with patch("hermes_cli.skills_hub.do_install", return_value=False):
+        result = skills_command(_Args())
+
+    assert result is False
+
+
+def test_skills_command_install_success_returns_none(hub_env, tmp_path):
+    """A successful install must not flip the router's return value --
+    only a failure should signal non-zero exit."""
+    from hermes_cli.skills_hub import skills_command
+
+    class _Args:
+        skills_action = "install"
+        identifier = "someorg/some-skill"
+        category = ""
+        force = False
+        yes = True
+        name = ""
+
+    with patch("hermes_cli.skills_hub.do_install", return_value=True):
+        result = skills_command(_Args())
+
+    assert result is None
 
 
 def _make_url_bundle_fetcher(name="", awaiting_name=True, url="https://example.com/SKILL.md"):
