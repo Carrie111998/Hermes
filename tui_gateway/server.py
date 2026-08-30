@@ -4898,19 +4898,47 @@ def _cron_sig():
 
 
 def _sessions_sig():
-    """Newest mtime across state.db and its WAL — the cross-process change
-    signal. Messaging-gateway turns and cron runs are written by OTHER
-    processes that never touch this gateway's transports; the shared SQLite
-    file is the one thing they all move (#58671)."""
+    """Content-based signature for the sessions table.
+
+    The cross-process change signal is a tuple of:
+    - max(state.db mtime, state.db-wal mtime)  — fast, catches any write
+    - (session_count, max_updated_at)           — content hash, filters out
+      heartbeat-only mtime churn that moves state.db without changing any
+      session row (#98005 / #38015).
+
+    Messaging-gateway turns and cron runs are written by OTHER processes that
+    never touch this gateway's transports; the shared SQLite file is the one
+    thing they all move (#58671).  But gateway_heartbeats refreshes a row
+    every 60 s, bumping state.db's mtime even when no session changed.  The
+    content component prevents that from broadcasting sessions.changed and
+    re-mounting the chat, which yanks the scroll position.
+    """
     home = _watcher_home()
-    sig = None
+    mtime_sig = None
     for name in ("state.db", "state.db-wal"):
         try:
             mtime = (home / name).stat().st_mtime_ns
         except OSError:
             continue
-        sig = mtime if sig is None else max(sig, mtime)
-    return sig
+        mtime_sig = mtime if mtime_sig is None else max(mtime_sig, mtime)
+
+    # Add a lightweight content probe: session count + newest updated_at.
+    # A failed probe falls back to mtime-only (pre-fix behaviour) so startup
+    # and read-only deployments still work.
+    content_sig = None
+    try:
+        import sqlite3 as _sqlite3
+        db_path = home / "state.db"
+        with _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5) as _con:
+            row = _con.execute(
+                "SELECT count(*), max(updated_at) FROM sessions"
+            ).fetchone()
+        if row:
+            content_sig = row
+    except Exception:
+        pass
+
+    return (mtime_sig, content_sig)
 
 
 def _platforms_sig():
