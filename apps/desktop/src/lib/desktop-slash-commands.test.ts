@@ -8,7 +8,10 @@ import {
   desktopSlashCommandArgumentMode,
   desktopSlashDescription,
   desktopSlashUnavailableMessage,
+  desktopSubcommandAllowlist,
+  desktopSubcommandUnavailableMessage,
   filterDesktopCommandsCatalog,
+  filterDesktopSubcommandCompletions,
   isDesktopSlashCommand,
   isDesktopSlashSuggestion,
   isModelPickerCommand,
@@ -166,6 +169,90 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashUnavailableMessage('/tools')).toBeNull()
     expect(desktopSlashUnavailableMessage('/save')).toBeNull()
     expect(desktopSlashUnavailableMessage('/personality')).toBeNull()
+  })
+
+  it('surfaces /skills on the desktop so pending write-approval review is reachable', () => {
+    // /skills' pending/approve/reject/diff subcommands run on the backend via
+    // the slash worker — the same exec path /memory uses. Marking it a
+    // "settings" surface left staged skill writes with no desktop review
+    // path while the pending store grew silently (#98330).
+    expect(isDesktopSlashSuggestion('/skills')).toBe(true)
+    expect(isDesktopSlashCommand('/skills')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/skills')).toBeNull()
+  })
+
+  it('narrows /skills to its review subcommands across backend catalog versions', () => {
+    // The explicit static spec protects current Desktop clients connected to
+    // older backends. A new backend repeats the same boundary through
+    // desktop_subcommands in its registry catalog.
+    rememberDesktopCommandsCatalog({
+      commands: {
+        '/skills': {
+          argument_mode: 'options',
+          desktop: null,
+          desktop_subcommands: ['pending', 'approve', 'reject', 'diff', 'approval']
+        },
+        '/memory': { argument_mode: 'options', desktop: null }
+      },
+      canon: { '/skills': '/skills', '/memory': '/memory' }
+    })
+
+    expect(desktopSubcommandAllowlist('/skills')).toEqual(['pending', 'approve', 'reject', 'diff', 'approval'])
+    // Unrestricted commands pass through.
+    expect(desktopSubcommandAllowlist('/memory')).toBeNull()
+    expect(desktopSubcommandAllowlist('/goal')).toBeNull()
+
+    // Execution gate: review subcommands forward, everything else stops.
+    expect(desktopSubcommandUnavailableMessage('/skills', 'pending')).toBeNull()
+    expect(desktopSubcommandUnavailableMessage('/skills', 'approve a1b2')).toBeNull()
+    expect(desktopSubcommandUnavailableMessage('/skills', 'DIFF a1b2')).toBeNull()
+    expect(desktopSubcommandUnavailableMessage('/memory', 'approve a1b2')).toBeNull()
+
+    const installBlocked = desktopSubcommandUnavailableMessage('/skills', 'install my-skill')
+    expect(installBlocked).toContain('/skills install')
+    expect(installBlocked).toContain('terminal')
+    expect(installBlocked).toContain('pending')
+
+    // Bare /skills would open the interactive CLI hub on the worker path —
+    // the desktop answer is the subcommand list instead.
+    const bare = desktopSubcommandUnavailableMessage('/skills', '')
+    expect(bare).toContain('subcommand')
+    expect(bare).toContain('pending')
+
+    // Completion filter: only allowlisted tokens survive the arg stage.
+    const hubItems = [
+      { text: 'search' },
+      { text: 'install' },
+      { text: 'inspect' },
+      { text: 'pending' },
+      { text: 'approve <id>' },
+      { text: 'reject' },
+      { text: 'diff <id>' },
+      { text: 'approval' },
+      { text: 'audit' },
+      { text: 'browse' }
+    ]
+
+    expect(filterDesktopSubcommandCompletions('/skills ', hubItems).map(item => item.text)).toEqual([
+      'pending',
+      'approve <id>',
+      'reject',
+      'diff <id>',
+      'approval'
+    ])
+    // Prefix stage: the gate is the allowlist boundary, not ranking — the
+    // backend already narrows to prefix matches before we see the items.
+    expect(filterDesktopSubcommandCompletions('/skills ap', hubItems).map(item => item.text)).toEqual([
+      'pending',
+      'approve <id>',
+      'reject',
+      'diff <id>',
+      'approval'
+    ])
+    // Command-token stage (`/skills` itself, no space) passes through.
+    expect(filterDesktopSubcommandCompletions('/skills', hubItems)).toHaveLength(hubItems.length)
+    // Unrestricted commands keep their full arg completions.
+    expect(filterDesktopSubcommandCompletions('/memory ', hubItems)).toHaveLength(hubItems.length)
   })
 
   it('routes /pet through the desktop action handler and drops /pets', () => {

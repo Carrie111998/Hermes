@@ -89,6 +89,25 @@ class TestCommandRegistry:
         assert model is not None
         assert model.desktop == "hidden"
 
+        # /skills' write-approval review subcommands run on the desktop via the
+        # slash worker (same exec path as /memory), so the desktop meta must
+        # offer it — a "settings" tag here hid the only review surface for
+        # staged skill writes (#98330). The desktop_subcommands scope keeps
+        # the offer narrowed to the review slice: the hub mutations
+        # (search/install/...) run an interactive CLI surface the desktop
+        # exec path must not reach.
+        skills = resolve_command("skills")
+        assert skills is not None
+        assert skills.desktop is None
+        assert command_desktop_meta(skills) == {
+            "argument_mode": "options",
+            "desktop": None,
+            "desktop_subcommands": ["pending", "approve", "reject", "diff", "approval"],
+        }
+        # Every declared desktop subcommand must be a real (completable)
+        # subcommand of the command family.
+        assert set(skills.desktop_subcommands or ()) <= set(skills.subcommands)
+
         goal = resolve_command("goal")
         assert goal is not None
         assert goal.argument_mode == "mixed"

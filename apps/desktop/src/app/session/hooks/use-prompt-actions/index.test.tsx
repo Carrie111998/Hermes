@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { rememberDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { requestGatewayForAgent } from '@/store/gateway'
@@ -37,9 +38,15 @@ import { uploadComposerAttachment, usePromptActions } from '.'
 
 // Suites in this file reuse the same stored-id constants. The module-level
 // single-flight resume map (and drift-recovery cache) would otherwise leak a
-// never-settling in-flight promise from one test into the next.
+// never-settling promise from one test into the next.
 beforeEach(() => {
   clearSingleFlightSessionResumeState()
+})
+
+afterEach(() => {
+  // Suite-local catalog overrides (see the /skills scope test) must not leak
+  // into other suites through the module-level remembered catalog.
+  rememberDesktopCommandsCatalog(undefined)
 })
 
 vi.mock('@/hermes', () => ({
@@ -320,6 +327,41 @@ describe('usePromptActions /title', () => {
 
     expect(requestGateway).not.toHaveBeenCalledWith('session.title', expect.anything())
     expect(requestGateway).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'title' }))
+  })
+
+  it('keeps /skills hub mutations off the desktop exec path (review subcommands only)', async () => {
+    // The registry narrows /skills to its write-approval review slice via
+    // desktop_subcommands (#98330 review): install/search/… run the
+    // interactive CLI hub on the worker path, so the dispatcher must stop
+    // them client-side while review subcommands still forward.
+    rememberDesktopCommandsCatalog({
+      commands: {
+        '/skills': {
+          argument_mode: 'options',
+          desktop: null,
+          desktop_subcommands: ['pending', 'approve', 'reject', 'diff', 'approval']
+        }
+      },
+      canon: { '/skills': '/skills' }
+    })
+
+    const refreshSessions = vi.fn(async () => undefined)
+    const requestGateway = vi.fn(async () => ({ output: 'no pending writes' }) as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/skills install my-skill')
+    await handle!.submitText('/skills')
+
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'skills install my-skill' }))
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'skills' }))
+
+    await handle!.submitText('/skills pending')
+
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'skills pending' }))
   })
 
   it('surfaces a rename error without touching the sidebar store', async () => {
