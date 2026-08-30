@@ -42,6 +42,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`claude-design`](/docs/user-guide/skills/bundled/creative/creative-claude-design) | Design one-off HTML artifacts (landing, deck, prototype). | `creative/claude-design` |
 | [`comfyui`](/docs/user-guide/skills/bundled/creative/creative-comfyui) | Generate images, video, and audio via diffusion workflows. | `creative/comfyui` |
 | [`design-md`](/docs/user-guide/skills/bundled/creative/creative-design-md) | Author/validate/export Google's DESIGN.md token spec files. | `creative/design-md` |
+| [`eli5`](/docs/user-guide/skills/bundled/creative/creative-eli5) | Explain any topic as a simple visual HTML page. | `creative/eli5` |
 | [`excalidraw`](/docs/user-guide/skills/bundled/creative/creative-excalidraw) | Hand-drawn Excalidraw JSON diagrams (arch, flow, seq). | `creative/excalidraw` |
 | [`humanizer`](/docs/user-guide/skills/bundled/creative/creative-humanizer) | Humanize text: strip AI-isms and add real voice. | `creative/humanizer` |
 | [`manim-video`](/docs/user-guide/skills/bundled/creative/creative-manim-video) | Manim CE animations: 3Blue1Brown math/algo videos. | `creative/manim-video` |

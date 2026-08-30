@@ -187,6 +187,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/creative/creative-claude-design',
                     'user-guide/skills/bundled/creative/creative-comfyui',
                     'user-guide/skills/bundled/creative/creative-design-md',
+                    'user-guide/skills/bundled/creative/creative-eli5',
                     'user-guide/skills/bundled/creative/creative-excalidraw',
                     'user-guide/skills/bundled/creative/creative-humanizer',
                     'user-guide/skills/bundled/creative/creative-manim-video',
