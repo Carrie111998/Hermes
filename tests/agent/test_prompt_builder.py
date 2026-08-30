@@ -850,6 +850,71 @@ class TestEnvironmentHints:
 
 
 
+    def test_ssh_backend_hint_names_the_target_host(self, monkeypatch):
+        """The probe reports the remote OS/user/cwd but never WHICH host.
+
+        Without the target the agent is told it is on "a remote host reached
+        over SSH" with no way to name the machine it is standing on — so it
+        can't reason about which box a path, service, or log belongs to.
+        """
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_SSH_HOST", "build-01.example.com")
+        monkeypatch.setenv("TERMINAL_SSH_USER", "ubuntu")
+        monkeypatch.delenv("TERMINAL_SSH_PORT", raising=False)
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        _pb._clear_backend_probe_cache()
+        result = _pb.build_environment_hints()
+        assert "Terminal backend: ssh (ubuntu@build-01.example.com)" in result
+        # Host suppression still holds — the target is not a host-info leak.
+        assert "User home directory:" not in result
+
+    def test_ssh_target_named_on_the_probe_success_path_too(self, monkeypatch):
+        """The live probe is the common path — the target must land there as
+        well, not just in the fallback."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_SSH_HOST", "build-01.example.com")
+        monkeypatch.setenv("TERMINAL_SSH_USER", "ubuntu")
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: "  OS: Linux 6.8.0")
+        _pb._clear_backend_probe_cache()
+        result = _pb.build_environment_hints()
+        assert "Terminal backend: ssh (ubuntu@build-01.example.com)" in result
+        assert "OS: Linux 6.8.0" in result
+
+    def test_ssh_target_includes_non_default_port_only(self, monkeypatch):
+        """Port 22 is noise; anything else is load-bearing for the agent."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setenv("TERMINAL_SSH_HOST", "box")
+        monkeypatch.setenv("TERMINAL_SSH_USER", "dev")
+
+        monkeypatch.setenv("TERMINAL_SSH_PORT", "22")
+        assert _pb._ssh_target_summary() == "dev@box"
+
+        monkeypatch.setenv("TERMINAL_SSH_PORT", "2222")
+        assert _pb._ssh_target_summary() == "dev@box:2222"
+
+    def test_ssh_target_omitted_when_host_unset(self, monkeypatch):
+        """No configured host → no parenthetical, and never a bare '@'."""
+        import agent.prompt_builder as _pb
+        monkeypatch.delenv("TERMINAL_SSH_HOST", raising=False)
+        monkeypatch.setenv("TERMINAL_SSH_USER", "ubuntu")
+        assert _pb._ssh_target_summary() == ""
+
+    def test_ssh_target_never_leaks_the_key_path(self, monkeypatch):
+        """Destination only — a private-key path must not reach the prompt."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_SSH_HOST", "box")
+        monkeypatch.setenv("TERMINAL_SSH_USER", "dev")
+        monkeypatch.setenv("TERMINAL_SSH_KEY", "/home/dev/.ssh/id_ed25519_prod")
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        _pb._clear_backend_probe_cache()
+        assert "id_ed25519_prod" not in _pb.build_environment_hints()
+
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
         import agent.prompt_builder as _pb

@@ -1269,6 +1269,27 @@ def _probe_remote_backend(env_type: str) -> str | None:
     return formatted
 
 
+def _ssh_target_summary() -> str:
+    """Return ``user@host[:port]`` for the configured SSH backend, or ``""``.
+
+    Read from the same ``TERMINAL_SSH_*`` env vars ``_get_env_config`` uses
+    (config.yaml ``terminal.ssh_*`` keys are exported to these at startup),
+    so the hint names the machine the backend actually connects to. The probe
+    reports the remote OS/user/cwd but never *which* host — without this the
+    agent is told it is on some remote Linux box with no way to name it.
+    Destination only: the key path never enters the prompt.
+    """
+    host = (os.getenv("TERMINAL_SSH_HOST") or "").strip()
+    if not host:
+        return ""
+    user = (os.getenv("TERMINAL_SSH_USER") or "").strip()
+    target = f"{user}@{host}" if user else host
+    port = (os.getenv("TERMINAL_SSH_PORT") or "").strip()
+    if port and port != "22":
+        target = f"{target}:{port}"
+    return target
+
+
 def _clear_backend_probe_cache() -> None:
     """Test helper — drop the backend probe cache so monkeypatched backends take effect."""
     _BACKEND_PROBE_CACHE.clear()
@@ -1286,7 +1307,10 @@ def build_environment_hints() -> str:
       modal, daytona, ssh, vercel_sandbox): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
-      and cwd. Falls back to a static summary if the probe fails.
+      and cwd. Falls back to a static summary if the probe fails. For the
+      **ssh** backend the configured ``user@host[:port]`` is named alongside
+      the backend, since the probe reports the remote OS/user/cwd but not
+      which host they belong to.
 
     The WSL environment hint is appended unchanged when running under WSL.
     """
@@ -1333,9 +1357,11 @@ def build_environment_hints() -> str:
     else:
         # --- Remote backend block (host info suppressed) ---
         probe = _probe_remote_backend(backend)
+        ssh_target = _ssh_target_summary() if backend == "ssh" else ""
+        backend_label = f"{backend} ({ssh_target})" if ssh_target else backend
         if probe:
             hints.append(
-                f"Terminal backend: {backend}. Your `terminal`, `read_file`, "
+                f"Terminal backend: {backend_label}. Your `terminal`, `read_file`, "
                 f"`write_file`, `patch`, and `search_files` tools all operate "
                 f"inside this {backend} environment — NOT on the machine "
                 f"where Hermes itself is running. The host OS, home, and cwd "
@@ -1347,7 +1373,7 @@ def build_environment_hints() -> str:
                 backend, f"a {backend} environment (likely Linux)"
             )
             hints.append(
-                f"Terminal backend: {backend}. Your `terminal`, `read_file`, "
+                f"Terminal backend: {backend_label}. Your `terminal`, `read_file`, "
                 f"`write_file`, `patch`, and `search_files` tools all operate "
                 f"inside {description} — NOT on the machine where Hermes "
                 f"itself runs. The backend probe didn't respond at "
