@@ -5809,6 +5809,12 @@ def cleanup_all_browsers() -> None:
     _cached_command_timeout = None
     _snapshot_threshold_resolved = False
     _cached_snapshot_threshold = None
+    try:
+        from hermes_cli.config import invalidate_config_caches
+
+        invalidate_config_caches()
+    except Exception:
+        logger.debug("Could not invalidate config cache during browser cleanup", exc_info=True)
     _cached_chromium_installed = None
     global _chromium_autoinstall_attempted
     _chromium_autoinstall_attempted = False
