@@ -229,6 +229,12 @@ hermes skills uninstall <skill-name>
 | [**unbroker**](/docs/user-guide/skills/optional/security/security-unbroker) | Autonomously remove your info from data-broker sites. |
 | [**web-pentest**](/docs/user-guide/skills/optional/security/security-web-pentest) | Authorized web pentest: recon, proof-based exploits, report. |
 
+## social-media
+
+| Skill | Description |
+|-------|-------------|
+| [**social-har-api-connectivity**](/docs/user-guide/skills/optional/social-media/social-media-social-har-api-connectivity) | Capture a social login session via CDP (authorized only). |
+
 ## software-development
 
 | Skill | Description |
