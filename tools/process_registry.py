@@ -632,6 +632,12 @@ class ProcessRegistry:
                     "user_name": session.watcher_user_name,
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
+                    # Spawning-session boundary stamp — same field the
+                    # "completion" type carries (#70300) so the gateway's
+                    # session-boundary pre-flight can drop this if the
+                    # spawning conversation was closed by an explicit user
+                    # boundary (/new) before this event drained.
+                    "parent_session_id": session.parent_session_id,
                     "message": (
                         f"Watch patterns disabled for process {session.id} — "
                         f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -672,6 +678,8 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
+            # See the watch_disabled event above for why this is stamped.
+            "parent_session_id": session.parent_session_id,
         }
         _redact_process_result(notification)
         self.completion_queue.put(notification)
@@ -3167,7 +3175,11 @@ def format_process_notification(evt: dict) -> "str | None":
     _attribution = _delegation_attribution_line(evt)
 
     if evt_type == "watch_disabled":
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+        text = f"[IMPORTANT: {evt.get('message', '')}"
+        if _attribution:
+            text += f"\n{_attribution}"
+        text += "]"
+        return text
 
     # Overflow events carry their human-readable summary in `message` —
     # without this case they fall through to the completion formatter and
@@ -3177,7 +3189,16 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")
-        _out = evt.get("output", "")
+        # _check_watch_patterns already ran the producer-side, non-forced
+        # _redact_process_result pass, but that respects the configurable
+        # security.redact_secrets. This text is delivered straight to a chat
+        # surface (gateway platform adapter or TUI), so apply the forced,
+        # unconditional redactor here too — same defence-in-depth reasoning
+        # as the completion-notification path in gateway/run.py.
+        from agent.redact import redact_terminal_output
+
+        _match_cmd = redact_terminal_output(_cmd, _cmd, force=True)
+        _out = redact_terminal_output(evt.get("output", ""), _cmd, force=True)
         _sup = evt.get("suppressed", 0)
         text = (
             f"[IMPORTANT: Background process {_sid} matched "
@@ -3186,7 +3207,7 @@ def format_process_notification(evt: dict) -> "str | None":
         if _attribution:
             text += f"{_attribution}\n"
         text += (
-            f"Command: {_cmd}\n"
+            f"Command: {_match_cmd}\n"
             f"Matched output:\n{_out}"
         )
         if _sup:
