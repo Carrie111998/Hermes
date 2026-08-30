@@ -11,23 +11,30 @@ Covers:
      ``HERMES_API_CALL_STALE_TIMEOUT`` env var) always wins untouched;
    - no budget => completely unchanged behavior.
 
-2. One-time-ness of the 80% wrap-up notice injection in
+2. Streaming stale-timeout parity through both the shared derivation and the
+   production worker/poll/abort path.
+
+3. One-time-ness of the 80% wrap-up notice injection in
    ``agent.conversation_loop._maybe_inject_run_budget_wrapup``:
    - fires once (latched), not repeatedly;
    - never fires when no budget is set or before the 80% threshold;
    - appended to the newest tool message (cache-safe /steer channel), no
      synthetic user message.
 
-3. Normalization of the config/CLI value
+4. Normalization of the config/CLI value
    (``agent.agent_init._normalize_run_budget_seconds``): dormant on
    null/invalid/non-positive input.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 
@@ -39,6 +46,7 @@ def _make_agent(tmp_path, monkeypatch, config_body: str = "", **overrides):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
     _write_config(tmp_path, config_body)
 
     from run_agent import AIAgent
@@ -195,6 +203,150 @@ def test_budget_without_started_clock_is_inert(monkeypatch, tmp_path):
     )
     agent._run_budget_started_at = None
     assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 600.0
+
+
+# ── streaming stale-timeout deadline scaling ────────────────────────────────
+
+
+def _stream_stale_timeout(agent, monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    monkeypatch.setattr(helpers, "get_provider_stale_timeout", lambda *a, **k: None)
+    return helpers._derive_stream_stale_timeout(
+        agent,
+        {"model": agent.model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+
+def test_no_budget_stream_stale_timeout_unchanged(monkeypatch, tmp_path):
+    agent = _make_agent(
+        tmp_path,
+        monkeypatch,
+        model="deepseek/deepseek-v4-pro",
+    )
+    assert _stream_stale_timeout(agent, monkeypatch) == 600.0
+
+
+def test_active_budget_caps_implicit_stream_reasoning_floor(monkeypatch, tmp_path):
+    agent = _make_agent(
+        tmp_path,
+        monkeypatch,
+        model="deepseek/deepseek-v4-pro",
+        run_budget_seconds=900,
+    )
+    agent._run_budget_started_at = time.time() - 800
+    assert _stream_stale_timeout(agent, monkeypatch) == 60.0
+
+
+def test_active_budget_never_raises_stream_stale_timeout(monkeypatch, tmp_path):
+    agent = _make_agent(tmp_path, monkeypatch, run_budget_seconds=900)
+    agent._run_budget_started_at = time.time() - 10
+    assert _stream_stale_timeout(agent, monkeypatch) == 180.0
+
+
+def test_explicit_stream_timeout_wins_over_budget_cap(monkeypatch, tmp_path):
+    from agent import chat_completion_helpers as helpers
+
+    agent = _make_agent(tmp_path, monkeypatch, run_budget_seconds=900)
+    agent._run_budget_started_at = time.time() - 800
+    monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "1200")
+    monkeypatch.setattr(helpers, "get_provider_stale_timeout", lambda *a, **k: None)
+    assert helpers._derive_stream_stale_timeout(
+        agent,
+        {"model": agent.model, "messages": [{"role": "user", "content": "hi"}]},
+    ) == 1200.0
+
+
+def test_explicit_provider_stream_timeout_wins_over_budget_cap(monkeypatch, tmp_path):
+    from agent import chat_completion_helpers as helpers
+
+    agent = _make_agent(tmp_path, monkeypatch, run_budget_seconds=900)
+    agent._run_budget_started_at = time.time() - 800
+    monkeypatch.setattr(
+        helpers, "get_provider_stale_timeout", lambda *a, **k: 1200.0
+    )
+    assert helpers._derive_stream_stale_timeout(
+        agent,
+        {"model": agent.model, "messages": [{"role": "user", "content": "hi"}]},
+    ) == 1200.0
+
+
+# ── production streaming ownership path ────────────────────────────────────
+
+
+def test_budget_cap_reaches_blocked_stream_watchdog(monkeypatch, tmp_path):
+    """The production stream poller must consume the budget-derived timeout."""
+    from agent import chat_completion_helpers as helpers
+
+    agent = _make_agent(
+        tmp_path,
+        monkeypatch,
+        model="deepseek/deepseek-v4-pro",
+        run_budget_seconds=900,
+    )
+    started_at = time.time()
+    agent._run_budget_started_at = started_at - 800
+    agent.api_mode = "chat_completions"
+
+    stream_entered = threading.Event()
+    release_stream = threading.Event()
+    abort_reasons = []
+
+    class BlockingStream:
+        response = SimpleNamespace(headers={})
+
+        def __iter__(self):
+            stream_entered.set()
+            if not release_stream.wait(timeout=5):
+                raise AssertionError("stream watchdog did not abort the blocked read")
+            raise httpx.ConnectError("connection dropped after stale abort")
+            yield  # pragma: no cover - keeps this method a generator
+
+        def close(self):
+            release_stream.set()
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = BlockingStream()
+
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "5")
+    monkeypatch.setattr(helpers, "get_provider_stale_timeout", lambda *a, **k: None)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+
+    def abort_request(_client, *, reason):
+        abort_reasons.append(reason)
+        release_stream.set()
+
+    monkeypatch.setattr(agent, "_abort_request_openai_client", abort_request)
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda _client, *, reason: None
+    )
+
+    real_time_module = helpers.time
+
+    class StreamClock:
+        @staticmethod
+        def time():
+            now = real_time_module.time()
+            return now + 61.0 if stream_entered.is_set() else now
+
+        monotonic = staticmethod(real_time_module.monotonic)
+
+    monkeypatch.setattr(helpers, "time", StreamClock)
+
+    with pytest.raises(httpx.ConnectError) as exc_info:
+        agent._interruptible_streaming_api_call(
+            {
+                "model": agent.model,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        )
+
+    assert stream_entered.is_set(), f"stream failed before iteration: {exc_info.value!r}"
+    assert abort_reasons == ["stale_stream_kill"]
+    assert agent._consecutive_stale_streams == 1
 
 
 # ── wrap-up injection one-time-ness ────────────────────────────────────────
