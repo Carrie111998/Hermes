@@ -138,6 +138,105 @@ _snapshot_guard = threading.Lock()
 _store_snapshots: Dict[int, Tuple[str, str]] = {}
 
 
+class _PosixAuthStoreParent:
+    """Retained no-follow descriptors for one auth-store parent chain."""
+
+    def __init__(self, descriptors: list[int]) -> None:
+        self.descriptors = descriptors
+        self.fd = descriptors[-1]
+
+    def close(self) -> None:
+        while self.descriptors:
+            os.close(self.descriptors.pop())
+
+
+def _open_posix_auth_store_parent(auth_file: Path, *, create: bool) -> _PosixAuthStoreParent:
+    """Open every parent component with openat-style no-follow semantics."""
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("POSIX auth-store publication requires O_DIRECTORY and O_NOFOLLOW")
+    absolute_parent = os.path.dirname(os.path.abspath(os.fspath(auth_file)))
+    components = [part for part in absolute_parent.split(os.sep) if part]
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    descriptors: list[int] = []
+    try:
+        current_fd = os.open(os.sep, flags | cloexec)
+        descriptors.append(current_fd)
+        for component in components:
+            try:
+                child_fd = os.open(component, flags | cloexec, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(component, flags | cloexec, dir_fd=current_fd)
+            descriptors.append(child_fd)
+            current_fd = child_fd
+    except BaseException:
+        while descriptors:
+            os.close(descriptors.pop())
+        raise
+    return _PosixAuthStoreParent(descriptors)
+
+
+def _posix_relative_file_identity(parent_fd: int, name: str) -> Optional[Tuple[int, int]]:
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _posix_relative_read(parent_fd: int, name: str) -> bytes:
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"Refusing to read auth-store link or non-file: {name}")
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            return handle.read()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _posix_relative_is_reparse_or_link(parent_fd: int, name: str) -> bool:
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return not stat.S_ISREG(info.st_mode)
+
+
+def _unlink_auth_temp(temp: Path, parent_fd: Optional[int]) -> None:
+    if sys.platform == "win32":
+        temp.unlink()
+    else:
+        os.unlink(temp.name, dir_fd=parent_fd)
+
+
+def _secure_posix_parent_fd(parent_fd: int, auth_file: Path) -> None:
+    """Apply directory permissions through the retained descriptor only."""
+    parent = Path(os.path.abspath(os.fspath(auth_file))).parent
+    if parent == Path("/") or len(parent.parts) < 3:
+        return
+    try:
+        from hermes_constants import _INSTALL_ROOT
+
+        if parent == _INSTALL_ROOT or _INSTALL_ROOT in parent.parents:
+            return
+    except (ImportError, AttributeError):
+        pass
+    try:
+        os.fchmod(parent_fd, 0o700)
+    except OSError:
+        pass
+
+
 def _path_key(path: Path) -> str:
     """Return a stable lexical key without following links or reparses."""
     return os.path.normcase(os.path.abspath(os.fspath(path)))
@@ -454,8 +553,10 @@ def _validate_auth_store_schema(auth_store: Any, *, require_section: bool = True
 
 def _migrate_legacy_systems_store(raw: Any) -> Optional[Dict[str, Any]]:
     """Return the canonical form of the one supported legacy store shape."""
-    if not isinstance(raw, dict) or "systems" not in raw or "providers" in raw:
+    if not isinstance(raw, dict) or "systems" not in raw:
         return None
+    if "providers" in raw or "credential_pool" in raw:
+        raise ValueError("hybrid legacy systems and canonical auth-store sections")
     systems = raw.get("systems")
     if not isinstance(systems, dict) or any(
         not isinstance(key, str) or not isinstance(value, dict)
@@ -481,7 +582,9 @@ def _is_valid_current_store_bytes(raw_bytes: bytes) -> bool:
     """Return whether bytes describe a complete, non-recovery auth store."""
     try:
         raw = json.loads(raw_bytes.decode("utf-8-sig"))
-        if isinstance(raw, dict) and "systems" in raw and "providers" not in raw:
+        if isinstance(raw, dict) and "systems" in raw:
+            if "providers" in raw or "credential_pool" in raw:
+                return False
             systems = raw.get("systems")
             return isinstance(systems, dict) and all(
                 isinstance(key, str) and isinstance(value, dict)
@@ -543,21 +646,34 @@ def _posix_atomic_replace(
     expected_digest: str,
     expected_identity: Optional[Tuple[int, int]],
     recovery: bool,
+    parent_fd: Optional[int] = None,
 ) -> None:
-    """Revalidate bytes and directory-entry identity at the replace boundary."""
+    """Revalidate and replace through the retained parent directory descriptor."""
+    owned_parent = None
+    if parent_fd is None:
+        owned_parent = _open_posix_auth_store_parent(auth_file, create=False)
+        parent_fd = owned_parent.fd
     try:
-        current_identity = _posix_file_identity(auth_file)
-        current_bytes = _read_auth_bytes(auth_file)
-    except OSError as exc:
-        raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file) from exc
-    if expected_identity is None:
-        raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
-    if current_identity != expected_identity or _digest(current_bytes) != expected_digest:
-        raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
-    # POSIX rename replaces the directory entry atomically and does not follow
-    # a final symlink. The identity/digest fence above binds this replace to the
-    # reviewed entry as closely as the platform permits.
-    os.replace(os.fspath(tmp_path), os.fspath(auth_file))
+        try:
+            current_identity = _posix_relative_file_identity(parent_fd, auth_file.name)
+            current_bytes = _posix_relative_read(parent_fd, auth_file.name)
+        except OSError as exc:
+            raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file) from exc
+        if expected_identity is None:
+            raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
+        if current_identity != expected_identity or _digest(current_bytes) != expected_digest:
+            raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
+        # Both names are resolved by the retained directory descriptor. An
+        # ancestor swap therefore cannot redirect this replacement.
+        os.replace(
+            tmp_path.name,
+            auth_file.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    finally:
+        if owned_parent is not None:
+            owned_parent.close()
 
 
 def _atomic_publish_auth_store(
@@ -567,6 +683,7 @@ def _atomic_publish_auth_store(
     expected_digest: Optional[str] = None,
     expected_identity: Optional[Tuple[int, int]] = None,
     recovery: bool = False,
+    parent_fd: Optional[int] = None,
 ) -> None:
     """Atomically publish while retaining the validated target directory."""
     if sys.platform == "win32":
@@ -628,44 +745,60 @@ def _atomic_publish_auth_store(
             win32file.CloseHandle(parent_handle)
         return
 
-    if os.path.lexists(os.fspath(auth_file)) and _is_reparse_or_link(auth_file):
-        raise OSError(f"Refusing to publish through auth-store link or reparse: {auth_file}")
-    if expected_digest is not None:
-        if (
-            expected_identity is None
-            and expected_digest == _digest(b"")
-            and not os.path.lexists(os.fspath(auth_file))
-        ):
-            os.replace(os.fspath(tmp_path), os.fspath(auth_file))
+    parent = None
+    if parent_fd is None:
+        parent = _open_posix_auth_store_parent(auth_file, create=False)
+        parent_fd = parent.fd
+    try:
+        if _posix_relative_is_reparse_or_link(parent_fd, auth_file.name):
+            raise OSError(f"Refusing to publish through auth-store link or reparse: {auth_file}")
+        if expected_digest is not None:
+            if (
+                expected_identity is None
+                and expected_digest == _digest(b"")
+                and _posix_relative_file_identity(parent_fd, auth_file.name) is None
+            ):
+                os.replace(
+                    tmp_path.name,
+                    auth_file.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            else:
+                _posix_atomic_replace(
+                    tmp_path,
+                    auth_file,
+                    expected_digest=expected_digest,
+                    expected_identity=expected_identity,
+                    recovery=recovery,
+                    parent_fd=parent_fd,
+                )
         else:
-            _posix_atomic_replace(
-                tmp_path,
-                auth_file,
-                expected_digest=expected_digest,
-                expected_identity=expected_identity,
-                recovery=recovery,
+            # Relative rename never re-resolves an ancestor, and does not follow
+            # a final symlink. The relative lstat guard above is the policy
+            # refusal for an incumbent link.
+            os.replace(
+                tmp_path.name,
+                auth_file.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
             )
-    else:
-        # POSIX rename replaces the directory entry and does not follow a final
-        # symlink. The lexical check above is a policy guard for fresh writes.
-        os.replace(os.fspath(tmp_path), os.fspath(auth_file))
+    finally:
+        if parent is not None:
+            parent.close()
 
 
-def _validate_auth_store_parent(auth_file: Path) -> None:
-    """Validate the destination parent before creating a credential temp file."""
+def _validate_auth_store_parent(auth_file: Path) -> Optional[_PosixAuthStoreParent]:
+    """Validate and retain a no-follow descriptor for the complete parent chain."""
     parent = auth_file.parent
     if sys.platform == "win32":
         handle = _windows_open_no_reparse(parent, directory=True)
         try:
-            return
+            return None
         finally:
             import win32file
             win32file.CloseHandle(handle)
-    current = parent
-    while current != current.parent:
-        if os.path.lexists(os.fspath(current)) and _is_reparse_or_link(current):
-            raise OSError(f"Refusing to write beneath auth-store link or reparse: {current}")
-        current = current.parent
+    return _open_posix_auth_store_parent(auth_file, create=True)
 
 # =============================================================================
 # Auth Store — persistence layer for ~/.hermes/auth.json
@@ -1015,6 +1148,8 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
     candidates.extend(_sidecar_candidate(auth_file, unique=True) for _ in range(8))
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     parent_handle = None
+    parent_fd = None
+    retained_parent = None
     parent_actual = None
     if sys.platform == "win32":
         try:
@@ -1029,6 +1164,12 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
             parent_actual = _windows_final_path(parent, parent_handle, win32file)
         except OSError:
             return None
+    else:
+        try:
+            retained_parent = _open_posix_auth_store_parent(parent / auth_file.name, create=False)
+            parent_fd = retained_parent.fd
+        except OSError:
+            return None
     try:
         for destination in candidates:
             temp = parent / f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
@@ -1039,9 +1180,10 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
                     _windows_create_sidecar_temp(temp, raw, parent_handle, parent_actual)
                 else:
                     fd = os.open(
-                        os.fspath(temp),
+                        temp.name,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
                         stat.S_IRUSR | stat.S_IWUSR,
+                        dir_fd=parent_fd,
                     )
                     with os.fdopen(fd, "wb") as handle:
                         fd = None
@@ -1051,26 +1193,38 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
                 if sys.platform == "win32":
                     _windows_link_sidecar_relative(temp, destination.name, parent_handle)
                 else:
-                    os.link(os.fspath(temp), os.fspath(destination), follow_symlinks=False)
+                    os.link(
+                        temp.name,
+                        destination.name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
                 published = True
                 # Once the no-replace link wins, publication is the sole
                 # preservation result. Verification is best effort and must
                 # never escape into the corruption handler as a false failure
                 # or trigger another publication attempt.
                 try:
-                    if _is_reparse_or_link(destination) or _digest(_read_auth_bytes(destination)) != _digest(raw):
+                    if sys.platform == "win32":
+                        invalid = _is_reparse_or_link(destination)
+                        published_bytes = _read_auth_bytes(destination)
+                    else:
+                        invalid = _posix_relative_is_reparse_or_link(parent_fd, destination.name)
+                        published_bytes = _posix_relative_read(parent_fd, destination.name)
+                    if invalid or _digest(published_bytes) != _digest(raw):
                         raise OSError(f"Corrupt sidecar verification failed: {destination}")
                 except Exception:
                     pass
                 try:
-                    temp.unlink()
+                    _unlink_auth_temp(temp, parent_fd)
                 except Exception:
                     pass
                 return destination
             except FileExistsError:
                 if published:
                     try:
-                        temp.unlink()
+                        _unlink_auth_temp(temp, parent_fd)
                     except (FileNotFoundError, OSError):
                         pass
                     return destination
@@ -1080,7 +1234,7 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
             except (OSError, ValueError):
                 if published:
                     try:
-                        temp.unlink()
+                        _unlink_auth_temp(temp, parent_fd)
                     except (FileNotFoundError, OSError):
                         pass
                     return destination
@@ -1093,7 +1247,7 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
                         pass
                 if not published:
                     try:
-                        temp.unlink()
+                        _unlink_auth_temp(temp, parent_fd)
                     except (FileNotFoundError, OSError):
                         pass
     finally:
@@ -1103,6 +1257,8 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
                 win32file.CloseHandle(parent_handle)
             except OSError:
                 pass
+        if retained_parent is not None:
+            retained_parent.close()
     return None
 
 
@@ -1142,7 +1298,13 @@ def _load_auth_store(
         # ``systems`` is the one legacy document accepted for migration. Every
         # current document must be a complete canonical object; in particular,
         # valid JSON such as [] or {"providers": []} is still corruption.
-        if isinstance(raw, dict) and "systems" in raw and "providers" not in raw:
+        if isinstance(raw, dict) and "systems" in raw:
+            if "providers" in raw or "credential_pool" in raw:
+                _raise_preserved_corruption(
+                    auth_file,
+                    raw_bytes,
+                    "hybrid legacy systems and canonical auth-store sections",
+                )
             systems = raw.get("systems")
             if not isinstance(systems, dict) or any(
                 not isinstance(key, str) or not isinstance(value, dict)
@@ -1224,35 +1386,53 @@ def _save_auth_store_locked(
             raise AuthStoreRecoveryRequired(auth_file) from exc
         if expected_digest is not None and expected_digest != _digest(current_bytes):
             raise AuthStoreWriteConflictError(auth_file)
-        if expected_digest is not None:
+    parent_handle = _validate_auth_store_parent(auth_file)
+    parent_fd = parent_handle.fd if parent_handle is not None else None
+    if expected_digest is not None and expected_identity is None:
+        if parent_fd is not None:
+            expected_identity = _posix_relative_file_identity(parent_fd, auth_file.name)
+        elif auth_file.exists():
             expected_identity = _posix_file_identity(auth_file)
-    if expected_digest is not None and expected_identity is None and auth_file.exists():
-        expected_identity = _posix_file_identity(auth_file)
-    auth_file.parent.mkdir(parents=True, exist_ok=True)
-    _validate_auth_store_parent(auth_file)
-    # Tighten parent dir to 0o700 so siblings can't traverse to creds.
-    # No-op on Windows (POSIX mode bits not enforced); ignore failures.
-    secure_parent_dir(auth_file)
+    # Tighten parent dir to 0o700 through the retained descriptor. No-op on
+    # Windows and on protected root/install directories.
+    if parent_fd is not None:
+        _secure_posix_parent_fd(parent_fd, auth_file)
+    else:
+        secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
     payload_bytes = payload.encode("utf-8")
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
-        fd = os.open(
-            str(tmp_path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            stat.S_IRUSR | stat.S_IWUSR,
-        )
+        if parent_fd is not None:
+            fd = os.open(
+                tmp_path.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+                dir_fd=parent_fd,
+            )
+        else:
+            fd = os.open(
+                str(tmp_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
         with os.fdopen(fd, "wb") as handle:
+            fd = None
             handle.write(payload_bytes)
             handle.flush()
             os.fsync(handle.fileno())
         # Re-check after serialization and immediately before replacement. All
         # in-process writers use this same lock, and the publication primitive
         # repeats the check while retaining Windows target/parent handles.
-        if auth_file.exists() and expected_digest is not None:
-            current_bytes = _read_auth_bytes(auth_file)
+        if expected_digest is not None:
+            if parent_fd is not None:
+                current_bytes = _posix_relative_read(parent_fd, auth_file.name)
+            elif auth_file.exists():
+                current_bytes = _read_auth_bytes(auth_file)
+            else:
+                current_bytes = b""
             if expected_digest != _digest(current_bytes):
                 raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
         _atomic_publish_auth_store(
@@ -1261,22 +1441,33 @@ def _save_auth_store_locked(
             expected_digest=expected_digest,
             expected_identity=expected_identity,
             recovery=recovery,
+            parent_fd=parent_fd,
         )
-        try:
-            dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
-        except OSError:
-            dir_fd = None
-        if dir_fd is not None:
+        if parent_fd is not None:
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+        else:
+            try:
+                dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
     finally:
         try:
-            if tmp_path.exists():
+            if parent_fd is not None:
+                _unlink_auth_temp(tmp_path, parent_fd)
+            elif tmp_path.exists():
                 tmp_path.unlink()
         except OSError:
             pass
+        if parent_handle is not None:
+            parent_handle.close()
     _remember_snapshot(auth_store, auth_file, payload_bytes)
     return auth_file
 

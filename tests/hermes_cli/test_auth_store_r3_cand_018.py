@@ -49,6 +49,43 @@ def test_legacy_systems_store_migrates_on_ordinary_save(tmp_path):
     assert isinstance(disk_store["updated_at"], str)
 
 
+
+
+@pytest.mark.parametrize(
+    "canonical_section",
+    [
+        {"providers": {"other": {"state": "must-survive"}}},
+        {"credential_pool": {"other": [{"state": "must-survive"}]}},
+    ],
+    ids=["providers", "credential-pool"],
+)
+def test_hybrid_legacy_and_canonical_store_is_rejected_and_preserved(
+    tmp_path, canonical_section
+):
+    primary = tmp_path / "auth.json"
+    original = json.dumps(
+        {
+            "version": auth.AUTH_STORE_VERSION,
+            "systems": {"nous_portal": {"api_key": "legacy"}},
+            **canonical_section,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    primary.write_bytes(original)
+
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(primary)
+
+    assert caught.value.preserved is True
+    assert caught.value.corrupt_path.read_bytes() == original
+    with pytest.raises(auth.AuthStoreRecoveryRequired):
+        auth._save_auth_store(
+            {"version": auth.AUTH_STORE_VERSION, "providers": {"new": {}}},
+            primary,
+        )
+    assert primary.read_bytes() == original
+
+
 def test_corruption_is_read_only_and_preserved(tmp_path, monkeypatch):
     primary = tmp_path / "auth.json"
     original = _malformed_store(primary)

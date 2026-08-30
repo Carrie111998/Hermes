@@ -497,6 +497,51 @@ def test_recovery_cas_rechecks_inside_publication_primitive(tmp_path, monkeypatc
     assert primary.read_bytes() == b"{external-writer-after-final-check"
 
 
+
+
+def test_posix_publication_remains_bound_after_ancestor_swap(tmp_path, monkeypatch):
+    """A retained parent fd must publish into the checked directory."""
+    if os.name == "nt":
+        pytest.skip("POSIX dirfd publication regression")
+    original_parent = tmp_path / "auth-home"
+    original_parent.mkdir()
+    primary = original_parent / "auth.json"
+    auth._save_auth_store(
+        {"version": auth.AUTH_STORE_VERSION, "providers": {"original": {}}},
+        primary,
+    )
+    store = auth._load_auth_store(primary)
+    store["providers"]["original"]["changed"] = True
+    attacker_parent = tmp_path / "attacker-home"
+    attacker_parent.mkdir()
+    (attacker_parent / "auth.json").write_bytes(b"attacker-owned")
+    moved_parent = tmp_path / "auth-home-original"
+    real_replace = owner.os.replace
+    swapped = False
+
+    def swap_before_publish(source, destination, **kwargs):
+        nonlocal swapped
+        if destination == "auth.json" and not swapped:
+            original_parent.rename(moved_parent)
+            original_parent.symlink_to(attacker_parent, target_is_directory=True)
+            swapped = True
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(owner.os, "replace", swap_before_publish)
+    try:
+        auth._save_auth_store(store, primary)
+        assert swapped is True
+        assert json.loads((moved_parent / "auth.json").read_text())["providers"] == {
+            "original": {"changed": True}
+        }
+        assert (attacker_parent / "auth.json").read_bytes() == b"attacker-owned"
+    finally:
+        if original_parent.is_symlink():
+            original_parent.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(original_parent)
+
+
 @pytest.mark.windows_only
 def test_windows_publication_rejects_ancestor_swap_before_source_open(tmp_path, monkeypatch):
     """A retained parent handle must reject a deterministic ancestor swap."""
