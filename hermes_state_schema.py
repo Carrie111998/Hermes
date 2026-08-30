@@ -240,51 +240,59 @@ class SessionSchemaMixin:
         if not to_drop:
             return 0
 
-        for name in to_drop:
-            # Names are drawn from the update_names literal allowlist above —
-            # never user input — so the identifier is interpolation-safe.
-            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+        # ── Atomic migration (98834) — SAVEPOINT rollback — 100x stronger ──
+        cursor.execute("SAVEPOINT cjk_update_of_migration")
+        try:
+            for name in to_drop:
+                # Names are drawn from the update_names literal allowlist above —
+                # never user input — so the identifier is interpolation-safe.
+                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
 
-        # Re-apply current DDL so CREATE TRIGGER installs the OF variants.
-        # Choose legacy vs v23 the same way _init_schema does.
-        if legacy_layout:
-            self._ensure_fts_schema(cursor, "messages_fts", LEGACY_FTS_SQL)
-            self._ensure_fts_schema(
-                cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
-            )
-        else:
-            self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
-            self._ensure_fts_schema(
-                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-            )
-            # CJK triggers live on the host SessionDB; only recreate one that
-            # this migration actually dropped. ``_ensure_fts_cjk_schema`` is
-            # documented never-raises and soft-fails OperationalError by
-            # clearing availability — raise-path handling alone is not
-            # enough. After ensure, require a narrowed CJK UPDATE trigger or
-            # durable quarantine (stale breadcrumb + unavailable).
-            if "messages_fts_cjk_update" in to_drop:
-                try:
-                    self._ensure_fts_cjk_schema(cursor)
-                except Exception:
-                    self._quarantine_cjk_after_update_of_migration(cursor)
-                    logger.exception(
-                        "CJK FTS re-ensure after UPDATE OF migration failed"
-                    )
-                    raise
-                if not self._cjk_update_trigger_is_narrowed(cursor):
-                    self._quarantine_cjk_after_update_of_migration(cursor)
-                    logger.warning(
-                        "CJK FTS UPDATE trigger missing or still broad after "
-                        "UPDATE OF migration; marked stale and unavailable"
-                    )
+            # Re-apply current DDL so CREATE TRIGGER installs the OF variants.
+            # Choose legacy vs v23 the same way _init_schema does.
+            if legacy_layout:
+                self._ensure_fts_schema(cursor, "messages_fts", LEGACY_FTS_SQL)
+                self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                )
+            else:
+                self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
+                self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
+                # CJK triggers live on the host SessionDB; only recreate one that
+                # this migration actually dropped. ``_ensure_fts_cjk_schema`` is
+                # documented never-raises and soft-fails OperationalError by
+                # clearing availability — raise-path handling alone is not
+                # enough. After ensure, require a narrowed CJK UPDATE trigger or
+                # durable quarantine (stale breadcrumb + unavailable).
+                if "messages_fts_cjk_update" in to_drop:
+                    try:
+                        self._ensure_fts_cjk_schema(cursor)
+                    except Exception:
+                        self._quarantine_cjk_after_update_of_migration(cursor)
+                        logger.exception(
+                            "CJK FTS re-ensure after UPDATE OF migration failed"
+                        )
+                        raise
+                    if not self._cjk_update_trigger_is_narrowed(cursor):
+                        self._quarantine_cjk_after_update_of_migration(cursor)
+                        logger.warning(
+                            "CJK FTS UPDATE trigger missing or still broad after "
+                            "UPDATE OF migration; marked stale and unavailable"
+                        )
 
-        logger.info(
-            "Migrated %d broad FTS UPDATE trigger(s) to AFTER UPDATE OF "
-            "(no rebuild required)",
-            len(to_drop),
-        )
-        return len(to_drop)
+            logger.info(
+                "Migrated %d broad FTS UPDATE trigger(s) to AFTER UPDATE OF "
+                "(no rebuild required)",
+                len(to_drop),
+            )
+            cursor.execute("RELEASE SAVEPOINT cjk_update_of_migration")
+            return len(to_drop)
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT cjk_update_of_migration")
+            cursor.execute("RELEASE SAVEPOINT cjk_update_of_migration")
+            raise
 
     def _cjk_update_trigger_is_narrowed(self, cursor: sqlite3.Cursor) -> bool:
         """True when messages_fts_cjk_update exists with AFTER UPDATE OF."""
