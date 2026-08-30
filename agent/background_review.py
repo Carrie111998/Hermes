@@ -19,11 +19,13 @@ for invariants and PR review criteria.
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import json
 import logging
 import os
-from pathlib import Path
 import threading
+import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.thread_scoped_output import thread_scoped_silence
@@ -185,6 +187,48 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
             "proceeding with foreground live turn",
             _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS,
         )
+
+
+# ---------------------------------------------------------------------------
+# Plugin host contract (P2.1)
+#
+# Plugins that piggyback on the background-review fork (e.g. to extract
+# structured memory from what the review saw) consume these stable seams
+# instead of monkey-patching module constants and functions. ``HOOK_CONTRACT_VERSION``
+# bumps on ANY signature change to ``ReviewExecutionContext`` or the three
+# ``background_review_*`` hooks; a plugin checks it at startup and fails
+# closed (no piggyback) when the host is older than it expects.
+# ---------------------------------------------------------------------------
+
+#: Bump on any change to ``ReviewExecutionContext`` fields or the
+#: ``background_review_started`` / ``_message`` / ``_finished`` contracts.
+#:
+#: v2 — ``background_review_finished`` gained ``status="cancelled"`` and now
+#: fires on the #84423 startup-fence path too (v1 could report a cancelled
+#: fork as ``"finished"``, and emitted nothing at all when the fence tripped).
+#: A v1 consumer still works: it sees an unknown status string, and the
+#: started/terminal counts still balance.
+HOOK_CONTRACT_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ReviewExecutionContext:
+    """Immutable description of one fork execution, handed to every
+    ``background_review_*`` hook and (as ``execution_kind``/``execution_id``
+    kwargs) to the ordinary per-turn hooks fired inside the fork.
+
+    Built on the FOREGROUND thread in :func:`spawn_background_review_thread`
+    (before the daemon starts), so ``session_id``/``platform`` are the fork's
+    true source values, captured once — not re-read from foreground activity
+    later (the C5 misattribution class).
+    """
+
+    execution_id: str           # uuid4().hex, unique per fork run
+    execution_kind: str         # "background_review"
+    session_id: str             # parent session, pinned at spawn
+    parent_turn_id: str         # foreground turn that spawned the fork
+    platform: Optional[str]     # from the live agent at spawn time
+    started_at: str             # UTC isoformat
 
 
 # ---------------------------------------------------------------------------
@@ -1398,6 +1442,7 @@ def _run_review_in_thread(
     prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None,
     review_run: Optional[_BackgroundReviewRun] = None,
+    context: Optional[ReviewExecutionContext] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -1409,8 +1454,61 @@ def _run_review_in_thread(
     :func:`prepare_background_review_run`.  If a live turn bumps the
     cancel generation before this review reaches its first provider call,
     the review aborts without entering ``run_conversation()`` (#84423).
+
+    P2.1: the fork's ordinary per-turn hooks (``pre_llm_call``,
+    ``pre_api_request`` …) are tagged ``execution_kind="background_review"``
+    via ``review_agent._execution_kind``/``_execution_id`` so plugins can
+    tell fork turns from live turns without prompt-text or turn-id
+    heuristics. ``background_review_message`` fires per assistant message
+    and ``background_review_finished`` fires exactly once — on EVERY exit,
+    including the two #84423 cancellation windows below — with the review
+    messages accumulated so far, replacing the summarizer-wrap extraction
+    seam.
+
+    Contract v2: ``status`` is ``"finished" | "failed" | "cancelled"``.
+    ``"cancelled"`` is reported whenever ``review_run.cancel_requested`` is
+    set, because a cancelled fork's transcript is EMPTY (startup fence) or
+    TRUNCATED (mid-flight interrupt) — a consumer that treats it as
+    ``"finished"`` would commit a partial extraction as if it were the
+    fork's whole output.
     """
+    # P2.1 + #84423: the one-shot terminal helper is defined BEFORE the
+    # startup fence below, because that fence returns without ever reaching
+    # the body. background_review_started has already fired on the foreground
+    # thread by then, so returning without a terminal event would break the
+    # counter invariant (started == finished + failed + cancelled) for every
+    # review a live turn outraces.
+    _terminal_emitted = {"done": False}
+
+    def _emit_terminal(status: str, error: Optional[str], msgs: List[Dict]) -> None:
+        if context is None or _terminal_emitted["done"]:
+            return
+        _terminal_emitted["done"] = True
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "background_review_finished",
+                context=context, messages=msgs,
+                status=status, error=error,
+            )
+        except Exception:
+            logger.warning("background_review_finished hook dispatch failed",
+                           exc_info=True)
+
+    def _terminal_status(default: str) -> str:
+        """``"cancelled"`` wins over a nominal success.
+
+        ``interrupt()`` is cooperative: ``run_conversation`` returns normally
+        after a mid-flight cancel, so the success path is reached with a
+        truncated transcript and cannot be distinguished by control flow —
+        only by the run token.
+        """
+        if review_run is not None and review_run.cancel_requested.is_set():
+            return "cancelled"
+        return default
+
     if review_run is not None and review_run.cancel_requested.is_set():
+        _emit_terminal("cancelled", None, [])
         finish_background_review_run(agent, review_run)
         return
 
@@ -1503,6 +1601,14 @@ def _run_review_in_thread(
             review_agent, _rt, _routed = build_cache_parity_fork(
                 agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS
             )
+
+            # P2.1: tag this fork's ordinary per-turn hooks so plugins can
+            # gate on execution_kind without prompt-text/turn-id heuristics.
+            # _execution_id ties every hook firing in this fork to the same
+            # ReviewExecutionContext handed to background_review_started.
+            review_agent._execution_kind = "background_review"
+            if context is not None:
+                review_agent._execution_id = context.execution_id
 
             # Register this fork on the PARENT's _active_children (the same
             # list interrupt() fans out to for subagent delegation) and
@@ -1660,6 +1766,22 @@ def _run_review_in_thread(
             # summary still needs the completed review agent's tool results.
             review_messages = list(getattr(review_agent, "_session_messages", []))
 
+            # P2.1: fire background_review_message for each assistant message
+            # (observer-only). Plugins use it for live debug taps; the
+            # finished hook below is where extraction/commit happens.
+            if context is not None:
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    for _msg in review_messages:
+                        if isinstance(_msg, dict) and _msg.get("role") == "assistant":
+                            _invoke_hook(
+                                "background_review_message",
+                                context=context, message=_msg,
+                            )
+                except Exception:
+                    logger.warning("background_review_message hook dispatch failed",
+                                   exc_info=True)
+
             # Tear down memory providers while stdout is still
             # redirected so background thread teardown (Honcho flush,
             # Hindsight sync, etc.) stays silent.  The finally block
@@ -1673,6 +1795,22 @@ def _run_review_in_thread(
             except Exception:
                 pass
             review_agent = None
+
+        # P2.1: background_review_finished — fired BEFORE summarize so a plugin
+        # still sees the full review_messages and can commit its own extraction
+        # on the daemon thread. Replaces the summarize_background_review_actions
+        # monkey-patch seam. Fired exactly once per fork (see _emit_terminal):
+        # on the success path here, on the failure path in the except below —
+        # never both.
+        #
+        # #84423 window B: this line is ALSO reached when the review was
+        # cancelled — begin_request() refused admission (run_conversation never
+        # ran, review_messages is empty), or a live turn interrupted the fork
+        # mid-flight (interrupt() is cooperative, so run_conversation returned
+        # normally and review_messages is truncated). Neither is a finished
+        # review, and neither is distinguishable by control flow here; ask the
+        # run token instead.
+        _emit_terminal(_terminal_status("finished"), None, review_messages)
 
         # Scan the review agent's messages for successful tool actions
         # and surface a compact summary to the user. Tool messages
@@ -1723,6 +1861,18 @@ def _run_review_in_thread(
                     pass
 
     except Exception as e:
+        # P2.1: fire background_review_finished on the failure path too so the
+        # plugin's _active_reviews entry is always retired (counters stay
+        # consistent: fork_started == fork_finished + fork_failed). No-ops if
+        # the success path already emitted a terminal event (an exception raised
+        # by the post-"finished" summary/output code lands here — it must not
+        # reclassify an already-finished fork as failed).
+        #
+        # Deliberately NOT _terminal_status(): a real exception outranks a
+        # pending cancel. "cancelled" would drop the error string, and a crash
+        # is what the operator needs to see even if a live turn happened to
+        # supersede this fork on the way out.
+        _emit_terminal("failed", str(e), list(review_messages))
         logger.warning("Background memory/skill review failed: %s", e)
         if review_usage:
             _log_review_completion(review_usage, "error")
@@ -1783,6 +1933,15 @@ def spawn_background_review_thread(
     from :func:`load_background_review_settings`. When omitted, config is
     read once here and shared with the worker (aux routing) so a single
     turn does not re-parse the config file.
+
+    P2.1: builds a :class:`ReviewExecutionContext` HERE, on the foreground
+    thread (before the daemon starts), and fires the ``background_review_*``
+    host contract. ``background_review_started`` lets a plugin append a
+    ``prompt_suffix`` (replaces constant monkey-patching); the context is
+    threaded into the daemon so ``background_review_message`` /
+    ``background_review_finished`` carry immutable provenance. The hook runs
+    *after* ``focus`` is folded in, so a plugin sees the prompt the fork will
+    actually use and user steering always precedes plugin suffixes.
     """
     if task_cfg is None:
         task_cfg = _background_review_task_config()
@@ -1805,6 +1964,37 @@ def spawn_background_review_thread(
             f"{focus}"
         )
 
+    # Build the immutable execution context on the foreground thread. The fork
+    # pins review_agent.session_id = agent.session_id (see _run_review_in_thread),
+    # so agent.session_id IS the fork's source session — captured once here.
+    context = ReviewExecutionContext(
+        execution_id=uuid.uuid4().hex,
+        execution_kind="background_review",
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        parent_turn_id=str(getattr(agent, "_current_turn_id", "") or ""),
+        platform=getattr(agent, "platform", None),
+        started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+    )
+
+    # background_review_started: plugins may return {"prompt_suffix": ...};
+    # the host concatenates every non-empty suffix onto the prompt. Replaces
+    # the old "patch the _MEMORY/_SKILL/_COMBINED_REVIEW_PROMPT constants"
+    # seam. A hook that raises is isolated by invoke_hook; the fork simply
+    # runs without that plugin's suffix.
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        for _r in _invoke_hook(
+            "background_review_started",
+            context=context,
+            prompt=prompt,
+            review_memory=review_memory,
+            review_skills=review_skills,
+        ):
+            if isinstance(_r, dict) and _r.get("prompt_suffix"):
+                prompt = prompt + "\n" + str(_r["prompt_suffix"])
+    except Exception:
+        logger.warning("background_review_started hook dispatch failed", exc_info=True)
+
     def _target() -> None:
         _run_review_in_thread(
             agent,
@@ -1812,12 +2002,15 @@ def spawn_background_review_thread(
             prompt,
             task_cfg=task_cfg,
             review_run=review_run,
+            context=context,
         )
 
     return _target, prompt
 
 
 __all__ = [
+    "HOOK_CONTRACT_VERSION",
+    "ReviewExecutionContext",
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
