@@ -172,6 +172,12 @@ _LEGACY_WEB_BACKENDS = frozenset(
     {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "keenable"}
 )
 
+# Legacy built-ins that can search but cannot extract. Mirrors the
+# ``supports_extract()`` answer of the corresponding plugins so capability
+# filtering still works before plugins load (subprocess agent runs,
+# delegate children, scripts) — see :func:`_backend_supports_capability`.
+_SEARCH_ONLY_WEB_BACKENDS = frozenset({"searxng", "brave-free", "ddgs", "xai"})
+
 
 def _registered_web_provider(backend: str):
     """Return a plugin-registered web provider by name, or ``None``.
@@ -220,8 +226,37 @@ def _list_registered_web_providers():
         return []
 
 
-def _get_backend() -> str:
+def _backend_supports_capability(backend: str, capability: str) -> bool:
+    """Return True when *backend* can serve *capability* ("search"/"extract").
+
+    Registered providers answer via ``supports_search()`` /
+    ``supports_extract()``; names with no registered provider fall back to
+    :data:`_SEARCH_ONLY_WEB_BACKENDS`. Unknown backends are assumed capable
+    so capability filtering never downgrades a custom provider's strict
+    selection into a silent switch.
+    """
+    provider = _registered_web_provider(backend)
+    if provider is not None:
+        try:
+            if capability == "search":
+                return bool(provider.supports_search())
+            if capability == "extract":
+                return bool(provider.supports_extract())
+        except Exception as exc:  # noqa: BLE001 — fall through to static map
+            logger.debug(
+                "web provider %r.supports_%s raised: %s", backend, capability, exc
+            )
+    if capability == "extract":
+        return (backend or "").lower().strip() not in _SEARCH_ONLY_WEB_BACKENDS
+    return True
+
+
+def _get_backend(capability: Optional[str] = None) -> str:
     """Determine which web backend to use (shared fallback).
+
+    When *capability* is given ("search"/"extract"), candidates that cannot
+    serve it are skipped during auto-detect, so e.g. extract never lands on
+    a search-only backend like ``ddgs`` (#98618).
 
     Reads ``web.backend`` from config.yaml (set by ``hermes tools``). A
     stored backend name is returned as-is — no availability probe, no
@@ -270,7 +305,9 @@ def _get_backend() -> str:
         ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
-        if available:
+        if available and (
+            capability is None or _backend_supports_capability(backend, capability)
+        ):
             return backend
 
     # Final fallback: walk plugin-registered providers so a custom backend
@@ -283,7 +320,10 @@ def _get_backend() -> str:
         if provider.name in _LEGACY_WEB_BACKENDS:
             continue
         try:
-            if provider.is_available():
+            if provider.is_available() and (
+                capability is None
+                or _backend_supports_capability(provider.name, capability)
+            ):
                 return provider.name
         except Exception as exc:  # noqa: BLE001 — a broken provider is skipped
             logger.debug("web provider %r.is_available() raised: %s", provider.name, exc)
@@ -305,7 +345,10 @@ def _get_backend() -> str:
                 if provider is None:
                     continue
                 try:
-                    if provider.is_keyless_available():
+                    if provider.is_keyless_available() and (
+                        capability is None
+                        or _backend_supports_capability(name, capability)
+                    ):
                         return name
                 except Exception as exc:  # noqa: BLE001 — skip broken provider
                     logger.debug(
@@ -356,7 +399,7 @@ def _get_capability_backend(capability: str) -> str:
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
     if specific:
         return specific
-    return _get_backend()
+    return _get_backend(capability)
 
 
 def _tavily_explicitly_configured() -> bool:
@@ -367,8 +410,13 @@ def _tavily_explicitly_configured() -> bool:
     )
 
 
-def _is_backend_available(backend: str) -> bool:
+def _is_backend_available(backend: str, capability: Optional[str] = None) -> bool:
     """Return True when the selected backend is currently usable.
+
+    When *capability* is given ("search"/"extract"), a backend that cannot
+    serve it answers False even when otherwise reachable — callers asking
+    "can this backend do the thing I'm about to ask?" get an honest answer
+    (#98618).
 
     For plugin-registered backends (any name outside
     :data:`_LEGACY_WEB_BACKENDS`), availability is delegated to the
@@ -380,6 +428,8 @@ def _is_backend_available(backend: str) -> bool:
     hardcoded probes below.
     """
     backend = (backend or "").lower().strip()
+    if capability and not _backend_supports_capability(backend, capability):
+        return False
     if backend not in _LEGACY_WEB_BACKENDS:
         registered = _registered_web_provider_available(backend)
         if registered is not None:
