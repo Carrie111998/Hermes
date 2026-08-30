@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 class DeferredQuestion:
     id: str
     plugin_id: str
-    platform: str
     session_key: str
     delivery_source: dict[str, object]
     question: str
@@ -37,9 +36,8 @@ class DeferredQuestion:
     updated_at: float
 
     @property
-    def chat_id(self) -> str:
-        """Compatibility accessor; the routing envelope is canonical."""
-        return str(self.delivery_source["chat_id"])
+    def platform(self) -> str:
+        return str(self.delivery_source["platform"])
 
 
 @dataclass(frozen=True)
@@ -71,8 +69,11 @@ class DeferredQuestionService:
         self._lock = threading.RLock()
         self._handlers: dict[tuple[str, str], DeferredQuestionHandler] = {}
         self._adapters: dict[str, tuple[Any, asyncio.AbstractEventLoop]] = {}
+        self._ready_platforms: set[str] = set()
         self._busy_callbacks: set[str] = set()
+        self._handling_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._recovery_task: asyncio.Task[None] | None = None
+        self.handling_retry_seconds = 5.0
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -89,7 +90,6 @@ class DeferredQuestionService:
                     plugin_id TEXT NOT NULL,
                     platform TEXT NOT NULL,
                     session_key TEXT NOT NULL,
-                    chat_id TEXT NOT NULL,
                     question TEXT NOT NULL,
                     handler_name TEXT NOT NULL,
                     context_json TEXT NOT NULL,
@@ -112,38 +112,6 @@ class DeferredQuestionService:
                 ON deferred_questions(session_key, state, created_at);
                 """
             )
-            columns = {
-                row["name"]
-                for row in conn.execute("PRAGMA table_info(deferred_questions)")
-            }
-            if "delivery_source_json" not in columns:
-                conn.execute(
-                    "ALTER TABLE deferred_questions ADD COLUMN delivery_source_json TEXT"
-                )
-            if "result_json" not in columns:
-                conn.execute("ALTER TABLE deferred_questions ADD COLUMN result_json TEXT")
-            if "delivery_attempted" not in columns:
-                conn.execute(
-                    "ALTER TABLE deferred_questions "
-                    "ADD COLUMN delivery_attempted INTEGER NOT NULL DEFAULT 0"
-                )
-            rows = conn.execute(
-                """
-                SELECT id, platform, chat_id FROM deferred_questions
-                WHERE delivery_source_json IS NULL
-                """
-            ).fetchall()
-            for row in rows:
-                source_json = json.dumps(
-                    {"platform": row["platform"], "chat_id": row["chat_id"]},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                conn.execute(
-                    "UPDATE deferred_questions SET delivery_source_json = ? "
-                    "WHERE id = ?",
-                    (source_json, row["id"]),
-                )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> DeferredQuestion | None:
@@ -172,7 +140,6 @@ class DeferredQuestionService:
         return DeferredQuestion(
             id=row["id"],
             plugin_id=row["plugin_id"],
-            platform=row["platform"],
             session_key=row["session_key"],
             delivery_source=delivery_source,
             question=row["question"],
@@ -201,7 +168,6 @@ class DeferredQuestionService:
         self,
         *,
         plugin_id: str,
-        platform: str,
         session_key: str,
         delivery_source: dict[str, object],
         question: str,
@@ -214,9 +180,7 @@ class DeferredQuestionService:
             delivery_source, sort_keys=True, separators=(",", ":")
         )
         chat_id = str(delivery_source.get("chat_id") or "")
-        source_platform = str(delivery_source.get("platform") or "")
-        if source_platform != platform:
-            raise ValueError("delivery source platform must match platform")
+        platform = str(delivery_source.get("platform") or "")
         if not all(
             value.strip()
             for value in (
@@ -237,18 +201,17 @@ class DeferredQuestionService:
                 conn.execute(
                     """
                     INSERT INTO deferred_questions (
-                        id, plugin_id, platform, session_key, chat_id, question,
+                        id, plugin_id, platform, session_key, question,
                         handler_name, context_json, dedupe_key, state, response,
                         created_at, updated_at, delivery_source_json, result_json,
                         delivery_attempted
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, ?, ?, ?, NULL, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, ?, ?, ?, NULL, 0)
                     """,
                     (
                         question_id,
                         plugin_id,
                         platform,
                         session_key,
-                        chat_id,
                         question,
                         handler_name,
                         context_json,
@@ -357,6 +320,15 @@ class DeferredQuestionService:
         except RuntimeError:
             loop = asyncio.get_event_loop()
         self._adapters[platform] = (adapter, loop)
+        self._ready_platforms.discard(platform)
+
+    def adapter_connected(self, platform: str, adapter: Any) -> None:
+        """Wake durable work only after this exact transport is usable."""
+        binding = self._adapters.get(platform)
+        if binding is None or binding[0] is not adapter:
+            return
+        _adapter, loop = binding
+        self._ready_platforms.add(platform)
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
@@ -367,13 +339,21 @@ class DeferredQuestionService:
                 (time.time(), platform),
             )
         self._wake_platform(platform)
-
         self._schedule_recovery(loop)
+
+    def adapter_disconnected(self, platform: str, adapter: Any) -> None:
+        binding = self._adapters.get(platform)
+        if binding is not None and binding[0] is adapter:
+            self._ready_platforms.discard(platform)
 
     def _schedule_recovery(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         if loop is None:
             loop = next(
-                (bound_loop for _adapter, bound_loop in self._adapters.values()),
+                (
+                    self._adapters[platform][1]
+                    for platform in self._ready_platforms
+                    if platform in self._adapters
+                ),
                 None,
             )
         if loop is None or not loop.is_running():
@@ -387,7 +367,7 @@ class DeferredQuestionService:
 
     def _wake_platform(self, platform: str) -> None:
         binding = self._adapters.get(platform)
-        if binding is None:
+        if binding is None or platform not in self._ready_platforms:
             return
         _adapter, loop = binding
 
@@ -501,7 +481,43 @@ class DeferredQuestionService:
                 return None
         return await self._run_handler(self.get(record.id))
 
-    async def _run_handler(self, record: DeferredQuestion) -> DeferredQuestionResult:
+    def _schedule_handling_retry(self, record: DeferredQuestion) -> None:
+        if record.id in self._handling_retry_tasks:
+            return
+        binding = self._adapters.get(record.platform)
+        if binding is None or record.platform not in self._ready_platforms:
+            return
+        _adapter, loop = binding
+
+        async def retry_once() -> None:
+            try:
+                await asyncio.sleep(self.handling_retry_seconds)
+                if record.platform not in self._ready_platforms:
+                    return
+                pending = self.get(record.id)
+                await self._run_handler(pending, schedule_retry=False)
+            except KeyError:
+                return
+            except Exception:
+                logger.error(
+                    "Deferred-question acknowledgement retry failed for %s",
+                    record.id,
+                    exc_info=True,
+                )
+            finally:
+                self._handling_retry_tasks.pop(record.id, None)
+
+        def schedule() -> None:
+            if record.id in self._handling_retry_tasks:
+                return
+            self._handling_retry_tasks[record.id] = asyncio.create_task(retry_once())
+
+        if loop.is_running():
+            loop.call_soon_threadsafe(schedule, context=contextvars.Context())
+
+    async def _run_handler(
+        self, record: DeferredQuestion, *, schedule_retry: bool = True
+    ) -> DeferredQuestionResult:
         handler = self._handlers.get((record.plugin_id, record.handler_name))
         if handler is None:
             raise LookupError(
@@ -556,6 +572,8 @@ class DeferredQuestionService:
                             """,
                             (time.time(), record.id),
                         )
+                    if schedule_retry:
+                        self._schedule_handling_retry(record)
                 raise RuntimeError(
                     getattr(delivered, "error", None)
                     or "deferred-question reply delivery failed"
@@ -607,7 +625,7 @@ class DeferredQuestionService:
             if (record.plugin_id, record.handler_name) not in self._handlers:
                 continue
             try:
-                result = await self._run_handler(record)
+                result = await self._run_handler(record, schedule_retry=False)
             except Exception:
                 logger.error(
                     "Deferred-question recovery failed for %s",
@@ -651,7 +669,6 @@ class DeferredQuestionClient:
     def enqueue(
         self,
         *,
-        platform: str,
         session_key: str,
         delivery_source: dict[str, object],
         question: str,
@@ -661,7 +678,6 @@ class DeferredQuestionClient:
     ) -> DeferredQuestion:
         return self._service.enqueue(
             plugin_id=self._plugin_id,
-            platform=platform,
             session_key=session_key,
             delivery_source=delivery_source,
             question=question,

@@ -3574,12 +3574,14 @@ class BasePlatformAdapter(ABC):
 
     def _mark_disconnected(self) -> None:
         self._running = False
+        self.notify_deferred_questions_disconnected()
         if self.has_fatal_error:
             return
         self._write_runtime_status_safe("disconnected", platform_state="disconnected", error_code=None, error_message=None)
 
     def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
         self._running = False
+        self.notify_deferred_questions_disconnected()
         self._fatal_error_code = code
         self._fatal_error_message = message
         self._fatal_error_retryable = retryable
@@ -3816,10 +3818,25 @@ class BasePlatformAdapter(ABC):
         self.set_deferred_question_service(get_deferred_question_service())
 
     def set_deferred_question_service(self, service: Any) -> None:
-        """Bind the host's durable question service to this adapter."""
+        """Register this adapter without waking work before it connects."""
         self._deferred_question_service = service
         platform_name = getattr(self.platform, "value", str(self.platform))
         service.bind_adapter(platform_name, self)
+
+    def notify_deferred_questions_connected(self) -> None:
+        """Wake durable plugin work after the transport is usable."""
+        service = self._deferred_question_service
+        if service is None:
+            return
+        platform_name = getattr(self.platform, "value", str(self.platform))
+        service.adapter_connected(platform_name, self)
+
+    def notify_deferred_questions_disconnected(self) -> None:
+        service = self._deferred_question_service
+        if service is None:
+            return
+        platform_name = getattr(self.platform, "value", str(self.platform))
+        service.adapter_disconnected(platform_name, self)
 
     def is_session_active(self, session_key: str) -> bool:
         """Return whether this adapter currently owns a run for ``session_key``."""

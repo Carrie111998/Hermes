@@ -19,7 +19,6 @@ def _service(path: Path):
 def _enqueue(service, *, dedupe_key: str = "invite-consent"):
     return service.enqueue(
         plugin_id="plow-chat",
-        platform="plow_chat",
         session_key="plow_chat:home:owner",
         delivery_source={
             "platform": "plow_chat",
@@ -41,6 +40,7 @@ def _awaiting_question(service, *, adapter=None):
         adapter,
         __import__("asyncio").get_running_loop(),
     )
+    service._ready_platforms.add("plow_chat")
     service.claim_for_delivery(question.id)
     service.mark_awaiting(question.id)
     return question, adapter
@@ -170,6 +170,7 @@ async def test_reply_delivery_recovery_does_not_rerun_handler(tmp_path: Path) ->
 
     adapter = FlakyReplyAdapter(service)
     question, _adapter = _awaiting_question(service, adapter=adapter)
+    service.handling_retry_seconds = 0
     handler_calls = 0
 
     async def handle(_record, _answer):
@@ -186,9 +187,11 @@ async def test_reply_delivery_recovery_does_not_rerun_handler(tmp_path: Path) ->
     assert persisted.state == "handling"
     assert persisted.result == DeferredQuestionResult.done("Consent recorded.")
 
-    results = await service.retry_handling()
+    await __import__("asyncio").sleep(0)
+    retry_tasks = tuple(service._handling_retry_tasks.values())
+    assert len(retry_tasks) == 1
+    await __import__("asyncio").gather(*retry_tasks)
 
-    assert results == [(question.id, DeferredQuestionResult.done("Consent recorded."))]
     assert handler_calls == 1
     assert adapter.attempts == 2
     with pytest.raises(KeyError):
@@ -230,6 +233,7 @@ async def test_overlapping_adapter_binds_run_one_handling_recovery(
 
     restarted.bind_adapter("plow_chat", adapter)
     restarted.bind_adapter("plow_chat", adapter)
+    restarted.adapter_connected("plow_chat", adapter)
     restarted.register_handler("plow-chat", "invite-consent", recover)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -406,6 +410,7 @@ async def test_ambiguous_delivery_is_not_retried_after_restart(tmp_path: Path) -
     restarted = _service(path)
     restarted_adapter = AmbiguousAdapter(restarted)
     restarted.bind_adapter("plow_chat", restarted_adapter)
+    restarted.adapter_connected("plow_chat", restarted_adapter)
     await __import__("asyncio").sleep(0)
     await __import__("asyncio").sleep(0)
 
@@ -433,6 +438,7 @@ async def test_failed_delivery_waits_for_an_external_wake(
 
     adapter = FlakyAdapter(service)
     service.bind_adapter("plow_chat", adapter)
+    service.adapter_connected("plow_chat", adapter)
     await __import__("asyncio").sleep(0)
     await __import__("asyncio").sleep(0)
 
@@ -465,6 +471,7 @@ async def test_wake_does_not_copy_the_enqueuers_context_into_delivery(
 
     adapter = ContextAdapter(service)
     service.bind_adapter("plow_chat", adapter)
+    service.adapter_connected("plow_chat", adapter)
     token = marker.set("member-turn")
     try:
         _enqueue(service)
@@ -487,7 +494,6 @@ def test_plugin_client_namespaces_handler_and_dedupe_key(tmp_path: Path) -> None
 
     client.register_handler("invite-consent", handler)
     question = client.enqueue(
-        platform="plow_chat",
         session_key="plow_chat:home:owner",
         delivery_source={"platform": "plow_chat", "chat_id": "home"},
         question="May I send invites?",
@@ -532,6 +538,11 @@ async def test_binding_adapter_recovers_question_after_restart(
     restarted = _service(path)
     adapter = _DeliveryAdapter(restarted, active=False)
     restarted.bind_adapter("plow_chat", adapter)
+    await __import__("asyncio").sleep(0)
+
+    assert adapter.sent == []
+
+    restarted.adapter_connected("plow_chat", adapter)
     await __import__("asyncio").sleep(0)
     await __import__("asyncio").sleep(0)
 
@@ -656,7 +667,6 @@ async def test_adapter_intercepts_deferred_reply_before_busy_queue(
     session_key = build_session_key(source)
     question = service.enqueue(
         plugin_id="plow-chat",
-        platform="telegram",
         session_key=session_key,
         delivery_source=source.to_dict(),
         question="May I send invites?",
@@ -692,24 +702,26 @@ async def test_adapter_intercepts_deferred_reply_before_busy_queue(
 
 
 @pytest.mark.asyncio
-async def test_adapter_rejects_unauthorized_deferred_reply(tmp_path: Path) -> None:
+@pytest.mark.parametrize("authorization", [False, None], ids=["denied", "unknown"])
+async def test_adapter_rejects_unauthorized_deferred_reply(
+    tmp_path: Path, authorization: bool | None
+) -> None:
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource, build_session_key
 
     service = _service(tmp_path / "questions.sqlite3")
     adapter = _GatewayAdapter()
     adapter.set_deferred_question_service(service)
-    adapter.set_authorization_check(lambda *_args: False)
+    adapter.set_authorization_check(lambda *_args: authorization)
     adapter._message_handler = AsyncMock(return_value="ordinary")
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="shared",
         chat_type="group",
-        user_id="outsider",
+        user_id="outsider" if authorization is False else "unknown",
     )
     question = service.enqueue(
         plugin_id="plow-chat",
-        platform="telegram",
         session_key=build_session_key(source),
         delivery_source=source.to_dict(),
         question="May I send invites?",
@@ -738,50 +750,6 @@ async def test_adapter_rejects_unauthorized_deferred_reply(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_adapter_rejects_indeterminate_deferred_reply(tmp_path: Path) -> None:
-    from gateway.platforms.base import MessageEvent, MessageType
-    from gateway.session import SessionSource, build_session_key
-
-    service = _service(tmp_path / "questions.sqlite3")
-    adapter = _GatewayAdapter()
-    adapter.set_deferred_question_service(service)
-    adapter.set_authorization_check(lambda *_args: None)
-    adapter._message_handler = AsyncMock(return_value="ordinary")
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="shared",
-        chat_type="group",
-        user_id="unknown",
-    )
-    question = service.enqueue(
-        plugin_id="plow-chat",
-        platform="telegram",
-        session_key=build_session_key(source),
-        delivery_source=source.to_dict(),
-        question="May I send invites?",
-        handler_name="invite-consent",
-        context={},
-        dedupe_key="invite-consent",
-    )
-    service.claim_for_delivery(question.id)
-    service.mark_awaiting(question.id)
-    handler = AsyncMock()
-    service.register_handler("plow-chat", "invite-consent", handler)
-
-    await adapter.handle_message(
-        MessageEvent(
-            text="yes",
-            source=source,
-            message_id="msg-unknown",
-            message_type=MessageType.TEXT,
-        )
-    )
-
-    assert service.get(question.id).state == "awaiting"
-    handler.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_slash_command_bypasses_pending_deferred_question(tmp_path: Path) -> None:
     import asyncio
 
@@ -797,7 +765,6 @@ async def test_slash_command_bypasses_pending_deferred_question(tmp_path: Path) 
     )
     question = service.enqueue(
         plugin_id="plow-chat",
-        platform="telegram",
         session_key=build_session_key(source),
         delivery_source=source.to_dict(),
         question="May I send invites?",

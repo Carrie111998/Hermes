@@ -7957,7 +7957,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         timeout = self._platform_connect_timeout_secs(platform, initial=initial)
         if timeout <= 0:
-            return await adapter.connect(is_reconnect=is_reconnect)
+            connected = bool(await adapter.connect(is_reconnect=is_reconnect))
+            if connected:
+                adapter.notify_deferred_questions_connected()
+            return connected
         # Use the detach-on-timeout pattern instead of plain asyncio.wait_for:
         # asyncio.wait_for cancels the overdue task but then waits for it to
         # exit. An adapter connect() that catches CancelledError can therefore
@@ -7974,8 +7977,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task.add_done_callback(consume_detached_task_result)
             raise
         if task in done:
-            result = await task
-            return bool(result)
+            connected = bool(await task)
+            if connected:
+                adapter.notify_deferred_questions_connected()
+            return connected
         task.cancel()
         task.add_done_callback(consume_detached_task_result)
         raise TimeoutError(
