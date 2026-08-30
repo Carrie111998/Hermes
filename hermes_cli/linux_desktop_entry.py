@@ -25,6 +25,7 @@ Electron main process both use this without loading the full CLI.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -57,27 +58,125 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
-def resolve_exec_command() -> str:
+def _desktop_stamp_path(project_root: Path) -> Path:
+    """Return the path to the desktop build stamp file under HERMES_HOME."""
+    # Import here to avoid circular imports
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "desktop-build-stamp.json"
+
+
+def _verify_build_stamp_matches(exe_path: Path, project_root: Path) -> bool:
+    """Verify the executable belongs to the current project and build generation.
+    
+    Reads the install-stamp.json next to the binary and compares content_hash
+    against the current project's computed hash. Returns False for stale,
+    incomplete, or unrelated artifacts (wrong project, wrong profile, corrupted build).
+    """
+    try:
+        # The stamp is at HERMES_HOME/desktop-build-stamp.json
+        stamp_file = _desktop_stamp_path(project_root)
+        if not stamp_file.is_file():
+            return False
+        
+        stamp_data = json.loads(stamp_file.read_text(encoding="utf-8"))
+        expected_hash = stamp_data.get("contentHash")
+        if not expected_hash:
+            return False
+        
+        # Compute current project's content hash
+        from hermes_cli.main import _compute_desktop_content_hash
+        current_hash = _compute_desktop_content_hash(project_root)
+        
+        return current_hash == expected_hash
+    except Exception:
+        # Any error (missing stamp, malformed JSON, import error) = no match
+        return False
+
+
+def _read_stamp_content_hash(project_root: Path) -> str:
+    """Read contentHash from desktop-build-stamp.json for sorting."""
+    try:
+        stamp_file = _desktop_stamp_path(project_root)
+        if stamp_file.is_file():
+            stamp_data = json.loads(stamp_file.read_text(encoding="utf-8"))
+            return stamp_data.get("contentHash", "")
+    except Exception:
+        pass
+    return ""
+
+
+def _find_packaged_candidates(project_root: Path) -> list[Path]:
+    """Find all packaged Electron executables, ordered by arch priority and build generation.
+    
+    Order: linux-unpacked (x86_64) > linux-arm64-unpacked > any other.
+    Within same arch, stamp content_hash wins (newer generation = higher hash sort).
+    No mtime dependency; stamp hash is the single source of truth.
+    """
+    release = project_root / "apps" / "desktop" / "release"
+    arch_order = ["linux-unpacked", "linux-arm64-unpacked"]
+    candidates = []
+    for idx, arch in enumerate(arch_order):
+        exe = release / arch / "Hermes"
+        if exe.exists():
+            # Use arch index as primary sort key (lower = higher priority)
+            # content_hash as secondary (for same arch, though typically only one per arch)
+            content_hash = _read_stamp_content_hash(project_root)
+            candidates.append((idx, content_hash, exe))
+    # Sort: explicit arch priority first (idx ascending), then stamp hash
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return [p for _, _, p in candidates]
+
+
+def packaged_linux_executable(project_root: Path) -> Optional[Path]:
+    """Return a verified, executable packaged Electron binary, or None.
+    
+    Checks (in order):
+    1. File exists and is a regular file
+    2. File is executable (os.X_OK)
+    3. Build stamp matches current project/generation (prevents stale/wrong-project artifacts)
+    """
+    for exe in _find_packaged_candidates(project_root):
+        if exe.is_file() and os.access(exe, os.X_OK):
+            if _verify_build_stamp_matches(exe, project_root):
+                return exe
+    return None
+
+
+def resolve_exec_command(project_root: Path) -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
     Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
     runs as a module with no launcher installed, use the current
     interpreter, also absolute.
+    
+    CRITICAL FIX: When a packaged Electron app exists, launch it DIRECTLY
+    with the required flags (--no-sandbox, --disable-gpu, --ozone-platform=x11)
+    instead of going through 'hermes desktop' which uses subprocess.run() and
+    blocks waiting for the GUI app to exit — breaking desktop launcher semantics.
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
+    # First, check if there's a packaged Electron executable we can launch directly
+    # This avoids the blocking subprocess.run() in cmd_gui()
+    exe = packaged_linux_executable(project_root)
+    
+    if exe:
+        # Launch the Electron binary directly with required flags for Linux/Wayland
+        argv = [
+            str(exe),
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-gpu-process",
+            "--in-process-gpu",
+            "--ozone-platform=x11",
+        ]
+        return " ".join(_quote_exec_arg(a) for a in argv)
+
+    # Fallback: use the hermes CLI (for cases where desktop isn't built yet)
     bin_path = resolve_hermes_bin()
     if bin_path:
         resolved = Path(bin_path).resolve()
         if _needs_interpreter(resolved):
-            # The resolved launcher is a Python script whose shebang points at
-            # a NON-venv interpreter (e.g. the repo's `hermes` script with
-            # `#!/usr/bin/env python3` when argv[0] came from the shell
-            # installer's bash wrapper). Launched from the .desktop entry that
-            # shebang resolves to the SYSTEM python and dies on the first
-            # third-party import (#90292) — silently, since Terminal=false.
-            # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
             argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
@@ -190,7 +289,7 @@ def install_desktop_entry(project_root: Path) -> Optional[Path]:
     # Use the themed name when the checkout has no icon (a lite or
     # packaged install). A broken absolute path renders as no icon.
     icon_value = str(icon) if icon.is_file() else "hermes"
-    contents = render_desktop_entry(resolve_exec_command(), icon_value)
+    contents = render_desktop_entry(resolve_exec_command(project_root), icon_value)
 
     try:
         entry_path.parent.mkdir(parents=True, exist_ok=True)
