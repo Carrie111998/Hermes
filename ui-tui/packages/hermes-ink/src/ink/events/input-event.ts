@@ -144,6 +144,28 @@ function parseKey(keypress: ParsedKey): [Key, string] {
     processedAsSpecialSequence = true
   }
 
+  // Restore the shifted case for letters that came through a special
+  // sequence. keycodeToName() lowercases every printable codepoint (so
+  // key-binding lookups can compare against a stable name), which means
+  // Shift+T under Kitty CSI u / xterm modifyOtherKeys reaches text input as
+  // "t" — typing under Ghostty's modifyOtherKeys push produces no capitals
+  // at all. Only plain Shift is uppercased: with ctrl/meta/super set the
+  // input string is a binding discriminator, not text, and consumers match
+  // it lowercase.
+  if (
+    processedAsSpecialSequence &&
+    keypress.shift &&
+    !keypress.ctrl &&
+    !keypress.meta &&
+    !keypress.super &&
+    !keypress.option &&
+    input.length === 1 &&
+    input >= 'a' &&
+    input <= 'z'
+  ) {
+    input = input.toUpperCase()
+  }
+
   // Clear input for non-alphanumeric keys (arrows, function keys, etc.)
   // Skip this for CSI u and application keypad mode sequences since
   // those were already converted to their proper input characters.

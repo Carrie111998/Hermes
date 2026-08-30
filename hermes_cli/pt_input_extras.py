@@ -331,6 +331,15 @@ def install_modify_other_keys_aliases() -> int:
         upper_char = chr(ch - 32)  # 'A'..'Z'
         shift_map[ch] = upper_char
         shift_map[ch - 32] = upper_char
+    # Shift+symbol: emitters that report the ALREADY-SHIFTED codepoint (the
+    # xterm modifyOtherKeys behaviour — Ghostty sends ESC[27;2;126~ for
+    # Shift+`) need no layout knowledge at all: the codepoint IS the
+    # character to insert.  Map every remaining printable ASCII codepoint to
+    # itself so '~', '!', '@', '{' etc. stop leaking (#95550).  Unshifted
+    # codepoints are deliberately still NOT guessed at, since the shifted
+    # result of a digit/punctuation key is layout-specific.
+    for cp in range(33, 127):
+        shift_map.setdefault(cp, chr(cp))
     _install_paired(2, shift_map)
 
     # -- Multi-modifier letters: Shift+Alt (4), Ctrl+Shift (6),
@@ -493,6 +502,51 @@ def install_modify_other_keys_aliases() -> int:
         _clear_vt100_prefix_cache()
 
     return changed
+
+
+def install_plain_char_data_fix() -> int:
+    """Make single-character key aliases insert the CHARACTER, not the raw
+    escape sequence that produced them.
+
+    ``ANSI_SEQUENCES`` values may be a plain one-character string (e.g. the
+    Shift+letter and Shift+symbol entries installed by
+    ``install_modify_other_keys_aliases``, and stock entries like Shift+Space
+    → ``" "``).  prompt_toolkit's parser builds ``KeyPress(key, data)`` where
+    ``data`` is the *matched byte sequence*, and the default ``Keys.Any``
+    binding inserts ``event.data`` — so a correctly-resolved Shift+T still
+    types the literal text ``\\x1b[27;2;84~`` into the buffer (#95550).
+
+    Wrap ``Vt100Parser._call_handler`` so that when the resolved key is a
+    single printable character, the data payload becomes that character.
+    Idempotent: a sentinel attribute prevents double-wrapping.
+
+    Returns 1 if the wrapper was installed, 0 if already present or
+    unavailable.
+    """
+    try:
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+    except Exception:
+        return 0
+
+    if getattr(Vt100Parser, "_hermes_plain_char_data_fix", False):
+        return 0
+
+    original = Vt100Parser._call_handler
+
+    def _call_handler(self, key, insert_text):
+        if (
+            isinstance(key, str)
+            and len(key) == 1
+            and insert_text
+            and insert_text != key
+            and insert_text.startswith("\x1b")
+        ):
+            insert_text = key
+        return original(self, key, insert_text)
+
+    Vt100Parser._call_handler = _call_handler
+    Vt100Parser._hermes_plain_char_data_fix = True
+    return 1
 
 
 def install_ignored_terminal_sequences() -> int:
