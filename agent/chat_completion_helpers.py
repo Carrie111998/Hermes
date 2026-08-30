@@ -4248,8 +4248,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
 
-            # Accumulate reasoning content
-            reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            # Accumulate reasoning content.
+            # Primary: SDK-promoted attributes (native DeepSeek / Moonshot).
+            # Fallback: model_extra dict — custom OpenAI-compatible gateways
+            # (e.g. a relay fronting deepseek-v4-flash) forward reasoning as
+            # an extra SSE field.  The SDK (openai>=1.54) promotes known extras
+            # from its known-model schema; an *unknown* provider is not in the
+            # schema, so reasoning lands in model_extra but NOT on the delta
+            # object as a named attr.  Without this fallback, streaming
+            # reasoning is silently dropped after the first tool call on custom
+            # providers (#98224).
+            reasoning_text = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+            )
+            if not reasoning_text and hasattr(delta, "model_extra"):
+                _delta_extra = getattr(delta, "model_extra", None) or {}
+                if isinstance(_delta_extra, dict):
+                    reasoning_text = (
+                        _delta_extra.get("reasoning_content")
+                        or _delta_extra.get("reasoning")
+                    )
             if reasoning_text:
                 # Summary-part models (gpt-5.x and other Responses relays) send
                 # one complete markdown block per delta with no separator, so
