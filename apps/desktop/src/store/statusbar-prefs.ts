@@ -14,7 +14,7 @@ export function toggleStatusbarVisible() {
 
 // Items the bar hides until the user turns them on from its context menu. The
 // bar's job is to answer "is the backend healthy, where am I, what's it doing" —
-// route shortcuts (cron/webhooks/agents), the terminal toggle, and the approval
+// route shortcuts (webhooks/agents), the terminal toggle, and the approval
 // pill are navigation, not status, so they start out of the way. The per-turn
 // session readouts (running/session timers, context meter) are diagnostics most
 // users don't watch, so they start hidden too and the bar stays quiet mid-turn.
