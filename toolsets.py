@@ -196,6 +196,12 @@ TOOLSETS = {
         "tools": ["cronjob"],
         "includes": []
     },
+
+    "watch": {
+        "description": "Native watch tool - poll a command on an interval and surface observations when an optional condition is met (background monitoring)",
+        "tools": ["watch"],
+        "includes": []
+    },
     
 
     "file": {
