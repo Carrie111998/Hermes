@@ -404,6 +404,7 @@ export function ListStripButton({
 }) {
   return (
     <button
+      aria-pressed={active}
       className={cn(
         'cursor-pointer text-[0.68rem] font-medium transition-colors disabled:opacity-40',
         active ? 'text-foreground' : 'text-muted-foreground/70 hover:text-foreground'

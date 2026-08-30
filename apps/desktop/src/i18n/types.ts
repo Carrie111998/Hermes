@@ -1130,6 +1130,8 @@ export interface Translations {
     sortAlpha: string
     sortMostUsedDesc: string
     sortLeastUsedAsc: string
+    viewFlat: string
+    viewGrouped: string
     enableAll: string
     disableAll: string
     disableUnused: string
