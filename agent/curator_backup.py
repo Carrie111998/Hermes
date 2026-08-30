@@ -657,7 +657,13 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
             # Python 3.12+ supports filter='data' for safer extraction.
             # Fall back to the unfiltered call for older interpreters but
             # still reject absolute paths and .. components defensively.
-            for member in tf.getmembers():
+            members = tf.getmembers()
+            file_count = sum(1 for m in members if m.isfile())
+            logger.info(
+                "Rollback: extracting %d members (%d files) from %s",
+                len(members), file_count, archive.name,
+            )
+            for member in members:
                 name = member.name
                 if name.startswith("/") or ".." in Path(name).parts:
                     raise tarfile.TarError(

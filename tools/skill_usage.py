@@ -1115,10 +1115,18 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         dest = archive_root / f"{skill_dir.name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
     # Audit ledger pre-capture (best-effort; never blocks the archive).
+    # Ensure we capture ALL files in the skill directory, not just SKILL.md
     _ledger_before = None
     try:
         from tools import skill_ledger as _ledger
-        _ledger_before = _ledger.capture_before(skill_dir)
+        if skill_dir is not None and skill_dir.is_dir():
+            _ledger_before = _ledger.capture_before(skill_dir)
+            # Validate: log how many files were captured for debugging
+            if _ledger_before is not None:
+                logger.info(
+                    "Archive ledger: captured %d files for skill '%s' at %s",
+                    len(_ledger_before), skill_name, skill_dir,
+                )
     except Exception:
         _ledger = None  # type: ignore[assignment]
 
@@ -1210,10 +1218,18 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
         return False, f"destination already exists: {dest}"
 
     # Audit ledger pre-capture (best-effort; never blocks the restore).
+    # Capture ALL files from the archived skill directory
     _ledger_before = None
     try:
         from tools import skill_ledger as _ledger
-        _ledger_before = _ledger.capture_before(src)
+        if src is not None and src.is_dir():
+            _ledger_before = _ledger.capture_before(src)
+            # Validate: log how many files were captured for debugging
+            if _ledger_before is not None:
+                logger.info(
+                    "Restore ledger: captured %d files for skill '%s' at %s",
+                    len(_ledger_before), skill_name, src,
+                )
     except Exception:
         _ledger = None  # type: ignore[assignment]
 

@@ -146,13 +146,20 @@ def snapshot_paths(root: Optional[Path]) -> List[Dict[str, str]]:
     if root.is_file():
         files = [root]
     elif root.is_dir():
+        # Capture ALL files recursively, including support directories
+        # (references/, scripts/, assets/, etc.)
         files = sorted(p for p in root.rglob("*") if p.is_file())
     else:
         return []
     out: List[Dict[str, str]] = []
     for f in files:
-        data = f.read_bytes()
-        out.append({"path": str(f), "sha256": _store_blob(data)})
+        try:
+            data = f.read_bytes()
+            out.append({"path": str(f), "sha256": _store_blob(data)})
+        except (OSError, IOError) as e:
+            # Log but continue - don't fail the entire snapshot for one file
+            logger.warning("skill_ledger: failed to read %s: %s", f, e)
+            continue
     return out
 
 
