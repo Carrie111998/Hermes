@@ -1421,6 +1421,18 @@ DEFAULT_CONFIG = {
         # starts delegating, nudging the user toward the live spawn-tree
         # dashboard. Set false to suppress the hint.
         "tui_agents_nudge": True,
+        # TUI-owned keys, seeded for `hermes config` parity (get/set/unset/
+        # show and the "unknown config key" guard). Values match the runtime
+        # fallbacks exactly, so seeding changes nothing for existing configs —
+        # defaults only apply when the key is absent. `sections` holds the
+        # per-section details_mode overrides written by `details_mode.<section>`.
+        "tui_theme": "auto",          # auto | dark | light (one-shot detect at first launch)
+        "mouse_tracking": "all",      # off | wheel | buttons | all; legacy tui_mouse honored when absent
+        "details_mode": "collapsed",  # collapsed | expanded | full
+        "thinking_mode": "",          # collapsed | truncated | full; unset = frontend default
+        "tui_compact": False,         # /density compact toggle
+        "tui_statusbar": "top",       # off | top | bottom
+        "sections": {},
         "bell_on_complete": False,
         # Stream the model's reasoning/thinking live before the response.
         # Default ON: on thinking models the reasoning phase can run tens of
