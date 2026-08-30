@@ -2160,10 +2160,11 @@ def _is_sensitive_path(path: Path) -> bool:
     the canonical guards cover as directory trees but a basename-only check
     would miss.
 
-    Read-side only: this guards list/read/download (the #57505 exfil surface).
-    The write endpoints (upload/mkdir/delete) are a separate threat class
-    handled by the write-path checks; extending this guard to them is out of
-    scope for this fix.
+    Guards both the read surfaces (list/read/download, the #57505 exfil
+    surface) and the write-text spot-editor endpoint (the #95306
+    config-injection chain). The remaining write endpoints
+    (upload/mkdir/delete) are a separate threat class that still awaits the
+    fuller write-root allowlist design.
     """
     if _is_sensitive_filename(path.name):
         return True

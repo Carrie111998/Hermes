@@ -38,7 +38,7 @@ def client(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "sensitive_name", [".env", "auth.json", "config.yaml"]
+    "sensitive_name", [".env", ".ENV", "auth.json", "config.yaml"]
 )
 def test_write_text_rejects_sensitive_targets(client, tmp_path, sensitive_name):
     target = tmp_path / sensitive_name
