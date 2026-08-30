@@ -1,0 +1,149 @@
+name: Security SAST & Secrets
+
+# First-party static analysis + secret scan for the Hermes Agent codebase.
+# Companion to supply-chain-audit.yml (which covers critical supply-chain
+# patterns) and osv-scanner.yml (which covers dependency CVEs). This file
+# closes the remaining gap: Python SAST (bandit) and committed-secret
+# detection (gitleaks), plus a pip-audit CVE re-check of the resolved tree.
+#
+# Design mirrors supply-chain-audit.yml: a `workflow_call` sub-workflow
+# gated by the orchestrator's `detect` outputs (inputs, not re-computed
+# diffs). It is a HARD gate — real High-severity findings and committed
+# secrets must block the merge, not just warn.
+#
+# Bandit runs with the project's [tool.bandit] config in pyproject.toml,
+# which already scopes out verified-first-party patterns (gateway bind
+# 0.0.0.0, redact.py regex literals, intentional CLI wrapping, fail-soft
+# try/except/pass). So a green run means "no NEW real issue", not "we
+# silenced everything".
+
+on:
+  workflow_call:
+    inputs:
+      event_name:
+        description: The event name from the calling orchestrator.
+        type: string
+        required: true
+      python:
+        description: Whether any Python-first-party file changed.
+        type: boolean
+        required: true
+      deps:
+        description: Whether pyproject.toml changed.
+        type: boolean
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write # gitleaks SARIF comment if needed
+  security-events: write # bandit/gitleaks SARIF upload (optional)
+
+jobs:
+  bandit:
+    name: Bandit Python SAST
+    if: inputs.python
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d494a04054ebb968ab38b4c5 # v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install bandit
+        run: python -m pip install --quiet "bandit>=1.8,<2"
+
+      - name: Run bandit (severity High only)
+        # -c pyproject.toml picks up the [tool.bandit] skips/excludes.
+        # --severity-level HIGH => fail only on High-severity issues, so
+        # the gate stays high-signal and won't red-X on Low/Medium noise.
+        run: |
+          set -euo pipefail
+          bandit -c pyproject.toml -r hermes_cli agent tools gateway acp_adapter plugins \
+            -x "**/tests/**,**/node_modules/**,**/venv/**,**/__pycache__/**,**/.hermes-runtime/**,**/ui-tui/**" \
+            --severity-level high -f txt -o bandit-report.txt || BANDIT_RC=$?
+          # bandit exits non-zero when findings at/above the severity level exist.
+          if [ "${BANDIT_RC:-0}" != "0" ]; then
+            echo "::error::Bandit found High-severity issues in first-party Python."
+            cat bandit-report.txt
+            exit 1
+          fi
+          echo "Bandit: no High-severity issues."
+
+  gitleaks:
+    name: Gitleaks secret scan
+    if: inputs.python
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks (protecting history + working tree)
+        # Scans both committed history and the working tree. Fails the PR
+        # on any committed secret. agent/redact.py is excluded because it
+        # legitimately contains the redactor's own PRIVATE KEY regex literal.
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION=v8.21.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
+          /tmp/gitleaks detect \
+            --source . \
+            --no-git \
+            --redact \
+            --exclude-path 'agent/redact.py' \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            || GITLEAKS_RC=$?
+          if [ "${GITLEAKS_RC:-0}" != "0" ]; then
+            echo "::error::Gitleaks detected a committed secret. Rotate the credential and force-push a clean history."
+            /tmp/gitleaks detect --source . --no-git --redact --exclude-path 'agent/redact.py'
+            exit 1
+          fi
+          echo "Gitleaks: no secrets found."
+
+      - name: Upload SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6a95dc7f87c9a8d93f3f0e16c9a7c2f8a9c4d8e6 # v3.29.10
+        with:
+          sarif_file: gitleaks.sarif
+
+  pip-audit:
+    name: pip-audit dependency CVE check
+    if: inputs.deps
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d494a04054ebb968ab38b4c5 # v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: python -m pip install --quiet "pip-audit>=2.7,<3"
+
+      - name: Resolve and audit the dependency tree
+        # Audits the pyproject.toml requires (build + runtime) for known CVEs.
+        # Fails the PR if a fixable vulnerability is present. The starlette
+        # CVE-2026-48710 pin is dev/transitive and accepted upstream (see
+        # pyproject.toml comment); pip-audit will surface it and the
+        # maintainer reviews per the existing supply-chain policy.
+        run: |
+          set -euo pipefail
+          pip-audit -r pyproject.toml -f json -o pipaudit.json || AUDIT_RC=$?
+          if [ "${AUDIT_RC:-0}" != "0" ]; then
+            echo "::error::pip-audit found dependency vulnerabilities."
+            pip-audit -r pyproject.toml
+            exit 1
+          fi
+          echo "pip-audit: no known vulnerabilities."

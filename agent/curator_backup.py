@@ -666,8 +666,16 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
             try:
                 tf.extractall(str(skills), filter="data")  # type: ignore[call-arg]
             except TypeError:
-                # Python < 3.12 — no filter kwarg
-                tf.extractall(str(skills))
+                # Python < 3.12 — no filter kwarg. Re-validate each member
+                # manually so the safe-path check at 660-665 still holds and
+                # we never reintroduce a path-traversal via extractall.
+                for member in tf.getmembers():
+                    _name = member.name
+                    if _name.startswith("/") or ".." in Path(_name).parts:
+                        raise tarfile.TarError(
+                            f"refusing to extract unsafe path: {_name!r}"
+                        )
+                    tf.extract(member, str(skills))
     except (OSError, tarfile.TarError) as e:
         # Best-effort recover. A partial extract can leave entries the
         # original tree never had, so drop those first, otherwise the
