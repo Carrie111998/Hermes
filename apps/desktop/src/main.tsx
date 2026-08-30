@@ -14,7 +14,7 @@ import './store/translucency'
 import '@/debug/dev-only'
 
 import { QueryClientProvider } from '@tanstack/react-query'
-import { StrictMode } from 'react'
+import { StrictMode, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import { HashRouter } from 'react-router'
 
@@ -44,6 +44,23 @@ if (import.meta.env.MODE !== 'production' || import.meta.env.VITE_PERF_PROBE ===
 }
 
 const winParam = new URLSearchParams(window.location.search).get('win')
+
+// When the main window comes back after being parked on a disconnected display
+// (see electron/main.ts keepMainWindowOnScreen), Chromium's page freeze can
+// leave settings queries in a stale state; refetch the settings data on
+// visibility recovery so a loading skeleton can't persist indefinitely.
+function RefetchOnVisible() {
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+      void queryClient.invalidateQueries({ queryKey: ['hermes-config-record'] })
+      void queryClient.invalidateQueries({ queryKey: ['hermes-config-schema'] })
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [])
+  return null
+}
 
 if (winParam === 'hud') {
   document.title = 'Hermes HUD'
@@ -85,6 +102,7 @@ if (winParam === 'overlay') {
                     Disabling transitions makes navigate() commit at default priority. */}
                   <HashRouter useTransitions={false}>
                     <App />
+                    <RefetchOnVisible />
                   </HashRouter>
                 </RootTooltipProvider>
               </HapticsProvider>
