@@ -875,6 +875,71 @@ class CompressionCommitFence:
             release()
 
 
+class SummaryCancelSource:
+    """Event-shaped cancel source: hard interrupt OR commit-fence cancellation.
+
+    ``aux_interrupt_protection`` accepts any object exposing ``is_set()``, and
+    the protected-call seam polls it every 20ms while the summary streams
+    (``_run_protected_sync_provider_call``). The compression worker installs
+    this for the duration of the summary call so a host that has stopped
+    waiting unwinds the provider call promptly.
+
+    Why the fence alone was not enough (#96953): the fence is consulted once
+    *before* summary dispatch (F6) and never again while the stream runs, and
+    :meth:`CompressionCommitFence.try_cancel_before_commit` — the only cancel
+    path an async host can take without blocking its event loop — has no
+    ``cancel_event`` parameter to signal with. A gateway-hygiene host that gave
+    up at its total ceiling therefore left the worker streaming a summary the
+    commit fence was already guaranteed to refuse: minutes of paid provider
+    tokens, one of the four bounded compression-pool slots
+    (``_COMPRESS_EXECUTOR_MAX_WORKERS``) held the whole time, and a
+    ``commit_fence_cancelled`` abort at the end with nothing to show for it.
+    """
+
+    __slots__ = ("_hard_event", "_fence", "_flag")
+
+    def __init__(self, hard_event: Any, fence: Any) -> None:
+        self._hard_event = hard_event
+        self._fence = fence
+        self._flag = False
+
+    def set(self) -> None:
+        """Set the underlying hard-interrupt event (duck-typed Event API)."""
+        self._flag = True
+        setter = getattr(self._hard_event, "set", None)
+        if callable(setter):
+            try:
+                setter()
+            except Exception:
+                logger.debug("hard cancel set failed", exc_info=True)
+
+    def is_set(self) -> bool:
+        if self._flag:
+            return True
+        if hard_interrupt_requested(self._hard_event):
+            return True
+        fence = self._fence
+        if fence is None:
+            return False
+        try:
+            return bool(fence.is_cancelled)
+        except Exception:
+            logger.debug("fence cancellation probe failed", exc_info=True)
+            return False
+
+
+def hard_interrupt_requested(hard_event: Any) -> bool:
+    """Read an explicit hard-interrupt event without leaking its failures."""
+    checker = getattr(hard_event, "is_set", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        logger.debug("hard cancel probe failed", exc_info=True)
+        return False
+
+
 # Defaults for the in-agent (non-hygiene) progress-aware compress_context wrap.
 # Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
@@ -3591,6 +3656,17 @@ def compress_context(
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
         # Event atomically; never infer cause from the racy message fields.
         _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+        # #96953: the aux layer polls this every 20ms while the summary
+        # streams, so a fence cancellation (hygiene ceiling, /stop, /restart,
+        # admission revoke) unwinds the provider call instead of letting the
+        # worker stream to completion for a commit the fence will refuse.
+        # Left as ``None`` when there is nothing to signal, so the aux scope
+        # keeps inheriting an outer cancel source exactly as it did before.
+        _summary_cancel_source = (
+            SummaryCancelSource(_hard_cancel_event, commit_fence)
+            if (_hard_cancel_event is not None or commit_fence is not None)
+            else None
+        )
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -3603,7 +3679,7 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_event=_summary_cancel_source
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
@@ -3620,6 +3696,24 @@ def compress_context(
                     agent.context_compressor, _attempt_generation
                 )
     except AuxiliaryExplicitCancellation:
+        # A fence cancellation now reaches the streaming summary call (#96953),
+        # so this unwind is no longer necessarily an operator interrupt.
+        # Classify by source: the hard-interrupt event is authoritative when it
+        # is set, otherwise a cancelled fence means the host stopped waiting.
+        _cancel_was_fence = bool(
+            commit_fence is not None
+            and not hard_interrupt_requested(
+                getattr(agent, "_hard_interrupt_requested", None)
+            )
+            and commit_fence.is_cancelled
+        )
+        if _cancel_was_fence:
+            logger.info(
+                "Compression summary aborted by commit-fence cancellation "
+                "(session=%s) — the host stopped waiting, so the summary was "
+                "stopped instead of run to completion for a refused commit.",
+                agent.session_id or "none",
+            )
         try:
             _restore_compressor_attempt_state(
                 agent.context_compressor,
@@ -3662,7 +3756,10 @@ def compress_context(
             started_at=_attempt_started_at,
             commit_status="aborted",
             split_status="aborted",
-            failure_class="explicit_interrupt",
+            failure_class=(
+                "commit_fence_cancelled" if _cancel_was_fence
+                else "explicit_interrupt"
+            ),
         )
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
