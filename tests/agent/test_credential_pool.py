@@ -2376,3 +2376,818 @@ def test_dead_manual_codex_alias_refreshed_on_disk_is_selectable(
     assert selected.id == "legacy-alias"
     assert selected.access_token == "fresh-access"
     assert selected.refresh_token == "fresh-refresh"
+
+
+def _manual_codex_row(
+    entry_id: str,
+    priority: int,
+    *,
+    status: str | None = None,
+    status_at: float | None = None,
+    refresh_token: str | None = None,
+) -> dict:
+    return {
+        "id": entry_id,
+        "label": entry_id,
+        "auth_type": "oauth",
+        "priority": priority,
+        "source": "manual:device_code",
+        "access_token": f"{entry_id}-access",
+        "refresh_token": (
+            f"{entry_id}-refresh" if refresh_token is None else refresh_token
+        ),
+        "last_status": status,
+        "last_status_at": status_at,
+        "last_error_code": 429 if status == "exhausted" else None,
+        "last_error_reason": "rate_limit" if status == "exhausted" else None,
+    }
+
+
+def _load_manual_codex_pool(tmp_path, monkeypatch, rows):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {"openai-codex": rows},
+        },
+    )
+    from agent.credential_pool import load_pool
+
+    return load_pool("openai-codex")
+
+
+def test_manual_codex_mark_uses_transaction_snapshot_after_external_delete(
+    tmp_path, monkeypatch
+):
+    """A completed pre-sync cannot make a later stale mark authoritative."""
+    rows = [_manual_codex_row("deleted", 0), _manual_codex_row("survivor", 1)]
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    stale = pool.entries()[0]
+    assert pool._sync_codex_entry_from_auth_store(stale) is stale
+    write_credential_pool(
+        "openai-codex",
+        [dict(rows[1], priority=0)],
+        removed_ids=["deleted"],
+    )
+
+    pool.mark_exhausted_and_rotate(status_code=429, credential_id="deleted")
+
+    assert [row["id"] for row in read_credential_pool("openai-codex")] == [
+        "survivor"
+    ]
+    assert [entry.id for entry in pool.entries()] == ["survivor"]
+
+
+def test_manual_codex_round_robin_uses_fresh_disk_order_and_membership(
+    tmp_path, monkeypatch
+):
+    rows = [
+        _manual_codex_row("first", 0),
+        _manual_codex_row("deleted", 1),
+        _manual_codex_row("promoted", 2),
+    ]
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy", lambda _provider: "round_robin"
+    )
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    write_credential_pool(
+        "openai-codex",
+        [dict(rows[2], priority=0), dict(rows[0], priority=1)],
+        removed_ids=["deleted"],
+    )
+
+    selected = pool.select()
+
+    assert selected is not None
+    assert selected.id == "promoted"
+    assert [row["id"] for row in read_credential_pool("openai-codex")] == [
+        "first",
+        "promoted",
+    ]
+    assert [entry.id for entry in pool.entries()] == ["first", "promoted"]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["reset_statuses", "add_entry", "remove_index", "cooldown_clear", "dead_prune",
+     "acquire_lease"],
+)
+def test_manual_codex_mutations_do_not_restore_externally_deleted_rows(
+    tmp_path, monkeypatch, operation
+):
+    now = time.time()
+    survivor_status = None
+    survivor_status_at = None
+    if operation == "reset_statuses":
+        survivor_status = "exhausted"
+        survivor_status_at = now
+    elif operation == "cooldown_clear":
+        survivor_status = "exhausted"
+        survivor_status_at = now - 7200
+    elif operation == "dead_prune":
+        survivor_status = "dead"
+        survivor_status_at = now - 2 * 24 * 60 * 60
+
+    rows = [
+        _manual_codex_row("deleted", 0),
+        _manual_codex_row(
+            "survivor",
+            1,
+            status=survivor_status,
+            status_at=survivor_status_at,
+        ),
+        _manual_codex_row("third", 2),
+    ]
+    if operation == "dead_prune":
+        rows = rows[:2]
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+
+    from agent.credential_pool import PooledCredential
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    authoritative = [dict(row) for row in rows if row["id"] != "deleted"]
+    for priority, row in enumerate(authoritative):
+        row["priority"] = priority
+    write_credential_pool(
+        "openai-codex", authoritative, removed_ids=["deleted"]
+    )
+
+    if operation == "reset_statuses":
+        assert pool.reset_statuses() == 1
+    elif operation == "add_entry":
+        pool.add_entry(
+            PooledCredential.from_dict(
+                "openai-codex", _manual_codex_row("added", 99)
+            )
+        )
+    elif operation == "remove_index":
+        removed = pool.remove_index(1)
+        assert removed is not None and removed.id == "survivor"
+    elif operation == "cooldown_clear":
+        selected = pool.select()
+        assert selected is not None and selected.id == "survivor"
+    elif operation == "acquire_lease":
+        assert pool.acquire_lease() == "survivor"
+    else:
+        assert pool.has_available() is False
+
+    persisted = read_credential_pool("openai-codex")
+    assert "deleted" not in {row["id"] for row in persisted}
+    assert "deleted" not in {entry.id for entry in pool.entries()}
+    if operation == "remove_index":
+        assert [row["id"] for row in persisted] == ["third"]
+    elif operation == "add_entry":
+        assert [row["id"] for row in persisted] == ["survivor", "third", "added"]
+    elif operation == "dead_prune":
+        assert persisted == []
+    elif operation in {"reset_statuses", "cooldown_clear"}:
+        survivor = next(row for row in persisted if row["id"] == "survivor")
+        assert survivor["last_status"] in (None, "ok")
+
+
+def test_terminal_invalid_grant_manual_codex_refresh_is_persisted_dead(
+    tmp_path, monkeypatch
+):
+    rows = [_manual_codex_row("dead", 0), _manual_codex_row("healthy", 1)]
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+
+    from hermes_cli.auth import AuthError, read_credential_pool
+
+    def _invalid_grant(*_args, **_kwargs):
+        raise AuthError(
+            "refresh rejected",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(
+        "agent.credential_pool.auth_mod.refresh_codex_oauth_pure", _invalid_grant
+    )
+
+    assert pool.try_refresh_matching(credential_id="dead") is None
+    persisted = {
+        row["id"]: row for row in read_credential_pool("openai-codex")
+    }
+    assert persisted["dead"]["last_status"] == "dead"
+    assert persisted["dead"]["last_error_reason"] == "invalid_grant"
+    selected = pool.select()
+    assert selected is not None and selected.id == "healthy"
+
+
+def test_nonterminal_manual_codex_refresh_failure_remains_exhausted(
+    tmp_path, monkeypatch
+):
+    rows = [
+        _manual_codex_row(
+            "target", 0, status="exhausted", status_at=time.time()
+        ),
+        _manual_codex_row("healthy", 1),
+    ]
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+
+    from hermes_cli.auth import read_credential_pool
+
+    def _temporary_failure(*_args, **_kwargs):
+        raise RuntimeError("temporary token endpoint failure")
+
+    monkeypatch.setattr(
+        "agent.credential_pool.auth_mod.refresh_codex_oauth_pure",
+        _temporary_failure,
+    )
+
+    assert pool.try_refresh_matching(credential_id="target") is None
+    persisted = {
+        row["id"]: row for row in read_credential_pool("openai-codex")
+    }
+    assert persisted["target"]["last_status"] == "exhausted"
+    assert persisted["healthy"]["last_status"] is None
+
+
+def test_force_refresh_without_refresh_token_preserves_failure_transition(
+    tmp_path, monkeypatch
+):
+    row = _manual_codex_row("target", 0)
+    row["refresh_token"] = ""
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, [row])
+
+    from hermes_cli.auth import read_credential_pool
+
+    assert pool.try_refresh_matching(credential_id="target") is None
+    persisted = read_credential_pool("openai-codex")
+    assert persisted[0]["last_status"] == "exhausted"
+    assert pool.select() is None
+
+
+def test_manual_codex_profile_materialization_reads_locked_global_snapshot(
+    tmp_path, monkeypatch
+):
+    """Fallback rows must be read under their own lock before profile save."""
+    import threading
+    from contextlib import contextmanager
+
+    from hermes_cli import auth as auth_mod
+
+    profile_path = tmp_path / "profile" / "auth.json"
+    global_path = tmp_path / "global" / "auth.json"
+    profile_path.parent.mkdir(parents=True)
+    global_path.parent.mkdir(parents=True)
+    profile_path.write_text(json.dumps({"version": 1, "credential_pool": {}}))
+    global_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openai-codex": [
+                        _manual_codex_row("deleted", 0),
+                        _manual_codex_row("survivor", 1),
+                    ]
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_store_cache", None)
+    monkeypatch.setattr(auth_mod, "_import_codex_cli_tokens", lambda: None)
+
+    from agent.credential_pool import PooledCredential, load_pool
+
+    pool = load_pool("openai-codex")
+    real_lock = auth_mod._auth_store_lock
+    real_load = auth_mod._load_auth_store
+    global_updated = threading.Event()
+    release_global = threading.Event()
+    global_attempted = threading.Event()
+    operation_done = threading.Event()
+    global_read_locked = threading.Event()
+
+    @contextmanager
+    def _tracking_lock(*args, **kwargs):
+        target = kwargs.get("target_path")
+        if (
+            threading.current_thread().name == "profile-operation"
+            and target is not None
+            and auth_mod._same_path(target, global_path)
+        ):
+            global_attempted.set()
+        with real_lock(*args, **kwargs):
+            yield
+
+    def _tracking_load(path=None):
+        if (
+            threading.current_thread().name == "profile-operation"
+            and path is not None
+            and auth_mod._same_path(path, global_path)
+        ):
+            holder = auth_mod._auth_lock_holder_for(global_path)
+            if getattr(holder, "depth", 0) > 0:
+                global_read_locked.set()
+        return real_load(path)
+
+    monkeypatch.setattr(auth_mod, "_auth_store_lock", _tracking_lock)
+    monkeypatch.setattr(auth_mod, "_load_auth_store", _tracking_load)
+
+    def _global_writer():
+        with real_lock(target_path=global_path):
+            store = real_load(global_path)
+            survivor = _manual_codex_row("survivor", 0)
+            survivor["access_token"] = "survivor-current-access"
+            store["credential_pool"]["openai-codex"] = [survivor]
+            auth_mod._save_auth_store(store, target_path=global_path)
+            global_updated.set()
+            assert release_global.wait(timeout=5)
+
+    def _profile_operation():
+        pool.add_entry(
+            PooledCredential.from_dict(
+                "openai-codex", _manual_codex_row("added", 99)
+            )
+        )
+        operation_done.set()
+
+    writer = threading.Thread(target=_global_writer, name="global-writer")
+    writer.start()
+    assert global_updated.wait(timeout=5)
+    operation = threading.Thread(target=_profile_operation, name="profile-operation")
+    operation.start()
+    # Fixed code attempts the source lock; baseline completes without it.
+    while not global_attempted.is_set() and not operation_done.is_set():
+        operation_done.wait(timeout=0.01)
+    release_global.set()
+    writer.join(timeout=5)
+    operation.join(timeout=5)
+    assert not writer.is_alive() and not operation.is_alive()
+
+    profile = json.loads(profile_path.read_text())
+    saved = profile["credential_pool"]["openai-codex"]
+    assert global_read_locked.is_set()
+    assert [row["id"] for row in saved] == ["survivor", "added"]
+    assert saved[0]["access_token"] == "survivor-current-access"
+
+
+def test_manual_codex_transaction_does_not_wait_for_auth_under_pool_lock(
+    tmp_path, monkeypatch
+):
+    """Auth-first and pool-first threads complete without lock inversion."""
+    import threading
+    from contextlib import contextmanager
+
+    from hermes_cli import auth as auth_mod
+
+    rows = [_manual_codex_row("first", 0), _manual_codex_row("second", 1)]
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy", lambda _provider: "round_robin"
+    )
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+    real_lock = auth_mod._auth_store_lock
+    auth_held = threading.Event()
+    pool_waiting_for_auth = threading.Event()
+    auth_thread_got_pool = []
+
+    @contextmanager
+    def _tracking_lock(*args, **kwargs):
+        if threading.current_thread().name == "pool-first":
+            pool_waiting_for_auth.set()
+        with real_lock(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(auth_mod, "_auth_store_lock", _tracking_lock)
+
+    def _auth_first():
+        with real_lock():
+            auth_held.set()
+            assert pool_waiting_for_auth.wait(timeout=5)
+            acquired = pool._lock.acquire(timeout=1)
+            auth_thread_got_pool.append(acquired)
+            if acquired:
+                pool._lock.release()
+
+    def _pool_first():
+        assert auth_held.wait(timeout=5)
+        pool.select()
+
+    auth_thread = threading.Thread(target=_auth_first, name="auth-first")
+    pool_thread = threading.Thread(target=_pool_first, name="pool-first")
+    auth_thread.start()
+    pool_thread.start()
+    auth_thread.join(timeout=5)
+    pool_thread.join(timeout=5)
+
+    assert not auth_thread.is_alive() and not pool_thread.is_alive()
+    assert auth_thread_got_pool == [True]
+
+
+def test_exact_manual_codex_refresh_adopts_external_delete_without_post(
+    tmp_path, monkeypatch
+):
+    rows = [_manual_codex_row("deleted", 0), _manual_codex_row("survivor", 1)]
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    write_credential_pool(
+        "openai-codex", [dict(rows[1], priority=0)], removed_ids=["deleted"]
+    )
+
+    def _must_not_refresh(*_args, **_kwargs):
+        raise AssertionError("deleted exact row must not reach token endpoint")
+
+    monkeypatch.setattr(
+        "agent.credential_pool.auth_mod.refresh_codex_oauth_pure",
+        _must_not_refresh,
+    )
+
+    assert pool.try_refresh_matching(credential_id="deleted") is None
+    assert [row["id"] for row in read_credential_pool("openai-codex")] == [
+        "survivor"
+    ]
+    assert [entry.id for entry in pool.entries()] == ["survivor"]
+
+
+def test_singleton_sync_does_not_restore_externally_deleted_manual_codex_row(
+    tmp_path, monkeypatch
+):
+    singleton = _manual_codex_row("singleton", 0)
+    singleton["source"] = "device_code"
+    manual = _manual_codex_row("deleted-manual", 1)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton["access_token"],
+                        "refresh_token": singleton["refresh_token"],
+                    }
+                }
+            },
+            "credential_pool": {"openai-codex": [singleton, manual]},
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import (
+        _save_codex_tokens,
+        read_credential_pool,
+        write_credential_pool,
+    )
+
+    pool = load_pool("openai-codex")
+    stale_singleton = next(
+        entry for entry in pool.entries() if entry.source == "device_code"
+    )
+    write_credential_pool(
+        "openai-codex", [singleton], removed_ids=["deleted-manual"]
+    )
+    _save_codex_tokens(
+        {
+            "access_token": "singleton-current-access",
+            "refresh_token": "singleton-current-refresh",
+        }
+    )
+
+    synced = pool._sync_codex_entry_from_auth_store(stale_singleton)
+
+    assert synced.access_token == "singleton-current-access"
+    persisted = read_credential_pool("openai-codex")
+    assert [row["id"] for row in persisted] == ["singleton"]
+    assert [entry.id for entry in pool.entries()] == ["singleton"]
+
+
+def test_provider_and_pool_transactions_lock_profile_global_in_same_order(
+    tmp_path, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from hermes_cli import auth as auth_mod
+
+    profile_path = tmp_path / "z-profile" / "auth.json"
+    global_path = tmp_path / "a-global" / "auth.json"
+    profile_path.parent.mkdir(parents=True)
+    global_path.parent.mkdir(parents=True)
+    profile_path.write_text(json.dumps({"version": 1, "credential_pool": {}}))
+    global_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {"openai-codex": {"tokens": {}}},
+                "credential_pool": {"openai-codex": []},
+            }
+        )
+    )
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_store_cache", None)
+
+    acquisitions = []
+
+    @contextmanager
+    def _recording_lock(*_args, **kwargs):
+        acquisitions.append(kwargs.get("target_path") or profile_path)
+        yield
+
+    monkeypatch.setattr(auth_mod, "_auth_store_lock", _recording_lock)
+
+    with auth_mod._provider_state_transaction("openai-codex"):
+        pass
+    provider_order = list(acquisitions)
+    acquisitions.clear()
+    auth_mod.mutate_credential_pool("openai-codex", lambda _rows: None)
+    pool_order = list(acquisitions)
+
+    expected = sorted(
+        [profile_path, global_path],
+        key=lambda path: str(path.resolve(strict=False)),
+    )
+    assert provider_order == expected
+    assert pool_order == expected
+
+
+def test_next_available_at_prunes_authoritative_manual_codex_rows_without_pool_auth_wait(
+    tmp_path, monkeypatch
+):
+    """A stale probe must neither restore a deleted row nor invert locks."""
+    import threading
+    from contextlib import contextmanager
+
+    from hermes_cli import auth as auth_mod
+
+    rows = [
+        _manual_codex_row("deleted", 0),
+        _manual_codex_row(
+            "prunable",
+            1,
+            status="dead",
+            status_at=time.time() - 2 * 24 * 60 * 60,
+        ),
+    ]
+    pool = _load_manual_codex_pool(tmp_path, monkeypatch, rows)
+    auth_mod.mutate_credential_pool(
+        "openai-codex",
+        lambda current: current.__setitem__(
+            slice(None), [row for row in current if row.get("id") != "deleted"]
+        ),
+    )
+
+    real_auth_lock = auth_mod._auth_store_lock
+    operation_thread = threading.get_ident()
+    auth_acquired_under_pool_lock = []
+
+    @contextmanager
+    def _tracking_auth_lock(*args, **kwargs):
+        if threading.get_ident() == operation_thread:
+            auth_acquired_under_pool_lock.append(pool._lock._is_owned())
+        with real_auth_lock(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(auth_mod, "_auth_store_lock", _tracking_auth_lock)
+
+    assert pool.next_available_at() is None
+
+    assert auth_acquired_under_pool_lock
+    assert not any(auth_acquired_under_pool_lock)
+    assert auth_mod.read_credential_pool("openai-codex") == []
+    assert pool.entries() == []
+
+
+def test_mixed_codex_singleton_mark_uses_authoritative_rows_after_manual_delete(
+    tmp_path, monkeypatch
+):
+    singleton = _manual_codex_row("singleton", 0)
+    singleton["source"] = "device_code"
+    deleted = _manual_codex_row("deleted-manual", 1)
+    survivor = _manual_codex_row("survivor", 2)
+    rows = [singleton, deleted, survivor]
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton["access_token"],
+                        "refresh_token": singleton["refresh_token"],
+                    }
+                }
+            },
+            "credential_pool": {"openai-codex": rows},
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    pool = load_pool("openai-codex")
+    write_credential_pool(
+        "openai-codex",
+        [singleton, survivor],
+        removed_ids=["deleted-manual"],
+    )
+
+    rotated = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        credential_id="singleton",
+    )
+
+    assert rotated is not None and rotated.id == "survivor"
+    persisted = read_credential_pool("openai-codex")
+    assert [row["id"] for row in persisted] == ["singleton", "survivor"]
+    assert persisted[0]["last_status"] == "exhausted"
+    assert persisted[1]["last_status"] is None
+    assert [entry.id for entry in pool.entries()] == ["singleton", "survivor"]
+
+
+def test_mixed_codex_singleton_refresh_uses_authoritative_row_after_manual_delete(
+    tmp_path, monkeypatch
+):
+    singleton = _manual_codex_row("singleton", 0, refresh_token="")
+    singleton["source"] = "device_code"
+    deleted = _manual_codex_row("deleted-manual", 1)
+    survivor = _manual_codex_row("survivor", 2)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton["access_token"],
+                        "refresh_token": "",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [singleton, deleted, survivor]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import (
+        _save_codex_tokens,
+        read_credential_pool,
+        write_credential_pool,
+    )
+
+    pool = load_pool("openai-codex")
+    authoritative_singleton = dict(
+        singleton,
+        access_token="singleton-current-access",
+        refresh_token="singleton-current-refresh",
+    )
+    write_credential_pool(
+        "openai-codex",
+        [authoritative_singleton, survivor],
+        removed_ids=["deleted-manual"],
+    )
+    _save_codex_tokens(
+        {
+            "access_token": "singleton-current-access",
+            "refresh_token": "singleton-current-refresh",
+        }
+    )
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": "singleton-fresh-access",
+            "refresh_token": "singleton-fresh-refresh",
+            "last_refresh": "fresh-at",
+        }
+
+    monkeypatch.setattr(
+        "agent.credential_pool.auth_mod.refresh_codex_oauth_pure", _refresh
+    )
+
+    refreshed = pool.try_refresh_matching(credential_id="singleton")
+
+    assert refresh_calls == [
+        ("singleton-current-access", "singleton-current-refresh")
+    ]
+    assert refreshed is not None and refreshed.id == "singleton"
+    assert refreshed.access_token == "singleton-fresh-access"
+    persisted = read_credential_pool("openai-codex")
+    assert [row["id"] for row in persisted] == ["singleton", "survivor"]
+    assert persisted[0]["access_token"] == "singleton-fresh-access"
+    assert persisted[0]["refresh_token"] == "singleton-fresh-refresh"
+    assert persisted[1]["access_token"] == survivor["access_token"]
+    assert [entry.id for entry in pool.entries()] == ["singleton", "survivor"]
+    saved_store = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    saved_tokens = saved_store["providers"]["openai-codex"]["tokens"]
+    assert saved_tokens["access_token"] == "singleton-fresh-access"
+    assert saved_tokens["refresh_token"] == "singleton-fresh-refresh"
+
+
+def test_singleton_forced_refresh_does_not_wait_for_auth_under_pool_lock(
+    tmp_path, monkeypatch
+):
+    """An auth-first thread can take the pool lock while refresh waits."""
+    import threading
+    from contextlib import contextmanager
+
+    from hermes_cli import auth as auth_mod
+
+    singleton = _manual_codex_row("singleton", 0)
+    singleton["source"] = "device_code"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(auth_mod, "_import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton["access_token"],
+                        "refresh_token": singleton["refresh_token"],
+                    }
+                }
+            },
+            "credential_pool": {"openai-codex": [singleton]},
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    real_auth_lock = auth_mod._auth_store_lock
+    real_locked_stores = auth_mod._locked_profile_global_auth_stores
+    auth_held = threading.Event()
+    refresh_waiting_for_auth = threading.Event()
+    auth_thread_pool_acquires = []
+    refreshed_entries = []
+    thread_errors = []
+
+    @contextmanager
+    def _tracking_locked_stores(*args, **kwargs):
+        if threading.current_thread().name == "pool-first":
+            refresh_waiting_for_auth.set()
+        with real_locked_stores(*args, **kwargs) as locked:
+            yield locked
+
+    monkeypatch.setattr(
+        auth_mod, "_locked_profile_global_auth_stores", _tracking_locked_stores
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.auth_mod.refresh_codex_oauth_pure",
+        lambda *_args: {
+            "access_token": "singleton-fresh-access",
+            "refresh_token": "singleton-fresh-refresh",
+        },
+    )
+
+    def _auth_first():
+        try:
+            with real_auth_lock():
+                auth_held.set()
+                if not refresh_waiting_for_auth.wait(timeout=5):
+                    thread_errors.append("refresh never waited for auth")
+                    return
+                acquired = pool._lock.acquire(timeout=1)
+                auth_thread_pool_acquires.append(acquired)
+                if acquired:
+                    pool._lock.release()
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    def _pool_first():
+        try:
+            if not auth_held.wait(timeout=5):
+                thread_errors.append("auth lock was never held")
+                return
+            refreshed_entries.append(
+                pool.try_refresh_matching(credential_id="singleton")
+            )
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    auth_thread = threading.Thread(target=_auth_first, name="auth-first")
+    pool_thread = threading.Thread(target=_pool_first, name="pool-first")
+    auth_thread.start()
+    pool_thread.start()
+    auth_thread.join(timeout=5)
+    pool_thread.join(timeout=5)
+
+    assert not auth_thread.is_alive() and not pool_thread.is_alive()
+    assert thread_errors == []
+    assert auth_thread_pool_acquires == [True]
+    assert len(refreshed_entries) == 1
+    assert refreshed_entries[0] is not None
+    assert refreshed_entries[0].access_token == "singleton-fresh-access"

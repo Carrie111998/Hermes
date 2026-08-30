@@ -754,6 +754,8 @@ class CredentialPool:
 
     def has_available(self) -> bool:
         """True if at least one entry is not currently in exhaustion cooldown."""
+        if self._has_manual_codex_entries():
+            return self._mutate_manual_codex("inspect") is not None
         # ``_available_entries`` is not read-only: it prunes aged-out DEAD
         # manual entries (rebinding ``self._entries``) and persists.  It must
         # run under ``self._lock`` like every other caller (``select`` etc.),
@@ -773,11 +775,12 @@ class CredentialPool:
         "unavailable".
 
         Like :meth:`has_available`, expired cooldowns are left uncleared
-        (``clear_expired=False``); the only writes are the same
-        re-auth/token sync paths ``has_available`` already performs — which
-        is exactly why this must run under ``self._lock`` like every other
-        ``_available_entries`` caller (see the comment on ``has_available``).
+        (``clear_expired=False``).  Mixed manual Codex pools are inspected and
+        pruned from the locked authoritative rows; other pools retain the
+        legacy in-memory path under ``self._lock``.
         """
+        if self._has_manual_codex_entries():
+            return self._mutate_manual_codex("next_available")
         with self._lock:
             available, _pending = self._available_entries()
             if available:
@@ -856,6 +859,144 @@ class CredentialPool:
                 removed_ids=removed_ids,
             )
 
+    def _has_manual_codex_entries(self) -> bool:
+        if self.provider != "openai-codex":
+            return False
+        with self._lock:
+            if any(
+                entry.source == SOURCE_MANUAL_DEVICE_CODE
+                for entry in self._entries
+            ):
+                return True
+        try:
+            found, _saved = auth_mod.mutate_credential_pool(
+                self.provider,
+                lambda rows: any(
+                    isinstance(row, dict)
+                    and row.get("source") == SOURCE_MANUAL_DEVICE_CODE
+                    for row in rows
+                ),
+            )
+            return bool(found)
+        except Exception:
+            logger.debug(
+                "Failed to inspect authoritative Codex pool sources",
+                exc_info=True,
+            )
+            return False
+
+    def _manual_codex_candidate(self, entry_id=None, api_key=None):
+        if self.provider != "openai-codex":
+            return None
+        with self._lock:
+            return next((entry for entry in self._entries
+                         if (entry_id and entry.id == entry_id)
+                         or (api_key and entry.runtime_api_key == api_key)),
+                        None if entry_id or api_key else
+                        self._current_unlocked() or (self._entries[0] if self._entries else None))
+
+    def _manual_codex_transaction(
+        self,
+        mutator,
+        *,
+        include_provider_state=False,
+        lock_timeout_seconds=None,
+    ):
+        result, saved = auth_mod.mutate_credential_pool(
+            self.provider, mutator,
+            include_provider_state=include_provider_state,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
+        adopted = [
+            PooledCredential.from_dict(self.provider, row)
+            for row in saved
+            if isinstance(row, dict)
+        ]
+        with self._lock:
+            self._entries = adopted
+            if self._current_id and not any(
+                entry.id == self._current_id for entry in adopted
+            ):
+                self._current_id = None
+        return result
+
+    def _codex_singleton_from_provider_state(
+        self,
+        entry: PooledCredential,
+        state: Optional[Dict[str, Any]],
+    ) -> PooledCredential:
+        if entry.source != "device_code" or not isinstance(state, dict):
+            return entry
+        tokens = state.get("tokens")
+        if not isinstance(tokens, dict):
+            return entry
+        store_access = tokens.get("access_token", "")
+        store_refresh = tokens.get("refresh_token", "")
+        current_access = entry.access_token or ""
+        current_refresh = entry.refresh_token or ""
+        should_adopt = bool(
+            store_access and (
+                store_access != current_access
+                or (store_refresh and store_refresh != current_refresh)
+            )
+        ) or bool(
+            store_refresh
+            and store_refresh != current_refresh
+            and not store_access
+        )
+        if not should_adopt:
+            return entry
+        if store_refresh and not store_access:
+            logger.info(
+                "Pool entry %s: auth.json has newer refresh_token "
+                "but no access_token; adopting refresh_token to "
+                "avoid replaying consumed token",
+                entry.id,
+            )
+        field_updates: Dict[str, Any] = {
+            "access_token": store_access or entry.access_token,
+            "refresh_token": store_refresh or entry.refresh_token,
+            "last_status": None,
+            "last_status_at": None,
+            "last_error_code": None,
+            "last_error_reason": None,
+            "last_error_message": None,
+            "last_error_reset_at": None,
+        }
+        if state.get("last_refresh"):
+            field_updates["last_refresh"] = state["last_refresh"]
+        return replace(entry, **field_updates)
+
+    def _marked_failure_entry(
+        self,
+        entry: PooledCredential,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+        *,
+        failure_reason: Optional[str] = None,
+    ) -> PooledCredential:
+        normalized_error = _normalize_error_context(error_context)
+        status = (
+            STATUS_DEAD
+            if self._is_terminal_auth_failure(status_code, normalized_error)
+            else STATUS_EXHAUSTED
+        )
+        updated_extra = dict(entry.extra)
+        if failure_reason:
+            updated_extra["failure_reason"] = failure_reason
+        else:
+            updated_extra.pop("failure_reason", None)
+        return replace(
+            entry,
+            last_status=status,
+            last_status_at=time.time(),
+            last_error_code=status_code,
+            last_error_reason=normalized_error.get("reason"),
+            last_error_message=normalized_error.get("message"),
+            last_error_reset_at=normalized_error.get("reset_at"),
+            extra=updated_extra,
+        )
+
     def _is_terminal_auth_failure(
         self,
         status_code: Optional[int],
@@ -893,36 +1034,11 @@ class CredentialPool:
         persist: bool = True,
         failure_reason: Optional[str] = None,
     ) -> PooledCredential:
-        normalized_error = _normalize_error_context(error_context)
-        # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
-        # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
-        # a revoked credential gets a 1-hour TTL cooldown and then re-enters
-        # rotation, failing immediately every hour until the user manually
-        # removes it (issue #32849).  DEAD entries are excluded from rotation
-        # unconditionally and only clear via an explicit re-auth write-side
-        # sync (``_save_codex_tokens`` after a fresh device-code login).
-        if self._is_terminal_auth_failure(status_code, normalized_error):
-            terminal_status = STATUS_DEAD
-        else:
-            terminal_status = STATUS_EXHAUSTED
-        # Carry the classifier's verdict onto the entry so the cooldown can be
-        # sized by what actually failed, not just the HTTP status (a billing
-        # 403 must not get the sole-credential transient cooldown). Absent a
-        # classification, clear any stale verdict from a previous failure.
-        updated_extra = dict(entry.extra)
-        if failure_reason:
-            updated_extra["failure_reason"] = failure_reason
-        else:
-            updated_extra.pop("failure_reason", None)
-        updated = replace(
+        updated = self._marked_failure_entry(
             entry,
-            last_status=terminal_status,
-            last_status_at=time.time(),
-            last_error_code=status_code,
-            last_error_reason=normalized_error.get("reason"),
-            last_error_message=normalized_error.get("message"),
-            last_error_reset_at=normalized_error.get("reset_at"),
-            extra=updated_extra,
+            status_code,
+            error_context,
+            failure_reason=failure_reason,
         )
         self._replace_entry(entry, updated)
         if persist:
@@ -1103,70 +1219,33 @@ class CredentialPool:
                 )
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "openai-codex")
-            if not isinstance(state, dict):
-                return entry
-            tokens = state.get("tokens")
-            if not isinstance(tokens, dict):
-                return entry
-            store_access = tokens.get("access_token", "")
-            store_refresh = tokens.get("refresh_token", "")
-            # Adopt auth.json tokens when either side differs.  Codex refresh
-            # tokens are single-use too, so a fresh refresh_token from
-            # another process means our entry's pair is consumed/stale.
-            #
-            # Also adopt when the store has a refresh_token but no
-            # access_token — another process may have rotated the pair
-            # and the store entry's access_token was already consumed;
-            # the important signal is the refresh_token difference.
-            entry_access = entry.access_token or ""
-            entry_refresh = entry.refresh_token or ""
-            should_adopt = False
-            if store_access and (
-                store_access != entry_access
-                or (store_refresh and store_refresh != entry_refresh)
-            ):
-                should_adopt = True
-            elif (
-                store_refresh
-                and store_refresh != entry_refresh
-                and not store_access
-            ):
-                # Store has only a refresh_token (no access_token) —
-                # another process rotated the pair.  Adopt the
-                # refresh_token so we don't replay the consumed one.
-                logger.info(
-                    "Pool entry %s: auth.json has newer refresh_token "
-                    "but no access_token; adopting refresh_token to "
-                    "avoid replaying consumed token",
-                    entry.id,
+            def _adopt_singleton(rows, state):
+                index = next((
+                    i for i, row in enumerate(rows)
+                    if isinstance(row, dict)
+                    and row.get("id") == entry.id
+                    and row.get("source") == entry.source
+                ), None)
+                if index is None:
+                    return None
+                current = PooledCredential.from_dict(self.provider, rows[index])
+                updated = self._codex_singleton_from_provider_state(
+                    current, state
                 )
-                should_adopt = True
+                if updated is not current:
+                    rows[index] = updated.to_dict()
+                return current.id
 
-            if should_adopt:
-                logger.debug(
-                    "Pool entry %s: syncing Codex tokens from auth.json "
-                    "(refreshed by another process)",
-                    entry.id,
-                )
-                field_updates: Dict[str, Any] = {
-                    "access_token": store_access or entry.access_token,
-                    "refresh_token": store_refresh or entry.refresh_token,
-                    "last_status": None,
-                    "last_status_at": None,
-                    "last_error_code": None,
-                    "last_error_reason": None,
-                    "last_error_message": None,
-                    "last_error_reset_at": None,
-                }
-                if state.get("last_refresh"):
-                    field_updates["last_refresh"] = state["last_refresh"]
-                updated = replace(entry, **field_updates)
-                self._replace_entry(entry, updated)
-                self._persist()
-                return updated
+            synced_id = self._manual_codex_transaction(
+                _adopt_singleton, include_provider_state=True,
+            )
+            with self._lock:
+                synced = next((
+                    current for current in self._entries
+                    if current.id == synced_id and current.source == entry.source
+                ), None)
+            if synced is not None:
+                return synced
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
         return entry
@@ -1484,6 +1563,11 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if (
+            self.provider == "openai-codex"
+            and entry.source == SOURCE_MANUAL_DEVICE_CODE
+        ):
+            return self._mutate_manual_codex("refresh", id=entry.id, force=force)
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1515,9 +1599,14 @@ class CredentialPool:
                 if self.provider == "xai-oauth"
                 else self._sync_anthropic_entry_from_pool_store
             )
-            with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
-            ):
+            lock = (
+                auth_mod._locked_profile_global_auth_stores(
+                    self._single_use_refresh_lock_timeout())
+                if self.provider == "openai-codex"
+                else _auth_store_lock(
+                    timeout_seconds=self._single_use_refresh_lock_timeout())
+            )
+            with lock:
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
                     if synced is not entry:
@@ -2168,7 +2257,204 @@ class CredentialPool:
             return False
         return False
 
+    def _mutate_manual_codex(self, operation: str, **values):
+        def _mutate(rows, state=None):
+            entries = [PooledCredential.from_dict(self.provider, row)
+                       for row in rows if isinstance(row, dict)]
+            result = None
+            if operation in {"select", "inspect", "lease", "next_available"}:
+                if operation == "next_available":
+                    entries = [
+                        self._codex_singleton_from_provider_state(item, state)
+                        for item in entries
+                    ]
+                working = CredentialPool(self.provider, entries)
+                working._strategy = self._strategy
+                working._persist = lambda **_kwargs: None
+                working._sync_codex_entry_from_auth_store = lambda entry: entry
+                if operation == "select":
+                    chosen, _pending = working._select_unlocked(refresh=False)
+                else:
+                    available, _pending = working._available_entries(
+                        clear_expired=operation == "lease")
+                    if operation == "lease" and available:
+                        leases = values["leases"]
+                        below = [item for item in available
+                                 if leases.get(item.id, 0) < self._max_concurrent]
+                        chosen = min(below or available,
+                                     key=lambda item: (leases.get(item.id, 0),
+                                                       item.priority))
+                    elif operation == "next_available":
+                        chosen = None
+                        if not available:
+                            sole_credential = sum(
+                                1 for item in working._entries
+                                if item.last_status != STATUS_DEAD
+                            ) <= 1
+                            candidates = [
+                                until
+                                for item in working._entries
+                                if item.last_status == STATUS_EXHAUSTED
+                                for until in [
+                                    _exhausted_until(
+                                        item,
+                                        sole_credential=sole_credential,
+                                    )
+                                ]
+                                if until is not None
+                            ]
+                            result = min(candidates) if candidates else None
+                    else:
+                        chosen = available[0] if available else None
+                entries = working._entries
+                if operation != "next_available":
+                    result = chosen.id if chosen else None
+            elif operation == "refresh":
+                index = next((i for i, entry in enumerate(entries)
+                              if entry.id == values.get("id")
+                              and (not values.get("source")
+                                   or entry.source == values["source"])), None)
+                if index is None and values.get("hint"):
+                    index = next((i for i, entry in enumerate(entries)
+                                  if entry.runtime_api_key == values["hint"]), None)
+                if index is not None:
+                    entry = self._codex_singleton_from_provider_state(
+                        entries[index], state
+                    )
+                    entries[index] = entry
+                    if not values["force"] and not self._entry_needs_refresh(entry):
+                        result = entry.id
+                    elif not entry.refresh_token:
+                        entries[index] = self._marked_failure_entry(entry, None)
+                    else:
+                        try:
+                            fresh = auth_mod.refresh_codex_oauth_pure(
+                                entry.access_token, entry.refresh_token)
+                            entries[index] = replace(
+                                entry, access_token=fresh["access_token"],
+                                refresh_token=fresh["refresh_token"],
+                                last_refresh=fresh.get("last_refresh"),
+                                last_status=STATUS_OK, last_status_at=None,
+                                last_error_code=None, last_error_reason=None,
+                                last_error_message=None, last_error_reset_at=None)
+                            result = entry.id
+                            if (
+                                entry.source == "device_code"
+                                and isinstance(state, dict)
+                            ):
+                                tokens = state.get("tokens")
+                                if not isinstance(tokens, dict):
+                                    tokens = {}
+                                tokens["access_token"] = fresh["access_token"]
+                                tokens["refresh_token"] = fresh["refresh_token"]
+                                state["tokens"] = tokens
+                                if fresh.get("last_refresh"):
+                                    state["last_refresh"] = fresh["last_refresh"]
+                        except Exception as exc:
+                            terminal = auth_mod._is_terminal_codex_oauth_refresh_error(exc)
+                            if terminal and entry.source == "device_code":
+                                if isinstance(state, dict):
+                                    tokens = state.get("tokens")
+                                    if not isinstance(tokens, dict):
+                                        tokens = {}
+                                    tokens.pop("access_token", None)
+                                    tokens.pop("refresh_token", None)
+                                    state["tokens"] = tokens
+                                    state["last_auth_error"] = {
+                                        "provider": "openai-codex",
+                                        "code": getattr(exc, "code", "unknown"),
+                                        "message": str(exc),
+                                        "reason": "credential_pool_refresh_failure",
+                                        "relogin_required": True,
+                                        "at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                entries = [
+                                    item for item in entries
+                                    if item.source != "device_code"
+                                ]
+                            else:
+                                entries[index] = self._marked_failure_entry(
+                                    entry, 401 if terminal else None,
+                                    {"reason": getattr(exc, "code", None),
+                                     "message": str(exc)} if terminal else None)
+            elif operation == "mark":
+                entry = next((item for item in entries
+                              if item.id == values.get("id")
+                              and (not values.get("source")
+                                   or item.source == values["source"])), None)
+                hinted = next((item for item in entries
+                               if values.get("hint")
+                               and item.runtime_api_key == values["hint"]), None)
+                if hinted is not None and (entry is None or
+                                           entry.runtime_api_key != values["hint"]):
+                    entry = hinted
+                if entry is None and not (values.get("id") or values.get("hint")):
+                    entry = next((item for item in entries
+                                  if item.id == values.get("current")),
+                                 entries[0] if entries else None)
+                if entry is not None:
+                    key = entry.runtime_api_key
+                    entries = [self._marked_failure_entry(
+                        item, values["status"], values.get("error"),
+                        failure_reason=values.get("failure_reason"))
+                        if item.id == entry.id or (key and item.runtime_api_key == key)
+                        else item for item in entries]
+                entries = [
+                    self._codex_singleton_from_provider_state(item, state)
+                    for item in entries
+                ]
+                working = CredentialPool(self.provider, entries)
+                working._strategy = self._strategy
+                working._persist = lambda **_kwargs: None
+                working._sync_codex_entry_from_auth_store = lambda entry: entry
+                chosen, _pending = working._select_unlocked(refresh=False)
+                entries, result = working._entries, chosen.id if chosen else None
+            elif operation == "reset":
+                result = sum(bool(item.last_status or item.last_status_at
+                                  or item.last_error_code) for item in entries)
+                entries = [replace(item, last_status=None, last_status_at=None,
+                                   last_error_code=None, last_error_reason=None,
+                                   last_error_message=None, last_error_reset_at=None)
+                           if item.last_status or item.last_status_at
+                           or item.last_error_code else item for item in entries]
+            elif operation == "remove" and 1 <= values["index"] <= len(entries):
+                removed = entries.pop(values["index"] - 1)
+                entries = [replace(item, priority=i) for i, item in enumerate(entries)]
+                result = removed.to_dict()
+            elif operation == "add":
+                added = replace(values["entry"], priority=_next_priority(entries))
+                entries.append(added)
+                result = added.id
+            rows[:] = [entry.to_dict() for entry in entries]
+            return result
+
+        provider_state_operation = operation in {
+            "next_available", "refresh", "mark",
+        }
+        result = self._manual_codex_transaction(
+            _mutate,
+            include_provider_state=provider_state_operation,
+            lock_timeout_seconds=(
+                self._single_use_refresh_lock_timeout()
+                if operation == "refresh" else None
+            ),
+        )
+        if operation in {"select", "inspect", "lease", "refresh", "mark", "add"}:
+            with self._lock:
+                if operation != "inspect":
+                    self._current_id = result
+                return next((entry for entry in self._entries
+                             if entry.id == result), None)
+        return result
+
     def select(self) -> Optional[PooledCredential]:
+        if self._has_manual_codex_entries():
+            entry = self._mutate_manual_codex("select")
+            if entry is not None and self._entry_needs_refresh(entry):
+                entry = self._refresh_entry(entry, force=False)
+            if entry is not None:
+                self._unmatched_rotation_streak = 0
+            return entry
         entry, pending_refresh = self._select_under_lock()
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
@@ -2429,6 +2715,8 @@ class CredentialPool:
         return entry, pending_refresh
 
     def peek(self) -> Optional[PooledCredential]:
+        if self._has_manual_codex_entries():
+            return self._mutate_manual_codex("inspect")
         # Single lock acquisition for the whole read; call the unlocked
         # helpers so we don't re-enter the non-reentrant ``self._lock``.
         with self._lock:
@@ -2447,6 +2735,14 @@ class CredentialPool:
         credential_id: Optional[str] = None,
         failure_reason: Optional[str] = None,
     ) -> Optional[PooledCredential]:
+        candidate = self._manual_codex_candidate(credential_id, api_key_hint)
+        if self._has_manual_codex_entries():
+            return self._mutate_manual_codex(
+                "mark", status=status_code, error=error_context,
+                hint=api_key_hint, id=credential_id,
+                source=candidate.source if candidate else None,
+                current=candidate.id if candidate else None,
+                failure_reason=failure_reason)
         with self._lock:
             entry = None
             identity_supplied = bool(credential_id or api_key_hint)
@@ -2616,6 +2912,19 @@ class CredentialPool:
         a stable tie-breaker. When every credential is already at the soft cap,
         still return the least-leased one instead of blocking.
         """
+        if credential_id is None and self._has_manual_codex_entries():
+            with self._lock:
+                leases = dict(self._active_leases)
+            chosen = self._mutate_manual_codex("lease", leases=leases)
+            if chosen is None:
+                return None
+            if self._entry_needs_refresh(chosen):
+                chosen = self._refresh_entry(chosen, force=False)
+                if chosen is None:
+                    return self.acquire_lease()
+            with self._lock:
+                self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
+            return chosen.id
         chosen_id, pending_refresh = self._acquire_lease_under_lock(credential_id)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
@@ -2667,7 +2976,11 @@ class CredentialPool:
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            current = self._current_unlocked()
+        return (
+            self.try_refresh_matching(credential_id=current.id)
+            if current is not None else None
+        )
 
     def try_refresh_matching(
         self,
@@ -2682,6 +2995,15 @@ class CredentialPool:
         the normal proactive refresh; the forced refresh below must consume a
         rotating refresh token exactly once.
         """
+        candidate = self._manual_codex_candidate(credential_id, api_key_hint)
+        if self._has_manual_codex_entries():
+            return self._mutate_manual_codex(
+                "refresh",
+                id=candidate.id if candidate else credential_id,
+                source=candidate.source if candidate else None,
+                hint=api_key_hint,
+                force=True,
+            )
         with self._lock:
             entry = None
             if credential_id:
@@ -2710,18 +3032,28 @@ class CredentialPool:
             if entry is None:
                 return None
             self._current_id = entry.id
-            return self._try_refresh_current_unlocked()
-
-    def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
-        entry = self._current_unlocked()
-        if entry is None:
-            return None
         refreshed = self._refresh_entry(entry, force=True)
-        if refreshed is not None:
-            self._current_id = refreshed.id
-        return refreshed
+        if refreshed is None:
+            return None
+        with self._lock:
+            adopted = next(
+                (
+                    current
+                    for current in self._entries
+                    if current.id == refreshed.id
+                ),
+                None,
+            )
+            if adopted is None:
+                if self._current_id == refreshed.id:
+                    self._current_id = None
+                return None
+            self._current_id = adopted.id
+            return adopted
 
     def reset_statuses(self) -> int:
+        if self._has_manual_codex_entries():
+            return self._mutate_manual_codex("reset")
         with self._lock:
             count = 0
             new_entries = []
@@ -2747,6 +3079,11 @@ class CredentialPool:
             return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
+        if self._has_manual_codex_entries():
+            removed = self._mutate_manual_codex("remove", index=index)
+            if not isinstance(removed, dict):
+                return None
+            return PooledCredential.from_dict(self.provider, removed)
         with self._lock:
             if index < 1 or index > len(self._entries):
                 return None
@@ -2791,6 +3128,14 @@ class CredentialPool:
             return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
+        if (
+            self.provider == "openai-codex"
+            and (
+                entry.source == SOURCE_MANUAL_DEVICE_CODE
+                or self._has_manual_codex_entries()
+            )
+        ):
+            return self._mutate_manual_codex("add", entry=entry)
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)

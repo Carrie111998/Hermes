@@ -33,6 +33,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from copy import deepcopy
 
 # httpx is imported lazily: it costs ~30ms at import time and hermes_cli.auth
 # is on the interactive-CLI startup path via credential_pool → auxiliary_client
@@ -73,7 +74,7 @@ else:
             delattr(self._resolve(), name)
 
     httpx = _LazyHttpx()
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1520,6 +1521,41 @@ def _load_provider_state_with_source(
 
 
 @contextmanager
+def _locked_profile_global_auth_stores(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    """Lock and load the active and existing global auth stores in path order."""
+    target_path = _auth_file_path()
+    source_path = _global_auth_file_path()
+    if source_path is not None and _same_path(source_path, target_path):
+        source_path = None
+    if source_path is not None and os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home = os.environ.get("HOME", "")
+        if real_home and _same_path(source_path, Path(real_home) / ".hermes" / "auth.json"):
+            source_path = None
+
+    paths = {os.path.normcase(os.path.realpath(target_path)): target_path}
+    if source_path is not None and source_path.exists():
+        paths[os.path.normcase(os.path.realpath(source_path))] = source_path
+    with ExitStack() as locks:
+        for path in (paths[key] for key in sorted(paths)):
+            locks.enter_context(_auth_store_lock(
+                timeout_seconds=timeout_seconds, target_path=path,
+            ))
+        target_store = _load_auth_store(target_path)
+        source_store = _load_auth_store(source_path) if source_path in paths.values() else {}
+        yield target_path, target_store, source_path, source_store
+
+
+def _provider_state_from_locked_stores(provider_id, target_path, target_store,
+                                       source_path, source_store):
+    for path, store in ((target_path, target_store), (source_path, source_store)):
+        providers = store.get("providers")
+        state = providers.get(provider_id) if isinstance(providers, dict) else None
+        if isinstance(state, dict):
+            return dict(state), path
+    return None, None
+
+
+@contextmanager
 def _provider_state_transaction(provider_id: str):
     """Lock the active auth store and any global fallback source in order.
 
@@ -1528,26 +1564,13 @@ def _provider_state_transaction(provider_id: str):
     target lock is acquired prevents both stale refreshes and whole-file lost
     updates without inverting the documented auth -> shared lock order.
     """
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state, source_path = _load_provider_state_with_source(
-            auth_store,
-            provider_id,
+    with _locked_profile_global_auth_stores() as (
+        target_path, auth_store, global_path, global_store,
+    ):
+        state, source_path = _provider_state_from_locked_stores(
+            provider_id, target_path, auth_store, global_path, global_store,
         )
-        active_path = _auth_file_path()
-        if source_path is None or _same_path(source_path, active_path):
-            yield auth_store, state, source_path
-            return
-
-        with _auth_store_lock(target_path=source_path):
-            source_store = _load_auth_store(source_path)
-            source_providers = source_store.get("providers")
-            source_state = None
-            if isinstance(source_providers, dict):
-                raw_state = source_providers.get(provider_id)
-                if isinstance(raw_state, dict):
-                    source_state = dict(raw_state)
-            yield auth_store, source_state, source_path
+        yield auth_store, state, source_path
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
@@ -1866,6 +1889,74 @@ def write_credential_pool(
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
         return _save_auth_store(auth_store)
+
+
+def mutate_credential_pool(
+    provider_id: str,
+    mutator: Callable[[List[Dict[str, Any]]], Any],
+    *,
+    include_provider_state: bool = False,
+    lock_timeout_seconds: Optional[float] = None,
+) -> Tuple[Any, List[Dict[str, Any]]]:
+    """Mutate locked authoritative rows, always saving to the active profile."""
+    lock_timeout = (
+        AUTH_LOCK_TIMEOUT_SECONDS
+        if lock_timeout_seconds is None else lock_timeout_seconds
+    )
+    with _locked_profile_global_auth_stores(lock_timeout) as (
+        target_path, target_store, source_path, source_store,
+    ):
+        pool = target_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            target_store["credential_pool"] = pool
+        target_rows = pool.get(provider_id)
+        rows = target_rows if isinstance(target_rows, list) and target_rows else []
+        if not rows and source_store:
+            source_pool = source_store.get("credential_pool")
+            source_rows = source_pool.get(provider_id) if isinstance(source_pool, dict) else None
+            if isinstance(source_rows, list):
+                rows = source_rows
+
+        working = deepcopy(rows)
+        state = None
+        state_before = None
+        state_path = None
+        if include_provider_state:
+            state, state_path = _provider_state_from_locked_stores(
+                provider_id, target_path, target_store, source_path, source_store,
+            )
+            if not isinstance(state, dict):
+                state = {}
+                state_path = target_path
+            state_before = deepcopy(state)
+            result = mutator(working, state)
+        else:
+            result = mutator(working)
+        saved = [
+            sanitize_borrowed_credential_payload(row, provider_id)
+            if isinstance(row, dict) else row
+            for row in working
+        ]
+        target_changed = saved != rows
+        source_changed = False
+        if include_provider_state and state != state_before:
+            if state_path is not None and _same_path(state_path, target_path):
+                _store_provider_state(
+                    target_store, provider_id, state, set_active=False,
+                )
+                target_changed = True
+            elif state_path is not None and source_store:
+                _store_provider_state(
+                    source_store, provider_id, state, set_active=False,
+                )
+                source_changed = True
+        if target_changed:
+            pool[provider_id] = saved
+            _save_auth_store(target_store, target_path=target_path)
+        if source_changed and source_path is not None:
+            _save_auth_store(source_store, target_path=source_path)
+        return result, deepcopy(saved)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
