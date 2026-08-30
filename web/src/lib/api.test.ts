@@ -119,6 +119,26 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api Credential Pool helpers", () => {
+  it("scopes credential pool requests to the selected management profile", async () => {
+    vi.stubGlobal("window", {});
+    setManagementProfile("coder");
+
+    const fetchMock = jsonFetchMock({ providers: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getCredentialPool();
+    await api.addCredentialPoolEntry("openrouter", "sk-or-test", "coder key");
+    await api.removeCredentialPoolEntry("openrouter", 1);
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/credentials/pool?profile=coder",
+      "/api/credentials/pool?profile=coder",
+      "/api/credentials/pool/openrouter/1?profile=coder",
+    ]);
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });
