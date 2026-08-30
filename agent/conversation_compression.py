@@ -1001,21 +1001,15 @@ def resolve_context_compression_timeouts(
     return idle, ceiling
 
 
-def resolve_compression_fallback_route() -> Optional[dict]:
-    """Return the first usable ``auxiliary.compression.fallback_chain`` entry.
+def _resolve_compression_fallback_routes() -> List[dict]:
+    """Return usable ``auxiliary.compression.fallback_chain`` entries in order.
 
     The chain is the user's declared answer to "the configured compression
     route is unhealthy". The auxiliary client applies it from its exception
     handler, so a route that *stalls* — connection open, no tokens, aborted by
     the host's progress-aware timeout — never reaches it (#78981). This
     resolves the same config into explicit ``call_llm`` route arguments the
-    stall path can pin onto one retry.
-
-    Only the first structurally complete entry is returned: one extra bounded
-    attempt is the budget for a stall, and if that entry cannot build a client
-    (or errors) the auxiliary client's own exception path still walks the rest
-    of the chain from there. Returns ``None`` when no entry is usable, which
-    keeps the historical continue-without-compression behaviour.
+    stall path can pin onto bounded retries.
     """
     try:
         from agent.auxiliary_client import (
@@ -1026,10 +1020,11 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         chain = _get_auxiliary_task_config("compression").get("fallback_chain")
     except Exception:
         logger.debug("compression fallback_chain lookup failed", exc_info=True)
-        return None
+        return []
     if not isinstance(chain, list):
-        return None
+        return []
 
+    routes = []
     for index, entry in enumerate(chain):
         if not isinstance(entry, dict):
             continue
@@ -1051,37 +1046,43 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         from agent.auxiliary_client import _coerce_positive_timeout
 
         timeout = _coerce_positive_timeout(entry.get("timeout"))
-        return {
-            "label": f"fallback_chain[{index}]({provider})",
-            "provider": provider,
-            "model": model,
-            "base_url": str(entry.get("base_url") or "").strip() or None,
-            "api_key": api_key or None,
-            "api_mode": str(
-                entry.get("api_mode") or entry.get("transport") or ""
-            ).strip() or None,
-            "timeout": timeout,
-        }
-    return None
+        routes.append(
+            {
+                "label": f"fallback_chain[{index}]({provider})",
+                "provider": provider,
+                "model": model,
+                "base_url": str(entry.get("base_url") or "").strip() or None,
+                "api_key": api_key or None,
+                "api_mode": str(
+                    entry.get("api_mode") or entry.get("transport") or ""
+                ).strip() or None,
+                "timeout": timeout,
+            }
+        )
+    return routes
+
+
+def resolve_compression_fallback_route() -> Optional[dict]:
+    """Return the first structurally usable compression fallback route."""
+    routes = _resolve_compression_fallback_routes()
+    return routes[0] if routes else None
 
 
 def _retry_compression_on_fallback_chain(
     *,
     worker: Callable[[CompressionCommitFence], Tuple[list, str]],
     messages: list,
-    system_prompt_fallback: Any,
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     on_commit_overrun: Optional[Callable[[float, float], None]] = None,
     telemetry_agent: Any = None,
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
 ) -> Optional[Tuple[list, str]]:
-    """Re-run an aborted compression once with the summary route pinned.
+    """Try each configured summary fallback after an aborted compression.
 
     Returns the fallback attempt's ``(messages, system_prompt)`` when it
-    actually compressed, or ``None`` when there was nothing to fall back to,
-    the attempt raised, or it produced no compression either — the caller then
-    degrades exactly as it did before.
+    actually compressed, or ``None`` after every structurally usable entry was
+    exhausted — the caller then degrades exactly as it did before.
 
     The retry is bounded the same way the primary was: silence for one idle
     window ends it, while a fallback that is streaming keeps its ceiling. The
@@ -1096,84 +1097,89 @@ def _retry_compression_on_fallback_chain(
     worker to resume mid-pipeline would couple this path to every host's
     callback ordering — deliberately out of scope.
     """
+    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
+    hard_cancel_is_set = getattr(hard_cancel, "is_set", None)
     # An explicit stop is not a stalled route. The retry worker would abort on
     # the same event anyway, but starting one at all makes /stop look ignored.
-    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
-    if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
+    if callable(hard_cancel_is_set) and hard_cancel_is_set():
         return None
 
-    route = resolve_compression_fallback_route()
-    if route is None:
-        return None
+    routes = _resolve_compression_fallback_routes()
+    for route in routes:
+        if callable(hard_cancel_is_set) and hard_cancel_is_set():
+            return None
 
-    # The aborted fence refuses every future commit, so the retry needs a
-    # fresh one. Mint it through the host's factory when it has one: hosts
-    # publish the active fence for hard-interrupt admission, and a /stop
-    # during the retry must serialize against THIS attempt's commit boundary.
-    retry_fence = None
-    if new_fence is not None:
-        try:
-            retry_fence = new_fence()
-        except Exception:
+        # Every aborted fence refuses future commits, so each retry needs a
+        # fresh one. Mint it through the host's factory when it has one: hosts
+        # publish the active fence for hard-interrupt admission, and a /stop
+        # during the retry must serialize against THIS attempt's boundary.
+        retry_fence = None
+        if new_fence is not None:
+            try:
+                retry_fence = new_fence()
+            except Exception:
+                logger.warning(
+                    "compression stall-fallback fence factory failed; the retry "
+                    "will run on an unpublished fence (a /stop mid-retry cannot "
+                    "serialize against its commit boundary)",
+                    exc_info=True,
+                )
+        if not isinstance(retry_fence, CompressionCommitFence):
             logger.warning(
-                "compression stall-fallback fence factory failed; the retry "
-                "will run on an unpublished fence (a /stop mid-retry cannot "
-                "serialize against its commit boundary)",
+                "compression stall-fallback retry running on an unpublished fence; "
+                "hard-interrupt admission will read the aborted attempt's fence "
+                "rather than the retry's commit boundary",
+            )
+            retry_fence = CompressionCommitFence()
+        idle = float(route.get("timeout") or idle_timeout_seconds)
+        ceiling = max(float(total_ceiling_seconds), idle)
+        logger.warning(
+            "Context compression stalled on the configured summary route — "
+            "retrying on %s (%s) before continuing down the fallback chain",
+            route["label"],
+            route["model"],
+        )
+        try:
+            from agent.context_compressor import pin_summary_route
+
+            with pin_summary_route(route):
+                result_msgs, result_prompt = run_compress_context_with_progress_timeout(
+                    worker=worker,
+                    messages=messages,
+                    # The outer attempt owns the one real degradation after
+                    # the whole chain is exhausted; retry no-ops discard this.
+                    system_prompt_fallback="",
+                    idle_timeout_seconds=idle,
+                    total_ceiling_seconds=ceiling,
+                    on_commit_overrun=on_commit_overrun,
+                    fence=retry_fence,
+                    telemetry_agent=telemetry_agent,
+                    stall_fallback=False,
+                )
+        except Exception:
+            # The primary already failed; a failing fallback must continue the
+            # declared chain, never turn the eventual degrade into a raised turn.
+            logger.warning(
+                "Context compression fallback attempt on %s failed",
+                route["label"],
                 exc_info=True,
             )
-    if not isinstance(retry_fence, CompressionCommitFence):
-        logger.warning(
-            "compression stall-fallback retry running on an unpublished fence; "
-            "hard-interrupt admission will read the aborted attempt's fence "
-            "rather than the retry's commit boundary",
-        )
-        retry_fence = CompressionCommitFence()
-    idle = float(route.get("timeout") or idle_timeout_seconds)
-    ceiling = max(float(total_ceiling_seconds), idle)
-    logger.warning(
-        "Context compression stalled on the configured summary route — "
-        "retrying once on %s (%s) before continuing without compression",
-        route["label"],
-        route["model"],
-    )
-    try:
-        from agent.context_compressor import pin_summary_route
-
-        with pin_summary_route(route):
-            result_msgs, result_prompt = run_compress_context_with_progress_timeout(
-                worker=worker,
-                messages=messages,
-                system_prompt_fallback=system_prompt_fallback,
-                idle_timeout_seconds=idle,
-                total_ceiling_seconds=ceiling,
-                on_commit_overrun=on_commit_overrun,
-                fence=retry_fence,
-                telemetry_agent=telemetry_agent,
-                stall_fallback=False,
+            continue
+        if result_msgs is messages:
+            # Aborted or no-op: the worker hands back the caller's own list.
+            logger.warning(
+                "Context compression fallback attempt on %s produced no "
+                "compression; trying the next configured route",
+                route["label"],
             )
-    except Exception:
-        # The primary already failed; a failing fallback must degrade, never
-        # turn "continue without compression" into a raised turn.
-        logger.warning(
-            "Context compression fallback attempt on %s failed",
-            route["label"],
-            exc_info=True,
-        )
-        return None
-    if result_msgs is messages:
-        # Aborted or no-op: the worker hands back the caller's own list.
-        logger.warning(
-            "Context compression fallback attempt on %s produced no "
-            "compression; continuing without compression",
+            continue
+        logger.info(
+            "Context compression recovered on %s after the primary summary route "
+            "stalled",
             route["label"],
         )
-        return None
-    logger.info(
-        "Context compression recovered on %s after the primary summary route "
-        "stalled",
-        route["label"],
-    )
-    return result_msgs, result_prompt
+        return result_msgs, result_prompt
+    return None
 
 
 def run_compress_context_with_progress_timeout(
@@ -1220,18 +1226,19 @@ def run_compress_context_with_progress_timeout(
     only on the timeout path, so successful compression never pays for (or
     fails on) an eager prompt rebuild.
 
-    ``stall_fallback`` (default on) makes an aborted stall attempt the
-    configured ``auxiliary.compression.fallback_chain`` once — pinned onto a
-    fresh fence — before degrading to "continue without compression". Nothing
-    raises out of a silent stall, so the auxiliary client's own fallback
-    handling (exception-path only) never sees it (#78981). ``on_timeout``
-    therefore fires only after that attempt has also failed, which keeps its
-    cooldown bookkeeping from suppressing the retry it precedes.
+    ``stall_fallback`` (default on) makes an aborted stall walk the configured
+    ``auxiliary.compression.fallback_chain`` in order — each route pinned onto
+    one fresh fence — before degrading to "continue without compression".
+    Nothing raises out of a silent stall, so the auxiliary client's own
+    fallback handling (exception-path only) never sees it (#78981).
+    ``on_timeout`` therefore fires only after every usable entry has failed,
+    which keeps its cooldown bookkeeping from suppressing the retries it
+    precedes.
 
-    ``new_fence`` mints that retry's fence. Hosts that publish the active
-    fence for hard-interrupt admission pass a factory that publishes the new
-    one too, so a ``/stop`` during the retry serializes against the retry's
-    commit boundary rather than the aborted attempt's.
+    ``new_fence`` mints each retry's fence. Hosts that publish the active fence
+    for hard-interrupt admission pass a factory that publishes each new one
+    too, so a ``/stop`` during a retry serializes against that retry's commit
+    boundary rather than the prior aborted attempt's.
     """
     if idle_timeout_seconds <= 0:
         raise ValueError(
@@ -1442,7 +1449,6 @@ def run_compress_context_with_progress_timeout(
             recovered = _retry_compression_on_fallback_chain(
                 worker=worker,
                 messages=messages,
-                system_prompt_fallback=system_prompt_fallback,
                 idle_timeout_seconds=idle,
                 total_ceiling_seconds=ceiling,
                 on_commit_overrun=on_commit_overrun,
