@@ -120,6 +120,46 @@ def active_session_limit_message(
     )
 
 
+SESSION_NOT_OWNED = "SESSION_NOT_OWNED"
+MAX_CONCURRENT_SESSIONS = "MAX_CONCURRENT_SESSIONS"
+PER_SESSION_EXCLUSIVE_SUBMIT = True
+
+
+class ActiveSessionRefusal(str):
+    """Human-readable refusal carrying a stable machine-readable reason."""
+
+    reason: str
+
+    def __new__(cls, message: str, reason: str) -> "ActiveSessionRefusal":
+        obj = super().__new__(cls, message)
+        obj.reason = reason
+        return obj
+
+
+def _is_same_writer(entry: dict[str, Any], metadata: Optional[dict[str, Any]]) -> bool:
+    """Return whether an existing lease belongs to this exact live writer."""
+    try:
+        if int(entry.get("pid") or -1) != os.getpid():
+            return False
+    except (TypeError, ValueError):
+        return False
+    existing_live = str((entry.get("metadata") or {}).get("live_session_id") or "")
+    incoming_live = str((metadata or {}).get("live_session_id") or "")
+    return bool(existing_live and incoming_live and existing_live == incoming_live)
+
+
+def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str:
+    surface = str(entry.get("surface") or "another surface")
+    pid = entry.get("pid")
+    started = _optional_float(entry.get("started_at"))
+    age = f", running {format_age(time.time() - started)}" if started else ""
+    return (
+        f"Session {session_id} already has a live owner ({surface}, pid {pid}{age}). "
+        "Only one surface at a time may run a session, because a second one would "
+        "reason from a transcript that does not include the first one's work."
+    )
+
+
 def _registry_home(registry_home: str | Path | None = None) -> Path:
     return Path(registry_home) if registry_home is not None else Path(get_hermes_home())
 
@@ -453,17 +493,20 @@ def try_acquire_active_session(
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None and not track_liveness:
+    key = str(session_id or "")
+    # A named session always needs a real lease: per-session exclusivity is a
+    # correctness invariant, independent of the optional global capacity cap.
+    if max_sessions is None and not track_liveness and not key:
         return ActiveSessionLease(
             lease_id=lease_id,
-            session_id=session_id,
+            session_id=key,
             surface=surface,
             enabled=False,
         ), None
 
     entry = _lease_entry(
         lease_id=lease_id,
-        session_id=str(session_id),
+        session_id=key,
         surface=str(surface),
         metadata=metadata,
         track_liveness=track_liveness,
@@ -492,6 +535,34 @@ def try_acquire_active_session(
         pruned = len(raw_entries) - len(entries)
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
+
+        if key:
+            for index, existing in enumerate(entries):
+                if str(existing.get("session_id") or "") != key:
+                    continue
+                if _is_same_writer(existing, metadata):
+                    entries[index] = entry
+                    _write_entries(state_path, entries)
+                    return ActiveSessionLease(
+                        lease_id=lease_id,
+                        session_id=key,
+                        surface=str(surface),
+                        state_path=state_path,
+                        lock_path=lock_path,
+                        track_liveness=track_liveness,
+                    ), None
+                _write_entries(state_path, entries)
+                logger.info(
+                    "Refused active session %s: already held by pid=%s surface=%s",
+                    key,
+                    existing.get("pid"),
+                    existing.get("surface"),
+                )
+                return None, ActiveSessionRefusal(
+                    session_already_owned_message(key, existing),
+                    SESSION_NOT_OWNED,
+                )
+
         active_count = len(entries)
         if max_sessions is not None and active_count >= max_sessions:
             _write_entries(state_path, entries)
@@ -501,15 +572,16 @@ def try_acquire_active_session(
                 max_sessions,
                 surface,
             )
-            return None, active_session_limit_message(
-                active_count, max_sessions, entries
+            return None, ActiveSessionRefusal(
+                active_session_limit_message(active_count, max_sessions, entries),
+                MAX_CONCURRENT_SESSIONS,
             )
         entries.append(entry)
         _write_entries(state_path, entries)
 
     return ActiveSessionLease(
         lease_id=lease_id,
-        session_id=str(session_id),
+        session_id=key,
         surface=str(surface),
         state_path=state_path,
         lock_path=lock_path,
@@ -579,6 +651,22 @@ def transfer_active_session(
                 "it during lease transfer"
             )
             return False
+
+        # A transfer changes the identity protected by this lease, so it must
+        # obey the same one-live-writer invariant as initial acquisition.
+        for entry in entries:
+            if str(entry.get("lease_id") or "") == lease.lease_id:
+                continue
+            if str(entry.get("session_id") or "") == new_session_id:
+                logger.info(
+                    "Refused active session transfer to %s: already held by "
+                    "pid=%s surface=%s",
+                    new_session_id,
+                    entry.get("pid"),
+                    entry.get("surface"),
+                )
+                return False
+
         updated = False
         for entry in entries:
             if str(entry.get("lease_id") or "") != lease.lease_id:

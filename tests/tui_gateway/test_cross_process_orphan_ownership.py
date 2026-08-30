@@ -127,7 +127,7 @@ def _stop_child(child: subprocess.Popen[str], release_file: Path) -> None:
     child.communicate()
 
 
-def test_unlimited_session_lease_remains_noop_without_liveness_tracking(
+def test_unlimited_named_session_still_tracks_exclusive_ownership(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "untracked-home"
@@ -140,8 +140,9 @@ def test_unlimited_session_lease_remains_noop_without_liveness_tracking(
     )
 
     assert lease is not None and message is None
-    assert lease.enabled is False
-    assert active_session_registry_snapshot(registry_home=home) == []
+    assert lease.enabled is True
+    assert len(active_session_registry_snapshot(registry_home=home)) == 1
+    lease.release()
 
 
 def test_orphan_guard_fails_closed_when_registry_is_unavailable(
@@ -351,6 +352,34 @@ def test_automatic_desktop_cleanup_preserves_sibling_and_ends_sole_owner(
             "source": "desktop",
         }
 
+    def _inject_legacy_local_sibling(index: int):
+        """Model a duplicate lease written by a pre-exclusivity build."""
+        from hermes_cli import active_sessions
+
+        lease_id = f"legacy-local-{index}"
+        entry = active_sessions._lease_entry(
+            lease_id=lease_id,
+            session_id=session_id,
+            surface="desktop",
+            metadata={"live_session_id": f"local-runtime-{index}"},
+            track_liveness=True,
+        )
+        state_path, lock_path = active_sessions._lease_paths(
+            registry_home=profile_home
+        )
+        with active_sessions._FileLock(lock_path):
+            entries = active_sessions._read_entries(state_path, strict=True)
+            entries.append(entry)
+            active_sessions._write_entries(state_path, entries)
+        return active_sessions.ActiveSessionLease(
+            lease_id=lease_id,
+            session_id=session_id,
+            surface="desktop",
+            state_path=state_path,
+            lock_path=lock_path,
+            track_liveness=True,
+        )
+
     try:
         _wait_for_child_file(child, ready_file, label="lease holder")
 
@@ -364,13 +393,7 @@ def test_automatic_desktop_cleanup_preserves_sibling_and_ends_sole_owner(
         assert set(reasons) == server._AUTOMATIC_SESSION_END_REASONS
 
         for index, reason in enumerate(reasons):
-            local_lease, message = server._claim_active_session_slot(
-                session_id,
-                live_session_id=f"local-runtime-{index}",
-                surface="desktop",
-                profile_home=profile_home,
-            )
-            assert local_lease is not None and message is None
+            local_lease = _inject_legacy_local_sibling(index)
             assert (
                 len(active_session_registry_snapshot(registry_home=profile_home)) == 2
             )
@@ -383,13 +406,7 @@ def test_automatic_desktop_cleanup_preserves_sibling_and_ends_sole_owner(
             assert remaining[0]["session_id"] == session_id
 
         # Explicit user close retains force/end semantics even with a sibling.
-        explicit_lease, message = server._claim_active_session_slot(
-            session_id,
-            live_session_id="explicit-runtime",
-            surface="desktop",
-            profile_home=profile_home,
-        )
-        assert explicit_lease is not None and message is None
+        explicit_lease = _inject_legacy_local_sibling(len(reasons))
         server._finalize_session(_session(explicit_lease), end_reason="tui_close")
         assert ended == [(session_id, "tui_close")]
         ended.clear()

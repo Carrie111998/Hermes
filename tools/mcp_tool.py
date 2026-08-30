@@ -114,13 +114,20 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
 
 logger = logging.getLogger(__name__)
+
+# The reserved key carrying the calling conversation's durable session id.
+#
+# Namespaced rather than bare so it cannot collide with a server's own metadata,
+# and stable because delegate-wave keys its watch registration off it: renaming
+# this silently returns the system to starting sessions nobody is watching.
+CALLER_SESSION_META_KEY = "io.delegate-wave/hermes-session-id"
 
 
 # Hard allocation ceiling for a single MCP text payload (chars). This is the
@@ -4599,6 +4606,25 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # no toolset or schema mutation, so the conversation's toolset stays
 # byte-stable and prompt caching is preserved.
 _server_trust_levels: Dict[str, str] = {}
+
+# Servers that have asked to be told which conversation is calling them.
+#
+# OPT-IN, AND DEFAULT OFF, BECAUSE THIS IS SOMEBODY'S IDENTITY.
+#
+# The caller-session id is a stable handle on a real conversation. A server that
+# needs it -- one that will answer back into that conversation later -- must say
+# so; every other server, including any third party the user happens to have
+# configured, has no business receiving it. The first version of this attached it
+# to every tool call on every server, which turned one integration's transport
+# contract into a global disclosure.
+#
+# Keyed on config rather than on a server-name string so the coupling survives
+# the user renaming their server, and so nothing has to hardcode "delegate_wave".
+_server_wants_caller_session: Dict[str, bool] = {}
+
+# Per-server repository capability, straight from config. Consumed by
+# tools/delegate_routing.py through the registry; see _record_tool_trust_metadata.
+_server_repo_access: Dict[str, Any] = {}
 _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
 
 _TRUST_FULL = "full"
@@ -4644,6 +4670,61 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     return hint is True
 
 
+def _resolve_mcp_repo_access(config: dict, raw_name: str, registry_name: str):
+    """One MCP tool's declared repository capability, or None (meaning withheld).
+
+    PER TOOL, NOT PER SERVER, AND THAT DISTINCTION IS THE WHOLE POINT.
+
+    A server-wide `repo_access: none` would hand a blanket permission to every
+    tool that server might ever expose. delegate-wave adding
+    `direct_apply_patch` next month would inherit "harmless" from a line written
+    before it existed -- which is precisely the future-tool hole that replacing
+    the built-in name list was meant to close, reopened one layer out.
+
+    So the config form is a MAPPING from the server's own tool name:
+
+        delegate_wave:
+          repo_access:
+            session_start: delegated_write
+            session_poll: none
+
+    A tool absent from that mapping is undeclared, and undeclared is withheld.
+
+    A bare string is still accepted, but ONLY when it is restrictive. A server
+    default may make things stricter than the fallback; it may never make them
+    laxer, because a lax default is exactly the blanket grant this avoids.
+    """
+    declared = (config or {}).get("repo_access")
+
+    if isinstance(declared, Mapping):
+        for key in (raw_name, registry_name):
+            if key in declared:
+                return declared[key]
+        return None
+
+    if isinstance(declared, str):
+        if declared.strip().lower() == "write":
+            # A restrictive server-wide default: everything from this server is
+            # treated as a direct mutator unless a mapping says otherwise.
+            return "write"
+        logger.warning(
+            "MCP server config declares a server-wide repo_access=%r. A "
+            "permissive server-wide default would grant every FUTURE tool from "
+            "this server the same permission, so it is ignored; declare "
+            "repo_access as a per-tool mapping instead. Treating %r as "
+            "undeclared (withheld while delegate-wave routing is on).",
+            declared, raw_name,
+        )
+        return None
+
+    if declared is not None:
+        logger.warning(
+            "MCP server config declares repo_access of unsupported type %r; "
+            "treating %r as undeclared (withheld).", type(declared).__name__, raw_name,
+        )
+    return None
+
+
 def _record_tool_trust_metadata(
     server_name: str, config: dict, tools: List[Any]
 ) -> None:
@@ -4652,6 +4733,12 @@ def _record_tool_trust_metadata(
         _server_trust_levels[server_name] = _normalize_server_trust(
             (config or {}).get("trust")
         )
+        _server_wants_caller_session[server_name] = bool(
+            (config or {}).get("send_caller_session_context", False)
+        )
+        # Kept for diagnostics only. The value that decides anything is
+        # resolved PER TOOL at registration -- see _resolve_mcp_repo_access.
+        _server_repo_access[server_name] = (config or {}).get("repo_access")
         hints = _tool_read_only_hints.setdefault(server_name, {})
         for tool in tools:
             name = getattr(tool, "name", None)
@@ -6075,6 +6162,31 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # THE CALLER'S IDENTITY, FOR THE SERVERS THAT ASKED FOR IT.
+        #
+        # An MCP server that wants to call back into the conversation that asked
+        # it for something needs to know which conversation that was. That is
+        # transport context, not task input: a model should never be choosing --
+        # or mistyping, or forgetting -- its own return address. delegate-wave's
+        # session_start made it an optional argument, the model omitted it, and
+        # the work ran with nobody registered to be told it had finished.
+        #
+        # Read in THIS synchronous handler, before anything is scheduled onto the
+        # MCP background loop. The stdio subprocess is long-lived and shared
+        # across conversations, so its environment cannot carry a per-conversation
+        # id, and the loop it runs on does not inherit this turn's ContextVars --
+        # which is the precise problem gateway/session_context.py exists to solve.
+        # Captured into the closure, it stays bound to the turn that made the call.
+        #
+        # Only for a server whose config sets send_caller_session_context. This is
+        # a durable handle on one of the user's conversations, and a server that
+        # does not answer back into conversations has no use for it.
+        _caller_session_id = ""
+        if _server_wants_caller_session.get(server_name, False):
+            from gateway.session_context import get_session_env
+
+            _caller_session_id = (get_session_env("HERMES_SESSION_ID") or "").strip()
+
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -6182,11 +6294,38 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"exited; failing the call fast instead of "
                             f"waiting {float(tool_timeout):.0f}s"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    # Stamped onto every call, invisible to the model. `_meta` is
+                    # exactly what MCP reserves for information the client and
+                    # server need and the LLM should neither see nor generate.
+                    _meta = (
+                        {CALLER_SESSION_META_KEY: _caller_session_id}
+                        if _caller_session_id
+                        else None
+                    )
+                    _call_coro = server.session.call_tool(
+                        tool_name, arguments=args, meta=_meta
+                    )
                     _watch_children = getattr(server, "_watch_stdio_children", None)
+                    # THE PROBE IS THE ONE WE RACE. DO NOT BUILD A SECOND ONE.
+                    #
+                    # This used to call _watch_children() purely to ask
+                    # isawaitable() about the result, throw that coroutine away,
+                    # and then call it AGAIN for the real ensure_future(). The
+                    # discarded one was never awaited and never closed, so every
+                    # single stdio tool call emitted
+                    #   RuntimeWarning: coroutine '_watch_stdio_children' was
+                    #   never awaited
+                    # on a live MCP path. Warning noise on a hot path is not
+                    # cosmetic: it trains the reader to ignore the channel that
+                    # real un-awaited coroutines would announce themselves on.
+                    #
+                    # Built once here and either raced below or explicitly
+                    # closed. isawaitable() on the object (rather than
+                    # iscoroutinefunction() on the callable) is kept deliberately
+                    # so a stub returning any awaitable still behaves as before.
+                    _watch_probe = _watch_children() if callable(_watch_children) else None
                     _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        inspect.isawaitable(_watch_probe)
                         and asyncio.iscoroutine(_call_coro)
                     )
                     if not _watch_ok:
@@ -6194,6 +6333,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # non-awaitable, or there is no child-watcher to race
                         # against: plain await is exactly the pre-#81995
                         # semantics.
+                        #
+                        # A coroutine we built and are not going to run must be
+                        # closed, or it becomes the very warning this change
+                        # removes.
+                        if asyncio.iscoroutine(_watch_probe):
+                            _watch_probe.close()
                         result = (
                             await _call_coro
                             if asyncio.iscoroutine(_call_coro)
@@ -6205,7 +6350,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_probe)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
@@ -7226,6 +7371,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         candidates.append(
             {
                 "registry_name": schema["name"],
+                "raw_name": mcp_tool.name,
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
@@ -7249,6 +7395,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         candidates.append(
             {
                 "registry_name": schema["name"],
+                "raw_name": handler_key,
                 "origin": f"generated utility {handler_key!r}",
                 "schema": schema,
                 "handler": handler_factories[handler_key](
@@ -7362,6 +7509,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=candidate["check_fn"],
             is_async=False,
             description=candidate["schema"]["description"],
+            # Declared PER TOOL in the server's config. None when this
+            # particular tool was not declared -- including a tool that appeared
+            # on the server today -- which the routing filter treats as write.
+            repo_access=_resolve_mcp_repo_access(
+                config, candidate.get("raw_name", ""), registry_name
+            ),
         )
 
         # The pre-check above is advisory only. Multiple servers connect in
@@ -7519,6 +7672,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            repo_access=_resolve_mcp_repo_access(config, raw_name, registry_name),
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
@@ -7552,6 +7706,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
+            repo_access=_resolve_mcp_repo_access(config, handler_key, util_name),
         )
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue
@@ -8137,7 +8292,7 @@ def get_registered_mcp_server_names() -> set:
 
 
 
-def refresh_agent_mcp_tools(
+def refresh_agent_tools(
     agent,
     *,
     enabled_override=None,
@@ -8145,10 +8300,11 @@ def refresh_agent_mcp_tools(
     quiet_mode: bool = True,
     content_aware: bool = False,
 ) -> set:
-    """Re-derive an already-built agent's tool snapshot from the live registry.
+    """Re-derive an already-built agent's complete tool snapshot.
 
-    The agent snapshots ``agent.tools`` once at build time and never re-reads
-    the registry (see ``run_agent`` / ``agent_init``).  When MCP servers connect
+    This is not conditional on MCP. The agent snapshots ``agent.tools`` once at
+    build time, while repository-routing policy is live config and must be
+    re-evaluated before every turn. When MCP servers connect
     *after* that snapshot — a slow HTTP/OAuth server that misses the bounded
     startup wait, or a ``/reload-mcp`` — their tools are invisible until the
     snapshot is rebuilt.  This is the single shared rebuild used by every such
@@ -8279,6 +8435,11 @@ def refresh_agent_mcp_tools(
             engine_names.update(staged_engine_names)
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
         return new_names - current
+
+
+def refresh_agent_mcp_tools(agent, **kwargs) -> set:
+    """Compatibility name for callers whose trigger is MCP discovery/reload."""
+    return refresh_agent_tools(agent, **kwargs)
 
 
 def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:

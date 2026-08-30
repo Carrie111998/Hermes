@@ -934,6 +934,22 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
             except Exception:
                 pass
 
+    # ── Close any external turn this session was hosting ───────────────
+    # AFTER the flush above, not before it. FINISHED tells a producer that
+    # canonical history is complete and may now be judged, and this function
+    # exists precisely because there may be messages not yet durable -- so
+    # announcing it first would invite exactly the misreading the state was
+    # introduced to prevent.
+    #
+    # Without it at all, the row would stay STARTED under a pid still alive for
+    # OTHER sessions, and a producer would wait on a turn that no longer exists.
+    #
+    # The outcome is deliberately distinct from a turn that ended on its own. A
+    # forced close is not the measured "killed before the marker persisted" case:
+    # finalization runs because state may be unflushed, so an absent marker here
+    # does NOT prove nothing happened, and must not by itself authorise a replay.
+    _finish_external_turn_if_idle(session, outcome="session_closed")
+
     # ── Plugin hook: on_session_end ────────────────────────────────────
     # Signals every plugin that the session is closing, with
     # interrupted=True so crash‑recovery plugins can flush buffers,
@@ -9435,6 +9451,46 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
+def _canonical_messages(history: list[dict]) -> list[dict]:
+    """Durable evidence, projected small and stable. The SIBLING of _history_to_messages.
+
+    That one answers "what should a person see" and drops hidden scaffolding. This one answers
+    "what is durably recorded", so hidden rows are kept -- they are the rows an automated producer
+    wrote and must be able to find again.
+
+    A deliberately narrow shape rather than the internal message dicts: every field serialized here
+    becomes a contract with an external reader, and the agent's working representation is not one
+    this project wants to freeze. Reasoning is reported as PRESENCE, not content -- a consumer
+    needs to know a turn happened and said something, not what the model thought.
+    """
+    messages: list[dict] = []
+    for m in history:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in {"user", "assistant", "tool", "system"}:
+            continue
+        row: dict = {"role": role, "text": _coerce_message_text(m.get("content"))}
+        display_kind = m.get("display_kind")
+        if display_kind:
+            row["display_kind"] = display_kind
+        for key in ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items"):
+            if m.get(key):
+                row[key] = True
+        # ``_row_id`` is the raw stamp SessionDB puts on persisted rows; the display projection
+        # renames it to ``row_id`` on the way out. Checking only the renamed spelling meant this
+        # projection silently never carried one, which matters now that row_id is part of a
+        # declared RPC shape external readers may come to depend on.
+        for key in ("_row_id", "row_id", "message_row_id"):
+            if m.get(key) is not None:
+                row["row_id"] = m.get(key)
+                break
+        if role == "assistant" and m.get("tool_calls"):
+            row["tool_calls"] = len(m["tool_calls"])
+        messages.append(row)
+    return messages
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -11724,6 +11780,9 @@ _KANBAN_NOTIFY_KINDS = (
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
+# A person is waiting to be told something finished, so this is the one poll on
+# the tick that a human directly perceives as latency.
+_EXTERNAL_TURN_POLL_SECONDS = 1.0
 
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
@@ -11975,6 +12034,156 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _finish_external_turn_if_idle(session: dict, outcome: str = "completed") -> None:
+    """Close the lifecycle of an external turn this session started.
+
+    A producer cannot tell a turn still being reasoned about from one that died:
+    both show a marker with no assistant reply. Its own liveness used to answer
+    that, back when it submitted the turn itself. On this rail the turn is hosted
+    by somebody else, so the end of it is recorded explicitly.
+
+    Observed rather than hooked, because _run_prompt_submit returns as soon as
+    the turn thread starts; the honest end-of-turn signal available here is the
+    session going idle again.
+    """
+    in_flight = session.get("_external_turn_in_flight")
+    if not in_flight:
+        return
+    if session.get("running") and not session.get("_finalized"):
+        return
+    event_id, claim_id = in_flight
+    session["_external_turn_in_flight"] = None
+    try:
+        from tools.session_external_turns import mark_external_turn_finished
+
+        mark_external_turn_finished(event_id, claim_id, outcome)
+    except Exception:
+        logger.debug("Failed to close external turn %s", event_id, exc_info=True)
+
+
+def _maybe_consume_external_turn(sid: str, session: dict) -> None:
+    """Take at most one queued external activation for this session, if we may.
+
+    The producer of these rows is a different local process; it deliberately did
+    NOT choose a transport, because "does this session have an owner right now"
+    is stale the instant it is answered. It enqueued, and the question of who is
+    entitled to run the event is settled here, at the moment of consumption.
+
+    THREE GATES, IN THIS ORDER, AND THE ORDER IS THE POINT.
+
+    1. The session must be idle. The poller never steers or interrupts: it waits
+       for the current turn to end and then adds a new one. This is why the wake
+       could not simply be a prompt.submit from outside -- that path interrupts.
+
+    2. The active-session lease must be ours. Every other notification rail can
+       assume the producer ran inside this process, so ownership is implicit.
+       This rail is cross-process by definition, so ownership is proved, not
+       assumed: the legitimate owner re-enters its own lease, and a process that
+       is not the owner gets SESSION_NOT_OWNED and leaves the row alone for
+       whoever is. If the owner has died its lease is pruned, and a later
+       process may take the event rather than it being lost with the corpse.
+
+    3. The row must be claimed durably, so two Hermes processes that both pass
+       gates 1 and 2 in the same instant cannot both run it.
+
+    The turn is submitted as a typed Delegate Wave timeline event. The row is
+    real model input and persists for producer reconciliation, but its display
+    kind and metadata let clients render a durable event card rather than lie
+    that the person typed it.
+    """
+    _finish_external_turn_if_idle(session)
+
+    key = str(session.get("session_key") or "")
+    if not key or session.get("running") or session.get("_finalized"):
+        return
+
+    from tools.session_external_turns import (
+        claim_external_turn,
+        mark_external_turn_started,
+        pending_external_turns,
+        release_external_turn,
+    )
+
+    rows = pending_external_turns(key, limit=1)
+    if not rows:
+        return
+    row = rows[0]
+    event_id = str(row.get("event_id") or "")
+
+    # Gate 2 before gate 3: claiming a row we are not entitled to run would take
+    # it out of circulation from the process that IS entitled to run it.
+    refusal = _ensure_active_session_slot(sid, session)
+    if refusal is not None:
+        logger.debug(
+            "Not consuming external turn %s for %s: %s",
+            event_id,
+            key,
+            getattr(refusal, "reason", None) or "refused",
+        )
+        return
+
+    # Re-read rather than trust the check at the top: two database round-trips
+    # have happened since, and a turn the person started in that gap makes the
+    # claim-then-release below pure churn.
+    if session.get("running") or session.get("_finalized"):
+        return
+    claim_id = claim_external_turn(event_id)
+    if not claim_id:
+        return
+
+    started = False
+    with session["history_lock"]:
+        if not session.get("running") and not session.get("_finalized"):
+            session["running"] = True
+            started = True
+    if not started:
+        # A real turn began between the idle check and the claim. Put it back;
+        # the next pass will find the session idle again.
+        release_external_turn(event_id, claim_id, "session became busy before dispatch")
+        return
+
+    # Commit the uncertain state BEFORE launching the thread. From the first
+    # instruction of that thread onward, its marker may be durable; a crash must
+    # therefore leave STARTED (producer reconciles canonical history), never a
+    # dead CLAIMED row that another consumer automatically replays.
+    if not mark_external_turn_started(event_id, claim_id):
+        with session["history_lock"]:
+            session["running"] = False
+        return
+
+    dispatched = False
+    try:
+        _emit("message.start", sid)
+        dispatched = bool(
+            _run_prompt_submit(
+                f"__external__{event_id}",
+                sid,
+                session,
+                str(row.get("body") or ""),
+                display_kind="delegate_wave_wake",
+                display_metadata={
+                    "event_id": event_id,
+                    "source": str(row.get("source") or "external"),
+                },
+            )
+        )
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+        release_external_turn(event_id, claim_id, f"dispatch raised: {type(exc).__name__}")
+        raise
+    if dispatched:
+        # Remembered so this poller can close the lifecycle when the turn ends.
+        # If this process dies first the row stays STARTED with a dead owner,
+        # which is the producer's signal to reconcile against history rather
+        # than wait forever or read it as a partial delivery.
+        session["_external_turn_in_flight"] = (event_id, claim_id)
+    else:
+        # Every early exit resets ``running`` itself. Roll back the pre-dispatch
+        # STARTED commit so a later pass can try again.
+        release_external_turn(event_id, claim_id, "dispatch did not start a turn")
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -11998,6 +12207,7 @@ def _notification_poller_loop(
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
+    _last_external_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
         # ── /loop wakeup driver ──────────────────────────────────────
@@ -12012,6 +12222,19 @@ def _notification_poller_loop(
                 print(
                     f"[tui_gateway] loop wakeup poll failed: "
                     f"{type(_loop_exc).__name__}: {_loop_exc}",
+                    file=sys.stderr,
+                )
+        # ── external activation inbox ────────────────────────────────
+        # A local process outside this one queued an event for this stored
+        # session. Consumed only while idle and only under our own lease.
+        if _now - _last_external_poll >= _EXTERNAL_TURN_POLL_SECONDS:
+            _last_external_poll = _now
+            try:
+                _maybe_consume_external_turn(sid, session)
+            except Exception as _ext_exc:
+                print(
+                    f"[tui_gateway] external turn poll failed: "
+                    f"{type(_ext_exc).__name__}: {_ext_exc}",
                     file=sys.stderr,
                 )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
@@ -16750,6 +16973,39 @@ def _persist_wake_enabled(enabled: bool) -> bool:
     except Exception as e:
         logger.warning("wake: failed to persist wake_word.enabled=%s: %s", enabled, e)
         return False
+
+
+@method("gateway.capabilities")
+def _(rid, params: dict) -> dict:
+    """What guarantees THIS BUILD enforces, for a client that must not assume.
+
+    An automated client cannot tell a gateway that fences concurrent writers to
+    one session from one that silently allows them -- both accept the same calls
+    and both answer prompt.submit the same way. It only finds out by corrupting a
+    conversation. So the guarantee is advertised, and a client that does not see
+    it advertised is expected to withhold rather than hope.
+
+    Sourced from the module that performs the enforcement, never from config: a
+    capability an operator can switch on without also having the mechanism is
+    worse than no capability at all, because it is believed.
+    """
+    from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
+    from tools.session_external_turns import SESSION_EXTERNAL_TURNS_V1
+
+    # Two separate guarantees, and a producer needs both named. The lease proves
+    # only that concurrent writers to a session are fenced; a build can do that
+    # and still have no inbox, in which case enqueued events would sit forever
+    # with nothing to consume them.
+    # THREE separate mechanical facts, and a producer needs all three. The lease fences concurrent
+    # writers; the inbox carries an event to the session's owner; canonical history is how the
+    # producer sees what its own delivery actually wrote. A build can genuinely have the first two
+    # and not the third -- that build existed, and its wakes would have been undeliverable-looking
+    # forever -- so this is not a version number, it is a statement about what is present.
+    return _ok(rid, {
+        "per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT),
+        "session_external_turns_v1": bool(SESSION_EXTERNAL_TURNS_V1),
+        "session_canonical_history_v1": "session.canonical_history" in _methods,
+    })
 
 
 @method("ping")

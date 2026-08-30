@@ -506,6 +506,29 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
+    # DELEGATE-WAVE ROUTING, APPLIED BEFORE THE MODEL EVER SEES THE TOOL LIST.
+    #
+    # When the switch is on, repository changes are delegate-wave's to make, so the tools that
+    # could edit files or run commands are not offered. Withholding beats instructing: guidance is
+    # something a model can reason its way past, and the failure is invisible until somebody reads
+    # a transcript. This is the one place the schema list is assembled, so it is the one place the
+    # rule has to hold.
+    # DELIBERATELY NOT WRAPPED IN A try/except.
+    #
+    # The first version was, with the comment "a broken routing module must never
+    # cost the user their tools". That is exactly backwards for this switch. Its
+    # entire value is that it cannot be bypassed, so a failure here must not hand
+    # back patch, write_file, terminal and computer_use silently -- which is the
+    # one outcome nobody would notice until a transcript showed Hermes editing a
+    # repository it was configured never to touch.
+    #
+    # Failing loudly costs a turn and is obvious. Failing open costs the
+    # guarantee and is invisible. When this switch is on, losing the tools is the
+    # correct response to not knowing whether we may offer them.
+    from tools.delegate_routing import filter_tools as _route_filter
+
+    tools_to_include = _route_filter(tools_to_include)
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
 
@@ -1393,6 +1416,20 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
             )
+
+    # Defense in depth for a stale schema already emitted by a provider. The
+    # turn-boundary rebuild is the primary boundary, but policy may also change
+    # from another surface after request assembly. Never dispatch a direct
+    # repository mutator while routing is currently enabled. Config read errors
+    # deliberately propagate: an unknown policy cannot authorize mutation.
+    from tools.delegate_routing import routing_enabled as _routing_enabled
+    from tools.registry import repo_access_of as _repo_access_of
+
+    if _repo_access_of(function_name) == "write" and _routing_enabled():
+        return tool_error(
+            f"'{function_name}' is unavailable while repository changes are "
+            "routed through Delegate Wave."
+        )
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:

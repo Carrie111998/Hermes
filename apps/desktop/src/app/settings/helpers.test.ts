@@ -331,6 +331,16 @@ describe('settings helpers', () => {
   })
 
   describe('sectionFieldEntries', () => {
+    // The repository-routing switch moved to the composer row, so Settings no
+    // longer renders it. The key itself still has to round-trip: the composer
+    // toggle writes it through the same getNested/setNested pair.
+    it('round-trips the repository-routing key the composer toggle writes', () => {
+      expect(getNested({}, 'delegate_wave.route_repo_changes')).toBeUndefined()
+      expect(setNested({}, 'delegate_wave.route_repo_changes', true)).toEqual({
+        delegate_wave: { route_repo_changes: true }
+      })
+    })
+
     it('renders memory.provider from config even when the backend schema omits it', () => {
       const schema = { 'memory.memory_enabled': { type: 'boolean' as const } }
       const config: HermesConfigRecord = { memory: { memory_enabled: true, provider: '' } }

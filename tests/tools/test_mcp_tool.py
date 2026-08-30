@@ -572,7 +572,15 @@ class TestToolHandler:
             with self._patch_mcp_loop():
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "hello world"
-            mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+            # `meta` rides alongside `arguments` on every call now. It carries the
+            # calling conversation's identity ONLY for servers whose config opted in
+            # via send_caller_session_context; for everyone else -- including this
+            # one -- it is None, which is the assertion that keeps the default-off
+            # promise honest. Asserting the exact call without `meta` made these two
+            # tests fail the moment that plumbing landed.
+            mock_session.call_tool.assert_called_once_with(
+                "greet", arguments={"name": "world"}, meta=None
+            )
         finally:
             _servers.pop("test_srv", None)
 
@@ -603,7 +611,15 @@ class TestToolHandler:
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "reconnected"
             reconnect.assert_called_once()
-            mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+            # `meta` rides alongside `arguments` on every call now. It carries the
+            # calling conversation's identity ONLY for servers whose config opted in
+            # via send_caller_session_context; for everyone else -- including this
+            # one -- it is None, which is the assertion that keeps the default-off
+            # promise honest. Asserting the exact call without `meta` made these two
+            # tests fail the moment that plumbing landed.
+            mock_session.call_tool.assert_called_once_with(
+                "greet", arguments={"name": "world"}, meta=None
+            )
         finally:
             _servers.pop("test_srv", None)
 
@@ -1290,14 +1306,24 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        assert result["ProgramFiles"] == r"C:\Program Files"
-        assert result["ProgramData"] == r"C:\ProgramData"
-        assert result["ProgramW6432"] == r"C:\Program Files"
-        assert result["LOCALAPPDATA"].endswith("Local")
-        assert result["APPDATA"].endswith("Roaming")
-        assert result["USERPROFILE"] == r"C:\Users\alice"
-        assert "GITHUB_TOKEN" not in result
-        assert "OPENAI_API_KEY" not in result
+        # Compared case-insensitively because WINDOWS os.environ UPPERCASES EVERY
+        # KEY. The mixed-case lookups this replaced could only ever succeed on
+        # Linux/macOS: on Windows patch.dict stored "PROGRAMFILES", the allowlist
+        # matched it (it compares .upper()), the value reached the subprocess
+        # exactly as intended -- and the assertion still raised KeyError. A red
+        # test that said nothing about the behaviour it names.
+        normalized = {key.upper(): value for key, value in result.items()}
+        assert normalized["PROGRAMFILES"] == r"C:\Program Files"
+        assert normalized["PROGRAMDATA"] == r"C:\ProgramData"
+        assert normalized["PROGRAMW6432"] == r"C:\Program Files"
+        assert normalized["LOCALAPPDATA"].endswith("Local")
+        assert normalized["APPDATA"].endswith("Roaming")
+        assert normalized["USERPROFILE"] == r"C:\Users\alice"
+        # The secrets half is the point of the test, so it is checked against the
+        # normalized view too -- a secret leaking under a differently-cased key
+        # would otherwise slip past.
+        assert "GITHUB_TOKEN" not in normalized
+        assert "OPENAI_API_KEY" not in normalized
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
-import type { HermesGateway } from '@/hermes'
+import type { HermesGateway, ProfileScope } from '@/hermes'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
@@ -36,6 +36,7 @@ export interface ChatBarProps {
   disabled: boolean
   focusKey?: string | null
   maxRecordingSeconds?: number
+  profileScope?: ProfileScope
   state: ChatBarState
   gateway?: HermesGateway | null
   queueSessionKey?: string | null

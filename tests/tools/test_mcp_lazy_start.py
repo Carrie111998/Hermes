@@ -320,6 +320,77 @@ class TestCacheLoadDescriptionScan:
         mock_scan.assert_called_once_with("playwright", "browser_navigate", "Navigate")
 
 
+class TestCachedRepositoryCapability:
+    @pytest.mark.parametrize(
+        ("declared", "expected"),
+        [("delegated_write", True), (None, False)],
+    )
+    def test_lazy_registration_preserves_per_tool_capability(self, declared, expected):
+        """Cached startup must enforce the same declarations as live discovery."""
+        from tools.delegate_routing import filter_tools
+        from tools.registry import registry
+
+        server = f"cached_capability_{'declared' if declared else 'missing'}"
+        registry_name = f"mcp__{server}__session_start"
+        config = {"command": "unused", "lazy": True}
+        if declared is not None:
+            config["repo_access"] = {"session_start": declared}
+        entry = {
+            "fingerprint": "unused",
+            "tools": [{
+                "name": "session_start",
+                "description": "Start delegated work",
+                "inputSchema": {"type": "object", "properties": {}},
+            }],
+            "utility_tools": [],
+        }
+
+        try:
+            assert mcp._register_from_cache_sync(server, config, entry) == [registry_name]
+            offered = filter_tools(
+                {registry_name},
+                {"delegate_wave": {"route_repo_changes": True}},
+                registry,
+            )
+            assert (registry_name in offered) is expected
+        finally:
+            registry.deregister(registry_name)
+
+    def test_lazy_utility_uses_its_handler_key_declaration(self):
+        from tools.delegate_routing import filter_tools
+        from tools.registry import registry
+
+        server = "cached_capability_utility"
+        registry_name = f"mcp__{server}__list_resources"
+        config = {
+            "command": "unused",
+            "lazy": True,
+            "repo_access": {"list_resources": "none"},
+        }
+        entry = {
+            "fingerprint": "unused",
+            "tools": [],
+            "utility_tools": [{
+                "handler_key": "list_resources",
+                "schema": {
+                    "name": registry_name,
+                    "description": "List resources",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+        }
+
+        try:
+            assert mcp._register_from_cache_sync(server, config, entry) == [registry_name]
+            assert filter_tools(
+                {registry_name},
+                {"delegate_wave": {"route_repo_changes": True}},
+                registry,
+            ) == {registry_name}
+        finally:
+            registry.deregister(registry_name)
+
+
 class TestResolveServerLazy:
     def test_default_off(self):
         assert mcp._resolve_server_lazy("s", {"command": "npx"}) is False

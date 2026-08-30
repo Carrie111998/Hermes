@@ -268,6 +268,14 @@ function TileChat({
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={noop}
           onTranscribeAudio={tileTranscribeAudio}
+          profileScope={
+            ownerRoute
+              ? {
+                  connectionId: ownerRoute.connectionId,
+                  profile: ownerRoute.targetProfile || ownerRoute.profile
+                }
+              : undefined
+          }
         />
       </ComposerScopeProvider>
     </SessionViewProvider>

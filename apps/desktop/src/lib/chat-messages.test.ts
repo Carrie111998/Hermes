@@ -435,6 +435,27 @@ describe('toChatMessages', () => {
     ])
   })
 
+  it('rehydrates a persisted Delegate Wave wake as a card-bearing user event', () => {
+    const wake =
+      'The delegate-wave session working on "ship it" finished and its result is on the branch.\n\n' +
+      '[delegate-wave-wake:wake_123]'
+
+    const messages = toChatMessages([
+      {
+        role: 'user',
+        content: wake,
+        display_kind: 'delegate_wave_wake',
+        display_metadata: { event_id: 'wake_123', source: 'delegate-wave' },
+        timestamp: 1
+      }
+    ])
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].role).toBe('user')
+    expect(messages[0].displayKind).toBe('delegate_wave_wake')
+    expect(chatMessageText(messages[0])).toBe(wake)
+  })
+
   // A backend older than this app serves display_metadata as unparsed JSON
   // text. Indexing into that string used to throw and fail the whole resume.
   it.each([

@@ -2030,6 +2030,9 @@ export interface Translations {
     transcribingDictation: string
     voiceControls: string
     voiceDictation: string
+    delegationRoutingOn: string
+    delegationRoutingOff: string
+    delegationRoutingSaveFailed: string
     speakReplies: string
     stopSpeakingReplies: string
     wakeWordListening: (phrase: string) => string
@@ -2762,6 +2765,16 @@ export interface Translations {
       branchNewChat: string
       react: string
       dismissError: string
+      delegateWave: {
+        completedLabel: string
+        questionLabel: string
+        readyLabel: string
+        failedLabel: string
+        completedSummary: (task: string) => string
+        questionFallback: (task: string) => string
+        readySummary: (task: string) => string
+        failedFallback: (task: string) => string
+      }
       /** Layer titles for the structured error card (agent/error_surface.py).
        *  `generic` is the fallback when the backend sent no descriptor. */
       errorLayers: {

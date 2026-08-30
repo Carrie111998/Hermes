@@ -18,6 +18,8 @@ export type ChatMessage = {
   id: string
   role: SessionMessage['role']
   parts: ChatMessagePart[]
+  /** Durable backend timeline type; renderer metadata must preserve its authority. */
+  displayKind?: SessionMessage['display_kind']
   timestamp?: number
   completedAt?: number
   pending?: boolean

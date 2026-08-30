@@ -9,6 +9,7 @@ import {
   getUsageAnalytics,
   installSkillFromHub,
   profileScopeKey,
+  saveHermesConfig,
   saveMcpServers,
   setApiRequestConnection,
   setApiRequestProfile,
@@ -78,6 +79,7 @@ describe('capability helpers are connection-scoped', () => {
     void getSkills({ connectionId: 'homelab', profile: 'inbox-bot' })
     void getToolsets({ connectionId: 'homelab', profile: 'inbox-bot' })
     void getSkillContent('arxiv', { connectionId: 'homelab', profile: 'inbox-bot' })
+    void saveHermesConfig({}, { connectionId: 'homelab', profile: 'inbox-bot' })
     void setSkillEnabled('arxiv', false, { connectionId: 'homelab', profile: 'inbox-bot' })
     void setToolsetEnabled('browser', true, { connectionId: 'homelab', profile: 'inbox-bot' })
     void saveMcpServers({}, { connectionId: 'homelab', profile: 'inbox-bot' })

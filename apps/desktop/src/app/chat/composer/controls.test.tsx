@@ -9,6 +9,14 @@ import { applyWakeStartResult, applyWakeStatus, resetWakeWordState } from '@/sto
 import { ComposerControls } from './controls'
 
 vi.mock('./model-pill', () => ({ ModelPill: () => null }))
+// Same reason as ModelPill: it reads the profile config through react-query,
+// and this harness is about the send/voice/queue row, not the config surface.
+// Its own behaviour is covered in delegation-toggle.test.tsx.
+vi.mock('./delegation-toggle', () => ({
+  DelegationToggle: ({ disabled }: { disabled: boolean }) => (
+    <button data-testid="delegation-toggle" disabled={disabled} type="button" />
+  )
+}))
 
 const state: ChatBarState = {
   model: { canSwitch: false, model: '', provider: '' },
@@ -97,6 +105,14 @@ describe('HUD mode', () => {
 
     expect(screen.getByLabelText('Stop dictation')).toBeTruthy()
     expect(screen.queryByLabelText('Voice')).toBeNull()
+  })
+})
+
+describe('routing policy control', () => {
+  it('is disabled for the full duration of an active turn', () => {
+    renderControls({ busy: true, disabled: false })
+
+    expect(screen.getByTestId('delegation-toggle').hasAttribute('disabled')).toBe(true)
   })
 })
 
