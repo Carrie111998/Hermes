@@ -2,12 +2,14 @@ import { readActivePreview } from '@/app/chat/right-rail/preview-reader'
 import { writeAgentTerminalChunk } from '@/app/right-sidebar/terminal/agent-terminal-stream'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
+import type { GatewayEventPayload } from '@/lib/chat-messages'
 import type { PreviewActAction } from '@/lib/preview-act/act-in-page'
 import type { TourAction, TourStep } from '@/lib/tour'
 import { $gateway } from '@/store/gateway'
 import { applyDesktopLayoutPreset, revealDesktopPane } from '@/store/pane-focus'
 import { recordAgentReaction } from '@/store/reactions-local'
 import { setMessages } from '@/store/session'
+import { $focusedRuntimeId } from '@/store/session-states'
 import { $tipsEnabled, type ActiveTip, showTip } from '@/store/tips'
 import { $toursEnabled } from '@/store/tours'
 
@@ -41,11 +43,37 @@ const loadPreviewEngine = () => {
     .then(mod => mod.actOnActivePreview as Awaited<ReturnType<typeof stable>>['actOnActivePreview'])
 }
 
+/** Wire payload from `drive_preview` (and `annotate_preview`, which rides the
+ *  same channel) into the action the preview engine takes.
+ *
+ *  Split out and exported because it is a field list, and a field list drifts:
+ *  `url` and `full` were both on the wire and both read downstream, but neither
+ *  was relayed here, so `navigate` answered "navigate needs a url" for a url it
+ *  had been handed and `elements full=true` quietly returned a delta. Inline in
+ *  the handler this could only be tested through a live preview pane, which is
+ *  why it went unnoticed; as a function it is checked directly against what
+ *  `tools/drive_preview_tool.py` puts on the wire. */
+export function previewActionFromPayload(payload: GatewayEventPayload | undefined): PreviewActAction {
+  return {
+    amount: payload?.amount,
+    full: payload?.full,
+    key: payload?.key,
+    kind: (payload?.action ?? '') as PreviewActAction['kind'],
+    max: payload?.max,
+    ref: payload?.ref,
+    selector: payload?.selector,
+    submit: payload?.submit,
+    text: payload?.text,
+    to: payload?.to as PreviewActAction['to'],
+    url: payload?.url
+  } as PreviewActAction
+}
+
 /** Desktop-surface bridge events: read-back requests the agent blocks on
  *  (terminal/preview/window), agent terminal streaming, pane reveal, and
  *  message reactions. */
 export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
-  const { event, payload, isActiveEvent } = ctx
+  const { event, payload, isActiveEvent, sessionId } = ctx
 
   if (event.type === 'terminal.read.request') {
     // read_terminal tool: serialize the renderer's xterm buffer and answer
@@ -89,9 +117,20 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
   if (event.type === 'preview.act.request') {
     // drive_preview tool: click/type/scroll/press inside the guest page, or
     // drive the pane's history. Dynamic import keeps the injected engine off
-    // the boot path. Active session only: a background turn must never reach
+    // the boot path. Focused session only: a background turn must never reach
     // into the page the user is working in (desktop AGENTS.md: offer, don't
     // hijack).
+    //
+    // "Focused" is NOT `isActiveEvent`. This bridge mounts once, in wiring, so
+    // its `activeSessionIdRef` is the PRIMARY view's runtime — but a tile (and
+    // every ⌘T tab, which `openNewSessionTile` creates unlisted) binds a
+    // runtime id of its own. Gating on the primary therefore refused every
+    // request from a tile the user was looking at, permanently, while its
+    // siblings on this same global pane — `preview.read.request` and the
+    // `preview.open` route — went through ungated. A tool that can navigate
+    // the pane but not click in it is not an anti-hijack property, just a
+    // broken one. `$focusedRuntimeId` is the predicate the guard always meant:
+    // the tile holding the active tab, else the primary's session.
     const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
     if (requestId) {
@@ -101,27 +140,24 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
           text: result ? JSON.stringify(result) : ''
         })
 
-      if (isActiveEvent) {
+      const focusedRuntimeId = $focusedRuntimeId.get()
+      const isFocusedEvent = isActiveEvent || (!!sessionId && sessionId === focusedRuntimeId)
+
+      if (isFocusedEvent) {
         void loadPreviewEngine()
-          .then(run =>
-            run({
-              amount: payload?.amount,
-              key: payload?.key,
-              kind: payload?.action ?? '',
-              max: payload?.max,
-              ref: payload?.ref,
-              selector: payload?.selector,
-              submit: payload?.submit,
-              text: payload?.text,
-              to: payload?.to as PreviewActAction['to']
-            })
-          )
+          .then(run => run(previewActionFromPayload(payload)))
           .then(answer, error =>
             answer({ error: error instanceof Error ? error.message : String(error), success: false })
           )
       } else {
+        // Name both sides. The bare sentence sent the agent hunting for a
+        // window to focus when the real answer is which chat asked, and it
+        // gave whoever reads a bug report nothing to correlate against.
         void answer({
-          error: 'The in-app browser only takes actions in the session the user is looking at.',
+          error:
+            'The in-app browser only takes actions in the session the user is looking at. ' +
+            `This request came from session ${sessionId || '(none)'}; the focused session is ` +
+            `${focusedRuntimeId || '(none)'}.`,
           success: false
         })
       }
