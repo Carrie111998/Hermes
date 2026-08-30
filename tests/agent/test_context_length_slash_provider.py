@@ -125,3 +125,36 @@ class TestSlashQualifiedResolution:
             )
         assert ("from-url", "m1") in calls
         assert ("opencode-go", "m1") not in calls
+
+    def test_openrouter_endpoint_keeps_slug_whole(self, monkeypatch):
+        # Same OR-slug protection as the explicit-provider test above, but
+        # for the caller that supplied NO provider and only the OpenRouter
+        # base URL: the endpoint makes the whole id an OR slug, and the
+        # first segment ("anthropic") names a bundled provider, so without
+        # the endpoint guard the strip would rewrite the id to
+        # ("anthropic", "claude-fable-5") and miss the OR catalog entry.
+        monkeypatch.setattr(
+            mm,
+            "fetch_model_metadata",
+            lambda: {"anthropic/claude-fable-5": {"context_length": 999_999}},
+        )
+        assert (
+            mm.get_model_context_length(
+                "anthropic/claude-fable-5",
+                base_url="https://openrouter.ai/api/v1",
+            )
+            == 999_999
+        )
+
+    def test_user_plugin_prefix_not_stripped(self, monkeypatch):
+        # The strip must key off BUNDLED provider names only: the registry
+        # is extended by user plugins, and a user-only registration must
+        # not change how a slash-qualified id resolves. "anthropic" is
+        # bundled, "acme-inference" is not.
+        calls = _with_models_dev(monkeypatch, {})
+        monkeypatch.setattr(
+            "providers.is_bundled_provider", lambda name: name == "anthropic"
+        )
+        with patch.dict(mm.DEFAULT_CONTEXT_LENGTHS, {"acme-inference/m9": 555}):
+            assert mm.get_model_context_length("acme-inference/m9") == 555
+        assert not calls
