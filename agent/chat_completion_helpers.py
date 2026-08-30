@@ -2948,6 +2948,53 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+def _bedrock_summary_no_client(reason, kind="openai"):
+    """``make_client`` for the bedrock summary dispatch — never invoked.
+
+    ``_dispatch_nonstreaming_api_request``'s bedrock branch manages its own
+    boto3 client and documents that it never calls ``make_client``. Raise
+    rather than return ``None`` so that if a future refactor does start calling
+    it here, it fails loudly instead of feeding ``None`` to an SDK.
+    """
+    raise AssertionError(
+        f"bedrock summary dispatch asked for a {kind!r} client "
+        f"(reason={reason!r}); bedrock_converse owns its own boto3 client"
+    )
+
+
+def _bedrock_iteration_summary(agent, api_messages: list, managed_call, *, retry_count: int) -> str:
+    """Run the iteration-limit summary over Bedrock Converse and return its text.
+
+    ``bedrock_converse`` never constructs an OpenAI client, so the OpenAI-wire
+    fallback in ``handle_max_iterations`` cannot serve it: that branch calls
+    ``_ensure_primary_openai_client()``, which raises, and the wrapping
+    ``except Exception`` turns the summary into an error string. Bedrock
+    sessions therefore never got a summary at the iteration limit — and worse,
+    when the agent happened to hold live OpenAI-compatible credentials that
+    branch built a request carrying the whole conversation and addressed it to
+    ``agent.base_url`` with a Bedrock ``modelId``, sending a Bedrock user's
+    conversation to a non-Bedrock endpoint.
+
+    Routes through ``_dispatch_nonstreaming_api_request`` rather than calling
+    ``converse()`` here, both to keep the per-api_mode dispatch in the one
+    place that helper's docstring promises and so this path inherits its
+    cachePoint-rejection and stale-connection recovery.
+
+    ``tools_for_api=[]`` suppresses ``toolConfig`` — the summary must not call
+    more tools, mirroring the ``codex_kwargs.pop("tools", None)`` above.
+    """
+    transport = agent._get_transport()
+    bedrock_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=[])
+    response = managed_call(
+        bedrock_kwargs,
+        lambda request: _dispatch_nonstreaming_api_request(
+            agent, request, make_client=_bedrock_summary_no_client
+        ),
+        retry_count=retry_count,
+    )
+    return (transport.normalize_response(response).content or "").strip()
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
@@ -3201,6 +3248,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 )
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
+            elif agent.api_mode == "bedrock_converse":
+                final_response = _bedrock_iteration_summary(
+                    agent, api_messages, _managed_summary_call, retry_count=0
+                )
             else:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
@@ -3253,6 +3304,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 )
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
+            elif agent.api_mode == "bedrock_converse":
+                final_response = _bedrock_iteration_summary(
+                    agent, api_messages, _managed_summary_call, retry_count=1
+                )
             else:
                 summary_kwargs = {
                     "model": agent.model,
