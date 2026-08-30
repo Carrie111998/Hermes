@@ -165,10 +165,10 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # falsify conversation history and invalidate resume/compression state.
         try:
             if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
-                return True
+                return "session_state"
             sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
             if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
-                return True
+                return "session_state"
         except Exception:
             pass
         try:
@@ -213,6 +213,8 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
             f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
             f"({roots_display}). Unset the variable or add this path's directory prefix."
         )
+    if denial == "session_state":
+        return f"{verb} denied: '{path}' is internal session history / state storage and cannot be modified directly."
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
 
