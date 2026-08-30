@@ -15,7 +15,6 @@ import logging
 import os
 import html as _html
 import re
-import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -24,6 +23,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from plugins.platforms.telegram.retirement import (
+    CAPACITY_WAIT_TIMEOUT as _RETIRED_CAPACITY_WAIT_TIMEOUT,
+    RetiredTelegramGeneration as _RetiredTelegramGeneration,
+    RetirementCapacityError,
+    TelegramRetirementRegistry as _TelegramRetirementRegistry,
+    drain_retired_generations as drain_telegram_retired_generations,
+    get_retirement_registry as _get_telegram_retirement_registry,
+)
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -102,43 +109,6 @@ async def _first_completed(*futures: "asyncio.Future") -> None:
     """
     await asyncio.wait(set(futures), return_when=asyncio.FIRST_COMPLETED)
 
-
-async def _shutdown_abandoned_app(app) -> None:
-    """Release a half-built PTB app's httpx transports after init was abandoned.
-
-    ``Application.shutdown()`` / ``Bot.shutdown()`` are gated on the app's
-    ``_initialized`` / ``_requests_initialized`` flags, which a wedged
-    ``initialize()`` (the case this whole path exists for) may never have set —
-    so calling only ``app.shutdown()`` no-ops and leaks the connection pool it
-    was meant to close.  ``HTTPXRequest`` builds its ``httpx.AsyncClient``
-    eagerly in its constructor and its ``shutdown()`` gates only on
-    ``client.is_closed``, so closing the request transports directly releases
-    the pool regardless of PTB init state.  We try the clean path first, then
-    fall back to the transports.  All best-effort and swallowed.
-    """
-    if app is None:
-        return
-    try:
-        await app.shutdown()
-    except Exception:
-        logger.debug("Abandoned Telegram app.shutdown() failed", exc_info=True)
-    # Directly close the underlying request transports (bypasses PTB's
-    # init-gated shutdown so the eagerly-built httpx pool is released even when
-    # the abandoned initialize() never flipped _initialized).
-    bot = getattr(app, "bot", None)
-    requests = getattr(bot, "_request", None) if bot is not None else None
-    if not requests:
-        return
-    for request in requests:
-        shutdown = getattr(request, "shutdown", None)
-        if shutdown is None:
-            continue
-        try:
-            result = shutdown()
-            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-                await result
-        except Exception:
-            logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -2469,50 +2439,75 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return False
 
-    async def _drain_polling_connections(self) -> None:
-        """Reset the httpx connection pool used for getUpdates polling.
+    async def _drain_polling_connections(self) -> bool:
+        """Reset getUpdates only when cleanup finishes under owned deadlines.
 
-        Network errors (especially through proxies like sing-box) can leave
-        httpx connections in a half-closed state that still occupy pool slots.
-        After enough reconnect cycles the pool fills up entirely, causing
-        ``Pool timeout: All connections in the connection pool are occupied.``
-
-        We reset ONLY ``_request[0]`` (the getUpdates request) — the general
-        request (``_request[1]``) is left untouched so concurrent
-        ``send_message`` / ``edit_message`` calls are never interrupted.
-
-        Implementation note: accesses ``Bot._request[0]`` which is the
-        get-updates ``BaseRequest`` in the PTB 22.x internal tuple
-        ``(get_updates_request, general_request)``.  There is no public
-        accessor for the polling request; review if upgrading to PTB 23+.
+        Ordinary request errors keep the historical initialize fallback. A
+        deadline timeout retires the complete Application so replacement builds
+        a fresh PTB resource graph.
         """
-        if not (self._app and self._app.bot):
-            return
+        app = self._app
+        if not (app and app.bot):
+            return True
         try:
-            # PTB 22.x: _request is a (get_updates, general) tuple;
-            # no public accessor exists for the polling request.
-            polling_req = self._app.bot._request[0]  # noqa: SLF001
+            polling_req = app.bot._request[0]  # noqa: SLF001
         except Exception:
-            return
+            return True
+
+        shutdown = getattr(polling_req, "shutdown", None)
+        initialize = getattr(polling_req, "initialize", None)
+        if not callable(shutdown) or not callable(initialize):
+            return True
         try:
-            # Bounded: a wedged CLOSE-WAIT socket can make this close hang
-            # forever and freeze the reconnect ladder (#66377).
-            await asyncio.wait_for(polling_req.shutdown(), timeout=_DRAIN_TIMEOUT)
+            shutdown_awaitable = shutdown()
+            if not inspect.isawaitable(shutdown_awaitable):
+                return True
+            await self._await_owned_lifecycle(
+                app,
+                shutdown_awaitable,
+                timeout=_DRAIN_TIMEOUT,
+                label="polling request shutdown",
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Polling request shutdown missed its owned deadline; "
+                "retiring the Application",
+                self.name,
+            )
+            self._retire_app(app, start=True)
+            return False
         except Exception:
             logger.debug(
-                "[%s] Polling request shutdown failed/timed out (non-fatal)",
-                self.name, exc_info=True,
+                "[%s] Polling request shutdown failed; attempting initialize fallback",
+                self.name,
+                exc_info=True,
             )
+
         try:
-            await asyncio.wait_for(polling_req.initialize(), timeout=_DRAIN_TIMEOUT)
-            logger.debug(
-                "[%s] Polling request pool drained before reconnect", self.name
+            initialize_awaitable = initialize()
+            if not inspect.isawaitable(initialize_awaitable):
+                return True
+            await self._await_owned_lifecycle(
+                app,
+                initialize_awaitable,
+                timeout=_DRAIN_TIMEOUT,
+                label="polling request initialize",
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Polling request initialize missed its owned deadline; "
+                "retiring the Application",
+                self.name,
+            )
+            self._retire_app(app, start=True)
+            return False
         except Exception:
             logger.debug(
-                "[%s] Polling request re-initialize failed/timed out (non-fatal)",
-                self.name, exc_info=True,
+                "[%s] Polling request initialize failed", self.name, exc_info=True
             )
+            return False
+        logger.debug("[%s] Polling request pool drained before reconnect", self.name)
+        return True
 
     def _begin_polling_generation(self) -> tuple[int, asyncio.Event]:
         """Start accepting progress for a new getUpdates polling generation."""
@@ -2668,18 +2663,15 @@ class TelegramAdapter(BasePlatformAdapter):
             # httpcore/AnyIO shielded scopes (#58236/#67498). Reuse the
             # proven wall-deadline helper and abandon the partial updater;
             # caller recovery will dispose/rebuild the whole adapter.
-            await _await_with_thread_deadline(
+            await self._await_owned_lifecycle(
+                app,
                 app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=drop_pending_updates,
                     error_callback=_generation_error_callback,
                 ),
                 timeout=_UPDATER_START_TIMEOUT,
-                on_abandon=(
-                    (lambda app=app: _shutdown_abandoned_app(app))
-                    if abandon_app_on_timeout
-                    else None
-                ),
+                label="Updater.start_polling()",
             )
         finally:
             _POLLING_GENERATION_CONTEXT.reset(context_token)
@@ -2715,6 +2707,74 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_progress_verifier_task = None
 
         task.add_done_callback(_clear_finished_verifier)
+
+    def _retirement_registry(
+        self, *, create: bool = True
+    ) -> Optional[_TelegramRetirementRegistry]:
+        return _get_telegram_retirement_registry(
+            getattr(self.config, "token", ""),
+            updater_stop_timeout=_UPDATER_STOP_TIMEOUT,
+            disconnect_step_timeout=_DISCONNECT_STEP_TIMEOUT,
+            create=create,
+        )
+
+    def _retire_app(
+        self, app: Any, *, start: bool = True
+    ) -> Optional[_RetiredTelegramGeneration]:
+        if app is None:
+            return None
+        try:
+            registry = self._retirement_registry()
+            if registry is None:
+                return None
+            entry = registry.retire(
+                app,
+                generation_id=getattr(self, "_polling_generation", 0),
+                start=start,
+            )
+            if entry is None:
+                logger.error(
+                    "[%s] Retired-generation capacity is full; refusing unowned cleanup",
+                    getattr(self, "name", "telegram"),
+                )
+            return entry
+        except Exception:
+            logger.exception(
+                "[%s] Failed to register retired Telegram generation",
+                getattr(self, "name", "telegram"),
+            )
+            return None
+
+    async def _await_owned_lifecycle(
+        self,
+        app: Any,
+        awaitable: Awaitable[Any],
+        *,
+        timeout: float,
+        label: str,
+    ) -> Any:
+        """Bound waiting while retaining the exact child task on abandonment."""
+        task = asyncio.ensure_future(awaitable)
+        try:
+            return await _await_with_thread_deadline(task, timeout=timeout)
+        except BaseException:
+            if not task.done():
+                entry = self._retire_app(app, start=False)
+                if entry is not None:
+                    entry.registry.track_external(entry, task)
+                    entry.registry.start(entry)
+                    logger.warning(
+                        "[%s] %s abandoned; retired-generation ownership retained",
+                        self.name,
+                        label,
+                    )
+                else:
+                    # Structural capacity gates prevent this for applications
+                    # built by connect(). Keep a defensive adapter-local owner
+                    # so even an invariant violation cannot orphan the task.
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+            raise
 
     def _get_general_request_drain_lock(self) -> asyncio.Lock:
         lock = getattr(self, "_general_request_drain_lock", None)
@@ -2811,9 +2871,11 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Same shielded-cancellation class as initialize/start_polling:
             # never let a wedged duplicate deleteWebhook pin initial connect.
-            await _await_with_thread_deadline(
+            await self._await_owned_lifecycle(
+                self._app,
                 delete_webhook(drop_pending_updates=False),
                 timeout=_UPDATER_START_TIMEOUT,
+                label="Bot.delete_webhook()",
             )
             return True
         except Exception as err:
@@ -3027,8 +3089,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     # the gateway silently drops messages for hours.
                     # Bounding stop() lets the reconnect ladder always advance.
                     # Refs: NousResearch/hermes-agent#58270
-                    await _await_with_thread_deadline(
-                        app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT
+                    await self._await_owned_lifecycle(
+                        app,
+                        app.updater.stop(),
+                        timeout=_UPDATER_STOP_TIMEOUT,
+                        label="network-recovery updater.stop()",
                     )
                 except asyncio.TimeoutError:
                     message = (
@@ -3045,6 +3110,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     await self._handoff_polling_fatal_error()
                     return
+        except RetirementCapacityError:
+            raise
         except Exception:
             pass
 
@@ -3062,7 +3129,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if getattr(self, "_polling_teardown_started", False):
             return
-        await self._drain_polling_connections()
+        if not await self._drain_polling_connections():
+            message = (
+                "Telegram polling request cleanup missed its owned deadline; "
+                "rebuilding the complete adapter generation."
+            )
+            self._set_fatal_error("telegram_network_error", message, retryable=True)
+            await self._handoff_polling_fatal_error()
+            return
 
         if getattr(self, "_polling_teardown_started", False):
             return
@@ -3597,8 +3671,11 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 if self._app and self._app.updater and self._app.updater.running:
                     try:
-                        await _await_with_thread_deadline(
-                            self._app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT
+                        await self._await_owned_lifecycle(
+                            self._app,
+                            self._app.updater.stop(),
+                            timeout=_UPDATER_STOP_TIMEOUT,
+                            label="conflict-recovery updater.stop()",
                         )
                     except asyncio.TimeoutError:
                         message = (
@@ -3622,7 +3699,14 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.sleep(RETRY_DELAY)
             if getattr(self, "_polling_teardown_started", False):
                 return
-            await self._drain_polling_connections()
+            if not await self._drain_polling_connections():
+                message = (
+                    "Telegram polling request cleanup missed its owned deadline; "
+                    "rebuilding the complete adapter generation."
+                )
+                self._set_fatal_error("telegram_network_error", message, retryable=True)
+                await self._handoff_polling_fatal_error()
+                return
             if getattr(self, "_polling_teardown_started", False):
                 return
 
@@ -3723,8 +3807,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._set_fatal_error("telegram_polling_conflict", message, retryable=False)
         try:
             if self._app and self._app.updater:
-                await _await_with_thread_deadline(
-                    self._app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT
+                await self._await_owned_lifecycle(
+                    self._app,
+                    self._app.updater.stop(),
+                    timeout=_UPDATER_STOP_TIMEOUT,
+                    label="fatal-conflict updater.stop()",
                 )
         except asyncio.TimeoutError:
             logger.warning(
@@ -3741,15 +3828,30 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handoff_polling_fatal_error()
 
     async def _handoff_polling_fatal_error(self) -> None:
-        """Notify the runner without letting child teardown cancel this owner.
+        """Transfer the complete Application before notifying the Gateway.
 
-        The runner bounds adapter cleanup in a child task.  ``disconnect()``
-        cancels the tracked polling-recovery task and the heartbeat task, so
-        retaining the current notifier in either field would cancel the fatal
-        callback before the runner can finish its reconnect or shutdown
-        decision.  Release only the current owner from whichever field tracks
-        it; unrelated tasks remain under teardown control.
+        The Gateway may pop this adapter immediately after the fatal callback.
+        Registering the Application first preserves ownership even when the
+        outer adapter disconnect deadline cancels its carrier task.
         """
+        app = getattr(self, "_app", None)
+        if app is not None:
+            entry = self._retire_app(app, start=True)
+            if entry is None:
+                registry = self._retirement_registry(create=False)
+                if registry is None or not await registry.wait_for_capacity(
+                    _RETIRED_CAPACITY_WAIT_TIMEOUT
+                ):
+                    raise RetirementCapacityError(
+                        "Telegram fatal handoff could not acquire retirement "
+                        "capacity before its total deadline"
+                    )
+                entry = self._retire_app(app, start=True)
+                if entry is None:
+                    raise RetirementCapacityError(
+                        "Telegram fatal handoff capacity became unavailable"
+                    )
+
         current_task = asyncio.current_task()
         if self._polling_error_task is current_task:
             self._polling_error_task = None
@@ -4435,7 +4537,28 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] No bot token configured", self.name)
             self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
             return False
-        
+
+        # Do not build another PTB Application while a retired generation still
+        # owns its cleanup. A single token has one polling slot; waiting here
+        # bounds adapter generations without blocking the Gateway loop.
+        try:
+            registry = self._retirement_registry(create=False)
+            if registry is not None and not await registry.wait_for_capacity(
+                _RETIRED_CAPACITY_WAIT_TIMEOUT
+            ):
+                message = (
+                    "Telegram retired-generation cleanup is still pending; "
+                    "deferring replacement to preserve lifecycle ownership."
+                )
+                logger.warning("[%s] %s", self.name, message)
+                self._set_fatal_error(
+                    "telegram_retired_generation_capacity", message, retryable=True
+                )
+                return False
+        except Exception:
+            logger.debug("[%s] Retired-generation capacity check failed", self.name, exc_info=True)
+            return False
+
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
@@ -4618,7 +4741,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
+                    **request_kwargs,
+                    proxy=proxy_url,
+                    httpx_kwargs=_with_limits(),
                 )
             else:
                 if disable_fallback:
@@ -4678,16 +4803,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         "[%s] Connecting to Telegram (attempt %d/%d)…",
                         self.name, _attempt + 1, _max_connect,
                     )
-                    await _await_with_thread_deadline(
+                    await self._await_owned_lifecycle(
+                        self._app,
                         self._app.initialize(),
                         timeout=_init_timeout,
-                        # On timeout the initialize() task is abandoned without
-                        # awaiting its cancellation (it may be wedged in a
-                        # shielded scope). Best-effort release the half-built
-                        # app's httpx client/connection pool so it isn't leaked
-                        # across the retry ladder (mirrors the client-close-on-
-                        # timeout pattern in agent/auxiliary_client.py).
-                        on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
+                        label="Application.initialize()",
                     )
                     break
                 except asyncio.TimeoutError:
@@ -4755,16 +4875,25 @@ class TelegramAdapter(BasePlatformAdapter):
                     # and will be GC'd (#67498).
                     if rebuild_app and _attempt < _max_connect - 1:
                         old_app = self._app
+                        entry = self._retire_app(old_app, start=True)
+                        if entry is None:
+                            raise RetirementCapacityError(
+                                "Telegram retired-generation ownership capacity exhausted"
+                            )
+                        # Construction itself is capacity-gated: the next PTB
+                        # graph cannot exist while this generation is owned.
+                        if not await entry.registry.wait_for_capacity(
+                            _RETIRED_CAPACITY_WAIT_TIMEOUT
+                        ):
+                            raise RetirementCapacityError(
+                                "Telegram retired-generation cleanup did not free "
+                                "capacity for a fresh Application"
+                            )
                         self._app = builder.build()
                         self._bot = self._app.bot
                         # Keep core and observer handlers in lockstep after a
                         # transient-init rebuild (#64176).
                         self._register_handlers(self._app)
-                        # Best-effort discard the old app's resources
-                        try:
-                            await _shutdown_abandoned_app(old_app)
-                        except Exception:
-                            pass
             await self._app.start()
 
             # Decide between webhook and polling mode
@@ -5131,6 +5260,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # is best-effort against a half-dead transport.
         self._release_platform_lock()
 
+        # Capture the Application before any adapter reference is cleared. The
+        # registry owns it even if this disconnect coroutine is cancelled by the
+        # Gateway's outer deadline.
+        retired_entry = self._retire_app(self._app, start=False)
+        if retired_entry is not None:
+            # Start on the next loop turn so the ownership carrier survives an
+            # outer fatal/shutdown cancellation before this coroutine reaches
+            # the end of its pre-app teardown work.
+            retired_entry.registry.start_soon(retired_entry)
+
         # Recovery can be suspended in stop/drain/start while disconnect begins.
         # Cancel and await both polling lifecycle owners immediately after the
         # fence, before any other teardown await lets them start a new generation.
@@ -5224,44 +5363,38 @@ class TelegramAdapter(BasePlatformAdapter):
             "pending-delivery cancel",
         )
 
-        if self._app:
+        if retired_entry is not None:
+            registry = retired_entry.registry
+            registry.start(retired_entry)
+            # Wait briefly for the owner carrier. A timeout is not disposal:
+            # the registry retains the entry and its child tasks until they
+            # terminate, so a replacement cannot create another generation.
+            await registry.wait_for_entry(
+                retired_entry, _DISCONNECT_STEP_TIMEOUT
+            )
+        elif self._app:
+            logger.error(
+                "[%s] Telegram Application could not be registered for retirement; "
+                "running bounded legacy teardown",
+                self.name,
+            )
             try:
-                # Only stop the updater if it's running.  Bounded with a
-                # timeout: a CLOSE-WAIT socket can wedge stop() on epoll
-                # indefinitely, which would hang disconnect() (and any
-                # gateway shutdown/restart waiting on it) forever.  On timeout
-                # we fall through to app.stop()/shutdown() to force teardown.
-                if self._app.updater and self._app.updater.running:
-                    try:
-                        await self._await_disconnect_step(
-                            self._app.updater.stop(),
-                            _UPDATER_STOP_TIMEOUT,
-                            "updater.stop()",
-                        )
-                    except Exception as stop_error:
-                        logger.warning(
-                            "[%s] updater.stop() failed during disconnect: %s",
-                            self.name,
-                            _redact_telegram_error_text(stop_error),
-                        )
-                # app.stop()/shutdown() can also block on a half-dead httpx
-                # pool. Detach-on-timeout so disconnect always returns (#80598).
+                await self._await_disconnect_step(
+                    self._app.updater.stop()
+                    if self._app.updater and self._app.updater.running
+                    else asyncio.sleep(0),
+                    _UPDATER_STOP_TIMEOUT,
+                    "updater.stop()",
+                )
                 if self._app.running:
                     await self._await_disconnect_step(
-                        self._app.stop(),
-                        _DISCONNECT_STEP_TIMEOUT,
-                        "app.stop()",
+                        self._app.stop(), _DISCONNECT_STEP_TIMEOUT, "app.stop()"
                     )
                 await self._await_disconnect_step(
-                    self._app.shutdown(),
-                    _DISCONNECT_STEP_TIMEOUT,
-                    "app.shutdown()",
+                    self._app.shutdown(), _DISCONNECT_STEP_TIMEOUT, "app.shutdown()"
                 )
-            except Exception as e:
-                logger.warning(
-                    "[%s] Error during Telegram disconnect: %s",
-                    self.name, _redact_telegram_error_text(e),
-                )
+            except Exception:
+                logger.debug("[%s] Legacy Telegram teardown failed", self.name, exc_info=True)
 
         self._app = None
         self._bot = None
