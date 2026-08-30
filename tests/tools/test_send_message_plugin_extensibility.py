@@ -14,7 +14,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platform_registry import PlatformEntry, platform_registry
-from tools.send_message_tool import resolve_send_target, send_message_tool
+from tools.send_message_tool import _send_to_platform, resolve_send_target, send_message_tool
 
 
 @pytest.fixture
@@ -150,6 +150,56 @@ def test_host_send_honors_sync_and_async_plugin_handlers(plugin_platform, async_
     assert result["platform"] == name
     assert result["chat_id"] == "@alice@example.com"
     assert seen[-1]["args"]["subject"] == "greeting"
+
+
+@pytest.mark.asyncio
+async def test_plugin_handler_receives_normalized_context_without_model_args(
+    plugin_platform,
+):
+    name, entry, _seen = plugin_platform
+    platform, pconfig, _config = _config_for(name)
+    received = []
+
+    async def handler(args, chat_id, platform_name, config, *, normalized):
+        received.append(
+            {
+                "args": args,
+                "chat_id": chat_id,
+                "platform_name": platform_name,
+                "config": config,
+                "normalized": normalized,
+            }
+        )
+        return {"success": True, "message_id": "normalized-id"}
+
+    entry.send_message_handler = handler
+    media_files = [("/tmp/report.pdf", False)]
+
+    result = await _send_to_platform(
+        platform,
+        pconfig,
+        "channel-1",
+        "Scheduled report",
+        thread_id="thread-1",
+        media_files=media_files,
+        force_document=True,
+    )
+
+    assert result == {"success": True, "message_id": "normalized-id"}
+    assert received == [
+        {
+            "args": {},
+            "chat_id": "channel-1",
+            "platform_name": name,
+            "config": pconfig,
+            "normalized": {
+                "message": "Scheduled report",
+                "thread_id": "thread-1",
+                "media_files": media_files,
+                "force_document": True,
+            },
+        }
+    ]
 
 
 def test_cli_and_cron_share_plugin_target_normalization(plugin_platform, monkeypatch, capsys):
