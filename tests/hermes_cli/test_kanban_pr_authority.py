@@ -344,6 +344,42 @@ def test_dispatch_default_assignment_does_not_persist_invalid_write_owner(
         ).fetchone()[0] == 0
 
 
+def test_dispatch_dry_run_does_not_report_unauthorized_default_spawn(kanban_home):
+    _write_profile(kanban_home, "read-only-reviewer", "read_only")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Legacy unassigned task",
+            body="Legacy body.",
+        )
+        conn.execute(
+            "UPDATE tasks SET title = ?, body = ? WHERE id = ?",
+            ("Repair pull request 17", _pr_body(), task_id),
+        )
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            default_assignee="read-only-reviewer",
+            max_spawn=1,
+            reconcile_orphans=False,
+        )
+
+        assert result.spawned == []
+        assert result.auto_assigned_default == []
+        assert result.skipped_unassigned == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.assignee is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind IN ('assigned', 'claim_rejected')",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
 def test_specify_rejects_typed_write_body_with_read_only_owner_atomically(
     kanban_home,
 ):
@@ -378,6 +414,96 @@ def test_specify_rejects_typed_write_body_with_read_only_owner_atomically(
             "WHERE task_id = ? AND kind = 'specified'",
             (task_id,),
         ).fetchone()[0] == 0
+
+
+def test_specify_cannot_erase_admitted_pr_identity_before_reader_assignment(
+    kanban_home,
+):
+    _write_profile(kanban_home, "write-maintainer", "write")
+    _write_profile(kanban_home, "read-only-reviewer", "read_only")
+    original_body = _pr_body(action="repair_and_push")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Repair pull request 17",
+            body=original_body,
+            assignee="write-maintainer",
+            triage=True,
+        )
+
+        with pytest.raises(ValueError, match="preserve exact pull-request identity"):
+            kb.specify_triage_task(
+                conn,
+                task_id,
+                title="Review local evidence",
+                body="Untyped review prose.",
+                assignee="read-only-reviewer",
+                author="specifier",
+            )
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "triage"
+        assert task.title == "Repair pull request 17"
+        assert task.body == original_body
+        assert task.assignee == "write-maintainer"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'specified'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_specify_cannot_change_admitted_pr_action(kanban_home):
+    _write_profile(kanban_home, "write-maintainer", "write")
+    original_body = _pr_body(action="repair_and_push")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Repair pull request 17",
+            body=original_body,
+            assignee="write-maintainer",
+            triage=True,
+        )
+
+        with pytest.raises(ValueError, match="preserve exact pull-request identity"):
+            kb.specify_triage_task(
+                conn,
+                task_id,
+                body=_pr_body(action="verify_ci_receipt"),
+                author="specifier",
+            )
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "triage"
+        assert task.body == original_body
+
+
+def test_specify_may_add_metadata_without_changing_admitted_pr_identity(kanban_home):
+    _write_profile(kanban_home, "write-maintainer", "write")
+    original_body = _pr_body(action="repair_and_push")
+    replacement = json.loads(original_body)
+    replacement["diagnostic_note"] = "bounded local evidence"
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Repair pull request 17",
+            body=original_body,
+            assignee="write-maintainer",
+            triage=True,
+        )
+
+        assert kb.specify_triage_task(
+            conn,
+            task_id,
+            body=json.dumps(replacement, sort_keys=True),
+            author="specifier",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status in {"todo", "ready"}
+        assert json.loads(task.body)["diagnostic_note"] == "bounded local evidence"
 
 
 def test_decompose_rejects_read_only_typed_write_child_and_rolls_back_graph(
@@ -463,6 +589,29 @@ def test_read_only_exact_head_review_can_transition_and_claim(kanban_home):
         assert claimed is not None
         assert claimed.status == "running"
         assert claimed.assignee == "read-only-reviewer"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "check_mergeability",
+        "review_mergeability",
+        "inspect_merge_conflicts",
+        "read_credit_metadata",
+    ],
+)
+def test_read_action_objects_do_not_become_write_actions(kanban_home, action):
+    _write_profile(kanban_home, "read-only-reviewer", "read_only")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Inspect pull request 17",
+            body=_pr_body(action=action),
+            assignee="read-only-reviewer",
+        )
+
+        assert kb.get_task(conn, task_id).assignee == "read-only-reviewer"
 
 
 @pytest.mark.parametrize("action", ["review_and_approve", "check_and_comment"])
