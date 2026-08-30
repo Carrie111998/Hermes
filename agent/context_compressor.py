@@ -1327,6 +1327,13 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
+# OmniRoute and several OpenAI-compatible gateways reject transcripts at 800
+# message rows even when their token payload still fits.  Once compression is
+# already running, keep a bounded recent tail and force the older rows into the
+# summary window so token-based tail protection cannot produce an 800 -> 800
+# in-place no-op.
+_MESSAGE_COUNT_PRESSURE_THRESHOLD = 600
+_MESSAGE_COUNT_PRESSURE_TAIL = 200
 
 # Pre-LLM feasibility skip (#60451): when the compressible middle is below
 # this fraction of threshold_tokens (and a prior real-usage ineffectiveness
@@ -6735,6 +6742,20 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # Message-count pressure is independent from token pressure.  A long
+        # tool/background-heavy transcript can fit the tail token budget while
+        # exceeding a gateway's hard row limit, leaving no middle window and
+        # making every 413 retry a no-op.  Force a conservative boundary that
+        # retains the newest 200 rows and summarizes the older rows.  Align
+        # backward so an assistant tool-call and its results stay together.
+        if len(messages) >= _MESSAGE_COUNT_PRESSURE_THRESHOLD:
+            pressure_cut = self._align_boundary_backward(
+                messages,
+                max(compress_start + 1, len(messages) - _MESSAGE_COUNT_PRESSURE_TAIL),
+            )
+            if pressure_cut > compress_end:
+                compress_end = pressure_cut
         return compress_start < compress_end
 
     # ------------------------------------------------------------------
@@ -7630,6 +7651,20 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # Message-count pressure is independent from token pressure. A long
+        # tool/background-heavy transcript can fit the tail token budget while
+        # exceeding a gateway's hard row limit, leaving no middle window and
+        # making every 413 retry a no-op. Force a conservative boundary that
+        # retains the newest 200 rows and summarizes the older rows.
+        if len(messages) >= _MESSAGE_COUNT_PRESSURE_THRESHOLD:
+            pressure_cut = self._align_boundary_backward(
+                messages,
+                max(compress_start + 1, len(messages) - _MESSAGE_COUNT_PRESSURE_TAIL),
+            )
+            if pressure_cut > compress_end:
+                compress_end = pressure_cut
+                telemetry["message_count_pressure"] = True
 
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining
