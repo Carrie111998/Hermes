@@ -7570,6 +7570,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "files_read",
                     "files_written",
                     "output_tail",
+                    "timeout_seconds",
                 ):
                     value = kwargs.get(key)
                     if value is None:
