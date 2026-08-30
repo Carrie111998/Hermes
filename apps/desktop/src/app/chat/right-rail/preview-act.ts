@@ -528,7 +528,7 @@ async function runPreviewAction(
       return { error: 'That preview tab is not a browser — open a page with open_preview first.', success: false }
     }
 
-    const url = String((action as { url?: unknown }).url ?? '').trim()
+    const url = String(action.url ?? '').trim()
 
     if (!url) {
       return { error: 'navigate needs a url.', success: false }

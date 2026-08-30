@@ -80,6 +80,11 @@ export interface PreviewActAction {
   submit?: boolean
   text?: string
   to?: 'bottom' | 'top'
+  /** navigate: the address to go to. Like the history verbs, `navigate` is
+   *  answered by the PANE and never reaches the in-page engine — but it
+   *  arrives on the same wire, so it is declared here rather than cast for at
+   *  the one place that reads it. */
+  url?: string
 }
 
 export interface PreviewActResult {
