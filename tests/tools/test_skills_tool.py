@@ -859,8 +859,11 @@ class TestSkillViewCollisionDetection:
         )
 
     def test_nested_local_collides_with_top_level_external(self, tmp_path):
-        """The original bug scenario: nested local + top-level external,
-        same name. Now refuses with both paths surfaced."""
+        """Local-tier precedence: nested local + top-level external, same
+        name. The profile-local copy intentionally overrides the shared
+        external one (same doctrine as project-tier narrowing) — a bare
+        name must stay loadable or forced skill loads (e.g. the review
+        dispatcher's sdlc-review) hard-crash worker spawns."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -879,13 +882,37 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("explore-codebase")
 
         result = json.loads(raw)
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        assert "foundations/runtime" in str(result.get("skill_dir", ""))
+
+    def test_ambiguity_within_local_tier_still_refuses(self, tmp_path):
+        """Two same-named skills BOTH in the local tier stay ambiguous —
+        tier narrowing only resolves cross-tier collisions."""
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+
+        _make_skill(
+            local_dir,
+            "explore-codebase",
+            category="foundations/runtime",
+            body="LOCAL A",
+        )
+        _make_skill(
+            local_dir,
+            "explore-codebase",
+            category="other/place",
+            body="LOCAL B",
+        )
+
+        p1, p2 = self._patch_dirs(local_dir, [])
+        with p1, p2:
+            raw = skill_view("explore-codebase")
+
+        result = json.loads(raw)
         assert result["success"] is False
         assert "Ambiguous skill name 'explore-codebase'" in result["error"]
-        assert "matches" in result
         assert len(result["matches"]) == 2
-        # Both paths surfaced
-        assert any("foundations/runtime" in p for p in result["matches"])
-        assert any("external" in p for p in result["matches"])
         assert "hint" in result
 
 

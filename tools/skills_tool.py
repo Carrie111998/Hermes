@@ -1367,6 +1367,40 @@ def skill_view(
                 candidates = project_candidates
 
         if len(candidates) > 1:
+            # Local-tier collision resolution (same rationale as the
+            # project-tier narrowing above, one tier down): a skill in the
+            # active profile's own skills dir intentionally overrides a
+            # same-named skill inherited from external_dirs (the shared
+            # fleet library). Without this, a profile-local copy of a
+            # shared skill makes the bare name unresolvable — which
+            # hard-crashes any spawn that force-loads it (e.g. the kanban
+            # review dispatcher's forced sdlc-review) and auto-blocks
+            # finished work. Ambiguity WITHIN the local tier still refuses
+            # below.
+            local_root = _skills_dir()
+            try:
+                local_root_resolved = local_root.resolve()
+            except Exception:
+                local_root_resolved = local_root
+
+            def _in_local(smd: Path) -> bool:
+                try:
+                    resolved = smd.resolve()
+                except Exception:
+                    resolved = smd
+                try:
+                    resolved.relative_to(local_root_resolved)
+                    return True
+                except ValueError:
+                    return False
+
+            local_candidates = [
+                (sd, smd) for sd, smd in candidates if _in_local(smd)
+            ]
+            if local_candidates:
+                candidates = local_candidates
+
+        if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
