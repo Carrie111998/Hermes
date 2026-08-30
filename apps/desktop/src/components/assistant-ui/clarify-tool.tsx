@@ -32,6 +32,7 @@ import {
   clearClarifyRequest,
   normalizeChoices,
   RECOMMENDED_LABEL,
+  restoreClarifyRequest,
   sessionClarifyRequest,
   warnDroppedChoices
 } from '@/store/clarify'
@@ -1034,10 +1035,15 @@ function ClarifyToolBatchPending({ request }: { request: ClarifyRequest | null }
 
     try {
       await gateway?.request('clarify.respond', { answer: '', request_id: request.requestId })
-    } catch {
-      // The tool times out on its own; a failed skip must never block the UI.
+    } catch (error) {
+      // The skip never reached the backend, which is still blocked on
+      // `clarify.respond`. Restore the request so this card stays mounted and
+      // answerable instead of collapsing to the not-ready spinner with the turn
+      // parked behind it.
+      restoreClarifyRequest(request)
+      notifyError(error, copy.sendFailed)
     }
-  }, [gateway, request])
+  }, [copy.sendFailed, gateway, request])
 
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {

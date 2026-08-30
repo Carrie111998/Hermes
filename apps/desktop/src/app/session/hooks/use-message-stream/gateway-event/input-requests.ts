@@ -1,5 +1,11 @@
 import { translateNow } from '@/i18n'
-import { normalizeChoices, normalizeQuestions, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
+import {
+  clarifyToolCallAlias,
+  normalizeChoices,
+  normalizeQuestions,
+  setClarifyRequest,
+  warnDroppedChoices
+} from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
@@ -46,6 +52,15 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         : undefined
 
     if (requestId && questions.length > 0) {
+      // Bind BEFORE the record is installed: the alias comes from the clarify
+      // tool call this session just started, or from the record a reconnect is
+      // replaying — both of which the write below would otherwise erase.
+      const toolCallId = clarifyToolCallAlias(sessionId, requestId, { questions })
+
+      // Install the canonical record first, then project its row, then derive
+      // attention from that projection — never the other way round. A
+      // malformed payload (no request id, or no usable question) falls through
+      // all three and produces no row, no card, and no attention.
       setClarifyRequest({
         choices: null,
         lockedAnswers,
@@ -53,7 +68,8 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         question: '',
         questions,
         requestId,
-        sessionId: sessionId ?? null
+        sessionId: sessionId ?? null,
+        ...(toolCallId ? { toolCallId } : {})
       })
 
       if (sessionId) {
@@ -95,12 +111,15 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         warnDroppedChoices('gateway', question, rawChoices)
       }
 
+      const toolCallId = clarifyToolCallAlias(sessionId, requestId, { question })
+
       setClarifyRequest({
         requestId,
         question,
         choices: choices.length > 0 ? choices : null,
         multiSelect,
-        sessionId: sessionId ?? null
+        sessionId: sessionId ?? null,
+        ...(toolCallId ? { toolCallId } : {})
       })
 
       if (sessionId) {

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { textWithoutReferenceLines, WIRE_REFERENCE_KINDS } from '@/components/assistant-ui/reference-kinds'
 import { type ChatMessage, type ChatMessagePart, chatMessageText } from '@/lib/chat-messages'
 import { $approvalModes, approvalModeForProfile } from '@/store/approval-mode'
+import { $clarifyRequests, setClarifyRequest, settleClarifyRequest, unresolvedClarifyRequest } from '@/store/clarify'
 import { $desktopOnboarding, consumePendingCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
@@ -1762,5 +1763,245 @@ describe('overlayConcurrentMessageChanges', () => {
       { type: 'text', text: 'partial A' },
       { type: 'text', text: ' + delta B' }
     ])
+  })
+})
+
+// ─── Authoritative tail graft must not clobber the unresolved clarify ────────
+//
+// The field failure: a 741-message compaction-era session parks a blocking
+// clarify, then an authoritative newest-tail hydration lands. That tail is the
+// persisted transcript, and a clarify that has not returned yet is NOT
+// persisted — so the graft replaces the cached array and the running clarify
+// row disappears while `Needs your input` and the canonical request both
+// remain. The reconciliation must reassert the unresolved projection AFTER the
+// authoritative messages and the current runtime identity are known, including
+// when an older backend omits `pending_clarify` from the snapshot.
+
+const FIELD_QUESTION = 'Authorize the exact sandbox credential-read boundary?'
+const CURRENT_RUNTIME_ID = 'runtime-after-rebind'
+
+function persistedLongHistory(count: number): ChatMessage[] {
+  return Array.from({ length: count }, (_unused, index) => ({
+    id: `persisted-${index}`,
+    parts: [{ type: 'text' as const, text: `compaction-era turn ${index}` }],
+    role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+    rowId: index
+  }))
+}
+
+function unresolvedClarifyParts(messages: ChatMessage[]) {
+  return messages
+    .flatMap(message => message.parts)
+    .filter(part => part.type === 'tool-call' && part.toolName === 'clarify' && part.result === undefined)
+}
+
+describe('unresolved clarify survives an authoritative tail graft', () => {
+  beforeEach(() => {
+    $clarifyRequests.set({})
+  })
+
+  afterEach(() => {
+    $clarifyRequests.set({})
+  })
+
+  it('reasserts the canonical unresolved row when the resume snapshot omits pending_clarify', () => {
+    // 741 persisted rows plus the interim assistant boundary of the live turn.
+    const authoritativeTail: ChatMessage[] = [
+      ...persistedLongHistory(741),
+      {
+        id: 'inflight-assistant-segment-0-runtime-after-rebind',
+        interim: true,
+        parts: [{ type: 'text', text: 'sealed interim boundary' }],
+        pending: false,
+        role: 'assistant'
+      }
+    ]
+
+    // The live blocking clarify arrived before any result persisted, so the
+    // canonical record lives in the store under the CURRENT runtime identity.
+    setClarifyRequest({
+      choices: ['Allow', 'Deny'],
+      multiSelect: false,
+      question: FIELD_QUESTION,
+      requestId: 'req-field-graft',
+      sessionId: CURRENT_RUNTIME_ID
+    })
+
+    expect(unresolvedClarifyParts(authoritativeTail)).toHaveLength(0)
+
+    // Older backend: the resume/activate snapshot carries no pending_clarify.
+    const reconciled = ensurePendingClarifyToolRow(authoritativeTail, undefined, CURRENT_RUNTIME_ID)
+
+    const rows = unresolvedClarifyParts(reconciled)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.type === 'tool-call' && rows[0].toolCallId).toBe('req-field-graft')
+    expect(rows[0]?.type === 'tool-call' && rows[0].args).toMatchObject({
+      choices: ['Allow', 'Deny'],
+      question: FIELD_QUESTION
+    })
+    // The authoritative history itself is untouched.
+    expect(reconciled).toHaveLength(authoritativeTail.length)
+  })
+
+  it('is idempotent and preserves array identity when nothing changes', () => {
+    const authoritativeTail: ChatMessage[] = persistedLongHistory(741)
+
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: FIELD_QUESTION,
+      requestId: 'req-field-idempotent',
+      sessionId: CURRENT_RUNTIME_ID
+    })
+
+    const once = ensurePendingClarifyToolRow(authoritativeTail, undefined, CURRENT_RUNTIME_ID)
+    const twice = ensurePendingClarifyToolRow(once, undefined, CURRENT_RUNTIME_ID)
+
+    expect(unresolvedClarifyParts(twice)).toHaveLength(1)
+    expect(twice).toBe(once)
+  })
+
+  it('never invents a live row for a session with no canonical request', () => {
+    const authoritativeTail: ChatMessage[] = persistedLongHistory(12)
+
+    const reconciled = ensurePendingClarifyToolRow(authoritativeTail, undefined, 'runtime-with-no-clarify')
+
+    expect(reconciled).toBe(authoritativeTail)
+    expect(unresolvedClarifyParts(reconciled)).toHaveLength(0)
+  })
+
+  // \u2500\u2500\u2500 Identical question text must not conflate two request-id epochs \u2500\u2500\u2500\u2500\u2500\u2500
+  //
+  // An unresolved clarify row can outlive its epoch (the app died while the
+  // question was open, so no completion ever landed for it). When the agent
+  // asks the SAME thing again after the user's next message, the new request
+  // has its own id and must still get its own answerable row \u2014 the stranded
+  // older row must not be mistaken for it.
+  it('projects a new request whose text matches an unresolved row from an earlier epoch', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'assistant-old-epoch',
+        parts: [
+          {
+            args: { choices: ['Allow', 'Deny'], question: FIELD_QUESTION },
+            toolCallId: 'req-epoch-old',
+            toolName: 'clarify',
+            type: 'tool-call'
+          }
+        ],
+        role: 'assistant'
+      },
+      msg('user-boundary', 'user', 'never mind \u2014 keep going'),
+      msg('assistant-new-epoch', 'assistant', 'Continuing.')
+    ]
+
+    setClarifyRequest({
+      choices: ['Allow', 'Deny'],
+      multiSelect: false,
+      question: FIELD_QUESTION,
+      requestId: 'req-epoch-new',
+      sessionId: CURRENT_RUNTIME_ID
+    })
+
+    const reconciled = ensurePendingClarifyToolRow(messages, undefined, CURRENT_RUNTIME_ID)
+    const rows = unresolvedClarifyParts(reconciled)
+
+    expect(rows.some(part => part.type === 'tool-call' && part.toolCallId === 'req-epoch-new')).toBe(true)
+    // The stranded older row is left exactly as the authoritative history had
+    // it \u2014 this reasserts the live request, it does not rewrite history.
+    expect(rows.some(part => part.type === 'tool-call' && part.toolCallId === 'req-epoch-old')).toBe(true)
+  })
+
+  // \u2500\u2500\u2500 F-003: the joined same-epoch row id becomes a validated alias \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  //
+  // A cold resume rebuilds the canonical record from `pending_clarify`, which
+  // carries only the gateway request id. The persisted transcript still holds
+  // the row the MODEL started, under the model's tool_call_id \u2014 and that is the
+  // only id `tool.complete` will come back with. The join this reconciliation
+  // already performs is the evidence that the two ids are one clarify, so bind
+  // it: otherwise a clarify answered elsewhere never settles here and the next
+  // activation reprojects it as a fake live card.
+  it('binds the joined same-epoch row id so the model\u2019s completion settles the request', () => {
+    const messages: ChatMessage[] = [
+      msg('user-epoch', 'user', 'go ahead'),
+      {
+        id: 'assistant-live',
+        parts: [
+          {
+            args: { choices: ['Allow', 'Deny'], question: FIELD_QUESTION },
+            toolCallId: 'call-model-1',
+            toolName: 'clarify',
+            type: 'tool-call'
+          }
+        ],
+        role: 'assistant'
+      }
+    ]
+
+    setClarifyRequest({
+      choices: ['Allow', 'Deny'],
+      multiSelect: false,
+      question: FIELD_QUESTION,
+      requestId: 'req-resume-alias',
+      sessionId: CURRENT_RUNTIME_ID
+    })
+
+    const reconciled = ensurePendingClarifyToolRow(messages, undefined, CURRENT_RUNTIME_ID)
+
+    // The join is a no-op on the transcript: one row, still the model's.
+    expect(reconciled).toBe(messages)
+    expect(unresolvedClarifyRequest(CURRENT_RUNTIME_ID)?.toolCallId).toBe('call-model-1')
+
+    expect(settleClarifyRequest(CURRENT_RUNTIME_ID, { requestId: 'call-model-1', toolName: 'clarify' })).toBe(true)
+    expect($clarifyRequests.get()[CURRENT_RUNTIME_ID]).toBeUndefined()
+  })
+
+  it('never binds an alias from a row stranded in an earlier epoch', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'assistant-old-epoch',
+        parts: [
+          {
+            args: { choices: ['Allow', 'Deny'], question: FIELD_QUESTION },
+            toolCallId: 'call-stranded',
+            toolName: 'clarify',
+            type: 'tool-call'
+          }
+        ],
+        role: 'assistant'
+      },
+      msg('user-boundary', 'user', 'never mind \u2014 keep going'),
+      msg('assistant-new-epoch', 'assistant', 'Continuing.')
+    ]
+
+    setClarifyRequest({
+      choices: ['Allow', 'Deny'],
+      multiSelect: false,
+      question: FIELD_QUESTION,
+      requestId: 'req-new-epoch-alias',
+      sessionId: CURRENT_RUNTIME_ID
+    })
+
+    ensurePendingClarifyToolRow(messages, undefined, CURRENT_RUNTIME_ID)
+
+    expect(unresolvedClarifyRequest(CURRENT_RUNTIME_ID)?.toolCallId).toBeUndefined()
+    expect(settleClarifyRequest(CURRENT_RUNTIME_ID, { requestId: 'call-stranded', toolName: 'clarify' })).toBe(false)
+    expect($clarifyRequests.get()[CURRENT_RUNTIME_ID]?.requestId).toBe('req-new-epoch-alias')
+  })
+
+  it('does not project one runtime identity\u2019s request onto another', () => {
+    const authoritativeTail: ChatMessage[] = persistedLongHistory(12)
+
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: FIELD_QUESTION,
+      requestId: 'req-other-runtime',
+      sessionId: 'runtime-somewhere-else'
+    })
+
+    const reconciled = ensurePendingClarifyToolRow(authoritativeTail, undefined, CURRENT_RUNTIME_ID)
+
+    expect(unresolvedClarifyParts(reconciled)).toHaveLength(0)
   })
 })

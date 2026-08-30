@@ -537,12 +537,21 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (includesBlockingClarifyTrigger(parsed.messages)) {
-            if (stream) {
-              streamScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
-            } else {
-              nonStreamingScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
+            // Same reason as the batch clarify branch above: the trigger text
+            // stays in message history, so once the answered tool result is
+            // present the turn falls through to the canned reply — otherwise
+            // the mock re-raises the blocking clarify on every later completion.
+            const hasToolResult = Array.isArray(parsed.messages)
+              && parsed.messages.some((message: { role?: string }) => message?.role === 'tool')
+
+            if (!hasToolResult) {
+              if (stream) {
+                streamScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
+              } else {
+                nonStreamingScriptedTurn(res, model, BLOCKING_CLARIFY_TURN)
+              }
+              return
             }
-            return
           }
 
           if (isQueueStopTrigger) {

@@ -6,6 +6,26 @@ const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
 const DEFAULT_TIMEOUT_MS = 60_000
 
+/**
+ * Optional E2E-only override for the interpreter that runs the real gateway.
+ *
+ * Unset (the default, and what CI uses) keeps the shipped
+ * `uv run --active --no-sync python` launcher exactly as it was. Set to an
+ * absolute interpreter path, it runs that interpreter directly against the
+ * candidate source on `PYTHONPATH`, so a host whose `uv`-managed environment
+ * is empty can still exercise the real gateway. This is test-harness
+ * configuration only: no production or backend code reads it.
+ */
+const GATEWAY_PYTHON_ENV_VAR = 'HERMES_E2E_GATEWAY_PYTHON'
+
+function gatewayLaunchArgv(): { args: string[]; command: string } {
+  const override = process.env[GATEWAY_PYTHON_ENV_VAR]?.trim()
+  if (override) {
+    return { args: ['-m', 'tui_gateway.entry'], command: override }
+  }
+  return { args: ['run', '--active', '--no-sync', 'python', '-m', 'tui_gateway.entry'], command: 'uv' }
+}
+
 interface JsonRpcError {
   code?: number
   message?: string
@@ -71,7 +91,8 @@ export class RealSessionBuilder {
   private closed = false
 
   private constructor(hermesHome: string) {
-    this.child = spawn('uv', ['run', '--active', '--no-sync', 'python', '-m', 'tui_gateway.entry'], {
+    const { args, command } = gatewayLaunchArgv()
+    this.child = spawn(command, args, {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
@@ -134,6 +155,24 @@ export class RealSessionBuilder {
 
     await this.request('session.close', { session_id: runtimeId })
     return { runtimeId, sessionId }
+  }
+
+  /**
+   * How many rows the durable transcript actually holds.
+   *
+   * A long-session test that only counts the turns it asked for is asserting
+   * its own arithmetic. The clarify-durability spec needs a real floor on the
+   * persisted history it hydrates against, so it reads the count back from the
+   * same store the desktop will resume from.
+   */
+  async countPersistedMessages(sessionId: string): Promise<number> {
+    const resumed = await this.request<{ messages?: unknown[]; session_id?: string }>('session.resume', {
+      cols: 120,
+      session_id: sessionId,
+    })
+    const runtimeId = readString(resumed, 'session_id')
+    if (runtimeId) await this.request('session.close', { session_id: runtimeId })
+    return Array.isArray(resumed?.messages) ? resumed.messages.length : 0
   }
 
   async close(): Promise<void> {

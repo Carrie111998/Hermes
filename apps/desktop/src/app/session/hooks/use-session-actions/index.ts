@@ -10,7 +10,7 @@ import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { normalizeChoices, setClarifyRequest } from '@/store/clarify'
+import { hasClarifyRequest, normalizeChoices, rebindClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { openGatewayForAgent, openGatewayForProfile } from '@/store/gateway'
@@ -653,6 +653,17 @@ export function useSessionActions({
       const isCurrentResume = () =>
         resumeRequestRef.current === requestId && selectedStoredSessionIdRef.current === storedSessionId
 
+      // The runtime identity this conversation had when the resume STARTED.
+      // A pending clarify is keyed by the runtime that raised it, and every
+      // stale-cache transition below (cross-wired mapping, empty-transcript
+      // drop, session-gone catch) deletes the stored→runtime entry before the
+      // cold resume mints a replacement. Reading the map afterwards therefore
+      // answers `undefined` and the rebind has nothing to move, stranding the
+      // authority under a key nothing reads. Remembering the id here — read
+      // once, never written back — keeps the ONE move possible without
+      // reviving the cache entry those purges deliberately removed.
+      const runtimeIdAtResumeEntry = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+
       // Paint the click before the profile-resolve / gateway-swap awaits below,
       // so there's zero dead air: highlight the row instantly (the sidebar reads
       // $selectedStoredSessionId) and, for a cold target, drop the previous
@@ -975,8 +986,21 @@ export function useSessionActions({
                 )
               }
 
+              // Reconcile unconditionally, after the authoritative messages and
+              // the runtime identity are both settled: the graft above rebuilt
+              // the array from persisted history, and a clarify still blocking
+              // the turn is by definition not in it. The snapshot is used when
+              // the gateway sent one; otherwise the live record under this same
+              // runtime identity is the authority (older backends omit
+              // `pending_clarify`). Idempotent — the array is returned
+              // unchanged when the row is already present.
+              activatedMessages = ensurePendingClarifyToolRow(
+                activatedMessages,
+                activated.pending_clarify,
+                cachedRuntimeId
+              )
+
               if (pendingClarify) {
-                activatedMessages = ensurePendingClarifyToolRow(activatedMessages, activated.pending_clarify)
                 requestScrollToBottom()
               }
 
@@ -991,7 +1015,7 @@ export function useSessionActions({
                   // Resumed onto an already-running turn — that IS backend
                   // proof the turn is live (no message.start will replay).
                   turnLive: state.turnLive || running,
-                  needsInput: pendingApproval || pendingClarify || state.needsInput,
+                  needsInput: pendingApproval || pendingClarify || hasClarifyRequest(cachedRuntimeId) || state.needsInput,
                   // Adopting someone else's turn: we'll stream its reply
                   // without ever having received its prompt, so the settle
                   // path must not take the "I saw it all" shortcut.
@@ -1284,9 +1308,19 @@ export function useSessionActions({
             ? currentMessages
             : preserveLocalAssistantErrors(inFlightRecovery.messages, currentMessages)
 
-        if (resumed.pending_clarify) {
-          messagesForView = ensurePendingClarifyToolRow(messagesForView, resumed.pending_clarify)
-        }
+        // A cold resume mints a NEW runtime id for the same conversation, and
+        // the request is parked under the runtime that raised it. Translate
+        // that identity ONCE, here, before anything projects a row or looks up
+        // a card — otherwise the authority stays stranded under a key nothing
+        // reads and the transcript paints "needs input" with no answerable
+        // card. Rebinding is a move, so the old runtime keeps no actionable
+        // copy. Then reconcile unconditionally against that one resolved
+        // identity, snapshot-first and store-otherwise.
+        rebindClarifyRequest(
+          runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ?? runtimeIdAtResumeEntry,
+          resumed.session_id
+        )
+        messagesForView = ensurePendingClarifyToolRow(messagesForView, resumed.pending_clarify, resumed.session_id)
 
         // Fail-latch on the PRE-recovery transcript: an orphan journal tail
         // must not mask a lost transcript (a retry that reloads real history
@@ -1341,7 +1375,8 @@ export function useSessionActions({
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.
             turnLive: state.turnLive || resumedRunning,
-            needsInput: pendingApproval || pendingClarify || state.needsInput,
+            needsInput:
+              pendingApproval || pendingClarify || hasClarifyRequest(resumed.session_id) || state.needsInput,
             adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,
             ...(inFlightRecovery.applied
               ? {

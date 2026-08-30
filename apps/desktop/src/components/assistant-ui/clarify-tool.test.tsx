@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $activeSessionId } from '@/store/session'
 
@@ -672,5 +672,103 @@ describe('ClarifyTool sealed-message persistence', () => {
 
     expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
     expect(document.querySelector('[data-slot="tool-block"]')).toBeTruthy()
+  })
+})
+
+// ─── Rendered actionability survives a failed settlement ─────────────────────
+//
+// Store/row equality is not acceptance: the decisive predicate is exactly one
+// MOUNTED `[data-slot="clarify-inline"]` card with an enabled answer control
+// that responds with the ORIGINAL request id. A settlement RPC that fails
+// leaves the backend blocked on `clarify.respond`, so the card must stay
+// mounted and answerable instead of collapsing to the not-ready spinner.
+
+const liveCards = () => document.querySelectorAll('[data-slot="clarify-inline"]')
+
+const enabledAnswerControls = () =>
+  [...document.querySelectorAll<HTMLButtonElement | HTMLTextAreaElement>('[data-choice], textarea')].filter(
+    control => !control.disabled
+  )
+
+describe('ClarifyTool settlement failure keeps the card answerable', () => {
+  it('single card survives a failed Skip and still answers the original request id', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('socket closed'))
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', { answer: '', request_id: 'request-1' })
+    })
+
+    await waitFor(() => {
+      expect(liveCards()).toHaveLength(1)
+      expect(enabledAnswerControls().length).toBeGreaterThan(0)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', { answer: 'staging', request_id: 'request-1' })
+    })
+  })
+
+  it('batch card survives a failed Skip and stays answerable', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('socket closed'))
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+        { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+      ],
+      requestId: 'request-batch',
+      sessionId: 'session-1'
+    })
+    renderClarify(<ClarifyTool {...liveBatchProps()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', { answer: '', request_id: 'request-batch' })
+    })
+
+    await waitFor(() => {
+      expect(liveCards()).toHaveLength(1)
+      expect(screen.getByRole('button', { name: /red/ })).toBeTruthy()
+      expect(enabledAnswerControls().length).toBeGreaterThan(0)
+    })
+  })
+
+  it('single card clears exactly once when the answer succeeds', async () => {
+    const request = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', { answer: 'staging', request_id: 'request-1' })
+    })
+
+    await waitFor(() => {
+      expect($clarifyRequests.get()['session-1']).toBeUndefined()
+    })
+
+    expect(request).toHaveBeenCalledTimes(1)
   })
 })

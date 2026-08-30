@@ -1,4 +1,5 @@
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
+import { hasClarifyRequest, noteClarifyToolCall, settleClarifyRequest } from '@/store/clarify'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
 import { pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
@@ -48,6 +49,15 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
     flushQueuedDeltas(sessionId)
     upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type, occurredAt)
 
+    // The model's tool_call_id, held for the `clarify.request` that follows it.
+    // That request carries the gateway's own separately-minted id, and this is
+    // the only frame that names the id `tool.complete` will come back with.
+    // `tool.progress` is not a new tool call and must not re-arm a slot the
+    // request already consumed.
+    if (event.type === 'tool.start' && payload?.name === 'clarify') {
+      noteClarifyToolCall(sessionId, { args: payload.args, toolCallId: payload.tool_id })
+    }
+
     if (isActiveEvent) {
       setPetActivity({ reasoning: false, toolRunning: true })
     }
@@ -71,11 +81,31 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
         }
       }
 
-      // A pending clarify blocks the turn, so the first tool.complete after
-      // one is the clarify resolving — drop the "needs input" flag here so
-      // the sidebar indicator clears as soon as it's answered, not only at
-      // message.complete.
-      updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+      // A pending clarify blocks the turn, so the clarify's own completion is
+      // the answer landing — drop the "needs input" flag here rather than
+      // waiting for message.complete. Only a MATCHING completion may do it:
+      // the agent runs other tools in the same batch, and clearing on an
+      // unrelated one left the session quiet while Python was still blocked on
+      // `clarify.respond` with a card the sidebar no longer pointed at.
+      const settledClarify = settleClarifyRequest(sessionId, {
+        question: typeof payload?.args === 'object' && payload.args !== null
+          ? typeof (payload.args as { question?: unknown }).question === 'string'
+            ? ((payload.args as { question: string }).question)
+            : undefined
+          : undefined,
+        requestId: typeof payload?.tool_id === 'string' ? payload.tool_id : undefined,
+        toolName: typeof payload?.name === 'string' ? payload.name : undefined
+      })
+
+      if (settledClarify || !hasClarifyRequest(sessionId)) {
+        updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+      }
+
+      // This tool call is over, so it can never legitimately alias a request
+      // raised after it — drop the slot whether or not one was ever bound.
+      if (payload?.name === 'clarify') {
+        noteClarifyToolCall(sessionId, null)
+      }
 
       // terminal/process tool calls are the only things that spawn or reap
       // background processes — sync the composer status stack right after.
