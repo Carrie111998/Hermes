@@ -185,3 +185,98 @@ def test_migrate_heartbeat_to_session():
 def test_migrate_noop_without_source():
     assert migrate_heartbeat_to_session("hb-none-a", "hb-none-b") is False
     assert migrate_heartbeat_to_session("same", "same") is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# heartbeat model routing (#92579)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_get_heartbeat_route_defaults():
+    """With no heartbeat config, all fields are empty."""
+    from hermes_cli.heartbeat import _get_heartbeat_route
+    route = _get_heartbeat_route()
+    assert route["model"] == ""
+    assert route["provider"] == ""
+    assert route["reasoning_effort"] == ""
+
+
+def test_get_heartbeat_route_from_config(monkeypatch):
+    """heartbeat.{model,provider,reasoning_effort} are read from config."""
+    from hermes_cli import config as cfg_mod
+
+    monkeypatch.setattr(
+        cfg_mod, "load_config_readonly",
+        lambda: {"heartbeat": {
+            "model": "google/gemini-3-flash-preview",
+            "provider": "openrouter",
+            "reasoning_effort": "low",
+        }},
+    )
+    from hermes_cli.heartbeat import _get_heartbeat_route
+    route = _get_heartbeat_route()
+    assert route["model"] == "google/gemini-3-flash-preview"
+    assert route["provider"] == "openrouter"
+    assert route["reasoning_effort"] == "low"
+
+
+def test_has_heartbeat_route_config_false_by_default():
+    from hermes_cli.heartbeat import has_heartbeat_route_config
+    # Default config has empty heartbeat section
+    assert has_heartbeat_route_config() is False
+
+
+def test_has_heartbeat_route_config_true_when_set(monkeypatch):
+    from hermes_cli import config as cfg_mod
+
+    monkeypatch.setattr(
+        cfg_mod, "load_config_readonly",
+        lambda: {"heartbeat": {"model": "gpt-4o-mini"}},
+    )
+    from hermes_cli.heartbeat import has_heartbeat_route_config
+    assert has_heartbeat_route_config() is True
+
+
+def test_format_heartbeat_route_inherited():
+    from hermes_cli.heartbeat import format_heartbeat_route
+    assert format_heartbeat_route() == "inherited from session"
+
+
+def test_format_heartbeat_route_configured(monkeypatch):
+    from hermes_cli import heartbeat as hb_mod
+
+    monkeypatch.setattr(
+        hb_mod, "load_config_readonly",
+        lambda: {"heartbeat": {
+            "provider": "openrouter",
+            "model": "google/gemini-3-flash-preview",
+            "reasoning_effort": "low",
+        }},
+    )
+    result = hb_mod.format_heartbeat_route()
+    assert "provider=openrouter" in result
+    assert "model=google/gemini-3-flash-preview" in result
+    assert "reasoning=low" in result
+
+
+def test_status_line_shows_route_when_configured(monkeypatch):
+    """status_line() includes route hint when heartbeat config is set."""
+    from hermes_cli import heartbeat as hb_mod
+
+    monkeypatch.setattr(
+        hb_mod, "load_config_readonly",
+        lambda: {"heartbeat": {"model": "gpt-4o-mini"}},
+    )
+    mgr = hb_mod.HeartbeatManager(session_id="hb-route-sid")
+    mgr.set("check CI", 600)
+    status = mgr.status_line()
+    assert "route:" in status
+    assert "model=gpt-4o-mini" in status
+
+
+def test_status_line_no_route_when_unconfigured():
+    """status_line() omits route hint when no heartbeat config is set."""
+    mgr = HeartbeatManager(session_id="hb-no-route-sid")
+    mgr.set("check CI", 600)
+    status = mgr.status_line()
+    assert "route:" not in status

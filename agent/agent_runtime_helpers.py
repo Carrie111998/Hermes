@@ -4412,12 +4412,18 @@ def looks_like_codex_intermediate_ack(
 # Conservative "trailing continue-intent" detector for the said-continue-but-
 # stopped stall guard (agent.stall_guards). Matches only when the message TAIL
 # announces an immediate next action ("Let me now…", "I will now…",
-# "Next, I…"), which is the observed stall shape: the model narrates the next
-# step and then ends the turn with no tool call. Kept deliberately narrow so
+# "Next, I…") OR a readiness acknowledgment that should have been followed by
+# tool calls ("I'm ready", "I can do that", "standing by until allowed").
+# The readiness patterns address issue #6204: the model acknowledges a clear
+# instruction but ends the turn without executing. Kept deliberately narrow so
 # ordinary answers that merely contain "I will" mid-sentence never trip it.
 _TRAILING_CONTINUE_INTENT_RE = re.compile(
     r"(?:\blet me now\b|\bi(?:['\u2019])?ll now\b|\bi will now\b"
-    r"|\bnow i(?:['\u2019]ll| will)\b|\bnext[,:] i\b)"
+    r"|\bnow i(?:['\u2019]ll| will)\b|\bnext[,:] i\b"
+    r"|\bi(?:['\u2019]| a)?m ready\b|\bi can do that\b"
+    r"|\bi(?:['\u2019]| a)?m (?:sitting|standing) (?:tight|by)\b"
+    r"|\buntil (?:i(?:['\u2019]| a)?m (?:allowed|permitted)|i get (?:permission|approval))\b"
+    r")"
     r"[^.!?\n]{0,100}[.:\u2026]?\s*$",
     re.IGNORECASE,
 )

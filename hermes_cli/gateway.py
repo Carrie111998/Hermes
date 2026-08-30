@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -137,15 +138,22 @@ def _get_service_pids(all_profiles: bool = False) -> set:
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
-    # systemd always lists every hermes-gateway* unit regardless of scope.
+    # When all_profiles=True, list every hermes-gateway* unit (update path
+    # restarts the whole fleet).  When scoped to the current profile, query
+    # only the expected service name to avoid picking up gateways from a
+    # different HERMES_HOME root (#4671).
     if supports_systemd_services():
+        if all_profiles:
+            _unit_pattern = "hermes-gateway*"
+        else:
+            _unit_pattern = get_service_name() + ".service"
         for scope_args in [["systemctl", "--user"], ["systemctl"]]:
             try:
                 result = subprocess.run(
                     scope_args
                     + [
                         "list-units",
-                        "hermes-gateway*",
+                        _unit_pattern,
                         "--plain",
                         "--no-legend",
                         "--no-pager",
@@ -949,6 +957,34 @@ def _filter_venv_launcher_stubs(pids: list[int]) -> list[int]:
     return [p for p in pids if p not in drop]
 
 
+def _pid_hermes_home_matches(pid: int, expected_home: str) -> bool:
+    """Return True when *pid*'s ``HERMES_HOME`` env var matches *expected_home*.
+
+    Best-effort: returns ``False`` if the process has exited, access is denied,
+    psutil is unavailable, or the env var cannot be read.  This is a post-filter
+    — the caller already has a candidate PID from argv-based matching.
+    """
+    if pid <= 1:
+        return False
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return False
+    try:
+        proc_env = psutil.Process(pid).environ() or {}
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+    proc_home = proc_env.get("HERMES_HOME", "").strip()
+    if not proc_home:
+        # Process has no HERMES_HOME set — assume the platform default.
+        from hermes_constants import _get_platform_default_hermes_home
+
+        proc_home = str(_get_platform_default_hermes_home())
+    return Path(proc_home).resolve() == Path(expected_home).resolve()
+
+
 def find_gateway_pids(
     exclude_pids: set | None = None, all_profiles: bool = False
 ) -> list:
@@ -984,6 +1020,16 @@ def find_gateway_pids(
         include_restart_managers=include_restart_managers,
     ):
         _append_unique_pid(pids, pid, _exclude)
+    # Post-filter: when scoped to the current profile, exclude PIDs whose
+    # HERMES_HOME environment variable doesn't match.  The argv-based
+    # matching above can false-match a default-profile gateway running under
+    # a different HERMES_HOME root (#4671).
+    if not all_profiles:
+        try:
+            current_home = str(get_hermes_home().resolve())
+        except Exception:
+            current_home = str(get_hermes_home())
+        pids = [pid for pid in pids if _pid_hermes_home_matches(pid, current_home)]
     return pids
 
 
@@ -3704,6 +3750,40 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+def _is_ephemeral_path_entry(entry: str) -> bool:
+    """Return True if *entry* is a transient/session-specific PATH directory.
+
+    Ephemeral entries — temp directories, tool-specific session shims — should
+    never be baked into a persistent service definition.  They drift across
+    shells and can cause false stale-definition detection (#8125).
+    """
+    if not entry:
+        return False
+    try:
+        resolved = Path(entry).resolve()
+        return any(resolved.is_relative_to(root) for root in _EPHEMERAL_PATH_ROOTS)
+    except (OSError, ValueError):
+        return False
+
+
+# Canonical temp directories resolved once at import time.  On macOS the
+# system temp is ``/private/tmp`` (``/tmp`` is a symlink) and the user temp
+# is ``/private/var/folders/…/T``.  On Linux both collapse to ``/tmp``.
+# ``/var/tmp`` is the traditional long-lived temp dir on Linux.  Checking
+# all roots avoids false-positives on paths like ``/opt/tmpfs-mounted/bin``
+# while still catching ``/tmp/…``, ``/var/tmp/…``, and
+# ``/private/var/folders/…/T/…`` (#8125).
+_EPHEMERAL_PATH_ROOTS = tuple(
+    dict.fromkeys(
+        [
+            Path("/tmp").resolve(),
+            Path("/var/tmp").resolve(),
+            Path(tempfile.gettempdir()).resolve(),
+        ]
+    )
+)
+
+
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
@@ -5207,7 +5287,12 @@ def generate_launchd_plist() -> str:
     _append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(
         dict.fromkeys(
-            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
+            priority_dirs
+            + [
+                p
+                for p in os.environ.get("PATH", "").split(":")
+                if p and not _is_ephemeral_path_entry(p)
+            ]
         )
     )
 

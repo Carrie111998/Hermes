@@ -394,3 +394,50 @@ def test_ignores_conversational_future_offers():
     assert not trailing_continue_intent(
         "If you want, I will happily review the PR once CI is green. Just say so!"
     )
+
+
+# ── issue #6204: readiness-ack stall patterns ────────────────────────────
+
+
+def test_detects_trailing_im_ready():
+    assert trailing_continue_intent("I'm ready.")
+    assert trailing_continue_intent("I am ready to proceed")
+    assert trailing_continue_intent("Okay, I'm ready")
+
+
+def test_detects_trailing_i_can_do_that():
+    assert trailing_continue_intent("I can do that.")
+    assert trailing_continue_intent("Sure, I can do that")
+
+
+def test_detects_trailing_sitting_tight():
+    # The exact pattern from repro #1 in issue #6204.
+    assert trailing_continue_intent(
+        "I hear you, and I'm sitting tight until I'm allowed to run the diagnostics."
+    )
+
+
+def test_detects_trailing_standing_by():
+    assert trailing_continue_intent("I'm standing by.")
+
+
+def test_detects_trailing_until_allowed():
+    assert trailing_continue_intent("Waiting until I'm allowed to proceed.")
+    assert trailing_continue_intent("I'll stay here until I get permission.")
+
+
+def test_ignores_ready_mid_sentence():
+    # "I'm ready" mid-sentence with substantive content after — not a stall.
+    assert not trailing_continue_intent(
+        "I'm ready to explain the architecture. First, the prompt cache layer "
+        "keeps the system prompt byte-stable across turns. Second, the tool "
+        "schema is sent on every API call."
+    )
+
+
+def test_ignores_i_can_do_that_with_continuation():
+    # "I can do that" followed by actual work description — not a dangling ack.
+    assert not trailing_continue_intent(
+        "I can do that. Here's the implementation: "
+        + "x" * 200
+    )

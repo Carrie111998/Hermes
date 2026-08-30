@@ -53,8 +53,13 @@ def _clean_inflight():
     Clears the guard bookkeeping defensively: on the unfixed scheduler only
     ``_running_job_ids`` exists; the age/future dicts and counters appear
     with the fix, and clearing them keeps the same file hermetic on both.
+    Also resets pool state and fire owners to avoid xdist cross-test
+    contamination.
     """
+    sched._parallel_pool = None
+    sched._parallel_pool_max_workers = None
     sched._running_job_ids.clear()
+    sched._running_fire_owners.clear()
     for attr in ("_running_since", "_running_futures", "_forced_releases"):
         obj = getattr(sched, attr, None)
         if obj is not None:
@@ -62,7 +67,12 @@ def _clean_inflight():
     if hasattr(sched, "_forced_release_count"):
         sched._forced_release_count = 0
     yield
+    if hasattr(sched, "_shutdown_parallel_pool"):
+        sched._shutdown_parallel_pool()
+    sched._parallel_pool = None
+    sched._parallel_pool_max_workers = None
     sched._running_job_ids.clear()
+    sched._running_fire_owners.clear()
     for attr in ("_running_since", "_running_futures", "_forced_releases"):
         obj = getattr(sched, attr, None)
         if obj is not None:
