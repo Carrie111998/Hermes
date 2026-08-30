@@ -78,7 +78,22 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            #
+            # LOCAL PATCH (see ~/.hermes/local-patches/): don't fully
+            # .resolve() sys.executable — that follows the venv/bin symlink
+            # all the way down into the current
+            # .hermes-runtime/python/generation-<hash>/ tree and bakes that
+            # literal, doomed path into the installed .desktop file's Exec=.
+            # `hermes update` rotates to a new generation and can prune the
+            # old one, so the next walker/wofi launch silently execs a
+            # deleted binary (Terminal=false swallows the failure) until
+            # `hermes desktop` happens to be run by hand again. venv/bin/python
+            # is the symlink `hermes update` atomically repoints — use that
+            # stable, unresolved path instead when it exists.
+            venv_python = resolved.parent / "venv" / "bin" / "python"
+            if not venv_python.is_file():
+                venv_python = Path(sys.executable).resolve()
+            argv = [str(venv_python), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
