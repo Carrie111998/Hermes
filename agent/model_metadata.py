@@ -594,6 +594,10 @@ DEFAULT_CONTEXT_LENGTHS = {
     "mimo-v2-omni": 262144,
     "mimo-v2-flash": 262144,
     "zai-org/GLM-5": 202752,
+    # Meta Muse Spark — 1M context (api.meta.ai, verified via models.dev opencode/meta)
+    # Covers muse-spark-1.1, 1.2, 1.2-contributor, 1.2-contributor-free
+    "muse-spark": 1_048_576,
+    "muse": 1_048_576,
 }
 
 # xAI Grok models that ACCEPT the `reasoning.effort` parameter on
