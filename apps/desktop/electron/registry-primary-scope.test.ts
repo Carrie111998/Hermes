@@ -30,7 +30,10 @@ describe('registry-primary REST scoping (#98578)', () => {
   })
 
   it('the stamped descriptor scopes a profile read the same way a fresh-dial remote does', () => {
+    // Remote/cloud primary descriptors carry no remoteProfile — that is the
+    // isolated-SSH contract — so both shapes below only differ by the stamp.
     const reusedPrimaryDescriptor = {
+      remoteProfile: null,
       baseUrl: 'http://127.0.0.1:8643',
       profile: 'architect',
       connectionId: 'wsl-gentoo',
@@ -43,12 +46,15 @@ describe('registry-primary REST scoping (#98578)', () => {
 
     // Pre-fix shape (no stamp): the translation branch leaves the path
     // unscoped, so the backend serves its home profile's config.
+    const unstampedPrimaryDescriptor = {
+      remoteProfile: null,
+      baseUrl: 'http://127.0.0.1:8643',
+      profile: 'architect',
+      connectionId: 'wsl-gentoo'
+    }
+
     expect(
-      pathForRegistryBackendRequest('/api/config', 'architect', {
-        baseUrl: 'http://127.0.0.1:8643',
-        profile: 'architect',
-        connectionId: 'wsl-gentoo'
-      })
+      pathForRegistryBackendRequest('/api/config', 'architect', unstampedPrimaryDescriptor)
     ).toBe('/api/config')
   })
 })
