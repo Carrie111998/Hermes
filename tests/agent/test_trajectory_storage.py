@@ -336,17 +336,26 @@ def _assert_lock_contention_times_out(tmp_path, monkeypatch):
         stdout=subprocess.PIPE,
         text=True,
     )
-    assert holder.stdout is not None
-    assert holder.stdout.readline().strip() == "locked"
-    monkeypatch.setattr(
-        trajectory_storage, "_TRAJECTORY_LOCK_TIMEOUT_SECONDS", 0.1, raising=False
-    )
-    started = time.monotonic()
     try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "locked"
+        monkeypatch.setattr(
+            trajectory_storage,
+            "_TRAJECTORY_LOCK_TIMEOUT_SECONDS",
+            0.1,
+            raising=False,
+        )
+        started = time.monotonic()
         saved = save_trajectory([], "test-model", True, path)
         elapsed = time.monotonic() - started
     finally:
-        holder.wait(timeout=5)
+        if holder.poll() is None:
+            holder.terminate()
+        try:
+            holder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=5)
 
     assert saved is False
     assert elapsed < 0.75
@@ -354,11 +363,13 @@ def _assert_lock_contention_times_out(tmp_path, monkeypatch):
 
 
 @pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
 def test_linux_lock_contention_times_out_without_writing(tmp_path, monkeypatch):
     _assert_lock_contention_times_out(tmp_path, monkeypatch)
 
 
 @pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
 def test_macos_lock_contention_times_out_without_writing(tmp_path, monkeypatch):
     _assert_lock_contention_times_out(tmp_path, monkeypatch)
 
@@ -433,6 +444,55 @@ def test_aliases_share_one_append_critical_section(
             "primary",
             "alias",
         }
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
+def test_plain_named_alias_to_gzip_is_rejected_across_processes(
+    tmp_path, alias_kind
+):
+    target = tmp_path / "target.jsonl.gz"
+    alias = tmp_path / "alias.jsonl"
+    assert save_trajectory([], "initial", True, target) is True
+    if alias_kind == "symlink":
+        alias.symlink_to(target)
+    else:
+        os.link(target, alias)
+    before = target.read_bytes()
+    code = (
+        "import sys;"
+        "from agent.trajectory import save_trajectory;"
+        "saved=save_trajectory([], 'must-not-append', True, sys.argv[1]);"
+        "print(saved, flush=True);"
+        "raise SystemExit(0 if not saved else 2)"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(alias)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
+    assert target.read_bytes() == before
+    with gzip.open(target, "rt", encoding="utf-8") as stream:
+        assert [json.loads(line)["model"] for line in stream] == ["initial"]
+
+
+def test_gzip_named_alias_to_plain_is_rejected_without_modifying_stream(tmp_path):
+    target = tmp_path / "target.jsonl"
+    alias = tmp_path / "alias.jsonl.gz"
+    assert save_trajectory([], "initial", True, target) is True
+    alias.symlink_to(target)
+    before = target.read_bytes()
+
+    assert save_trajectory([], "must-not-append", True, alias) is False
+
+    assert target.read_bytes() == before
+    assert json.loads(target.read_text(encoding="utf-8"))["model"] == "initial"
 
 
 def test_mixed_directory_discovery_is_sorted_and_has_no_duplicates(tmp_path):

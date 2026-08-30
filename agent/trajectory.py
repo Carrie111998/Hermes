@@ -33,6 +33,7 @@ _trajectory_lock_guard = threading.Lock()
 _trajectory_locks: dict[tuple[int, int], threading.Lock] = {}
 _TRAJECTORY_LOCK_TIMEOUT_SECONDS = 10.0
 _TRAJECTORY_LOCK_POLL_SECONDS = 0.05
+_GZIP_MAGIC = b"\x1f\x8b"
 
 
 def _acquire_os_lock(lock_file, deadline: float) -> None:
@@ -120,6 +121,25 @@ def _validate_existing_gzip(stream) -> None:
         stream.seek(0, os.SEEK_END)
 
 
+def _existing_trajectory_format(stream) -> str | None:
+    """Detect a nonempty trajectory as gzip or plain from its bytes."""
+    if os.fstat(stream.fileno()).st_size == 0:
+        return None
+    stream.seek(0)
+    magic = stream.read(len(_GZIP_MAGIC))
+    stream.seek(0, os.SEEK_END)
+    return "gzip" if magic == _GZIP_MAGIC else "plain"
+
+
+def _validate_trajectory_format(stream, expected_format: str) -> None:
+    actual_format = _existing_trajectory_format(stream)
+    if actual_format is not None and actual_format != expected_format:
+        raise ValueError(
+            f"trajectory format conflict: path requests {expected_format}, "
+            f"existing file is {actual_format}"
+        )
+
+
 def _append_payload(stream, payload: bytes) -> None:
     """Durably append one complete member/line or restore the old length."""
     original_size = os.fstat(stream.fileno()).st_size
@@ -186,9 +206,11 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
 
     try:
         line = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
-        payload = gzip.compress(line) if str(filename).endswith(".gz") else line
+        expected_format = "gzip" if str(filename).endswith(".gz") else "plain"
+        payload = gzip.compress(line) if expected_format == "gzip" else line
         with _trajectory_append_lock(filename) as stream:
-            if str(filename).endswith(".gz"):
+            _validate_trajectory_format(stream, expected_format)
+            if expected_format == "gzip":
                 _validate_existing_gzip(stream)
             _append_payload(stream, payload)
         logger.info("Trajectory saved to %s", filename)

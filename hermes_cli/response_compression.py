@@ -39,6 +39,7 @@ _EXCLUDED_EXACT_PATHS = {
     "/api/fs/read-text",
     "/api/logs",
     "/api/media",
+    "/api/ops/backup/download",
 }
 # Route families that contain one-time tokens, secrets, raw configuration, or
 # authentication/session material. Match only the root or a slash descendant.
@@ -74,10 +75,9 @@ def _quality(parameters: list[str]) -> float:
     seen = False
     for parameter in parameters:
         name, separator, raw_value = parameter.partition("=")
-        if name.strip().lower() != "q" or seen or not separator:
+        if name.lower() != "q" or seen or not separator:
             return 0.0
         seen = True
-        raw_value = raw_value.strip()
         if not _QVALUE_RE.fullmatch(raw_value):
             return 0.0
         quality = float(raw_value)
