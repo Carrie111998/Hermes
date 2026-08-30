@@ -195,6 +195,7 @@ export interface SessionResumeResponse {
   session_id: string
   started_at?: number
   status?: LiveSessionStatus
+  todo_state?: { revision?: number; todos?: unknown[] }
 }
 
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
@@ -232,6 +233,7 @@ export interface SessionActivateResponse {
   session_key?: string
   started_at?: number
   status?: LiveSessionStatus
+  todo_state?: { revision?: number; todos?: unknown[] }
 }
 
 export interface SessionListItem {
@@ -703,6 +705,7 @@ export type GatewayEvent =
         inline_diff?: string
         name?: string
         result_text?: string
+        revision?: number
         summary?: string
         tool_id: string
         todos?: unknown[]
@@ -710,6 +713,7 @@ export type GatewayEvent =
       session_id?: string
       type: 'tool.complete'
     }
+  | { payload: { revision?: number; todos?: unknown[] }; session_id?: string; type: 'todo.updated' }
   | {
       payload: {
         answers?: Record<string, string>
