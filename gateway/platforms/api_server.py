@@ -7330,11 +7330,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
-                    result = agent.run_conversation(
+                    from gateway.api_goal_runtime import run_goal_aware_turn
+
+                    goal_events: List[Dict[str, Any]] = []
+
+                    def _run_turn(message, history):
+                        return agent.run_conversation(
+                            user_message=message,
+                            conversation_history=history,
+                            task_id=effective_task_id,
+                        )
+
+                    result = run_goal_aware_turn(
+                        session_id=session_id or effective_task_id,
                         user_message=user_message,
                         conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                        run_turn=_run_turn,
+                        status_callback=goal_events.append,
+                        should_stop=(
+                            (lambda: active_run_id in self._stopping_run_ids)
+                            if active_run_id else None
+                        ),
                     )
+                    if goal_events:
+                        result["goal_events"] = goal_events
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -7836,10 +7855,32 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
+                            from gateway.api_goal_runtime import run_goal_aware_turn
+
+                            def _goal_event(event: Dict[str, Any]) -> None:
+                                payload = dict(event)
+                                payload.update({
+                                    "run_id": run_id,
+                                    "timestamp": time.time(),
+                                })
+                                loop.call_soon_threadsafe(
+                                    _put_event_if_active, payload
+                                )
+
+                            def _run_turn(message, history):
+                                return agent.run_conversation(
+                                    user_message=message,
+                                    conversation_history=history,
+                                    task_id=effective_task_id,
+                                )
+
+                            r = run_goal_aware_turn(
+                                session_id=session_id or effective_task_id,
                                 user_message=user_message,
                                 conversation_history=conversation_history,
-                                task_id=effective_task_id,
+                                run_turn=_run_turn,
+                                status_callback=_goal_event,
+                                should_stop=lambda: run_id in self._stopping_run_ids,
                             )
                         finally:
                             # Worker finished (interrupted or complete) —

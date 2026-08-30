@@ -12,6 +12,7 @@ Covers:
 import asyncio
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +26,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from hermes_cli import goals
 from tools import approval as approval_mod
 
 
@@ -120,6 +122,24 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+@pytest.fixture
+def api_goal_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(str(home))
+    goals._DB_CACHE.clear()
+    yield home
+    reset_hermes_home_override(token)
+    goals._DB_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +358,54 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_goal_runs_continue_and_emit_native_lifecycle_events(
+        self, adapter, api_goal_home
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent") as mock_create,
+                patch(
+                    "hermes_cli.goals.judge_goal",
+                    side_effect=[
+                        ("continue", "one step remains", False, None, False),
+                        ("done", "objective complete", False, None, False),
+                    ],
+                ),
+                patch(
+                    "hermes_cli.goals.gather_background_processes",
+                    return_value=[],
+                ),
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = [
+                    {"final_response": "first turn"},
+                    {"final_response": "finished"},
+                ]
+                mock_agent.session_prompt_tokens = 10
+                mock_agent.session_completion_tokens = 5
+                mock_agent.session_total_tokens = 15
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "/goal finish the migration",
+                        "session_id": "api-goal-run",
+                    },
+                )
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert mock_agent.run_conversation.call_count == 2
+        assert '"event": "goal.started"' in body
+        assert body.count('"event": "goal.status"') == 2
+        assert '"verdict": "done"' in body
+        assert '"event": "run.completed"' in body
+        assert '"output": "finished"' in body
 
 
     @pytest.mark.asyncio
