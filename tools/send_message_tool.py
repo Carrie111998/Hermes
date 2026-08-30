@@ -6,6 +6,8 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import html
+import inspect
 import json
 import logging
 import os
@@ -262,7 +264,10 @@ def send_message_tool(args, **kw):
 
 
 def send_telegram_notification_pane(
-    *, message: str, button_rows: list[list[dict[str, str]]]
+    *,
+    message: str,
+    button_rows: list[list[dict[str, str]]],
+    items: list[dict[str, object]] | None = None,
 ) -> dict:
     """Send an internal notification to the Telegram home chat with trusted actions.
 
@@ -270,7 +275,9 @@ def send_telegram_notification_pane(
     Product notifications can offer trusted managed actions and Portal deep
     links without giving an arbitrary tool caller a second, Telegram-specific
     message surface. Rows are explicit so each skill keeps its action and link
-    together in Telegram's compact inline keyboard.
+    together. Bot API 10.3 clients render the trusted controls directly inside
+    each rich-message item; the compact inline keyboard is retained as a safe
+    fallback for older Bot API servers and clients.
     """
     prepare_send_message_platforms()
     try:
@@ -286,6 +293,7 @@ def send_telegram_notification_pane(
             return _error("Telegram has no configured home channel")
 
         safe_rows: list[list[dict[str, str]]] = []
+        safe_rows_by_item: list[list[dict[str, str]]] = []
         button_count = 0
         for row in button_rows[:8]:
             safe_row: list[dict[str, str]] = []
@@ -313,8 +321,48 @@ def send_telegram_notification_pane(
                         "callback_data": callback_data,
                     })
                     button_count += 1
+            safe_rows_by_item.append(safe_row)
             if safe_row:
                 safe_rows.append(safe_row)
+
+        rich_message_html = None
+        if items:
+            rich_item_parts: list[str] = []
+            for item, item_buttons in zip(items[:8], safe_rows_by_item):
+                heading = html.escape(str(item.get("heading") or "").strip())
+                detail = html.escape(str(item.get("detail") or "").strip())
+                if not heading or not detail:
+                    continue
+                controls: list[str] = []
+                for button in item_buttons:
+                    label = html.escape(button["label"])
+                    if button.get("url"):
+                        controls.append(
+                            '<tg-button type="url" url="'
+                            f'{html.escape(button["url"], quote=True)}">'
+                            f"{label}</tg-button>"
+                        )
+                    else:
+                        controls.append(
+                            '<tg-button type="callback_data" style="primary" data="'
+                            f'{html.escape(button["callback_data"], quote=True)}">'
+                            f"{label}</tg-button>"
+                        )
+                control_html = f"<br/>{' '.join(controls)}" if controls else ""
+                rich_item_parts.append(
+                    f"<p><b>{heading}</b><br/>{detail}{control_html}</p>"
+                )
+            if rich_item_parts:
+                item_count = len(rich_item_parts)
+                rich_parts = [
+                    "<h3>Collective Wisdom</h3>",
+                    (
+                        f"<p>{item_count} new "
+                        f"{'update' if item_count == 1 else 'updates'}</p>"
+                    ),
+                    *rich_item_parts,
+                ]
+                rich_message_html = "".join(rich_parts)
 
         from model_tools import _run_async
 
@@ -325,6 +373,7 @@ def send_telegram_notification_pane(
                 message,
                 disable_link_previews=True,
                 action_button_rows=safe_rows,
+                rich_message_html=rich_message_html,
             )
         )
         return result if isinstance(result, dict) else {"success": bool(result)}
@@ -1493,6 +1542,7 @@ async def _send_telegram(
     url_buttons=None,
     action_buttons=None,
     action_button_rows=None,
+    rich_message_html=None,
 ):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
@@ -1578,6 +1628,73 @@ async def _send_telegram(
                 )
             if effective_thread_id is not None:
                 thread_kwargs["message_thread_id"] = effective_thread_id
+
+        if rich_message_html and not media_files:
+            raw_request = getattr(bot, "do_api_request", None)
+            if inspect.iscoroutinefunction(raw_request):
+                rich_payload = {
+                    "chat_id": int_chat_id,
+                    "rich_message": {"html": rich_message_html},
+                    **thread_kwargs,
+                }
+                if disable_link_previews:
+                    rich_payload["link_preview_options"] = {"is_disabled": True}
+                try:
+                    rich_result = await raw_request(
+                        "sendRichMessage", api_kwargs=rich_payload
+                    )
+                except Exception as rich_error:
+                    error_name = rich_error.__class__.__name__.lower()
+                    error_code = getattr(rich_error, "error_code", None)
+                    error_text = str(rich_error).lower()
+                    permanent_rejection = (
+                        error_name in {"badrequest", "endpointnotfound"}
+                        or error_code in {400, 404}
+                        or isinstance(
+                            rich_error,
+                            (AttributeError, TypeError, NotImplementedError),
+                        )
+                        or (
+                            ("method" in error_text or "endpoint" in error_text)
+                            and (
+                                "not found" in error_text
+                                or "does not exist" in error_text
+                            )
+                        )
+                        or "unsupported" in error_text
+                        or "not implemented" in error_text
+                    )
+                    if not permanent_rejection:
+                        logger.warning(
+                            "Telegram rich notification failed transiently; "
+                            "not resending to avoid a duplicate: %s",
+                            _sanitize_error_text(rich_error),
+                        )
+                        return _error(
+                            "Telegram rich notification failed: "
+                            f"{_sanitize_error_text(rich_error)}"
+                        )
+                    logger.debug(
+                        "Telegram rejected the Bot API 10.3 rich notification; "
+                        "falling back to an inline keyboard: %s",
+                        _sanitize_error_text(rich_error),
+                    )
+                else:
+                    message_id = None
+                    if isinstance(rich_result, dict):
+                        message_id = rich_result.get("message_id")
+                        if message_id is None:
+                            message_id = (rich_result.get("result") or {}).get(
+                                "message_id"
+                            )
+                    else:
+                        message_id = getattr(rich_result, "message_id", None)
+                    return {
+                        "success": True,
+                        "message_id": (
+                            str(message_id) if message_id is not None else None
+                        ),
+                    }
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).

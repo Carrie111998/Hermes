@@ -311,27 +311,27 @@ class WisdomConsumption:
 
     @staticmethod
     def _telegram_notification_text(event: dict[str, Any]) -> tuple[str, str]:
-        name = escape(str(event["skill_name"]))
+        name = str(event["skill_name"])
         version = f" · v{event['version']}" if event.get("version") else ""
         category = str(event["category"])
         state = str(event.get("state") or "")
         if category == "publication_decision":
             if state in {"published", "approved"}:
-                return "✅ <b>Your skill was published</b>", f"{name}{version}"
+                return "✅ Your skill was published", f"{name}{version}"
             if state == "changes_requested":
-                return "✏️ <b>Your skill needs changes</b>", f"{name}{version}"
+                return "✏️ Your skill needs changes", f"{name}{version}"
             if state in {"declined", "rejected"}:
-                return "↩️ <b>Your skill was not published</b>", f"{name}{version}"
-            return "📣 <b>Your contribution changed</b>", f"{name}{version}"
+                return "↩️ Your skill was not published", f"{name}{version}"
+            return "📣 Your contribution changed", f"{name}{version}"
         if category == "new_skill":
-            return "🆕 <b>New skill from your team</b>", f"{name}{version}"
+            return "🆕 New skill from your team", f"{name}{version}"
         if category == "installed":
-            return "⬇️ <b>Installed on this device</b>", f"{name}{version}"
+            return "⬇️ Installed on this device", f"{name}{version}"
         if category == "updated":
-            return "✅ <b>Updated on this device</b>", f"{name}{version}"
+            return "✅ Updated on this device", f"{name}{version}"
         if category == "update_available":
-            return "⬆️ <b>Update available</b>", f"{name}{version}"
-        return "⚠️ <b>Installed skill is unavailable</b>", f"{name}{version}"
+            return "⬆️ Update available", f"{name}{version}"
+        return "⚠️ Installed skill is unavailable", f"{name}{version}"
 
     def _remote_installations(self) -> dict[str, dict[str, Any]]:
         identity = self.store.installation_identity()
@@ -1140,9 +1140,11 @@ class WisdomConsumption:
             f"{len(selected)} new {'update' if len(selected) == 1 else 'updates'}",
         ]
         button_rows: list[list[dict[str, str]]] = []
+        rich_items: list[dict[str, str]] = []
         for event in selected:
             heading, detail = self._telegram_notification_text(event)
-            lines.extend(["", heading, detail])
+            lines.extend(["", f"<b>{escape(heading)}</b>", escape(detail)])
+            rich_items.append({"heading": heading, "detail": detail})
             row: list[dict[str, str]] = []
             if event["category"] == "new_skill":
                 row.append({
@@ -1160,13 +1162,16 @@ class WisdomConsumption:
                     "label": "View ↗",
                     "url": portal_url,
                 })
-            if row:
-                button_rows.append(row)
+            # Keep one row per notification even when an item has no actions,
+            # so rich-message controls cannot drift onto the next skill.
+            button_rows.append(row)
         try:
             from tools.send_message_tool import send_telegram_notification_pane
 
             raw = send_telegram_notification_pane(
-                message="\n".join(lines), button_rows=button_rows
+                message="\n".join(lines),
+                button_rows=button_rows,
+                items=rich_items,
             )
             result = json.loads(raw) if isinstance(raw, str) else raw
         except Exception as exc:

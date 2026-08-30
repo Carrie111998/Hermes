@@ -498,6 +498,12 @@ def test_feed_cursor_is_durable_deduplicated_and_telegram_uses_home_target(
             }
         ]
     ]
+    assert calls[0]["items"] == [
+        {
+            "heading": "✅ Updated on this device",
+            "detail": "managed-skill · v2",
+        }
+    ]
 
 
 def test_telegram_update_available_offers_verified_update_action(
@@ -543,6 +549,12 @@ def test_telegram_update_available_offers_verified_update_action(
                 "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/skill-1?version=2",
             },
         ]
+    ]
+    assert calls[0]["items"] == [
+        {
+            "heading": "⬆️ Update available",
+            "detail": "managed-skill · v2",
+        }
     ]
 
 
@@ -634,6 +646,12 @@ def test_notifications_resolve_org_skill_names_filter_noise_and_deep_link(
                 "url": "http://127.0.0.1:3111/orgs/org-1/wisdom/skills/remote-skill?version=3",
             },
         ]
+    ]
+    assert calls[0]["items"] == [
+        {
+            "heading": "🆕 New skill from your team",
+            "detail": "team-runbook · v3",
+        }
     ]
 
     manager.notifications(mark_seen=True)
