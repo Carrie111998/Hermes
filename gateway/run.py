@@ -13850,8 +13850,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Re-arm heartbeat watches orphaned by this restart (the in-memory
         # registry starts empty every boot; see _resume_heartbeat_watches).
-        # One-shot: it returns after the scan, so _spawn_supervised's
-        # clean-exit rule correctly never respawns it.
+        # Like _loop_wakeup_watcher above, this ticks for the life of the
+        # process rather than scanning once, so a transient startup race
+        # (adapter not yet connected, session_store not yet warm) self-heals
+        # on the next tick instead of orphaning that heartbeat permanently.
         self._spawn_supervised(self._resume_heartbeat_watches, "heartbeat_resume_watcher")
 
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
@@ -22522,8 +22524,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         The registry maps ``quick_key`` → ``(source, session_id)`` so the
         poller can rebuild a MessageEvent and enqueue via the adapter FIFO.
         In-memory by design: heartbeat STATE survives restarts in SessionDB,
-        but firing resumes when the user touches /heartbeat again in the new
-        gateway process (documented; durable schedules belong to cron).
+        and firing resumes automatically once the new gateway process comes
+        back up — ``_resume_heartbeat_watches`` calls this same method for
+        every persisted heartbeat at startup, so no user action is required
+        (durable schedules that must survive anything still belong to cron).
         """
         watch = getattr(self, "_heartbeat_watch", None)
         if watch is None:
@@ -22972,50 +22976,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)
 
-    async def _resume_heartbeat_watches(self) -> None:
+    async def _resume_heartbeat_watches(self, interval: float = 15.0) -> None:
         """Re-arm ``_heartbeat_watch`` from persisted state after a restart.
 
         The watch dict is process-memory only and starts empty on every
-        gateway boot, so an active heartbeat set before a restart was
-        otherwise orphaned — its state survives in SessionDB, but nothing
+        gateway boot, so an active heartbeat set before a restart would
+        otherwise be orphaned — its state survives in SessionDB, but nothing
         polls it — until the user ran /heartbeat again. Gateway heartbeats
         persist their originating platform/chat/thread in
-        ``HeartbeatState.route`` (mirrors /loop's restart recovery), so this
-        rebuilds the watch without any user interaction. Runs once at
-        startup; a CLI-owned heartbeat carries no route and is driven by its
-        own watchdog thread instead.
+        ``HeartbeatState.route`` (mirrors /loop's restart recovery via
+        ``_loop_wakeup_watcher``), so this rebuilds the watch without any
+        user interaction.
+
+        Like ``_loop_wakeup_watcher``, this is a ``while self._running``
+        ticker rather than a one-shot scan: a transient failure on any
+        given tick (adapter not yet connected, session_store not yet warm)
+        would otherwise orphan that heartbeat for the rest of the process's
+        life, with nothing left to retry it. Each tick only touches
+        sessions not already present in ``_heartbeat_watch``, so a heartbeat
+        that's already re-armed is left alone. A CLI-owned heartbeat carries
+        no route and is driven by its own watchdog thread instead.
         """
         await asyncio.sleep(5)  # let platforms finish connecting
-        try:
-            from hermes_cli.heartbeat import list_active_heartbeats
+        while self._running:
+            try:
+                from hermes_cli.heartbeat import list_active_heartbeats
 
-            await self._warm_goals_session_db("heartbeat resume")
-            for sid, state in list_active_heartbeats():
-                route = state.route or {}
-                platform_name = route.get("platform", "")
-                chat_id = route.get("chat_id", "")
-                if not platform_name or not chat_id:
-                    continue
-                evt_stub = {
-                    "session_key": "",
-                    "platform": platform_name,
-                    "chat_id": chat_id,
-                    "chat_type": route.get("chat_type", ""),
-                    "thread_id": route.get("thread_id", ""),
-                    "user_id": route.get("user_id", ""),
-                    "user_name": route.get("user_name", ""),
-                }
-                source = self._build_process_event_source(evt_stub)
-                if source is None:
-                    continue
-                try:
-                    quick_key = self._session_key_for_source(source)
-                except Exception:
-                    continue
-                if quick_key:
-                    self._register_heartbeat_watch(quick_key, source, sid)
-        except Exception:
-            logger.debug("heartbeat resume scan failed", exc_info=True)
+                await self._warm_goals_session_db("heartbeat resume")
+                watch = getattr(self, "_heartbeat_watch", None) or {}
+                resumed_sids = {sid for _source, sid in watch.values()}
+                for sid, state in list_active_heartbeats():
+                    if sid in resumed_sids:
+                        continue
+                    route = state.route or {}
+                    platform_name = route.get("platform", "")
+                    chat_id = route.get("chat_id", "")
+                    if not platform_name or not chat_id:
+                        continue
+                    evt_stub = {
+                        "session_key": "",
+                        "platform": platform_name,
+                        "chat_id": chat_id,
+                        "chat_type": route.get("chat_type", ""),
+                        "thread_id": route.get("thread_id", ""),
+                        "user_id": route.get("user_id", ""),
+                        "user_name": route.get("user_name", ""),
+                    }
+                    source = self._build_process_event_source(evt_stub)
+                    if source is None:
+                        continue
+                    try:
+                        quick_key = self._session_key_for_source(source)
+                    except Exception:
+                        continue
+                    if quick_key:
+                        self._register_heartbeat_watch(quick_key, source, sid)
+            except Exception:
+                logger.debug("heartbeat resume scan failed", exc_info=True)
+            await asyncio.sleep(interval)
 
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
