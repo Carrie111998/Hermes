@@ -178,6 +178,7 @@ authenticate_demo() {
   local -a relogin_args=(
     --privy-did "${PRIVY_DID}"
     --org-id "${TEAM_ORG_ID}"
+    --hermes-home "${DEMO_HOME}"
   )
 
   export HERMES_HOME="${AGENT_HOME}"
@@ -186,10 +187,6 @@ authenticate_demo() {
   export HERMES_WISDOM_QUIET=1
   # shellcheck disable=SC1091
   source "${ROOT}/scripts/wisdom-demo-env.sh"
-
-  if [[ ! -s "${HERMES_SHARED_AUTH_DIR}/nous_auth.json" ]]; then
-    relogin_args+=(--hermes-home "${DEMO_HOME}")
-  fi
 
   (
     cd "${PORTAL_APP}"
