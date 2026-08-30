@@ -215,6 +215,55 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+def test_request_review_goal_mode_asks_judge_about_implementation_not_review(
+    monkeypatch, tmp_path
+):
+    """A goal-mode card whose acceptance criteria require same-card review
+    must not deadlock: judging kanban_request_review with the exact same
+    question as kanban_complete ("is the whole card, including review,
+    done?") can never pass on an implementer's summary alone, since review
+    hasn't happened yet — and can't until review is requested. The judge
+    call for a review handoff must instead ask whether the implementation is
+    ready to hand off, without requiring reviewer/approval evidence.
+    Regression for #98160."""
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        run_id = kb.get_task(conn, tid).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    # A judge that withholds DONE for missing reviewer evidence UNLESS the
+    # goal text itself says that's not required for this check — i.e. it
+    # reacts to the reframing, not to which tool called it.
+    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+        if "do not withhold DONE merely because" in goal:
+            return "done", "implementation evidence present", False, None, False
+        return "continue", "no reviewer approval evidence yet", False, None, False
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    out = kt._handle_request_review({"summary": "Implemented X; ready for review."})
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "review"
+    finally:
+        conn.close()
+
+    # kanban_complete must remain gated by the unscoped question — this fix
+    # only reframes review handoffs, it doesn't weaken completion enforcement.
+    out2 = kt._handle_complete({"summary": "Implemented X."})
+    d2 = json.loads(out2)
+    assert "Goal completion rejected by judge" in d2.get("error", "")
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})
