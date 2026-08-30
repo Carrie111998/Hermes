@@ -1259,6 +1259,14 @@ def _profile_author() -> str:
         return "user"
 
 
+def _unblock_author() -> str:
+    """Distinguish an operator CLI transition from a worker retry."""
+
+    if str(os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return _profile_author()
+    return "operator"
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "create",
@@ -2542,7 +2550,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
-    author = _profile_author() if reason else None
+    author = _unblock_author() if reason else None
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
