@@ -1451,6 +1451,24 @@ def _use_real_profile() -> bool:
 # local browsing attaches to this one agent-browser session so concurrent
 # tasks reuse the same copy-browser instead of each launching a rival Chromium
 # on the same copied user-data-dir.
+def _real_profile_headed() -> bool:
+    """Whether the real-profile browser should open a visible window.
+
+    Reads ``browser.real_profile_headed`` (default True, preserving today's
+    visible-by-design behavior) on EVERY call, mirroring ``_use_real_profile``
+    so flipping it takes effect on the next launch without a restart.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            return bool(browser_cfg.get("real_profile_headed", True))
+    except Exception as e:
+        logger.debug("Could not read browser.real_profile_headed from config: %s", e)
+    return True
+
+
 _REAL_PROFILE_SESSION = "hermes-real-profile"
 _real_profile_cdp_lock = threading.Lock()
 _real_profile_cdp_cache: dict = {}
@@ -1714,12 +1732,15 @@ def _real_profile_cdp() -> tuple:
             "--disable-features=Translate",
             "--no-startup-window",
         ]
-        if sys.platform.startswith("linux") and not (
-            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if not _real_profile_headed() or (
+            sys.platform.startswith("linux") and not (
+                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+            )
         ):
-            # Display-less Linux (servers, CI): the real binary cannot open a
-            # window, so it exits at startup. Chrome's NEW headless mode shares
-            # the profile's normal cookie store (unlike legacy --headless with
+            # Either the user opted into a hidden window (browser.real_profile_headed:
+            # false) or this is display-less Linux (servers, CI), where the real binary
+            # cannot open a window and exits at startup either way. Chrome's NEW headless
+            # mode shares the profile's normal cookie store (unlike legacy --headless with
             # its separate store), so real-profile auth still loads.
             chrome_argv.append("--headless=new")
         try:
