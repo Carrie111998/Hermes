@@ -577,6 +577,35 @@ def _apply_profile_override() -> None:
     from hermes_cli._parser import top_level_value_flag_sets
 
     value_flags, optional_value_flags = top_level_value_flag_sets()
+
+    def _find_subcommand() -> tuple[str | None, int | None]:
+        """Find the first positional command, skipping option values.
+
+        Looking for the literal ``doctor`` in the preceding tokens is not
+        sufficient: ``--model doctor chat`` contains the word without
+        selecting the doctor command.
+        """
+        i = 0
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--" or (arg == "--args" and _inside_mcp_add_args(i)):
+                return None, None
+            if arg in {"--profile", "-p"} or arg in value_flags:
+                i += 2 if i + 1 < len(argv) else 1
+            elif arg in optional_value_flags:
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    i += 2
+                else:
+                    i += 1
+            elif arg.startswith("--profile=") or "=" in arg:
+                i += 1
+            elif arg.startswith("-"):
+                i += 1
+            else:
+                return arg, i
+        return None, None
+
+    subcommand, subcommand_index = _find_subcommand()
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -589,7 +618,11 @@ def _apply_profile_override() -> None:
         # `hermes doctor --profile NAME` is a read-only inspection target,
         # not the global profile override. The doctor subparser owns that
         # spelling; retain the historical global override everywhere else.
-        doctor_before = subcommand == "doctor"
+        doctor_before = (
+            subcommand == "doctor"
+            and subcommand_index is not None
+            and i > subcommand_index
+        )
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
             if doctor_before:
                 i += 2
