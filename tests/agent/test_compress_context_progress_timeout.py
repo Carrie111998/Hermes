@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent.conversation_compression import (
     CompressionCommitFence,
+    context_compression_timed_out,
+    mark_context_compression_timed_out,
+    reset_context_compression_timeout_outcome,
     resolve_context_compression_timeouts,
     run_compress_context_with_progress_timeout,
 )
@@ -46,6 +50,31 @@ class TestResolveContextCompressionTimeouts:
 
 
 class TestRunCompressContextWithProgressTimeout:
+    def test_timeout_outcome_is_isolated_between_overlapping_entrypoints(self):
+        agent = SimpleNamespace()
+        worker_marked = threading.Event()
+        main_reset = threading.Event()
+        seen = {}
+
+        def worker():
+            reset_context_compression_timeout_outcome(agent)
+            mark_context_compression_timed_out(agent)
+            worker_marked.set()
+            assert main_reset.wait(timeout=2)
+            seen["worker"] = context_compression_timed_out(agent)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert worker_marked.wait(timeout=2)
+
+        reset_context_compression_timeout_outcome(agent)
+        seen["main"] = context_compression_timed_out(agent)
+        main_reset.set()
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert seen == {"main": False, "worker": True}
+
     def test_silent_worker_times_out_and_preserves_messages(self):
         original = [{"role": "user", "content": "keep-me"}]
         started = threading.Event()
