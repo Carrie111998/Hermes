@@ -189,10 +189,9 @@ def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
 
     Conservative on purpose: an unprovable axis must answer "different"
     (try the candidate — worst case one wasted RTT) rather than "same"
-    (skip — worst case stranded failover). Two distinct custom labels at
-    one URL may carry different per-entry api_keys, so a shared URL alone
-    never proves a shared credential; it is only used as a weak signal
-    when a provider label is missing entirely.
+    (skip — worst case stranded failover). Explicit credential fingerprints
+    take precedence; when either provider label is absent, the same explicit
+    URL remains the established fallback signal.
     """
     if a.credential_id or b.credential_id:
         return bool(
@@ -202,11 +201,11 @@ def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
         # Same label = same configured credential. Different labels =
         # different credential config (first-class registry providers
         # explicitly so — #70893; custom entries can each carry their own
-        # api_key, so sameness is unprovable and we must not skip).
+        # api_key, so sameness is unprovable).
         return a.provider == b.provider
-    # Provider and credential are unknown: URL equality cannot prove a shared
-    # credential because multiple keys can serve one endpoint.
-    return False
+    # Preserve the base fallback: when a provider label is absent, identical
+    # explicit URLs are the strongest available credential-surface signal.
+    return bool(a.base_url and a.base_url == b.base_url)
 
 
 def same_route(a: BackendIdentity, b: BackendIdentity) -> bool:

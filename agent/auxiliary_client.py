@@ -169,6 +169,12 @@ from agent.model_metadata import (
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from agent.failure_scope import (
+    is_connection_error as _is_connection_error,
+    is_endpoint_unreachable_error as _is_endpoint_unreachable_error,
+    is_timeout_error as _is_timeout_error,
+    is_transient_transport_error as _failure_scope_is_transient_transport_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4430,137 +4436,6 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
-def _is_timeout_error(exc: Exception) -> bool:
-    """Detect a request timeout — the full-budget stall, distinct from a fast
-    connection drop.
-
-    A timeout burns the entire configured ``timeout`` before surfacing, so a
-    same-provider retry on the critical compression path doubles the
-    user-visible wall time (issue #54465). A streaming-close / dropped
-    connection, by contrast, fails fast and is cheap to retry — those stay on
-    the retry path even for compression.
-    """
-    try:
-        from openai import APITimeoutError
-        if isinstance(exc, APITimeoutError):
-            return True
-    except ImportError:
-        pass
-    if "Timeout" in type(exc).__name__:
-        return True
-    return "timed out" in str(exc).lower()
-
-
-def _is_endpoint_unreachable_error(exc: Exception) -> bool:
-    """Recognize failures that prove the endpoint itself cannot be reached.
-
-    HTTPX wraps the useful OS error in ``ConnectError`` (and sometimes in a
-    second ``ConnectError`` cause), so inspect a short exception chain rather
-    than only the outer display type.  A reset/premature-close is deliberately
-    excluded: it proves a transient stream blip, not that every model behind
-    the endpoint is unavailable.
-    """
-    seen: set[int] = set()
-    current: Optional[BaseException] = exc
-    for _ in range(5):
-        if current is None or id(current) in seen:
-            break
-        seen.add(id(current))
-        error_type = type(current).__name__.lower()
-        text = str(current).lower()
-        if any(
-            marker in text
-            for marker in (
-                "connection reset",
-                "incomplete chunked read",
-                "peer closed connection",
-                "response ended prematurely",
-                "unexpected eof",
-                "remoteprotocolerror",
-                "localprotocolerror",
-            )
-        ):
-            current = current.__cause__ or current.__context__
-            continue
-        if error_type in {
-            "connectionrefusederror",
-            "gaierror",
-            "addressnotavailable",
-        }:
-            return True
-        if error_type in {"connecttimeout", "connecttimeouterror"}:
-            # A connect timeout means no response connection was established;
-            # it invalidates this endpoint, unlike ReadTimeout/PoolTimeout
-            # after the request has reached the provider.
-            return True
-        if error_type == "connecterror" and (
-            "all connection attempts failed" in text
-            or "failed to establish a new connection" in text
-            or "cannot connect" in text
-            or "connect timeout" in text
-        ):
-            return True
-        if any(
-            marker in text
-            for marker in (
-                "connection refused",
-                "name or service not known",
-                "temporary failure in name resolution",
-                "getaddrinfo failed",
-                "nodename nor servname provided",
-                "dns failure",
-                "no route to host",
-                "network is unreachable",
-            )
-        ):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
-def _is_connection_error(exc: Exception) -> bool:
-    """Detect connection/network errors that warrant provider fallback.
-
-    Returns True for errors indicating the provider endpoint is unreachable
-    (DNS failure, connection refused, TLS errors, timeouts).  These are
-    distinct from API errors (4xx/5xx) which indicate the provider IS
-    reachable but returned an error.
-    """
-    try:
-        from openai import APIConnectionError, APITimeoutError
-        if isinstance(exc, (APIConnectionError, APITimeoutError)):
-            return True
-    except ImportError:
-        pass
-    # urllib3 / httpx / httpcore connection errors
-    err_type = type(exc).__name__
-    if any(kw in err_type for kw in (
-        "Connection", "Connect", "Timeout", "DNS", "SSL", "ReadError",
-        "WriteError", "RemoteProtocol", "LocalProtocol",
-    )):
-        return True
-    err_lower = str(exc).lower()
-    if any(kw in err_lower for kw in (
-        "connection refused", "name or service not known",
-        "no route to host", "network is unreachable",
-        "timed out", "connection reset",
-        "all connection attempts failed", "nodename nor servname provided",
-        "getaddrinfo failed", "failed to establish a new connection",
-        # httpcore / httpx streaming premature-close errors.  These surface
-        # when a proxy or provider drops the connection mid-stream and are
-        # transient by nature — the request should be retried or rerouted.
-        # See issue #18458.
-        "incomplete chunked read",
-        "peer closed connection",
-        "response ended prematurely",
-        "unexpected eof",
-        "remoteprotocolerror",
-        "localprotocolerror",
-    )):
-        return True
-    return False
-
-
 def _is_transient_transport_error(exc: Exception) -> bool:
     """Return True for a one-off transport blip worth retrying ON the
     same provider before any provider/model fallback.
@@ -4572,12 +4447,7 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     ``_is_auth_error`` / ``_is_rate_limit_error`` which the except-chain
     handles by switching provider, refreshing creds, or rotating the pool.
     """
-    if _is_connection_error(exc):
-        return True
-    status = getattr(exc, "status_code", None) or getattr(
-        getattr(exc, "response", None), "status_code", None
-    )
-    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+    return _failure_scope_is_transient_transport_error(exc)
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2
