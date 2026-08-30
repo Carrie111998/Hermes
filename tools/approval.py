@@ -13,6 +13,7 @@ import contextvars
 import fnmatch
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
@@ -23,6 +24,8 @@ import threading
 import time
 import unicodedata
 import uuid
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -30,6 +33,159 @@ from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+class ApprovalOutcome(str, Enum):
+    """Machine-readable outcome of an approval gate.
+
+    This is a ``str`` enum deliberately: old callers that compare the legacy
+    dictionary values with strings and JSON serializers continue to work,
+    while new callers no longer have to infer policy from human-facing text.
+    """
+
+    APPROVED = "approved"
+    DENIED = "denied"
+    TIMEOUT = "timeout"
+    POLICY_DENIED = "policy_denied"
+    BLOCKED = "blocked"
+    NON_INTERACTIVE = "non_interactive"
+    PENDING = "pending"
+    HARDLINE = "hardline"
+    TRANSPORT_FAILED = "transport_failed"
+    TRANSPORT_INVALID = "transport_invalid"
+    TRANSPORT_ERROR = "transport_error"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class ApprovalBoundary:
+    """Immutable identity for one approval decision and its retry boundary."""
+
+    operation_id: str
+    intent_digest: str
+    policy_digest: str
+
+    @classmethod
+    def for_request(
+        cls,
+        command: str,
+        env_type: str = "",
+        *,
+        operation_id: Optional[str] = None,
+        policy: Optional[object] = None,
+    ) -> "ApprovalBoundary":
+        """Create a stable boundary without retaining the command itself."""
+        intent = hashlib.sha256(
+            json.dumps(
+                {"command": command, "env_type": env_type},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        policy_digest = hashlib.sha256(
+            json.dumps(
+                policy if policy is not None else {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return cls(
+            operation_id=operation_id or f"approval:{intent}",
+            intent_digest=intent,
+            policy_digest=policy_digest,
+        )
+
+
+_approval_operation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_operation_id", default=""
+)
+
+
+def set_current_approval_operation(operation_id: str) -> contextvars.Token[str]:
+    """Bind an immutable operation identity for the current tool context."""
+    return _approval_operation_id.set(operation_id or "")
+
+
+def reset_current_approval_operation(token: contextvars.Token[str]) -> None:
+    """Restore the prior approval operation identity."""
+    _approval_operation_id.reset(token)
+
+
+def _typed_approval_result(
+    result: dict,
+    *,
+    command: str,
+    env_type: str,
+    operation_id: Optional[str] = None,
+) -> dict:
+    """Add typed outcome and immutable retry metadata to a legacy result."""
+    if not isinstance(result, dict):
+        return result
+    raw = result.get("outcome")
+    if raw is None:
+        if result.get("approved"):
+            outcome = ApprovalOutcome.APPROVED
+        elif result.get("status") in {"approval_required", "pending_approval"}:
+            outcome = ApprovalOutcome.PENDING
+        else:
+            # Last-resort mapping for untyped legacy dicts only. Prefer a
+            # producer-set outcome over message phrasing.
+            text = str(result.get("message") or "").lower()
+            outcome = (
+                ApprovalOutcome.TIMEOUT if "timed out" in text or "timeout" in text
+                else ApprovalOutcome.NON_INTERACTIVE
+                if "no interactive" in text or "non-interactive" in text
+                else ApprovalOutcome.DENIED
+            )
+    else:
+        try:
+            if raw == "notify_failed":
+                outcome = ApprovalOutcome.TRANSPORT_FAILED
+            else:
+                outcome = ApprovalOutcome(raw)
+        except ValueError:
+            outcome = ApprovalOutcome.ERROR
+    policy = {
+        "mode": _get_approval_mode(),
+        "cron": _is_cron_approval_context(),
+        "single_query": _is_single_query_approval_context(),
+    }
+    boundary = ApprovalBoundary.for_request(
+        command, env_type,
+        operation_id=operation_id or _approval_operation_id.get() or None,
+        policy=policy,
+    )
+    result["outcome"] = outcome
+    # A refusal is terminal for this exact operation. A caller that wants to
+    # try a changed operation must supply a new operation identity; it cannot
+    # mutate the approved request in place and silently reuse consent.
+    result["retryable"] = bool(result.get("approved"))
+    result["operation_id"] = boundary.operation_id
+    result["intent_digest"] = boundary.intent_digest
+    result["policy_digest"] = boundary.policy_digest
+    return result
+
+
+def _typed_approval_guard(func):
+    """Decorate public approval guards without changing legacy call shapes."""
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        result = func(*args, **kwargs)
+        if func.__name__ == "request_tool_approval":
+            command = f"{args[0] if args else kwargs.get('tool_name', '')}:"
+            command += str(args[1] if len(args) > 1 else kwargs.get("reason", ""))
+            env_type = "tool"
+        else:
+            command = kwargs.get("command", args[0] if args else "")
+            env_type = kwargs.get("env_type", args[1] if len(args) > 1 else "")
+        return _typed_approval_result(
+            result,
+            command=str(command),
+            env_type=str(env_type),
+            operation_id=kwargs.get("operation_id"),
+        )
+    return wrapped
 
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
@@ -3701,7 +3857,7 @@ def _run_approval_gate(
     cron_deny_message: str,
     single_query_deny_message: str,
     autoapprove_log_prefix: str,
-    fail_closed_when_no_human: bool = False,
+    fail_closed_when_no_human: bool = True,
     no_human_block_message: str = "",
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
@@ -3731,14 +3887,13 @@ def _run_approval_gate(
             under ``cron_mode: deny``.
         single_query_deny_message: Message returned when a single-query
             (-q) session hits this gate under ``single_query_mode: deny``.
-        autoapprove_log_prefix: Log line prefix for the non-interactive
-            auto-approve warning (identifies command vs plugin origin).
+        autoapprove_log_prefix: Log line prefix for the explicit policy
+            auto-approval warning (identifies command vs plugin origin).
         fail_closed_when_no_human: When True, a non-interactive non-gateway
             context that is NOT a cron session (e.g. a bare script with
             HERMES_INTERACTIVE unset) BLOCKS instead of auto-approving. The
-            dangerous-command path keeps its historical fail-open default
-            (False); the plugin-escalation path opts in to fail-closed so a
-            plugin-flagged action never runs ungated without a human.
+            dangerous-command and plugin-escalation paths fail closed unless
+            an explicit cron/single-query approve policy applies.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
 
@@ -3778,6 +3933,8 @@ def _run_approval_gate(
                     "message": single_query_deny_message,
                     "pattern_key": pattern_key,
                     "description": description,
+                    "outcome": ApprovalOutcome.POLICY_DENIED,
+                    "user_consent": False,
                 }
             # single_query_mode: approve — auto-approve. Unlike cron, this must
             # return here rather than fall through: the plugin-escalation
@@ -3797,13 +3954,14 @@ def _run_approval_gate(
                     "message": cron_deny_message,
                     "pattern_key": pattern_key,
                     "description": description,
+                    "outcome": ApprovalOutcome.POLICY_DENIED,
+                    "user_consent": False,
                 }
             # cron_mode: approve — fall through to auto-approve below.
         elif fail_closed_when_no_human:
             # Non-cron, non-interactive, no gateway: no human can answer.
-            # The plugin-escalation path opts in to fail-closed here so a
-            # plugin-flagged action never runs ungated. (The dangerous-
-            # command path keeps the historical fail-open default.)
+            # Approval is therefore denied unless an explicit policy above
+            # authorized this non-interactive context.
             logger.warning(
                 "%s (pattern: %s): %s — no interactive user/gateway present; "
                 "BLOCKED (fail-closed). Set HERMES_INTERACTIVE or "
@@ -4000,9 +4158,11 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
 
 
+@_typed_approval_guard
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None,
-                            has_host_access: bool = False) -> dict:
+                            has_host_access: bool = False,
+                            operation_id: Optional[str] = None) -> dict:
     """Check if a command is dangerous and handle approval.
 
     This is the main entry point called by terminal_tool before executing
@@ -4014,6 +4174,8 @@ def check_dangerous_command(command: str, env_type: str,
         approval_callback: Optional CLI callback for interactive prompts.
         has_host_access: True when a Docker sandbox bind-mounts host paths,
             so its commands can reach the host and must not skip approval.
+        operation_id: Optional stable identity for this operation. A new
+            operation must use a new identity after a terminal refusal.
 
     Returns:
         {"approved": True/False, "message": str or None, ...}
@@ -4077,12 +4239,14 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
+@_typed_approval_guard
 def request_tool_approval(
     tool_name: str,
     reason: str,
     *,
     rule_key: str = "",
     approval_callback=None,
+    operation_id: Optional[str] = None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -4641,9 +4805,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+@_typed_approval_guard
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             operation_id: Optional[str] = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -4734,6 +4900,8 @@ def check_all_command_guards(command: str, env_type: str,
                         ),
                         "pattern_key": _pk,
                         "description": description,
+                        "outcome": ApprovalOutcome.POLICY_DENIED,
+                        "user_consent": False,
                     }
                 # Also run tirith check in single-query-deny mode so content-level
                 # threats (homograph URLs, pipe-to-interpreter, terminal
@@ -4754,6 +4922,8 @@ def check_all_command_guards(command: str, env_type: str,
                                 "dangerous commands in single-query mode, set "
                                 "approvals.single_query_mode: approve in config.yaml."
                             ),
+                            "outcome": ApprovalOutcome.POLICY_DENIED,
+                            "user_consent": False,
                         }
                 except ImportError:
                     # Tirith not installed. Honour security.tirith_fail_open:
@@ -4782,9 +4952,12 @@ def check_all_command_guards(command: str, env_type: str,
                                 "approach, install tirith, or set "
                                 "approvals.single_query_mode: approve in config.yaml."
                             ),
+                            "outcome": ApprovalOutcome.POLICY_DENIED,
+                            "user_consent": False,
                         }
                     # else: tirith_fail_open is True — allow as before
-            # single_query_mode: approve — fall through to auto-approve below.
+            if _get_single_query_approval_mode() == "approve":
+                return {"approved": True, "message": None}
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -4800,6 +4973,8 @@ def check_all_command_guards(command: str, env_type: str,
                             "To allow dangerous commands in cron jobs, set "
                             "approvals.cron_mode: approve in config.yaml."
                         ),
+                        "outcome": ApprovalOutcome.POLICY_DENIED,
+                        "user_consent": False,
                     }
                 # Also run tirith check in cron-deny mode so content-level
                 # threats (homograph URLs, pipe-to-interpreter, terminal
@@ -4819,6 +4994,8 @@ def check_all_command_guards(command: str, env_type: str,
                                 "To allow dangerous commands in cron jobs, set "
                                 "approvals.cron_mode: approve in config.yaml."
                             ),
+                            "outcome": ApprovalOutcome.POLICY_DENIED,
+                            "user_consent": False,
                         }
                 except ImportError:
                     # Tirith not installed. Honour security.tirith_fail_open:
@@ -4847,7 +5024,37 @@ def check_all_command_guards(command: str, env_type: str,
                                 "approvals.cron_mode: approve in config.yaml."
                             ),
                         }
-                    # else: tirith_fail_open is True — allow as before
+        # cron_mode: approve is an explicit policy for this non-interactive
+        # context, so preserve the existing auto-approval contract.
+        if _is_cron_approval_context() and _get_cron_approval_mode() == "approve":
+            return {"approved": True, "message": None}
+
+        # A background/bare-script caller has no approval surface.  It may
+        # continue only when both security checks are clean; it must not use
+        # this fast path to bypass a dangerous-command or Tirith finding.
+        _bg_dangerous, _bg_key, _bg_desc = detect_dangerous_command(command)
+        _bg_tirith = {"action": "allow"}
+        try:
+            from tools.tirith_security import check_command_security
+            _bg_tirith = check_command_security(command)
+        except ImportError:
+            # Tirith's configured fail-open behaviour remains unchanged.  The
+            # pattern detector above is independent and still fail-closed.
+            pass
+        if _bg_dangerous or _bg_tirith.get("action") in {"block", "warn"}:
+            _bg_desc = _bg_desc if _bg_dangerous else _format_tirith_description(_bg_tirith)
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: {_bg_desc}. This background/non-interactive "
+                    "execution has no user or approval gateway. Do not retry "
+                    "the same operation through another path."
+                ),
+                "pattern_key": _bg_key if _bg_dangerous else "tirith:background",
+                "description": _bg_desc,
+                "outcome": ApprovalOutcome.NON_INTERACTIVE,
+                "user_consent": False,
+            }
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -5291,8 +5498,10 @@ def check_all_command_guards(command: str, env_type: str,
             "user_approved": True, "description": combined_desc}
 
 
+@_typed_approval_guard
 def check_execute_code_guard(code: str, env_type: str,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             operation_id: Optional[str] = None) -> dict:
     """Approve an execute_code script before its child process is spawned.
 
     execute_code runs arbitrary local Python — the script can call
@@ -5302,13 +5511,11 @@ def check_execute_code_guard(code: str, env_type: str,
     the script as a whole before it runs (#30882). Returns the same dict
     contract as ``check_all_command_guards``.
 
-    Scope (documented limitation, #30882): in a purely local non-interactive
-    non-gateway session (no TTY, not gateway, not cron-deny) this returns
-    approved — matching the existing terminal auto-approve contract. The
-    hardline floor still blocks catastrophic ``terminal()`` commands the script
-    issues; running arbitrary code headlessly without any approval surface is
-    trusted-by-config (set a gateway/ask surface or ``approvals.cron_mode`` to
-    require approval).
+    Scope: in a purely local non-interactive non-gateway session this now
+    fails closed because arbitrary Python can bypass terminal string checks.
+    Set an explicit ``approvals.cron_mode: approve`` or
+    ``approvals.single_query_mode: approve`` policy only for intentionally
+    trusted automation.
     """
     pattern_key = "execute_code"
     description = (
@@ -5391,8 +5598,23 @@ def check_execute_code_guard(code: str, env_type: str,
     # pending_approval. Terminal-command (not whole-script) CLI leaks from
     # the script's own per-call terminal() guards are handled separately in
     # check_all_command_guards.
-    if not is_gateway and not is_ask:
-        return {"approved": True, "message": None}
+    # There is no safe implicit approval for arbitrary Python.  A background
+    # invocation must name an explicit trusted policy (cron/single-query
+    # approve above) or have a live approval surface.
+    if not is_cli and not is_gateway and not is_ask:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code requires an interactive user, gateway, "
+                "or an explicit trusted non-interactive approval policy. "
+                "Arbitrary Python can bypass terminal command checks; do not "
+                "retry this operation through another path."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": ApprovalOutcome.NON_INTERACTIVE,
+            "user_consent": False,
+        }
 
     session_key = get_current_session_key()
     # Built only now (past the early-return gates) so the common non-approval
