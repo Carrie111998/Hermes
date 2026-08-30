@@ -32,6 +32,7 @@ import {
   clearClarifyRequest,
   normalizeChoices,
   RECOMMENDED_LABEL,
+  restoreClarifyRequest,
   sessionClarifyRequest,
   warnDroppedChoices
 } from '@/store/clarify'
@@ -1090,10 +1091,11 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
           { answer: '', request_id: request.requestId }
         )
       }
-    } catch {
-      // The tool times out on its own; a failed skip must never block the UI.
+    } catch (error) {
+      restoreClarifyRequest(request)
+      notifyError(error, copy.sendFailed)
     }
-  }, [gateway, onAnswered, request])
+  }, [copy.sendFailed, gateway, onAnswered, request])
 
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {

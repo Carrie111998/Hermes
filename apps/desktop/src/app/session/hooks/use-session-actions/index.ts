@@ -25,7 +25,7 @@ import {
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { $clarifyRequests } from '@/store/clarify'
+import { $clarifyRequests, bindClarifyToolCallAlias } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import {
@@ -1300,6 +1300,23 @@ export function useSessionActions({
                 ? restorePendingClarifyToolCall(activatedMessages, pendingClarifyToolPayload(pendingClarify))
                 : null
 
+              if (pendingClarify && pendingClarifyProjection) {
+                const unresolved = pendingClarifyProjection.messages
+                  .flatMap(message => message.parts)
+                  .find(
+                    part =>
+                      part.type === 'tool-call' &&
+                      part.toolName === 'clarify' &&
+                      part.result === undefined &&
+                      part.toolCallId &&
+                      part.toolCallId !== pendingClarify.requestId
+                  )
+
+                if (unresolved && unresolved.type === 'tool-call' && unresolved.toolCallId) {
+                  bindClarifyToolCallAlias(cachedRuntimeId, pendingClarify.requestId, unresolved.toolCallId)
+                }
+              }
+
               const clearedClarifyProjection = clarifyAuthoritativelyAbsent
                 ? settlePendingClarifyToolCall(
                     activatedMessages,
@@ -1687,6 +1704,23 @@ export function useSessionActions({
         const pendingClarifyProjection = pendingClarify
           ? restorePendingClarifyToolCall(messagesForView, pendingClarifyToolPayload(pendingClarify))
           : null
+
+        if (pendingClarify && pendingClarifyProjection) {
+          const unresolved = pendingClarifyProjection.messages
+            .flatMap(message => message.parts)
+            .find(
+              part =>
+                part.type === 'tool-call' &&
+                part.toolName === 'clarify' &&
+                part.result === undefined &&
+                part.toolCallId &&
+                part.toolCallId !== pendingClarify.requestId
+            )
+
+          if (unresolved && unresolved.type === 'tool-call' && unresolved.toolCallId) {
+            bindClarifyToolCallAlias(resumed.session_id, pendingClarify.requestId, unresolved.toolCallId)
+          }
+        }
 
         const clearedClarifyProjection = clarifyAuthoritativelyAbsent
           ? settlePendingClarifyToolCall(
