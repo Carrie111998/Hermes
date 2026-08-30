@@ -65,6 +65,82 @@ _MACOS_TCC_PROTECTED_HOME_DIRS = (
 )
 
 
+# Root directories whose children Windows Cloud Files may keep as dehydrated
+# placeholders: OneDrive "Files On-Demand" and iCloud for Windows.  ANY
+# filesystem access below these roots — even a plain stat() from `rg`,
+# `find`, or `du` — triggers on-demand hydration, so a routine recursive
+# scan of a profile directory can silently download tens of GB (issue
+# #97898: a "find the repo" scan pulled iCloud Photos at ~53 MB/s).
+# Env-var names are written in their real camel-case spelling and looked up
+# case-insensitively (Windows env vars are case-insensitive; the harness
+# test fakes are not).
+_ONEDRIVE_ENV_VARS = ("OneDrive", "OneDriveConsumer", "OneDrivePublic")
+_ICLOUD_ENV_VARS = ("iCloudDrive", "I_CLOUD_DRIVE_LOCATION")
+# Default iCloud for Windows locations relative to the user profile.
+_ICLOUD_HOME_SUBDIRS = (
+    "iCloudDrive",
+    "iCloud Photos",
+    os.path.join("Pictures", "iCloud Photos"),
+)
+
+
+def _windows_cloud_search_exclusions(
+    path: str,
+    *,
+    cwd: Optional[str] = None,
+    env: Optional[dict] = None,
+    platform: Optional[str] = None,
+) -> List[str]:
+    """Return cloud-sync roots below a broad Windows search root, if any.
+
+    Absolute, forward-slash-relative-to-``path`` (a bare name when the search
+    root IS the profile home).  Verified against the real ripgrep on Windows:
+    ``-g '!<abs posix path>/**'`` prunes during traversal, while backslash
+    spellings and profile-relative names never match an absolute search root.
+    Direct searches INSIDE a cloud root stay unpruned — opening one file the
+    caller explicitly asked for may legitimately hydrate it; walking the whole
+    tree unattended is the bug.
+    """
+    if (platform or sys.platform) != "win32":
+        return []
+    environ = os.environ if env is None else env
+    profile = environ.get("USERPROFILE") or str(Path.home())
+    roots: List[Path] = []
+    for var in _ONEDRIVE_ENV_VARS + _ICLOUD_ENV_VARS:
+        # Windows env lookup is case-insensitive; envMapping fakes are not.
+        value = environ.get(var)
+        if value is None:
+            lowered = {k.lower(): v for k, v in environ.items()}
+            value = lowered.get(var.lower())
+        if value:
+            roots.append(Path(value))
+    for sub in _ICLOUD_HOME_SUBDIRS:
+        roots.append(Path(profile) / sub)
+
+    root = Path(path).expanduser()
+    if not root.is_absolute():
+        root = Path(cwd or os.getcwd()) / root
+    root = Path(os.path.normpath(str(root)))
+
+    exclusions: List[str] = []
+    seen = set()
+    for candidate in roots:
+        candidate = Path(os.path.normpath(str(candidate)))
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            continue
+        if not relative.parts:
+            # Search root IS a cloud root: caller chose it explicitly.
+            continue
+        posix = relative.as_posix()
+        key = posix.lower()
+        if key not in seen:
+            seen.add(key)
+            exclusions.append(posix)
+    return exclusions
+
+
 def _macos_protected_search_exclusions(
     path: str,
     *,
@@ -2879,18 +2955,35 @@ class ShellFileOperations(FileOperations):
             result = self._search_content(pattern, path, file_glob, limit, offset,
                                           output_mode, context)
 
-        exclusions = self._macos_search_exclusions(path)
+        exclusions = self._protected_search_exclusions(path)
         if exclusions and not result.error:
-            skipped = ", ".join(item.split("/")[-1] for item in exclusions)
-            result.warning = (
-                "Skipped macOS protected folders during broad search to avoid "
-                f"an unattended privacy prompt: {skipped}. Search a protected "
-                "folder directly when access is intentional."
-            )
+            names = [item.rstrip("/").split("/")[-1] for item in exclusions]
+            env = getattr(self, "env", None)
+            local = getattr(env, "is_local", True) is not False
+            if local and sys.platform == "win32":
+                result.warning = (
+                    "Skipped cloud-sync folders during broad search to avoid "
+                    "on-demand hydration (multi-GB downloads): "
+                    f"{', '.join(names)}. Search a cloud folder directly when "
+                    "those downloads are intentional."
+                )
+            else:
+                result.warning = (
+                    "Skipped macOS protected folders during broad search to "
+                    "avoid an unattended privacy prompt: "
+                    f"{', '.join(names)}. Search a protected folder directly "
+                    "when access is intentional."
+                )
         return result
 
-    def _macos_search_exclusions(self, path: str) -> List[str]:
+    def _protected_search_exclusions(self, path: str) -> List[str]:
         """Protected descendants to prune for this search root, if any.
+
+        Unions the macOS TCC-protected home folders (unattended privacy
+        prompts) with Windows Cloud Files sync roots (on-demand hydration
+        downloads, #97898). The two are platform-exclusive in practice —
+        each helper no-ops off its platform — so one list serves every
+        engine and the search()-level warning without overlap.
 
         Gated on ``env.is_local``: ``sys.platform``/``Path.home()`` describe
         the CONTROLLER, but search commands execute on ``self.env``'s host — a
@@ -2907,7 +3000,7 @@ class ShellFileOperations(FileOperations):
         cwd = getattr(self.env, "cwd", None) or self.cwd
         return _macos_protected_search_exclusions(
             path, cwd=cwd, home=_HOME, platform=sys.platform
-        )
+        ) + _windows_cloud_search_exclusions(path, cwd=cwd)
     
     def _try_multi_path_search(self, pattern: str, path: str, target: str,
                                file_glob: Optional[str], limit: int, offset: int,
@@ -3078,7 +3171,7 @@ class ShellFileOperations(FileOperations):
         # an access attempt (filtering matched paths after descent is too late).
         protected_paths = [
             os.path.normpath(os.path.join(path, item))
-            for item in self._macos_search_exclusions(path)
+            for item in self._protected_search_exclusions(path)
         ]
         prune_expr = ""
         if protected_paths:
@@ -3152,7 +3245,7 @@ class ShellFileOperations(FileOperations):
         fetch_limit = limit + offset
         exclusion_globs = " ".join(
             f"--glob {self._escape_shell_arg(f'!{item}/**')}"
-            for item in self._macos_search_exclusions(path)
+            for item in self._protected_search_exclusions(path)
         )
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
@@ -3244,7 +3337,7 @@ class ShellFileOperations(FileOperations):
             cmd_parts.extend(["-C", str(context)])
         
         # Exclude macOS TCC-protected descendants during broad searches.
-        for item in self._macos_search_exclusions(path):
+        for item in self._protected_search_exclusions(path):
             cmd_parts.extend(["--glob", self._escape_shell_arg(f"!{item}/**")])
 
         # Add file glob filter (must be quoted to prevent shell expansion)
@@ -3391,7 +3484,7 @@ class ShellFileOperations(FileOperations):
         # instead — same traversal-prevention the find backend uses.
         protected_paths = [
             os.path.normpath(os.path.join(path, item))
-            for item in self._macos_search_exclusions(path)
+            for item in self._protected_search_exclusions(path)
         ]
         if protected_paths:
             return self._search_with_grep_pruned(
