@@ -4063,7 +4063,9 @@ class SessionStore:
             self._clear_dirty_transcript(session_id)
             return True
 
-    def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
+    def load_transcript(
+        self, session_id: str, *, raise_on_error: bool = False
+    ) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript.
 
         state.db is the canonical store. The legacy JSONL fallback was removed
@@ -4076,8 +4078,13 @@ class SessionStore:
         chain while reads queried the stale id directly — the transcript
         "vanished" (disk=0) even though every message sat healthy under the
         child session.
+
+        Set ``raise_on_error`` for callers that must distinguish an unreadable
+        transcript from a genuinely empty one.
         """
         if not self._db:
+            if raise_on_error:
+                raise RuntimeError("Session database is unavailable")
             return []
         # Follow the write-side reroute chain (cycle-guarded, same shape as
         # append_to_transcript).
@@ -4093,6 +4100,8 @@ class SessionStore:
             if tip:
                 session_id = tip
         except Exception:
+            if raise_on_error:
+                raise
             pass
         try:
             # repair_alternation: this load feeds LIVE REPLAY. A durable
@@ -4111,6 +4120,8 @@ class SessionStore:
                 "downstream must not treat this as data loss): %s",
                 session_id, e,
             )
+            if raise_on_error:
+                raise
             return []
 
     def rewind_session(
