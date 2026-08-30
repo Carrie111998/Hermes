@@ -31,6 +31,7 @@ export interface SubagentProgress {
   filesWritten?: string[]
   goal: string
   id: string
+  idSource?: 'fallback' | 'server'
   index: number
   inputTokens?: number
   iteration?: number
