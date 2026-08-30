@@ -1320,7 +1320,37 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         with _env_lock:
             env = _active_environments.get(task_id) or _active_environments.get(container_id)
         if env is not None and getattr(env, "cwd", None) is not None:
-            env.cwd = new_cwd
+            # Third site of the container-cwd guard, alongside env creation
+            # (#54447) and per-command resolution (#50636). A surface that
+            # registers its HOST workspace (a Desktop/TUI session posting
+            # /Users/<me> on every turn) must not have that path written onto
+            # a live container env: ShellFileOperations reads ``env.cwd`` for
+            # EVERY file operation and the command wrapper prefixes
+            # ``builtin cd -- <cwd> || exit 126``, so an unusable value turns
+            # read_file/patch/search_files into "File not found" and "rg is
+            # not installed" until the next terminal command happens to
+            # rewrite the cwd. The session record above keeps the host path
+            # (its readers guard it); the live env keeps the cwd it can
+            # actually chdir into.
+            # Fall back to the configured backend when the instance is
+            # unrecognized (a plugin env created before stamping, a test
+            # double): on a container-configured process that is the better
+            # guess, and guessing "container" only ever declines to write a
+            # cwd the sandbox could not have used anyway.
+            env_type = _env_instance_backend_name(env)
+            if not env_type:
+                try:
+                    env_type = str(_get_env_config().get("env_type") or "").lower()
+                except Exception:
+                    env_type = ""
+            if _is_container_backend(env_type) and _is_unusable_container_cwd(new_cwd):
+                logger.info(
+                    "Not applying registered cwd %r to the live %s environment "
+                    "(host/relative path won't exist in the sandbox). Keeping %r.",
+                    new_cwd, env_type, env.cwd,
+                )
+            else:
+                env.cwd = new_cwd
 
 
 def clear_task_env_overrides(task_id: str):
@@ -1701,6 +1731,40 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     if not os.path.isabs(cwd):
         return True
     return False
+
+
+_ENV_CLASS_BACKEND_HINTS = (
+    ("docker", "docker"),
+    ("singularity", "singularity"),
+    ("managedmodal", "managed_modal"),
+    ("modal", "modal"),
+    ("daytona", "daytona"),
+    ("vercel", "vercel_sandbox"),
+    ("ssh", "ssh"),
+    ("local", "local"),
+)
+
+
+def _env_instance_backend_name(env) -> str:
+    """Best-effort backend name for a LIVE environment object.
+
+    ``_is_container_backend`` answers questions about a configured backend
+    *type*; callers holding an already-created environment need the same
+    answer about the instance in hand (the process config may have changed,
+    and plugin backends have no built-in class). Prefer the stamp written by
+    ``_create_environment`` for plugin providers, then fall back to the class
+    name. Returns "" when the instance is unrecognizable; callers decide what
+    an unknown backend means (the cwd guard below falls back to the configured
+    ``env_type``).
+    """
+    stamped = getattr(env, "_hermes_backend_name", None)
+    if isinstance(stamped, str) and stamped.strip():
+        return stamped.strip().lower()
+    name = env.__class__.__name__.lower()
+    for needle, backend in _ENV_CLASS_BACKEND_HINTS:
+        if needle in name:
+            return backend
+    return ""
 
 
 # One-shot guard for the config-fallback bridge below.  Purely an
