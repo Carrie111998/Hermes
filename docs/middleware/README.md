@@ -54,8 +54,8 @@ Supported middleware kinds:
 `turn_route` is called once for an external user turn before Hermes constructs
 the provider client or agent. The callback receives no credentials, API keys,
 or provider clients. It may replace `model`, `provider`, `requested_provider`,
-and non-secret runtime hints. Hermes resolves credentials for the selected
-provider through its normal resolver afterwards. Internal events and tool
+and non-secret runtime hints. Hermes resolves or refreshes credentials for the
+selected provider through its normal resolver after this decision. Internal events and tool
 continuations must set `internal` or `tool_continuation` and bypass this phase.
 Routing failures are fail-open and retain the host route.
 

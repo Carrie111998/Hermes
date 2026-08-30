@@ -326,7 +326,7 @@ class CLIAgentSetupMixin:
 
         # Run behavior-changing turn middleware only for an external user
         # turn. The public payload contains no credentials; provider clients
-        # are resolved after a plugin has returned its selection. Background
+        # are resolved or refreshed by Hermes after a plugin has returned its selection. Background
         # helpers and internal continuations opt out via ``_skip_turn_routing``.
         if not getattr(self, "_skip_turn_routing", False):
             try:
