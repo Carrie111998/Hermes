@@ -94,7 +94,7 @@ class TestSlackSendClarify:
         _clear_clarify_state()
 
     @pytest.mark.asyncio
-    async def test_multi_choice_renders_buttons_and_other(self):
+    async def test_multi_choice_renders_readable_rows_and_other(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
@@ -116,23 +116,56 @@ class TestSlackSendClarify:
         blocks = kwargs["blocks"]
         assert blocks[0]["type"] == "section"
         assert "Which environment?" in blocks[0]["text"]["text"]
-        assert blocks[1]["type"] == "actions"
-        elements = blocks[1]["elements"]
-        # 2 choices + Other
-        assert len(elements) == 3
-        assert elements[0]["action_id"] == "hermes_clarify_choice_0"
-        assert elements[0]["value"] == "cid1|0"
-        assert elements[1]["action_id"] == "hermes_clarify_choice_1"
-        assert elements[1]["value"] == "cid1|1"
-        assert elements[0]["text"]["text"] == "staging"
-        # Final button is the free-text "Other"
-        assert elements[2]["action_id"] == "hermes_clarify_other"
-        assert elements[2]["value"] == "cid1|other"
-        for block in blocks:
-            if block["type"] == "actions":
-                action_ids = [element["action_id"] for element in block["elements"]]
-                assert len(action_ids) == len(set(action_ids))
+        assert blocks[1]["type"] == "section"
+        assert blocks[1]["text"]["text"] == "*1.* staging"
+        assert blocks[1]["accessory"]["text"]["text"] == "Select 1"
+        assert blocks[1]["accessory"]["action_id"] == "hermes_clarify_choice_0"
+        assert blocks[1]["accessory"]["value"] == "cid1|0"
+        assert blocks[2]["type"] == "section"
+        assert blocks[2]["text"]["text"] == "*2.* production"
+        assert blocks[2]["accessory"]["text"]["text"] == "Select 2"
+        assert blocks[2]["accessory"]["action_id"] == "hermes_clarify_choice_1"
+        assert blocks[2]["accessory"]["value"] == "cid1|1"
 
+        # The free-text path remains a separate final action.
+        assert blocks[3]["type"] == "actions"
+        assert len(blocks[3]["elements"]) == 1
+        assert blocks[3]["elements"][0]["action_id"] == "hermes_clarify_other"
+        assert blocks[3]["elements"][0]["value"] == "cid1|other"
+
+        action_ids = [block["accessory"]["action_id"] for block in blocks[1:3]]
+        action_ids.append(blocks[3]["elements"][0]["action_id"])
+        assert len(action_ids) == len(set(action_ids))
+
+    @pytest.mark.asyncio
+    async def test_long_choice_is_visible_in_wrapping_text_not_button_label(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "2.2"})
+        long_choice = (
+            "Keep the existing deployment branch and preserve all unpublished "
+            "changes while we inspect the <production> difference & rollback evidence."
+        )
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="Which deployment path should we use?",
+            choices=[long_choice, "Create a clean replacement branch"],
+            clarify_id="cid-long",
+            session_key="sk-long",
+        )
+
+        blocks = mock_client.chat_postMessage.call_args.kwargs["blocks"]
+        first_choice = blocks[1]
+        assert first_choice["type"] == "section"
+        assert first_choice["text"]["text"] == (
+            "*1.* Keep the existing deployment branch and preserve all unpublished "
+            "changes while we inspect the &lt;production&gt; difference "
+            "&amp; rollback evidence."
+        )
+        assert len(first_choice["text"]["text"]) > 75
+        assert first_choice["accessory"]["text"]["text"] == "Select 1"
+        assert long_choice not in first_choice["accessory"]["text"]["text"]
 
     @pytest.mark.asyncio
     async def test_mrkdwn_escapes_question(self):

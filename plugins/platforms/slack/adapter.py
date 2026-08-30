@@ -7350,16 +7350,19 @@ class SlackAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Render a clarify prompt as Block Kit interactive buttons.
+        """Render a clarify prompt as readable Block Kit choice rows.
 
-        Multi-choice mode (``choices`` non-empty): one button per option
-        (unique ``hermes_clarify_choice_<idx>`` action_id, ``value`` packs
+        Multi-choice mode (``choices`` non-empty): one wrapping section per
+        option with a compact ``Select <n>`` accessory button (unique
+        ``hermes_clarify_choice_<idx>`` action_id, ``value`` packs
         ``clarify_id|idx``) plus a final "✏️ Other…" button
-        (``hermes_clarify_other``).  A choice click resolves the clarify
-        primitive directly; the "Other" button flips the entry into
-        text-capture mode so the gateway's platform-agnostic text-intercept
-        (:meth:`GatewayRunner._handle_message`) picks up the next typed
-        message and resolves the clarify — no Slack-specific text machinery.
+        (``hermes_clarify_other``).  Keeping the decision text out of the
+        button label avoids Slack's aggressive button ellipsis while a choice
+        click still resolves the clarify primitive directly.  The "Other"
+        button flips the entry into text-capture mode so the gateway's
+        platform-agnostic text-intercept (:meth:`GatewayRunner._handle_message`)
+        picks up the next typed message and resolves the clarify — no
+        Slack-specific text machinery.
 
         Open-ended mode (``choices`` empty): delegates to the base
         implementation, which renders the plain question and arms the same
@@ -7397,36 +7400,61 @@ class SlackAdapter(BasePlatformAdapter):
             if len(body) > budget:
                 body = body[:budget] + "..."
 
-            # One button per choice + a free-text "Other" button.  Slack caps
-            # an actions block at 5 elements; the clarify tool caps choices at
-            # 4 (+ Other = 5) so this is normally one block, but chunk anyway
-            # so a larger choice list degrades gracefully instead of 400ing.
-            elements = []
-            for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
-                elements.append({
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
-                    "action_id": f"hermes_clarify_choice_{idx}",
-                    "value": f"{clarify_id}|{idx}",
-                })
-            elements.append({
-                "type": "button",
-                "text": {"type": "plain_text", "text": "✏️ Other…", "emoji": True},
-                "action_id": "hermes_clarify_other",
-                "value": f"{clarify_id}|other",
-            })
-
+            # Slack visually truncates button labels at roughly 30 characters,
+            # so render the full option as wrapping section text and keep only
+            # the compact selection action in the button accessory.
             blocks: list = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": body}},
             ]
-            for start in range(0, len(elements), 5):
-                blocks.append({"type": "actions", "elements": elements[start:start + 5]})
+            for idx, choice in enumerate(choices):
+                label = str(choice).strip() or f"Option {idx + 1}"
+                escaped_label = (
+                    label.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+                blocks.append(
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*{idx + 1}.* {escaped_label}",
+                        },
+                        "accessory": {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": f"Select {idx + 1}",
+                                "emoji": True,
+                            },
+                            "accessibility_label": f"Select option {idx + 1}",
+                            "action_id": f"hermes_clarify_choice_{idx}",
+                            "value": f"{clarify_id}|{idx}",
+                        },
+                    }
+                )
+            blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "✏️ Other…",
+                                "emoji": True,
+                            },
+                            "action_id": "hermes_clarify_other",
+                            "value": f"{clarify_id}|other",
+                        }
+                    ],
+                }
+            )
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
                 "text": body,
-                "blocks": blocks,
+                "blocks": sanitize_blocks(blocks),
             }
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
