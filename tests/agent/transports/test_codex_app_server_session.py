@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -298,6 +299,112 @@ class TestRunTurn:
             assert result.error is None
         else:
             assert result.error and expected_error in result.error
+
+    @pytest.mark.parametrize(
+        "status, expected_interrupted, expected_error",
+        [
+            ("completed", False, None),
+            ("interrupted", True, None),
+            ("failed", False, "status=failed"),
+        ],
+    )
+    def test_completion_in_approval_predrain_is_terminal(
+        self, status, expected_interrupted, expected_error
+    ):
+        """Every scoped notification takes the same terminal-status path."""
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="pwd",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": status, "error": None},
+        )
+
+        result = make_session(
+            client,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        ).run_turn("hi", turn_timeout=0.05, notification_poll_timeout=0.0)
+
+        assert client.responses == [("approval-1", {"decision": "accept"})]
+        assert result.interrupted is expected_interrupted
+        assert result.should_retire is False
+        if expected_error is None:
+            assert result.error is None
+        else:
+            assert result.error and expected_error in result.error
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_completion_in_approval_predrain_terminates_without_budget(
+        self, monkeypatch
+    ):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="pwd",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        empty_polls = {"count": 0}
+        original_take = client.take_notification
+
+        def take_notification(timeout=0.0):
+            note = original_take(timeout)
+            if note is None:
+                empty_polls["count"] += 1
+                if empty_polls["count"] > 3:
+                    raise AssertionError("pre-drained completion did not terminate turn")
+            return note
+
+        monkeypatch.setattr(client, "take_notification", take_notification)
+
+        result = make_session(
+            client,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        ).run_turn("hi", notification_poll_timeout=0.0)
+
+        assert result.interrupted is False
+        assert result.error is None
+        assert result.should_retire is False
+
+    def test_late_completion_after_deadline_is_rejected(self, monkeypatch):
+        client = FakeClient()
+        clock = {"now": 0.0}
+
+        def take_notification(timeout=0.0):
+            clock["now"] = 0.03
+            return {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turn": {
+                        "id": "turn-fake-001",
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            }
+
+        monkeypatch.setattr(client, "take_notification", take_notification)
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        result = make_session(client).run_turn(
+            "hi", turn_timeout=0.01, notification_poll_timeout=1.0
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "timed out" in result.error
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
 
 
 
@@ -686,6 +793,140 @@ class TestServerRequestRouting:
         s.run_turn("hi", turn_timeout=1.0)
         assert ("r1", {"decision": "accept"}) in client.responses
 
+    def test_approval_callback_cannot_cross_turn_deadline(self, monkeypatch):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="sleep 300",
+            cwd="/tmp",
+        )
+        clock = {"now": 0.0}
+        entered = threading.Event()
+        exited = threading.Event()
+
+        def callback(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+            deadline=None,
+            cancel_event=None,
+        ):
+            entered.set()
+            clock["now"] = 0.03
+            assert deadline == pytest.approx(0.02)
+            if cancel_event is not None:
+                cancel_event.wait(0.1)
+            exited.set()
+            return "once"
+
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        result = make_session(client, approval_callback=callback).run_turn(
+            "hi", turn_timeout=0.02, notification_poll_timeout=0.0
+        )
+
+        assert entered.is_set()
+        assert exited.wait(0.1)
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "timed out" in result.error
+        assert client.responses == [("approval-1", {"decision": "decline"})]
+
+    def test_explicit_interrupt_unblocks_pending_approval(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="sleep 300",
+            cwd="/tmp",
+        )
+        entered = threading.Event()
+        exited = threading.Event()
+
+        def callback(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+            deadline=None,
+            cancel_event=None,
+        ):
+            entered.set()
+            assert cancel_event is not None
+            cancel_event.wait(1.0)
+            exited.set()
+            return "deny"
+
+        session = make_session(client, approval_callback=callback)
+        holder = {}
+        run_thread = threading.Thread(
+            target=lambda: holder.setdefault(
+                "result", session.run_turn("hi", notification_poll_timeout=0.0)
+            )
+        )
+        run_thread.start()
+        assert entered.wait(0.5)
+
+        session.request_interrupt()
+        run_thread.join(0.5)
+
+        assert not run_thread.is_alive()
+        assert exited.is_set()
+        result = holder["result"]
+        assert result.interrupted is True
+        assert result.should_retire is False
+        assert client.responses == [("approval-1", {"decision": "decline"})]
+
+    def test_process_death_unblocks_pending_approval(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="sleep 300",
+            cwd="/tmp",
+        )
+        entered = threading.Event()
+        exited = threading.Event()
+
+        def callback(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+            deadline=None,
+            cancel_event=None,
+        ):
+            entered.set()
+            assert cancel_event is not None
+            cancel_event.wait(1.0)
+            exited.set()
+            return "deny"
+
+        holder = {}
+        run_thread = threading.Thread(
+            target=lambda: holder.setdefault(
+                "result",
+                make_session(client, approval_callback=callback).run_turn(
+                    "hi", notification_poll_timeout=0.0
+                ),
+            )
+        )
+        run_thread.start()
+        assert entered.wait(0.5)
+
+        client._closed = True
+        run_thread.join(0.5)
+
+        assert not run_thread.is_alive()
+        assert exited.is_set()
+        result = holder["result"]
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "exited unexpectedly" in result.error
+        assert client.responses == [("approval-1", {"decision": "decline"})]
+
 
 
 # ---- enriched approval prompts ----
@@ -1068,6 +1309,118 @@ class TestSessionRetirement:
         assert r.final_text == "tool finished"
         assert r.should_retire is False
         assert r.interrupted is False
+
+    @pytest.mark.parametrize("turn_timeout", [None, 1.0])
+    def test_approval_does_not_disarm_post_tool_watchdog(
+        self, monkeypatch, turn_timeout
+    ):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="echo hi",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex1",
+                "command": "echo hi",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "hi",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        clock = {"now": 0.0, "empty_polls": 0}
+        original_take = client.take_notification
+
+        def take_notification(timeout=0.0):
+            note = original_take(timeout)
+            if note is None:
+                clock["now"] += 0.05
+                clock["empty_polls"] += 1
+                if clock["empty_polls"] > 30:
+                    raise AssertionError("approval permanently disarmed watchdog")
+            return note
+
+        monkeypatch.setattr(client, "take_notification", take_notification)
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        result = make_session(
+            client,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        ).run_turn(
+            "tool, approval, silence",
+            turn_timeout=turn_timeout,
+            notification_poll_timeout=0.0,
+            post_tool_quiet_timeout=0.1,
+        )
+
+        assert result.tool_iterations == 1
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "silent" in result.error
+        assert client.responses == [("approval-1", {"decision": "accept"})]
+
+    def test_post_tool_watchdog_can_expire_during_approval(self, monkeypatch):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="echo hi",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex1",
+                "command": "echo hi",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "hi",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        clock = {"now": 0.0}
+        exited = threading.Event()
+
+        def callback(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+            deadline=None,
+            cancel_event=None,
+        ):
+            assert deadline == pytest.approx(0.1)
+            assert cancel_event is not None
+            clock["now"] = 0.11
+            cancel_event.wait(0.1)
+            exited.set()
+            return "once"
+
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        result = make_session(client, approval_callback=callback).run_turn(
+            "tool, approval, silence",
+            notification_poll_timeout=0.0,
+            post_tool_quiet_timeout=0.1,
+        )
+
+        assert exited.wait(0.1)
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "silent" in result.error
+        assert client.responses == [("approval-1", {"decision": "decline"})]
 
 
 
