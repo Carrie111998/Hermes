@@ -1513,7 +1513,7 @@ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1649,6 +1649,8 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "onload": str(frontmatter.get("onload", "") or ""),
+        "rel_path": str(rel_path),
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1765,7 +1767,7 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
-) -> str:
+) -> tuple[str, list[dict]]:
     """Build a compact skill index for the system prompt.
 
     Two-layer cache:
@@ -1831,7 +1833,7 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
-) -> str:
+) -> tuple[str, list[dict]]:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
@@ -1851,6 +1853,11 @@ def _build_skills_system_prompt_inner(
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+            # Old-format cached strings (v2 snapshots) get wrapped to
+            # maintain the new (index, onload_entries) contract.
+            if isinstance(cached, str):
+                cached = (cached, [])
+                _SKILLS_PROMPT_CACHE[cache_key] = cached
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
@@ -2135,14 +2142,35 @@ def _build_skills_system_prompt_inner(
             + hidden_note
         )
 
+    # ── Collect onload entries ──────────────────────────────────────────
+    # Skills with an `onload:` frontmatter field register a script that the
+    # system-prompt builder runs at session init. If it returns "INJECT",
+    # the skill body is pre-loaded into the system prompt volatile tier.
+    onload_entries: list[dict] = []
+    for entry in visible_entries:
+        ol_raw = entry.get("onload", "") or ""
+        ol = str(ol_raw).strip()
+        if not ol:
+            continue
+        rp = entry.get("rel_path", "") or ""
+        if not rp:
+            continue
+        rp_obj = Path(rp)
+        onload_entries.append({
+            "onload": ol,
+            "skill_dir": str(skills_dir / rp_obj.parent),
+            "skill_md_path": str(skills_dir / rp),
+            "skill_name": entry.get("skill_name", "?"),
+        })
+
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:
-        _SKILLS_PROMPT_CACHE[cache_key] = result
+        _SKILLS_PROMPT_CACHE[cache_key] = (result, onload_entries)
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
             _SKILLS_PROMPT_CACHE.popitem(last=False)
 
-    return result
+    return result, onload_entries
 
 
 # =========================================================================
