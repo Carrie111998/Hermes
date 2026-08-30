@@ -6184,19 +6184,22 @@ class BasePlatformAdapter(ABC):
 
     async def _await_stale_session_handoff(self, session_key: str) -> bool:
         """Join the one stale-session recovery transition for this session."""
-        handoff = self._session_ingress_handoffs.get(session_key)
+        handoffs = getattr(self, "_session_ingress_handoffs", None)
+        if handoffs is None:
+            handoffs = self._session_ingress_handoffs = {}
+        handoff = handoffs.get(session_key)
         if handoff is None:
             if session_key not in self._active_sessions:
                 return False
             if not self._session_task_is_stale(session_key):
                 return False
             handoff = asyncio.create_task(self._heal_stale_session_lock(session_key))
-            self._session_ingress_handoffs[session_key] = handoff
+            handoffs[session_key] = handoff
         try:
             return await asyncio.shield(handoff)
         finally:
-            if handoff.done() and self._session_ingress_handoffs.get(session_key) is handoff:
-                self._session_ingress_handoffs.pop(session_key, None)
+            if handoff.done() and handoffs.get(session_key) is handoff:
+                handoffs.pop(session_key, None)
 
     def _start_session_processing(
         self,
