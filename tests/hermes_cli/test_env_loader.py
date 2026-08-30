@@ -6,6 +6,38 @@ import sys
 from hermes_cli.env_loader import load_hermes_dotenv
 
 
+def test_launcher_protected_env_vars_survive_dotenv_layers(tmp_path, monkeypatch):
+    import hermes_cli.env_loader as env_loader
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / ".env").write_text(
+        "PROTECTED_ONE=stale-profile-one\nPROTECTED_TWO=stale-profile-two\n",
+        encoding="utf-8",
+    )
+    project_env = tmp_path / "project.env"
+    project_env.write_text(
+        "PROTECTED_ONE=stale-project-one\nPROTECTED_TWO=stale-project-two\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        env_loader,
+        "LAUNCHER_PROTECTED_ENV_VARS",
+        ("PROTECTED_ONE", "PROTECTED_TWO"),
+    )
+    monkeypatch.setenv("PROTECTED_ONE", "process-one")
+    monkeypatch.setenv("PROTECTED_TWO", "process-two")
+
+    load_hermes_dotenv(
+        hermes_home=home,
+        project_env=project_env,
+        load_external_secrets=False,
+    )
+
+    assert os.environ["PROTECTED_ONE"] == "process-one"
+    assert os.environ["PROTECTED_TWO"] == "process-two"
+
+
 def test_recovered_update_retry_skips_external_secret_sources(tmp_path, monkeypatch):
     """The post-recovery updater must not remap native vault dependencies."""
     import hermes_cli.env_loader as env_loader
