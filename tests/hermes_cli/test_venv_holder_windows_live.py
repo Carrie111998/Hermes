@@ -37,15 +37,19 @@ pytestmark = pytest.mark.skipif(
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _spawn(args: list[str], cwd: Path | None = None) -> subprocess.Popen:
+def _spawn(
+    args: list[str], cwd: Path | None = None, *, interpreter: str | None = None
+) -> subprocess.Popen:
     """Spawn a real sleeper process whose argv carries the given tail.
 
     ``python -c "sleep" <tail...>`` — the tail is inert data to the child
     but fully visible to psutil cmdline scans, which is what the detection
-    code classifies on.
+    code classifies on. Defaults to this test's own interpreter (a stand-in
+    for "a real Hermes process" holding this venv); pass *interpreter* to
+    simulate a genuinely unrelated python — see ``_foreign_interpreter``.
     """
     proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(300)", *args],
+        [interpreter or sys.executable, "-c", "import time; time.sleep(300)", *args],
         cwd=str(cwd or PROJECT_ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -53,6 +57,23 @@ def _spawn(args: list[str], cwd: Path | None = None) -> subprocess.Popen:
     time.sleep(0.8)  # let the process table settle
     assert proc.poll() is None, "sleeper died at spawn"
     return proc
+
+
+def _foreign_interpreter() -> str:
+    """A python executable that belongs to no project venv at all.
+
+    Venv-holder detection now resolves the live venv via introspection
+    (``sys.prefix`` of the process running the scan) rather than a
+    hardcoded folder name, so it correctly recognizes ANY venv under the
+    project root — including this test suite's own ``.venv313``. A
+    "foreign" process must therefore run a genuinely different
+    interpreter, not just carry unrelated argv from this same one:
+    ``sys.base_prefix`` is the interpreter a venv was created FROM, which
+    is never itself a venv under the project root.
+    """
+    windows = sys.platform == "win32"
+    candidate = Path(sys.base_prefix) / ("python.exe" if windows else "bin/python3")
+    return str(candidate) if candidate.is_file() else sys.executable
 
 
 def _detect() -> list[tuple[int, str, str]]:
@@ -86,12 +107,17 @@ class TestDetection:
             _kill(proc)
 
     def test_foreign_python_not_detected(self):
-        """A python process with no Hermes argv and cwd OUTSIDE the install
-        must not be reported as a holder."""
+        """A python process with no Hermes argv, cwd OUTSIDE the install,
+        and an interpreter outside every project venv must not be
+        reported as a holder."""
         import tempfile
 
         outside = Path(tempfile.mkdtemp())
-        proc = _spawn(["totally", "unrelated"], cwd=outside)
+        proc = _spawn(
+            ["totally", "unrelated"],
+            cwd=outside,
+            interpreter=_foreign_interpreter(),
+        )
         try:
             pids = [pid for pid, _, _ in _detect()]
             assert proc.pid not in pids
