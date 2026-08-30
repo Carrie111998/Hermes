@@ -29,6 +29,59 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def test_latest_summary_suppressed_while_newer_run_active(tmp_path):
+    """#98204: a stale blocked/completed summary must not surface as the latest
+    while a newer run is still active (unfinished, no summary of its own) —
+    otherwise a RUNNING task reads as still blocked. Once the newer run finishes
+    with its own summary, that summary becomes the latest."""
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as conn:
+        # Older run: blocked, ended, carries a summary.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, summary) "
+            "VALUES ('t1', 'blocked', 100, 150, 'blocked', ?)",
+            ("Production blocked: ring vs track 1.36:1",),
+        )
+        # Newer run: running, active (ended_at NULL), no summary yet.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, summary) "
+            "VALUES ('t1', 'running', 200, NULL, NULL)"
+        )
+        conn.commit()
+
+        # While the newer run is active, the stale summary is suppressed.
+        assert kb.latest_summary(conn, "t1") is None
+        assert kb.latest_summaries(conn, ["t1"]) == {}
+
+        # When the newer run completes with its own summary, that is the latest.
+        conn.execute(
+            "UPDATE task_runs SET ended_at = 250, status = 'completed', summary = ? "
+            "WHERE task_id = 't1' AND started_at = 200",
+            ("Done: corrected the ratio",),
+        )
+        conn.commit()
+        assert kb.latest_summary(conn, "t1") == "Done: corrected the ratio"
+        assert kb.latest_summaries(conn, ["t1"]) == {"t1": "Done: corrected the ratio"}
+
+
+def test_latest_summary_returns_newest_when_all_runs_finished(tmp_path):
+    """Control: with no active newer run, the newest available summary surfaces
+    exactly as before."""
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, summary) "
+            "VALUES ('t2', 'completed', 100, 150, 'first')"
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, summary) "
+            "VALUES ('t2', 'completed', 200, 250, 'second')"
+        )
+        conn.commit()
+        assert kb.latest_summary(conn, "t2") == "second"
+        assert kb.latest_summaries(conn, ["t2"]) == {"t2": "second"}
+
+
 def _init_git_repo(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
