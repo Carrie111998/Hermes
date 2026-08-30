@@ -26,6 +26,10 @@ from typing import Any, Literal
 
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
+from gateway.hosted_room_attachments import (
+    MAX_TASK_ATTACHMENT_BYTES,
+    MAX_TASK_ATTACHMENTS,
+)
 
 
 MAX_DISCUSSION_MEMBERS = 6
@@ -38,12 +42,23 @@ MAX_MEMBER_TEXT_BYTES = 64 * 1024
 _TRUNCATED_REPLY_NOTICE = (
     "\n\n[Reply truncated. Ask the Bot to share the full result as a file.]"
 )
+MAX_ATTACHMENTS = 8
+MAX_ATTACHMENT_NAME_CHARS = 255
+MAX_ATTACHMENT_MIME_CHARS = 127
+MAX_ATTACHMENT_ID_CHARS = 128
+MAX_ATTACHMENT_SIZE_BYTES = 15_000_000
+MAX_ATTACHMENT_TOTAL_BYTES = 25_000_000
+MAX_ATTACHMENT_MANIFEST_BYTES = 32 * 1024
 
 DecisionStatus = Literal["idle", "task", "settled", "bounded"]
 TerminalKind = Literal["settled", "failed", "cancelled", "deferred"]
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
+_MIME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"
+)
+_ATTACHMENT_ID_RE = re.compile(r"^att_[0-9a-f]{32}$")
 _FENCE_START_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _BARE_URI_START_RE = re.compile(r"(?i)(?:https?://|ftp://|mailto:|www\.)")
 _TURN_ID_RE = re.compile(
@@ -75,6 +90,9 @@ _REMOTE_MEMBER_FIELDS = frozenset({
     "target_profile",
 })
 _USER_PAYLOAD_FIELDS = frozenset({"text", "thread_id"})
+_USER_PAYLOAD_OPTIONAL_FIELDS = frozenset({"attachments"})
+_ATTACHMENT_FIELDS = frozenset({"attachment_id", "kind", "name", "size", "mime"})
+_ATTACHMENT_KINDS = frozenset({"image", "pdf", "file"})
 _MEMBER_MESSAGE_FIELDS = frozenset({
     "discussion_event_id",
     "member_id",
@@ -273,24 +291,159 @@ def _exact_fields(
     return value
 
 
-def validate_user_payload(value: Any) -> dict[str, Any]:
+def _attachment_name(value: Any, *, index: int) -> str:
+    if not isinstance(value, str):
+        raise DiscussionValidationError(f"attachment {index} name must be a string")
+    name = value.strip()
+    if (
+        not name
+        or len(name) > MAX_ATTACHMENT_NAME_CHARS
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+        or "\n" in name
+        or "\r" in name
+    ):
+        raise DiscussionValidationError(
+            f"attachment {index} name must be a bounded basename"
+        )
+    return name
+
+
+def _attachment_mime(value: Any, *, index: int, kind: str) -> str:
+    if not isinstance(value, str):
+        raise DiscussionValidationError(f"attachment {index} mime must be a string")
+    mime = value.strip().lower()
+    if (
+        not mime
+        or len(mime) > MAX_ATTACHMENT_MIME_CHARS
+        or _MIME_RE.fullmatch(mime) is None
+    ):
+        raise DiscussionValidationError(f"attachment {index} has invalid mime metadata")
+    if kind == "image" and not mime.startswith("image/"):
+        raise DiscussionValidationError(
+            f"attachment {index} image kind requires image mime"
+        )
+    if kind == "pdf" and mime != "application/pdf":
+        raise DiscussionValidationError(
+            f"attachment {index} pdf kind requires application/pdf"
+        )
+    return mime
+
+
+def _validate_attachments(
+    value: Any,
+    *,
+    member_ids: Iterable[str] | None,
+) -> list[dict[str, Any]]:
+    if member_ids is None:
+        raise DiscussionValidationError(
+            "attachment validation requires the frozen room member ids"
+        )
+    if not isinstance(value, list):
+        raise DiscussionValidationError("attachments must be a list")
+    if len(value) > MAX_ATTACHMENTS:
+        raise DiscussionValidationError(
+            f"attachments must contain at most {MAX_ATTACHMENTS} entries"
+        )
+    expected_member_ids = tuple(
+        _identifier(member_id, label="attachment member_id") for member_id in member_ids
+    )
+    if not expected_member_ids or len(set(expected_member_ids)) != len(
+        expected_member_ids
+    ):
+        raise DiscussionValidationError(
+            "attachment member ids must be a non-empty frozen set"
+        )
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(value):
+        attachment = _exact_fields(
+            raw,
+            label=f"attachment {index}",
+            required=_ATTACHMENT_FIELDS,
+        )
+        attachment_id = attachment["attachment_id"]
+        if (
+            not isinstance(attachment_id, str)
+            or len(attachment_id) > MAX_ATTACHMENT_ID_CHARS
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
+        ):
+            raise DiscussionValidationError(
+                f"attachment {index} has an invalid opaque attachment_id"
+            )
+        kind = attachment["kind"]
+        if not isinstance(kind, str) or kind not in _ATTACHMENT_KINDS:
+            raise DiscussionValidationError(
+                f"attachment {index} kind must be image, pdf, or file"
+            )
+        name = _attachment_name(attachment["name"], index=index)
+        size = attachment["size"]
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 0 < size <= MAX_ATTACHMENT_SIZE_BYTES
+        ):
+            raise DiscussionValidationError(
+                f"attachment {index} size must be between 1 and "
+                f"{MAX_ATTACHMENT_SIZE_BYTES} bytes"
+            )
+        mime = _attachment_mime(attachment["mime"], index=index, kind=kind)
+        normalized.append({
+            "attachment_id": attachment_id,
+            "kind": kind,
+            "name": name,
+            "size": size,
+            "mime": mime,
+        })
+    if len({item["attachment_id"] for item in normalized}) != len(normalized):
+        raise DiscussionValidationError("attachment ids must be unique")
+    if sum(item["size"] for item in normalized) > MAX_ATTACHMENT_TOTAL_BYTES:
+        raise DiscussionValidationError(
+            "attachment manifest exceeds the message byte limit"
+        )
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > MAX_ATTACHMENT_MANIFEST_BYTES:
+        raise DiscussionValidationError("attachment manifest is too large")
+    return normalized
+
+
+def validate_user_payload(
+    value: Any,
+    *,
+    member_ids: Iterable[str] | None = None,
+) -> dict[str, Any]:
     """Validate and normalize the exact ``message.user`` Discussion payload."""
 
     payload = _exact_fields(
         value,
         label="user payload",
         required=_USER_PAYLOAD_FIELDS,
+        optional=_USER_PAYLOAD_OPTIONAL_FIELDS,
     )
     text = payload["text"]
     if not isinstance(text, str):
         raise DiscussionValidationError("user payload text must be a string")
     text = text.strip()
-    if not text:
-        raise DiscussionValidationError("user payload text must not be empty")
+    if not text and not payload.get("attachments"):
+        raise DiscussionValidationError(
+            "user payload must contain text or attachments"
+        )
     if len(text.encode("utf-8")) > MAX_USER_TEXT_BYTES:
         raise DiscussionValidationError("user payload text is too large")
     thread_id = _identifier(payload["thread_id"], label="thread_id")
-    return {"text": text, "thread_id": thread_id}
+    normalized: dict[str, Any] = {"text": text, "thread_id": thread_id}
+    if "attachments" in payload:
+        normalized["attachments"] = _validate_attachments(
+            payload["attachments"],
+            member_ids=member_ids,
+        )
+    return normalized
 
 
 def _validate_member_target(
@@ -895,7 +1048,10 @@ def _validate_event(
         raise DiscussionValidationError("event payload must be an object")
 
     if kind == "message.user":
-        payload = validate_user_payload(payload)
+        payload = validate_user_payload(
+            payload,
+            member_ids=(member.member_id for member in room.members),
+        )
         if actor.get("kind") != "user":
             raise DiscussionValidationError("message.user requires a user actor")
     elif kind == "message.member":
@@ -1125,6 +1281,9 @@ def _derive_member_watermarks(
     messages_by_id = {
         event.event_id: event for event in events if event.kind == "message.member"
     }
+    user_seq_by_id = {
+        event.event_id: event.seq for event in events if event.kind == "message.user"
+    }
     terminal_by_task: dict[str, _ValidatedEvent] = {}
     watermarks: dict[tuple[str, str], int] = {}
     for event in events:
@@ -1158,7 +1317,18 @@ def _derive_member_watermarks(
                 raise DiscussionValidationError(
                     "turn.settled references no matching member message"
                 )
-            watermark = max(watermark, message.seq)
+            discussion_seq = user_seq_by_id.get(
+                str(event.payload["discussion_event_id"])
+            )
+            if discussion_seq is None:
+                raise DiscussionValidationError(
+                    "turn.settled references no matching user discussion"
+                )
+            # A partial attachment batch deliberately stops before the latest
+            # user event. Do not let this Bot's later visible reply skip the
+            # older attachment events that still need a bounded follow-up task.
+            if watermark >= discussion_seq:
+                watermark = max(watermark, message.seq)
         watermarks[key] = max(watermarks.get(key, 0), watermark)
     return watermarks
 
@@ -1207,6 +1377,36 @@ def _truncate_utf8_text(value: Any, *, max_bytes: int, suffix: str = "") -> str:
     return suffix.strip()
 
 
+def _attachment_prompt_lines(
+    messages: Sequence[_ValidatedEvent],
+) -> list[str]:
+    entries: list[str] = []
+    queued_media = False
+    for event in messages:
+        if event.kind != "message.user":
+            continue
+        for attachment in event.payload.get("attachments", []):
+            name = json.dumps(attachment["name"], ensure_ascii=True)
+            metadata = f"{attachment['mime']}, {attachment['size']} bytes"
+            if attachment["kind"] == "file":
+                entries.append(f"- Staged file {name} ({metadata})")
+                continue
+            queued_media = True
+            label = "image" if attachment["kind"] == "image" else "PDF"
+            entries.append(
+                f"- Queued {label} {name} ({metadata}) for this turn."
+            )
+    if not entries:
+        return []
+    lines = ["", "Attachments available to you for this turn:", *entries]
+    if queued_media:
+        lines.append(
+            "Queued image/PDF attachments are staged separately for this turn; "
+            "inspect the supplied media rather than treating its filename as content."
+        )
+    return lines
+
+
 def _build_prompt(
     *,
     room: DiscussionRoom,
@@ -1215,9 +1415,15 @@ def _build_prompt(
     watermark: int,
     seen_through_seq: int,
 ) -> str:
-    delta = [event for event in messages if watermark < event.seq <= seen_through_seq][
-        -MAX_DISCUSSION_DELTA_LINES:
-    ]
+    delta = [
+        event
+        for event in messages
+        if watermark < event.seq <= seen_through_seq
+        and not (
+            event.kind == "message.member"
+            and event.payload.get("member_id") == member.member_id
+        )
+    ][-MAX_DISCUSSION_DELTA_LINES:]
     peers = ", ".join(
         f"@{candidate.handle}"
         for candidate in room.members
@@ -1229,6 +1435,7 @@ def _build_prompt(
         "",
         "New messages in this thread since your last turn (oldest first):",
     ]
+    attachment_lines = _attachment_prompt_lines(delta)
     rules = [
         "",
         "Rules for this Discussion:",
@@ -1237,7 +1444,9 @@ def _build_prompt(
         "- Mention a teammate by handle to pull them into the next round; do not repeat points already made.",
         "- Never reveal content from private conversations. Your reply is published verbatim.",
     ]
-    fixed_bytes = len("\n".join([*opening, *rules]).encode("utf-8"))
+    fixed_bytes = len(
+        "\n".join([*opening, *attachment_lines, *rules]).encode("utf-8")
+    )
     available = max(0, driver.MAX_PROMPT_BYTES - fixed_bytes - 1)
     selected: list[str] = []
     omitted = False
@@ -1255,7 +1464,7 @@ def _build_prompt(
     selected.reverse()
     if omitted:
         selected.insert(0, "  [Earlier content omitted to fit this turn.]")
-    prompt = "\n".join([*opening, *selected, *rules])
+    prompt = "\n".join([*opening, *selected, *attachment_lines, *rules])
     if len(prompt.encode("utf-8")) > driver.MAX_PROMPT_BYTES:
         raise DiscussionValidationError("Discussion prompt exceeds the driver limit")
     return prompt
@@ -1313,6 +1522,7 @@ def _make_task_plan(
     round_index: int,
     seen_through_seq: int,
     prompt: str,
+    attachments: Sequence[Mapping[str, Any]] = (),
 ) -> DiscussionTaskPlan:
     turn_id = _turn_id(
         source_event_seq=discussion_event.seq,
@@ -1342,6 +1552,8 @@ def _make_task_plan(
         "prompt": prompt,
         "source_event_seq": discussion_event.seq,
     }
+    if attachments:
+        payload["attachments"] = [dict(attachment) for attachment in attachments]
     return DiscussionTaskPlan(
         identity=identity,
         payload=payload,
@@ -1351,6 +1563,52 @@ def _make_task_plan(
         round_index=round_index,
         seen_through_seq=seen_through_seq,
     )
+
+
+def _bounded_task_delta(
+    messages: Sequence[_ValidatedEvent],
+    *,
+    watermark: int,
+    maximum_seq: int,
+) -> tuple[int, list[_ValidatedEvent], list[dict[str, Any]]]:
+    """Return the oldest complete input prefix that fits one model turn.
+
+    Every accepted user message already fits the per-message attachment limits,
+    so the first event can always make progress. Stopping only between events
+    preserves each message and lets the terminal watermark resume at the next
+    unconsumed event instead of poisoning the room backlog.
+    """
+
+    selected: list[_ValidatedEvent] = []
+    attachments: list[dict[str, Any]] = []
+    attachment_bytes = 0
+    seen_through_seq = watermark
+    for event in messages:
+        if not watermark < event.seq <= maximum_seq:
+            continue
+        event_attachments = (
+            list(event.payload.get("attachments", []))
+            if event.kind == "message.user"
+            else []
+        )
+        next_count = len(attachments) + len(event_attachments)
+        next_bytes = attachment_bytes + sum(
+            int(attachment["size"]) for attachment in event_attachments
+        )
+        if event_attachments and (
+            next_count > MAX_TASK_ATTACHMENTS
+            or next_bytes > MAX_TASK_ATTACHMENT_BYTES
+        ):
+            if selected:
+                break
+            raise DiscussionValidationError(
+                "one user message exceeds the per-task attachment budget"
+            )
+        selected.append(event)
+        attachments.extend(dict(attachment) for attachment in event_attachments)
+        attachment_bytes = next_bytes
+        seen_through_seq = event.seq
+    return seen_through_seq, selected, attachments
 
 
 def plan_next_task(
@@ -1449,7 +1707,7 @@ def plan_next_task(
     }
     for key, value in _derive_member_watermarks(validated).items():
         watermarks[key] = max(watermarks.get(key, 0), value)
-    seen_through_seq = max(event.seq for event in thread_messages)
+    maximum_seen_seq = max(event.seq for event in thread_messages)
 
     for round_index in range(MAX_DISCUSSION_ROUNDS):
         # The user's message selects the first round, with no mention meaning
@@ -1475,14 +1733,21 @@ def plan_next_task(
             )
         ordered = _rotate(responders, round_index)
         for member_index, member in enumerate(ordered):
-            if (round_index, member.member_id) in terminals:
-                continue
             watermark = watermarks.get((thread_id, member.member_id), 0)
-            delta = [
-                event
+            terminal = terminals.get((round_index, member.member_id))
+            pending_attachments = any(
+                event.kind == "message.user"
+                and watermark < event.seq <= maximum_seen_seq
+                and event.payload.get("attachments")
                 for event in thread_messages
-                if watermark < event.seq <= seen_through_seq
-            ]
+            )
+            if terminal is not None and not pending_attachments:
+                continue
+            seen_through_seq, delta, attachments = _bounded_task_delta(
+                thread_messages,
+                watermark=watermark,
+                maximum_seq=maximum_seen_seq,
+            )
             if not delta:
                 continue
             prompt = _build_prompt(
@@ -1500,6 +1765,7 @@ def plan_next_task(
                 round_index=round_index,
                 seen_through_seq=seen_through_seq,
                 prompt=prompt,
+                attachments=attachments,
             )
             return DiscussionDecision(
                 status="task",
@@ -1559,7 +1825,9 @@ def reconstruct_task_plan(
         "source_event_seq",
     })
     if not required_payload <= frozenset(payload) or (
-        frozenset(payload) - required_payload - {"target_member_id"}
+        frozenset(payload)
+        - required_payload
+        - {"attachments", "target_member_id"}
     ):
         raise DiscussionReconstructionError("driver task payload shape changed")
     match = _TURN_ID_RE.fullmatch(identity.turn_id)
@@ -1611,6 +1879,37 @@ def reconstruct_task_plan(
         raise DiscussionReconstructionError("task prompt is missing")
     if len(prompt.encode("utf-8")) > driver.MAX_PROMPT_BYTES:
         raise DiscussionReconstructionError("task prompt exceeds the driver limit")
+    # Reconstruct the watermark that existed when THIS task was planned. Once
+    # its terminal publication lands, the current watermark includes this
+    # task's own seen-through sequence and would incorrectly erase the
+    # attachments that were part of its persisted payload.
+    terminal = next(
+        (
+            event
+            for event in validated
+            if event.kind in _TERMINAL_EVENT_KINDS
+            and event.payload.get("task_id") == identity.task_id
+        ),
+        None,
+    )
+    watermark_events = (
+        validated
+        if terminal is None
+        else tuple(event for event in validated if event.seq < terminal.seq)
+    )
+    watermarks = _derive_member_watermarks(watermark_events)
+    watermark = watermarks.get((identity.thread_id, member.member_id), 0)
+    task_messages = _message_events(
+        validated,
+        thread_id=identity.thread_id,
+        maximum_seq=seen_through_seq,
+    )
+    attachments = [
+        dict(attachment)
+        for event in task_messages
+        if watermark < event.seq <= seen_through_seq and event.kind == "message.user"
+        for attachment in event.payload.get("attachments", [])
+    ]
     reconstructed = _make_task_plan(
         room=room,
         discussion_event=discussion,
@@ -1619,6 +1918,7 @@ def reconstruct_task_plan(
         round_index=round_index,
         seen_through_seq=seen_through_seq,
         prompt=prompt,
+        attachments=attachments,
     )
     if reconstructed.identity != identity or dict(reconstructed.payload) != dict(
         payload
@@ -1675,9 +1975,10 @@ def plan_publication(
             "deferred publication requires an execution generation"
         )
 
+    source_event_seq = int(task.payload["source_event_seq"])
     newer_same_thread = any(
         event.kind == "message.user"
-        and event.seq > task.seen_through_seq
+        and event.seq > source_event_seq
         and event.payload.get("thread_id") == task.identity.thread_id
         for event in validated
     )

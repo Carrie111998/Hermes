@@ -831,11 +831,21 @@ async def _handle_runs(
                         # ownership so stop/cancel can reap only the
                         # background processes this run created (#76115).
                         _publish_turn_process_ownership(agent, effective_task_id)
-                        r = agent.run_conversation(
-                            user_message=user_message,
-                            conversation_history=conversation_history,
-                            task_id=effective_task_id,
+                        run_kwargs = {
+                            "user_message": user_message,
+                            "conversation_history": conversation_history,
+                            "task_id": effective_task_id,
+                        }
+                        room_persist_user_message = (
+                            body.get("_room_persist_user_message")
+                            if self._room_grant_token(request)
+                            else None
                         )
+                        if room_persist_user_message is not None:
+                            run_kwargs["persist_user_message"] = (
+                                room_persist_user_message
+                            )
+                        r = agent.run_conversation(**run_kwargs)
                     finally:
                         # Worker finished (interrupted or complete) —
                         # clear turn ownership immediately so a later
