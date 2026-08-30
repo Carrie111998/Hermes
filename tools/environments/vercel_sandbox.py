@@ -28,6 +28,7 @@ from tools.environments.base import (
     _ThreadedProcessHandle,
     _load_json_store,
     _save_json_store,
+    agent_initiated_command,
 )
 from tools.environments.file_sync import (
     FileSyncManager,
@@ -629,7 +630,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         def exec_fn() -> tuple[str, int]:
             result = sandbox.run_command(
                 "bash",
-                ["-lc" if login else "-c", cmd_string],
+                ["-lc" if login else "-c", agent_initiated_command(cmd_string)],
                 cwd=workspace_root,
             )
             return _extract_result_output(result), _extract_result_returncode(result)

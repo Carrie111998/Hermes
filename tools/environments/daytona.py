@@ -15,6 +15,7 @@ from pathlib import Path
 from tools.environments.base import (
     BaseEnvironment,
     _ThreadedProcessHandle,
+    agent_initiated_command,
 )
 from tools.environments.file_sync import (
     FileSyncManager,
@@ -231,9 +232,9 @@ class DaytonaEnvironment(BaseEnvironment):
                     pass
 
         if login:
-            shell_cmd = f"bash -l -c {shlex.quote(cmd_string)}"
+            shell_cmd = f"bash -l -c {shlex.quote(agent_initiated_command(cmd_string))}"
         else:
-            shell_cmd = f"bash -c {shlex.quote(cmd_string)}"
+            shell_cmd = f"bash -c {shlex.quote(agent_initiated_command(cmd_string))}"
 
         def exec_fn() -> tuple[str, int]:
             response = sandbox.process.exec(shell_cmd, timeout=timeout)

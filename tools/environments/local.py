@@ -583,6 +583,23 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+# Marker stamped on every Hermes-spawned subprocess environment.  The agent's
+# command-execution layer (terminal / file / code-execution tools) builds child
+# envs through the builders below; the marker tells a nested `hermes config set`
+# that it was invoked BY an agent rather than by a human in a terminal, so the
+# approvals.model_config_confirm gate can distinguish the two (#97652).  A human's
+# own `hermes config set` in their login shell is never spawned by Hermes and
+# thus never carries this marker.  Inert unless something reads it.
+# Single source of truth lives in tools/environments/base.py; re-exported here
+# so the local builders keep the short name.
+from tools.environments.base import (
+    AGENT_INITIATED_ENV,
+    stamp_agent_initiated as _stamp_agent_initiated,
+)
+
+HERMES_AGENT_INITIATED = AGENT_INITIATED_ENV
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -655,6 +672,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     _apply_windows_msys_bash_env_defaults(sanitized)
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
+
+    # Agent-initiated marker (#97652): signal nested `hermes config set` that a
+    # Hermes tool (not a human shell) spawned this child.
+    _stamp_agent_initiated(sanitized)
 
     return sanitized
 
@@ -862,6 +883,12 @@ def build_subprocess_env(
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
+    # Agent-initiated marker (#97652): the non-scrub path was the one spawn
+    # site that skipped it. Every Hermes-spawned child must carry the marker so
+    # a nested `hermes config set` is gated regardless of the environment path
+    # (singularity builds its child env through this factory with
+    # scrub_secrets=False).
+    _stamp_agent_initiated(env)
     return env
 
 
@@ -1469,6 +1496,10 @@ def _make_run_env(env: dict) -> dict:
     _apply_windows_msys_bash_env_defaults(run_env)
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
+
+    # Agent-initiated marker (#97652): signal nested `hermes config set` that a
+    # Hermes tool (not a human shell) spawned this child.
+    _stamp_agent_initiated(run_env)
 
     return run_env
 

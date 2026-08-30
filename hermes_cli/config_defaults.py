@@ -2572,6 +2572,18 @@ DEFAULT_CONFIG = {
         # modal; HERMES_TUI_NO_CONFIRM=1 force-skips that modal regardless of
         # the configured value.
         "destructive_slash_confirm": True,
+        # When true, an agent-initiated write to a model-routing config key
+        # (model.*, delegation.model/provider/base_url,
+        # auxiliary.*.model/provider/base_url) is gated: an interactive TTY
+        # prompts y/N, and a NON-interactive context (the agent running
+        # `hermes config set` through the terminal tool) silently refuses the
+        # write and exits non-zero instead of rewriting the user's billing-
+        # relevant model routing.  The write can be performed deliberately by
+        # passing `--confirm-model-change` (user-directed write).  Marker
+        # used: HERMES_AGENT_INITIATED set by the agent command-execution
+        # layer — a human's own `hermes config set` carries no marker and is
+        # never gated.
+        "model_config_confirm": True,
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)

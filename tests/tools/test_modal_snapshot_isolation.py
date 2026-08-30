@@ -114,12 +114,20 @@ def _install_modal_test_modules(
         except OSError:
             return None
 
+    def _agent_initiated_command(command: str):
+        # Mirrors tools.environments.base.agent_initiated_command (#97652):
+        # modal.py imports it for exec-command marking, but these
+        # snapshot-isolation tests never exercise _run_bash command paths, so
+        # a faithful prefix stub is sufficient to satisfy the import.
+        return f"export HERMES_AGENT_INITIATED=1; {command}"
+
     sys.modules["tools.environments.base"] = types.SimpleNamespace(
         BaseEnvironment=_DummyBaseEnvironment,
         _ThreadedProcessHandle=_DummyThreadedProcessHandle,
         _load_json_store=_load_json_store,
         _save_json_store=_save_json_store,
         _file_mtime_key=_file_mtime_key,
+        agent_initiated_command=_agent_initiated_command,
     )
     sys.modules["tools.interrupt"] = types.SimpleNamespace(is_interrupted=lambda: False)
     sys.modules["tools.credential_files"] = types.SimpleNamespace(

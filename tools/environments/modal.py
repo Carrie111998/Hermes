@@ -20,6 +20,7 @@ from tools.environments.base import (
     _ThreadedProcessHandle,
     _load_json_store,
     _save_json_store,
+    agent_initiated_command,
 )
 from tools.environments.file_sync import (
     FileSyncManager,
@@ -418,10 +419,11 @@ class ModalEnvironment(BaseEnvironment):
         def exec_fn() -> tuple[str, int]:
             async def _do():
                 args = ["bash"]
+                marked_cmd = agent_initiated_command(cmd_string)
                 if login:
-                    args.extend(["-l", "-c", cmd_string])
+                    args.extend(["-l", "-c", marked_cmd])
                 else:
-                    args.extend(["-c", cmd_string])
+                    args.extend(["-c", marked_cmd])
                 process = await sandbox.exec.aio(*args, timeout=timeout)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
