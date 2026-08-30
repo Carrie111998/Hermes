@@ -1017,7 +1017,17 @@ def _rewrite_compound_background(command: str) -> str:
         suffix = result[amp_pos + 1 :]
         # `{` needs a trailing space in bash; the closing `}` needs to be
         # preceded by `;` or `&` — we're providing `&` from the backgrounding.
-        result = prefix + "{ " + middle + "& }" + suffix
+        #
+        # If a statement *follows* the `&` (`A && B & C`), bash would parse
+        # `A && { B & } C` as a command list followed by a bare word — a
+        # syntax error (#98222; breaks the remote-kernel spawn template's
+        # `... & echo PID:$!`).  `&` is itself a list terminator, so the
+        # brace group needs `;` to close its list when a token follows —
+        # even after whitespace (`A && B & echo x` is invalid as written;
+        # the source `&` was the terminator the following word relied on).
+        # When only a newline/EOF follows, the group already ends the list.
+        sep = " ;" if suffix.strip() and "\n" not in suffix[: len(suffix) - len(suffix.lstrip())] else ""
+        result = prefix + "{ " + middle + "& }" + sep + suffix
 
     return result
 
