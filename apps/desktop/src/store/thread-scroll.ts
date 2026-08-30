@@ -28,6 +28,25 @@ export const setThreadAtBottom = (isAtBottom: boolean) => {
 
 export const resetThreadScroll = () => setThreadAtBottom(true)
 
+/** Keep-alive tabs stay mounted with a real layout box, so their stick-to-bottom
+ *  misses (and unmount resets) would flash the visible jump pill and dim the
+ *  composer. Only the on-screen pane may publish the composer-facing mirror. */
+export const publishThreadAtBottom = (isAtBottom: boolean, publisher: { paneVisible: boolean }): void => {
+  if (!publisher.paneVisible) {
+    return
+  }
+
+  setThreadAtBottom(isAtBottom)
+}
+
+export const resetPublishedThreadScroll = (publisher: { paneVisible: boolean }): void => {
+  if (!publisher.paneVisible) {
+    return
+  }
+
+  resetThreadScroll()
+}
+
 // Cross-component bridge: the jump button lives by the composer, the viewport's
 // `scrollToBottom` lives inside the thread. The bridge registers a handler; the
 // button fires it. Mirrors the composer focus/insert emitter pattern.

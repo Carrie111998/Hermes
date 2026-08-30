@@ -17,7 +17,7 @@ import {
 } from 'react'
 import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 
-import { usePaneLifecycle } from '@/components/pane-shell/pane-visibility'
+import { usePaneLifecycle, usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
 import { cn } from '@/lib/utils'
@@ -25,8 +25,8 @@ import {
   onScrollToBottomRequest,
   onThreadEditClose,
   onThreadEditOpen,
-  resetThreadScroll,
-  setThreadAtBottom
+  publishThreadAtBottom,
+  resetPublishedThreadScroll
 } from '@/store/thread-scroll'
 import { isSecondaryWindow } from '@/store/windows'
 
@@ -421,6 +421,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   const mountedPanes = useStore($mountedTranscriptPanes)
   const paneLifecycle = usePaneLifecycle()
+  const paneVisible = usePaneVisible()
   // Hidden panes retain only a live-tail budget. Visible panes share the normal
   // screen budget; a reveal backfills older rows in bounded transition steps.
   const paneBudget = transcriptPaneBudget(mountedPanes, paneLifecycle === 'hot-hidden')
@@ -575,8 +576,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
-  useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
-  useEffect(() => () => resetThreadScroll(), [])
+  useEffect(() => publishThreadAtBottom(isAtBottom, { paneVisible }), [isAtBottom, paneVisible])
+  useEffect(() => () => resetPublishedThreadScroll({ paneVisible }), [paneVisible])
 
   // Floating jump button (outside this subtree) → return to the bottom.
   useEffect(() => onScrollToBottomRequest(() => void scrollToBottom()), [scrollToBottom])

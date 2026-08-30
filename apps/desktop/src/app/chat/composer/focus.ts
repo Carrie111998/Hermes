@@ -396,10 +396,21 @@ export const focusComposerInput = (el: HTMLElement | null) => {
   // Skip when already focused: focus() runs the full focusing steps (forcing
   // layout) even on the active element, and during a session switch the DOM is
   // large and dirty — the redundant retries were measurably expensive there.
+  // Also skip when another composer already holds the caret: keep-alive tabs
+  // remount on 30s transcript/status backstops and would otherwise yank typing
+  // out of the visible box.
   const focus = () => {
-    if (document.activeElement !== el) {
-      el.focus({ preventScroll: true })
+    if (document.activeElement === el) {
+      return
     }
+
+    const active = document.activeElement
+
+    if (active instanceof HTMLElement && active.dataset.slot === RICH_INPUT_SLOT) {
+      return
+    }
+
+    el.focus({ preventScroll: true })
   }
 
   focus()
