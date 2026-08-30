@@ -8098,6 +8098,33 @@ def _desktop_linux_needs_no_sandbox() -> bool:
         return False
 
 
+def _desktop_linux_userns_sandbox_available() -> bool:
+    """Return whether Chromium can create its unprivileged user namespace."""
+    if sys.platform != "linux":
+        return False
+    unshare = shutil.which("unshare")
+    if not unshare:
+        return False
+    try:
+        return subprocess.run(
+            [
+                unshare,
+                "--user",
+                "--map-current-user",
+                "--",
+                unshare,
+                "--user",
+                "true",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> bool:
     """Return True when ``chrome-sandbox`` exists as a regular file."""
     if sys.platform != "linux":
@@ -8134,6 +8161,10 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
         return False
 
     if sandbox_lstat.st_uid == 0 and stat.S_IMODE(sandbox_lstat.st_mode) == 0o4755:
+        return True
+
+    if _desktop_linux_userns_sandbox_available():
+        print("✓ Using Chromium's user-namespace sandbox (setuid helper not needed).")
         return True
 
     sudo = shutil.which("sudo")

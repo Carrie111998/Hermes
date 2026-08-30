@@ -297,9 +297,8 @@ stop_ui() { # error/manual outcomes keep the window up briefly so a watching
 #   * the running binary must live under THIS checkout's rebuilt
 #     apps/desktop/release/linux-unpacked (anchored, path-segment-aware --
 #     proof the update we just ran replaced the selected executable);
-#   * chrome-sandbox ABSENT is fine (namespace-sandbox build; nothing to
-#     block on), PRESENT means root-owned AND setuid or Electron refuses to
-#     boot ("quit and never came back");
+#   * chrome-sandbox ABSENT is fine; when PRESENT, a working user-namespace
+#     sandbox or a root-owned setuid helper makes relaunch safe;
 #   * a user sandbox opt-out (ELECTRON_DISABLE_SANDBOX=1/true in our
 #     inherited env, --no-sandbox among the replayed launch args, or the
 #     Desktop vouching via --sandbox-fallback) makes the relaunch safe
@@ -316,6 +315,10 @@ linux_gate() {
   sb="$unpacked/chrome-sandbox"
   if [ ! -e "$sb" ]; then GATE=relaunch; return; fi
   if [ -u "$sb" ] && [ "$(stat -c %u "$sb" 2>/dev/null)" = "0" ]; then GATE=relaunch; return; fi
+  if command -v unshare >/dev/null 2>&1 \
+      && unshare --user --map-current-user -- unshare --user true >/dev/null 2>&1; then
+    GATE=relaunch; return
+  fi
 
   case "${ELECTRON_DISABLE_SANDBOX:-}" in 1|true|TRUE|True) GATE=relaunch; return ;; esac
   [ "$SANDBOX_FALLBACK" -eq 1 ] && { GATE=relaunch; return; }

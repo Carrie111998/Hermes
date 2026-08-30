@@ -6,7 +6,7 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -917,6 +917,34 @@ def test_relaunchable_fixup_legacy_adhoc_success_still_verifies_and_never_delete
 
 
 # --- Linux launcher entry registration ------------------------------------
+
+
+@pytest.mark.linux_only
+def test_linux_userns_probe_matches_chromium_and_fails_closed(monkeypatch):
+    unshare = "/usr/bin/unshare"
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: unshare if name == "unshare" else None)
+    run = Mock(return_value=subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(cli_main.subprocess, "run", run)
+
+    assert cli_main._desktop_linux_userns_sandbox_available() is True
+    assert run.call_args.args[0] == [
+        unshare, "--user", "--map-current-user", "--", unshare, "--user", "true",
+    ]
+
+    run.return_value = subprocess.CompletedProcess([], 1)
+    assert cli_main._desktop_linux_userns_sandbox_available() is False
+
+
+@pytest.mark.linux_only
+def test_linux_userns_sandbox_skips_suid_repair(tmp_path, monkeypatch):
+    executable = tmp_path / "Hermes"
+    sandbox = tmp_path / "chrome-sandbox"
+    executable.touch()
+    sandbox.touch(mode=0o755)
+    monkeypatch.setattr(cli_main, "_desktop_linux_userns_sandbox_available", lambda: True)
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: pytest.fail(f"unexpected {name}"))
+
+    assert cli_main._desktop_linux_sandbox_fixup(executable) is True
 
 
 @pytest.mark.linux_only

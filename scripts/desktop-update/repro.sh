@@ -97,15 +97,18 @@ case "$MODE" in
     # exits without running an update.
     G="/tmp/hermes-gate-test.$$"
     UNPACKED="$G/hermes-agent/apps/desktop/release/linux-unpacked"
-    mkdir -p "$UNPACKED"
+    TEST_BIN="$G/bin"
+    mkdir -p "$UNPACKED" "$TEST_BIN"
     touch "$UNPACKED/hermes" && chmod +x "$UNPACKED/hermes"
+    printf '#!/bin/sh\n[ "${HERMES_TEST_USERNS_AVAILABLE:-0}" = 1 ]\n' > "$TEST_BIN/unshare"
+    chmod +x "$TEST_BIN/unshare"
 
     fails=0
     expect() { # name expected actual
       if [ "$2" = "$3" ]; then printf 'ok   %s -> %s\n' "$1" "$3"
       else printf 'FAIL %s -> %s (want %s)\n' "$1" "$3" "$2"; fails=$((fails+1)); fi
     }
-    decide() { bash "$SCRIPT_DIR/posix.sh" --self-test-gate --install-root "$G/hermes-agent" "$@" | cut -d: -f1; }
+    decide() { PATH="$TEST_BIN:$PATH" bash "$SCRIPT_DIR/posix.sh" --self-test-gate --install-root "$G/hermes-agent" "$@" | cut -d: -f1; }
 
     expect "appimage (not under unpacked)"      skew     "$(decide --relaunch-target /opt/Hermes/hermes)"
     expect "sibling-prefix dir not fooled"      skew     "$(decide --relaunch-target "$UNPACKED-evil/hermes")"
@@ -113,6 +116,7 @@ case "$MODE" in
 
     touch "$UNPACKED/chrome-sandbox"
     expect "sandbox not root/setuid"            manual   "$(decide --relaunch-target "$UNPACKED/hermes")"
+    expect "userns sandbox available"           relaunch "$(HERMES_TEST_USERNS_AVAILABLE=1 decide --relaunch-target "$UNPACKED/hermes")"
     expect "opt-out: --sandbox-fallback"        relaunch "$(decide --relaunch-target "$UNPACKED/hermes" --sandbox-fallback)"
     expect "opt-out: --no-sandbox launch arg"   relaunch "$(decide --relaunch-target "$UNPACKED/hermes" -- --no-sandbox)"
     expect "opt-out: ELECTRON_DISABLE_SANDBOX"  relaunch "$(ELECTRON_DISABLE_SANDBOX=1 decide --relaunch-target "$UNPACKED/hermes")"
@@ -120,7 +124,7 @@ case "$MODE" in
     # Result JSON must survive hostile strings (git allows `"` in branch
     # names; messages carry arbitrary text) -- parse it back with python.
     QHOME="$G/qhome"; mkdir -p "$QHOME/hermes-agent"
-    bash "$SCRIPT_DIR/posix.sh" --no-ui --no-marker-cleanup --desktop-pid 0 \
+    bash "$SCRIPT_DIR/posix.sh" --daemonized --no-ui --no-marker-cleanup --desktop-pid 0 \
       --install-root "$QHOME/hermes-agent" --branch 'evil"branch\n$(x)' >/dev/null 2>&1 || true
     if python3 -c "import json,sys; d=json.load(open('$QHOME/.hermes-update-result.json')); sys.exit(0 if d['branch']=='evil\"branch\\\\n\$(x)' and d['ok']==False else 1)"; then
       printf 'ok   result JSON escapes hostile branch/message\n'
