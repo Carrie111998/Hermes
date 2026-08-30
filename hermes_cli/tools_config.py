@@ -875,7 +875,6 @@ def _pip_install(
     (or the last failure for the caller to inspect).
     """
     venv_root = Path(sys.executable).parent.parent
-    uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
 
     # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare which()
     # misses the uv Hermes installed and prefers a system one when both exist.
@@ -883,7 +882,14 @@ def _pip_install(
     # where installing uv is in scope — and tier 2 is a pip that the Windows
     # installer's `uv venv` does not seed, so failing to find uv here is the
     # difference between a working post-setup hook and "No module named pip".
-    from hermes_cli.managed_uv import ensure_uv
+    from hermes_cli.managed_uv import ensure_uv, managed_python_env
+
+    # Official managed_python_env() isolation so a third-party
+    # UV_PYTHON / UV_PYTHON_INSTALL_DIR cannot steer this install into an
+    # unintended interpreter (same class as the update-path fix); then point
+    # VIRTUAL_ENV at this install's venv.
+    uv_env = managed_python_env()
+    uv_env["VIRTUAL_ENV"] = str(venv_root)
 
     uv_bin = ensure_uv()
     if uv_bin:
