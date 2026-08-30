@@ -248,6 +248,12 @@ hermes skills uninstall <skill-name>
 |-------|-------------|
 | [**openhue**](/docs/user-guide/skills/optional/smart-home/smart-home-openhue) | Control Philips Hue lights, scenes, rooms via OpenHue CLI. |
 
+## social-media
+
+| Skill | Description |
+|-------|-------------|
+| [**hermes-tweet**](/docs/user-guide/skills/optional/social-media/social-media-hermes-tweet) | Use Xquik tools for read and gated X workflows. |
+
 ## software-development
 
 | Skill | Description |
