@@ -2664,7 +2664,6 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
-        "allow_shell_key_cmd": False,  # gate shell=True for key_cmd (P0 fix; default argv-only)
         "website_blocklist": {
             "enabled": False,
             "domains": [],

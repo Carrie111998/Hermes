@@ -14,6 +14,10 @@ behaviours that make the feature work:
 
 from __future__ import annotations
 
+import json
+import shlex
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
 
@@ -23,25 +27,139 @@ from agent.command_token_source import (
     CommandTokenError,
     CommandTokenSource,
     _mint,
+    _parse_command_argv,
     build_command_token_provider,
 )
 
 
+def _python_command(code: str) -> str:
+    argv = [sys.executable, "-c", code]
+    if sys.platform == "win32":
+        # Force quoting for Python snippets containing shell-like punctuation;
+        # native Windows argv parsing otherwise leaves ``print(...)`` unquoted.
+        return subprocess.list2cmdline([sys.executable, "-c", f"{code} "])
+    return " ".join(shlex.quote(part) for part in argv)
+
+
+def _python_print(value: str) -> str:
+    return _python_command(f"print({value!r}, end='')")
+
+
 class TestMinting:
+    def test_default_execution_uses_argv_without_shell(self, monkeypatch):
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen["command"] = command
+            seen["shell"] = kwargs.get("shell")
+            return SimpleNamespace(returncode=0, stdout="tok-safe", stderr="")
+
+        monkeypatch.setattr("agent.command_token_source.subprocess.run", fake_run)
+
+        assert _mint("token-helper --profile prod", "dbx") == ("tok-safe", None)
+        assert seen == {
+            "command": ["token-helper", "--profile", "prod"],
+            "shell": False,
+        }
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            (
+                r"helper --config C:\Users\andre\config.json",
+                ["helper", "--config", r"C:\Users\andre\config.json"],
+            ),
+            (
+                r'"C:\Program Files\helper.exe" --path C:\tmp\token',
+                [
+                    r"C:\Program Files\helper.exe",
+                    "--path",
+                    r"C:\tmp\token",
+                ],
+            ),
+            (
+                "helper --path C:\\tmp\\",
+                ["helper", "--path", "C:\\tmp\\"],
+            ),
+        ],
+    )
+    def test_windows_parser_preserves_native_backslashes(self, command, expected):
+        if sys.platform != "win32":
+            pytest.skip("native backslash parsing is Windows-specific")
+        assert _parse_command_argv(command, "dbx") == expected
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'cmd.exe /d /c "echo pwned > marker"',
+            'powershell -NoProfile -Command "Set-Content marker pwned"',
+            'pwsh -NoProfile -c "Set-Content marker pwned"',
+            'sh -c "echo pwned > marker"',
+            'bash -c "echo pwned > marker"',
+        ],
+    )
+    def test_shell_launchers_are_rejected_before_execution(self, monkeypatch, command):
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("shell launcher must be rejected before process creation")
+
+        monkeypatch.setattr("agent.command_token_source.subprocess.run", fail_if_called)
+        with pytest.raises(CommandTokenError, match="shell"):
+            _mint(command, "dbx")
+
+    @pytest.mark.parametrize("command", [
+        'env -u SECRET bash -c "echo pwned"',
+        'env --split-string="bash -c echo"',
+        'nice bash -c "echo pwned"',
+        'nohup sh -c "echo pwned"',
+        'xargs -0 bash -c "echo pwned"',
+        'wsl sh -c "echo pwned"',
+    ])
+    def test_process_dispatch_wrappers_are_rejected(self, monkeypatch, command):
+        monkeypatch.setattr(
+            "agent.command_token_source.subprocess.run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+        )
+        with pytest.raises(CommandTokenError, match="process wrapper"):
+            _mint(command, "dbx")
+
+    def test_nul_command_is_normalized_to_provider_error(self):
+        with pytest.raises(CommandTokenError, match="could not be parsed") as excinfo:
+            _mint("helper\x00--token", "dbx")
+        assert "helper" not in str(excinfo.value)
+
+    def test_shell_injection_marker_never_runs(self, tmp_path):
+        marker = tmp_path / "marker"
+        python = sys.executable.replace("\\", "/")
+        marker_path = marker.as_posix()
+        first = (
+            f'"{python}" -c "from pathlib import Path; '
+            f"Path(r'{marker_path}').write_text('pwned')\""
+        )
+        second = f'"{python}" -c "print(\'tok\')"'
+        separator = "&" if sys.platform == "win32" else ";"
+
+        with pytest.raises(CommandTokenError):
+            _mint(f"{first} {separator} {second}", "dbx")
+
+        assert not marker.exists(), "shell metacharacters must not run a second operation"
+
     def test_bare_token_stdout(self):
-        source = CommandTokenSource("printf 'tok-abc'", "dbx")
+        source = CommandTokenSource(_python_command("print('tok-abc', end='')"), "dbx")
         assert source() == "tok-abc"
 
     def test_json_access_token(self):
         """The OAuth 2.0 token-endpoint response shape."""
         source = CommandTokenSource(
-            """printf '{"access_token":"tok-json","expires_in":3600}'""", "dbx"
+            _python_command(
+                "print('{\"access_token\":\"tok-json\",\"expires_in\":3600}', end='')"
+            ),
+            "dbx",
         )
         assert source() == "tok-json"
 
     def test_trailing_newline_is_stripped(self):
         """A raw newline in the credential would corrupt the auth header."""
-        assert CommandTokenSource("echo tok-nl", "dbx")() == "tok-nl"
+        assert CommandTokenSource(_python_command("print('tok-nl')"), "dbx")() == "tok-nl"
 
     def test_multiline_output_is_rejected_not_guessed(self):
         """Only the token may land on stdout.
@@ -50,33 +168,30 @@ class TestMinting:
         warning, two tokens) into a corrupt-credential 401 that is much harder
         to diagnose than an explicit refusal.
         """
-        source = CommandTokenSource("printf 'banner\\ntok-real'", "dbx")
+        source = CommandTokenSource(
+            _python_command("print('banner\\ntok-real', end='')"), "dbx"
+        )
         with pytest.raises(CommandTokenError, match="multiple lines"):
             source()
 
     def test_json_without_access_token_is_an_error(self):
-        source = CommandTokenSource("""printf '{"nope":1}'""", "dbx")
+        source = CommandTokenSource(_python_command("print('{\"nope\":1}', end='')"), "dbx")
         with pytest.raises(CommandTokenError, match="access_token"):
             source()
 
     def test_empty_output_is_an_error(self):
         with pytest.raises(CommandTokenError, match="no output"):
-            CommandTokenSource("true", "dbx")()
+            CommandTokenSource(_python_command("pass"), "dbx")()
 
     def test_nonzero_exit_is_an_error(self):
-        # argv-style: /bin/sh -c lets us exit with a specific code without using
-        # shell-only metachars (the previous `exit 3` was a shell builtin that
-        # has no argv form). shlex.split() yields ["/bin/sh","-c","exit 3"] and
-        # the exit code is preserved.
         with pytest.raises(CommandTokenError, match="exited 3"):
-            CommandTokenSource("/bin/sh -c 'exit 3'", "dbx")()
+            CommandTokenSource(_python_command("raise SystemExit(3)"), "dbx")()
 
     def test_failure_message_is_actionable_without_echoing_the_command(self):
         """Actionable, but never echoes the command (it may embed a secret)."""
-        # argv-style: the secret argument is a plain argv token, not a shell
-        # metachar — so the shell-mode rejection (which would otherwise fire on
-        # `;`) does not trigger.
-        secret_cmd = "/bin/sh -c 'print-token --client-secret=SENTINEL-SECRET; exit 1'"
+        secret_cmd = _python_command(
+            "import sys; print('SENTINEL-SECRET', file=sys.stderr); raise SystemExit(1)"
+        )
         with pytest.raises(CommandTokenError) as excinfo:
             CommandTokenSource(secret_cmd, "dbx")()
         message = str(excinfo.value)
@@ -88,12 +203,11 @@ class TestMinting:
 class TestNoCredentialLeak:
     def test_failure_message_excludes_command_output(self):
         """A failing auth helper may print a token — it must not be surfaced."""
-        # argv-style: keep the multi-statement semantics inside a single quoted
-        # argv token (`/bin/sh -c '...'`) so the helper still emits SENTINEL to
-        # stdout/stderr before exiting non-zero. No shell metachars in the
-        # outer command string — the argv-mode default accepts it.
         source = CommandTokenSource(
-            "/bin/sh -c \"printf 'SENTINEL-SECRET'; printf 'stderr-SENTINEL' >&2; exit 1\"",
+            _python_command(
+                "import sys; print('SENTINEL-SECRET', file=sys.stdout); "
+                "print('stderr-SENTINEL', file=sys.stderr); raise SystemExit(1)"
+            ),
             "dbx",
         )
         with pytest.raises(CommandTokenError) as excinfo:
@@ -105,24 +219,19 @@ class TestCaching:
     def test_token_is_cached_between_calls(self):
         """Without caching the command would run on every request."""
         # A command whose output changes each run: equal results prove caching.
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource(
+            _python_command("import time; print(time.time_ns(), end='')"), "dbx"
+        )
         assert source() == source()
 
     def test_expired_token_is_reminted(self):
-        # argv-style: a counter on disk changes every run. `$RANDOM` would be
-        # bash-only (empty under dash, which is /bin/sh on Debian-family CI),
-        # and the original `$(date +%s%N)` used `$()` — a shell metachar that
-        # the argv-mode default blocks. `cat /tmp/...` reads the counter.
-        import os
-        counter = os.path.join(os.environ.get("TMPDIR", "/tmp"), "hermes_keycmd_expired_test")
-        with open(counter, "w") as _f:
-            _f.write("0")
-        # python3 prints whatever value is in the file, then we bump it.
+        # time_ns changes every run and is available on every supported OS.
         source = CommandTokenSource(
-            f'python3 -c "import time; '
-            f'v=open({counter!r}).read().strip(); '
-            f'open({counter!r},\'w\').write(str(int(v)+1)); '
-            f'print(\'{{\\"access_token\\":\\"tok-\' + v + \'\\",\\"expires_in\\":3600}}\')"',
+            _python_command(
+                "import json, time; print(json.dumps({"
+                "'access_token': f'tok-{time.time_ns()}', 'expires_in': 3600"
+                "}), end='')"
+            ),
             "dbx",
         )
         first = source()
@@ -140,7 +249,9 @@ class TestCaching:
         """
         from agent.command_token_source import _NO_TTL_REFRESH_SECONDS
 
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource(
+            _python_command("import time; print(time.time_ns(), end='')"), "dbx"
+        )
         first = source()
         assert 0 < source._expires_at - time.monotonic() <= _NO_TTL_REFRESH_SECONDS
         assert source() == first  # cached inside the window
@@ -149,7 +260,7 @@ class TestCaching:
 
     def test_advertised_ttl_sets_an_expiry(self):
         source = CommandTokenSource(
-            """printf '{"access_token":"tok","expires_in":3600}'""", "dbx"
+            _python_print('{"access_token":"tok","expires_in":3600}'), "dbx"
         )
         source()
         assert source._expires_at is not None
@@ -157,7 +268,7 @@ class TestCaching:
     def test_ttl_shorter_than_the_leeway_still_caches_briefly(self):
         """A leeway larger than the TTL must not disable caching entirely."""
         source = CommandTokenSource(
-            """printf '{"access_token":"tok","expires_in":1}'""", "dbx"
+            _python_print('{"access_token":"tok","expires_in":1}'), "dbx"
         )
         source()
         assert source._expires_at is not None
@@ -270,47 +381,44 @@ class TestAbsoluteExpiry:
 
     def test_iso_expiry_yields_a_ttl(self):
         deadline = self._iso(3600)
-        _, ttl = _mint(f"printf '%s' '{{\"access_token\":\"t\",\"expiry\":\"{deadline}\"}}'", "p")
+        payload = json.dumps({"access_token": "t", "expiry": deadline})
+        _, ttl = _mint(_python_print(payload), "p")
         assert ttl is not None, "an advertised deadline must produce a TTL"
         assert 3500 < ttl <= 3600
 
     def test_azure_expires_on_spelling(self):
         deadline = self._iso(1800)
-        _, ttl = _mint(f"printf '%s' '{{\"access_token\":\"t\",\"expiresOn\":\"{deadline}\"}}'", "p")
+        payload = json.dumps({"access_token": "t", "expiresOn": deadline})
+        _, ttl = _mint(_python_print(payload), "p")
         assert ttl is not None and 1700 < ttl <= 1800
 
     def test_expires_in_still_wins_when_both_present(self):
         """The RFC 6749 field is authoritative where a helper sends both."""
         deadline = self._iso(3600)
-        _, ttl = _mint(
-            f"printf '%s' '{{\"access_token\":\"t\",\"expires_in\":120,\"expiry\":\"{deadline}\"}}'",
-            "p",
+        payload = json.dumps(
+            {"access_token": "t", "expires_in": 120, "expiry": deadline}
         )
+        _, ttl = _mint(_python_print(payload), "p")
         assert ttl == 120.0
 
     def test_unparseable_expiry_is_not_a_ttl(self):
         """Junk must fall back to refresh-on-401, never to a guessed deadline."""
-        _, ttl = _mint('printf \'%s\' \'{"access_token":"t","expiry":"whenever"}\'', "p")
+        _, ttl = _mint(_python_print('{"access_token":"t","expiry":"whenever"}'), "p")
         assert ttl is None
 
     def test_already_past_expiry_is_not_a_ttl(self):
         """A stale deadline must not become a negative or zero TTL."""
-        _, ttl = _mint(
-            f"printf '%s' '{{\"access_token\":\"t\",\"expiry\":\"{self._iso(-60)}\"}}'", "p"
-        )
+        payload = json.dumps({"access_token": "t", "expiry": self._iso(-60)})
+        _, ttl = _mint(_python_print(payload), "p")
         assert ttl is None
 
     def test_the_token_actually_gets_re_minted(self, tmp_path):
         """The regression that mattered: a deadline must expire the cache."""
         counter = tmp_path / "calls"
-        # argv-style: a python one-liner appends `x` to the counter and prints
-        # the JSON token. The original used `printf x >> {counter}; printf ...`
-        # which depends on shell redirection (`>>`) and command chaining (`;`)
-        # — both shell metachars blocked by argv-mode.
-        deadline = self._iso(1)
-        cmd = (
-            f"python3 -c \"open({str(counter)!r}, 'a').write('x'); "
-            f"print('{{\\\\\"access_token\\\\\":\\\\\"t\\\\\",\\\\\"expiry\\\\\":\\\\\"{deadline}\\\\\"}}')\""
+        cmd = _python_command(
+            "import json; from pathlib import Path; "
+            f"p=Path({str(counter)!r}); p.open('a').write('x'); "
+            f"print(json.dumps({{'access_token': 't', 'expiry': {self._iso(1)!r}}}), end='')"
         )
         src = CommandTokenSource(cmd, "p")
         src()
