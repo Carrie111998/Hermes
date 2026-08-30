@@ -509,3 +509,75 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+class TestKanbanWorkerToolsetInjection:
+    """Regression test for #98808: the dispatcher-worker injection appends
+    "kanban" to the enabled toolsets so workers always keep their lifecycle
+    handoff tools (complete/block/heartbeat). The subtraction pass used to
+    iterate the caller's original disabled_toolsets, so a worker profile
+    listing "kanban" in agent.disabled_toolsets (the recommended setup for
+    profiles that delegate but shouldn't carry the orchestrator toolset in
+    normal chat) stripped the injected tools right back out."""
+
+    def test_worker_keeps_lifecycle_tools_despite_own_disabled_toolsets(self, monkeypatch):
+        from model_tools import _compute_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "worker-test-task")
+        invalidate_check_fn_cache()
+        tools = _compute_tool_definitions(
+            enabled_toolsets=["file"],
+            disabled_toolsets=["kanban"],
+            quiet_mode=True,
+        )
+        names = {t["function"]["name"] for t in tools}
+        assert {"kanban_complete", "kanban_block", "kanban_heartbeat"} <= names, (
+            f"dispatcher worker lost lifecycle tools: {names & {'kanban_complete', 'kanban_block', 'kanban_heartbeat'}}"
+        )
+
+    def test_non_worker_disabled_kanban_still_strips_tools(self, monkeypatch):
+        """Outside the worker context, an explicit disable must keep its
+        normal chat semantics: kanban tools are removed."""
+        from model_tools import _compute_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        invalidate_check_fn_cache()
+        tools = _compute_tool_definitions(
+            enabled_toolsets=["file", "kanban"],
+            disabled_toolsets=["kanban"],
+            quiet_mode=True,
+        )
+        names = {t["function"]["name"] for t in tools}
+        assert not any(n.startswith("kanban_") for n in names)
+
+    def test_delegated_child_does_not_inherit_forced_kanban(self, monkeypatch):
+        """A delegate_task child spawned inside a worker process must not
+        inherit the forced kanban toolset (existing isolation guarantee)."""
+        from agent.delegation_context import delegated_child_context
+        from model_tools import _compute_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "worker-test-task")
+        with delegated_child_context():
+            invalidate_check_fn_cache()
+            tools = _compute_tool_definitions(
+                enabled_toolsets=["file"],
+                disabled_toolsets=["kanban"],
+                quiet_mode=True,
+            )
+        names = {t["function"]["name"] for t in tools}
+        assert not any(n.startswith("kanban_") for n in names)
+
+    def test_caller_disabled_toolsets_list_not_mutated(self, monkeypatch):
+        from model_tools import _compute_tool_definitions
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "worker-test-task")
+        disabled = ["kanban"]
+        _compute_tool_definitions(
+            enabled_toolsets=["file"],
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+        )
+        assert disabled == ["kanban"]

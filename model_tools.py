@@ -424,6 +424,10 @@ def _compute_tool_definitions(
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
+    # Work on a copy so the dispatcher-worker injection below can exempt
+    # "kanban" from the caller's own disabled list without mutating it (#98808).
+    effective_disabled_toolsets = list(disabled_toolsets) if disabled_toolsets else []
+
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
         if (
@@ -438,6 +442,12 @@ def _compute_tool_definitions(
             # (for token/cost reasons), but that should not strip the kanban
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
+            # The subtraction pass below iterates the caller's disabled
+            # toolsets; a worker profile that disables "kanban" for its
+            # normal chat surface would otherwise strip the injected
+            # lifecycle tools right back out (#98808).
+            if "kanban" in effective_disabled_toolsets:
+                effective_disabled_toolsets.remove("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -461,8 +471,8 @@ def _compute_tool_definitions(
     # This ensures that even if a composite toolset (like hermes-cli)
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
-    if disabled_toolsets:
-        for toolset_name in disabled_toolsets:
+    if effective_disabled_toolsets:
+        for toolset_name in effective_disabled_toolsets:
             if validate_toolset(toolset_name):
                 from toolsets import bundle_non_core_tools, get_toolset
                 if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
