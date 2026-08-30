@@ -6439,7 +6439,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if already_streamed:
                     return
                 if isinstance(text, str) and text.strip():
-                    _stream_q.put(("__commentary__", {"text": text}))
+                    _stream_q.put_threadsafe(("__commentary__", {"text": text}))
 
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(

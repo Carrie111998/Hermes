@@ -246,7 +246,7 @@ class TestAdapterInit:
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"agent": {"max_turns": 200}})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
-            staticmethod(lambda: {}),
+            staticmethod(lambda *a, **k: {}),
         )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 200)
@@ -286,7 +286,7 @@ class TestAdapterInit:
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
-            staticmethod(lambda: {}),
+            staticmethod(lambda *a, **k: {}),
         )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
@@ -324,7 +324,7 @@ class TestAdapterInit:
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
-            staticmethod(lambda: {}),
+            staticmethod(lambda *a, **k: {}),
         )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
@@ -356,7 +356,7 @@ class TestAdapterInit:
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
-            staticmethod(lambda: {}),
+            staticmethod(lambda *a, **k: {}),
         )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
