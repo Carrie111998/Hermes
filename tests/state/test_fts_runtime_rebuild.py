@@ -32,6 +32,7 @@ from hermes_state import (
     _FTS_TRIGGERS,
     _concrete_state_db_holder_pids,
     _is_inactive_orphan_desktop_holder,
+    _retire_active_structural_quarantine,
 )
 
 
@@ -276,18 +277,23 @@ class TestRuntimeFtsRebuild:
         os.chmod(proc_root / "222" / "fd", 0o755)
 
     def test_generic_corruption_requires_fts_scoped_evidence(self):
-        """A generic malformed-image error alone cannot authorize FTS repair."""
-        assert not SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError("database disk image is malformed")
+        """SQLite result-code provenance must outrank error prose."""
+        generic = sqlite3.DatabaseError("database disk image is malformed")
+        assert not SessionDB._is_fts_write_corruption_error(generic)
+
+        structural = sqlite3.DatabaseError("database disk image is malformed")
+        structural.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+        assert not SessionDB._is_fts_write_corruption_error(structural)
+
+        fts = sqlite3.DatabaseError("database disk image is malformed")
+        fts.sqlite_errorcode = getattr(sqlite3, "SQLITE_CORRUPT_VTAB", 267)
+        assert SessionDB._is_fts_write_corruption_error(fts)
+
+        contradictory = sqlite3.IntegrityError(
+            'fts5: corrupt structure record for table "messages_fts"'
         )
-        assert SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError(
-                'fts5: corrupt structure record for table "messages_fts"'
-            )
-        )
-        assert not SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError("no such table: nothing_fts_related")
-        )
+        contradictory.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_TRIGGER
+        assert not SessionDB._is_fts_write_corruption_error(contradictory)
 
     def test_generic_malformed_write_fails_closed(self, db, monkeypatch):
         db.create_session("s1", source="test")
@@ -322,6 +328,58 @@ class TestRuntimeFtsRebuild:
         with pytest.raises(sqlite3.DatabaseError, match="canonical writes disabled"):
             db._execute_write(_later_write)
         assert called is False
+
+    def test_structural_quarantine_spans_handles_restarts_and_generations(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        seed = SessionDB(db_path=db_path)
+        seed.create_session("seed", source="test")
+        seed.close()
+        corrupt_generation = db_path.read_bytes()
+
+        first = SessionDB(db_path=db_path)
+        second = SessionDB(db_path=db_path)
+        try:
+            structural = sqlite3.DatabaseError("database disk image is malformed")
+            structural.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+            with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
+                first._execute_write(
+                    lambda _conn: (_ for _ in ()).throw(structural)
+                )
+
+            called = False
+
+            def _sibling_write(_conn):
+                nonlocal called
+                called = True
+
+            with pytest.raises(
+                sqlite3.DatabaseError, match="canonical writes disabled"
+            ):
+                second._execute_write(_sibling_write)
+            assert called is False
+        finally:
+            first.close()
+            second.close()
+
+        with pytest.raises(sqlite3.DatabaseError, match="writable open refused"):
+            SessionDB(db_path=db_path)
+
+        replacement = tmp_path / "replacement.db"
+        raw = sqlite3.connect(replacement)
+        raw.execute("CREATE TABLE replacement_generation (id INTEGER PRIMARY KEY)")
+        raw.commit()
+        raw.close()
+        os.replace(replacement, db_path)
+        _retire_active_structural_quarantine(db_path)
+        repaired = SessionDB(db_path=db_path)
+        repaired.create_session("repaired", source="test")
+        repaired.close()
+
+        db_path.write_bytes(corrupt_generation)
+        with pytest.raises(sqlite3.DatabaseError, match="writable open refused"):
+            SessionDB(db_path=db_path)
 
     def test_append_self_heals_after_fts_corruption(self, db, tmp_path):
         if not db._fts_enabled:

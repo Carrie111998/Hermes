@@ -2330,6 +2330,112 @@ def _db_fingerprint(db_path: Path) -> "Optional[str]":
         return None
 
 
+_DB_GENERATIONS: Dict[str, str] = {}
+_DB_GENERATIONS_LOCK = threading.Lock()
+
+
+def _remember_db_generation(db_path: Path, fingerprint: Optional[str]) -> Optional[str]:
+    """Share a pre-open fingerprint with sibling handles in this process."""
+    key = os.path.normcase(str(db_path.resolve(strict=False)))
+    with _DB_GENERATIONS_LOCK:
+        if fingerprint is not None:
+            _DB_GENERATIONS[key] = fingerprint
+            return fingerprint
+        return _DB_GENERATIONS.get(key)
+
+
+def _structural_quarantine_path(db_path: Path, fingerprint: str) -> Path:
+    """Return the retained marker for one database generation."""
+    generation_id = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+    return db_path.with_name(
+        f"{db_path.name}.structural-quarantine-{generation_id}.json"
+    )
+
+
+def _active_structural_quarantine_path(db_path: Path) -> Path:
+    return db_path.with_name(f"{db_path.name}.structural-quarantine.json")
+
+
+def _read_quarantine_payload(marker: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        return {"reason": f"quarantine authority {marker} could not be read: {exc}"}
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return {"reason": f"quarantine authority {marker} has an invalid format"}
+    return payload
+
+
+def _read_structural_quarantine(
+    db_path: Path, fingerprint: Optional[str]
+) -> Optional[str]:
+    """Return why this path or exact generation is unsafe for writes."""
+    active = _read_quarantine_payload(_active_structural_quarantine_path(db_path))
+    if active is not None:
+        reason = active.get("reason")
+        return reason if isinstance(reason, str) and reason else "structural corruption"
+    if fingerprint is None:
+        return None
+    marker = _structural_quarantine_path(db_path, fingerprint)
+    payload = _read_quarantine_payload(marker)
+    if payload is None:
+        return None
+    if payload.get("fingerprint") != fingerprint:
+        return f"quarantine authority {marker} does not match this database generation"
+    reason = payload.get("reason")
+    return reason if isinstance(reason, str) and reason else "structural corruption"
+
+
+def _write_quarantine_payload(marker: Path, payload: Dict[str, Any]) -> None:
+    tmp = marker.with_name(
+        f".{marker.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with tmp.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, marker)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _record_structural_quarantine(
+    db_path: Path, fingerprint: Optional[str], reason: str
+) -> None:
+    """Atomically publish a durable write quarantine for one DB generation.
+
+    The active marker blocks every opener until verified offline repair. The
+    generation marker remains after repair so restoring old bytes restores the
+    quarantine rather than silently blessing the corrupt file.
+    """
+    payload = {
+        "version": 1,
+        "fingerprint": fingerprint,
+        "reason": reason,
+        "detected_at": time.time(),
+    }
+    if fingerprint is not None:
+        _write_quarantine_payload(
+            _structural_quarantine_path(db_path, fingerprint), payload
+        )
+    _write_quarantine_payload(_active_structural_quarantine_path(db_path), payload)
+
+
+def _retire_active_structural_quarantine(db_path: Path) -> None:
+    """Retire the path-wide gate after verified repair, retaining history."""
+    _active_structural_quarantine_path(db_path).unlink(missing_ok=True)
+    key = os.path.normcase(str(db_path.resolve(strict=False)))
+    with _DB_GENERATIONS_LOCK:
+        _DB_GENERATIONS.pop(key, None)
+
+
 def _backup_content_identity(db_path: Path) -> "Optional[str]":
     """Recovery-image identity for forensic-backup dedupe: whole-file + sidecars.
 
@@ -3298,6 +3404,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 if result.get("repaired"):
                     result["journal_mode_before"] = before_mode
                     _restore_journal_mode_after_repair(db_path, before_mode)
+                    _retire_active_structural_quarantine(db_path)
             # Environmental aborts happen before a strategy gets to mutate the
             # isolated snapshot. They are retriable operating conditions, not
             # proof that the damaged database exhausted a repair strategy.
@@ -4583,6 +4690,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Once SQLite cannot prove the damage is confined to derived FTS data,
         # no later operation on this handle may resume canonical writes.
         self._structural_corruption_error: Optional[str] = None
+        # Content identity captured before opening SQLite. It binds an external
+        # structural-corruption quarantine to these exact database bytes.
+        self._db_generation: Optional[str] = None
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
@@ -4668,6 +4778,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # readonly database" from deep inside _init_schema.
             if not read_only:
                 preflight_db_writability(self.db_path, db_label="state.db")
+
+            if self.db_path.exists():
+                self._db_generation = _remember_db_generation(
+                    self.db_path, _db_fingerprint(self.db_path)
+                )
+                self._structural_corruption_error = _read_structural_quarantine(
+                    self.db_path, self._db_generation
+                )
+                if self._structural_corruption_error is not None:
+                    raise sqlite3.DatabaseError(
+                        "state.db structural corruption was detected; writable "
+                        "open refused until offline repair: "
+                        f"{self._structural_corruption_error}"
+                    )
 
             # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
             # generic "file is not a database" with no recovery path. Quarantine
@@ -5282,11 +5406,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns whatever *fn* returns.
         """
-        if self._structural_corruption_error is not None:
-            raise sqlite3.DatabaseError(
-                "state.db structural corruption was detected; canonical writes "
-                f"disabled until offline repair: {self._structural_corruption_error}"
-            )
+        self._refuse_structurally_quarantined_write()
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -5309,6 +5429,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        # Recheck after SQLite serializes writers. A sibling
+                        # process may have published while this writer waited.
+                        self._refuse_structurally_quarantined_write()
                         result = fn(self._conn)
                         self._conn.commit()
                     except BaseException:
@@ -5383,10 +5506,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     is_malformed_db_error(exc)
                     and self._structural_corruption_error is None
                 ):
-                    self._structural_corruption_error = str(exc)
+                    self._quarantine_structural_corruption(exc)
                     logger.critical(
                         "state.db reported structural corruption (%s); canonical "
-                        "writes are disabled for this handle until offline repair.",
+                        "writes are disabled for this database generation until "
+                        "offline repair.",
                         exc,
                     )
                 raise
@@ -5399,6 +5523,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+
+    def _refuse_structurally_quarantined_write(self) -> None:
+        """Refuse writes when this database generation has been quarantined."""
+        durable_reason = _read_structural_quarantine(
+            self.db_path, self._db_generation
+        )
+        if durable_reason is not None:
+            self._structural_corruption_error = durable_reason
+        if self._structural_corruption_error is not None:
+            raise sqlite3.DatabaseError(
+                "state.db structural corruption was detected; canonical writes "
+                "disabled until offline repair: "
+                f"{self._structural_corruption_error}"
+            )
+
+    def _quarantine_structural_corruption(self, exc: sqlite3.DatabaseError) -> None:
+        """Latch and publish structural corruption without trusting state.db."""
+        reason = str(exc)
+        self._structural_corruption_error = reason
+        try:
+            _record_structural_quarantine(
+                self.db_path, self._db_generation, reason
+            )
+        except OSError as marker_exc:
+            logger.critical(
+                "Could not persist state.db structural quarantine outside the "
+                "database (%s); this handle remains write-disabled: %s",
+                marker_exc,
+                exc,
+            )
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
@@ -5430,9 +5584,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
-        """True only when SQLite names FTS as the corrupt object."""
-        msg = str(exc).lower()
-        return "fts5" in msg and "corrupt" in msg
+        """True only for SQLite's explicit corrupt-virtual-table result code."""
+        corrupt_vtab = getattr(sqlite3, "SQLITE_CORRUPT_VTAB", 267)
+        return getattr(exc, "sqlite_errorcode", None) == corrupt_vtab
 
     def _has_fts_corruption_evidence(self, exc: sqlite3.DatabaseError) -> bool:
         """Confirm that a generic SQLITE_CORRUPT originates in an FTS index.
@@ -5447,6 +5601,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if self._is_fts_write_corruption_error(exc):
             return True
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        if error_code is not None and error_code != sqlite3.SQLITE_CORRUPT:
+            # Result-code provenance outranks prose. A constraint or I/O code
+            # cannot authorize destructive live index maintenance.
+            return False
         if not is_malformed_db_error(exc):
             return False
         try:
@@ -5652,11 +5811,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         if not self._has_fts_corruption_evidence(exc):
             if is_malformed_db_error(exc):
-                self._structural_corruption_error = str(exc)
+                self._quarantine_structural_corruption(exc)
                 logger.critical(
                     "state.db reported unscoped or mixed structural corruption "
-                    "(%s); canonical writes are disabled for this handle until "
-                    "offline repair.",
+                    "(%s); canonical writes are disabled for this database "
+                    "generation until offline repair.",
                     exc,
                 )
             return False

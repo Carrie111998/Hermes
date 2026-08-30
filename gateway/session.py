@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import json
+import sqlite3
 import threading
 import uuid
 from pathlib import Path
@@ -3930,9 +3931,9 @@ class SessionStore:
 
     @staticmethod
     def _is_fts_corruption_error(exc: Exception) -> bool:
-        """True only when SQLite explicitly identifies FTS corruption."""
-        text = str(exc).lower()
-        return "fts5" in text and "corrupt" in text
+        """True only for SQLite's explicit corrupt-virtual-table result code."""
+        corrupt_vtab = getattr(sqlite3, "SQLITE_CORRUPT_VTAB", 267)
+        return getattr(exc, "sqlite_errorcode", None) == corrupt_vtab
 
     def _rebuild_fts_once(self) -> bool:
         """Attempt FTS5 ``rebuild`` command once per store lifetime.

@@ -1,5 +1,6 @@
 """Tests for gateway session management."""
 import json
+import sqlite3
 import pytest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -1550,9 +1551,16 @@ class TestGatewaySessionDbRecovery:
         assert not SessionStore._is_fts_corruption_error(
             RuntimeError("malformed database schema (messages_fts)")
         )
-        assert SessionStore._is_fts_corruption_error(
-            RuntimeError('fts5: corrupt structure record for table "messages_fts"')
+        fts = sqlite3.DatabaseError(
+            'fts5: corrupt structure record for table "messages_fts"'
         )
+        fts.sqlite_errorcode = getattr(sqlite3, "SQLITE_CORRUPT_VTAB", 267)
+        assert SessionStore._is_fts_corruption_error(fts)
+        contradictory = sqlite3.IntegrityError(
+            'fts5: corrupt structure record for table "messages_fts"'
+        )
+        contradictory.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_TRIGGER
+        assert not SessionStore._is_fts_corruption_error(contradictory)
         assert not SessionStore._is_fts_corruption_error(
             RuntimeError("shifts were applied")
         )
