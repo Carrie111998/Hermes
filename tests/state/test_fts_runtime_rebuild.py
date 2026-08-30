@@ -16,6 +16,7 @@ until a later open atomically rebuilds the index and restores the triggers.
 import json
 import os
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,7 @@ from hermes_state import (
     _FTS_TRIGGERS,
     _concrete_state_db_holder_pids,
     _is_inactive_orphan_desktop_holder,
-    _retire_active_structural_quarantine,
+    _finalize_structural_repair,
 )
 
 
@@ -333,12 +334,8 @@ class TestRuntimeFtsRebuild:
         self, tmp_path
     ):
         db_path = tmp_path / "state.db"
-        seed = SessionDB(db_path=db_path)
-        seed.create_session("seed", source="test")
-        seed.close()
-        corrupt_generation = db_path.read_bytes()
-
         first = SessionDB(db_path=db_path)
+        first.create_session("seed", source="test")
         second = SessionDB(db_path=db_path)
         try:
             structural = sqlite3.DatabaseError("database disk image is malformed")
@@ -363,16 +360,17 @@ class TestRuntimeFtsRebuild:
             first.close()
             second.close()
 
+        corrupt_generation = db_path.read_bytes()
         with pytest.raises(sqlite3.DatabaseError, match="writable open refused"):
             SessionDB(db_path=db_path)
 
         replacement = tmp_path / "replacement.db"
         raw = sqlite3.connect(replacement)
-        raw.execute("CREATE TABLE replacement_generation (id INTEGER PRIMARY KEY)")
+        raw.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
         raw.commit()
         raw.close()
         os.replace(replacement, db_path)
-        _retire_active_structural_quarantine(db_path)
+        assert _finalize_structural_repair(db_path)
         repaired = SessionDB(db_path=db_path)
         repaired.create_session("repaired", source="test")
         repaired.close()
@@ -380,6 +378,64 @@ class TestRuntimeFtsRebuild:
         db_path.write_bytes(corrupt_generation)
         with pytest.raises(sqlite3.DatabaseError, match="writable open refused"):
             SessionDB(db_path=db_path)
+
+    def test_quarantine_publication_precedes_waiting_sibling_write(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        first = SessionDB(db_path=db_path)
+        first.create_session("seed", source="test")
+        second = SessionDB(db_path=db_path)
+        detector_entered = threading.Event()
+        release_detector = threading.Event()
+        sibling_started = threading.Event()
+        errors = []
+        sibling_callback_called = False
+
+        structural = sqlite3.DatabaseError("database disk image is malformed")
+        structural.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+
+        def _detect(_conn):
+            detector_entered.set()
+            assert release_detector.wait(timeout=5)
+            raise structural
+
+        def _run_detector():
+            try:
+                first._execute_write(_detect)
+            except sqlite3.DatabaseError as exc:
+                errors.append(exc)
+
+        def _sibling_write(_conn):
+            nonlocal sibling_callback_called
+            sibling_callback_called = True
+
+        def _run_sibling():
+            sibling_started.set()
+            try:
+                second._execute_write(_sibling_write)
+            except sqlite3.DatabaseError as exc:
+                errors.append(exc)
+
+        detector = threading.Thread(target=_run_detector)
+        sibling = threading.Thread(target=_run_sibling)
+        try:
+            detector.start()
+            assert detector_entered.wait(timeout=5)
+            sibling.start()
+            assert sibling_started.wait(timeout=5)
+            release_detector.set()
+            detector.join(timeout=5)
+            sibling.join(timeout=5)
+            assert not detector.is_alive()
+            assert not sibling.is_alive()
+            assert sibling_callback_called is False
+            assert len(errors) == 2
+            assert any("canonical writes disabled" in str(exc) for exc in errors)
+        finally:
+            release_detector.set()
+            detector.join(timeout=5)
+            sibling.join(timeout=5)
+            first.close()
+            second.close()
 
     def test_append_self_heals_after_fts_corruption(self, db, tmp_path):
         if not db._fts_enabled:
