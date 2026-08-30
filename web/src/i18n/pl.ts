@@ -449,6 +449,76 @@ export const pl: Translations = {
     learnSubmit: 'Naucz',
     skillSaved: name => `Zapisano umiejętność ${name} ✓`,
     editSkill: name => `Edytuj umiejętność: ${name}`,
+    configure: 'Konfiguruj',
+    editSkillMd: 'Edytuj SKILL.md',
+    hub: {
+      searchPlaceholder: 'Szukaj w centrum umiejętności (GitHub, oficjalne, społecznościowe)…',
+      search: 'Szukaj',
+      updateAll: 'Aktualizuj wszystkie',
+      searchFailed: error => `Wyszukiwanie w centrum nie powiodło się: ${error}`,
+      installing: identifier => `Instalowanie ${identifier}…`,
+      installFailed: error => `Instalacja nie powiodła się: ${error}`,
+      updating: 'Aktualizowanie zainstalowanych umiejętności…',
+      updateFailed: error => `Aktualizacja nie powiodła się: ${error}`,
+      running: 'w toku',
+      done: 'zakończono',
+      dismiss: 'Odrzuć',
+      starting: 'Uruchamianie…',
+      featured: 'Polecane umiejętności',
+      featuredDescription: 'z indeksu Hermesa — wyszukaj powyżej, aby znaleźć tysiące innych',
+      landingEmpty: 'Wyszukaj powyżej, aby przeglądać umiejętności z połączonych źródeł.',
+      noMatches: 'Nie znaleziono pasujących umiejętności w centrum.',
+      connecting: 'Łączenie z centrami umiejętności…',
+      sourcesFallback: 'Wyniki pochodzą z tych samych źródeł co',
+      connectedHubs: 'Połączone centra:',
+      githubRateLimitTooltip: 'Osiągnięto limit API GitHub — ustaw GITHUB_TOKEN, aby go zwiększyć',
+      indexUnavailableTooltip: 'Centralny indeks jest niedostępny — używane są źródła pobierane na żywo',
+      rateLimitedSuffix: ' (osiągnięto limit)',
+      results: count => `Liczba wyników: ${count}`,
+      timedOut: sources => `Przekroczono limit czasu: ${sources}`,
+      openSkill: name => `Otwórz umiejętność ${name}`,
+      details: 'Szczegóły',
+      installed: 'Zainstalowano',
+      install: 'Zainstaluj',
+      trustLabels: {
+        trusted: 'zaufane',
+        builtin: 'wbudowane',
+        community: 'społecznościowe',
+        unknown: 'nieznane'
+      },
+      verdictLabels: {
+        safe: 'Bezpieczna',
+        caution: 'Wymaga ostrożności',
+        dangerous: 'Niebezpieczna'
+      },
+      severityLabels: {
+        critical: 'krytyczne',
+        high: 'wysokie',
+        medium: 'średnie',
+        low: 'niskie'
+      },
+      dialogDescription: name =>
+        `Wyświetl źródło SKILL.md i przeskanuj umiejętność ${name} pod kątem bezpieczeństwa przed instalacją.`,
+      previewFailed: error => `Nie udało się wyświetlić podglądu: ${error}`,
+      scanFailed: error => `Skanowanie nie powiodło się: ${error}`,
+      readSkillMd: 'Czytaj SKILL.md',
+      rescan: 'Skanuj ponownie',
+      securityScan: 'Skanowanie bezpieczeństwa',
+      files: 'Pliki:',
+      emptySkillMd: '(SKILL.md jest pusty)',
+      sourceLoadFailed: 'Nie udało się wczytać źródła umiejętności.',
+      scanning: 'Pobieranie, izolowanie i skanowanie…',
+      scanPrompt: 'Przed instalacją przeskanuj umiejętność, aby wykryć ryzykowne wzorce.',
+      verdict: label => `Werdykt: ${label}`,
+      findingSummary: (trust, count) => `Źródło: ${trust} · liczba wykrytych problemów: ${count}`,
+      policyLabels: {
+        allow: 'Instalacja dozwolona',
+        ask: 'Wymaga potwierdzenia',
+        block: 'Instalacja zablokowana'
+      },
+      severityCount: (label, count) => `${label}: ${count}`,
+      noRiskyPatterns: 'Nie wykryto ryzykownych wzorców'
+    },
     editorEditDescription:
       'Zmień plik SKILL.md tej umiejętności. Metadane frontmatter (nazwa i opis) zostaną sprawdzone przy zapisie.',
     editorCreateDescription:
@@ -593,7 +663,8 @@ Tutaj umieść ponumerowane kroki, dokładne polecenia i pułapki.
     },
     expiresIn: 'wygasa za {time}',
     disconnectSuccess: provider => `Rozłączono dostawcę ${provider}`,
-    disconnectFailed: error => `Nie udało się rozłączyć dostawcy: ${error}`
+    disconnectFailed: error => `Nie udało się rozłączyć dostawcy: ${error}`,
+    loadProvidersFailed: error => `Nie udało się wczytać dostawców: ${error}`
   },
 
   language: { switchTo: 'Zmień język' },

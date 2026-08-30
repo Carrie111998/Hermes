@@ -458,6 +458,82 @@ export const en: Translations = {
     learnSubmit: "Learn it",
     skillSaved: (name) => `${name} saved ✓`,
     editSkill: (name) => `Edit skill: ${name}`,
+    configure: "Configure",
+    editSkillMd: "Edit SKILL.md",
+    hub: {
+      searchPlaceholder: "Search the skill hub (GitHub, official, community)…",
+      search: "Search",
+      updateAll: "Update all",
+      searchFailed: (error) => `Hub search failed: ${error}`,
+      installing: (identifier) => `Installing ${identifier}…`,
+      installFailed: (error) => `Install failed: ${error}`,
+      updating: "Updating installed skills…",
+      updateFailed: (error) => `Update failed: ${error}`,
+      running: "running",
+      done: "done",
+      dismiss: "Dismiss",
+      starting: "Starting…",
+      featured: "Featured skills",
+      featuredDescription:
+        "from the Hermes index — search above for thousands more",
+      landingEmpty:
+        "Search the hub above to browse installable skills from the connected sources.",
+      noMatches: "No matching skills found in the hub.",
+      connecting: "Connecting to skill hubs…",
+      sourcesFallback: "Results come from the same sources as",
+      connectedHubs: "Connected hubs:",
+      githubRateLimitTooltip:
+        "GitHub API rate-limited — set GITHUB_TOKEN to raise the limit",
+      indexUnavailableTooltip:
+        "Centralized index unavailable — falling back to live sources",
+      rateLimitedSuffix: " (rate-limited)",
+      results: (count) => `${count} result${count === 1 ? "" : "s"}`,
+      timedOut: (sources) => `${sources} timed out`,
+      openSkill: (name) => `Open ${name}`,
+      details: "Details",
+      installed: "Installed",
+      install: "Install",
+      trustLabels: {
+        trusted: "trusted",
+        builtin: "builtin",
+        community: "community",
+        unknown: "unknown",
+      },
+      verdictLabels: {
+        safe: "Safe",
+        caution: "Caution",
+        dangerous: "Dangerous",
+      },
+      severityLabels: {
+        critical: "critical",
+        high: "high",
+        medium: "medium",
+        low: "low",
+      },
+      dialogDescription: (name) =>
+        `Preview the SKILL.md source and run a security scan for ${name} before installing.`,
+      previewFailed: (error) => `Preview failed: ${error}`,
+      scanFailed: (error) => `Scan failed: ${error}`,
+      readSkillMd: "Read SKILL.md",
+      rescan: "Re-scan",
+      securityScan: "Security scan",
+      files: "Files:",
+      emptySkillMd: "(SKILL.md is empty)",
+      sourceLoadFailed: "Couldn't load the skill source.",
+      scanning: "Fetching, quarantining, and scanning…",
+      scanPrompt:
+        "Run a security scan to inspect this skill for risky patterns before installing.",
+      verdict: (label) => `Verdict: ${label}`,
+      findingSummary: (trust, count) =>
+        `${trust} source · ${count} finding${count === 1 ? "" : "s"}`,
+      policyLabels: {
+        allow: "Install allowed",
+        ask: "Needs confirmation",
+        block: "Install blocked",
+      },
+      severityCount: (label, count) => `${count} ${label}`,
+      noRiskyPatterns: "No risky patterns detected",
+    },
     editorEditDescription:
       "Rewrite this skill's SKILL.md. Frontmatter (name, description) is validated on save.",
     editorCreateDescription:
@@ -601,6 +677,7 @@ Numbered steps, exact commands, and pitfalls go here.
     expiresIn: "expires in {time}",
     disconnectSuccess: (provider) => `${provider} disconnected`,
     disconnectFailed: (error) => `Disconnect failed: ${error}`,
+    loadProvidersFailed: (error) => `Failed to load providers: ${error}`,
   },
 
   language: {

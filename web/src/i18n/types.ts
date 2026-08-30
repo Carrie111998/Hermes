@@ -474,6 +474,75 @@ export interface Translations {
     learnSubmit?: string;
     skillSaved?: (name: string) => string;
     editSkill?: (name: string) => string;
+    configure?: string;
+    editSkillMd?: string;
+    hub?: {
+      searchPlaceholder: string;
+      search: string;
+      updateAll: string;
+      searchFailed: (error: string) => string;
+      installing: (identifier: string) => string;
+      installFailed: (error: string) => string;
+      updating: string;
+      updateFailed: (error: string) => string;
+      running: string;
+      done: string;
+      dismiss: string;
+      starting: string;
+      featured: string;
+      featuredDescription: string;
+      landingEmpty: string;
+      noMatches: string;
+      connecting: string;
+      sourcesFallback: string;
+      connectedHubs: string;
+      githubRateLimitTooltip: string;
+      indexUnavailableTooltip: string;
+      rateLimitedSuffix: string;
+      results: (count: number) => string;
+      timedOut: (sources: string) => string;
+      openSkill: (name: string) => string;
+      details: string;
+      installed: string;
+      install: string;
+      trustLabels: {
+        trusted: string;
+        builtin: string;
+        community: string;
+        unknown: string;
+      };
+      verdictLabels: {
+        safe: string;
+        caution: string;
+        dangerous: string;
+      };
+      severityLabels: {
+        critical: string;
+        high: string;
+        medium: string;
+        low: string;
+      };
+      dialogDescription: (name: string) => string;
+      previewFailed: (error: string) => string;
+      scanFailed: (error: string) => string;
+      readSkillMd: string;
+      rescan: string;
+      securityScan: string;
+      files: string;
+      emptySkillMd: string;
+      sourceLoadFailed: string;
+      scanning: string;
+      scanPrompt: string;
+      verdict: (label: string) => string;
+      findingSummary: (trust: string, count: number) => string;
+      policyLabels: {
+        allow: string;
+        ask: string;
+        block: string;
+      };
+      severityCount: (label: string, count: number) => string;
+      noRiskyPatterns: string;
+    };
     editorEditDescription?: string;
     editorCreateDescription?: string;
     editorName?: string;
@@ -608,6 +677,7 @@ export interface Translations {
     expiresIn: string;
     disconnectSuccess?: (provider: string) => string;
     disconnectFailed?: (error: string) => string;
+    loadProvidersFailed?: (error: string) => string;
   };
 
   // ── Language switcher ──

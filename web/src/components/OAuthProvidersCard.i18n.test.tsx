@@ -76,4 +76,20 @@ describe("OAuthProvidersCard Polish disconnect feedback", () => {
     });
     expect(onError).not.toHaveBeenCalledWith(expect.stringContaining("failed"));
   });
+
+  it("uses the locale-owned provider load error callback", async () => {
+    mocks.getOAuthProviders.mockRejectedValueOnce(new Error("serwer niedostępny"));
+    const onError = vi.fn();
+
+    render(<OAuthProvidersCard onError={onError} />);
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(
+        "Nie udało się wczytać dostawców: Error: serwer niedostępny",
+      );
+    });
+    expect(onError).not.toHaveBeenCalledWith(
+      expect.stringContaining("Failed to load providers"),
+    );
+  });
 });

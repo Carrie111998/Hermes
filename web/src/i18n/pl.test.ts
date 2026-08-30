@@ -170,7 +170,58 @@ describe('Polish dashboard localization', () => {
     expect(pl.oauth.disconnectFailed?.('brak połączenia')).toBe(
       'Nie udało się rozłączyć dostawcy: brak połączenia'
     )
+    expect(pl.oauth.loadProvidersFailed?.('brak połączenia')).toBe(
+      'Nie udało się wczytać dostawców: brak połączenia'
+    )
     expect(pl.achievements.card.no_evidence).toBe('Brak jeszcze dowodów')
+  })
+
+  it('owns the active Skills Hub vocabulary and enum mappings in Polish', () => {
+    const hub = pl.skills.hub!
+
+    expect([pl.skills.configure, pl.skills.editSkillMd, pl.skills.editSkill?.('audit')]).toEqual([
+      'Konfiguruj',
+      'Edytuj SKILL.md',
+      'Edytuj umiejętność: audit'
+    ])
+    expect([hub.search, hub.updateAll, hub.details, hub.install, hub.installed]).toEqual([
+      'Szukaj',
+      'Aktualizuj wszystkie',
+      'Szczegóły',
+      'Zainstaluj',
+      'Zainstalowano'
+    ])
+    expect(hub.trustLabels).toEqual({
+      trusted: 'zaufane',
+      builtin: 'wbudowane',
+      community: 'społecznościowe',
+      unknown: 'nieznane'
+    })
+    expect(hub.verdictLabels).toEqual({
+      safe: 'Bezpieczna',
+      caution: 'Wymaga ostrożności',
+      dangerous: 'Niebezpieczna'
+    })
+    expect(hub.severityLabels).toEqual({
+      critical: 'krytyczne',
+      high: 'wysokie',
+      medium: 'średnie',
+      low: 'niskie'
+    })
+    expect(hub.policyLabels).toEqual({
+      allow: 'Instalacja dozwolona',
+      ask: 'Wymaga potwierdzenia',
+      block: 'Instalacja zablokowana'
+    })
+    expect(hub.results(12)).toBe('Liczba wyników: 12')
+    expect(hub.timedOut('github, skillsmp')).toBe('Przekroczono limit czasu: github, skillsmp')
+    expect(hub.findingSummary('społecznościowe', 3)).toBe(
+      'Źródło: społecznościowe · liczba wykrytych problemów: 3'
+    )
+    expect(hub.severityCount('wysokie', 2)).toBe('wysokie: 2')
+    expect(hub.searchFailed('brak sieci')).toBe(
+      'Wyszukiwanie w centrum nie powiodło się: brak sieci'
+    )
   })
 
   it('renders count-dependent labels as complete locale-owned messages', () => {

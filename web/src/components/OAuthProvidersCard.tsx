@@ -67,9 +67,15 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
     api
       .getOAuthProviders()
       .then((resp) => setProviders(resp.providers))
-      .catch((e) => onErrorRef.current?.(`Failed to load providers: ${e}`))
+      .catch((e) =>
+        onErrorRef.current?.(
+          (t.oauth.loadProvidersFailed ?? en.oauth.loadProvidersFailed!)(
+            String(e),
+          ),
+        ),
+      )
       .finally(() => setLoading(false));
-  }, []);
+  }, [t.oauth.loadProvidersFailed]);
 
   useEffect(() => {
     refresh();
