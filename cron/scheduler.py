@@ -6712,10 +6712,40 @@ def run_job(
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        # Best-effort audit write on failure path. _audit_fire_id
-        # may be unset if the exception fired before submit() — guard
-        # with a None check so the audit write itself never raises.
+        # Expected, fail-closed sentinel skips (#44585 drift guard, #72056
+        # pre-dispatch config validation) raise RuntimeError as a control-flow
+        # signal. The delivery path already applies alert-once dedup for the
+        # user-facing alert; gate the *log* the same way. Before this fix the
+        # run-wide except logged the benign, already-alerted sentinel at ERROR
+        # with a full traceback on every tick, polluting errors.log /
+        # ERROR-level alerting and drowning out genuine job failures.
+        _is_benign_sentinel = (
+            DRIFT_SKIP_MARKER in error_msg
+            or DRIFT_SKIP_SILENT_MARKER in error_msg
+            or BLOCKED_CONFIG_MARKER in error_msg
+            or BLOCKED_CONFIG_SILENT_MARKER in error_msg
+        )
+        _is_already_alerted = (
+            DRIFT_SKIP_SILENT_MARKER in error_msg
+            or BLOCKED_CONFIG_SILENT_MARKER in error_msg
+        )
+        if _is_benign_sentinel and _is_already_alerted:
+            # `:silent` = operator already alerted on a previous tick
+            # (alert-once). Keep it at DEBUG so errors.log stays quiet.
+            logger.debug(
+                "Job '%s': skipped (sentinel, already alerted): %s",
+                job_name, error_msg, 
+            )
+        elif _is_benign_sentinel:
+            # First (loud) sentinel tick: one WARNING, no traceback.
+            logger.warning(
+                "Job '%s': skipped (sentinel): %s", job_name, error_msg
+            )
+        else:
+            logger.exception("Job '%s' failed: %s", job_name, error_msg)
+         # Best-effort audit write on failure path. _audit_fire_id
+         # may be unset if the exception fired before submit() — guard
+         # with a None check so the audit write itself never raises.
         if "_audit_fire_id" in locals():
             _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
             _write_usage_audit({
