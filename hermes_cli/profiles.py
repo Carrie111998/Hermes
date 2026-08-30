@@ -1377,6 +1377,18 @@ def create_profile(
     return profile_dir
 
 
+# The failure reason flows into user-facing status lines (`hermes update`,
+# `hermes profile create`); a raw stderr tail from a crashing child can carry
+# ANSI escape sequences or carriage resets that garble those lines (#97792).
+_REASON_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+
+def _reason_text(stderr: str) -> str:
+    # Carriage returns become spaces *before* any splitlines() so a mid-line
+    # \r cannot turn the tail into an empty last line.
+    return _REASON_ESCAPE_RE.sub("", stderr).replace("\r", " ")
+
+
 def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
     """Seed bundled skills into a profile via subprocess.
 
@@ -1405,12 +1417,12 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
             return json.loads(result.stdout.strip())
         # quiet suppresses success chatter, not error detail: keep returning
         # the reason so `hermes update` can print why a profile failed (#97792).
-        stderr_tail = result.stderr.strip().splitlines() or ["no stderr"]
+        stderr_tail = _reason_text(result.stderr).strip().splitlines() or ["no stderr"]
         if not quiet:
             print(f"⚠ Skill seeding returned exit code {result.returncode}")
             if result.stderr.strip():
                 print(f"  {result.stderr.strip()[:200]}")
-        return {"error": f"rc={result.returncode}: {stderr_tail[-1][:200]}"}
+        return {"error": f"rc={result.returncode}: {stderr_tail[-1].strip()[:200]}"}
     except subprocess.TimeoutExpired:
         if not quiet:
             print("⚠ Skill seeding timed out (60s)")

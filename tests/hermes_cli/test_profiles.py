@@ -287,6 +287,22 @@ class TestSeedProfileSkillsFailureReason:
         r = seed_profile_skills(profile_dir, quiet=True)
         assert r == {"error": "rc=1: ValueError: bad manifest"}
 
+    def test_stderr_tail_is_sanitized_for_status_lines(self, profile_env, monkeypatch):
+        import subprocess as _sp
+
+        profile_dir = create_profile("orchestrator", no_alias=True)
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: _sp.CompletedProcess(
+                args=a, returncode=1,
+                stdout="",
+                stderr="\x1b[31mValueError\x1b[0m: bad manifest\r\x1b[K",
+            ),
+        )
+        r = seed_profile_skills(profile_dir, quiet=True)
+        # The reason reaches user-facing lines without ANSI/control characters.
+        assert r == {"error": "rc=1: ValueError: bad manifest"}
+
     def test_zero_exit_empty_stdout_returns_reason(self, profile_env, monkeypatch):
         import subprocess as _sp
 
