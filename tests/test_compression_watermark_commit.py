@@ -141,8 +141,7 @@ class TestWatermarkCommit:
         watermark = db.get_active_message_watermark("sess1")
         db.append_message(
             "sess1", role="assistant", content="tail with tools",
-            tool_calls=[{"id": "t1", "type": "function",
-                         "function": {"name": "x", "arguments": "{}"}}],
+            tool_calls={"id": "t1", "name": "legacy_tool"},
         )
         db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
         info = db.get_session("sess1")
@@ -252,6 +251,12 @@ class TestRotationPathWatermark:
         watermark = db.get_active_message_watermark("sess1")
         assert db.try_acquire_compression_lock("sess1", "rotator") is True
         db.append_message("sess1", role="user", content=tail_content)
+        db.append_message(
+            "sess1",
+            role="assistant",
+            content="mid-rotation tool call",
+            tool_calls={"id": "t1", "name": "legacy_tool"},
+        )
         # Ceiling captured AFTER the foreign append, BEFORE the rotation
         # path's own pre-publish flush (which this test has none of).
         ceiling = db.get_active_message_watermark("sess1")
@@ -272,6 +277,7 @@ class TestRotationPathWatermark:
             SUMMARY[0]["content"],
             SUMMARY[1]["content"],
             tail_content,
+            "mid-rotation tool call",
         ]
         model_history, display_history = db.get_resume_conversations("child1")
         visible_steers = [
@@ -280,13 +286,17 @@ class TestRotationPathWatermark:
             if message.get("content") == tail_content
         ]
         assert len(visible_steers) == 1
-        assert visible_steers[0]["_row_id"] == model_history[-1]["_row_id"]
+        model_steer = next(
+            message for message in model_history if message.get("content") == tail_content
+        )
+        assert visible_steers[0]["_row_id"] == model_steer["_row_id"]
         assert all(
             message.get("content") != tail_content
             for message in db.get_ancestor_display_prefix("child1")
         )
         info = db.get_session("child1")
-        assert info["message_count"] == 3
+        assert info["message_count"] == 4
+        assert info["tool_call_count"] == 1
         # Parent keeps its copy for lineage recovery; parent is closed.
         parent_info = db.get_session("sess1")
         assert parent_info["end_reason"] == "compression"
