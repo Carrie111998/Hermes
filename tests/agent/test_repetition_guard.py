@@ -48,3 +48,18 @@ class TestRepetitionGuard:
         assert is_repetition_dominated("") is False
         assert is_repetition_dominated(None) is False
         assert is_repetition_dominated(12345) is False
+
+    def test_multipart_list_content_flagged(self):
+        # Multipart list where text parts contain repeated sentences
+        parts = [
+            {"type": "text", "text": _INCIDENT_ECHO * 1000},
+            {"type": "text", "text": _INCIDENT_ECHO * 1000},
+        ]
+        assert is_repetition_dominated(parts) is True
+
+    def test_multipart_list_non_repeating_not_flagged(self):
+        parts = [
+            {"type": "text", "text": "Unique intro part describing architecture."},
+            {"type": "text", "text": "Unique body part detailing verification steps."},
+        ]
+        assert is_repetition_dominated(parts) is False
