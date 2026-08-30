@@ -1126,10 +1126,16 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "worker"}
         assert serve["worker"] == get_profile_dir("worker")
 
+    def test_unmarked_runtime_directory_is_ignored(self, profile_env):
+        create_profile("coder", no_alias=True)
+        junk = get_profile_dir("coder").parent / "cachetmp"
+        junk.mkdir()
+        (junk / "state.db").write_bytes(b"")
+        serve = dict(profiles_to_serve(multiplex=True))
+        assert "cachetmp" not in serve
+        assert "coder" in serve
+        assert (get_profile_dir("coder") / "profile.yaml").is_file()
 
-
-        assert set(serve) == {"default", "worker"}
-        assert serve["worker"] == get_profile_dir("worker")
 
 
 # ---------------------------------------------------------------------------

@@ -1158,6 +1158,8 @@ def profiles_to_serve(
                 continue
             if named_profile_is_deleted(entry):
                 continue
+            if not (entry / "profile.yaml").is_file():
+                continue
             if allowed is not None and name not in allowed:
                 continue
             serve.append((name, entry))
@@ -1356,15 +1358,14 @@ def create_profile(
     # Persist description if the caller provided one. Done last so a
     # partial-create failure doesn't strand a description file in an
     # incomplete profile.
-    if description and description.strip():
-        try:
-            write_profile_meta(
-                profile_dir,
-                description=description.strip(),
-                description_auto=False,
-            )
-        except Exception:
-            pass  # non-fatal — user can describe later with `hermes profile describe`
+    try:
+        meta_kwargs = {}
+        if description and description.strip():
+            meta_kwargs["description"] = description.strip()
+            meta_kwargs["description_auto"] = False
+        write_profile_meta(profile_dir, **meta_kwargs)
+    except Exception:
+        pass  # non-fatal — user can describe later with `hermes profile describe`
 
     # Phase 4: when running inside a container under s6, register the
     # new profile's gateway as a runtime s6 service so
