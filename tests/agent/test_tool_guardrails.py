@@ -186,6 +186,59 @@ def test_no_progress_streak_resets_when_result_changes():
     assert controller.before_call("terminal", args).action == "allow"
 
 
+def test_non_string_result_skips_no_progress_tracking_without_crashing():
+    # tool_executor can hand structured multimodal results (dicts with
+    # content lists) to after_call. _result_hash is only defined on str, so
+    # these must bypass no-progress tracking entirely rather than crashing
+    # on .encode() — the guidance text can't be appended to multimodal
+    # content anyway.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    args = {"url": "https://example.com/page"}
+    multimodal_result = {
+        "content": [
+            {"type": "text", "text": "page snapshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]
+    }
+
+    decisions = [
+        controller.after_call("read_url", args, multimodal_result, failed=False)
+        for _ in range(5)
+    ]
+
+    assert [d.action for d in decisions] == ["allow"] * 5
+    assert controller._no_progress == {}
+    # Fallback classifier likewise has no textual signal to work with.
+    assert classify_tool_failure("read_url", multimodal_result) == (False, "")
+
+
+def test_non_string_result_breaks_existing_no_progress_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=3)
+    )
+    args = {"command": "cat /tmp/out.txt"}
+    result = '{"output":"same","exit_code":0,"error":null}'
+
+    controller.after_call("terminal", args, result, failed=False)
+    warned = controller.after_call("terminal", args, result, failed=False)
+    assert warned.action == "warn"
+
+    # A structured result with identical args resets the streak...
+    controller.after_call("terminal", args, {"content": [{"type": "text", "text": "same"}]}, failed=False)
+
+    # ...so the next identical string result restarts at 1, below the warn
+    # threshold (a streak of 3 would have warned again).
+    restarted = controller.after_call("terminal", args, result, failed=False)
+    assert restarted.action == "allow"
+    assert restarted.count == 1
+
+
 # ── Per-turn runaway-loop caps (Claude Code v2.1.212, Week 29) ──────────────
 
 from agent.tool_guardrails import LoopCapConfig  # noqa: E402
