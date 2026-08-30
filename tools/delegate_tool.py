@@ -3057,6 +3057,13 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif _schema_valid is False:
+            # A schema-constrained delegation whose final response still fails
+            # validation after the bounded retry must fail CLOSED (#96355):
+            # reporting "completed" alongside schema_valid=false would let
+            # automated consumers treat an unfulfilled machine-readable
+            # contract as a successful structured delegation.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
