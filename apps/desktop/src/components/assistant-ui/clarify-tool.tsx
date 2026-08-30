@@ -114,6 +114,7 @@ function readClarifyArgs(args: unknown): ClarifyArgs {
 }
 
 interface ClarifyBatchResponse {
+  choices?: string[] | null
   id?: string
   question?: string
   answer?: string | string[]
@@ -133,9 +134,12 @@ export function readClarifyBatchResult(result: unknown): {
   const responses = row.responses.map((entry): ClarifyBatchResponse => {
     const item = parseMaybeObject(entry)
     const answer = item.user_response
+    const rawChoices = item.choices_offered
+    const choices = rawChoices === undefined ? undefined : normalizeChoices(rawChoices)
 
     return {
       answer: Array.isArray(answer) ? answer.map(String) : typeof answer === 'string' ? answer : undefined,
+      choices: choices === undefined ? undefined : choices.length > 0 ? choices : null,
       id: stringField(item, 'id'),
       question: stringField(item, 'question')
     }
@@ -292,9 +296,10 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
 
 function ClarifyToolSettled(props: ToolCallMessagePartProps) {
   const batch = readClarifyBatchResult(props.result)
+  const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
 
   if (batch.responses.length > 0) {
-    return <ClarifyToolBatchSettled responses={batch.responses} />
+    return <ClarifyToolBatchSettled fallbackQuestions={fromArgs.questions} responses={batch.responses} />
   }
 
   return <ClarifyToolSingleSettled {...props} />
@@ -813,22 +818,40 @@ function ClarifyToolSinglePending({
 // ─── Batch (multi-question) clarify ─────────────────────────────────────────
 
 /** Settled batch card: every question with its locked (or absent) answer. */
-function ClarifyToolBatchSettled({ responses }: { responses: { question?: string; answer?: string | string[] }[] }) {
+function ClarifyToolBatchSettled({
+  fallbackQuestions,
+  responses
+}: {
+  fallbackQuestions?: ClarifyArgs['questions']
+  responses: ClarifyBatchResponse[]
+}) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
+
+  const followUp = useCallback(
+    (question: string, choice: string) => {
+      requestComposerInsert(copy.lateAnswer(question, choice), { mode: 'block' })
+      requestComposerFocus()
+      triggerHaptic('selection')
+    },
+    [copy]
+  )
 
   return (
     <ClarifyShell className="my-1.5 grid gap-2.5" data-clarify-settled="">
       {responses.map((row, index) => {
+        const fallback = fallbackQuestions?.[index]
+        const question = row.question || fallback?.question
+        const choices = row.choices === undefined ? (fallback?.choices ?? []) : (row.choices ?? [])
         const answer = Array.isArray(row.answer) ? row.answer.join(', ') : (row.answer ?? '')
         const blank = !answer.trim()
 
         return (
           <div className="grid gap-1" key={`${index}-${row.question ?? ''}`}>
-            {row.question ? (
+            {question ? (
               <ClarifyLine icon={MessageQuestion}>
                 <span className="whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
-                  {row.question}
+                  {question}
                 </span>
               </ClarifyLine>
             ) : null}
@@ -843,6 +866,22 @@ function ClarifyToolBatchSettled({ responses }: { responses: { question?: string
                 {blank ? copy.skipped : answer}
               </p>
             </ClarifyLine>
+            {blank && choices.length > 0 && question ? (
+              <div className="grid gap-px" data-clarify-late-choices="" role="group">
+                {choices.map((choice, choiceIndex) => (
+                  <ChoiceButton
+                    char={letterFor(choiceIndex)}
+                    choice={choice}
+                    key={`${choiceIndex}-${choice}`}
+                    onClick={() => followUp(question, choice)}
+                    title={copy.lateAnswerTip}
+                  />
+                ))}
+                <p className="px-1.5 pt-0.5 text-[0.6875rem] leading-4 text-(--ui-text-tertiary)">
+                  {copy.lateAnswerHint}
+                </p>
+              </div>
+            ) : null}
           </div>
         )
       })}
