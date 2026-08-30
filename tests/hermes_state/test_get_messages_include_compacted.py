@@ -206,6 +206,64 @@ class TestDisplayDedupe:
         assert [m["id"] for m in page] == all_ids[2:]
         assert len(page) == 2
 
+    def test_backward_cursor_survives_compaction_copying_unseen_messages(self, db):
+        """A copy above the cursor must not hide its unseen pre-cursor row."""
+        sid = "cursor-compaction"
+        db.create_session(sid, source="cli")
+        db.append_messages_batch(
+            sid,
+            [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "content": "a2"},
+                {"role": "user", "content": "q3"},
+                {"role": "assistant", "content": "a3"},
+            ],
+        )
+        original = db.get_messages(sid)
+
+        first = db.get_messages(
+            sid, include_compacted=True, latest=True, limit=2
+        )
+        cursor = first[0]["id"]
+        assert [m["content"] for m in first] == ["q3", "a3"]
+
+        # Exercise the production transition: archive the old generation and
+        # publish a summary plus fresh active copies of two messages the client
+        # has not fetched yet. Their timestamps are preserved exactly, as in a
+        # protected-tail copy, so display projection recognizes them as the
+        # same logical messages.
+        copied = [
+            {
+                "role": message["role"],
+                "content": message["content"],
+                "timestamp": message["timestamp"],
+            }
+            for message in original[2:4]
+        ]
+        db.archive_and_compact(
+            sid,
+            [
+                {
+                    "role": "user",
+                    "content": "summary of q1/a1",
+                    "_compressed_summary": True,
+                },
+                *copied,
+            ],
+        )
+
+        second = db.get_messages(
+            sid,
+            include_compacted=True,
+            latest=True,
+            before_id=cursor,
+            limit=2,
+        )
+        assert [m["content"] for m in second] == ["q2", "a2"]
+        assert len({m["content"] for m in first + second}) == 4
+
     def test_distinct_tool_calls_with_same_content_are_not_merged(self, db):
         """Two real tool messages that happen to share role/content/timestamp
         must stay separate: the dedupe key includes the tool fields, so only

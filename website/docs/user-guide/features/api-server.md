@@ -196,6 +196,35 @@ Retrieve a previously stored response by ID.
 
 Delete a stored response.
 
+### GET /api/sessions/\{session_id\}/messages
+
+Returns persisted session messages in chronological order. By default only active messages are visible, keeping context-compacted and rewound rows hidden.
+
+Query parameters:
+
+- `limit` — maximum messages to return (clamped to 500; defaults to 500).
+- `offset` — zero-based offset in the selected order.
+- `order` — `oldest` or `latest`. An omitted `limit` defaults to the latest page; explicit pagination defaults to `oldest` for compatibility.
+- `before_id` — for stable backward paging, pass the prior response's `pagination.next_before_id` with `order=latest`. It cannot be combined with a nonzero `offset`.
+- `include_compacted` — when `true`, include compression-archived turns while still excluding rewound or undone rows.
+
+```json
+{
+  "object": "list",
+  "session_id": "session-id",
+  "data": [{"id": 42, "role": "assistant", "content": "..."}],
+  "pagination": {
+    "limit": 100,
+    "offset": 0,
+    "order": "latest",
+    "returned": 100,
+    "next_before_id": 42
+  }
+}
+```
+
+With `order=latest`, pass `pagination.next_before_id` as `before_id` to page backward. Unlike a moving-tail offset, this cursor remains stable if new messages append between requests. Every page remains chronological, and `include_compacted=true` never exposes rewound history. `offset` remains supported for existing clients.
+
 ### GET /v1/models
 
 Lists the agent as an available model. The advertised model name defaults to the [profile](/user-guide/profiles) name (or `hermes-agent` for the default profile). Required by most frontends for model discovery.

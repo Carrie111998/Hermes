@@ -612,11 +612,17 @@ async def get_session_messages(
     offset: int = Query(0, ge=0),
     order: Optional[str] = Query(None),
     include_compacted: bool = Query(False),
+    before_id: Optional[int] = Query(None, ge=1),
 ):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
             status_code=400,
             detail="order must be one of: oldest, latest",
+        )
+    if before_id is not None and (order != "latest" or offset != 0):
+        raise HTTPException(
+            status_code=400,
+            detail="before_id requires order=latest and is incompatible with offset",
         )
 
     def _read():
@@ -640,6 +646,7 @@ async def get_session_messages(
                 offset=offset,
                 latest=latest_page,
                 include_compacted=include_compacted,
+                before_id=before_id,
             )
         finally:
             db.close()
@@ -676,6 +683,7 @@ async def get_session_messages(
             "offset": offset,
             "order": order or ("latest" if limit is None else "oldest"),
             "returned": len(projected_messages),
+            "next_before_id": messages[0]["id"] if messages else None,
         },
     }
 

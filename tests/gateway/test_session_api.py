@@ -107,6 +107,7 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "offset": 0,
         "order": "latest",
         "returned": 500,
+        "next_before_id": payload["data"][0]["id"],
     }
     assert payload["data"][0]["content"] == "msg 1"
     assert payload["data"][-1]["content"] == "msg 500"
@@ -114,6 +115,61 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "msg 1",
         "msg 2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_messages_pages_compacted_history_from_latest(adapter, session_db):
+    session_db.create_session("long-chat", "api_server")
+    session_db.append_message("long-chat", "user", "old")
+    session_db.append_message("long-chat", "assistant", "old reply")
+    session_db.archive_and_compact(
+        "long-chat", [{"role": "system", "content": "summary"}]
+    )
+    session_db.append_message("long-chat", "user", "recent")
+    session_db.append_message("long-chat", "assistant", "recent reply")
+    rewound_id = session_db.append_message("long-chat", "user", "rewound")
+    session_db._conn.execute(
+        "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?", (rewound_id,)
+    )
+    session_db._conn.commit()
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(
+            "/api/sessions/long-chat/messages"
+            "?include_compacted=true&order=latest&limit=2"
+        )
+        assert response.status == 200
+        payload = await response.json()
+        # Appending between requests used to move the offset-relative tail,
+        # duplicating one recent row and permanently skipping an older row.
+        session_db.append_message("long-chat", "assistant", "appended later")
+        earlier_response = await cli.get(
+            "/api/sessions/long-chat/messages"
+            "?include_compacted=true&order=latest&limit=3"
+            f"&before_id={payload['pagination']['next_before_id']}"
+        )
+        assert earlier_response.status == 200
+        earlier = await earlier_response.json()
+
+    assert [message["content"] for message in payload["data"]] == [
+        "recent",
+        "recent reply",
+    ]
+    assert payload["pagination"] == {
+        "limit": 2,
+        "offset": 0,
+        "order": "latest",
+        "returned": 2,
+        "next_before_id": payload["data"][0]["id"],
+    }
+    assert [message["content"] for message in earlier["data"]] == [
+        "old",
+        "old reply",
+        "summary",
+    ]
+    assert not ({message["id"] for message in payload["data"]} & {message["id"] for message in earlier["data"]})
+    assert "rewound" not in [message["content"] for message in payload["data"] + earlier["data"]]
 
 
 @pytest.mark.asyncio

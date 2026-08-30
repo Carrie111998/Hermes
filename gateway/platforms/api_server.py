@@ -4505,7 +4505,11 @@ class APIServerAdapter(BasePlatformAdapter):
         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
         raw_limit = request.query.get("limit")
         raw_offset = request.query.get("offset", "0")
+        raw_before_id = request.query.get("before_id")
         order = request.query.get("order")
+        include_compacted = _coerce_request_bool(
+            request.query.get("include_compacted"), default=False
+        )
         if order not in (None, "oldest", "latest"):
             return web.json_response(
                 _openai_error(
@@ -4517,13 +4521,24 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             offset = int(raw_offset)
             requested_limit = None if raw_limit is None else int(raw_limit)
+            before_id = None if raw_before_id is None else int(raw_before_id)
         except (TypeError, ValueError):
             offset = -1
             requested_limit = -1
+            before_id = -1
         if offset < 0 or (requested_limit is not None and requested_limit < 0):
             return web.json_response(
                 _openai_error(
                     "limit and offset must be non-negative integers",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+
+        if before_id is not None and (before_id < 1 or order != "latest" or offset != 0):
+            return web.json_response(
+                _openai_error(
+                    "before_id requires a positive integer, order=latest, and no offset",
                     code="invalid_pagination",
                 ),
                 status=400,
@@ -4538,6 +4553,8 @@ class APIServerAdapter(BasePlatformAdapter):
             limit=limit,
             offset=offset,
             latest=latest_page,
+            include_compacted=include_compacted,
+            before_id=before_id,
         )
         return web.json_response({
             "object": "list",
@@ -4548,6 +4565,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "offset": offset,
                 "order": order or ("latest" if default_page else "oldest"),
                 "returned": len(messages),
+                "next_before_id": messages[0]["id"] if messages else None,
             },
         })
 

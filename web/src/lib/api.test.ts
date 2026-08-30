@@ -119,6 +119,103 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api.getSessionMessages", () => {
+  it("preserves the legacy explicit-profile call signature", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ session_id: "one", messages: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessionMessages("one", "worker");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/one/messages?limit=500&order=latest&profile=worker",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("requests the newest full-history page including compacted messages", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ session_id: "session/one", messages: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessionMessages(
+      "session/one",
+      { includeCompacted: true, order: "latest", limit: 500 },
+      "worker",
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/session%2Fone/messages?limit=500&order=latest&include_compacted=true&profile=worker",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("supports explicit backward pagination offsets", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ session_id: "one", messages: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessionMessages(
+      "one",
+      { includeCompacted: true, order: "latest", limit: 200, offset: 300 },
+      "worker",
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/one/messages?limit=200&order=latest&offset=300&include_compacted=true&profile=worker",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("uses the prior oldest-row cursor when the tail grows between pages", async () => {
+    vi.stubGlobal("window", {});
+    const rows = Array.from({ length: 10 }, (_, index) => ({
+      id: index + 1,
+      role: "user",
+      content: `msg-${index + 1}`,
+    }));
+    const fetchMock = vi.fn(async (rawUrl: string) => {
+      const url = new URL(rawUrl, "http://dashboard.test");
+      const before = url.searchParams.get("before_id");
+      const eligible = before ? rows.filter((row) => row.id < Number(before)) : rows;
+      const messages = eligible.slice(-4);
+      return new Response(
+        JSON.stringify({
+          session_id: "one",
+          messages,
+          pagination: {
+            limit: 4,
+            offset: 0,
+            order: "latest",
+            returned: messages.length,
+            next_before_id: messages[0]?.id ?? null,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await api.getSessionMessages("one", { limit: 4, order: "latest" });
+    rows.push({ id: 11, role: "user", content: "appended-between-pages" });
+    const second = await api.getSessionMessages("one", {
+      limit: 4,
+      order: "latest",
+      beforeId: first.pagination!.next_before_id!,
+    });
+    const third = await api.getSessionMessages("one", {
+      limit: 4,
+      order: "latest",
+      beforeId: second.pagination!.next_before_id!,
+    });
+
+    expect(fetchMock.mock.calls[1][0]).toContain("before_id=7");
+    expect([...third.messages, ...second.messages, ...first.messages].map((row) => row.id)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    ]);
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });

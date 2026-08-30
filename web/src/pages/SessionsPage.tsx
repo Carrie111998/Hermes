@@ -42,6 +42,7 @@ import {
 import type {
   SessionInfo,
   SessionMessage,
+  SessionMessagesResponse,
   SessionSearchResult,
   SessionStoreStats,
   StatusResponse,
@@ -96,6 +97,8 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     vulcan_delegate: { icon: Play, color: "text-warning" },
     webhook: { icon: Globe, color: "text-warning" },
   };
+
+const SESSION_MESSAGE_PAGE_SIZE = 500;
 
 const AUTOMATION_SESSION_SOURCES = [
   "cron",
@@ -476,6 +479,10 @@ function SessionRow({
   resumeInChatEnabled,
 }: SessionRowProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
+  const [messagePagination, setMessagePagination] = useState<
+    NonNullable<SessionMessagesResponse["pagination"]> | null
+  >(null);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(session.title ?? "");
@@ -487,9 +494,16 @@ function SessionRow({
     if (!isExpanded || messages !== null) return;
     let cancelled = false;
     api
-      .getSessionMessages(session.id)
+      .getSessionMessages(session.id, {
+        includeCompacted: true,
+        order: "latest",
+        limit: SESSION_MESSAGE_PAGE_SIZE,
+      })
       .then((resp) => {
-        if (!cancelled) setMessages(resp.messages);
+        if (!cancelled) {
+          setMessages(resp.messages);
+          setMessagePagination(resp.pagination ?? null);
+        }
       })
       .catch((err) => {
         if (!cancelled) setError(String(err));
@@ -498,6 +512,42 @@ function SessionRow({
       cancelled = true;
     };
   }, [isExpanded, session.id, messages]);
+
+  const loadEarlierMessages = async () => {
+    if (!messagePagination || loadingEarlier) {
+      return;
+    }
+    setLoadingEarlier(true);
+    setError(null);
+    const limit = SESSION_MESSAGE_PAGE_SIZE;
+    const beforeId = messagePagination.next_before_id;
+    const legacyOffset = messagePagination.offset + messagePagination.returned;
+    try {
+      const resp = await api.getSessionMessages(session.id, {
+        includeCompacted: true,
+        order: "latest",
+        limit,
+        beforeId: beforeId ?? undefined,
+        offset: beforeId === undefined ? legacyOffset : undefined,
+      });
+      setMessages((current) => {
+        if (!current) return resp.messages;
+        // The cursor is the primary consistency contract. Keep this guard for
+        // mixed-version gateways or a message whose visibility changes while
+        // the row is expanded.
+        const existing = new Set(current.map((message) => message.id));
+        return [
+          ...resp.messages.filter((message) => !existing.has(message.id)),
+          ...current,
+        ];
+      });
+      setMessagePagination(resp.pagination ?? null);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoadingEarlier(false);
+    }
+  };
 
   const sourceKey = session.source?.split(":")[0];
   const sourceInfo = (session.source
@@ -752,7 +802,23 @@ function SessionRow({
             </p>
           )}
           {messages && messages.length > 0 && (
-            <MessageList messages={messages} highlight={searchQuery} />
+            <div className="flex flex-col gap-3">
+              {messagePagination &&
+                messagePagination.returned === messagePagination.limit && (
+                <Button
+                  ghost
+                  className="self-center"
+                  disabled={loadingEarlier}
+                  onClick={() => void loadEarlierMessages()}
+                >
+                  {loadingEarlier ? (
+                    <Spinner className="mr-2 text-sm" />
+                  ) : null}
+                  Load earlier messages
+                </Button>
+              )}
+              <MessageList messages={messages} highlight={searchQuery} />
+            </div>
           )}
         </div>
       )}

@@ -11967,6 +11967,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        before_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -11998,11 +11999,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``after_id`` enables keyset pagination (``id > after_id``): O(1)
         page seeks on huge transcripts where OFFSET degrades to O(n) per
         page. Ascending order only (incompatible with ``latest``/``offset``).
+        ``before_id`` is the descending counterpart (``id < before_id``),
+        used to page backwards from a prior latest page without a moving-tail
+        OFFSET. Pages remain chronological and new appends cannot shift them.
         """
         if after_id is not None and (latest or offset):
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        if before_id is not None and (not latest or offset or after_id is not None):
+            raise ValueError("before_id requires latest paging and is incompatible with offset/after_id")
         if include_inactive:
             # Audit / debug reads: every row, including soft-deleted.
             active_clause = ""
@@ -12013,7 +12019,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             active_clause = " AND (active = 1 OR compacted = 1)"
         else:
             active_clause = " AND active = 1"
-        keyset_clause = " AND id > ?" if after_id is not None else ""
+        keyset_clause = " AND id > ?" if after_id is not None else (
+            " AND id < ?" if before_id is not None else ""
+        )
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
             f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
@@ -12030,11 +12038,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # full display set (a session's rows are bounded; the UI-level
             # 500-row cap lives in the endpoint, not here), dedupe in Python,
             # then apply paging.
+            # Cursor eligibility must be fixed before choosing the preferred
+            # copy. A compaction between pages can otherwise move an unseen
+            # logical message above before_id and make its older copy vanish.
+            display_cursor_clause = " AND id < ?" if before_id is not None else ""
+            display_params = [session_id]
+            if before_id is not None:
+                display_params.append(before_id)
             with self._read_ctx() as conn:
                 cursor = conn.execute(
                     "SELECT * FROM messages WHERE session_id = ?" + active_clause
-                    + " ORDER BY id ASC",
-                    [session_id],
+                    + display_cursor_clause + " ORDER BY id ASC",
+                    display_params,
                 )
                 all_rows = cursor.fetchall()
             seen: dict = {}
@@ -12080,6 +12095,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if latest:
                 rows = rows[::-1]
         else:
+            if before_id is not None:
+                params.append(before_id)
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
                 sql += " LIMIT ? OFFSET ?"
