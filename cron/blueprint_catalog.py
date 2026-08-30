@@ -386,6 +386,52 @@ CATALOG: List[AutomationBlueprint] = [
         tags=("competitors", "news", "monitor", "research"),
     ),
     AutomationBlueprint(
+        # Inspired by Energy's (getenergy.com) proactive suggestions: the
+        # assistant watches the user's own activity streams (posts, inbox,
+        # calendar) and suggests timely cross-source actions — suggest-only.
+        key="opportunity-radar",
+        title="Opportunity radar",
+        description="A recurring scan of your posts, inbox, and calendar that "
+        "suggests timely actions — where a need in one place meets an "
+        "opening in another.",
+        category="general",
+        schedule_template="{minute} {hour} * * {dow}",
+        prompt_template=(
+            "Load the opportunity-radar skill and run the scan tick for this "
+            "radar. Sources: {sources}. Opportunity focus: {focus}. Collect "
+            "new signals from each source since its stored cutoff, cross-link "
+            "needs against openings, dedup against the suggestion ledger, and "
+            "deliver at most 3 evidenced suggestions — propose only, never "
+            "act. If nothing clears the bar, respond with [SILENT]. On the "
+            "first run, execute the skill's setup phase first: pin the radar "
+            "contract, verify one live read per source, and write the state "
+            "file under ~/.hermes/opportunity-radar/."
+        ),
+        slots=[
+            BlueprintSlot(
+                name="sources", type="text", label="What should it watch?",
+                default="my public posts, my inbox, and my calendar",
+                help="activity streams to scan — posts (X handle), email, "
+                "calendar, recent Hermes sessions",
+            ),
+            BlueprintSlot(
+                name="focus", type="text",
+                label="What counts as an opportunity?",
+                default="intros I should ask for, unanswered asks, deadlines "
+                "I can act on, follow-ups going cold",
+            ),
+            _TIME("09:00"),
+            BlueprintSlot(
+                name="recurrence", type="weekdays", label="Scan on",
+                default="weekdays",
+                options=tuple(WEEKDAY_PRESETS.keys()),
+            ),
+            _DELIVER,
+        ],
+        skills=("opportunity-radar",),
+        tags=("proactive", "suggestions", "monitor"),
+    ),
+    AutomationBlueprint(
         key="habit-checkin",
         title="Habit check-in",
         description="A recurring nudge to keep a habit on track and reflect "
