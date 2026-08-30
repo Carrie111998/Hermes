@@ -2091,7 +2091,12 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "image_gen",         # image-generation provider config (agent/image_gen_registry.py)
     "video_gen",         # video-generation provider config (agent/video_gen_registry.py)
     "plugins",           # plugin enable/disable lists (hermes_cli/plugins_cmd.py)
-    "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
+    # NOTE: ``smart_model_routing`` was REMOVED from this allowlist on
+    # 2026-08-30 (migration v39→v40, #98835). It was a placeholder — no
+    # runtime consumer read it. The v40 migration strips it from existing
+    # user files; the ``validate_config_structure`` fail-closed check
+    # below surfaces a warning if it appears on disk so future authors
+    # notice the dead-code trap instead of silently carrying the key.
     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
     "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered
@@ -2286,6 +2291,27 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     # scalars are bridged into os.environ (gateway/run.py, hermes send) so
     # users can feed skills and external apps env-style keys from config.yaml
     # — a closed-world allowlist can never enumerate those.
+
+    # ── Removed-config fail-closed check (#98835) ─────────────────────────
+    # `smart_model_routing` was a setup-wizard placeholder whose value no
+    # runtime consumer reads. The v39→v40 migration strips it from user
+    # files on first read, but installations that disabled auto-migration
+    # (or that hand-edited the file back between migrations) still carry
+    # the dead key. Warn — don't error — so existing installs upgrade
+    # cleanly while every future boot sees the same message until the
+    # key is removed. The companion ``hermes doctor`` finding explains
+    # the remediation.
+    if "smart_model_routing" in config:
+        issues.append(ConfigIssue(
+            "warning",
+            "Root-level key 'smart_model_routing' is not used by Hermes "
+            "— the placeholder has no runtime consumer (#98835).",
+            "Delete the 'smart_model_routing:' block from config.yaml. "
+            "Model selection is governed by `model:` (top-level), "
+            "`fallback_providers:` / `fallback_model:`, and per-task "
+            "`auxiliary:` overrides — there is no separate routing flag.",
+        ))
+
     for key in config:
         if key.startswith("_"):
             continue

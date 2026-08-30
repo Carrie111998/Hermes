@@ -3530,9 +3530,10 @@ def _blank_slate_minimize_config(config: dict):
     mem["memory_enabled"] = False
     mem["user_profile_enabled"] = False
 
-    # No filesystem checkpoints, no smart model routing, no auto session reset.
+    # No filesystem checkpoints, no auto session reset. (Removed the
+    # ``smart_model_routing`` placeholder — no runtime consumer ever read it.
+    # See migration v39→v40 and #98835.)
     config.setdefault("checkpoints", {})["enabled"] = False
-    config.setdefault("smart_model_routing", {})["enabled"] = False
     config.setdefault("session_reset", {})["mode"] = "none"
 
     # Quiet, minimal display.
@@ -3582,7 +3583,7 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     print()
     print_success("Minimal baseline applied:")
     print_info("  Toolsets: file, terminal, vision, skills (everything else off)")
-    print_info("  Compression, memory, checkpoints, smart routing: off")
+    print_info("  Compression, memory, checkpoints: off")
 
     # ── The fork: stop here, or walk through enabling things ──
     print()

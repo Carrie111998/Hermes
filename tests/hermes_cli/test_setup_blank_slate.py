@@ -80,8 +80,15 @@ class TestBlankSlateMinimizeConfig:
         assert cfg["memory"]["memory_enabled"] is False
         assert cfg["memory"]["user_profile_enabled"] is False
         assert cfg["checkpoints"]["enabled"] is False
-        assert cfg["smart_model_routing"]["enabled"] is False
         assert cfg["session_reset"]["mode"] == "none"
+
+    def test_does_not_seed_removed_smart_model_routing(self):
+        """Regression guard for #98835 — the placeholder was removed because
+        no runtime consumer ever read it; Blank Slate must not re-introduce
+        the dead key on a fresh install."""
+        cfg = {}
+        _blank_slate_minimize_config(cfg)
+        assert "smart_model_routing" not in cfg
 
 
 class TestBlankSlateFork:
