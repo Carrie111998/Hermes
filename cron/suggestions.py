@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 # shared default root. See cron/jobs.py for the full rationale.
 CRON_DIR = get_hermes_home().resolve() / "cron"
 SUGGESTIONS_FILE = CRON_DIR / "suggestions.json"
+_IMPORT_STORE = (CRON_DIR, SUGGESTIONS_FILE)
 
 # In-process lock protecting load->modify->save cycles (the background review
 # fork and the main agent can both write).
@@ -69,17 +70,36 @@ def _secure_file(path: Path) -> None:
         pass
 
 
-def _ensure_dir() -> None:
+def _current_store() -> tuple[Path, Path]:
+    """Return suggestion paths for the active cron store context.
+
+    Deliberately monkeypatched compatibility constants remain authoritative;
+    otherwise share ``cron.jobs``' dynamic profile and HERMES_HOME resolution.
+    """
+    cron_changed = CRON_DIR != _IMPORT_STORE[0]
+    file_changed = SUGGESTIONS_FILE != _IMPORT_STORE[1]
+    if file_changed:
+        return SUGGESTIONS_FILE.parent, SUGGESTIONS_FILE
+    if cron_changed:
+        return CRON_DIR, CRON_DIR / "suggestions.json"
+    from cron.jobs import _current_cron_store
+
+    cron_dir = _current_cron_store().cron_dir
+    return cron_dir, cron_dir / "suggestions.json"
+
+
+def _ensure_dir(cron_dir: Optional[Path] = None) -> None:
     from cron.jobs import _ensure_cron_dir
 
-    _ensure_cron_dir(CRON_DIR)
+    _ensure_cron_dir(cron_dir or _current_store()[0])
 
 
 def _load_raw() -> Dict[str, Any]:
-    if not SUGGESTIONS_FILE.exists():
+    suggestions_file = _current_store()[1]
+    if not suggestions_file.exists():
         return {"suggestions": []}
     try:
-        with open(SUGGESTIONS_FILE, "r", encoding="utf-8") as f:
+        with open(suggestions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("suggestions.json unreadable (%s); starting empty", e)
@@ -93,8 +113,11 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
-    _ensure_dir()
-    fd, tmp_path = tempfile.mkstemp(dir=str(SUGGESTIONS_FILE.parent), suffix=".tmp", prefix=".sugg_")
+    cron_dir, suggestions_file = _current_store()
+    _ensure_dir(cron_dir)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(suggestions_file.parent), suffix=".tmp", prefix=".sugg_"
+    )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
@@ -104,8 +127,8 @@ def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
             )
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, SUGGESTIONS_FILE)
-        _secure_file(SUGGESTIONS_FILE)
+        atomic_replace(tmp_path, suggestions_file)
+        _secure_file(suggestions_file)
     except BaseException:
         try:
             os.unlink(tmp_path)
