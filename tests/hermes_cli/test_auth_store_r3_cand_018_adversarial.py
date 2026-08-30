@@ -503,3 +503,41 @@ def test_windows_publication_rejects_ancestor_swap_before_source_open(tmp_path, 
             original_parent.unlink()
         if moved_parent.exists():
             moved_parent.rename(original_parent)
+
+
+def test_windows_lock_init_permission_error_retries_until_timeout(tmp_path, monkeypatch):
+    """A raced lock-file init must reach the bounded acquisition timeout."""
+    lock_path = tmp_path / "auth.lock"
+    lock_path.write_bytes(b"")
+    init_attempts = []
+    lock_attempts = []
+
+    class RacingMsvcrt:
+        LK_NBLCK = object()
+
+        @staticmethod
+        def locking(*args, **kwargs):
+            lock_attempts.append(args)
+            raise PermissionError("synthetic concurrent lock-file race")
+
+    real_write_text = Path.write_text
+
+    def fail_lock_initialization(path, *args, **kwargs):
+        if path == lock_path:
+            init_attempts.append(path)
+            raise PermissionError("synthetic concurrent lock-file init race")
+        return real_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(owner, "msvcrt", RacingMsvcrt())
+    monkeypatch.setattr(Path, "write_text", fail_lock_initialization)
+    clock = iter((0.0, 2.0))
+    monkeypatch.setattr(owner.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(owner.time, "sleep", lambda _seconds: None)
+
+    holder = type("Holder", (), {})()
+    with pytest.raises(TimeoutError, match="synthetic lock timeout"):
+        with owner._file_lock(lock_path, holder, 0.0, "synthetic lock timeout"):
+            pass
+
+    assert init_attempts == [lock_path]
+    assert len(lock_attempts) == 1
