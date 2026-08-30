@@ -6732,6 +6732,12 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         min_value=1,
     )
 
+    raw_summary_instructions = compression.get("summary_instructions", "")
+    if isinstance(raw_summary_instructions, str) and raw_summary_instructions.strip():
+        cc.summary_instructions = raw_summary_instructions
+    else:
+        cc.summary_instructions = ""
+
     try:
         ratio_raw = compression.get(
             "target_ratio", _compressor_ctor_default("summary_target_ratio", 0.20)
