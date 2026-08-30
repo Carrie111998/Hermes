@@ -4340,11 +4340,11 @@ class TestRunConversation:
         assert requested_caps == [65536, 65536]
 
     def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
-        """Ollama-hosted GLM responses can misreport truncated output as stop."""
+        """Local Ollama-hosted GLM (no :cloud suffix) misreports truncated output as stop."""
         self._setup_agent(agent)
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
-        agent.model = "glm-5.1:cloud"
+        agent.model = "glm-4-9b"  # local GLM — no :cloud suffix
 
         tool_turn = _mock_response(
             content="",
@@ -4383,6 +4383,43 @@ class TestRunConversation:
         third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
         assert third_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in third_call_messages[-1]["content"]
+
+    def test_ollama_glm_cloud_stop_after_tools_does_not_request_continuation(self, agent):
+        """Cloud-backed GLM (:cloud suffix) forwards finish_reason faithfully — no rewrite."""
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.1:cloud"  # cloud suffix — proxy is transparent
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        real_stop = _mock_response(
+            content="Based on the search results, the best next step is to update the config.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            real_stop,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Cloud GLM: stop is taken at face value — 2 API calls, no synthetic continuation
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert (
+            result["final_response"]
+            == "Based on the search results, the best next step is to update the config."
+        )
 
 
 
