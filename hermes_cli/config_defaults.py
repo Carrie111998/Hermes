@@ -2165,6 +2165,22 @@ DEFAULT_CONFIG = {
         "surface_child_process_notifications": False,
     },
 
+    # High-level multi-agent development workflow. This layer is intentionally
+    # thin: it uses delegation.* for actual child model/provider selection and
+    # loop/tool limits, while defining role defaults and orchestration policy.
+    "multi_agent": {
+        "enabled": True,
+        "default_mode": "delegation",  # synchronous child agents built on delegate_task
+        "max_correction_loops": 3,
+        "require_review": True,
+        "roles": {
+            "developer": {"toolsets": ["terminal", "file", "web"]},
+            "tester": {"toolsets": ["terminal", "file", "browser"]},
+            "reviewer": {"toolsets": ["terminal", "file"]},
+            "debugger": {"toolsets": ["terminal", "file", "browser"]},
+        },
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
@@ -3953,7 +3969,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 39,
+    "_config_version": 40,
 }
 
 # Optional environment variables that enhance functionality

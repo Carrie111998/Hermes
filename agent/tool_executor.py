@@ -2428,6 +2428,52 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+        elif function_name == "multi_agent_orchestrate":
+            objective_preview = (function_args.get("objective") or "multi-agent workflow")[:45]
+            spinner = None
+            if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
+                face = random.choice(KawaiiSpinner.get_waiting_faces())
+                spinner = KawaiiSpinner(
+                    f"{face} 🧑‍💻 {objective_preview} · (/agents to monitor)",
+                    spinner_type='dots',
+                    print_fn=agent._print_fn,
+                )
+                spinner.start()
+            agent._delegate_spinner = spinner
+            _multi_agent_result = None
+            try:
+                def _execute(next_args: dict) -> Any:
+                    from tools.multi_agent_tool import multi_agent_orchestrate as _multi_agent_orchestrate
+                    return _multi_agent_orchestrate(
+                        objective=next_args.get("objective", ""),
+                        task_context=next_args.get("task_context") or {},
+                        max_correction_loops=next_args.get("max_correction_loops"),
+                        run_reviewer=next_args.get("run_reviewer"),
+                        developer_toolsets=next_args.get("developer_toolsets"),
+                        tester_toolsets=next_args.get("tester_toolsets"),
+                        reviewer_toolsets=next_args.get("reviewer_toolsets"),
+                        debugger_toolsets=next_args.get("debugger_toolsets"),
+                        parent_agent=agent,
+                    )
+                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id,
+                    execute=_execute,
+                    scope_block=_ts_scope_block,
+                    display_index=i,
+                ))
+                _multi_agent_result = function_result
+            finally:
+                agent._delegate_spinner = None
+                tool_duration = time.time() - tool_start_time
+                cute_msg = _get_cute_tool_message_impl('multi_agent_orchestrate', function_args, tool_duration, result=_multi_agent_result)
+                if spinner:
+                    spinner.stop(cute_msg)
+                elif agent._should_emit_quiet_tool_messages():
+                    agent._vprint(f"  {cute_msg}")
         elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None
