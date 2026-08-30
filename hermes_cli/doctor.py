@@ -3200,6 +3200,17 @@ def run_doctor(args):
                 ["gh", "auth", "status", "--json", "authenticated"],
                 capture_output=True, timeout=10,
             )
+            if result.returncode == 0:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        # Fallback for gh < 2.52 (no --json flag on auth status).
+        # The plain command exits 0 when authenticated, 1 otherwise.
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "status"],
+                capture_output=True, timeout=10,
+            )
             return result.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
