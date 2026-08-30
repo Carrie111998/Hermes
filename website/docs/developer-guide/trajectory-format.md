@@ -29,11 +29,11 @@ previous valid byte length before the lock is released. If that rollback also
 fails, Hermes logs the rollback error and still returns `False`; callers must
 treat `False` as having no saved-data guarantee rather than retrying blindly.
 
-Writers serialize through a process-local lock and an OS lock on the persistent
-`<trajectory>.lock` sidecar. Lock acquisition has a 10-second bound. The
-sidecar file is intentionally not deleted: the kernel lock, not the file's
-existence or contents, represents ownership, so a file left by a terminated
-process is harmless and avoids unlink/recreate races.
+Writers serialize through a process-local inode lock and an OS lock on the
+trajectory data file itself. This makes symlink and hard-link aliases share one
+critical section. Lock acquisition has a 10-second bound; a newly created data
+file may remain empty if lock acquisition fails, but no trajectory is reported
+as saved. Legacy `<trajectory>.lock` sidecars are harmless and ignored.
 
 
 ## JSONL Entry Format
@@ -235,6 +235,12 @@ preserve earlier complete records but may yield decompressed bytes from the
 incomplete member before raising `EOFError` on the next read. Treat any such
 exception as a failed read and do not accept the final record unless the stream
 reaches clean EOF.
+
+Before every gzip append, Hermes validates all existing concatenated members
+while holding the data-file lock. If any member is truncated or invalid, the
+append fails closed, leaves the existing bytes untouched, logs a warning, and
+returns `False`. Hermes does not guess where to truncate or automatically
+repair a damaged final member.
 
 `trajectory_compressor.py` accepts directories containing any mix of
 `.jsonl` and `.jsonl.gz`, de-duplicates discovered paths, and preserves

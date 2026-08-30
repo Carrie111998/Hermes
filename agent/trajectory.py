@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - exercised on POSIX
 
 
 _trajectory_lock_guard = threading.Lock()
-_trajectory_locks: dict[str, threading.Lock] = {}
+_trajectory_locks: dict[tuple[int, int], threading.Lock] = {}
 _TRAJECTORY_LOCK_TIMEOUT_SECONDS = 10.0
 _TRAJECTORY_LOCK_POLL_SECONDS = 0.05
 
@@ -45,10 +45,9 @@ def _acquire_os_lock(lock_file, deadline: float) -> None:
                 pass
         elif msvcrt is not None:
             try:
-                lock_file.seek(0, os.SEEK_END)
-                if lock_file.tell() == 0:
-                    lock_file.write(b"\0")
-                    lock_file.flush()
+                # Windows byte-range locks may extend beyond EOF, so locking
+                # byte zero also works for a newly created empty data file
+                # without writing a marker into the trajectory.
                 lock_file.seek(0)
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
                 return
@@ -74,24 +73,24 @@ def _release_os_lock(lock_file) -> None:
 
 @contextlib.contextmanager
 def _trajectory_append_lock(filename):
-    """Serialize appends with a bounded thread/OS lock acquisition."""
-    lock_key = os.path.abspath(os.fspath(filename))
-    with _trajectory_lock_guard:
-        thread_lock = _trajectory_locks.setdefault(lock_key, threading.Lock())
+    """Open and lock the trajectory inode across path aliases."""
+    with open(filename, "a+b", buffering=0) as stream:
+        stat_result = os.fstat(stream.fileno())
+        lock_key = (stat_result.st_dev, stat_result.st_ino)
+        with _trajectory_lock_guard:
+            thread_lock = _trajectory_locks.setdefault(lock_key, threading.Lock())
 
-    deadline = time.monotonic() + _TRAJECTORY_LOCK_TIMEOUT_SECONDS
-    if not thread_lock.acquire(timeout=_TRAJECTORY_LOCK_TIMEOUT_SECONDS):
-        raise TimeoutError("timed out waiting for in-process trajectory append lock")
-    try:
-        lock_path = f"{lock_key}.lock"
-        with open(lock_path, "a+b") as lock_file:
-            _acquire_os_lock(lock_file, deadline)
+        deadline = time.monotonic() + _TRAJECTORY_LOCK_TIMEOUT_SECONDS
+        if not thread_lock.acquire(timeout=_TRAJECTORY_LOCK_TIMEOUT_SECONDS):
+            raise TimeoutError("timed out waiting for in-process trajectory append lock")
+        try:
+            _acquire_os_lock(stream, deadline)
             try:
-                yield
+                yield stream
             finally:
-                _release_os_lock(lock_file)
-    finally:
-        thread_lock.release()
+                _release_os_lock(stream)
+        finally:
+            thread_lock.release()
 
 
 def _write_all(stream, payload: bytes) -> None:
@@ -103,24 +102,42 @@ def _write_all(stream, payload: bytes) -> None:
         remaining = remaining[written:]
 
 
-def _append_payload(filename, payload: bytes) -> None:
+def _validate_existing_gzip(stream) -> None:
+    """Fail closed unless every existing gzip member reaches a clean EOF."""
+    if os.fstat(stream.fileno()).st_size == 0:
+        return
+
+    stream.seek(0)
+    try:
+        with gzip.GzipFile(fileobj=stream, mode="rb") as reader:
+            while reader.read(1024 * 1024):
+                pass
+    except (EOFError, gzip.BadGzipFile, OSError) as exc:
+        raise ValueError(
+            "existing gzip trajectory has an incomplete or invalid final member"
+        ) from exc
+    finally:
+        stream.seek(0, os.SEEK_END)
+
+
+def _append_payload(stream, payload: bytes) -> None:
     """Durably append one complete member/line or restore the old length."""
-    with open(filename, "a+b", buffering=0) as stream:
-        original_size = os.fstat(stream.fileno()).st_size
+    original_size = os.fstat(stream.fileno()).st_size
+    stream.seek(0, os.SEEK_END)
+    try:
+        _write_all(stream, payload)
+        os.fsync(stream.fileno())
+    except Exception:
         try:
-            _write_all(stream, payload)
+            os.ftruncate(stream.fileno(), original_size)
             os.fsync(stream.fileno())
         except Exception:
-            try:
-                os.ftruncate(stream.fileno(), original_size)
-                os.fsync(stream.fileno())
-            except Exception:
-                logger.error(
-                    "Failed to roll back partial trajectory append in %s",
-                    filename,
-                    exc_info=True,
-                )
-            raise
+            logger.error(
+                "Failed to roll back partial trajectory append in %s",
+                stream.name,
+                exc_info=True,
+            )
+        raise
 
 
 def convert_scratchpad_to_think(content: str) -> str:
@@ -170,8 +187,10 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
     try:
         line = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
         payload = gzip.compress(line) if str(filename).endswith(".gz") else line
-        with _trajectory_append_lock(filename):
-            _append_payload(filename, payload)
+        with _trajectory_append_lock(filename) as stream:
+            if str(filename).endswith(".gz"):
+                _validate_existing_gzip(stream)
+            _append_payload(stream, payload)
         logger.info("Trajectory saved to %s", filename)
         return True
     except Exception as e:

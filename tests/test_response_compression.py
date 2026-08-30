@@ -6,7 +6,10 @@ import gzip
 import pytest
 from starlette.datastructures import Headers
 
-from hermes_cli.response_compression import SelectiveGZipMiddleware
+from hermes_cli.response_compression import (
+    SelectiveGZipMiddleware,
+    _is_excluded_path,
+)
 
 
 _LARGE_BODY = b'{"payload":"' + (b"compressible-value " * 2_000) + b'"}'
@@ -20,13 +23,20 @@ def _run_asgi_response(
     response_headers=(),
     streaming=False,
     body=_LARGE_BODY,
+    status_code=200,
 ):
     """Run the real middleware and return raw ASGI response events."""
 
     async def app(scope, receive, send):
         headers = [(b"content-type", value) for value in content_types]
         headers.extend(response_headers)
-        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": headers,
+            }
+        )
         if streaming:
             midpoint = len(body) // 2
             await send(
@@ -180,6 +190,10 @@ def test_accept_encoding_negotiation_allows_gzip(values):
         (b"gzip;q=bogus",),
         (b"gzip;q=1.001",),
         (b"gzip;q=-1",),
+        (b"gzip;foo=bar",),
+        (b"gzip;q=1;foo=bar",),
+        (b"gzip;foo",),
+        (b"gzip;=bar",),
         (b"*;q=0",),
         (b"gzip;q=0, *;q=1",),
     ],
@@ -209,10 +223,19 @@ def test_accept_encoding_negotiation_rejects_disallowed_or_malformed_gzip(values
         "/api/webhooks/example",
         "/api/pairing",
         "/api/files/read",
+        "/api/files/download",
         "/api/fs/read-text",
         "/api/fs/read-data-url",
+        "/api/fs/download",
         "/api/logs",
         "/api/media",
+        "/api/actions/hermes-update/status",
+        "/api/messaging/whatsapp/onboarding/start",
+        "/api/messaging/whatsapp/onboarding/pairing-id",
+        "/api/messaging/whatsapp/onboarding/pairing-id/apply",
+        "/api/messaging/telegram/onboarding/start",
+        "/api/messaging/telegram/onboarding/pairing-id",
+        "/api/messaging/telegram/onboarding/pairing-id/apply",
     ],
 )
 def test_sensitive_dashboard_routes_are_not_compressed_even_when_streaming(path):
@@ -233,7 +256,13 @@ def test_sensitive_dashboard_routes_are_not_compressed_even_when_streaming(path)
         "/authentic",
         "/api/webhooksmith",
         "/api/files/reader",
+        "/api/files/downloader",
         "/api/fs/read-texture",
+        "/api/fs/downloader",
+        "/api/actionsmith/hermes-update/status",
+        "/api/actions-extra/hermes-update/status",
+        "/api/messaging/whatsapp/onboardings/start",
+        "/api/messaging/telegram/onboarding-extra/start",
     ],
 )
 def test_sensitive_route_lookalikes_remain_compressible(path):
@@ -241,6 +270,26 @@ def test_sensitive_route_lookalikes_remain_compressible(path):
 
     assert headers["content-encoding"] == "gzip"
     assert gzip.decompress(body) == _LARGE_BODY
+
+
+def test_sensitive_route_census_is_registered_and_excluded():
+    from hermes_cli.web_server import app
+
+    expected_paths = {
+        "/api/files/download",
+        "/api/fs/download",
+        "/api/actions/{name}/status",
+        "/api/messaging/whatsapp/onboarding/start",
+        "/api/messaging/whatsapp/onboarding/{pairing_id}",
+        "/api/messaging/whatsapp/onboarding/{pairing_id}/apply",
+        "/api/messaging/telegram/onboarding/start",
+        "/api/messaging/telegram/onboarding/{pairing_id}",
+        "/api/messaging/telegram/onboarding/{pairing_id}/apply",
+    }
+    registered_paths = {route.path for route in app.routes}
+
+    assert expected_paths <= registered_paths
+    assert all(_is_excluded_path(path) for path in expected_paths)
 
 
 def test_nonstreaming_wire_headers_match_compressed_body():
@@ -281,5 +330,37 @@ def test_preexisting_content_encoding_is_preserved_without_recompression():
 
     assert headers["content-encoding"] == "br"
     assert int(headers["content-length"]) == len(_LARGE_BODY)
+    assert "vary" not in headers
+    assert body == _LARGE_BODY
+
+
+@pytest.mark.parametrize(
+    ("status_code", "response_headers"),
+    [
+        (206, ()),
+        (200, ((b"content-range", b"bytes 0-99/1000"),)),
+    ],
+)
+def test_range_responses_bypass_compression(status_code, response_headers):
+    headers, body = _response_parts(
+        _run_asgi_response(
+            status_code=status_code,
+            response_headers=response_headers,
+        )
+    )
+
+    assert "content-encoding" not in headers
+    assert "vary" not in headers
+    assert body == _LARGE_BODY
+
+
+@pytest.mark.parametrize("etag", [b'"strong-validator"', b'W/"weak-validator"'])
+def test_etag_bearing_responses_bypass_compression(etag):
+    headers, body = _response_parts(
+        _run_asgi_response(response_headers=((b"etag", etag),))
+    )
+
+    assert headers["etag"] == etag.decode()
+    assert "content-encoding" not in headers
     assert "vary" not in headers
     assert body == _LARGE_BODY

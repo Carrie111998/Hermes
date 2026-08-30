@@ -1,5 +1,6 @@
 """Tests for lossless trajectory storage formats."""
 
+import builtins
 import errno
 import gzip
 import json
@@ -7,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -140,15 +142,26 @@ def test_real_process_appends_form_readable_concatenated_gzip_members(tmp_path):
         "payload=[{'from':'tool','value':sys.argv[2]+'-'+'雪'*100000}];"
         "raise SystemExit(0 if save_trajectory(payload,'test-model',True,sys.argv[1]) else 2)"
     )
-    processes = [
-        subprocess.Popen(
-            [sys.executable, "-c", code, str(path), str(index)],
-            cwd=Path(__file__).resolve().parents[2],
-        )
-        for index in range(8)
-    ]
-
-    return_codes = [process.wait(timeout=20) for process in processes]
+    processes = []
+    try:
+        for index in range(8):
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", code, str(path), str(index)],
+                    cwd=Path(__file__).resolve().parents[2],
+                )
+            )
+        return_codes = [process.wait(timeout=20) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
     assert return_codes == [0] * len(processes)
     with gzip.open(path, "rt", encoding="utf-8") as stream:
@@ -181,22 +194,69 @@ def test_truncated_final_member_preserves_prefix_then_raises(tmp_path):
                 next(stream)
 
 
-def test_read_only_directory_failure_returns_false_and_is_not_logged_as_saved(
+def test_append_rejects_truncated_existing_gzip_without_changing_it(
     tmp_path, caplog
 ):
+    path = tmp_path / "truncated-before-append.jsonl.gz"
+    assert save_trajectory([], "valid", True, path) is True
+    with path.open("ab") as stream:
+        stream.write(gzip.compress(b'{"model":"interrupted"}\n')[:-8])
+    before = path.read_bytes()
+
+    with caplog.at_level(logging.INFO, logger="agent.trajectory"):
+        saved = save_trajectory([], "must-not-append", True, path)
+
+    assert saved is False
+    assert path.read_bytes() == before
+    assert "Failed to save trajectory" in caplog.text
+    assert "Trajectory saved to" not in caplog.text
+
+
+def test_append_accepts_and_preserves_valid_existing_gzip_members(tmp_path):
+    path = tmp_path / "valid-before-append.jsonl.gz"
+    assert save_trajectory([], "first", True, path) is True
+
+    assert save_trajectory([], "second", True, path) is True
+
+    with gzip.open(path, "rt", encoding="utf-8") as stream:
+        assert [json.loads(line)["model"] for line in stream] == ["first", "second"]
+
+
+def test_permission_failure_is_deterministic_and_not_logged_as_saved(
+    tmp_path, monkeypatch, caplog
+):
+    path = tmp_path / "trajectory.jsonl.gz"
+    real_open = builtins.open
+
+    def deny_target(candidate, *args, **kwargs):
+        if os.path.abspath(os.fspath(candidate)) == os.path.abspath(path):
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", deny_target)
+    with caplog.at_level(logging.INFO, logger="agent.trajectory"):
+        saved = save_trajectory([], "test-model", True, path)
+
+    assert saved is False
+    assert "Failed to save trajectory" in caplog.text
+    assert "Trajectory saved to" not in caplog.text
+    assert not path.exists()
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or getattr(os, "geteuid", lambda: 0)() == 0,
+    reason="requires non-root POSIX permission enforcement",
+)
+def test_read_only_directory_integration_rejects_append(tmp_path):
     directory = tmp_path / "readonly"
     directory.mkdir()
     path = directory / "trajectory.jsonl.gz"
     directory.chmod(0o500)
     try:
-        with caplog.at_level(logging.INFO, logger="agent.trajectory"):
-            saved = save_trajectory([], "test-model", True, path)
+        assert save_trajectory([], "test-model", True, path) is False
     finally:
         directory.chmod(0o700)
 
-    assert saved is False
-    assert "Failed to save trajectory" in caplog.text
-    assert "Trajectory saved to" not in caplog.text
     assert not path.exists()
 
 
@@ -259,12 +319,11 @@ def test_unexpected_os_lock_error_is_reported_without_retrying(
     assert saved is False
     assert attempts == 1
     assert "Input/output error" in caplog.text
-    assert not path.exists()
+    assert path.read_bytes() == b""
 
 
 def _assert_lock_contention_times_out(tmp_path, monkeypatch):
     path = tmp_path / "contended.jsonl.gz"
-    lock_path = f"{path}.lock"
     code = (
         "import fcntl,sys,time;"
         "f=open(sys.argv[1],'a+b');"
@@ -273,7 +332,7 @@ def _assert_lock_contention_times_out(tmp_path, monkeypatch):
         "time.sleep(1)"
     )
     holder = subprocess.Popen(
-        [sys.executable, "-c", code, lock_path],
+        [sys.executable, "-c", code, str(path)],
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -291,7 +350,7 @@ def _assert_lock_contention_times_out(tmp_path, monkeypatch):
 
     assert saved is False
     assert elapsed < 0.75
-    assert not path.exists()
+    assert path.read_bytes() == b""
 
 
 @pytest.mark.linux_only
@@ -312,6 +371,68 @@ def test_stale_sidecar_file_does_not_block_append(tmp_path):
     assert save_trajectory([], "test-model", True, path) is True
     with gzip.open(path, "rt", encoding="utf-8") as stream:
         assert json.loads(next(stream))["model"] == "test-model"
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
+def test_aliases_share_one_append_critical_section(
+    tmp_path, monkeypatch, alias_kind
+):
+    primary = tmp_path / "primary.jsonl.gz"
+    alias = tmp_path / "alias.jsonl.gz"
+    assert save_trajectory([], "initial", True, primary) is True
+    if alias_kind == "symlink":
+        alias.symlink_to(primary)
+    else:
+        os.link(primary, alias)
+
+    real_write_all = trajectory_storage._write_all
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered_early = threading.Event()
+    calls_guard = threading.Lock()
+    calls = 0
+
+    def controlled_write(stream, payload):
+        nonlocal calls
+        with calls_guard:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        elif not release_first.is_set():
+            second_entered_early.set()
+        return real_write_all(stream, payload)
+
+    monkeypatch.setattr(trajectory_storage, "_write_all", controlled_write)
+    results = []
+
+    first = threading.Thread(
+        target=lambda: results.append(save_trajectory([], "primary", True, primary))
+    )
+    second = threading.Thread(
+        target=lambda: results.append(save_trajectory([], "alias", True, alias))
+    )
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    try:
+        overlapped = second_entered_early.wait(timeout=0.5)
+    finally:
+        release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert overlapped is False
+    assert results == [True, True]
+    with gzip.open(primary, "rt", encoding="utf-8") as stream:
+        assert {json.loads(line)["model"] for line in stream} == {
+            "initial",
+            "primary",
+            "alias",
+        }
 
 
 def test_mixed_directory_discovery_is_sorted_and_has_no_duplicates(tmp_path):

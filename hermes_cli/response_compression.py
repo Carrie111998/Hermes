@@ -32,7 +32,9 @@ _QVALUE_RE = re.compile(r"^(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)$")
 # file/log content. Query strings are not part of ASGI ``scope['path']``.
 _EXCLUDED_EXACT_PATHS = {
     "/api/env/reveal",
+    "/api/files/download",
     "/api/files/read",
+    "/api/fs/download",
     "/api/fs/read-data-url",
     "/api/fs/read-text",
     "/api/logs",
@@ -41,9 +43,12 @@ _EXCLUDED_EXACT_PATHS = {
 # Route families that contain one-time tokens, secrets, raw configuration, or
 # authentication/session material. Match only the root or a slash descendant.
 _EXCLUDED_PATH_TREES = (
+    "/api/actions",
     "/api/auth",
     "/api/config",
     "/api/mcp/oauth",
+    "/api/messaging/telegram/onboarding",
+    "/api/messaging/whatsapp/onboarding",
     "/api/pairing",
     "/api/providers/oauth",
     "/api/webhooks",
@@ -69,9 +74,7 @@ def _quality(parameters: list[str]) -> float:
     seen = False
     for parameter in parameters:
         name, separator, raw_value = parameter.partition("=")
-        if name.strip().lower() != "q":
-            continue
-        if seen or not separator:
+        if name.strip().lower() != "q" or seen or not separator:
             return 0.0
         seen = True
         raw_value = raw_value.strip()
@@ -123,8 +126,13 @@ class _SelectiveGZipResponder(GZipResponder):
             self.initial_message = message
             headers = Headers(raw=self.initial_message["headers"])
             self.content_encoding_set = "content-encoding" in headers
-            self.content_type_is_excluded = not _is_compressible_content_type(
-                headers.getlist("content-type")
+            self.content_type_is_excluded = (
+                message["status"] == 206
+                or "content-range" in headers
+                or "etag" in headers
+                or not _is_compressible_content_type(
+                    headers.getlist("content-type")
+                )
             )
             return
 
