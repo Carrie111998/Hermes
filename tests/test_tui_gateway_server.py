@@ -2112,6 +2112,58 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
         server._wake_owner_surface = ""
 
 
+def test_wake_start_auto_arm_disabled_skips_requirements_probe(monkeypatch):
+    """Auto-arm on a wake word that cannot arm must refuse BEFORE probing.
+
+    check_wake_word_requirements() → _stt_ready() can lazy-install
+    faster-whisper as a synchronous subprocess that outlives the client's RPC
+    timeout, so a disabled-config auto-arm on every gateway.ready used to
+    surface as a spurious "error: timeout: wake.start" (#98409). The refusal
+    is reason:"disabled"/"disabled_for_surface" regardless of what the probe
+    would say, so the probe (the lazy-install entry point) must not run at
+    all on this path.
+    """
+    from tools import wake_word
+
+    config = {"enabled": False, "phrase": "hey hermes", "surface": "auto",
+              "start_new_session": True}
+    monkeypatch.setattr(wake_word, "load_wake_word_config", lambda: dict(config))
+
+    def _probe_explodes(_cfg):
+        raise AssertionError(
+            "check_wake_word_requirements() ran for an auto-arm that cannot "
+            "arm — the STT lazy-install entry point must be unreachable here"
+        )
+
+    monkeypatch.setattr(wake_word, "check_wake_word_requirements", _probe_explodes)
+
+    transport = types.SimpleNamespace(_closed=False)
+    server._wake_owner_transport = None
+    server._wake_owner_surface = ""
+    try:
+        # Feature off in config.
+        disabled = _dispatch_sync({
+            "id": "wake-autoarm-disabled",
+            "method": "wake.start",
+            "params": {"surface": "gui"},
+        }, transport=transport)
+        assert disabled["result"] == {"started": False, "reason": "disabled"}
+
+        # Feature on but scoped to a different surface: same must-refuse
+        # conclusion, so the probe must not run here either.
+        config["enabled"] = True
+        config["surface"] = "tui"
+        scoped = _dispatch_sync({
+            "id": "wake-autoarm-scoped",
+            "method": "wake.start",
+            "params": {"surface": "gui"},
+        }, transport=transport)
+        assert scoped["result"] == {"started": False, "reason": "disabled_for_surface"}
+    finally:
+        server._wake_owner_transport = None
+        server._wake_owner_surface = ""
+
+
 def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch):
     """The ear toggle / /wake on|off write wake_word.enabled; auto-arm never does."""
     from tools import wake_word

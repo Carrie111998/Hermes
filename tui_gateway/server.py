@@ -16803,6 +16803,20 @@ def _(rid, params: dict) -> dict:
     prefer_client = surface in ("gui", "desktop") or bool(params.get("client_capture"))
     capture_mode = resolve_capture_mode(cfg, prefer_client=prefer_client)
     external_audio = capture_mode == "client"
+    # Auto-arm (persist omitted) against a disabled wake word can only ever be
+    # refused, with a reason the requirements probe cannot change. Refuse
+    # BEFORE probing: check_wake_word_requirements() → _stt_ready() can
+    # lazy-install faster-whisper as a synchronous subprocess that far
+    # outlives the client's RPC timeout, so every gateway.ready auto-arm on a
+    # disabled wake word surfaced as a spurious "error: timeout: wake.start"
+    # (#98409). The persist gesture keeps requirements-first below so a
+    # gesture on an unarmed-able setup still refuses WITHOUT flipping
+    # wake_word.enabled.
+    if not persist and not wake_surface_enabled(surface, cfg):
+        reason = "disabled" if not cfg.get("enabled") else "disabled_for_surface"
+        logger.info("wake.start(%s): %s (enabled=%s, surface=%s)",
+                    surface, reason, cfg.get("enabled"), cfg.get("surface"))
+        return _ok(rid, {"started": False, "reason": reason})
     # Requirements first: a gesture on an unarmed-able setup (no STT/TTS, no
     # mic, missing key) must refuse WITHOUT flipping wake_word.enabled — else
     # config says on while nothing can ever arm, and auto-arm paths churn.
