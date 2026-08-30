@@ -164,7 +164,12 @@ describe('Polish dashboard localization', () => {
     )
     expect(pl.oauth.login).toBe('Zaloguj')
     expect(pl.kanban.columnHelp.todo).toBe('Oczekuje na zależności lub nie ma przypisanego profilu')
-    expect([pl.kanban.tenant, pl.kanban.allTenants]).toEqual(['Tenant', 'Wszystkie tenanty'])
+    expect([pl.kanban.tenant, pl.kanban.allTenants]).toEqual(['Przestrzeń', 'Wszystkie przestrzenie'])
+    expect(pl.env.keySaved?.('OPENAI_API_KEY')).toBe('Zapisano klucz OPENAI_API_KEY')
+    expect(pl.oauth.disconnectSuccess?.('OpenAI')).toBe('Rozłączono dostawcę OpenAI')
+    expect(pl.oauth.disconnectFailed?.('brak połączenia')).toBe(
+      'Nie udało się rozłączyć dostawcy: brak połączenia'
+    )
     expect(pl.achievements.card.no_evidence).toBe('Brak jeszcze dowodów')
   })
 

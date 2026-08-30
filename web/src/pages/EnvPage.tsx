@@ -36,6 +36,7 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 import { useI18n } from "@/i18n";
+import { en } from "@/i18n/en";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 
@@ -98,7 +99,7 @@ const CATEGORY_META_ICONS: Record<string, typeof KeyRound> = {
 /*  EnvVarRow — single key edit row                                    */
 /* ------------------------------------------------------------------ */
 
-function EnvVarRow({
+export function EnvVarRow({
   varKey,
   info,
   edits,
@@ -260,7 +261,11 @@ function EnvVarRow({
               size="icon"
               onClick={() => onReveal(varKey)}
               title={isRevealed ? t.env.hideValue : t.env.showValue}
-              aria-label={isRevealed ? `Hide ${varKey}` : `Reveal ${varKey}`}
+              aria-label={
+                isRevealed
+                  ? (t.env.hideKey ?? en.env.hideKey!)(varKey)
+                  : (t.env.revealKey ?? en.env.revealKey!)(varKey)
+              }
             >
               {isRevealed ? <EyeOff /> : <Eye />}
             </Button>
@@ -623,14 +628,14 @@ export default function EnvPage() {
   const sections = useMemo(() => {
     const items: { id: string; label: string }[] = [
       { id: "section-oauth", label: "OAuth" },
-      { id: "section-providers", label: "Providers" },
+      { id: "section-providers", label: t.env.sectionProviders ?? en.env.sectionProviders! },
     ];
     if (vars) {
       const categories = ["tool", "messaging", "setting"];
       const CATEGORY_LABELS: Record<string, string> = {
-        tool: "Tools",
+        tool: t.env.sectionTools ?? en.env.sectionTools!,
         messaging: t.common.gateway ?? "Gateway",
-        setting: "Settings",
+        setting: t.env.sectionSettings ?? en.env.sectionSettings!,
       };
       for (const cat of categories) {
         const hasEntries = Object.values(vars).some(
@@ -657,7 +662,7 @@ export default function EnvPage() {
     setAfterTitle(
       <nav
         className="flex shrink-0 flex-nowrap items-center gap-1"
-        aria-label="Jump to section"
+        aria-label={t.env.jumpToSection ?? en.env.jumpToSection}
       >
         {sections.map((s) => (
           <button
@@ -674,7 +679,7 @@ export default function EnvPage() {
     return () => {
       setAfterTitle(null);
     };
-  }, [vars, sections, setAfterTitle]);
+  }, [vars, sections, setAfterTitle, t.env.jumpToSection]);
 
   const handleSave = async (key: string) => {
     const value = edits[key];
@@ -704,7 +709,7 @@ export default function EnvPage() {
         delete n[key];
         return n;
       });
-      showToast(`${key} ${t.common.save.toLowerCase()}d`, "success");
+      showToast((t.env.keySaved ?? en.env.keySaved!)(key), "success");
     } catch (e) {
       showToast(`${t.config.failedToSave} ${key}: ${e}`, "error");
     } finally {

@@ -460,6 +460,30 @@ export interface Translations {
     profileSelector?: string;
     currentProfile?: string;
     managingProfile?: string;
+    browseHub?: string;
+    learnSkill?: string;
+    newSkill?: string;
+    learnDescription?: string;
+    learnLocalSource?: string;
+    learnLocalPlaceholder?: string;
+    learnUrl?: string;
+    learnUrlPlaceholder?: string;
+    learnNotes?: string;
+    learnNotesPlaceholder?: string;
+    learnCancel?: string;
+    learnSubmit?: string;
+    skillSaved?: (name: string) => string;
+    editSkill?: (name: string) => string;
+    editorEditDescription?: string;
+    editorCreateDescription?: string;
+    editorName?: string;
+    editorCategoryOptional?: string;
+    editorNameRequired?: string;
+    editorContentRequired?: string;
+    editorSaving?: string;
+    editorSaveChanges?: string;
+    editorCreateSkill?: string;
+    editorCreateTemplate?: string;
   };
 
   // ── Config page ──
@@ -533,6 +557,13 @@ export interface Translations {
     customKeyNamePlaceholder: string;
     add: string;
     invalidKeyName: string;
+    sectionProviders?: string;
+    sectionTools?: string;
+    sectionSettings?: string;
+    jumpToSection?: string;
+    keySaved?: (key: string) => string;
+    revealKey?: (key: string) => string;
+    hideKey?: (key: string) => string;
   };
 
   // ── OAuth ──
@@ -575,6 +606,8 @@ export interface Translations {
       external: string;
     };
     expiresIn: string;
+    disconnectSuccess?: (provider: string) => string;
+    disconnectFailed?: (error: string) => string;
   };
 
   // ── Language switcher ──

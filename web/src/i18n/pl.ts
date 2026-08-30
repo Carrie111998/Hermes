@@ -433,7 +433,42 @@ export const pl: Translations = {
     more: 'jeszcze {count}',
     profileSelector: 'Profil',
     currentProfile: 'bieżący ({name})',
-    managingProfile: 'Zarządzasz profilem „{name}” — przełączniki dotyczą tego profilu, a nie tego panelu.'
+    managingProfile: 'Zarządzasz profilem „{name}” — przełączniki dotyczą tego profilu, a nie tego panelu.',
+    browseHub: 'Przeglądaj centrum',
+    learnSkill: 'Naucz umiejętności',
+    newSkill: 'Nowa umiejętność',
+    learnDescription:
+      'Wskaż Hermesowi dowolne źródła, a utworzy z nich umiejętność wielokrotnego użytku zgodną ze standardami tworzenia. Wypełnij dowolne pola poniżej; agent zbierze źródła i zapisze umiejętność na czacie.',
+    learnLocalSource: 'Lokalny plik lub katalog',
+    learnLocalPlaceholder: '~/projekty/jakis-sdk  (odczyt przez read_file / search_files)',
+    learnUrl: 'URL',
+    learnUrlPlaceholder: 'https://docs.example.com/api  (pobieranie przez web_extract)',
+    learnNotes: 'Inne informacje — opisz proces, wklej notatki lub napisz „to, co właśnie zrobiliśmy”',
+    learnNotesPlaceholder: 'np. jak rozliczam wydatki: otwórz portal, …',
+    learnCancel: 'Anuluj',
+    learnSubmit: 'Naucz',
+    skillSaved: name => `Zapisano umiejętność ${name} ✓`,
+    editSkill: name => `Edytuj umiejętność: ${name}`,
+    editorEditDescription:
+      'Zmień plik SKILL.md tej umiejętności. Metadane frontmatter (nazwa i opis) zostaną sprawdzone przy zapisie.',
+    editorCreateDescription:
+      'Utwórz własną umiejętność z metadanymi YAML i instrukcjami Markdown. Będzie dostępna dla agenta i możliwa do dołączenia do zadań cron.',
+    editorName: 'Nazwa',
+    editorCategoryOptional: 'Kategoria (opcjonalnie)',
+    editorNameRequired: 'Nazwa umiejętności jest wymagana.',
+    editorContentRequired: 'Treść pliku SKILL.md jest wymagana.',
+    editorSaving: 'Zapisywanie…',
+    editorSaveChanges: 'Zapisz zmiany',
+    editorCreateSkill: 'Utwórz umiejętność',
+    editorCreateTemplate: `---
+name: moja-umiejetnosc
+description: Jednozdaniowy opis sytuacji, w których należy użyć tej umiejętności.
+---
+
+# Moja umiejętność
+
+Tutaj umieść ponumerowane kroki, dokładne polecenia i pułapki.
+`
   },
 
   config: {
@@ -507,7 +542,14 @@ export const pl: Translations = {
     customKeyName: 'Nazwa zmiennej',
     customKeyNamePlaceholder: 'np. MY_SERVICE_API_KEY',
     add: 'Dodaj',
-    invalidKeyName: 'Użyj tylko liter, cyfr i podkreśleń (nazwa musi zaczynać się literą lub podkreśleniem).'
+    invalidKeyName: 'Użyj tylko liter, cyfr i podkreśleń (nazwa musi zaczynać się literą lub podkreśleniem).',
+    sectionProviders: 'Dostawcy',
+    sectionTools: 'Narzędzia',
+    sectionSettings: 'Ustawienia',
+    jumpToSection: 'Przejdź do sekcji',
+    keySaved: key => `Zapisano klucz ${key}`,
+    revealKey: key => `Ujawnij klucz ${key}`,
+    hideKey: key => `Ukryj klucz ${key}`
   },
 
   oauth: {
@@ -549,7 +591,9 @@ export const pl: Translations = {
       device_code: 'Kod urządzenia',
       external: 'Zewnętrzne CLI'
     },
-    expiresIn: 'wygasa za {time}'
+    expiresIn: 'wygasa za {time}',
+    disconnectSuccess: provider => `Rozłączono dostawcę ${provider}`,
+    disconnectFailed: error => `Nie udało się rozłączyć dostawcy: ${error}`
   },
 
   language: { switchTo: 'Zmień język' },
@@ -686,8 +730,8 @@ export const pl: Translations = {
     createBoard: 'Utwórz tablicę',
     search: 'Szukaj',
     filterCards: 'Filtruj karty…',
-    tenant: 'Tenant',
-    allTenants: 'Wszystkie tenanty',
+    tenant: 'Przestrzeń',
+    allTenants: 'Wszystkie przestrzenie',
     assignee: 'Przypisany profil',
     allProfiles: 'Wszystkie profile',
     showArchived: 'Pokaż zarchiwizowane',

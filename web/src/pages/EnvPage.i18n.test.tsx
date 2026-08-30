@@ -9,7 +9,7 @@ import type { Translations } from "@/i18n/types";
 import { en } from "@/i18n/en";
 import { pl } from "@/i18n/pl";
 
-import { EnvCategoryCard, ProviderGroupCard } from "./EnvPage";
+import { EnvCategoryCard, EnvVarRow, ProviderGroupCard } from "./EnvPage";
 
 const i18nState = vi.hoisted(() => ({ t: undefined as unknown }));
 
@@ -97,5 +97,28 @@ describe("EnvPage localized count composition", () => {
     rerender(<EnvCategoryCard section={section} {...rowProps} />);
 
     expect(screen.getByText("1 of 2 configured")).not.toBeNull();
+  });
+
+  it("uses complete locale-owned reveal and hide labels", () => {
+    const { rerender } = render(
+      <EnvVarRow
+        varKey="TEST_API_KEY"
+        info={envInfo(true)}
+        {...rowProps}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Ujawnij klucz TEST_API_KEY" })).not.toBeNull();
+
+    rerender(
+      <EnvVarRow
+        varKey="TEST_API_KEY"
+        info={envInfo(true)}
+        {...rowProps}
+        revealed={{ TEST_API_KEY: "secret" }}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Ukryj klucz TEST_API_KEY" })).not.toBeNull();
   });
 });

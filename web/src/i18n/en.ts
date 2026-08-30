@@ -443,6 +443,41 @@ export const en: Translations = {
     currentProfile: "current ({name})",
     managingProfile:
       "Managing profile \u201c{name}\u201d — toggles apply to that profile, not this dashboard\u2019s.",
+    browseHub: "Browse hub",
+    learnSkill: "Learn a skill",
+    newSkill: "New skill",
+    learnDescription:
+      "Point Hermes at anything and it will distill a reusable skill — following the house authoring standards. Fill in any combination below; the agent gathers the sources and writes the skill in chat.",
+    learnLocalSource: "Local file or directory",
+    learnLocalPlaceholder: "~/projects/some-sdk  (read with read_file / search_files)",
+    learnUrl: "URL",
+    learnUrlPlaceholder: "https://docs.example.com/api  (fetched with web_extract)",
+    learnNotes: "Anything else — describe the workflow, paste notes, or say “what we just did”",
+    learnNotesPlaceholder: "e.g. how I file an expense report: open the portal, …",
+    learnCancel: "Cancel",
+    learnSubmit: "Learn it",
+    skillSaved: (name) => `${name} saved ✓`,
+    editSkill: (name) => `Edit skill: ${name}`,
+    editorEditDescription:
+      "Rewrite this skill's SKILL.md. Frontmatter (name, description) is validated on save.",
+    editorCreateDescription:
+      "Author a custom skill — YAML frontmatter plus markdown instructions. It becomes available to the agent and attachable to cron jobs.",
+    editorName: "Name",
+    editorCategoryOptional: "Category (optional)",
+    editorNameRequired: "Skill name is required.",
+    editorContentRequired: "SKILL.md content is required.",
+    editorSaving: "Saving…",
+    editorSaveChanges: "Save changes",
+    editorCreateSkill: "Create skill",
+    editorCreateTemplate: `---
+name: my-skill
+description: One-line description of when to use this skill.
+---
+
+# My Skill
+
+Numbered steps, exact commands, and pitfalls go here.
+`,
   },
 
   config: {
@@ -515,6 +550,13 @@ export const en: Translations = {
     customKeyNamePlaceholder: "e.g. MY_SERVICE_API_KEY",
     add: "Add",
     invalidKeyName: "Use letters, numbers and underscores only (must start with a letter or underscore).",
+    sectionProviders: "Providers",
+    sectionTools: "Tools",
+    sectionSettings: "Settings",
+    jumpToSection: "Jump to section",
+    keySaved: (key) => `${key} saved`,
+    revealKey: (key) => `Reveal ${key}`,
+    hideKey: (key) => `Hide ${key}`,
   },
 
   oauth: {
@@ -557,6 +599,8 @@ export const en: Translations = {
       external: "External CLI",
     },
     expiresIn: "expires in {time}",
+    disconnectSuccess: (provider) => `${provider} disconnected`,
+    disconnectFailed: (error) => `Disconnect failed: ${error}`,
   },
 
   language: {
