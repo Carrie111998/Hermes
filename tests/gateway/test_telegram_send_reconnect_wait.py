@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
@@ -117,6 +118,68 @@ async def test_send_permanent_fatal_fails_immediately_without_wait():
     )
 
     result = await adapter.send("123", "hello")
+
+    assert result.success is False
+    assert result.error == "Not connected"
+    assert result.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_edit_message_delegates_to_replacement_when_already_live():
+    """#98228: an in-flight progress edit on a retired adapter must resolve
+    through the connected replacement instead of failing 'Not connected' and
+    fragmenting later progress into fresh messages."""
+    old = _make_adapter()
+    old._bot = None
+    live = _make_adapter()
+    live._bot = _connected_bot()
+    live.edit_message = AsyncMock(return_value=SendResult(success=True, message_id="7"))
+    runner = MagicMock()
+    runner.adapters = {old.platform: live}
+    old.gateway_runner = runner
+    old._wait_for_reconnection = AsyncMock(
+        side_effect=AssertionError("must not wait when replacement is already live")
+    )
+
+    result = await old.edit_message("123", "7", "updated")
+
+    assert result.success is True
+    live.edit_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_message_delegates_to_replacement_when_already_live():
+    """#98228: post-delivery cleanup on a retired adapter must delete through
+    the connected replacement so temporary progress/heartbeat messages don't
+    linger after a reconnect."""
+    old = _make_adapter()
+    old._bot = None
+    live = _make_adapter()
+    live._bot = _connected_bot()
+    live.delete_message = AsyncMock(return_value=True)
+    runner = MagicMock()
+    runner.adapters = {old.platform: live}
+    old.gateway_runner = runner
+    old._wait_for_reconnection = AsyncMock(
+        side_effect=AssertionError("must not wait when replacement is already live")
+    )
+
+    assert await old.delete_message("123", "7") is True
+    live.delete_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_edit_message_permanent_fatal_fails_closed_without_delegation():
+    """A permanently fatal (auth) failure must fail closed — never wait or
+    delegate across an incompatible identity."""
+    adapter = _make_adapter()
+    adapter._bot = None
+    adapter._set_fatal_error("telegram_auth_error", "invalid token", retryable=False)
+    adapter._wait_for_reconnection = AsyncMock(
+        side_effect=AssertionError("must not wait on permanent fatal")
+    )
+
+    result = await adapter.edit_message("123", "7", "updated")
 
     assert result.success is False
     assert result.error == "Not connected"
