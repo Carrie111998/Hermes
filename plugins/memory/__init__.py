@@ -38,7 +38,7 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 from hermes_cli.config import cfg_get
 
 if TYPE_CHECKING:
@@ -323,6 +323,7 @@ def load_memory_provider(
     name: str,
     *,
     register_skills: Optional[bool] = None,
+    host_context: Any = None,
 ) -> Optional["MemoryProvider"]:
     """Load and return a MemoryProvider instance by name.
 
@@ -350,7 +351,7 @@ def load_memory_provider(
 
     try:
         provider = (
-            _load_provider_from_dir(provider_dir, register_skills=register_skills)
+            _load_provider_from_dir(provider_dir, register_skills=register_skills, host_context=host_context)
             if provider_dir
             else _load_provider_from_entry_point(
                 entry_point,
@@ -420,6 +421,7 @@ def _load_provider_from_dir(
     provider_dir: Path,
     *,
     register_skills: bool = True,
+    host_context: Any = None,
 ) -> Optional["MemoryProvider"]:
     """Import a provider module and extract the MemoryProvider instance.
 
@@ -509,7 +511,7 @@ def _load_provider_from_dir(
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
-        collector = _ProviderCollector(name, register_skills=register_skills)
+        collector = _ProviderCollector(name, register_skills=register_skills, host_context=host_context)
         try:
             mod.register(collector)
         except Exception as e:
@@ -551,11 +553,31 @@ class _ProviderCollector:
     registration surface as any other plugin.
     """
 
-    def __init__(self, name: str, *, register_skills: bool = True):
+    def __init__(self, name: str, *, register_skills: bool = True, host_context: Any = None):
         self.name = name
         self.provider = None
         self._register_skills = register_skills
         self._context = None
+        self._host_context = host_context
+        self._llm = None
+
+    @property
+    def llm(self):
+        """Host-owned LLM facade for memory providers (e.g. Hindsight ``llm_provider=hermes``).
+
+        Prefers an explicitly supplied host context (loader ``host_context=``),
+        otherwise builds the shared :class:`PluginLlm` facade so extraction/
+        embedding requests run against Hermes' active model/provider/auth
+        without the provider ever seeing raw credentials.
+        """
+        host_llm = getattr(self._host_context, "llm", None)
+        if host_llm is not None:
+            return host_llm
+        if self._llm is None:
+            from agent.plugin_llm import PluginLlm
+
+            self._llm = PluginLlm(plugin_id=f"memory.{self.name}")
+        return self._llm
 
     def register_memory_provider(self, provider):
         self.provider = provider

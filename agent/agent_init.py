@@ -1924,6 +1924,20 @@ def init_agent(
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
+                        # Memory providers that bridge through the host-owned
+                        # LLM may run on their own worker thread, outside the
+                        # turn ContextVar. Pass the resolved parent runtime so
+                        # inheritance cannot fall back to another profile's
+                        # persisted model/provider.
+                        "main_runtime": {
+                            "provider": getattr(agent, "provider", "") or "",
+                            "requested_provider": getattr(agent, "requested_provider", "") or "",
+                            "model": getattr(agent, "model", "") or "",
+                            "base_url": getattr(agent, "base_url", "") or "",
+                            "api_key": getattr(agent, "api_key", "") or "",
+                            "api_mode": getattr(agent, "api_mode", "") or "",
+                            "auth_mode": getattr(agent, "auth_mode", "") or "",
+                        },
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning

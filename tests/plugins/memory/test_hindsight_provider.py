@@ -11,6 +11,7 @@ import re
 import stat
 import sys
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+from plugins.memory import hindsight as hindsight_module
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -58,6 +60,38 @@ def _clean_env(tmp_path, monkeypatch):
     # Patch the actual API and keep all legacy profile writes in tmp_path.
     isolated_home = tmp_path / "user-home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: isolated_home))
+
+
+def test_provider_atexit_registration_is_process_wide(monkeypatch):
+    """Many providers must share one exit hook rather than stack callbacks."""
+    registered = []
+    instances = weakref.WeakSet()
+    monkeypatch.setattr(hindsight_module.atexit, "register", registered.append)
+    monkeypatch.setattr(hindsight_module, "_PROVIDER_INSTANCES", instances)
+    monkeypatch.setattr(hindsight_module, "_PROVIDER_ATEXIT_REGISTERED", False)
+
+    first = HindsightMemoryProvider()
+    second = HindsightMemoryProvider()
+    first._register_atexit()
+    second._register_atexit()
+
+    assert registered == [hindsight_module._shutdown_all_hindsight_providers]
+    assert first in instances
+    assert second in instances
+
+
+def test_provider_atexit_shutdown_is_non_blocking(monkeypatch):
+    """Interpreter exit must not wait for server-side retain visibility."""
+    provider = HindsightMemoryProvider()
+    shutdown = MagicMock()
+    monkeypatch.setattr(provider, "shutdown", shutdown)
+
+    provider._atexit_shutdown()
+
+    shutdown.assert_called_once_with(
+        retain_shutdown_timeout=0.0,
+        thread_join_timeout=0.0,
+    )
 
 
 def _make_mock_client():
@@ -262,6 +296,8 @@ class TestConfig:
         assert provider._retain_every_n_turns == 1
         assert provider._recall_max_tokens == 4096
         assert provider._recall_max_input_chars == 800
+        assert provider.prefetch_timeout == 30.0
+        assert provider._retain_shutdown_timeout == 30.0
         assert provider._tags is None
         assert provider._observation_scopes is None
         assert provider._recall_tags is None
@@ -370,6 +406,279 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+
+    def test_get_client_serializes_background_start_race(self, monkeypatch):
+        import threading
+
+        created = []
+
+        class FakeHindsightEmbedded:
+            def __init__(self, **kwargs):
+                time.sleep(0.05)
+                created.append(kwargs)
+
+        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+
+        p = HindsightMemoryProvider(SimpleNamespace(llm=SimpleNamespace()))
+        p._mode = "local_embedded"
+        p._config = {
+            "profile": "jarpis",
+            "llm_provider": "hermes",
+            "llm_model": "ignored",
+            "bank_id": "jarpis",
+            "idle_timeout": 0,
+        }
+        p._main_runtime = {
+            "provider": "openai-codex",
+            "model": "parent-model-a",
+            "api_mode": "codex_responses",
+        }
+        p._bank_id = "jarpis"
+        results = []
+        errors = []
+
+        def get_client():
+            try:
+                results.append(p._get_client())
+            except Exception as exc:  # pragma: no cover - assertion below reports it
+                errors.append(exc)
+
+        threads = [threading.Thread(target=get_client) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+        try:
+            assert not errors
+            assert len(results) == 2
+            assert results[0] is results[1]
+            assert len(created) == 1
+        finally:
+            p.shutdown()
+
+    def test_inherited_providers_share_one_process_runtime(self, monkeypatch):
+        created = []
+        bridges = []
+
+        class FakeBridge:
+            def __init__(self, llm, *, main_runtime=None):
+                self.llm = llm
+                self.main_runtime = main_runtime
+                self.closed = False
+                bridges.append(self)
+
+            @property
+            def api_key(self):
+                return "bridge-key"
+
+            @property
+            def base_url(self):
+                return "http://127.0.0.1:12345/v1"
+
+            def start(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        class FakeHindsightEmbedded:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.close_calls = 0
+                created.append(self)
+
+            def close(self, stop_daemon=False):
+                self.close_calls += 1
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight",
+            SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded),
+        )
+        monkeypatch.setattr("plugins.memory.hindsight.HermesLlmBridge", FakeBridge)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+
+        config = {
+            "profile": "jarpis",
+            "llm_provider": "hermes",
+            "llm_model": "ignored",
+            "bank_id": "jarpis",
+            "idle_timeout": 0,
+        }
+        parent_runtime_a = {
+            "provider": "parent-provider-a",
+            "model": "parent-model-a",
+            "api_mode": "parent-wire-a",
+        }
+        parent_runtime_b = {
+            "provider": "parent-provider-b",
+            "model": "parent-model-b",
+            "api_mode": "parent-wire-b",
+        }
+
+        def make_provider(parent_runtime):
+            provider = HindsightMemoryProvider(SimpleNamespace(llm=SimpleNamespace()))
+            provider._mode = "local_embedded"
+            provider._config = dict(config)
+            provider._main_runtime = dict(parent_runtime)
+            return provider
+
+        first = make_provider(parent_runtime_a)
+        second = make_provider(parent_runtime_b)
+        try:
+            first_client = first._get_client()
+            second_client = second._get_client()
+
+            assert first_client is second_client
+            assert len(created) == 1
+            assert len(bridges) == 1
+            expected_profile = hindsight_module._shared_embedded_profile_name(config)
+            assert first._embedded_profile_override == expected_profile
+            assert second._embedded_profile_override == expected_profile
+            assert first._main_runtime != second._main_runtime
+            assert first._embedded_runtime_key == second._embedded_runtime_key
+            assert first._embedded_runtime_key is not None
+            assert bridges[0].main_runtime == parent_runtime_a
+            runtime = hindsight_module._EMBEDDED_RUNTIME_REGISTRY[first._embedded_runtime_key]
+            assert runtime.refs == 2
+
+            first.shutdown()
+            assert created[0].close_calls == 0
+            assert bridges[0].closed is False
+            assert runtime.refs == 1
+
+            second.shutdown()
+            assert created[0].close_calls == 1
+            assert bridges[0].closed is True
+            assert first._embedded_runtime_key is None
+            assert not hindsight_module._EMBEDDED_RUNTIME_REGISTRY
+        finally:
+            # Keep the test idempotent if an assertion fails before either
+            # provider reaches its normal teardown path.
+            first.shutdown()
+            second.shutdown()
+
+    def test_inherited_runtime_identity_is_stable(self):
+        config = {"profile": "jarpis", "llm_provider": "hermes"}
+
+        first_key = hindsight_module._shared_embedded_runtime_key(config)
+        second_key = hindsight_module._shared_embedded_runtime_key(dict(config))
+
+        assert first_key == second_key
+        assert hindsight_module._shared_embedded_profile_name(config) == "jarpis-hermes-shared"
+        assert "model" not in hindsight_module._shared_embedded_profile_name(config)
+
+    def test_hermes_runtime_does_not_require_parent_model_snapshot(self, monkeypatch):
+        created = []
+
+        class FakeBridge:
+            def __init__(self, llm, *, main_runtime=None):
+                self.main_runtime = main_runtime
+                self.closed = False
+
+            @property
+            def api_key(self):
+                return "bridge-key"
+
+            @property
+            def base_url(self):
+                return "http://127.0.0.1:12345/v1"
+
+            def start(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        class FakeEmbedded:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                created.append(self)
+
+            def close(self, stop_daemon=False):
+                return None
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight",
+            SimpleNamespace(HindsightEmbedded=FakeEmbedded),
+        )
+        monkeypatch.setattr("plugins.memory.hindsight.HermesLlmBridge", FakeBridge)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+
+        provider = HindsightMemoryProvider(SimpleNamespace(llm=SimpleNamespace()))
+        provider._mode = "local_embedded"
+        provider._config = {
+            "profile": "jarpis",
+            "llm_provider": "hermes",
+            "llm_model": "ignored",
+            "idle_timeout": 0,
+        }
+        provider._main_runtime = {}
+
+        try:
+            client = provider._get_client()
+            assert isinstance(client, FakeEmbedded)
+            assert client is created[0]
+            assert client.kwargs["llm_model"] == "hermes-inherited"
+        finally:
+            provider.shutdown()
+
+    def test_get_client_waits_for_background_daemon_start(self):
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+        client = object()
+        p = HindsightMemoryProvider()
+        p._client = client
+        p._timeout = 2
+
+        def background_start():
+            started.set()
+            release.wait(timeout=2.0)
+
+        daemon_thread = threading.Thread(target=background_start)
+        p._daemon_thread = daemon_thread
+        daemon_thread.start()
+        results = []
+        caller = threading.Thread(target=lambda: results.append(p._get_client()))
+        caller.start()
+        try:
+            assert started.wait(timeout=1.0)
+            time.sleep(0.05)
+            assert results == []
+            release.set()
+            caller.join(timeout=2.0)
+            assert results == [client]
+        finally:
+            release.set()
+            caller.join(timeout=2.0)
+            daemon_thread.join(timeout=2.0)
+            p._client = None
+            p._daemon_thread = None
+
+    def test_hermes_inheritance_uses_stable_database_independent_of_daemon_profile(self):
+        provider = HindsightMemoryProvider()
+        assert provider._effective_embedded_database_url(
+            {"profile": "jarpis", "llm_provider": "hermes"},
+            inherit_hermes_llm=True,
+        ) == "pg0://hindsight-embed-jarpis"
+        assert provider._effective_embedded_database_url(
+            {"profile": "jarpis", "llm_provider": "openai"},
+            inherit_hermes_llm=False,
+        ) is None
+        assert provider._effective_embedded_database_url(
+            {
+                "profile": "jarpis",
+                "llm_provider": "hermes",
+                "database_url": "postgresql://managed/hindsight",
+            },
+            inherit_hermes_llm=True,
+        ) == "postgresql://managed/hindsight"
 
 
 class TestPostSetup:
@@ -552,8 +861,12 @@ class TestToolHandlers:
 
 
 class TestPrefetch:
-    def test_prefetch_returns_empty_when_no_result(self, provider):
-        assert provider.prefetch("test") == ""
+    def test_prefetch_runs_synchronous_recall_when_no_warm_result(self, provider):
+        result = provider.prefetch("test")
+
+        assert "Memory 1" in result
+        assert "Memory 2" in result
+        provider._client.arecall.assert_awaited_once()
 
 
     def test_recall_sync_defaults_off(self, provider):
@@ -674,6 +987,31 @@ class TestPrefetchServerRetainVisibility:
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
         assert "op-async-1" in provider._pending_retain_ops
+        provider._pending_retain_ops.clear()
+
+    def test_tracks_parent_operation_by_document_id_when_response_omits_id(self, provider):
+        provider._document_id = "test-doc"
+        provider._client.aretain_batch = AsyncMock(
+            return_value=SimpleNamespace(operation_id=None, operation_ids=None)
+        )
+        provider._client.operations = MagicMock()
+        provider._client.operations.list_operations = AsyncMock(
+            return_value=SimpleNamespace(
+                operations=[
+                    SimpleNamespace(
+                        id="op-parent",
+                        document_id="test-doc",
+                        status="pending",
+                    )
+                ]
+            )
+        )
+
+        provider.sync_turn("hello", "world")
+        provider._retain_queue.join()
+
+        assert "op-parent" in provider._pending_retain_ops
+        provider._pending_retain_ops.clear()
 
     def test_tracks_multiple_operation_ids(self, provider):
         provider._client.aretain_batch = AsyncMock(
@@ -684,6 +1022,7 @@ class TestPrefetchServerRetainVisibility:
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
         assert {"op-a", "op-b"} <= provider._pending_retain_ops
+        provider._pending_retain_ops.clear()
 
     def test_sync_retain_tracks_no_ops(self, provider_with_config):
         p = provider_with_config(retain_async=False)
@@ -1082,6 +1421,29 @@ class TestShutdownRace:
         assert provider._client.aretain_batch.call_count == 2
 
 
+    def test_shutdown_waits_for_pending_server_retain(self, provider):
+        provider._pending_retain_ops = {"op-pending"}
+        provider._retain_shutdown_timeout = 0.25
+        provider._writer_thread = None
+        provider._wait_for_server_retain_ops = MagicMock(return_value=True)
+
+        provider.shutdown()
+
+        provider._wait_for_server_retain_ops.assert_called_once()
+        args, kwargs = provider._wait_for_server_retain_ops.call_args
+        assert args[1] == 0.25
+        assert kwargs["allow_shutdown"] is True
+
+    def test_shutdown_uses_retain_drain_timeout(self, provider):
+        writer = MagicMock()
+        writer.is_alive.return_value = True
+        provider._writer_thread = writer
+        provider._retain_shutdown_timeout = 0.25
+
+        provider.shutdown()
+
+        writer.join.assert_called_once_with(timeout=0.25)
+
     def test_shutdown_drains_pending_retains(self, provider):
         """Shutdown must wait for queued retains to complete, not abandon them.
 
@@ -1417,6 +1779,27 @@ class TestAvailability:
         p = HindsightMemoryProvider()
         assert not p.is_available()
 
+    def test_missing_local_runtime_emits_actionable_warning(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home",
+            lambda: tmp_path / "nonexistent",
+        )
+        monkeypatch.setenv("HINDSIGHT_MODE", "local_embedded")
+
+        def _raise(_name):
+            raise ModuleNotFoundError("No module named 'hindsight'")
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib.import_module",
+            _raise,
+        )
+
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            assert not HindsightMemoryProvider().is_available()
+
+        assert "hindsight-all" in caplog.text
+        assert "hermes memory setup" in caplog.text
+
     def test_initialize_disables_local_mode_when_runtime_import_fails(self, tmp_path, monkeypatch):
         config = {"mode": "local_embedded"}
         config_path = tmp_path / "hindsight" / "config.json"
@@ -1518,11 +1901,13 @@ class TestShutdown:
 
         provider._mode = "local_embedded"
         provider._client = embedded
+        provider._embedded_profile_override = "jarpis-hermes-test-instance"
 
         provider.shutdown()
 
         inner_client.aclose.assert_awaited_once()
-        embedded.close.assert_called_once()
+        embedded.close.assert_called_once_with(stop_daemon=True)
+        embedded._manager.stop.assert_called_once_with("jarpis-hermes-test-instance")
         assert embedded._client is None
         assert provider._client is None
 
