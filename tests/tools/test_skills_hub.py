@@ -225,6 +225,30 @@ class TestGitHubSourceFileFetch:
 
         assert src.fetch("owner/repo/skills/demo") is None
 
+    def test_full_tree_ignores_parent_relative_prose_link(self):
+        src = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        src._tree_revisions["owner/repo"] = "abc123"
+        src._get_repo_tree = MagicMock(return_value=(
+            "main",
+            [
+                {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "skills/demo/CHANGELOG.md", "type": "blob", "mode": "100644"},
+            ],
+        ))
+        src._fetch_file_content = MagicMock(return_value=(
+            "---\nname: demo\ndescription: demo\n---\n"
+            "See [the shared contract](../other/contract.md).\n"
+        ))
+        src._fetch_file_bytes = MagicMock(return_value=b"changed\n")
+
+        bundle = src.fetch("owner/repo/skills/demo")
+
+        assert bundle is not None
+        assert bundle.files["CHANGELOG.md"] == b"changed\n"
+        src._fetch_file_bytes.assert_called_once_with(
+            "owner/repo", "skills/demo/CHANGELOG.md", ref="abc123"
+        )
+
 
 # ---------------------------------------------------------------------------
 # SkillsShSource

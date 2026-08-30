@@ -795,7 +795,13 @@ class GitHubSource(SkillSource):
             return None
         referenced = _referenced_support_paths(skill_md)
         if referenced is None:
-            return None
+            # A complete pinned tree confines every downloaded byte beneath
+            # skill_path, so parent-relative prose links cannot escape the
+            # bundle. Keep fail-closed behavior only for the Contents API
+            # fallback, where references determine what gets fetched.
+            if tree is None:
+                return None
+            referenced = set()
 
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
         if tree is not None:
