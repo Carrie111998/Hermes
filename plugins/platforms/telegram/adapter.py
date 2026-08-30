@@ -9844,6 +9844,21 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+        # Ensure DM/personal-chat sessions are persisted to state.db (fixes resume / sessions list)
+        store = getattr(self, "_session_store", None)
+        if store:
+            try:
+                session_entry = store.get_or_create_session(event.source)
+                entry = {
+                    "role": "user",
+                    "content": event.text or "",
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                }
+                if event.message_id:
+                    entry["message_id"] = str(event.message_id)
+                store.append_to_transcript(session_entry.session_id, entry)
+            except Exception:
+                pass  # non-fatal; transcript already written to .jsonl
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -9865,6 +9880,21 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        # Ensure DM/personal-chat sessions are persisted to state.db (fixes resume / sessions list)
+        store = getattr(self, "_session_store", None)
+        if store:
+            try:
+                session_entry = store.get_or_create_session(event.source)
+                entry = {
+                    "role": "user",
+                    "content": event.text or "",
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                }
+                if event.message_id:
+                    entry["message_id"] = str(event.message_id)
+                store.append_to_transcript(session_entry.session_id, entry)
+            except Exception:
+                pass  # non-fatal; transcript already written to .jsonl
         # Telegram clients split messages above 4096 chars into multiple
         # updates.  A long command paste (e.g. ``/queue <huge prompt>``)
         # arrives as a COMMAND chunk near the limit followed by plain TEXT
