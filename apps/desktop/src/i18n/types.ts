@@ -410,6 +410,8 @@ export interface Translations {
     notifications: {
       title: string
       intro: string
+      inAppLabel: string
+      inAppDesc: string
       enableAll: string
       enableAllDesc: string
       focusedHint: string
