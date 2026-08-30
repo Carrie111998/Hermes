@@ -128,9 +128,11 @@ class TestWeComConnect:
 
         adapter._read_events = AsyncMock(side_effect=read_events)
         adapter._open_connection = AsyncMock()
-        adapter._mark_connected = MagicMock()
         adapter.notify_deferred_questions_disconnected = MagicMock()
         adapter.notify_deferred_questions_connected = MagicMock()
+        adapter._mark_connected = MagicMock(
+            side_effect=adapter.notify_deferred_questions_connected
+        )
         monkeypatch.setattr(wecom_module.asyncio, "sleep", AsyncMock())
 
         await adapter._listen_loop()

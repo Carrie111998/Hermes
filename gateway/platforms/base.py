@@ -3571,6 +3571,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_message = None
         self._fatal_error_retryable = True
         self._write_runtime_status_safe("connected", platform_state="connected", error_code=None, error_message=None)
+        self.notify_deferred_questions_connected()
 
     def _mark_disconnected(self) -> None:
         self._running = False
@@ -3825,18 +3826,21 @@ class BasePlatformAdapter(ABC):
 
     def notify_deferred_questions_connected(self) -> None:
         """Wake durable plugin work after the transport is usable."""
-        service = self._deferred_question_service
-        if service is None:
+        if not self.is_connected:
             return
-        platform_name = getattr(self.platform, "value", str(self.platform))
-        service.adapter_connected(platform_name, self)
+        self._set_deferred_transport_ready(True)
 
     def notify_deferred_questions_disconnected(self) -> None:
+        self._set_deferred_transport_ready(False)
+
+    def _set_deferred_transport_ready(self, ready: bool) -> None:
+        """Publish every transport transition through one durable-work seam."""
         service = self._deferred_question_service
         if service is None:
             return
         platform_name = getattr(self.platform, "value", str(self.platform))
-        service.adapter_disconnected(platform_name, self)
+        transition = service.adapter_connected if ready else service.adapter_disconnected
+        transition(platform_name, self)
 
     def is_session_active(self, session_key: str) -> bool:
         """Return whether this adapter currently owns a run for ``session_key``."""

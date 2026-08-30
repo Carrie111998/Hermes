@@ -95,6 +95,41 @@ async def test_response_is_persisted_before_handler_and_resolves(
 
 
 @pytest.mark.asyncio
+async def test_reconnect_recovery_does_not_rerun_active_handler(tmp_path: Path) -> None:
+    import asyncio
+
+    from gateway.deferred_questions import DeferredQuestionResult
+
+    service = _service(tmp_path / "questions.sqlite3")
+    question, adapter = _awaiting_question(service)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handle(_record, _answer):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return DeferredQuestionResult.done("Consent recorded.")
+
+    service.register_handler("plow-chat", "invite-consent", handle)
+    handling = asyncio.create_task(
+        service.handle_response(question.session_key, "Sure!")
+    )
+    await started.wait()
+
+    service.adapter_connected("plow_chat", adapter)
+    await asyncio.sleep(0)
+    if service._recovery_task is not None:
+        await service._recovery_task
+
+    assert calls == 1
+    release.set()
+    assert await handling == DeferredQuestionResult.done("Consent recorded.")
+
+
+@pytest.mark.asyncio
 async def test_unclear_response_reasks_same_question(tmp_path: Path) -> None:
     from gateway.deferred_questions import DeferredQuestionResult
 
@@ -167,20 +202,7 @@ async def test_reply_delivery_recovery_does_not_rerun_handler(tmp_path: Path) ->
     path = tmp_path / "questions.sqlite3"
     service = _service(path)
 
-    class FlakyReplyAdapter(_DeliveryAdapter):
-        def __init__(self, service) -> None:
-            super().__init__(service, active=False)
-            self.attempts = 0
-
-        async def deliver_deferred_message(self, delivery_source, content):
-            self.attempts += 1
-            if self.attempts == 1:
-                return SimpleNamespace(
-                    success=False, error="offline", retryable=True
-                )
-            return await super().deliver_deferred_message(delivery_source, content)
-
-    adapter = FlakyReplyAdapter(service)
+    adapter = _RetryableOnceAdapter(service)
     question, _adapter = _awaiting_question(service, adapter=adapter)
     service.handling_retry_seconds = 0
     handler_calls = 0
@@ -301,6 +323,18 @@ class _DeliveryAdapter:
         assert pending.state in {"delivering", "handling"}
         self.sent.append((delivery_source["chat_id"], content))
         return SimpleNamespace(success=True, error=None, retryable=False)
+
+
+class _RetryableOnceAdapter(_DeliveryAdapter):
+    def __init__(self, service) -> None:
+        super().__init__(service, active=False)
+        self.attempts = 0
+
+    async def deliver_deferred_message(self, delivery_source, content):
+        self.attempts += 1
+        if self.attempts == 1:
+            return SimpleNamespace(success=False, error="offline", retryable=True)
+        return await super().deliver_deferred_message(delivery_source, content)
 
 
 class _GatewayAdapter(BasePlatformAdapter):
@@ -427,18 +461,7 @@ async def test_disconnected_handling_recovery_waits_for_reconnect(
 
     service = _service(tmp_path / "questions.sqlite3")
 
-    class ReconnectingAdapter(_DeliveryAdapter):
-        def __init__(self, service) -> None:
-            super().__init__(service, active=False)
-            self.attempts = 0
-
-        async def deliver_deferred_message(self, delivery_source, content):
-            self.attempts += 1
-            if self.attempts == 1:
-                return SimpleNamespace(success=False, error="offline", retryable=True)
-            return await super().deliver_deferred_message(delivery_source, content)
-
-    adapter = ReconnectingAdapter(service)
+    adapter = _RetryableOnceAdapter(service)
     question, _adapter = _awaiting_question(service, adapter=adapter)
     service.handling_retry_seconds = 0
     handler_calls = 0

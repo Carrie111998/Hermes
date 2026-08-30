@@ -798,7 +798,6 @@ class WeComAdapter(BasePlatformAdapter):
                     await self._open_connection()
                     backoff_idx = 0
                     self._mark_connected()
-                    self.notify_deferred_questions_connected()
                     logger.info("[%s] Reconnected", self.name)
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)

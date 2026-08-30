@@ -73,6 +73,7 @@ class DeferredQuestionService:
         self._adapters: dict[str, tuple[Any, asyncio.AbstractEventLoop]] = {}
         self._ready_platforms: set[str] = set()
         self._busy_callbacks: set[str] = set()
+        self._handling_questions: set[str] = set()
         self._handling_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._recovery_task: asyncio.Task[None] | None = None
         self.handling_retry_seconds = 5.0
@@ -335,6 +336,8 @@ class DeferredQuestionService:
         binding = self._adapters.get(platform)
         if binding is None or binding[0] is not adapter:
             return
+        if platform in self._ready_platforms:
+            return
         _adapter, loop = binding
         self._ready_platforms.add(platform)
         with self._lock, self._transaction() as conn:
@@ -537,6 +540,17 @@ class DeferredQuestionService:
 
     async def _run_handler(
         self, record: DeferredQuestion, *, schedule_retry: bool = True
+    ) -> DeferredQuestionResult | None:
+        if record.id in self._handling_questions:
+            return None
+        self._handling_questions.add(record.id)
+        try:
+            return await self._run_handler_once(record, schedule_retry=schedule_retry)
+        finally:
+            self._handling_questions.discard(record.id)
+
+    async def _run_handler_once(
+        self, record: DeferredQuestion, *, schedule_retry: bool
     ) -> DeferredQuestionResult:
         handler = self._handlers.get((record.plugin_id, record.handler_name))
         if handler is None:
@@ -654,7 +668,8 @@ class DeferredQuestionService:
                     exc_info=True,
                 )
                 continue
-            results.append((record.id, result))
+            if result is not None:
+                results.append((record.id, result))
         return results
 
 
