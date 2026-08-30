@@ -861,31 +861,35 @@ def enforce_final_context_budget(
     reason: str = "",
     api_kwargs: dict | None = None,
 ) -> None:
-    """Raise :class:`ContextCeilingExceeded` if ``budget.total`` exceeds the
-    effective limit = ``min(invocation pre-cap, profile ceiling)``.
-
-    Shared terminal enforcement primitive — the ONE place every physical
+    """Shared terminal enforcement primitive — the ONE place every physical
     dispatch owner (main + auxiliary) calls immediately before provider I/O.
     No-op when neither ``pre_cap`` nor ``ceiling`` is configured.
 
-    When ``api_kwargs`` is supplied, overflow is classified:
+    Effective limit = ``min(invocation pre-cap, profile ceiling)``.
 
-    * **Unshrinkable** — ``budget.input_tokens_estimate`` alone is at or over
-      the effective limit.  The input payload cannot be reduced by touching
-      the output cap; :class:`ContextCeilingExceeded` is raised (the provider
-      is never called, and the caller's provider-400 recovery path is
-      preserved because the provider never returns a 400 for a request it
-      never received).
+    When ``budget.total > limit``, overflow is classified:
 
-    * **Shrinkable** — the input fits, but ``input + output_reservation``
-      exceeds the limit.  The requested output cap is clamped in-place to
-      ``max(0, limit - input_tokens_estimate)`` (the maximum legal output
-      allowance from the remaining budget) and the check is re-run against
-      the clamped reservation.  This avoids sending a known-invalid cap to
-      the provider while preserving the existing provider-400 recovery
-      path as a fallback for cases where the clamp is insufficient (e.g.
-      the provider's own tokenizer counts the input larger than Hermes's
-      rough estimate).
+    * **Unshrinkable** — the non-output portion (``input + system + tools``,
+      i.e. ``budget.total - budget.output_reservation``) is at or over the
+      effective limit.  No amount of output-cap reduction can help;
+      :class:`ContextCeilingExceeded` is raised before provider I/O (the
+      provider is never called, so its 400-error recovery path is preserved
+      — the provider never returns a 400 for a request it never received).
+
+    * **Shrinkable** — the non-output portion fits under the limit, but
+      ``non_output + output_reservation`` exceeds it.  When ``api_kwargs``
+      is supplied and carries an explicit output cap, the cap is clamped
+      in-place to ``limit - non_output`` (the maximum legal output allowance
+      from the remaining budget) and the call proceeds with the reduced cap.
+      The clamp never raises an existing cap — it only lowers one.  When no
+      explicit cap field is present (the reservation came from the provider
+      implicit / DEFAULT floor), the overflow is treated as unshrinkable and
+      :class:`ContextCeilingExceeded` is raised (conservative refusal).
+
+    A locally refused request is NOT a provider call: no network I/O, no
+    ``api_call_count`` increment, no iteration-budget slot consumed.  The
+    caller catches :class:`ContextCeilingExceeded`, refunds counters, and
+    surfaces a clean local refusal.
     """
     # effective limit = min(invocation pre-cap, profile ceiling); no-op if
     # neither is a valid positive int.
