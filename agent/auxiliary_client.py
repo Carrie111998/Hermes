@@ -3631,8 +3631,12 @@ def _compat_runtime_main() -> Optional[Dict[str, Any]]:
 
     ``set_runtime_main`` mirrors values into the old module attributes for
     introspection, but those mirrors must never become runtime inputs. A direct
-    patch is recognized only when it differs from the mirrored snapshot and
-    only on the main thread, keeping concurrent session workers isolated.
+    patch is recognized only when it differs from the mirrored snapshot; only
+    the fields that differ are treated as overrides. This matters for legacy
+    tests and integrations that patch just a live endpoint: carrying the
+    mirrored provider/model along with that partial patch can resurrect a stale
+    route from an earlier turn. The compatibility path is main-thread-only so
+    concurrent session workers remain isolated.
     """
     if threading.current_thread() is not threading.main_thread():
         return None
@@ -3644,9 +3648,16 @@ def _compat_runtime_main() -> Optional[Dict[str, Any]]:
         _RUNTIME_MAIN_API_MODE,
         _RUNTIME_MAIN_AUTH_MODE,
     )
-    if values == _RUNTIME_MAIN_COMPAT_SNAPSHOT:
+    changed = {
+        field: value
+        for field, value, snapshot in zip(
+            _MAIN_RUNTIME_FIELDS, values, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+        )
+        if value != snapshot
+    }
+    if not changed:
         return None
-    return dict(zip(_MAIN_RUNTIME_FIELDS, values))
+    return changed
 
 
 def _runtime_main_value(field: str) -> Any:
