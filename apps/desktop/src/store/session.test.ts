@@ -32,6 +32,7 @@ import {
   ensureDefaultWorkspaceCwd,
   forgetSessionOwnerHintsForConnection,
   getConfiguredDefaultProjectDir,
+  getRememberedWorkspaceCwd,
   getRememberedRoute,
   getRememberedSessionId,
   getSessionOwnerHint,
@@ -716,6 +717,28 @@ describe('workspaceCwdForNewSession', () => {
     // never reads the remote keys (nor inherits the sticky local workspace).
     $connection.set(null)
     expect(workspaceCwdForNewSession()).toBe('')
+  })
+
+  it('does not inherit a persisted remote workspace on a bare new session', () => {
+    $connection.set({ baseUrl: 'http://backend-a', mode: 'remote' } as never)
+    window.localStorage.setItem(
+      'hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-a.default',
+      '/backend/project-a'
+    )
+
+    expect(getRememberedWorkspaceCwd()).toBe('/backend/project-a')
+    expect(workspaceCwdForNewSession()).toBe('')
+  })
+
+  it('honors an explicit configured default in remote mode', () => {
+    $connection.set({ baseUrl: 'http://backend-a', mode: 'remote' } as never)
+    window.localStorage.setItem(
+      'hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-a.default',
+      '/backend/project-a'
+    )
+    applyConfiguredDefaultProjectDir('/home/user/configured')
+
+    expect(workspaceCwdForNewSession()).toBe('/home/user/configured')
   })
 
   it('remembers only the workspace the user picked, not the one they looked at', () => {
