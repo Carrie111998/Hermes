@@ -171,6 +171,48 @@ def test_turn_route_middleware_receives_redacted_route_and_resolves_provider(mon
     assert trace == [{"source": "test"}]
 
 
+def test_gateway_command_and_turn_route_share_durable_session_key(monkeypatch):
+    """A control command must affect the same chat after physical rotation."""
+    from hermes_cli.plugins import invoke_plugin_command
+
+    runner = _make_runner()
+    disabled: set[str] = set()
+
+    def veto_off(raw_args, *, session_key=None):
+        assert raw_args == ""
+        disabled.add(session_key)
+        return "disabled"
+
+    invoke_plugin_command(
+        veto_off,
+        "",
+        session_id="physical-before",
+        session_key="chat-1",
+        platform="telegram",
+    )
+
+    observed = {}
+
+    def fake_apply(route, **context):
+        observed.update(context)
+        if context["session_key"] in disabled:
+            return SimpleNamespace(changed=False, payload=route, trace=[])
+        return SimpleNamespace(changed=True, payload=route, trace=[])
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_turn_route_middleware", fake_apply)
+    model, _runtime, _trace = runner._apply_turn_route_middleware(
+        message="next turn",
+        model="primary",
+        runtime_kwargs={"provider": "openai"},
+        session_id="physical-after-rotation",
+        session_key="chat-1",
+        source=_make_source(),
+    )
+    assert model == "primary"
+    assert observed["session_id"] == "physical-after-rotation"
+    assert observed["session_key"] == "chat-1"
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
