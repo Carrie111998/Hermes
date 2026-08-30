@@ -4156,6 +4156,7 @@ def compress_context(
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
                     from agent.context_compressor import (
+                        _DB_PERSISTED_MARKER,
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
@@ -4169,11 +4170,24 @@ def compress_context(
                         lock_holder=_lock_holder,
                     )
                     split_status = "in_place_committed"
-                    # Reset the flush identity set so the next turn's appends are
-                    # diffed against the COMPACTED transcript: the compacted dicts
-                    # are passed as conversation_history next turn and skipped by
-                    # identity, so only genuinely new turn messages get appended
-                    # (no dup of the summary, no resurrection of dropped turns).
+                    # Stamp the persistence marker on the committed dicts —
+                    # the same post-commit contract as the micro-compaction
+                    # sync (_sync_micro_compact_to_db). compress() returns
+                    # marker-swept copies (#57491), and the compacted dicts
+                    # come back as the live ``messages`` list while the flush
+                    # still receives the pre-compaction dicts as
+                    # ``conversation_history``, so its identity skip cannot
+                    # cover them: without this stamp the next _persist_session
+                    # re-INSERTs the whole post-compaction transcript (#98450).
+                    # Stamped only after a successful archive_and_compact —
+                    # on failure the sweep stays, matching the micro path's
+                    # rollback semantics.
+                    for _compacted_msg in compressed:
+                        if isinstance(_compacted_msg, dict):
+                            _compacted_msg[_DB_PERSISTED_MARKER] = True
+                    # Reset the flush identity set: stale ids from the
+                    # pre-compaction dicts must not survive into the next
+                    # flush's one-shot seed translation.
                     agent._flushed_db_message_ids = set()
                     # Rotation-independent signal: the conversation was compacted in
                     # place (id unchanged). The gateway reads this (NOT an id-change

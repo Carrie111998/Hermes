@@ -436,3 +436,65 @@ class TestCompactedTurnsStaySearchable:
                 "ZEBRAWORD", role_filter=["user", "assistant"], include_inactive=True
             )
             assert len(recovered) == 1
+
+
+class TestInPlaceCommitStampsPersistenceMarkers:
+    """The in-place batch commit must stamp ``_DB_PERSISTED_MARKER`` on the
+    compacted dicts — the same post-commit contract as the micro-compaction
+    sync. ``compress()`` returns marker-swept copies (#57491) that come back
+    as the live ``messages`` list, while the flush still receives the
+    pre-compaction dicts as ``conversation_history``; without the stamp the
+    identity skip cannot cover them and the next persist re-INSERTs the whole
+    post-compaction transcript (#98450)."""
+
+    def test_committed_dicts_carry_marker(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260830_marker"
+            _seed(db, sid, "marker")
+            agent = _make_agent(db, sid, in_place=True)
+
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            compressed, _sp = compress_context(
+                agent, messages, approx_tokens=100_000, system_message="sys"
+            )
+
+            assert agent._last_compaction_in_place is True
+            for msg in compressed:
+                assert msg.get(_DB_PERSISTED_MARKER) is True
+
+    def test_no_duplicate_rows_after_post_commit_persist(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260830_dupes"
+            _seed(db, sid, "dupes")
+            agent = _make_agent(db, sid, in_place=True)
+
+            history = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            compressed, _sp = compress_context(
+                agent, history, approx_tokens=100_000, system_message="sys"
+            )
+
+            # Production sequence (#98450): the turn-finalize persist runs over
+            # the compacted live list while conversation_history still holds the
+            # pre-compaction dicts — identity cannot dedupe these.
+            agent._flush_messages_to_session_db(compressed, history)
+
+            active = db.get_messages_as_conversation(sid)
+            assert len(active) == 2
+            assert [m.get("content") for m in active] == [
+                "[CONTEXT COMPACTION] summary of prior turns",
+                "recent reply",
+            ]
+            all_rows = db.get_messages(sid, include_inactive=True)
+            # 8 archived originals + 2 compacted actives — nothing re-inserted.
+            assert len(all_rows) == 10
+            contents = [m["content"] for m in all_rows]
+            assert len(contents) == len(set(contents))
