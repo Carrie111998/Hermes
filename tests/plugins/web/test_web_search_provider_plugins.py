@@ -45,6 +45,8 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
+        "BROKER_CALLER_HERMES_CANARY_TOKEN",
+        "SEARCH_BROKER_URL",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -82,6 +84,7 @@ class TestBundledPluginsRegister:
             "firecrawl",
             "keenable",
             "parallel",
+            "search-broker",
             "searxng",
             "tavily",
             "xai",
@@ -95,6 +98,7 @@ class TestBundledPluginsRegister:
             ("searxng", True, False),
             ("exa", True, True),
             ("parallel", True, True),
+            ("search-broker", True, False),
             ("tavily", True, True),
             ("firecrawl", True, True),
             # xai: search-only via Grok's agentic web_search tool.
@@ -117,7 +121,17 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        [
+            "brave-free",
+            "ddgs",
+            "searxng",
+            "exa",
+            "parallel",
+            "search-broker",
+            "tavily",
+            "firecrawl",
+            "xai",
+        ],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -175,6 +189,18 @@ class TestIsAvailable:
         assert p is not None
         assert p.is_available() is False
         monkeypatch.setenv("EXA_API_KEY", "real")
+        assert p.is_available() is True
+
+    def test_search_broker_requires_caller_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("search-broker")
+        assert p is not None
+        assert p.is_available() is False
+        monkeypatch.setenv("BROKER_CALLER_HERMES_CANARY_TOKEN", "real")
         assert p.is_available() is True
 
     def test_parallel_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:

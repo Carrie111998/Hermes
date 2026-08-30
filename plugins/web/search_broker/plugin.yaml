@@ -1,0 +1,9 @@
+name: web-search-broker
+version: 1.0.0
+description: "Search Capability Broker native Hermes provider"
+author: Local
+kind: backend
+provides_web_providers:
+  - search-broker
+requires_env:
+  - BROKER_CALLER_HERMES_CANARY_TOKEN
