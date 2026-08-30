@@ -146,3 +146,27 @@ async def test_preview_feeds_tool_messages_system_prompt_and_tools_to_estimator(
     assert captured["tools"] == fake_tools, "tool schemas dropped from the preview estimate"
 
 
+@pytest.mark.asyncio
+async def test_preview_labels_lower_bound_when_tool_schema_lookup_fails():
+    """If tool-schema resolution raises, the preview must say the number
+    is a lower bound instead of quietly reporting a partial estimate as
+    if it were the full context (reviewer feedback on #98368).
+    """
+    runner = _make_runner(_make_history(3))
+    runner._session_db = MagicMock()
+    runner._session_db.get_session = AsyncMock(
+        return_value={"system_prompt": "SYSTEM PROMPT"}
+    )
+    runner._resolve_enabled_toolsets_for_source = MagicMock(
+        side_effect=RuntimeError("boom")
+    )
+
+    with patch("gateway.run._load_gateway_config", return_value={}):
+        result = await runner._handle_compress_command(
+            _make_event("/compress --preview")
+        )
+
+    assert "lower bound" in result.lower(), result
+    assert "tool schemas" in result
+
+

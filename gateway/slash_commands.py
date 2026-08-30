@@ -4508,6 +4508,11 @@ class GatewaySlashCommandsMixin:
                 if m.get("role") in {"user", "assistant", "tool"}
             ]
 
+            # Track which payload buckets we couldn't resolve, so a lookup
+            # failure degrades to a labeled lower bound instead of silently
+            # posing as the full context (reviewer feedback on #98368).
+            _omitted_buckets = []
+
             _sys_prompt = ""
             _get_session = getattr(self._session_db, "get_session", None)
             if callable(_get_session):
@@ -4515,10 +4520,13 @@ class GatewaySlashCommandsMixin:
                     _pv_session_row = await _get_session(session_entry.session_id)
                 except Exception:
                     _pv_session_row = None
+                    _omitted_buckets.append("system prompt")
                 if isinstance(_pv_session_row, dict):
                     _raw_prompt = _pv_session_row.get("system_prompt")
                     if isinstance(_raw_prompt, str) and _raw_prompt.strip():
                         _sys_prompt = _raw_prompt
+            else:
+                _omitted_buckets.append("system prompt")
 
             _pv_tools = None
             if source.platform:
@@ -4543,6 +4551,9 @@ class GatewaySlashCommandsMixin:
                         session_entry.session_id,
                         exc_info=True,
                     )
+                    _omitted_buckets.append("tool schemas")
+            else:
+                _omitted_buckets.append("tool schemas")
 
             approx_tokens = estimate_request_tokens_rough(
                 _pv_msgs, system_prompt=_sys_prompt, tools=_pv_tools
@@ -4551,6 +4562,11 @@ class GatewaySlashCommandsMixin:
                 _pv_msgs, partial, keep_last, focus_topic, approx_tokens
             )
             lines = [f"🗜️ {line}" for line in report["lines"]]
+            if _omitted_buckets:
+                lines.append(
+                    "⚠️ Lower bound — could not resolve: "
+                    + ", ".join(_omitted_buckets) + "."
+                )
             if _aggressive:
                 lines.append(_agg_note)
             return "\n".join(lines)
