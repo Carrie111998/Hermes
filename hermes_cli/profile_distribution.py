@@ -47,6 +47,12 @@ Manifest format (``distribution.yaml`` at the profile root)::
       - skills/
       - cron/
       - mcp.json
+    preload_skills:          # optional; always-active profile guidance
+      - security-review
+
+``preload_skills`` loads full instructions from skills already installed in
+that profile whenever the normal agent system prompt is built. It does not
+grant tools, permissions, or access to skills that are missing or disabled.
 
 Update semantics:
 
@@ -176,6 +182,10 @@ class DistributionManifest:
     license: str = ""
     env_requires: List[EnvRequirement] = field(default_factory=list)
     distribution_owned: List[str] = field(default_factory=list)
+    # Skills this distribution wants loaded into every session for this profile.
+    # This is prompt/context activation only: it grants no extra tools or
+    # permissions, and disabled/missing skills remain unavailable.
+    preload_skills: List[str] = field(default_factory=list)
     # Tracked after install — where we pulled from, so ``update`` can re-pull.
     source: str = ""
     # ISO-8601 UTC timestamp written on install / update, so ``info`` and
@@ -200,6 +210,10 @@ class DistributionManifest:
         if dist_owned_raw and not isinstance(dist_owned_raw, list):
             raise DistributionError("distribution_owned must be a list")
         distribution_owned = [str(p).strip().strip("/") for p in dist_owned_raw if str(p).strip()]
+        preload_raw = data.get("preload_skills") or []
+        if preload_raw and not isinstance(preload_raw, list):
+            raise DistributionError("preload_skills must be a list")
+        preload_skills = [str(s).strip() for s in preload_raw if str(s).strip()]
         return cls(
             name=name,
             version=str(data.get("version") or "0.1.0"),
@@ -209,6 +223,7 @@ class DistributionManifest:
             license=str(data.get("license") or ""),
             env_requires=env_requires,
             distribution_owned=distribution_owned,
+            preload_skills=preload_skills,
             source=str(data.get("source") or ""),
             installed_at=str(data.get("installed_at") or ""),
         )
@@ -230,6 +245,8 @@ class DistributionManifest:
             out["env_requires"] = [e.to_dict() for e in self.env_requires]
         if self.distribution_owned:
             out["distribution_owned"] = self.distribution_owned
+        if self.preload_skills:
+            out["preload_skills"] = self.preload_skills
         if self.source:
             out["source"] = self.source
         if self.installed_at:

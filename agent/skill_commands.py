@@ -193,7 +193,7 @@ def _extract_bundle_user_instruction(message: str) -> Optional[str]:
 def _resolve_skill_commands_platform() -> Optional[str]:
     """Return the current platform scope used for disabled-skill filtering.
 
-    Used to detect when the active platform has shifted so
+    Used to detect when the active platform scope changes so
     :func:`get_skill_commands` can drop a stale cache that was populated
     for a different platform's ``skills.platform_disabled`` view (#14536).
 
@@ -315,8 +315,15 @@ def _build_skill_message(
     user_instruction: str = "",
     runtime_note: str = "",
     session_id: str | None = None,
+    allow_inline_shell: bool = True,
 ) -> str:
-    """Format a loaded skill into a user/system message payload."""
+    """Format a loaded skill into a user/system message payload.
+
+    ``allow_inline_shell`` preserves the existing behavior for explicit skill
+    invocations and CLI/TUI preloads. Automatic native surfaces can disable
+    inline-shell expansion so loading prompt guidance cannot execute host
+    commands as a side effect of prompt construction.
+    """
     from tools.skills_tool import SKILLS_DIR
 
     content = str(loaded_skill.get("content") or "")
@@ -327,7 +334,7 @@ def _build_skill_message(
     skills_cfg = _load_skills_config()
     if skills_cfg.get("template_vars", True):
         content = _substitute_template_vars(content, skill_dir, session_id)
-    if skills_cfg.get("inline_shell", False):
+    if allow_inline_shell and skills_cfg.get("inline_shell", False):
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
         content = _expand_inline_shell(content, skill_dir, timeout)
 
@@ -842,10 +849,24 @@ def build_stacked_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    activation_note_template: str | None = None,
+    allow_inline_shell: bool | None = None,
 ) -> tuple[str, list[str], list[str]]:
-    """Load one or more skills for session-wide CLI/TUI preloading.
+    """Load one or more skills for session-wide preloading.
 
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
+
+    ``activation_note_template`` may override the default CLI activation note.
+    It receives ``{skill_name}`` and is used by other native surfaces such as
+    profile-distribution preloads without duplicating skill-loading logic.
+
+    ``allow_inline_shell`` preserves existing explicit CLI/TUI preload
+    behavior when true. When omitted, the default CLI activation path keeps
+    inline shell enabled while a custom/native-surface activation template
+    defaults to non-executing rendering. Automatic prompt construction must
+    not gain host-command side effects merely because ``skills.inline_shell``
+    is enabled globally. A future custom surface that represents an explicit
+    user invocation may opt in deliberately with ``allow_inline_shell=True``.
 
     Disabled skills are treated the same as missing ones: this loads via a
     raw identifier straight into ``_load_skill_payload``, bypassing
@@ -854,6 +875,9 @@ def build_preloaded_skills_prompt(
     a deployment's ``HERMES_TUI_SKILLS`` env var could force-load a skill an
     operator disabled via ``skills.disabled``/``skills.platform_disabled``.
     """
+    if allow_inline_shell is None:
+        allow_inline_shell = activation_note_template is None
+
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
     missing: list[str] = []
@@ -889,17 +913,21 @@ def build_preloaded_skills_prompt(
         except Exception:
             pass  # Non-critical
 
-        activation_note = (
-            f'[IMPORTANT: The user launched this CLI session with the "{skill_name}" skill '
-            "preloaded. Treat its instructions as active guidance for the duration of this "
-            "session unless the user overrides them.]"
-        )
+        if activation_note_template:
+            activation_note = activation_note_template.format(skill_name=skill_name)
+        else:
+            activation_note = (
+                f'[IMPORTANT: The user launched this CLI session with the "{skill_name}" skill '
+                "preloaded. Treat its instructions as active guidance for the duration of this "
+                "session unless the user overrides them.]"
+            )
         prompt_parts.append(
             _build_skill_message(
                 loaded_skill,
                 skill_dir,
                 activation_note,
                 session_id=task_id,
+                allow_inline_shell=bool(allow_inline_shell),
             )
         )
         loaded_names.append(skill_name)

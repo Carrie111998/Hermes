@@ -85,6 +85,22 @@ def _prompt_parts(agent):
         return build_system_prompt_parts(agent)
 
 
+def test_distribution_preload_prompt_is_in_volatile_tier():
+    agent = _make_agent()
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch(
+            "agent.system_prompt._distribution_preloaded_skills_prompt",
+            return_value="DISTRIBUTION_PRELOAD_MARKER",
+        ),
+    ):
+        parts = build_system_prompt_parts(agent)
+    assert "DISTRIBUTION_PRELOAD_MARKER" in parts["volatile"]
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""

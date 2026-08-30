@@ -405,6 +405,57 @@ def _agent_home(agent: Any) -> Optional[Path]:
     return None
 
 
+def _distribution_preloaded_skills_prompt(agent: Any) -> str:
+    """Render skills declared by this profile distribution as always-active.
+
+    The distribution owns the profile payload already, so preloading one of its
+    installed skills adds prompt context only; it grants no extra tools or
+    permissions. Resolve against the agent's own profile home so multiplexed
+    gateway/Desktop sessions cannot leak another profile's preload contract.
+    """
+    home = _agent_home(agent)
+    if home is None:
+        return ""
+    try:
+        from hermes_cli.profile_distribution import read_manifest
+
+        manifest = read_manifest(home)
+    except Exception as exc:
+        logger.debug("profile preload manifest unavailable for %s: %s", home, exc)
+        return ""
+    identifiers = list(getattr(manifest, "preload_skills", None) or []) if manifest else []
+    if not identifiers:
+        return ""
+
+    try:
+        from agent.skill_commands import build_preloaded_skills_prompt
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        token = set_hermes_home_override(home)
+        try:
+            prompt, _loaded, missing = build_preloaded_skills_prompt(
+                identifiers,
+                task_id=str(getattr(agent, "session_id", "") or "") or None,
+                activation_note_template=(
+                    '[IMPORTANT: This profile distribution preloads the "{skill_name}" skill. '
+                    "Treat its instructions as active guidance for this profile on every turn "
+                    "unless the user explicitly overrides them.]"
+                ),
+            )
+        finally:
+            reset_hermes_home_override(token)
+        if missing:
+            logger.warning(
+                "Profile distribution preload missing/disabled skill(s) for %s: %s",
+                home,
+                ", ".join(missing),
+            )
+        return prompt or ""
+    except Exception as exc:
+        logger.warning("Could not render profile distribution preloads for %s: %s", home, exc)
+        return ""
+
+
 def _agent_skills_dir(agent: Any) -> Optional[Path]:
     """The agent's own ``<home>/skills`` dir, or None to use ambient home."""
     home = _agent_home(agent)
@@ -916,6 +967,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # system message is one cache unit regardless of internal order.)
     if skills_prompt:
         volatile_parts.append(skills_prompt)
+
+    distribution_preloads = _distribution_preloaded_skills_prompt(agent)
+    if distribution_preloads:
+        volatile_parts.append(distribution_preloads)
 
     if agent._memory_store:
         if agent._memory_enabled:
