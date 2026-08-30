@@ -231,7 +231,17 @@ def test_severity_at_or_above_uses_threshold_semantics():
 # ---------------------------------------------------------------------------
 
 
-def test_role_assignee_mismatch_fires_on_common_prefixes():
+def test_role_assignee_mismatch_fires_on_common_prefixes(tmp_path, monkeypatch):
+    hermes_root = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_root))
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: hermes_root)
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: hermes_root / "profiles")
+
+    for p in ("coder", "reviewer", "devops"):
+        pdir = hermes_root / "profiles" / p
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "config.yaml").write_text(f"model: {p}-test\n")
+
     cases = [
         ("Coder: fix memory leak", "reviewer", "Coder", "coder"),
         ("Reviewer: review PR #123", "coder", "Reviewer", "reviewer"),
@@ -382,6 +392,91 @@ def test_role_assignee_mismatch_suppresses_suggested_reassign_for_tombstoned_pro
     conn = kb.connect()
     try:
         t_id = kb.create_task(conn, title="Ghost task", assignee="ghost")
+        dispatch_result = kb.dispatch_once(conn)
+        assert t_id in dispatch_result.skipped_nonspawnable, (
+            f"Expected {t_id} in skipped_nonspawnable, got {dispatch_result.skipped_nonspawnable}"
+        )
+    finally:
+        conn.close()
+
+
+def test_list_profiles_on_disk_filters_tombstones(tmp_path, monkeypatch):
+    """list_profiles_on_disk() discovers live profiles with config.yaml and excludes tombstoned dirs."""
+    from hermes_constants import mark_named_profile_deleted
+    from hermes_cli.kanban_db import list_profiles_on_disk
+
+    hermes_root = tmp_path / ".hermes"
+    profiles_dir = hermes_root / "profiles"
+    profiles_dir.mkdir(parents=True)
+
+    live_dir = profiles_dir / "live_worker"
+    live_dir.mkdir()
+    (live_dir / "config.yaml").write_text("model: test\n")
+
+    tomb_dir = profiles_dir / "tomb_worker"
+    tomb_dir.mkdir()
+    (tomb_dir / "config.yaml").write_text("model: test\n")
+    mark_named_profile_deleted(tomb_dir)
+
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: hermes_root)
+
+    discovered = list_profiles_on_disk()
+    assert "live_worker" in discovered
+    assert "tomb_worker" not in discovered
+    assert "default" in discovered
+
+
+def test_role_assignee_mismatch_explicit_config_tombstone_filtered_via_load_config(tmp_path, monkeypatch):
+    """When config.yaml defines explicit `profiles: [ghost]` but ghost has a tombstone,
+    kd.config_from_runtime_config(load_config()) processes the config and ensures ghost
+    is not marked spawnable and produces no suggested reassign or CLI actions."""
+    from hermes_constants import mark_named_profile_deleted
+    from hermes_cli.profiles import profile_exists
+    from hermes_cli.config import load_config
+    import yaml
+
+    now = int(time.time())
+    hermes_root = tmp_path / ".hermes"
+    ghost_dir = hermes_root / "profiles" / "ghost"
+    ghost_dir.mkdir(parents=True)
+    (ghost_dir / "config.yaml").write_text("model: ghost-model\n")
+    mark_named_profile_deleted(ghost_dir)
+
+    cfg_file = hermes_root / "config.yaml"
+    cfg_file.write_text(yaml.dump({"profiles": ["ghost", "reviewer"]}))
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_root))
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: hermes_root)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_root)
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: hermes_root / "profiles")
+
+    assert not profile_exists("ghost"), "Tombstoned ghost profile must not exist"
+
+    runtime_cfg = load_config()
+    diag_cfg = kd.config_from_runtime_config(runtime_cfg)
+    assert "profiles" in diag_cfg
+
+    task = _task(title="Ghost: run ghost job", assignee="reviewer", status="ready")
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=diag_cfg)
+    mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+    assert len(mismatches) == 1
+    d = mismatches[0]
+    assert d.severity == "warning"
+    assert d.data["role_prefix"] == "Ghost"
+    assert d.data["expected_assignee"] == "ghost"
+    # Actionable reassign and CLI actions must NOT be produced for tombstoned profile
+    suggested_actions = [a for a in d.actions if a.suggested]
+    assert len(suggested_actions) == 0, f"Expected 0 suggested actions, got: {suggested_actions}"
+    reassign_actions = [a for a in d.actions if a.kind == "reassign"]
+    assert len(reassign_actions) == 0, f"Expected 0 reassign actions, got: {reassign_actions}"
+    cli_actions = [a for a in d.actions if a.kind == "cli_hint"]
+    assert len(cli_actions) == 0, f"Expected 0 cli_hint actions, got: {cli_actions}"
+
+    # Dispatcher contract check
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        t_id = kb.create_task(conn, title="Ghost: run ghost job", assignee="ghost")
         dispatch_result = kb.dispatch_once(conn)
         assert t_id in dispatch_result.skipped_nonspawnable, (
             f"Expected {t_id} in skipped_nonspawnable, got {dispatch_result.skipped_nonspawnable}"

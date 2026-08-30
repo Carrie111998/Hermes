@@ -1540,6 +1540,10 @@
     const [copiedKey, setCopiedKey] = useState(null);
     const [reassignProfile, setReassignProfile] = useState(defaultReassignProfile);
 
+    useEffect(function () {
+      setReassignProfile(defaultReassignProfile);
+    }, [defaultReassignProfile]);
+
     const execAction = function (action) {
       if (busy) return;
       if (action.kind === "cli_hint") {
@@ -4786,11 +4790,4 @@
   }
   KanbanPage.DiagnosticCard = DiagnosticCard;
   KanbanPage.DiagnosticsSection = DiagnosticsSection;
-  if (typeof window !== "undefined") {
-    window.HermesKanban = {
-      KanbanPage: KanbanPage,
-      DiagnosticCard: DiagnosticCard,
-      DiagnosticsSection: DiagnosticsSection,
-    };
-  }
 })();

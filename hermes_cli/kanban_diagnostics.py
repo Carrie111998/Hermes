@@ -1150,42 +1150,54 @@ def _rule_role_assignee_mismatch(task, events, runs, now, cfg) -> list[Diagnosti
 
     role_norm = role_prefix.strip().lower()
 
-    installed_profiles: set[str] = set()
-    cfg_has_explicit_profiles = False
+    # Recognized roles: common prefix vocabulary + on-disk profile directories + configured profiles
+    recognized_roles: set[str] = set(COMMON_ROLE_PREFIXES)
+    try:
+        from hermes_cli.profiles import list_profile_names
+        for p in list_profile_names():
+            s = str(p).strip().lower()
+            if s:
+                recognized_roles.add(s)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.kanban_db import list_profiles_on_disk
+        for p in list_profiles_on_disk():
+            s = str(p).strip().lower()
+            if s:
+                recognized_roles.add(s)
+    except Exception:
+        pass
+
+    configured_profiles: set[str] = set()
     if isinstance(cfg, dict) and "profiles" in cfg:
-        cfg_has_explicit_profiles = True
         profiles_cfg = cfg.get("profiles")
         if isinstance(profiles_cfg, (list, set, tuple, dict)):
             for p in profiles_cfg:
                 try:
                     s = str(p).strip().lower()
                     if s:
-                        installed_profiles.add(s)
+                        configured_profiles.add(s)
+                        recognized_roles.add(s)
                 except Exception:
                     continue
 
-    recognized_roles: set[str] = set(COMMON_ROLE_PREFIXES)
-    if not cfg_has_explicit_profiles:
-        installed_profiles = _discover_installed_profiles()
-        try:
-            from hermes_cli.profiles import list_profile_names
-            for p in list_profile_names():
-                s = str(p).strip().lower()
-                if s:
-                    recognized_roles.add(s)
-        except Exception:
-            pass
-    else:
-        recognized_roles |= installed_profiles
-
-    known_roles = recognized_roles | installed_profiles
-    if role_norm not in known_roles:
+    if role_norm not in recognized_roles:
         return []
 
     if role_norm == assignee.lower():
         return []
 
-    is_spawnable = role_norm in installed_profiles
+    # Actionable target: must be a live (non-tombstoned) profile verified via profile_exists
+    installed_profiles = _discover_installed_profiles()
+    try:
+        from hermes_cli.profiles import profile_exists
+        for p in configured_profiles:
+            if profile_exists(p):
+                installed_profiles.add(p)
+        is_spawnable = (role_norm in installed_profiles) and profile_exists(role_norm)
+    except Exception:
+        is_spawnable = role_norm in installed_profiles
     task_id = str(_task_field(task, "id") or "")
     actions: list[DiagnosticAction] = []
     if is_spawnable:

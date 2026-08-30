@@ -1173,45 +1173,40 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
 
 
 def _render_dashboard_diagnostic_card(
-    diag: dict,
-    task: dict,
+    diag: dict | None = None,
+    task: dict | None = None,
     board_slug: str = "default",
     assignees: list[str] | None = None,
+    steps: list[dict] | None = None,
 ) -> dict:
     """Execute DiagnosticCard from plugins/kanban/dashboard/dist/index.js in Node.js
-    and capture rendered DOM state plus executed network POST actions."""
+    using real React and JSDOM to capture rendered DOM state plus executed network POST actions."""
     import json
+    import os
     import subprocess
     from pathlib import Path
+    from hermes_constants import find_hermes_node_executable
 
     repo_root = Path(__file__).resolve().parents[2]
     bundle_path = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
 
     runner_script = """
 const fs = require("fs");
+const jsdom = require("jsdom");
+const { JSDOM } = jsdom;
+const dom = new JSDOM("<!DOCTYPE html><html><body><div id=\\"root\\"></div></body></html>", { url: "http://localhost" });
+globalThis.window = dom.window;
+globalThis.document = dom.window.document;
+globalThis.navigator = dom.window.navigator;
+globalThis.HTMLElement = dom.window.HTMLElement;
+globalThis.Node = dom.window.Node;
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+const React = require("react");
+const ReactDOMClient = require("react-dom/client");
 
 let registeredPage = null;
 const postCalls = [];
-
-const React = {
-  Component: class Component {},
-  createElement: (type, props, ...children) => {
-    return { type, props: props || {}, children: children.flat(Infinity) };
-  }
-};
-
-let hookState = [];
-let hookIdx = 0;
-function useState(initial) {
-  const idx = hookIdx++;
-  if (hookState[idx] === undefined) {
-    hookState[idx] = typeof initial === "function" ? initial() : initial;
-  }
-  const setter = (val) => {
-    hookState[idx] = typeof val === "function" ? val(hookState[idx]) : val;
-  };
-  return [hookState[idx], setter];
-}
 
 const SDK = {
   React,
@@ -1226,11 +1221,11 @@ const SDK = {
     Badge: (props) => React.createElement("span", props),
   },
   hooks: {
-    useState,
-    useEffect: (fn) => fn(),
-    useCallback: (fn) => fn,
-    useMemo: (fn) => fn(),
-    useRef: (initial) => ({ current: initial }),
+    useState: React.useState,
+    useEffect: React.useEffect,
+    useCallback: React.useCallback,
+    useMemo: React.useMemo,
+    useRef: React.useRef,
   },
   utils: {
     cn: (...args) => args.filter(Boolean).join(" "),
@@ -1243,80 +1238,91 @@ const SDK = {
   }
 };
 
-globalThis.window = {
-  __HERMES_PLUGIN_SDK__: SDK,
-  __HERMES_PLUGINS__: {
-    register: (name, component) => {
-      registeredPage = component;
-    }
-  },
-  prompt: (msg, val) => val,
-  navigator: {
-    clipboard: {
-      writeText: async (text) => {},
-    },
-  },
-};
-globalThis.document = {
-  querySelector: () => null,
+globalThis.window.__HERMES_PLUGIN_SDK__ = SDK;
+globalThis.window.__HERMES_PLUGINS__ = {
+  register: (name, component) => {
+    registeredPage = component;
+  }
 };
 
 const bundleCode = fs.readFileSync(process.argv[1], "utf8");
 eval(bundleCode);
 
-const DiagnosticCard = (globalThis.window.HermesKanban && globalThis.window.HermesKanban.DiagnosticCard) ||
-  (registeredPage && registeredPage.DiagnosticCard);
-
+const DiagnosticCard = registeredPage && registeredPage.DiagnosticCard;
 if (!DiagnosticCard) {
-  throw new Error("DiagnosticCard component not exposed on HermesKanban or registeredPage");
+  throw new Error("DiagnosticCard component not exposed on registeredPage");
 }
 
 const rawInput = fs.readFileSync(0, "utf8");
 const inputData = JSON.parse(rawInput);
-const vdom = DiagnosticCard(inputData);
+const steps = Array.isArray(inputData.steps) ? inputData.steps : [inputData];
 
-function findInTree(node, predicate) {
-  const res = [];
-  if (!node) return res;
-  if (predicate(node)) res.push(node);
-  if (node.children) {
-    for (const c of node.children) {
-      res.push(...findInTree(c, predicate));
+const container = document.getElementById("root");
+const root = ReactDOMClient.createRoot(container);
+
+(async () => {
+  const stepResults = [];
+  for (let s = 0; s < steps.length; s++) {
+    const step = steps[s];
+    const props = {
+      diag: step.diag,
+      task: step.task,
+      boardSlug: step.boardSlug || inputData.boardSlug || "default",
+      assignees: step.assignees || inputData.assignees || ["coder", "reviewer", "devops"],
+      onRefresh: () => {},
+    };
+
+    await React.act(async () => {
+      root.render(React.createElement(DiagnosticCard, { key: "diag-card-stable-key", ...props }));
+    });
+
+    const selectEl = container.querySelector("select");
+    const selectedValue = selectEl ? selectEl.value : null;
+
+    if (step.clickReassign !== false) {
+      const btns = container.querySelectorAll("button");
+      for (const btn of btns) {
+        if (btn.textContent.includes("Reassign")) {
+          await React.act(async () => {
+            btn.click();
+            await new Promise(r => setTimeout(r, 10));
+          });
+        }
+      }
     }
+
+    stepResults.push({
+      stepIndex: s,
+      selectedValue,
+    });
   }
-  return res;
-}
 
-const selectNodes = findInTree(vdom, n => n.type === "select");
-const selectedValue = selectNodes.length > 0 ? selectNodes[0].props.value : null;
-
-const btnNodes = findInTree(vdom, n => n.type && (n.type.name === "DiagnosticActionButton" || n.type === "button"));
-for (const btn of btnNodes) {
-  if (btn.props && typeof btn.props.onExec === "function" && btn.props.action && btn.props.action.kind === "reassign") {
-    btn.props.onExec(btn.props.action);
-  }
-}
-
-console.log(JSON.stringify({
-  selectedValue,
-  postCalls,
-}));
+  console.log(JSON.stringify({
+    selectedValue: stepResults[stepResults.length - 1].selectedValue,
+    stepResults,
+    postCalls,
+  }));
+})();
 """
 
-    payload = {
-        "diag": diag,
-        "task": task,
-        "boardSlug": board_slug,
-        "assignees": assignees or ["coder", "reviewer"],
-    }
-    from hermes_constants import find_hermes_node_executable
-    import shutil
-    node_bin = find_hermes_node_executable("node") or shutil.which("node") or "node"
+    if steps is not None:
+        payload = {"steps": steps, "boardSlug": board_slug, "assignees": assignees}
+    else:
+        payload = {
+            "diag": diag,
+            "task": task,
+            "boardSlug": board_slug,
+            "assignees": assignees or ["coder", "reviewer"],
+        }
+    node_bin = find_hermes_node_executable("node") or "node"
+    env = dict(os.environ)
+    env["NODE_PATH"] = str(repo_root / "node_modules")
     proc = subprocess.run(
         [node_bin, "-e", runner_script, str(bundle_path)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
+        env=env,
     )
     if proc.returncode != 0:
         raise RuntimeError(
@@ -1379,6 +1385,92 @@ def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clear
     assert r2.status_code == 200
     mismatch_rows2 = [row for row in r2.json()["diagnostics"] if row["task_id"] == t]
     assert len(mismatch_rows2) == 0
+
+
+def test_diagnostic_card_rerender_synchronizes_suggested_assignee_and_posts_updated_target():
+    """Rerender regression: when DiagnosticCard remains mounted under a stable key
+    and suggested_assignee prop changes from coder to reviewer, reassignProfile must
+    synchronize with the updated suggestion and clicking reassign must POST reviewer."""
+    diag_step1 = {
+        "kind": "role_assignee_mismatch",
+        "severity": "warning",
+        "title": "Title role prefix mismatches",
+        "detail": "Mismatch detail",
+        "actions": [{
+            "kind": "reassign",
+            "label": "Reassign to @coder",
+            "payload": {"suggested_assignee": "coder", "current_assignee": "reviewer"},
+            "suggested": True,
+        }],
+    }
+    task_step1 = {"id": "t_1", "title": "Coder: fix bug", "assignee": "reviewer"}
+
+    diag_step2 = {
+        "kind": "role_assignee_mismatch",
+        "severity": "warning",
+        "title": "Title role prefix mismatches",
+        "detail": "Mismatch detail",
+        "actions": [{
+            "kind": "reassign",
+            "label": "Reassign to @reviewer",
+            "payload": {"suggested_assignee": "reviewer", "current_assignee": "coder"},
+            "suggested": True,
+        }],
+    }
+    task_step2 = {"id": "t_1", "title": "Reviewer: review PR", "assignee": "coder"}
+
+    steps = [
+        {"diag": diag_step1, "task": task_step1, "clickReassign": False},
+        {"diag": diag_step2, "task": task_step2, "clickReassign": True},
+    ]
+
+    res = _render_dashboard_diagnostic_card(steps=steps, board_slug="default", assignees=["coder", "reviewer", "devops"])
+    assert res["stepResults"][0]["selectedValue"] == "coder", (
+        f"Initial mount expected selectedValue 'coder', got {res['stepResults'][0]['selectedValue']}"
+    )
+    assert res["stepResults"][1]["selectedValue"] == "reviewer", (
+        f"After rerender expected selectedValue 'reviewer', got {res['stepResults'][1]['selectedValue']}"
+    )
+    assert len(res["postCalls"]) == 1
+    post_body = json.loads(res["postCalls"][0]["opts"]["body"])
+    assert post_body["profile"] == "reviewer", (
+        f"POST request expected profile 'reviewer', got {post_body['profile']}"
+    )
+
+
+def test_diagnostics_endpoint_with_explicit_config_tombstone_suppresses_suggested_reassign(client, kanban_home):
+    """When runtime config contains explicit `profiles: [ghost]` but ghost is tombstoned on disk,
+    the diagnostics endpoint emits advisory role mismatch without suggested reassign actions."""
+    from hermes_constants import mark_named_profile_deleted
+    import yaml
+
+    # Write config with explicit profiles
+    cfg_data = {"profiles": ["ghost", "reviewer"]}
+    (kanban_home / "config.yaml").write_text(yaml.dump(cfg_data))
+
+    # Create tombstoned ghost profile directory
+    ghost_dir = kanban_home / "profiles" / "ghost"
+    ghost_dir.mkdir(parents=True, exist_ok=True)
+    (ghost_dir / "config.yaml").write_text("model: ghost-test\n")
+    mark_named_profile_deleted(ghost_dir)
+
+    conn = kb.connect()
+    try:
+        t = kb.create_task(conn, title="Ghost: cleanup memory", assignee="reviewer")
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    mismatch_rows = [row for row in data["diagnostics"] if row["task_id"] == t]
+    assert len(mismatch_rows) == 1
+    diag = mismatch_rows[0]["diagnostics"][0]
+    assert diag["kind"] == "role_assignee_mismatch"
+    suggested_actions = [a for a in diag.get("actions", []) if a.get("suggested")]
+    assert len(suggested_actions) == 0, f"Expected 0 suggested actions for dead ghost, got {suggested_actions}"
+    reassign_actions = [a for a in diag.get("actions", []) if a.get("kind") == "reassign"]
+    assert len(reassign_actions) == 0, f"Expected 0 reassign actions for dead ghost, got {reassign_actions}"
 
 
 
