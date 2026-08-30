@@ -77,7 +77,9 @@ const {
   setPrimaryGateway
 } = await import('./gateway')
 
-const { requestForSessionProfile, sessionRpcNeedsProfileRoute } = await import('./session-request-router')
+const { requestForSessionProfile, sessionOwnerRouteForOpen, sessionRpcNeedsProfileRoute } =
+  await import('./session-request-router')
+
 const { $connectionsRegistry } = await import('./connection-registry-state')
 
 function installDesktop(): void {
@@ -175,6 +177,31 @@ describe('sessionRpcNeedsProfileRoute', () => {
   it('pins a route owner with a connectionId', () => {
     expect(sessionRpcNeedsProfileRoute({ connectionId: 'local', profile: 'developer' })).toBe(true)
     expect(sessionRpcNeedsProfileRoute({ connectionId: '', profile: 'developer' })).toBe(false)
+  })
+})
+
+describe('sessionOwnerRouteForOpen', () => {
+  it('keeps a connection-tagged row on its authoritative source', () => {
+    expect(
+      sessionOwnerRouteForOpen({ connection_id: 'source-a', profile: 'worker' }, 'source-b')
+    ).toEqual({ connectionId: 'source-a', profile: 'worker', targetProfile: 'worker' })
+  })
+
+  it('routes an untagged existing row through the active registry source', () => {
+    expect(sessionOwnerRouteForOpen({ profile: 'default' }, 'forge')).toEqual({
+      connectionId: 'forge',
+      profile: 'default',
+      targetProfile: 'default'
+    })
+  })
+
+  it('preserves the legacy local fallback when no registry source is active', () => {
+    expect(sessionOwnerRouteForOpen({ profile: 'developer' }, null)).toEqual({
+      connectionId: 'local',
+      mode: 'local',
+      profile: 'developer',
+      targetProfile: 'developer'
+    })
   })
 })
 

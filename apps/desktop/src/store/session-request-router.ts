@@ -43,6 +43,37 @@ export function sessionOwnerRouteFromRow(
   return { connectionId, profile: String(row?.profile ?? '').trim() || 'default' }
 }
 
+/**
+ * Resolve the exact owner captured by a sidebar open intent.
+ *
+ * Unified-list rows from another registered source carry `connection_id` and
+ * remain authoritative. Rows returned directly by the active backend can be
+ * untagged, however; those inherit the active registry connection instead of
+ * being mislabeled as local. Only a legacy window with no registry identity
+ * falls back to the local profile door.
+ */
+export function sessionOwnerRouteForOpen(
+  row: { connection_id?: null | string; profile?: null | string } | null | undefined,
+  activeConnectionId: null | string | undefined
+): SessionOwnerRoute | undefined {
+  const profile = String(row?.profile ?? '').trim()
+
+  if (!profile) {
+    return undefined
+  }
+
+  const rowConnectionId = String(row?.connection_id ?? '').trim()
+  const activeConnection = String(activeConnectionId ?? '').trim()
+  const connectionId = rowConnectionId || activeConnection || 'local'
+
+  return {
+    connectionId,
+    ...(rowConnectionId || activeConnection ? {} : { mode: 'local' as const }),
+    profile,
+    targetProfile: profile
+  }
+}
+
 // ── Session-scoped RPC routing (the #89206 class) ───────────────────────────
 // A session-scoped RPC (session.resume / session.activate / session.usage /
 // prompt.submit) only means anything on the backend that OWNS the session's
