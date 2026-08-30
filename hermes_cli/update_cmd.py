@@ -2979,6 +2979,14 @@ def _receipt_reports_stale_runtime(expected_sha: str | None = None) -> bool:
     post-restart ``fleet`` matrix when present; fall back to the plan only
     for an unfinished receipt (interrupt / failed / incomplete restart) —
     the #95294 smoking-gun shape.
+
+    Guard (#98022): when the receipt is from an interrupted run but the
+    code that was *pulled* in that run (receipt["post_update"]["sha"])
+    already matches the current checkout, the fleet is already on the
+    right code and no restart is needed.  Without this guard an interrupted
+    receipt triggers a catchup restart on every subsequent ``hermes update``
+    call because ``plan.runtimes[].code_sha`` always contains the *pre-pull*
+    SHAs which will never equal the post-pull checkout.
     """
     try:
         from hermes_cli.update_receipt import read_latest_receipt
@@ -3009,6 +3017,16 @@ def _receipt_reports_stale_runtime(expected_sha: str | None = None) -> bool:
 
     if not _receipt_looks_unfinished(receipt):
         return False
+
+    # Guard #98022: the interrupted receipt pulled a specific code version.
+    # If that version matches the current checkout, the code is already
+    # current — re-triggering a catchup restart every run is wrong.
+    post_update = receipt.get("post_update")
+    if isinstance(post_update, dict):
+        pulled_sha = post_update.get("sha") or post_update.get("code_sha")
+        if pulled_sha and str(pulled_sha) == str(expected_sha):
+            return False
+
     plan = receipt.get("plan")
     if not isinstance(plan, dict):
         return False
