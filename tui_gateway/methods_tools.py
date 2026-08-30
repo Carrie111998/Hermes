@@ -265,7 +265,7 @@ def _(rid, params: dict) -> dict:
 
         all_pairs: list[list[str]] = []
         canon: dict[str, str] = {}
-        commands: dict[str, dict[str, str | None]] = {}
+        commands: dict[str, dict[str, object]] = {}
         categories: list[dict] = []
         cat_map: dict[str, list[list[str]]] = {}
         cat_order: list[str] = []
