@@ -16,6 +16,29 @@ def test_gateway_config_stt_disabled_from_dict_nested():
     assert config.stt_enabled is False
 
 
+def test_gateway_config_stt_local_fallback_defaults_to_true():
+    assert GatewayConfig.from_dict({}).stt_local_fallback is True
+
+
+def test_gateway_config_stt_local_fallback_disabled_from_dict_nested():
+    config = GatewayConfig.from_dict({"stt": {"local_fallback": False}})
+    assert config.stt_local_fallback is False
+
+
+def test_load_gateway_config_bridges_stt_local_fallback_from_config_yaml(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"stt": {"local_fallback": False}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert load_gateway_config().stt_local_fallback is False
+
+
 def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
