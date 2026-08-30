@@ -42,6 +42,88 @@ class TestUserSystemdPrivateSocketPreflight:
         assert calls == ["env"]
 
 
+class TestUserUnitDirResolvesAccountHome:
+    """User-scope unit paths must resolve to the login account home (#98699).
+
+    Profile isolation can point the process ``HOME`` at
+    ``{HERMES_HOME}/home`` — the *active* profile's, not even the one
+    selected with ``-p``. A unit written under a profile home is invisible
+    to ``systemctl --user``: ``gateway install`` reports success while the
+    service never exists.
+    """
+
+    def _profile_homes(self, tmp_path):
+        real = tmp_path / "account-home"
+        amelia = tmp_path / "dot-hermes" / "profiles" / "amelia" / "home"
+        nick = tmp_path / "dot-hermes" / "profiles" / "nick-white" / "home"
+        for d in (real, amelia, nick):
+            d.mkdir(parents=True)
+        return real, amelia, nick
+
+    def test_unit_path_ignores_profile_home(self, tmp_path, monkeypatch):
+        real, amelia, _nick = self._profile_homes(tmp_path)
+        monkeypatch.setenv("HOME", str(amelia))
+        monkeypatch.setenv(
+            "HERMES_HOME", str(tmp_path / "dot-hermes" / "profiles" / "amelia")
+        )
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(real)))
+
+        unit = gateway_cli.get_systemd_unit_path()
+
+        expected = (
+            real / ".config" / "systemd" / "user" / f"{gateway_cli.get_service_name()}.service"
+        )
+        assert unit == expected
+        assert str(amelia) not in str(unit)
+
+    def test_unit_path_ignores_sibling_profile_home(self, tmp_path, monkeypatch):
+        # Issue #98699: HOME points at the *active* profile's home while -p
+        # selected a different profile — neither is the account home.
+        real, amelia, _nick = self._profile_homes(tmp_path)
+        monkeypatch.setenv("HOME", str(amelia))
+        monkeypatch.setenv(
+            "HERMES_HOME", str(tmp_path / "dot-hermes" / "profiles" / "nick-white")
+        )
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(real)))
+
+        unit = gateway_cli.get_systemd_unit_path()
+
+        expected = (
+            real / ".config" / "systemd" / "user" / f"{gateway_cli.get_service_name()}.service"
+        )
+        assert unit == expected
+
+    def test_recorded_real_home_wins(self, tmp_path, monkeypatch):
+        real, amelia, _nick = self._profile_homes(tmp_path)
+        monkeypatch.setenv("HOME", str(amelia))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real))
+        monkeypatch.setattr(
+            pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir="/etc/passwd-fallback")
+        )
+
+        unit = gateway_cli.get_systemd_unit_path()
+
+        expected = (
+            real / ".config" / "systemd" / "user" / f"{gateway_cli.get_service_name()}.service"
+        )
+        assert unit == expected
+
+    def test_legacy_search_paths_use_account_home(self, tmp_path, monkeypatch):
+        real, amelia, _nick = self._profile_homes(tmp_path)
+        monkeypatch.setenv("HOME", str(amelia))
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(real)))
+
+        paths = gateway_cli._legacy_unit_search_paths()
+
+        assert paths == [
+            (False, real / ".config" / "systemd" / "user"),
+            (True, Path("/etc/systemd/system")),
+        ]
+
+
 class TestSystemdServiceRefresh:
 
 
