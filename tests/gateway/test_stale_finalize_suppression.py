@@ -158,7 +158,22 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
+class FinalizeFailAdapter(FinalizeCaptureAdapter):
+    """Adapter where finalize=True edit fails (e.g. rate limit/flood control)."""
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        if finalize:
+            return SendResult(success=False, error="flood_control")
+        return await super().edit_message(
+            chat_id, message_id, content, finalize=finalize, metadata=metadata
+        )
+
+
+async def _run_streaming_turn(
+    monkeypatch, tmp_path, agent_cls, session_id, adapter_cls=FinalizeCaptureAdapter
+):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -183,7 +198,7 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = FinalizeCaptureAdapter()
+    adapter = adapter_cls()
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -265,6 +280,80 @@ async def test_equal_text_control_still_suppresses_duplicate_send(
     # (created by one send, then edited). No duplicate full send.
     full_sends = [c for c in adapter.sent if FULL_RESPONSE in c["content"]]
     assert len(full_sends) <= 1, f"duplicate final delivery: {full_sends!r}"
+
+
+class _UnrecordedStalePreviewConsumer(GatewayStreamConsumer):
+    """Force the #98552 shape: partial preview with cursor, but unrecorded final payload."""
+
+    async def run(self):
+        await super().run()
+        self._final_response_sent = True
+        self._final_content_delivered = True
+        self._delivered_final_text = None
+        self._last_sent_text = STREAMED_PREFIX + " ▉"
+
+
+@pytest.mark.asyncio
+async def test_unrecorded_stale_preview_does_not_suppress_complete_response(
+    monkeypatch, tmp_path
+):
+    """#98552 — unrecorded finalize with partial on-screen preview must not suppress final send."""
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {"tool_progress": "off", "interim_assistant_messages": False},
+                "streaming": {
+                    "enabled": True,
+                    "edit_interval": 0.01,
+                    "buffer_threshold": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = StalePrefixAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = FinalizeCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    stream_consumer_mod = importlib.import_module("gateway.stream_consumer")
+    monkeypatch.setattr(
+        stream_consumer_mod,
+        "GatewayStreamConsumer",
+        _UnrecordedStalePreviewConsumer,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    result = await runner._run_agent(
+        message="describe this photo",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-98552-unrecorded-preview",
+        session_key="agent:main:telegram:group:-1001",
+    )
+
+    assert result["final_response"] == FULL_RESPONSE
+    # Delivery must not have been suppressed
+    full_sends = [c for c in adapter.sent if FULL_RESPONSE in c["content"]]
+    assert len(full_sends) == 1, f"expected normal final send, got: {adapter.sent!r}"
 
 
 class _PayloadLessSplitConsumer(GatewayStreamConsumer):
@@ -376,6 +465,20 @@ class TestDeliveredFinalMatches:
     def test_no_record_returns_none(self):
         consumer = _consumer()
         assert consumer.delivered_final_matches("anything") is None
+
+    def test_no_record_with_stale_visible_prefix_returns_false(self):
+        """#98552: unrecorded finalize with partial on-screen preview must return False."""
+        consumer = _consumer()
+        consumer._last_sent_text = STREAMED_PREFIX + " ▉"
+        consumer._delivered_final_text = None
+        assert consumer.delivered_final_matches(FULL_RESPONSE) is False
+
+    def test_no_record_with_matching_visible_prefix_returns_true(self):
+        """Visible on-screen preview matching full response (only cursor unstripped) matches."""
+        consumer = _consumer()
+        consumer._last_sent_text = FULL_RESPONSE + " ▉"
+        consumer._delivered_final_text = None
+        assert consumer.delivered_final_matches(FULL_RESPONSE) is True
 
     def test_matching_record_returns_true(self):
         consumer = _consumer()

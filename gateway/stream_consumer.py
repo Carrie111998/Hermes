@@ -655,6 +655,13 @@ class GatewayStreamConsumer:
             if self._turn_split_delivery:
                 # #78541: refuse legacy trust for payload-less split delivery.
                 return False
+            # If we have a visible on-screen prefix:
+            # - If it demonstrably differs from target (e.g. truncated preview with cursor),
+            #   this is a stale delivery and must not be trusted (#98552).
+            # - If it matches target (e.g. preview delivered full response), it is confirmed.
+            visible_prefix = self._visible_prefix().strip()
+            if visible_prefix:
+                return visible_prefix == target
             return None
         if self._delivered_final_text.strip() == target:
             return True

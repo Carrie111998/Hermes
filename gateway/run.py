@@ -31040,7 +31040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             content=_final,
                             finalize=True,
                         )
-                        if getattr(_reconcile_res, "success", True):
+                        if _reconcile_res is not None and getattr(_reconcile_res, "success", False) is True:
                             response["already_sent"] = True
                             logger.info(
                                 "Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).",
