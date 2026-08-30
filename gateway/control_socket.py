@@ -172,6 +172,13 @@ def _detect_supervisor() -> str:
         return "desktop"
     if "--external-supervisor" in sys.argv:
         return "external"
+    try:
+        from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV
+
+        if env.get(EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV) == str(os.getpid()):
+            return "external"
+    except Exception:
+        pass
     return "manual"
 
 

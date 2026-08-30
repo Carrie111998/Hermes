@@ -20,6 +20,22 @@ def test_external_marker_identifies_supervisor_process(monkeypatch):
     assert gateway._running_under_gateway_supervisor() is True
 
 
+def test_control_identity_reports_pid_bound_external_supervisor(monkeypatch):
+    """Live identity must expose wrapped-runtime ownership to update clients."""
+    import gateway.control_socket as control_socket
+
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_MANAGED", raising=False)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+    monkeypatch.setenv(
+        gateway.EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV,
+        str(control_socket.os.getpid()),
+    )
+    monkeypatch.setattr(control_socket.sys, "argv", ["hermes", "gateway", "run"])
+
+    assert control_socket._detect_supervisor() == "external"
+
+
 def test_gateway_run_external_supervisor_flag_marks_process(monkeypatch):
     monkeypatch.delenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
     monkeypatch.setattr(
@@ -156,6 +172,29 @@ def test_update_hands_external_supervisor_gateway_back_without_watcher(monkeypat
             "run",
             "--external-supervisor",
         ],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "launch_detached_profile_gateway_restart",
+        lambda *_args: pytest.fail("detached watcher must not be launched"),
+    )
+
+    assert gateway._prepare_profile_gateway_update_restart("work", 1234) == (
+        "external-supervisor"
+    )
+
+
+def test_update_hands_pid_bound_gateway_back_without_watcher(monkeypatch):
+    """Update must not race the wrapped runtime with a detached watcher."""
+    monkeypatch.setattr(
+        gateway,
+        "_capture_gateway_argv",
+        lambda _pid: ["python", "-m", "hermes_cli.main", "gateway", "run"],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_gateway_process_has_bound_external_supervisor",
+        lambda pid: pid == 1234,
     )
     monkeypatch.setattr(
         gateway,

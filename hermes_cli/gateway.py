@@ -1018,12 +1018,26 @@ def _capture_gateway_argv(pid: int) -> list[str] | None:
     return argv
 
 
+def _gateway_process_has_bound_external_supervisor(pid: int) -> bool:
+    """Return whether ``pid`` owns the wrapped-runtime supervisor slot."""
+    if pid <= 1:
+        return False
+    try:
+        import psutil  # type: ignore
+
+        environ = psutil.Process(pid).environ()
+    except Exception:
+        return False
+    return environ.get(EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV) == str(pid)
+
+
 def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | None:
     """Choose who relaunches a profile gateway after ``hermes update``.
 
-    A gateway started with ``--external-supervisor`` must exit back to that
-    manager. Starting Hermes's detached watcher as well would escape the
-    manager and race its replacement process. Ordinary foreground gateways
+    An externally supervised gateway must exit back to that manager. Ownership
+    is declared either by ``--external-supervisor`` or by the wrapped-runtime
+    PID-bound marker. Starting Hermes's detached watcher as well would escape
+    the manager and race its replacement process. Ordinary foreground gateways
     retain the existing detached-watcher behavior.
 
     When the profile-derived relaunch cannot be armed -- typically because
@@ -1037,7 +1051,9 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
     so the fallback costs nothing extra.
     """
     argv = _capture_gateway_argv(pid)
-    if argv and "--external-supervisor" in argv:
+    if (argv and "--external-supervisor" in argv) or (
+        _gateway_process_has_bound_external_supervisor(pid)
+    ):
         return "external-supervisor"
     if launch_detached_profile_gateway_restart(profile, pid):
         return "detached"
