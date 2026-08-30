@@ -3807,6 +3807,29 @@ def _resolve_root_config_path(config_path: Path) -> Optional[Path]:
     return root_config if root_config != config_path else None
 
 
+def _warn_nested_inherit(user_config: Dict[str, Any], config_path: Path) -> None:
+    """Warn when ``inherit: true`` sits inside a section instead of at the top.
+
+    Inheritance is a whole-file switch, so a nested `inherit` does nothing. It
+    also fails quietly in the worst way: the section it was meant to fill stays
+    empty, and the user sees a missing model rather than a misplaced key.
+    """
+    nested = [
+        key
+        for key, value in user_config.items()
+        if isinstance(value, dict) and value.get("inherit") is True
+    ]
+    if not nested:
+        return
+
+    where = ", ".join(f"{key}.inherit" for key in sorted(nested))
+    print(
+        f"⚠ {config_path}: {where} has no effect — `inherit: true` applies to the "
+        "whole file and must sit at the top level.",
+        file=sys.stderr,
+    )
+
+
 def _load_inherited_config(config_path: Path) -> Dict[str, Any]:
     """Read the root profile's config to fill gaps in an inheriting profile.
 
@@ -3914,6 +3937,19 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     inherited.pop("inherit", None)
                     if inherited:
                         config = _deep_merge(config, inherited)
+                    elif _resolve_root_config_path(config_path) is None:
+                        # `inherit: true` was asked for and could not be
+                        # honoured — the profile is not where inheritance can
+                        # find a root. Silence here reproduces the bug this
+                        # feature exists to fix: a config that reads as empty
+                        # for a reason nothing on screen explains.
+                        print(
+                            f"⚠ {config_path}: `inherit: true` has no effect here — "
+                            "inheritance expects a profile at <root>/profiles/<name>/.",
+                            file=sys.stderr,
+                        )
+                else:
+                    _warn_nested_inherit(user_config, config_path)
 
                 config = _deep_merge(config, user_config)
             except Exception as e:

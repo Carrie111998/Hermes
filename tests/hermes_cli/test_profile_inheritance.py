@@ -200,3 +200,57 @@ class TestDegradesSafely:
         cfg = load_config()
 
         assert cfg["agent"]["max_turns"] == 7
+
+    def test_a_nested_inherit_is_reported_instead_of_ignored(
+        self, hermes_root, capsys
+    ):
+        """`inherit` inside a section does nothing, so it must not do it quietly.
+
+        The misplaced key leaves the section empty, and the user meets a missing
+        model rather than a misplaced line. Naming the key is the difference
+        between a two-second fix and a debugging session.
+        """
+        write_root, load_profile = hermes_root
+        write_root({"model": {"default": "root-model"}})
+
+        cfg = load_profile("nested", {"model": {"inherit": True}})
+
+        assert cfg.get("model", {}).get("default") != "root-model"
+        assert "model.inherit" in capsys.readouterr().err
+
+    def test_a_top_level_inherit_warns_about_nothing(self, hermes_root, capsys):
+        """The correct spelling must stay silent."""
+        write_root, load_profile = hermes_root
+        write_root({"model": {"default": "root-model"}})
+
+        cfg = load_profile("correct", {"inherit": True})
+
+        assert cfg["model"]["default"] == "root-model"
+        assert "has no effect" not in capsys.readouterr().err
+
+    def test_an_unreachable_root_is_reported_not_swallowed(self, tmp_path, monkeypatch, capsys):
+        """A profile outside `<root>/profiles/<name>/` cannot inherit — say so.
+
+        `_resolve_root_config_path` walks a fixed two levels up, so a profile
+        nested deeper finds no root. Failing silently there would recreate the
+        exact bug inheritance exists to fix: a config that reads as empty with
+        nothing on screen explaining why.
+        """
+        root = tmp_path / "hermes"
+        deep = root / "profiles" / "team" / "member"
+        deep.mkdir(parents=True)
+        (root / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"default": "root-model"}}), encoding="utf-8"
+        )
+        (deep / "config.yaml").write_text(
+            yaml.safe_dump({"inherit": True}), encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(deep))
+        _clear_config_cache()
+
+        cfg = load_config()
+
+        # The profile is left with no model at all — the symptom the warning
+        # exists to explain.
+        assert not cfg.get("model")
+        assert "has no effect here" in capsys.readouterr().err
