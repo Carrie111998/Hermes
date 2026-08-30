@@ -107,6 +107,97 @@ class TestHandleResumeCommand:
         assert "/resume 1" in result
         db.close()
 
+    @pytest.mark.asyncio
+    async def test_resume_index_excludes_current_session(self, tmp_path):
+        """Numeric /resume choices must match the list shown to users."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        list_event = _make_event(text="/resume")
+        lane_key = _session_key_for_event(list_event)
+        db.create_session(
+            "sess_001", "telegram", session_key=lane_key,
+            user_id="12345", chat_id="67890",
+        )
+        db.set_session_title("sess_001", "First")
+        db.create_session(
+            "sess_002", "telegram", session_key=lane_key,
+            user_id="12345", chat_id="67890",
+        )
+        db.set_session_title("sess_002", "Second")
+        # Make the current session the newest titled row. If /resume's numeric
+        # resolver includes it, /resume 1 will resolve to the current session
+        # instead of the first visible non-current row.
+        db.create_session(
+            "current_session_001", "telegram", session_key=lane_key,
+            user_id="12345", chat_id="67890",
+        )
+        db.set_session_title("current_session_001", "Current")
+
+        list_runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=list_event,
+        )
+        listing = await list_runner._handle_resume_command(list_event)
+
+        assert "Current" not in listing
+        assert "1." in listing
+        assert "Second" in listing
+
+        resume_event = _make_event(text="/resume 1")
+        resume_runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=resume_event,
+        )
+        result = await resume_runner._handle_resume_command(resume_event)
+
+        assert "Resumed" in result
+        resume_runner.session_store.switch_session.assert_called_once()
+        call_args = resume_runner.session_store.switch_session.call_args
+        assert call_args[0][1] == "sess_002"
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_matrix_resume_index_excludes_current_session(self, tmp_path):
+        """Matrix numbering must use the same current-session filter."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(
+            text="/resume",
+            platform=Platform.MATRIX,
+            user_id="@alice:hs",
+            chat_id="!room:hs",
+        )
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "matrix_old", "matrix", session_key=lane_key,
+            user_id="@alice:hs", chat_id="!room:hs",
+        )
+        db.set_session_title("matrix_old", "Earlier")
+        db.create_session(
+            "matrix_current",
+            "matrix",
+            session_key=lane_key,
+            user_id="@alice:hs",
+            chat_id="!room:hs",
+        )
+        db.set_session_title("matrix_current", "Current")
+
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="matrix_current",
+            event=event,
+        )
+        runner._gateway_session_origin_for_id = lambda _session_id: event.source
+
+        listing = await runner._handle_resume_command(event)
+
+        assert "Current" not in listing
+        assert "Earlier" in listing
+        db.close()
 
     @pytest.mark.asyncio
     async def test_resume_clears_session_model_overrides(self, tmp_path):
