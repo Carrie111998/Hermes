@@ -40,7 +40,6 @@ data/
 test_durations.json
 .pytest-cache/
 tmp/
-/temp/
 temp_vision_images/
 hermes-*/*
 examples/
