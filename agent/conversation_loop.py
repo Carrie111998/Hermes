@@ -1843,6 +1843,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    frontier_required: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1867,6 +1868,13 @@ def run_conversation(
             the message unchanged.
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
+        frontier_required: Caller-supplied, per-call assertion that this turn
+            must be served by a frontier-class model (HF-04 Layer A, IGN-197).
+            When True *and* the shared HERMES_FRONTIER_DOWNGRADE_CHECK flag is
+            on, a turn that ends on a non-frontier model after fallback
+            activation appends a caller-visible ``frontier_downgrade`` entry to
+            ``result["warnings"]``. Never blocks the response. Defaults to
+            False, so no existing caller changes behaviour.
                 or queuing follow-up prefetch work.
 
     Returns:
@@ -8669,6 +8677,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        frontier_required=frontier_required,
     )
 
 

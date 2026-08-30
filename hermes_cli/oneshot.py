@@ -190,6 +190,14 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             # a config-matching bug silently dropped flex -> 2.3x billing).
             "service_tier": result.get("service_tier"),
         }
+        # HF-04 Layer A: on this path the guard's log line cannot reach anyone —
+        # run_oneshot() calls logging.disable(CRITICAL) for the whole run — and
+        # stdout carries only the final response. The usage report is the one
+        # machine-readable artefact a cron pipeline already collects, so a
+        # frontier warning that fired must appear here or it is invisible.
+        _warnings = result.get("warnings")
+        if isinstance(_warnings, list) and _warnings:
+            report["warnings"] = _warnings
         if failure is not None:
             report["failure"] = failure
         out = Path(path).expanduser()
@@ -311,6 +319,30 @@ def run_oneshot(
         return 1
 
     _write_usage_file(usage_file, result)
+
+    # HF-04 Layer A: fail loud. Logging is disabled for the whole oneshot run,
+    # so without this the guard's finding would exist only in a result dict that
+    # nothing prints. stderr (never stdout) keeps piped consumers of the final
+    # response byte-identical while still putting the warning in front of
+    # whoever reads a cron job's error output.
+    for _warning in (result.get("warnings") or []):
+        if not isinstance(_warning, dict):
+            continue
+        _type = _warning.get("type")
+        if _type == "frontier_downgrade":
+            real_stderr.write(
+                f"hermes -z: frontier guarantee not held: requested "
+                f"{_warning.get('requested_model')!r} but "
+                f"{_warning.get('served_model')!r} served this turn\n"
+            )
+        elif _type == "frontier_check_unavailable":
+            real_stderr.write(
+                f"hermes -z: frontier guarantee unverified "
+                f"({_warning.get('detail') or _type}): requested "
+                f"{_warning.get('requested_model')!r}, served "
+                f"{_warning.get('served_model')!r}\n"
+            )
+    real_stderr.flush()
 
     # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
     # those to a real stdout TextIO raises UnicodeEncodeError and aborts with
@@ -507,7 +539,31 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        # HF-04 Layer A (IGN-252 blocker #3): this is the production caller
+        # that asserts the frontier requirement. Oneshot is the cron / delegated
+        # worker path — the one HF-04 was actually observed on, and the one with
+        # no human reading a response body — and it is the only call path that
+        # knows, at this point, whether the model was *explicitly named* by the
+        # caller or merely inherited from config.
+        #
+        # `explicitly_requested` is deliberately the same condition the provider
+        # auto-detect above uses: --model or HERMES_INFERENCE_MODEL, not
+        # cfg_model. A config default is "use my defaults", not an assertion.
+        # HERMES_FRONTIER_REQUIRED overrides the derivation either way.
+        #
+        # The requested model is stamped on the agent so turn_finalizer compares
+        # against what the caller asked for rather than the primary-runtime
+        # snapshot, which may already reflect a startup-time fallback.
+        from agent.frontier_guard import resolve_frontier_required
+
+        frontier_required = resolve_frontier_required(
+            effective_model,
+            explicitly_requested=bool((model or "").strip() or env_model),
+        )
+        if frontier_required and effective_model:
+            agent._frontier_requested_model = effective_model
+
+        result = agent.run_conversation(prompt, frontier_required=frontier_required)
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
