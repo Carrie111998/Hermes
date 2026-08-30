@@ -919,7 +919,10 @@ test('resolveDirectoryForIpc accepts directory symlinks or junctions', async () 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 function readMain() {
-  return fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
+  return ['main.ts', 'secret-storage-oauth.ts', 'secret-storage-connections.ts', 'secret-storage-ssh.ts']
+    .map((name) => fs.readFileSync(path.join(__dirname, name), 'utf8'))
+    .join('\n')
+    .replace(/\r\n/g, '\n')
 }
 
 test('registry JSON helpers retain native OAuth bearer authentication', () => {

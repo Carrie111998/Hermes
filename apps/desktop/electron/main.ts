@@ -112,7 +112,6 @@ import {
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
-  type RegistryBackendRequestScope,
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
   resolveProfileApiRequest,
@@ -188,14 +187,12 @@ import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
 import {
   filenameFromContentDisposition,
-  fsPumpDeps,
   gatewayFilePath,
   gatewayFileRequestPaths,
   isNotFoundError,
   parseDataUrlToBuffer,
   pumpStreamToFile,
-  resolveGatewayFileBackend,
-  writeBufferToFile
+  resolveGatewayFileBackend
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
@@ -247,7 +244,6 @@ import {
   waitForManagedSshBootstrapFence,
   waitForManagedUpdateOperations
 } from './managed-ssh-update'
-import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
@@ -260,18 +256,12 @@ import {
 } from './native-auth-decisions'
 import {
   nativeRefreshUrl,
-  type NativeTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
-import {
-  loadNativeTokenSet,
-  type NativeTokenStoreIo,
-  persistNativeTokenSet,
-  rewriteNativeTokenStore
-} from './native-token-store'
+import { loadNativeTokenSet, persistNativeTokenSet, rewriteNativeTokenStore } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
 import { createParentStartMarkerResolver, parentWatchdogEnv } from './parent-process-identity'
@@ -334,13 +324,15 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { createSecretStorageConnections } from './secret-storage-connections'
+import { createSecretStorageOauth } from './secret-storage-oauth'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
   SECRET_STORAGE_POLICY_FILE,
-  type SecretStoragePolicy,
   writeSecretStoragePolicy
 } from './secret-storage-policy'
+import { createSecretStorageSsh } from './secret-storage-ssh'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -444,6 +436,121 @@ import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
+
+let DEFAULT_NOUS_PORTAL_URL: any
+let OAUTH_SESSION_PARTITION: any
+let SECRET_STORAGE_POLICY_PATH: any
+let SECRET_STORAGE_TRANSITION_PATH: any
+let _clearNativeTokens: any
+let _loadNativeTokens: any
+let _nativeTokenStoreIo: any
+let _nativeTokenStorePath: any
+let _nativeTokens: any
+let _persistNativeTokens: any
+let _secretStoragePolicy: any
+let _secretStoragePolicyIo: any
+let _storeNativeTokens: any
+let activeSshTerminalTarget: any
+let applySecretStorageEncryption: any
+let assertCanMutateManagedPrimaryRouting: any
+let backendQuitTeardownDone: any
+let bootstrapSshConnection: any
+let bootstrapSshConnectionInner: any
+let buildRemoteBlock: any
+let buildRemoteConnection: any
+let buildSshBlock: any
+let clearManagedSshRecovery: any
+let clearOauthSession: any
+let clearSecretStorageTransition: any
+let cloudAgentSilentSignIn: any
+let coerceDesktopConnectionConfig: any
+let decryptDesktopSecret: any
+let decryptRemoteHeaders: any
+let decryptSecretForMigration: any
+let desktopInstallationId: any
+let discoverCloudAgents: any
+let downloadViaOauthSessionToFile: any
+let effectiveSshConfigFingerprint: any
+let encryptDesktopSecret: any
+let encryptIncomingRemoteHeaders: any
+let ensureNativeAccessToken: any
+let ensureTerminalBackend: any
+let fetchJsonViaOauthSession: any
+let finalizeGatewayDownload: any
+let freshGatewayWsUrl: any
+let gatedFileAuth: any
+let gatewayFileRequestPath: any
+let getOauthSession: any
+let getOauthSessionForUrl: any
+let hasLiveOauthSession: any
+let hasLivePortalSession: any
+let hasNativeSession: any
+let hasOauthSessionCookie: any
+let hasPortalAccessToken: any
+let headersForRemoteRequest: any
+let installRemoteHeaderRules: any
+let managedConnectionRecoveries: any
+let managedConnectionUpdateGate: any
+let managedConnectionUpdates: any
+let managedPrimaryRestoreOwners: any
+let managedUpdateQuitWait: any
+let managedUpdateQuitWaitDone: any
+let markManagedSshRecoveryLaunching: any
+let migrateLegacyEncryptedSecretsOnce: any
+let mintGatewayWsTicket: any
+let oauthCookieWarmups: any
+let oauthSessionsByPartition: any
+let openOauthLoginWindow: any
+let openPortalLoginWindow: any
+let parseOrgSelectionError: any
+let persistManagedSshRecovery: any
+let persistSshConnectionToken: any
+let portalAccessRenewal: any
+let postJsonNoAuth: any
+let preserveCorruptRegistrySidecar: any
+let previewReachByWebContents: any
+let probeSecureTokenStorage: any
+let reachablePreviewUrl: any
+let readActiveDesktopProfile: any
+let readDesktopConnectionConfig: any
+let readDesktopConnectionsRegistry: any
+let readGatewayErrorText: any
+let readManagedSshRecoveryRecords: any
+let readSecretStorageTransition: any
+let recoverSecretStorageTransition: any
+let rememberRemoteWsHeaders: any
+let renewPortalAccessSilently: any
+let resetPreviewReach: any
+let resolveOauthPartitionForUrl: any
+let resolvePortalBaseUrl: any
+let rewriteAllStoredSecrets: any
+let rollbackSshBootstrapResult: any
+let runSecretStorageTransition: any
+let sanitizeConnectionProfiles: any
+let sanitizeConnectionsRegistry: any
+let sanitizeDesktopConnectionConfig: any
+let sanitizeRegistryConnection: any
+let saveGatewayFile: any
+let saveGatewayFileViaDataUrl: any
+let saveRegistryConnection: any
+let secretStoragePolicy: any
+let setSecretStoragePolicy: any
+let sshBootstrapCoordinator: any
+let sshConnections: any
+let sshOwnershipKey: any
+let sshProbeReuseProof: any
+let sshQuitTeardownDone: any
+let sshRememberLog: any
+let sshScopeKey: any
+let teardownSshConnection: any
+let trimCloudAgents: any
+let trimCloudOrg: any
+let warmOauthCookieStore: any
+let writeActiveDesktopProfile: any
+let writeDesktopConnectionConfig: any
+let writeDesktopConnectionsRegistry: any
+let writeManagedSshRecoveryRecords: any
+let writeSecretStorageTransition: any
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -6982,3370 +7089,11 @@ function installMediaPermissions() {
 //     (which triggers that server-side refresh) and treat a real 401 as
 //     "needs re-login"; the AT-or-RT cookie presence check is only a cheap
 //     "is the user signed in at all?" gate / display signal.
-// ---------------------------------------------------------------------------
+// Secret-storage cluster moved to shard modules.
 
-const OAUTH_SESSION_PARTITION = LEGACY_OAUTH_PARTITION
+// Secret-storage cluster moved to shard modules.
 
-function getOauthSession() {
-  if (oauthSession || !app.isReady()) {
-    return oauthSession
-  }
-
-  oauthSession = session.fromPartition(OAUTH_SESSION_PARTITION)
-
-  return oauthSession
-}
-
-// Per-connection cookie jars (#92183). A NON-primary v2 registry remote with
-// cookie auth rides its own partition so two registered gateways can never
-// evict — or be handed — each other's session cookies (Chromium jars ignore
-// the port, so two dashboards on one VPN host used to collide in the shared
-// jar above). The primary / v1 remote / cloud / portal flows keep the legacy
-// shared partition; see oauth-partition.ts for the full rules.
-const oauthSessionsByPartition = new Map()
-
-function resolveOauthPartitionForUrl(url) {
-  try {
-    return resolveOauthPartition(url, {
-      registry: readDesktopConnectionsRegistry(),
-      v1RemoteUrl: readDesktopConnectionConfig()?.remote?.url
-    })
-  } catch {
-    // A broken registry read must never take cookie auth down with it.
-    return OAUTH_SESSION_PARTITION
-  }
-}
-
-function getOauthSessionForUrl(url) {
-  const partition = resolveOauthPartitionForUrl(url)
-
-  if (partition === OAUTH_SESSION_PARTITION) {
-    return getOauthSession()
-  }
-
-  if (!app.isReady()) {
-    return null
-  }
-
-  let sess = oauthSessionsByPartition.get(partition)
-
-  if (!sess) {
-    sess = session.fromPartition(partition)
-    oauthSessionsByPartition.set(partition, sess)
-  }
-
-  return sess
-}
-
-// Cold-start cookie-jar warm-up. A `persist:` partition materialized via
-// session.fromPartition() loads its on-disk cookie store LAZILY: the very first
-// cookies.get() on a fresh cold start can resolve BEFORE the jar has finished
-// hydrating from disk and return an empty array — even though the user is
-// signed in. That false-negative used to make hasLiveOauthSession() report
-// "not signed in", which on the initial boot path (startHermes → the renderer's
-// single-shot boot() with no retry) surfaced as the "Hermes couldn't start"
-// OAuth overlay that vanishes the instant the user clicks Retry.
-//
-// We force the store to hydrate once, up front: flushStorageData() then a
-// throwaway cookies.get(). The promise is memoized so every caller awaits the
-// same single warm-up. Best-effort — any error resolves so we fall back to the
-// live read (which then does its own bounded re-check).
-// Memoized per PARTITION: per-connection jars (#92183) hydrate independently.
-const oauthCookieWarmups = new Map()
-
-function warmOauthCookieStore(url?) {
-  const partition = resolveOauthPartitionForUrl(url)
-  const pending = oauthCookieWarmups.get(partition)
-
-  if (pending) {
-    return pending
-  }
-
-  const warmup = (async () => {
-    const sess = getOauthSessionForUrl(url)
-
-    if (!sess) {
-      // App not ready yet — don't memoize a no-op; let a later call retry.
-      oauthCookieWarmups.delete(partition)
-
-      return
-    }
-
-    try {
-      // flushStorageData() forces Chromium to reconcile the in-memory cookie
-      // monster with the on-disk SQLite store; the subsequent get() then reads
-      // a populated jar rather than racing the lazy first-access load.
-      sess.flushStorageData?.()
-      await sess.cookies.get({})
-    } catch {
-      // Best effort; the real read below re-checks with bounded retries.
-    }
-  })()
-
-  oauthCookieWarmups.set(partition, warmup)
-
-  return warmup
-}
-
-// Bare + prefixed variants of the session cookies live in
-// connection-config.ts (cookiesHaveSession / cookiesHaveLiveSession). See
-// that module for details.
-
-async function hasOauthSessionCookie(baseUrl) {
-  const sess = getOauthSessionForUrl(baseUrl)
-
-  if (!sess) {
-    return false
-  }
-
-  const parsed = new URL(baseUrl)
-
-  try {
-    // Query by URL so the cookie jar applies Domain/Path/Secure scoping for us.
-    const cookies = await sess.cookies.get({ url: baseUrl })
-
-    return cookiesHaveSession(cookies)
-  } catch {
-    // Fall back to a host match if the URL query path errors.
-    try {
-      const cookies = await sess.cookies.get({ domain: parsed.hostname })
-
-      return cookiesHaveSession(cookies)
-    } catch {
-      return false
-    }
-  }
-}
-
-// Like hasOauthSessionCookie, but returns true when EITHER a live access-token
-// cookie OR a (longer-lived) refresh-token cookie is present. This is the right
-// "is the user signed in at all?" check: an expired AT with a live RT is still
-// a connectable session because the gateway rotates a fresh AT server-side on
-// the next authenticated request. Gating on the AT alone forces a needless full
-// re-login every ~15 min. Used for the Settings "connected" indicator and as a
-// cheap early-out before attempting a network round-trip in resolveRemoteBackend.
-async function hasLiveOauthSession(baseUrl) {
-  const sess = getOauthSessionForUrl(baseUrl)
-
-  if (!sess) {
-    return false
-  }
-
-  const parsed = new URL(baseUrl)
-
-  const readLive = async () => {
-    try {
-      const cookies = await sess.cookies.get({ url: baseUrl })
-
-      return cookiesHaveLiveSession(cookies)
-    } catch {
-      try {
-        const cookies = await sess.cookies.get({ domain: parsed.hostname })
-
-        return cookiesHaveLiveSession(cookies)
-      } catch {
-        return false
-      }
-    }
-  }
-
-  // First read against the (possibly still-hydrating) jar.
-  if (await readLive()) {
-    return true
-  }
-
-  // Cold-start false-negative guard. A `persist:` partition's cookie store
-  // loads lazily, so the FIRST read on a fresh boot can come back empty even
-  // for a signed-in user — the exact race that produced the transient "Hermes
-  // couldn't start / not signed in" overlay that Retry always cleared. Before
-  // trusting a negative, force the store to hydrate and re-read a couple of
-  // times with a short backoff. A genuinely signed-out user still resolves
-  // false quickly (≤ ~180ms); a signed-in user racing the load now wins.
-  await warmOauthCookieStore(baseUrl)
-
-  for (const delayMs of [30, 60, 90]) {
-    if (await readLive()) {
-      return true
-    }
-
-    await new Promise(resolve => setTimeout(resolve, delayMs))
-  }
-
-  return readLive()
-}
-
-async function clearOauthSession(baseUrl) {
-  const sess = getOauthSessionForUrl(baseUrl)
-
-  if (!sess) {
-    return
-  }
-
-  try {
-    const cookies = await sess.cookies.get(baseUrl ? { url: baseUrl } : {})
-    await Promise.all(
-      cookies.map(c => {
-        const scheme = c.secure ? 'https' : 'http'
-        const cookieUrl = `${scheme}://${c.domain.replace(/^\./, '')}${c.path || '/'}`
-
-        return sess.cookies.remove(cookieUrl, c.name).catch(() => undefined)
-      })
-    )
-  } catch {
-    // Best effort — a stale cookie self-expires anyway.
-  }
-}
-
-// Open a gateway login window in the OAuth session partition, resolving once
-// the access-token cookie appears (login done) or rejecting if the user closes
-// the window first. The window navigates through the IDP and back to
-// /auth/callback, which sets the session cookies on the partition; we poll the
-// cookie jar rather than try to read the HttpOnly value.
-//
-// `silent` selects the URL the window loads, which decides interactive-vs-silent:
-//   - silent=false (default): load ``/login`` — the public interstitial that
-//     renders the "Log in with X" provider chooser. This is the interactive
-//     remote-gateway login the settings UI drives.
-//   - silent=true: load the PROTECTED root ``/`` instead. ``/login`` is a public
-//     route, so loading it NEVER triggers the gate's auto-SSO and always shows
-//     the chooser. Loading a protected page with no session cookie makes the
-//     gate run ``_auto_sso_response``: single registered provider + a live
-//     portal session in this partition → a silent 302 through
-//     ``/auth/login`` → portal ``/oauth/authorize`` (auto-approves org members)
-//     → ``/auth/callback``, which sets the gateway cookie with NO interactive
-//     prompt. This is the per-agent cloud cascade (decisions.md Q5).
-function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
-  return new Promise((resolve, reject) => {
-    if (!app.isReady()) {
-      reject(new Error('Desktop is not ready to start an OAuth login.'))
-
-      return
-    }
-
-    const sess = getOauthSessionForUrl(baseUrl)
-
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
-
-      return
-    }
-
-    let settled = false
-    let win = null
-    let pollTimer = null
-    let revealTimer = null
-
-    const finish = err => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-
-      if (pollTimer) {
-        clearInterval(pollTimer)
-      }
-
-      if (revealTimer) {
-        clearTimeout(revealTimer)
-      }
-
-      try {
-        if (win && !win.isDestroyed()) {
-          win.destroy()
-        }
-      } catch {
-        // window already torn down
-      }
-
-      if (err) {
-        reject(err)
-      } else {
-        resolve({ baseUrl, ok: true })
-      }
-    }
-
-    const checkCookie = async () => {
-      if (settled) {
-        return
-      }
-
-      if (await hasOauthSessionCookie(baseUrl)) {
-        finish(null)
-      }
-    }
-
-    try {
-      win = new BrowserWindow({
-        width: 520,
-        height: 720,
-        title: silent ? 'Connecting to Hermes Cloud agent…' : 'Sign in to Hermes gateway',
-        autoHideMenuBar: true,
-        // Silent cascade: start HIDDEN. The auto-SSO 302 chain completes in
-        // well under a second, so the window normally never needs to show. We
-        // only reveal it as a fallback if the cascade DOESN'T complete quickly
-        // (e.g. the portal session lapsed and the gate fell through to the
-        // interactive chooser) — see the reveal timer below.
-        show: !silent,
-        webPreferences: {
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: true,
-          session: sess,
-          webSecurity: true
-        }
-      })
-    } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)))
-
-      return
-    }
-
-    // Re-check the cookie jar on every successful navigation (the callback
-    // redirect is the moment cookies get set) plus a low-frequency poll as a
-    // belt-and-braces fallback for IDPs that finish via in-page JS.
-    win.webContents.on('did-navigate', () => void checkCookie())
-    win.webContents.on('did-redirect-navigation', () => void checkCookie())
-    win.webContents.on('did-frame-navigate', () => void checkCookie())
-    // Log-only lifecycle diagnostics: a crashed sign-in renderer is invisible
-    // to the window's promise path (it never settles), so without this the
-    // failure leaves no trace in desktop.log (#81290 follow-up).
-    installWindowRendererLifecycle(win, { kind: 'oauth', callbacks: { log: rememberLog } })
-    pollTimer = setInterval(() => void checkCookie(), 750)
-
-    // Silent-mode reveal fallback: if the cascade hasn't settled shortly, the
-    // auto-SSO didn't go through silently (no portal session, multi-provider,
-    // loop-guard tripped, etc.) and the window is now showing an interactive
-    // page. Reveal it so the user can complete sign-in manually rather than
-    // staring at nothing. Cleared on finish().
-    if (silent && win) {
-      revealTimer = setTimeout(() => {
-        try {
-          if (!settled && win && !win.isDestroyed() && !win.isVisible()) {
-            win.show()
-          }
-        } catch {
-          // window torn down
-        }
-      }, 2500)
-    }
-
-    win.on('closed', () => {
-      if (!settled) {
-        finish(new Error('Login window closed before authentication completed.'))
-      }
-    })
-
-    // ``next`` is intentionally omitted: the gateway lands on ``/`` after
-    // login, which is a valid authenticated page that sets the cookies. We
-    // only care that the cookie jar is populated.
-    //
-    // silent=true loads the protected root so the gate auto-SSOs (no chooser);
-    // silent=false loads the public ``/login`` chooser for interactive sign-in.
-    const normalizedBase = normalizeRemoteBaseUrl(baseUrl)
-    const loginUrl = silent ? `${normalizedBase}/` : `${normalizedBase}/login`
-    win.loadURL(loginUrl).catch(error => {
-      finish(error instanceof Error ? error : new Error(String(error)))
-    })
-  })
-}
-
-// JSON request routed through the OAuth session partition so the HttpOnly
-// session cookie is attached automatically by Electron's net stack. Used for
-// authed REST against a gated gateway, including minting WS tickets.
-function fetchJsonViaOauthSession(url, options: any = {}) {
-  return new Promise((resolve, reject) => {
-    const sess = getOauthSessionForUrl(url)
-
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
-
-      return
-    }
-
-    let parsed
-
-    try {
-      parsed = new URL(url)
-    } catch (error) {
-      reject(new Error(`Invalid URL: ${error.message}`))
-
-      return
-    }
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
-
-      return
-    }
-
-    const body = serializeJsonBody(options.body)
-    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
-    const request = electronNet.request({
-      method: options.method || 'GET',
-      url,
-      session: sess,
-      useSessionCookies: true,
-      redirect: 'follow'
-    } as any)
-
-    setJsonRequestHeaders(request)
-
-    for (const [name, value] of Object.entries({ ...headersForRemoteRequest(url), ...(options.headers || {}) })) {
-      request.setHeader(name, String(value))
-    }
-
-    let timedOut = false
-
-    const timer = setTimeout(() => {
-      timedOut = true
-
-      try {
-        request.abort()
-      } catch {
-        // already finished
-      }
-
-      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    }, timeoutMs)
-
-    request.on('response', res => {
-      const chunks = []
-      res.on('data', chunk => chunks.push(Buffer.from(chunk)))
-      res.on('end', () => {
-        if (timedOut) {
-          return
-        }
-
-        clearTimeout(timer)
-        const text = Buffer.concat(chunks).toString('utf8')
-        const statusCode = res.statusCode || 500
-
-        if (statusCode >= 400) {
-          const err = new Error(`${statusCode}: ${text || ''}`) as any
-          err.statusCode = statusCode
-          reject(err)
-
-          return
-        }
-
-        if (!text) {
-          resolve(null)
-
-          return
-        }
-
-        const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
-        const contentType = String(res.headers['content-type'] || res.headers['Content-Type'] || '')
-
-        if (looksHtml || contentType.includes('text/html')) {
-          reject(new Error(`Expected JSON from ${url} but got HTML (status ${statusCode}).`))
-
-          return
-        }
-
-        try {
-          resolve(JSON.parse(text))
-        } catch {
-          reject(new Error(`Invalid JSON from ${url} (status ${statusCode}): ${text.slice(0, 200)}`))
-        }
-      })
-    })
-    request.on('error', error => {
-      if (timedOut) {
-        return
-      }
-
-      clearTimeout(timer)
-      reject(error)
-    })
-
-    if (body) {
-      request.write(body)
-    }
-
-    request.end()
-  })
-}
-
-// ---------------------------------------------------------------------------
-// RFC 8252 native-app tokens (system-browser + loopback + PKCE).
-//
-// Unlike the cookie flow, the native flow hands the desktop opaque bearer
-// tokens it holds itself: the access token authenticates REST via
-// ``Authorization: Bearer`` (which the gateway gate now accepts) and mints WS
-// tickets the same way, so NO browser session cookie or embedded webview is
-// involved. Tokens are persisted encrypted at rest via Electron ``safeStorage``
-// (OS keychain) keyed by gateway base URL, and refreshed via
-// ``/auth/native/refresh`` before expiry. This is the desktop half of the
-// feature; the server half lives in hermes_cli/dashboard_auth/native_flow.py.
-// ---------------------------------------------------------------------------
-
-// In-memory cache of decrypted native tokens, keyed by normalized base URL.
-// Backed by the encrypted on-disk store so it survives restarts.
-const _nativeTokens = new Map<string, NativeTokenSet>()
-
-function _nativeTokenStorePath() {
-  // Co-located with the connection config under userData; one JSON file mapping
-  // baseUrl → { encoding, value } safeStorage payloads.
-  return path.join(app.getPath('userData'), 'native-oauth-tokens.json')
-}
-
-// The electron-coupled half of the token store: safeStorage encryption plus the
-// userData file. native-token-store.ts owns the serialization/parse round trip
-// so it can be tested without an Electron runtime.
-function _nativeTokenStoreIo(): NativeTokenStoreIo {
-  return {
-    encrypt: encryptDesktopSecret,
-    decrypt: decryptDesktopSecret,
-    readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
-    readBackupStoreText: () => fs.readFileSync(`${_nativeTokenStorePath()}.bak`, 'utf8'),
-    writeStoreText: (text: string) => {
-      const target = _nativeTokenStorePath()
-      const backup = `${target}.bak`
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-
-      // Keep the last complete predecessor before publishing the replacement.
-      // Both writes use temp-file + rename; an interrupted write therefore
-      // leaves either the old primary, the old backup, or a complete new file.
-      if (fs.existsSync(target)) {
-        const current = fs.readFileSync(target, 'utf8')
-        try {
-          const parsed = JSON.parse(current)
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            writeSecretFileAtomic(backup, current, { encoding: 'utf8' })
-          }
-        } catch {
-          // Preserve an existing valid backup when the primary is corrupt.
-        }
-      }
-      writeSecretFileAtomic(target, text, { encoding: 'utf8' })
-    },
-    rememberLog
-  }
-}
-
-function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
-  persistNativeTokenSet(baseUrl, tokens, _nativeTokenStoreIo())
-}
-
-function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
-  const cached = _nativeTokens.get(baseUrl)
-
-  if (cached) {
-    return cached
-  }
-
-  const tokens = loadNativeTokenSet(baseUrl, _nativeTokenStoreIo())
-
-  if (tokens) {
-    _nativeTokens.set(baseUrl, tokens)
-  }
-
-  return tokens
-}
-
-function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet) {
-  // Publish first. A failed atomic write must not leave memory claiming a
-  // credential that a fresh process cannot recover.
-  _persistNativeTokens(baseUrl, tokens)
-  _nativeTokens.set(baseUrl, tokens)
-}
-
-function _clearNativeTokens(baseUrl: string) {
-  _persistNativeTokens(baseUrl, null)
-  _nativeTokens.delete(baseUrl)
-}
-
-// True when we hold native bearer tokens for this gateway (the native-flow
-// analogue of hasLiveOauthSession's cookie check).
-function hasNativeSession(baseUrl: string): boolean {
-  return _loadNativeTokens(baseUrl) !== null
-}
-
-// POST JSON WITHOUT the OAuth cookie partition — used for the native token +
-// refresh exchanges, which are cookieless by design. Thin wrapper over
-// fetchJson (no token) so it shares timeout/JSON handling.
-function postJsonNoAuth(url: string, body: unknown, opts: any = {}) {
-  // resolveJsonBody passes the object through UNCHANGED — fetchJson owns
-  // JSON.stringify. Pre-stringifying here double-encodes the body (a JSON
-  // string inside a JSON string), which the gateway's Pydantic model rejects
-  // with a 422 "Input should be a valid dictionary" (the native
-  // /auth/native/token + /auth/native/refresh legs both go through here).
-  return fetchJson(url, null, { method: 'POST', body: resolveJsonBody(body), ...opts })
-}
-
-// Return a valid native access token for baseUrl, refreshing via
-// /auth/native/refresh if the stored one is at/near expiry. Returns null when
-// there are no tokens or the refresh is terminally rejected (caller re-logins).
-async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
-  const tokens = _loadNativeTokens(baseUrl)
-
-  if (!tokens) {
-    return null
-  }
-
-  if (!tokenNeedsRefresh(tokens, Math.floor(Date.now() / 1000))) {
-    return tokens.accessToken
-  }
-
-  if (!tokens.refreshToken) {
-    // Access token expired and no RT to rotate — force re-login.
-    _clearNativeTokens(baseUrl)
-
-    return null
-  }
-
-  try {
-    const body = await postJsonNoAuth(
-      nativeRefreshUrl(baseUrl),
-      { refresh_token: tokens.refreshToken, provider: tokens.provider },
-      { timeoutMs: 10_000 }
-    )
-
-    const rotated = parseTokenResponse(body)
-    _storeNativeTokens(baseUrl, rotated)
-
-    return rotated.accessToken
-  } catch (error: any) {
-    // A 401 means the RT is dead (session_expired) — drop tokens so the UI
-    // prompts a fresh native login. A 503/transient keeps them for a retry.
-    if (error && error.statusCode === 401) {
-      _clearNativeTokens(baseUrl)
-
-      return null
-    }
-
-    throw error
-  }
-}
-
-// OAuth-session download that streams the response body straight to a
-// user-selected destination (via finalizeGatewayDownload). The connect timeout
-// is cleared once the response headers arrive.
-function downloadViaOauthSessionToFile(url, ctx, options: any = {}) {
-  return new Promise((resolve, reject) => {
-    const sess = getOauthSessionForUrl(url)
-
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
-
-      return
-    }
-
-    let parsed
-
-    try {
-      parsed = new URL(url)
-    } catch (error) {
-      reject(new Error(`Invalid URL: ${error.message}`))
-
-      return
-    }
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
-
-      return
-    }
-
-    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
-    const request = electronNet.request({
-      method: 'GET',
-      url,
-      session: sess,
-      useSessionCookies: true,
-      redirect: 'follow'
-    } as any)
-
-    let settled = false
-
-    const timer = setTimeout(() => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-
-      try {
-        request.abort()
-      } catch {
-        // already finished
-      }
-
-      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    }, timeoutMs)
-
-    request.on('response', res => {
-      if (settled) {
-        return
-      }
-
-      // Response headers arrived — cancel the connect timeout so it can't abort
-      // the stream while the save dialog is open or bytes are still flowing.
-      settled = true
-      clearTimeout(timer)
-      finalizeGatewayDownload(res, res.statusCode || 500, res.headers || {}, {
-        ...ctx,
-        abort: () => {
-          try {
-            request.abort()
-          } catch {
-            // already finished
-          }
-        }
-      }).then(resolve, reject)
-    })
-    request.on('error', error => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-      clearTimeout(timer)
-      reject(error)
-    })
-    request.end()
-  })
-}
-
-// Shared tail for both transports: validate status, pick a filename, prompt the
-// save dialog, then stream the (still-unconsumed) response body to the chosen
-// destination. On an HTTP error the status code is attached so saveGatewayFile
-// can trigger the 404-only compatibility fallback.
-async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) {
-  if (statusCode >= 400) {
-    const message = await readGatewayErrorText(res)
-    const error: any = new Error(`${statusCode}: ${message}`)
-    error.statusCode = statusCode
-    throw error
-  }
-
-  const disposition = headers['content-disposition'] || headers['Content-Disposition']
-  const filename = filenameFromContentDisposition(disposition) || ctx.suggested || ctx.fallbackName
-
-  const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: filename,
-    title: 'Save File'
-  })
-
-  if (result.canceled || !result.filePath) {
-    ctx.abort?.()
-
-    return { canceled: true, saved: false }
-  }
-
-  try {
-    // Failure-atomic: exclusive temp create beside the destination, rename into
-    // place only once the body is complete (#96597).
-    await pumpStreamToFile(res, result.filePath, fsPumpDeps())
-  } catch (error) {
-    ctx.abort?.()
-    throw error
-  }
-
-  return { path: result.filePath, saved: true }
-}
-
-// Read a bounded amount of an error response body for the thrown message.
-function readGatewayErrorText(res): Promise<string> {
-  return new Promise(resolve => {
-    const chunks = []
-    let total = 0
-
-    res.on('data', chunk => {
-      if (total >= 500) {
-        return
-      }
-
-      const buffer = Buffer.from(chunk)
-
-      total += buffer.length
-      chunks.push(buffer)
-    })
-    res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8').slice(0, 500)))
-    res.on('error', () => resolve(Buffer.concat(chunks).toString('utf8').slice(0, 500)))
-  })
-}
-
-interface GatewayFileConnection extends RegistryBackendRequestScope {
-  authMode?: 'oauth' | 'token'
-  baseUrl: string
-  token?: null | string
-}
-
-interface GatewayFileSaveContext {
-  fallbackName: string
-  suggested: string
-}
-
-interface GatewayFileSavePayload {
-  connectionId?: unknown
-  path?: unknown
-  profile?: unknown
-  suggestedName?: unknown
-}
-
-async function gatedFileAuth(connection: GatewayFileConnection) {
-  const nativeAt =
-    connection.authMode === 'oauth' ? await ensureNativeAccessToken(connection.baseUrl).catch(() => null) : null
-
-  return resolveGatedDownloadAuth(connection.authMode, nativeAt, connection.token)
-}
-
-function gatewayFileRequestPath(
-  connection: GatewayFileConnection,
-  connectionId: null | string,
-  profile: null | string,
-  requestPath: string
-) {
-  return connectionId
-    ? pathForRegistryBackendRequest(requestPath, profile, connection)
-    : pathWithGlobalRemoteProfile(requestPath, profile, profileRouteOptions(profile))
-}
-
-async function saveGatewayFile(payload: GatewayFileSavePayload = {}) {
-  const filePath = gatewayFilePath(payload.path)
-
-  if (!filePath) {
-    throw new Error('Missing gateway file path')
-  }
-
-  const { connection, connectionId, profile } = await resolveGatewayFileBackend<GatewayFileConnection>(payload, {
-    ensureLegacy: ensureBackend,
-    ensureRegistry: ensureRegistryBackend
-  })
-
-  const suggested = String(payload.suggestedName || '').trim()
-  const fallbackName = path.basename(filePath) || suggested || 'download'
-  const ctx = { suggested, fallbackName }
-
-  const requestPaths = gatewayFileRequestPaths(filePath, requestPath =>
-    gatewayFileRequestPath(connection, connectionId, profile, requestPath)
-  )
-
-  const url = `${connection.baseUrl}${requestPaths.download}`
-
-  try {
-    const auth = await gatedFileAuth(connection)
-
-    if (auth.kind === 'bearer') {
-      return await downloadViaTokenToFile(url, auth.token, ctx, { bearer: auth.token })
-    }
-
-    if (auth.kind === 'cookie') {
-      return await downloadViaOauthSessionToFile(url, ctx)
-    }
-
-    return await downloadViaTokenToFile(url, auth.token, ctx)
-  } catch (error) {
-    // Desktop and the remote gateway update independently. A gateway predating
-    // /api/fs/download 404s here; fall back (ONLY on 404) to the older capped
-    // data-URL route so downloads keep working against older backends.
-    if (isNotFoundError(error)) {
-      return await saveGatewayFileViaDataUrl(connection, requestPaths.dataUrl, ctx)
-    }
-
-    throw error
-  }
-}
-
-// Compatibility fallback: fetch the file through the capped
-// `/api/fs/read-data-url` route, decode it, and save. Bounded by the gateway's
-// data-URL cap, so it only serves smaller files — enough to keep older gateways
-// working until they gain the streaming route.
-async function saveGatewayFileViaDataUrl(
-  connection: GatewayFileConnection,
-  requestPath: string,
-  ctx: GatewayFileSaveContext
-) {
-  const url = `${connection.baseUrl}${requestPath}`
-  const auth = await gatedFileAuth(connection)
-  let json: unknown
-
-  if (auth.kind === 'bearer') {
-    json = await fetchJson(url, null, { bearer: auth.token })
-  } else if (auth.kind === 'cookie') {
-    json = await fetchJsonViaOauthSession(url)
-  } else {
-    json = await fetchJson(url, auth.token)
-  }
-
-  const dataUrl =
-    json && typeof json === 'object' && 'dataUrl' in json && typeof json.dataUrl === 'string' ? json.dataUrl : ''
-
-  if (!dataUrl) {
-    throw new Error('Gateway returned no file data')
-  }
-
-  const buffer = parseDataUrlToBuffer(dataUrl)
-  const filename = ctx.suggested || ctx.fallbackName
-
-  const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: filename,
-    title: 'Save File'
-  })
-
-  if (result.canceled || !result.filePath) {
-    return { canceled: true, saved: false }
-  }
-
-  // Same failure-atomic contract as the streaming path: a direct writeFile
-  // truncates an existing destination before the write completes (#96597).
-  await writeBufferToFile(buffer, result.filePath, fsPumpDeps())
-
-  return { path: result.filePath, saved: true }
-}
-
-// Mint a single-use WS ticket for a gated gateway. Returns the ticket string.
-// Prefers a native bearer token (cookieless RFC 8252 flow) when present,
-// falling back to the OAuth cookie partition otherwise.
-// Throws (with statusCode 401) if the session cookie is missing/expired —
-// callers treat that as "needs re-login".
-// Transient transport blips (brief host unreachable, 5xx, timeouts) are retried
-// a few times before failing — those 1-3s flaps were promoting into the
-// full-screen "couldn't start" lockout on reconnect.
-async function mintGatewayWsTicket(baseUrl, headers = {}) {
-  return withTransientRetries(async () => {
-    // Native flow: mint the ticket with the bearer token, no cookie involved.
-    const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
-
-    if (nativeAt) {
-      const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
-        method: 'POST',
-        timeoutMs: 8_000,
-        bearer: nativeAt,
-        headers
-      })) as any
-
-      const ticket = body?.ticket
-
-      if (!ticket || typeof ticket !== 'string') {
-        throw new Error('Gateway did not return a WS ticket.')
-      }
-
-      return ticket
-    }
-
-    const body = (await fetchJsonViaOauthSession(`${baseUrl}/api/auth/ws-ticket`, {
-      method: 'POST',
-      timeoutMs: 8_000,
-      headers
-    })) as any
-
-    const ticket = body?.ticket
-
-    if (!ticket || typeof ticket !== 'string') {
-      throw new Error('Gateway did not return a WS ticket.')
-    }
-
-    return ticket
-  })
-}
-
-// Build a fresh WS URL for the *current* connection. Critical for reconnects:
-// OAuth WS tickets are single-use with a ~30s TTL, so the ticket baked into
-// the cached connection's wsUrl is stale on the second connect. The renderer
-// calls this immediately before every gateway.connect() so each WS upgrade
-// carries a freshly-minted ticket. For local/token connections this just
-// reuses the static token (no minting needed).
-async function freshGatewayWsUrl(profile) {
-  // Mint for the requested profile's backend, NOT always the primary. The
-  // renderer re-mints right before every gateway.connect(); when swapping to a
-  // pooled profile we must return THAT backend's ws URL, otherwise the connect
-  // silently lands back on the primary (default) backend and writes sessions to
-  // the wrong profile's DB. A null/empty profile resolves to the primary, so
-  // legacy callers and single-profile users are unchanged.
-  const connection = await ensureBackend(profile)
-
-  if (connection.authMode === 'oauth') {
-    const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers)
-    const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
-
-    rememberRemoteWsHeaders(wsUrl, connection.headers)
-
-    return wsUrl
-  }
-
-  // Local/token: the cached wsUrl already carries the (long-lived) token.
-  rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
-
-  return connection.wsUrl
-}
-
-// --- Hermes Cloud discovery + silent per-agent sign-in (cloud-auto-discovery
-// Phase 3) ---------------------------------------------------------------
-//
-// The "cloud" connection mode lets a user sign in to the Nous portal ONCE in
-// the OAuth session partition, then (a) discover their hosted agents and (b)
-// connect to any of them with no second interactive sign-in. Both ride the one
-// portal session cookie living in `persist:hermes-remote-oauth`:
-//   - discovery  → GET {portal}/api/agents over the partition-bound net; the
-//     portal session cookie authenticates it (NAS Phase 2.5 accepts the cookie).
-//   - cascade    → opening an agent's own /login in the same partition hits the
-//     portal's silent auto-approve (org member, existing session) and 302s back
-//     with that agent's session cookie — no prompt. Each agent still completes
-//     its own PKCE exchange; SSO removes the human click, not a security check.
-
-// Canonical Nous portal base URL, overridable for staging/dev. Mirrors the CLI
-// convention (hermes_cli/auth.py DEFAULT_NOUS_PORTAL_URL + the same env names)
-// so a single override flips every Hermes surface to the same portal.
-const DEFAULT_NOUS_PORTAL_URL = 'https://portal.nousresearch.com'
-
-function resolvePortalBaseUrl() {
-  const raw = process.env.HERMES_PORTAL_BASE_URL || process.env.NOUS_PORTAL_BASE_URL || DEFAULT_NOUS_PORTAL_URL
-
-  return String(raw).trim().replace(/\/+$/, '')
-}
-
-// Whether the OAuth partition currently holds a live Nous portal session — the
-// credential that powers both discovery and the silent cascade. The portal
-// authenticates via PRIVY, not the Hermes gateway session cookies, so this
-// checks for the `privy-token` cookie on the portal host (NOT
-// hasLiveOauthSession, which looks for hermes_session_at/rt that the portal
-// never sets). See connection-config.ts cookiesHavePrivySession.
-//
-// Mirrors hasLiveOauthSession's cold-start guard (#73495): a `persist:`
-// partition's cookie store hydrates lazily, so the FIRST read on a fresh boot
-// can come back empty even for a signed-in user. The renderer checks Cloud
-// status exactly once on entering cloud mode, so a single false-negative here
-// used to clear the discovered agent list and demand a re-login that a plain
-// retry would have avoided. Warm the store and re-read with a short backoff
-// before trusting a negative.
-async function hasLivePortalSession() {
-  const sess = getOauthSession()
-
-  if (!sess) {
-    return false
-  }
-
-  const portalBaseUrl = resolvePortalBaseUrl()
-  const parsed = new URL(portalBaseUrl)
-
-  const readPortal = async () => {
-    try {
-      const cookies = await sess.cookies.get({ url: portalBaseUrl })
-
-      return cookiesHavePrivySession(cookies)
-    } catch {
-      try {
-        const cookies = await sess.cookies.get({ domain: parsed.hostname })
-
-        return cookiesHavePrivySession(cookies)
-      } catch {
-        return false
-      }
-    }
-  }
-
-  if (await readPortal()) {
-    return true
-  }
-
-  await warmOauthCookieStore()
-
-  for (const delayMs of [30, 60, 90]) {
-    if (await readPortal()) {
-      return true
-    }
-
-    await new Promise(resolve => setTimeout(resolve, delayMs))
-  }
-
-  return readPortal()
-}
-
-// Whether the jar holds the short-lived Privy ACCESS token — the exact cookie
-// `/api/agents` validates. hasLivePortalSession() answers "signed in at all?"
-// (renewal material counts); this answers "can discovery succeed right now?".
-async function hasPortalAccessToken() {
-  const sess = getOauthSession()
-
-  if (!sess) {
-    return false
-  }
-
-  const portalBaseUrl = resolvePortalBaseUrl()
-  const parsed = new URL(portalBaseUrl)
-
-  try {
-    const cookies = await sess.cookies.get({ url: portalBaseUrl })
-
-    return cookiesHavePrivyAccessToken(cookies)
-  } catch {
-    try {
-      const cookies = await sess.cookies.get({ domain: parsed.hostname })
-
-      return cookiesHavePrivyAccessToken(cookies)
-    } catch {
-      return false
-    }
-  }
-}
-
-// Bounded silent renewal of the short-lived Privy access token (#73495).
-//
-// After a Desktop restart the long-lived `privy-session` / `privy-refresh-token`
-// cookies routinely survive while the ~1h `privy-token` access cookie has
-// expired. Discovery then 401s and the only offered recovery used to be a full
-// interactive re-login — even though the persisted refresh material can mint a
-// fresh access token with no user action: loading any portal page runs the
-// Privy client, which rotates a new `privy-token` from the refresh session.
-//
-// This drives exactly that, headlessly: a hidden window on the portal root in
-// the OAuth partition, polled until the access cookie lands, torn down on a
-// bounded timeout. Never shown — if renewal can't complete silently the caller
-// falls back to the interactive needsCloudLogin path. The in-flight promise is
-// shared so concurrent discovery + cascade calls ride one renewal.
-let portalAccessRenewal: Promise<boolean> | null = null
-
-function renewPortalAccessSilently() {
-  if (portalAccessRenewal) {
-    return portalAccessRenewal
-  }
-
-  portalAccessRenewal = (async () => {
-    if (!app.isReady()) {
-      return false
-    }
-
-    const sess = getOauthSession()
-
-    if (!sess) {
-      return false
-    }
-
-    // No renewal material at all → nothing to renew; interactive login is
-    // genuinely required.
-    if (!(await hasLivePortalSession())) {
-      return false
-    }
-
-    if (await hasPortalAccessToken()) {
-      return true
-    }
-
-    const portalBaseUrl = resolvePortalBaseUrl()
-
-    return await new Promise<boolean>(resolve => {
-      let settled = false
-      let win = null
-      let pollTimer = null
-      let deadlineTimer = null
-
-      const finish = (ok: boolean) => {
-        if (settled) {
-          return
-        }
-
-        settled = true
-
-        if (pollTimer) {
-          clearInterval(pollTimer)
-        }
-
-        if (deadlineTimer) {
-          clearTimeout(deadlineTimer)
-        }
-
-        try {
-          if (win && !win.isDestroyed()) {
-            win.destroy()
-          }
-        } catch {
-          // window already torn down
-        }
-
-        rememberLog(`[cloud] silent portal access renewal ${ok ? 'succeeded' : 'did not complete'}`)
-        resolve(ok)
-      }
-
-      const checkCookie = async () => {
-        if (settled) {
-          return
-        }
-
-        if (await hasPortalAccessToken()) {
-          finish(true)
-        }
-      }
-
-      try {
-        win = new BrowserWindow({
-          width: 520,
-          height: 720,
-          show: false,
-          title: 'Renewing Hermes Cloud session…',
-          autoHideMenuBar: true,
-          webPreferences: {
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: true,
-            session: sess,
-            webSecurity: true
-          }
-        })
-      } catch {
-        finish(false)
-
-        return
-      }
-
-      win.webContents.on('did-navigate', () => void checkCookie())
-      win.webContents.on('did-redirect-navigation', () => void checkCookie())
-      win.webContents.on('did-frame-navigate', () => void checkCookie())
-      installWindowRendererLifecycle(win, { kind: 'portal-renew', callbacks: { log: rememberLog } })
-      pollTimer = setInterval(() => void checkCookie(), 500)
-      // Hard deadline: this window is never revealed, so an unrenewable session
-      // (revoked refresh token, portal down) must resolve false rather than
-      // hang the discovery call behind an invisible window.
-      deadlineTimer = setTimeout(() => finish(false), 12_000)
-
-      win.on('closed', () => finish(false))
-
-      win.loadURL(portalBaseUrl).catch(() => finish(false))
-    })
-  })().finally(() => {
-    portalAccessRenewal = null
-  }) as Promise<boolean>
-
-  return portalAccessRenewal
-}
-
-// Drive a one-time interactive portal sign-in in the OAuth partition. Unlike
-// openOauthLoginWindow (which targets a gateway's /login), this lands on the
-// portal itself so the resulting session cookie is portal-scoped — the cookie
-// that authenticates discovery AND is reused for every silent per-agent
-// cascade. Resolves once the portal session cookie appears.
-function openPortalLoginWindow() {
-  const portalBaseUrl = resolvePortalBaseUrl()
-
-  return new Promise((resolve, reject) => {
-    if (!app.isReady()) {
-      reject(new Error('Desktop is not ready to start a Hermes Cloud sign-in.'))
-
-      return
-    }
-
-    const sess = getOauthSession()
-
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
-
-      return
-    }
-
-    let settled = false
-    let win = null
-    let pollTimer = null
-
-    const finish = err => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-
-      if (pollTimer) {
-        clearInterval(pollTimer)
-      }
-
-      try {
-        if (win && !win.isDestroyed()) {
-          win.destroy()
-        }
-      } catch {
-        // window already torn down
-      }
-
-      if (err) {
-        reject(err)
-      } else {
-        resolve({ portalBaseUrl, ok: true })
-      }
-    }
-
-    const checkCookie = async () => {
-      if (settled) {
-        return
-      }
-
-      // A live portal (Privy) session cookie means sign-in completed.
-      if (await hasLivePortalSession()) {
-        finish(null)
-      }
-    }
-
-    try {
-      win = new BrowserWindow({
-        width: 520,
-        height: 720,
-        title: 'Sign in to Hermes Cloud',
-        autoHideMenuBar: true,
-        webPreferences: {
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: true,
-          session: sess,
-          webSecurity: true
-        }
-      })
-    } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)))
-
-      return
-    }
-
-    win.webContents.on('did-navigate', () => void checkCookie())
-    win.webContents.on('did-redirect-navigation', () => void checkCookie())
-    win.webContents.on('did-frame-navigate', () => void checkCookie())
-    // Log-only lifecycle diagnostics, same rationale as the OAuth window:
-    // a crashed portal sign-in renderer never settles the promise, so the
-    // failure would otherwise leave no trace in desktop.log (#81290
-    // follow-up).
-    installWindowRendererLifecycle(win, { kind: 'portal', callbacks: { log: rememberLog } })
-    pollTimer = setInterval(() => void checkCookie(), 750)
-
-    win.on('closed', () => {
-      if (!settled) {
-        finish(new Error('Sign-in window closed before authentication completed.'))
-      }
-    })
-
-    // Land on the portal root; any authenticated portal page sets the session
-    // cookie. We only care that the partition cookie jar is populated.
-    win.loadURL(portalBaseUrl).catch(error => {
-      finish(error instanceof Error ? error : new Error(String(error)))
-    })
-  })
-}
-
-// Discover the hosted (Hermes Cloud) agents the signed-in user can see. Calls
-// the NAS trimmed-summary endpoint over the partition-bound net, so the portal
-// session cookie is attached automatically (no bearer needed — NAS accepts the
-// cookie). Returns { agents } on success, or { needsOrgSelection: true, orgs }
-// when the user belongs to multiple orgs and hasn't picked one yet (NAS 409
-// org_selection_required). Pass `org` (a slug/id from a prior org list) to
-// scope discovery to that org. Throws a needsCloudLogin-tagged error when no
-// portal session is present.
-async function discoverCloudAgents(org?: string) {
-  const portalBaseUrl = resolvePortalBaseUrl()
-
-  if (!(await hasLivePortalSession())) {
-    const err = new Error(
-      'You are not signed in to Hermes Cloud. Open Settings → Gateway, choose Hermes Cloud, and sign in.'
-    ) as any
-
-    err.needsCloudLogin = true
-    throw err
-  }
-
-  // Renewable session present but the short-lived access token `/api/agents`
-  // validates is gone (typical after a restart — `privy-token` is ~1h,
-  // `privy-session`/`privy-refresh-token` last ~30 days). Renew silently up
-  // front instead of letting the request 401 into a re-login demand (#73495).
-  if (!(await hasPortalAccessToken())) {
-    await renewPortalAccessSilently()
-  }
-
-  const orgQuery = org ? `?org=${encodeURIComponent(org)}` : ''
-  let body
-
-  const fetchAgents = () =>
-    fetchJsonViaOauthSession(`${portalBaseUrl}/api/agents${orgQuery}`, {
-      method: 'GET',
-      timeoutMs: 15_000
-    })
-
-  try {
-    body = (await fetchAgents()) as any
-  } catch (initialError) {
-    let error = initialError as any
-
-    // A 401 with renewal material still in the jar: attempt ONE bounded silent
-    // renewal and retry, so a lapsed access token doesn't surface as a full
-    // interactive re-login while a 30-day refresh session sits unused. Only a
-    // rejected/failed renewal (or a second 401 on genuinely fresh access)
-    // falls through to needsCloudLogin.
-    if (error && error.statusCode === 401 && (await renewPortalAccessSilently())) {
-      try {
-        body = (await fetchAgents()) as any
-      } catch (retryError) {
-        error = retryError
-      }
-    }
-
-    if (body === undefined) {
-      // A 401 means the portal session lapsed (and silent renewal could not
-      // recover it) — surface it as a re-login, not a generic failure.
-      if (error && error.statusCode === 401) {
-        const err = new Error(
-          'Your Hermes Cloud session has expired. Open Settings → Gateway and sign in again.'
-        ) as any
-
-        err.needsCloudLogin = true
-        err.cause = error
-        throw err
-      }
-
-      // A 409 means we're a multi-org user who hasn't picked an org. The body
-      // carries the user's org list; surface it so the renderer shows a picker
-      // and re-calls discovery with the chosen org. (fetchJsonViaOauthSession
-      // throws on >=400 with err.statusCode + err.message "409: <json body>".)
-      if (error && error.statusCode === 409) {
-        const orgs = parseOrgSelectionError(error)
-
-        if (orgs) {
-          return { needsOrgSelection: true, orgs }
-        }
-      }
-
-      throw error
-    }
-  }
-
-  return { agents: trimCloudAgents(body), org: trimCloudOrg(body?.org) }
-}
-
-// Project a NAS response org ({ id, slug, name, isPersonal }) to the trimmed
-// shape the renderer persists, or null when absent/malformed.
-function trimCloudOrg(org) {
-  if (!org || typeof org !== 'object' || typeof org.id !== 'string') {
-    return null
-  }
-
-  return {
-    id: org.id,
-    slug: typeof org.slug === 'string' ? org.slug : null,
-    name: typeof org.name === 'string' ? org.name : org.id,
-    isPersonal: Boolean(org.isPersonal),
-    role: typeof org.role === 'string' ? org.role : 'MEMBER'
-  }
-}
-
-// Extract the org list from a 409 org_selection_required error body. The error
-// message is "409: <raw json>" (see fetchJsonViaOauthSession); parse defensively
-// and return null if it isn't the shape we expect (caller then rethrows).
-function parseOrgSelectionError(error) {
-  const msg = String(error?.message || '')
-  const jsonStart = msg.indexOf('{')
-
-  if (jsonStart < 0) {
-    return null
-  }
-
-  let parsed
-
-  try {
-    parsed = JSON.parse(msg.slice(jsonStart))
-  } catch {
-    return null
-  }
-
-  if (parsed?.error !== 'org_selection_required' || !Array.isArray(parsed.orgs)) {
-    return null
-  }
-
-  return parsed.orgs
-    .filter(o => o && typeof o === 'object' && typeof o.id === 'string')
-    .map(o => ({
-      id: o.id,
-      slug: typeof o.slug === 'string' ? o.slug : null,
-      name: typeof o.name === 'string' ? o.name : o.id,
-      isPersonal: Boolean(o.isPersonal),
-      role: typeof o.role === 'string' ? o.role : 'MEMBER'
-    }))
-}
-
-// Project NAS's agent rows to the trimmed DTO the renderer consumes.
-function trimCloudAgents(body) {
-  const agents = Array.isArray(body?.agents) ? body.agents : []
-
-  return agents
-    .filter(a => a && typeof a === 'object' && typeof a.id === 'string')
-    .map(a => ({
-      id: a.id,
-      name: typeof a.name === 'string' ? a.name : a.id,
-      status: typeof a.status === 'string' ? a.status : 'unknown',
-      dashboardUrl: typeof a.dashboardUrl === 'string' ? a.dashboardUrl : null,
-      dashboardGatewayState: typeof a.dashboardGatewayState === 'string' ? a.dashboardGatewayState : 'unknown'
-    }))
-}
-
-// Silent per-agent sign-in: open the selected agent dashboard's /login in the
-// SAME OAuth partition. Because the user already holds a live portal session
-// there, the agent's /oauth/authorize auto-approves (org member) and 302s back,
-// setting that agent's gateway session cookie WITHOUT a second interactive
-// prompt. Reuses openOauthLoginWindow — the window self-closes the instant the
-// agent's session cookie lands (a silent flow finishes in well under a second;
-// if the portal session were absent it would fall through to an interactive
-// login, which the discovery gate already prevents). Returns once the agent's
-// gateway session cookie is present.
-async function cloudAgentSilentSignIn(dashboardUrl) {
-  const baseUrl = normalizeRemoteBaseUrl(dashboardUrl)
-
-  // Pre-req: a live portal session must exist, or this would surface an
-  // interactive prompt rather than a silent cascade. Discovery already gates on
-  // this, but a selection can arrive after the session lapsed.
-  if (!(await hasLivePortalSession())) {
-    const err = new Error('Your Hermes Cloud session has expired. Sign in to Hermes Cloud again.') as any
-    err.needsCloudLogin = true
-    throw err
-  }
-
-  // The cascade rides the portal's auto-approve, which needs the short-lived
-  // access state just like discovery. If only renewal material survived the
-  // restart, mint a fresh access token first so the hidden cascade window
-  // auto-SSOs instead of stalling on an interactive chooser (#73495).
-  if (!(await hasPortalAccessToken())) {
-    await renewPortalAccessSilently()
-  }
-
-  await openOauthLoginWindow(baseUrl, { silent: true })
-
-  return { baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
-}
-
-// ---------------------------------------------------------------------------
-// Keychain-backed secret storage (secret-storage-policy.ts owns the decision).
-// Default ON: new persisted secrets use safeStorage. Settings → Gateway
-// exposes an explicit plaintext escape hatch; flipping it re-encodes stored
-// secrets in place.
-// ---------------------------------------------------------------------------
-const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_POLICY_FILE)
-
-const _secretStoragePolicyIo = {
-  readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
-  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' })
-}
-
-let _secretStoragePolicy: SecretStoragePolicy | null = null
-
-function secretStoragePolicy(): SecretStoragePolicy {
-  if (!_secretStoragePolicy) {
-    _secretStoragePolicy = readSecretStoragePolicy(_secretStoragePolicyIo)
-  }
-
-  return _secretStoragePolicy
-}
-
-function setSecretStoragePolicy(next: SecretStoragePolicy) {
-  const normalized = { on: next.on === true, migrated: next.migrated === true }
-  // Publish the policy before changing the process cache. If the atomic write
-  // fails, this process must continue using the previously committed policy.
-  writeSecretStoragePolicy(normalized, _secretStoragePolicyIo)
-  _secretStoragePolicy = normalized
-}
-
-const { encryptDesktopSecret, decryptDesktopSecret, decryptRemoteHeaders, encryptIncomingRemoteHeaders } =
-  createDesktopSecretStorage({
-    getPolicy: secretStoragePolicy,
-    safeStorage,
-    classifyStoredSecret,
-    normalizeRemoteHeaders,
-    safeStorageEncoding: SAFE_STORAGE_ENCODING,
-    encryptStrict: encryptDesktopSecretStrict
-  })
-
-/**
- * Keychain availability as the renderer should see it. With encryption
- * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
- * itself a keychain touch that raises the macOS dialog this feature exists
- * to avoid. We report `true` so no plain-text warning banners fire: storing
- * plaintext is the user's explicit choice, not the default mode.
- */
-function probeSecureTokenStorage(): boolean {
-  if (!secretStoragePolicy().on) {
-    return true
-  }
-
-  try {
-    return Boolean(safeStorage.isEncryptionAvailable())
-  } catch {
-    return false
-  }
-}
-
-/**
- * Rewrite every stored desktop secret (v1 connection.json token/headers +
- * per-profile overrides, v2 registry connections, native OAuth token store)
- * through `reencode`. Returns true when any store was rewritten. Shared by
- * the one-shot legacy migration and the Settings encryption toggle.
- */
-function rewriteAllStoredSecrets(shouldRewrite: (secret: any) => boolean, reencode: (secret: any) => any): boolean {
-  let touched = false
-
-  const rewriteBlock = (block: any) => {
-    if (!block || typeof block !== 'object') {
-      return block
-    }
-
-    const next = { ...block, ...(block.token ? { token: reencode(block.token) } : {}) }
-
-    if (block.headers && typeof block.headers === 'object') {
-      next.headers = Object.fromEntries(Object.entries(block.headers).map(([k, v]) => [k, reencode(v)]))
-    }
-
-    return next
-  }
-
-  const blockNeedsRewrite = (o: any) =>
-    shouldRewrite(o?.token) ||
-    Object.values(o?.headers && typeof o.headers === 'object' ? o.headers : {}).some(shouldRewrite)
-
-  // v1 connection.json.
-  const config = readDesktopConnectionConfig()
-
-  if (blockNeedsRewrite(config.remote) || Object.values(config.profiles || {}).some(blockNeedsRewrite)) {
-    touched = true
-    writeDesktopConnectionConfig({
-      ...config,
-      remote: rewriteBlock(config.remote),
-      profiles: Object.fromEntries(Object.entries(config.profiles || {}).map(([k, v]) => [k, rewriteBlock(v)]))
-    })
-  }
-
-  // v2 connections.json registry.
-  const registry = readDesktopConnectionsRegistry()
-
-  if (registry.connections?.some(blockNeedsRewrite)) {
-    touched = true
-    writeDesktopConnectionsRegistry({ ...registry, connections: registry.connections.map(rewriteBlock) })
-  }
-
-  // Native OAuth token store: baseUrl → blob. The store module rejects a
-  // corrupt primary before mutation and publishes the complete replacement via
-  // the atomic owner-only writer supplied above.
-  if (rewriteNativeTokenStore(shouldRewrite, reencode, _nativeTokenStoreIo())) {
-    touched = true
-  }
-
-  return touched
-}
-
-const SECRET_STORAGE_TRANSITION_PATH = path.join(app.getPath('userData'), 'secret-storage-transition.json')
-
-type SecretStorageTransition = { targetOn: boolean; targetMigrated: boolean }
-
-function writeSecretStorageTransition(transition: SecretStorageTransition) {
-  writeSecretFileAtomic(SECRET_STORAGE_TRANSITION_PATH, JSON.stringify(transition), { encoding: 'utf8' })
-}
-
-function readSecretStorageTransition(): SecretStorageTransition | null {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(SECRET_STORAGE_TRANSITION_PATH, 'utf8'))
-    if (typeof parsed?.targetOn !== 'boolean' || typeof parsed?.targetMigrated !== 'boolean') {
-      throw new Error('invalid transition state')
-    }
-    return parsed
-  } catch (error) {
-    if ((error as any)?.code === 'ENOENT') {
-      return null
-    }
-    throw new Error(
-      `Secret storage transition marker is corrupt: ${error instanceof Error ? error.message : String(error)}`
-    )
-  }
-}
-
-function clearSecretStorageTransition() {
-  try {
-    fs.rmSync(SECRET_STORAGE_TRANSITION_PATH, { force: true })
-  } catch (error) {
-    throw new Error(
-      `Secret storage transition completed but its recovery marker could not be removed: ${error instanceof Error ? error.message : String(error)}`
-    )
-  }
-}
-
-function decryptSecretForMigration(secret: any): string {
-  if (secret?.encoding !== SAFE_STORAGE_ENCODING || !secret.value) {
-    return ''
-  }
-
-  try {
-    return safeStorage.decryptString(Buffer.from(String(secret.value), 'base64'))
-  } catch {
-    return ''
-  }
-}
-
-/**
- * Run the multi-store rewrite behind a durable marker. The marker is written
- * before the first destination and removed only after every destination and
- * the target policy have been atomically published. A restart can therefore
- * resume an interrupted transition from the marker without trusting memory.
- */
-function runSecretStorageTransition(
-  targetOn: boolean,
-  targetMigrated: boolean,
-  shouldRewrite: (secret: any) => boolean,
-  reencode: (secret: any) => any
-) {
-  writeSecretStorageTransition({ targetOn, targetMigrated })
-  rewriteAllStoredSecrets(shouldRewrite, reencode)
-  setSecretStoragePolicy({ on: targetOn, migrated: targetMigrated })
-  clearSecretStorageTransition()
-}
-
-function recoverSecretStorageTransition() {
-  const transition = readSecretStorageTransition()
-  if (!transition) {
-    return
-  }
-
-  const shouldRewrite = transition.targetOn
-    ? (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
-    : (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
-  const reencode = transition.targetOn
-    ? (secret: any) => (shouldRewrite(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret)
-    : (secret: any) => {
-        if (!shouldRewrite(secret)) {
-          return secret
-        }
-        const plaintext = decryptSecretForMigration(secret)
-        return plaintext ? { encoding: 'plain', value: plaintext } : secret
-      }
-
-  runSecretStorageTransition(transition.targetOn, transition.targetMigrated, shouldRewrite, reencode)
-}
-
-/**
- * One-shot legacy migration. The default policy is secure and migrates legacy
- * plaintext blobs when possible; an explicit `{ on: false, migrated: true }`
- * remains a durable opt-out and is never silently overridden. Both directions
- * use the same recovery marker, and `migrated` is not committed after failure.
- */
-function migrateLegacyEncryptedSecretsOnce() {
-  recoverSecretStorageTransition()
-  const policy = secretStoragePolicy()
-
-  if (policy.migrated) {
-    return
-  }
-
-  const targetOn = policy.on
-  const shouldRewrite = targetOn
-    ? (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
-    : (secret: any) => classifyStoredSecret(secret, policy) === 'migrate'
-  const reencode = targetOn
-    ? (secret: any) => (shouldRewrite(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret)
-    : (secret: any) => {
-        if (!shouldRewrite(secret)) {
-          return secret
-        }
-        const plaintext = decryptSecretForMigration(secret)
-        return plaintext ? { encoding: 'plain', value: plaintext } : secret
-      }
-
-  try {
-    runSecretStorageTransition(targetOn, true, shouldRewrite, reencode)
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-    rememberLog(`[secret-storage] legacy migration pass failed; migration remains pending: ${detail}`)
-    return
-  }
-}
-
-/**
- * Settings → Gateway toggle: flip keychain-backed encryption and re-encode
- * every stored secret to match. The marker is durable before the first rewrite,
- * and policy publication is the final step, so a crash cannot commit a secure
- * policy over a partially migrated set.
- */
-function applySecretStorageEncryption(on: boolean) {
-  const enable = on === true
-
-  if (secretStoragePolicy().on === enable) {
-    return { on: enable }
-  }
-
-  if (enable) {
-    const needsEncrypt = (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
-
-    if (
-      !(() => {
-        try {
-          return Boolean(safeStorage.isEncryptionAvailable())
-        } catch {
-          return false
-        }
-      })()
-    ) {
-      throw new Error(
-        'OS keychain encryption is unavailable on this machine, so stored gateway secrets cannot be encrypted.'
-      )
-    }
-
-    runSecretStorageTransition(true, true, needsEncrypt, secret =>
-      needsEncrypt(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret
-    )
-    return { on: true }
-  }
-
-  const needsDecrypt = (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
-
-  runSecretStorageTransition(false, true, needsDecrypt, secret => {
-    if (!needsDecrypt(secret)) {
-      return secret
-    }
-
-    const plaintext = decryptSecretForMigration(secret)
-    return plaintext ? { encoding: 'plain', value: plaintext } : secret
-  })
-
-  return { on: false }
-}
-
-function rememberRemoteWsHeaders(wsUrl, headers = {}) {
-  remoteWsHeaderStore.remember(wsUrl, headers)
-}
-
-function headersForRemoteRequest(requestUrl) {
-  const exactWsHeaders = remoteWsHeaderStore.headersFor(requestUrl)
-
-  if (exactWsHeaders && Object.keys(exactWsHeaders).length > 0) {
-    return exactWsHeaders
-  }
-
-  const config = readDesktopConnectionConfig()
-
-  if (modeIsRemoteLike(config.mode) && config.remote?.url) {
-    const headers = decryptRemoteHeaders(config.remote.headers)
-
-    if (Object.keys(headers).length > 0 && remoteRequestMatchesBaseUrl(requestUrl, config.remote.url)) {
-      return headers
-    }
-  }
-
-  return {}
-}
-
-function installRemoteHeaderRules() {
-  if (remoteHeaderRulesInstalled) {
-    return
-  }
-
-  remoteHeaderRulesInstalled = true
-  session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
-    applyRemoteRequestHeaders(details, callback, headersForRemoteRequest)
-  })
-}
-
-// Validate + normalize the per-profile remote overrides map read from disk.
-// Drops malformed names/entries and keeps only the recognized fields so a
-// hand-edited or stale connection.json can't inject junk into resolution.
-function sanitizeConnectionProfiles(raw: Record<string, any>) {
-  if (!raw || typeof raw !== 'object') {
-    return {}
-  }
-
-  const out = {}
-
-  for (const [name, entry] of Object.entries(raw)) {
-    if (!entry || typeof entry !== 'object') {
-      continue
-    }
-
-    if (name !== 'default' && !PROFILE_NAME_RE.test(name)) {
-      continue
-    }
-
-    if (entry.mode === 'ssh') {
-      const ssh = normalizeSshConfig(entry)
-
-      if (ssh) {
-        if (entry.token && typeof entry.token === 'object') {
-          ssh.token = entry.token
-        }
-
-        out[name] = ssh
-      }
-
-      continue
-    }
-
-    const cleaned: {
-      mode: 'remote' | 'local' | 'cloud'
-      url?: string
-      authMode?: string
-      token?: object
-      headers?: object
-      org?: string
-      savedSsh?: object
-    } = {
-      mode: modeIsRemoteLike(entry.mode) ? entry.mode : 'local'
-    }
-
-    if (cleaned.mode === 'local') {
-      const savedSsh = normalizeSshConfig(entry.savedSsh)
-
-      if (savedSsh) {
-        cleaned.savedSsh = savedSsh
-      }
-    }
-
-    const url = String(entry.url || '').trim()
-
-    if (url) {
-      cleaned.url = url
-    }
-
-    cleaned.authMode = normAuthMode(entry.authMode)
-
-    if ((entry as any).token && typeof entry.token === 'object') {
-      cleaned.token = entry.token
-    }
-
-    const headers = normalizeRemoteHeaders((entry as any).headers)
-
-    if (Object.keys(headers).length > 0) {
-      cleaned.headers = headers
-    }
-
-    // Preserve the Hermes Cloud org tag on cloud-mode entries so Settings can
-    // reopen into the same org for a per-profile cloud connection.
-    if (cleaned.mode === 'cloud') {
-      const org = String(entry.org || '').trim()
-
-      if (org) {
-        cleaned.org = org
-      }
-    }
-
-    out[name] = cleaned
-  }
-
-  return out
-}
-
-function readDesktopConnectionConfig() {
-  // Check if file changed on disk since last read (e.g. modified by another
-  // process or an external tool).  Our own writes update the cache inline
-  // via writeDesktopConnectionConfig, but external changes would be missed.
-  let mtime = null
-
-  try {
-    mtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
-  } catch {
-    mtime = null
-  }
-
-  if (connectionConfigCache && connectionConfigCacheMtime === mtime) {
-    return connectionConfigCache
-  }
-
-  let config = { mode: 'local', remote: {}, profiles: {} }
-
-  try {
-    const raw = fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8')
-    // Tighten an install written before this file was owner-only. Every write
-    // now goes out at 0600, but a file already on disk keeps its old 0644 bits
-    // until something chmods it, and waiting for the user's next Settings save
-    // would leave it group/other-readable indefinitely. Runs on a cache miss
-    // only (once per launch, plus after an external edit); chmod moves ctime,
-    // not mtime, so it cannot invalidate the cache it sits inside.
-    //
-    // Deliberately BEFORE JSON.parse, not after: a truncated or hand-mangled
-    // connection.json still contains the token bytes, and parse throws into the
-    // catch below, which swallows the error and falls back to local mode. With
-    // the tighten after the parse, exactly the file that is both corrupt AND
-    // world-readable would be the one file never tightened — and nothing would
-    // ever retry it, because the fallback config is not written back. The chmod
-    // needs only the path, so it has no reason to wait for valid JSON.
-    tightenSecretFileMode(DESKTOP_CONNECTION_CONFIG_PATH)
-
-    const parsed = JSON.parse(raw)
-
-    // Legacy plaintext is migrated before the first window by
-    // migrateLegacyEncryptedSecretsOnce(). This read path remains deliberately
-    // side-effect free: it only parses and tightens the existing file, while
-    // the durable transition marker owns all re-encoding writes.
-    if (parsed && typeof parsed === 'object') {
-      const remote = parsed.remote && typeof parsed.remote === 'object' ? parsed.remote : {}
-      // authMode lives on the remote sub-object: 'oauth' (cookie + ws-ticket)
-      // or 'token' (legacy static session token). Default to 'token' for
-      // backward compatibility with configs written before OAuth support.
-      remote.authMode = remote.authMode === 'oauth' ? 'oauth' : 'token'
-      config = {
-        mode: parsed.mode === 'ssh' ? 'ssh' : modeIsRemoteLike(parsed.mode) ? parsed.mode : 'local',
-        remote,
-        // Per-profile remote overrides: each profile may point at its own
-        // backend (local spawn or its own remote URL). Preserved verbatim so
-        // profileRemoteOverride() can resolve them; normalized lazily on save.
-        profiles: sanitizeConnectionProfiles(parsed.profiles)
-      }
-    }
-  } catch {
-    // Missing or malformed connection settings should fall back to local.
-  }
-
-  connectionConfigCache = config
-  connectionConfigCacheMtime = mtime
-
-  return config
-}
-
-function writeDesktopConnectionConfig(config) {
-  fs.mkdirSync(path.dirname(DESKTOP_CONNECTION_CONFIG_PATH), { recursive: true })
-  // Owner-only, not writeFileAtomic: this is the single choke point for every
-  // connection.json write (the IPC save/apply handlers and
-  // persistSshConnectionToken all land here), and the file carries the
-  // safeStorage-encrypted gateway token plus its URL and SSH host/user/keyPath.
-  // safeStorage keeps the token opaque; 0600 keeps the whole record — and the
-  // fields that are NOT encrypted — off other local accounts, matching
-  // native-oauth-tokens.json and desktop-installation.json.
-  writeSecretFileAtomic(DESKTOP_CONNECTION_CONFIG_PATH, JSON.stringify(config, null, 2))
-  connectionConfigCache = config
-  connectionConfigCacheMtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
-}
-
-// ── v2 connection registry (multi-source) ──────────────────────────────────
-
-/**
- * Read the v2 registry, importing from v1 connection.json exactly once (when
- * connections.json does not exist yet). Same mtime-cache + tighten-mode
- * discipline as readDesktopConnectionConfig; a corrupt registry degrades to
- * local-only via normalizeRegistry rather than throwing at boot.
- *
- * An EXISTING registry is additionally reconciled against v1 when the two have
- * drifted — see reconcileRegistryDrift. The one-shot migration cannot cover a
- * user who registered nothing and then pointed Settings -> Gateway at a remote,
- * and until that heals, every launch re-homes them onto a local backend.
- */
-function readDesktopConnectionsRegistry() {
-  let mtime = null
-
-  try {
-    mtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
-  } catch {
-    mtime = null
-  }
-
-  if (connectionRegistryCache && connectionRegistryCacheMtime === mtime) {
-    return connectionRegistryCache
-  }
-
-  let registry
-
-  if (mtime === null) {
-    // First run on this build: import the v1 single-connection config. The v1
-    // file is NOT modified or deleted — older builds keep reading it. The
-    // migration is deterministic over the v1 input, so even if two processes
-    // race the first run (updater relaunch, second window), both derive the
-    // same registry and the later atomic write is a no-op content-wise.
-    registry = migrateV1ToRegistry(readDesktopConnectionConfig())
-
-    try {
-      writeDesktopConnectionsRegistry(registry)
-    } catch {
-      // Write failed (full disk, read-only userData). Keep the migrated
-      // registry in memory so list/save keep working this session instead of
-      // hard-failing every hermes:connections:* call.
-      connectionRegistryCache = registry
-      connectionRegistryCacheMtime = null
-    }
-
-    return connectionRegistryCache
-  }
-
-  try {
-    // Same rationale as connection.json: tighten BEFORE parse so a corrupt
-    // file that still holds token bytes gets its mode fixed anyway.
-    tightenSecretFileMode(DESKTOP_CONNECTIONS_REGISTRY_PATH)
-    registry = normalizeRegistry(JSON.parse(fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8')))
-  } catch {
-    // Whole-file corruption (truncated write, mangled hand-edit). The
-    // degraded local-only registry keeps boot working, but the file BYTES are
-    // the user's connection data — preserve them in a sidecar BEFORE any
-    // later write (drift reconcile, connection save) overwrites the file
-    // (#94246: recovery must never be data loss).
-    preserveCorruptRegistrySidecar()
-    registry = normalizeRegistry(null)
-  }
-
-  if (registry?.quarantined?.length) {
-    rememberLog(
-      `[connections] ${registry.quarantined.length} malformed registry entr${registry.quarantined.length === 1 ? 'y was' : 'ies were'} quarantined (kept under "quarantined" in connections.json); healthy connections loaded normally.`
-    )
-  }
-
-  // Heal v1 -> v2 drift: the v1 global route names a remote this registry has
-  // never heard of, so the live descriptor resolves to no connectionId and the
-  // launch pick sends the window somewhere else. Persist so the repair is a
-  // one-time event rather than a recomputation on every read; a failed write
-  // still returns the healed registry for this session.
-  const reconciled = reconcileRegistryDrift(registry, readDesktopConnectionConfig())
-
-  if (reconciled.changed) {
-    registry = reconciled.registry
-
-    try {
-      writeDesktopConnectionsRegistry(registry)
-
-      return connectionRegistryCache
-    } catch {
-      connectionRegistryCache = registry
-      connectionRegistryCacheMtime = null
-
-      return registry
-    }
-  }
-
-  connectionRegistryCache = registry
-  connectionRegistryCacheMtime = mtime
-
-  return registry
-}
-
-// Copy an unparseable connections.json aside (once per corruption event) so a
-// later registry write can never destroy the only copy of the user's saved
-// connections (#94246). Best effort: failure to preserve must not block boot.
-function preserveCorruptRegistrySidecar() {
-  try {
-    const rawText = fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8')
-
-    if (!rawText.trim()) {
-      return
-    }
-
-    const sidecar = `${DESKTOP_CONNECTIONS_REGISTRY_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`
-
-    if (!fs.existsSync(sidecar)) {
-      fs.writeFileSync(sidecar, rawText, { mode: 0o600 })
-    }
-
-    rememberLog(
-      `[connections] connections.json could not be parsed; preserved the original file at ${sidecar} and continuing with a local-only registry. No connection data was deleted.`
-    )
-  } catch {
-    // The read itself failed (missing file, permissions) — nothing to save.
-  }
-}
-
-function writeDesktopConnectionsRegistry(registry) {
-  fs.mkdirSync(path.dirname(DESKTOP_CONNECTIONS_REGISTRY_PATH), { recursive: true })
-  // Owner-only for the same reason as connection.json: entries carry
-  // safeStorage-encrypted tokens plus URLs and SSH host/user/keyPath.
-  writeSecretFileAtomic(DESKTOP_CONNECTIONS_REGISTRY_PATH, JSON.stringify(registry, null, 2))
-  connectionRegistryCache = registry
-  connectionRegistryCacheMtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
-}
-
-/**
- * Renderer-facing view of a registry entry: token bytes never cross the IPC
- * boundary — the renderer gets a preview + set flag, mirroring
- * sanitizeDesktopConnectionConfig.
- */
-function sanitizeRegistryConnection(entry) {
-  const { token, headers, ...rest } = entry
-  const decrypted = decryptDesktopSecret(token)
-  // Last-known stable backend identity (from roster enumeration / Test) so
-  // Settings can hint "Same backend as <label>" on connections that are two
-  // addresses for one box. Display-only; absent until a probe has seen it.
-  const knownInstallId = connectionInstallIds.get(entry.id)?.id
-
-  return {
-    ...rest,
-    tokenSet: Boolean(decrypted),
-    tokenPreview: tokenPreview(decrypted),
-    ...(knownInstallId ? { installId: knownInstallId } : {}),
-    // Header VALUES are secrets (Cloudflare Access client secrets etc.) and
-    // never cross the IPC boundary — the renderer only needs the names to
-    // render the edit form.
-    headerNames: headers && typeof headers === 'object' ? Object.keys(headers) : []
-  }
-}
-
-function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()) {
-  // Same keyring signal the v1 sanitize exposes: lets the Connections panel
-  // offer the plain-text opt-in on keyring-less Linux instead of failing.
-  // Policy-aware: never touches safeStorage while encryption is opted out.
-  const secureTokenStorage = probeSecureTokenStorage()
-
-  return {
-    version: registry.version,
-    primary: registry.primary,
-    launchMode: registry.launchMode,
-    lastUsed: registry.lastUsed,
-    secureTokenStorage,
-    connections: registry.connections.map(sanitizeRegistryConnection),
-    // Surface quarantined-entry NOTICES only (reason + best-effort label) —
-    // the raw entries can carry token envelopes and stay in the file (#94246).
-    quarantined: (registry.quarantined || []).map(q => ({
-      reason: String(q?.reason || 'unknown'),
-      label:
-        q && q.entry && typeof q.entry === 'object' && typeof (q.entry as any).label === 'string'
-          ? (q.entry as any).label
-          : ''
-    }))
-  }
-}
-
-/**
- * Save (create or edit) a registry connection from a renderer payload.
- * Edits merge over the stored entry (mergeConnectionInput) so fields the
- * editor doesn't carry — cloud `org`, ssh `remoteHermesPath`/`remoteProfile` —
- * survive a rename. Token handling mirrors coerceDesktopConnectionConfig: an
- * incoming plaintext token is encrypted (honoring the same allowPlainTextToken
- * opt-in seam as Settings → Gateway); an absent token field inherits the
- * stored envelope on edit; switching auth away from 'token' clears it
- * (normalizeConnectionInput drops tokens on non-token entries).
- */
-async function saveRegistryConnection(input: any = {}) {
-  const registry = readDesktopConnectionsRegistry()
-  const existing = input.id ? registry.connections.find(c => c.id === input.id) : null
-  const incomingToken = typeof input.token === 'string' ? input.token.trim() : ''
-
-  const token = resolvePersistedRemoteToken({
-    incomingToken,
-    persistToken: true,
-    existingToken: existing?.token,
-    allowPlainText: input.allowPlainTextToken,
-    encryptSecret: encryptDesktopSecret
-  })
-
-  // Extra gateway headers arrive as plaintext strings from the editor (or
-  // envelopes from a hand-edited import). Encrypt plaintext values the same
-  // way tokens are stored; a null/empty value drops that header. An absent
-  // `headers` field inherits the stored set via mergeConnectionInput.
-  const headers =
-    input.headers && typeof input.headers === 'object'
-      ? encryptIncomingRemoteHeaders(input.headers, existing?.headers, {
-          allowPlainText: input.allowPlainTextToken
-        })
-      : input.headers
-
-  const merged = mergeConnectionInput({ ...input, token, headers }, existing)
-  const entry = normalizeConnectionInput(merged, registry)
-
-  // Token-auth remotes must actually have a token to be dialable. OAuth and
-  // cloud entries authenticate via cookies/native tokens instead.
-  if (entry.kind === 'remote' && entry.authMode !== 'oauth' && !decryptDesktopSecret(entry.token)) {
-    throw new Error('Remote gateway session token is required.')
-  }
-
-  if (existing && connectionDialFieldsChanged(existing, entry)) {
-    managedConnectionUpdateGate.assertCanMutate(entry.id)
-  }
-
-  writeDesktopConnectionsRegistry(upsertConnection(registry, entry))
-
-  // A dial-material edit (endpoint/auth/ssh routing — NOT a label rename)
-  // leaves pooled backends under `conn:<id>::*` and renderer sockets pointing
-  // at the OLD target while the UI shows the new one. Recycle them: stop this
-  // connection's pooled backends/tunnels and tell renderers to dispose+redial
-  // their secondaries for this connection id.
-  if (existing && connectionDialFieldsChanged(existing, entry)) {
-    await stopRegistryConnectionBackends(entry.id)
-    broadcastConnectionsChanged({ connectionId: entry.id, reason: 'updated' })
-  } else {
-    // Every OTHER successful save (a brand-new connection, a label rename)
-    // must still republish the registry snapshot, or windows that didn't
-    // perform the save — and the switcher menu fed by $connectionsRegistry —
-    // keep painting the stale list until reload (#95393). 'saved' is a pure
-    // registry-refresh signal: no sockets moved, so listeners must not
-    // dispose or redial anything for it.
-    broadcastConnectionsChanged({ connectionId: entry.id, reason: 'saved' })
-  }
-
-  return sanitizeRegistryConnection(entry)
-}
-
-// Returns the desktop's chosen profile name, or null when unset. "default" is
-// a valid stored value (pins the root HERMES_HOME explicitly); null means "no
-// preference" and preserves the legacy launch (no --profile flag).
-function readActiveDesktopProfile() {
-  try {
-    const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
-
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
-    }
-  } catch {
-    // Missing or malformed → no preference.
-  }
-
-  return null
-}
-
-function writeActiveDesktopProfile(name) {
-  const value = typeof name === 'string' ? name.trim() : ''
-
-  if (value && value !== 'default' && !PROFILE_NAME_RE.test(value)) {
-    throw new Error(`Invalid profile name: ${value}`)
-  }
-
-  fs.mkdirSync(path.dirname(DESKTOP_PROFILE_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile: value || null }, null, 2))
-
-  return value || null
-}
-
-// Sanitize a connection config into the renderer-facing shape. With no
-// `profile` this describes the global/default connection (the existing
-// behavior); with a `profile` it describes that profile's per-profile remote
-// override (or an empty "local/inherit" view when the profile has none).
-async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionConfig(), profile = null) {
-  const key = connectionScopeKey(profile)
-  const scoped = key ? config.profiles?.[key] || null : null
-  const block = key ? scoped || {} : config.remote || {}
-
-  const envOverride = key ? false : Boolean(process.env.HERMES_DESKTOP_REMOTE_URL)
-  const savedMode = key ? scoped?.mode : config.mode
-  const ssh = savedMode === 'ssh' ? normalizeSshConfig(block) : null
-
-  const savedSsh = savedMode === 'local' ? (key ? savedProfileSsh(config, key) : normalizeSshConfig(block)) : null
-
-  const remoteToken = decryptDesktopSecret(block.token)
-  const authMode = normAuthMode(block.authMode)
-  const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
-  const mode = envOverride ? 'remote' : savedMode === 'ssh' ? 'ssh' : modeIsRemoteLike(savedMode) ? savedMode : 'local'
-
-  // Whether the OS keyring (safeStorage) can encrypt the saved token. When
-  // false the renderer knows to offer the plain-text opt-in in Settings →
-  // Gateway. With keychain encryption explicitly opted out this reports true
-  // WITHOUT touching safeStorage — probing is itself a keychain touch that
-  // raises the macOS password dialog (see probeSecureTokenStorage).
-  const secureTokenStorage = probeSecureTokenStorage()
-
-  // Whether the currently saved token is stored in plain text (the explicit
-  // keyring-less opt-out path). The env override supplies its token from the
-  // environment, not the saved block, so it never reports as plain text here.
-  const remoteTokenPlainText = !envOverride && block.token?.encoding === 'plain'
-
-  let remoteOauthConnected = false
-
-  if (authMode === 'oauth' && remoteUrl) {
-    try {
-      // Display signal: treat a live RT cookie as "connected" even if the AT
-      // cookie has lapsed — the gateway refreshes the AT on the next request,
-      // so the session is still usable. A stored native bearer token (cookieless
-      // RFC 8252 flow) counts as connected too — otherwise a completed native
-      // sign-in shows "not connected" in Settings. The authoritative liveness
-      // check is the ws-ticket mint in resolveRemoteBackend at actual connect time.
-      remoteOauthConnected = oauthSessionIsLive(hasNativeSession(remoteUrl), await hasLiveOauthSession(remoteUrl))
-    } catch {
-      remoteOauthConnected = false
-    }
-  }
-
-  return {
-    mode,
-    // Echo the scope back so the UI knows which profile (if any) this reflects.
-    profile: key,
-    remoteAuthMode: authMode,
-    remoteOauthConnected,
-    remoteUrl,
-    // The persisted Hermes Cloud org (slug/id) for a cloud connection, or '' for
-    // remote/local. Lets Settings → Gateway reopen into the same org.
-    cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
-    remoteTokenPreview: tokenPreview(remoteToken),
-    remoteTokenSet: Boolean(remoteToken),
-    // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
-    // affordance in Settings → Gateway on keyring-less Linux.
-    secureTokenStorage,
-    // Whether the saved token is currently persisted in plain text.
-    remoteTokenPlainText,
-    sshHost: (ssh || savedSsh)?.host || '',
-    sshUser: (ssh || savedSsh)?.user || '',
-    sshPort: (ssh || savedSsh)?.port || null,
-    sshKeyPath: (ssh || savedSsh)?.keyPath || '',
-    sshRemoteHermesPath: (ssh || savedSsh)?.remoteHermesPath || '',
-    sshRemoteProfile: (ssh || savedSsh)?.remoteProfile || '',
-    // The env override only forces the global/primary connection; a per-profile
-    // scope is never overridden by HERMES_DESKTOP_REMOTE_URL.
-    envOverride
-  }
-}
-
-// Build + validate a `{ url, authMode, token }` remote block. OAuth gateways
-// authenticate via the login-window session cookie (verified at connect time in
-// resolveRemoteBackend), so only token-auth remotes require a saved token.
-// `org` (optional) is the Hermes Cloud org slug/id the instance was discovered
-// under — persisted so Settings can reopen into the same org; omitted from the
-// block when empty so plain remote connections stay unchanged.
-function buildRemoteBlock(remoteUrl, authMode, token, org?: string, headers?: object) {
-  if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
-    throw new Error('Remote gateway session token is required.')
-  }
-
-  const block: { url: string; authMode: string; token: object; headers?: object; org?: string } = {
-    url: normalizeRemoteBaseUrl(remoteUrl),
-    authMode,
-    token
-  }
-
-  const remoteHeaders = normalizeRemoteHeaders(headers)
-
-  if (Object.keys(remoteHeaders).length > 0) {
-    block.headers = remoteHeaders
-  }
-
-  const orgValue = typeof org === 'string' ? org.trim() : ''
-
-  if (orgValue) {
-    block.org = orgValue
-  }
-
-  return block
-}
-
-function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopConnectionConfig(), options: any = {}) {
-  const persistToken = options.persistToken !== false
-  const key = connectionScopeKey(input.profile)
-  // 'cloud' and 'remote' both persist a remote-shaped block; 'cloud' is
-  // remembered as its own provenance (Q6) and resolves to remote downstream.
-  // Anything else collapses to local.
-  const mode = input.mode === 'ssh' ? 'ssh' : modeIsRemoteLike(input.mode) ? input.mode : 'local'
-  const remoteLike = modeIsRemoteLike(mode)
-
-  // The block being edited: a per-profile entry or the global remote block.
-  const rawExistingBlock = key ? existing.profiles?.[key] || {} : existing.remote || {}
-  // Leaving a CLOUD connection unselects it: a cloud block's url/org/token
-  // describe a discovered Hermes Cloud instance, NOT a user-owned remote gateway,
-  // so switching to local or remote must NOT inherit them (otherwise the stale
-  // cloud URL lingers and re-selecting Cloud looks "already connected"). When the
-  // saved block was cloud and the new mode is not cloud, start from an empty
-  // block. (remote↔local toggles still preserve a real remote URL as before.)
-  const existingMode = key ? existing.profiles?.[key]?.mode : existing.mode
-  const leavingCloud = existingMode === 'cloud' && mode !== 'cloud'
-  const leavingSsh = rawExistingBlock.mode === 'ssh' && mode !== 'ssh' && mode !== 'local'
-  const existingBlock = leavingCloud || leavingSsh ? {} : rawExistingBlock
-  const remoteUrl = String(input.remoteUrl ?? existingBlock.url ?? '').trim()
-  // authMode: explicit input wins; otherwise inherit the saved value, default 'token'.
-  const authMode = resolveAuthMode(input.remoteAuthMode, existingBlock.authMode)
-  // Cloud org: only meaningful for 'cloud' mode. Explicit input wins; otherwise
-  // inherit the saved org. A plain 'remote' connection never carries an org
-  // (switching cloud→remote drops it), so it stays unset unless mode is cloud.
-  const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
-  const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
-
-  const remoteHeaders =
-    input.remoteHeaders && typeof input.remoteHeaders === 'object'
-      ? encryptIncomingRemoteHeaders(input.remoteHeaders, existingBlock.headers, {
-          allowPlainText: input.allowPlainTextToken
-        })
-      : existingBlock.headers
-
-  // Persist decision lives in hardening.resolvePersistedRemoteToken so the
-  // IPC-propagation seam (allowPlainTextToken → encryptDesktopSecret opt-in) is
-  // covered by a focused regression test. Pass allowPlainText through RAW — the
-  // helper coerces with `=== true`, so a truthy-non-true value never enables
-  // plain-text storage, and that strictness is asserted in exactly one place.
-  const nextToken = resolvePersistedRemoteToken({
-    incomingToken,
-    persistToken,
-    existingToken: existingBlock.token,
-    allowPlainText: input.allowPlainTextToken,
-    encryptSecret: encryptDesktopSecret
-  })
-
-  if (mode === 'ssh') {
-    const sshBlock = buildSshBlock(input, savedProfileSsh(existing, key) || rawExistingBlock)
-
-    if (key) {
-      const profiles = { ...(existing.profiles || {}), [key]: sshBlock }
-
-      return {
-        mode: existing.mode === 'ssh' || modeIsRemoteLike(existing.mode) ? existing.mode : 'local',
-        remote: existing.remote || {},
-        profiles
-      }
-    }
-
-    return { mode: 'ssh', remote: sshBlock, profiles: existing.profiles || {} }
-  }
-
-  if (key) {
-    // Per-profile scope: a remote/cloud entry pins this profile to its own
-    // backend; a local entry clears the override so the profile inherits the
-    // default. The mode tag (remote vs cloud) is preserved on the entry.
-    const profiles = { ...(existing.profiles || {}) }
-
-    if (remoteLike) {
-      profiles[key] = {
-        mode,
-        ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders)
-      }
-    } else {
-      const localEntry = localProfileEntry(rawExistingBlock)
-
-      if (localEntry) {
-        profiles[key] = localEntry
-      } else {
-        delete profiles[key]
-      }
-    }
-
-    return {
-      mode: existing.mode === 'ssh' || modeIsRemoteLike(existing.mode) ? existing.mode : 'local',
-      remote: existing.remote || {},
-      profiles
-    }
-  }
-
-  const nextRemote = remoteLike
-    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders)
-    : existingMode === 'ssh'
-      ? rawExistingBlock
-      : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken }
-
-  // Preserve per-profile overrides when saving the global connection.
-  return { mode, remote: nextRemote, profiles: existing.profiles || {} }
-}
-
-// Build an SSH connection block from a save payload, preserving an
-// already-adopted dashboard token from the existing block (the token is minted
-// + reconciled at bootstrap, never user-entered). `mode: 'ssh'` is stamped so
-// normalizeSshConfig/profileSshOverride recognize it.
-function buildSshBlock(input: any, existingBlock: any = {}) {
-  // `??` (not `||`) so an explicit '' (user CLEARED the field) wins over the
-  // saved value; only a truly absent (undefined) field inherits.
-  const merged = normalizeSshConfig({
-    mode: 'ssh',
-    host: input.sshHost ?? existingBlock.host,
-    user: input.sshUser ?? existingBlock.user,
-    port: input.sshPort ?? existingBlock.port,
-    keyPath: input.sshKeyPath ?? existingBlock.keyPath,
-    remoteHermesPath: input.sshRemoteHermesPath ?? existingBlock.remoteHermesPath,
-    remoteProfile: input.sshRemoteProfile ?? existingBlock.remoteProfile
-  })
-
-  if (!merged) {
-    throw new Error('SSH host is required.')
-  }
-
-  // Carry forward an already-adopted dashboard token unless the host changed
-  // (a different host invalidates the old dashboard's token).
-  if (existingBlock.token && existingBlock.host === merged.host) {
-    merged.token = existingBlock.token
-  }
-
-  return merged
-}
-
-// Build a remote backend connection descriptor from an already-resolved remote
-// config. Handles both auth models (OAuth ws-ticket vs static session token)
-// and is shared by the per-profile, env, and global resolution paths. `token`
-// is the DECRYPTED static token (or null in OAuth mode). `source` is a label
-// for diagnostics ('profile' | 'env' | 'settings').
-async function buildRemoteConnection(
-  rawUrl,
-  authMode,
-  token,
-  source,
-  remoteHost?,
-  remoteKind = 'url',
-  remoteIdentity?,
-  headers?
-) {
-  const baseUrl = normalizeRemoteBaseUrl(rawUrl)
-  const remoteHeaders = decryptRemoteHeaders(headers)
-  // For token/oauth remotes the meaningful host is the real backend URL; for
-  // SSH remotes the caller passes the entered/resolved host explicitly (the
-  // baseUrl is a 127.0.0.1 tunnel and would be useless in the pill).
-  const host = remoteHost || hostLabelFromBaseUrl(baseUrl)
-
-  if (authMode === 'oauth') {
-    // OAuth gateway: auth comes from EITHER a native bearer token (cookieless
-    // RFC 8252 flow) OR the session cookies in the OAuth partition. Liveness is
-    // NOT "is the access-token cookie present?" — Portal issues a 24h rotating
-    // refresh token (hermes #37247), and the gateway middleware transparently
-    // rotates a fresh ~15-min access token from it on the next authenticated
-    // request. So a session with an expired AT cookie but a live RT cookie is
-    // still perfectly connectable. We early-out only when NEITHER a native
-    // token NOR any cookie is present, then mint a ws-ticket (which itself
-    // prefers the native bearer) as the authoritative liveness check.
-    //
-    // The native-token check is essential: the native login stores bearer
-    // tokens (no cookie is ever set), so gating solely on hasLiveOauthSession
-    // here would reject a freshly-completed native sign-in and loop the UI back
-    // into "not signed in" even though mintGatewayWsTicket would succeed with
-    // the stored bearer.
-    if (
-      !oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl)) &&
-      oauthGuardMayHardFail(await gatewayAuthProviders(baseUrl, remoteHeaders))
-    ) {
-      throw makeUnsignedOauthError()
-    }
-
-    let ticket
-
-    try {
-      ticket = await mintGatewayWsTicket(baseUrl, remoteHeaders)
-    } catch (error) {
-      // For a Nous-managed Cloud agent, a 502/503/504 from the WS-ticket mint
-      // means the backend server itself is down — the actionable Cloud-down
-      // error. This boundary runs BEFORE the readiness loop, so without this
-      // the ticket wrapper below would swallow the server-fault classification
-      // and the renderer would never see isCloudBackendDown. Preserve the
-      // existing 401/403 reauth and generic transport behavior for everything
-      // else (#85335).
-      const cloudError = makeNousCloudBackendDownError(baseUrl, error)
-
-      if (cloudError !== null) {
-        throw cloudError
-      }
-
-      throw gatewayTicketFailure(
-        error,
-        oauthTicketFailureAuthMessage(hasNativeSession(baseUrl)),
-        'Could not reach the remote Hermes gateway while refreshing its WebSocket ticket. Try reconnecting.'
-      )
-    }
-
-    const wsUrl = buildGatewayWsUrlWithTicket(baseUrl, ticket)
-
-    rememberRemoteWsHeaders(wsUrl, remoteHeaders)
-
-    return {
-      baseUrl,
-      mode: 'remote',
-      source,
-      authMode: 'oauth',
-      remoteHost: host || undefined,
-      remoteIdentity,
-      remoteKind,
-      headers: remoteHeaders,
-      // No static token in OAuth mode; REST is cookie-authed via the partition.
-      token: null,
-      wsUrl
-    }
-  }
-
-  if (!token) {
-    throw new Error(
-      'Remote Hermes gateway is selected, but no session token is saved. ' +
-        'Open Settings → Gateway and save a token, or switch back to Local.'
-    )
-  }
-
-  const wsUrl = buildGatewayWsUrl(baseUrl, token)
-
-  rememberRemoteWsHeaders(wsUrl, remoteHeaders)
-
-  return {
-    baseUrl,
-    mode: 'remote',
-    source,
-    authMode: 'token',
-    remoteHost: host || undefined,
-    remoteIdentity,
-    remoteKind,
-    headers: remoteHeaders,
-    token,
-    wsUrl
-  }
-}
-
-const sshConnections = new Map<string, any>()
-const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PATH)
-
-// Managed SSH update lifecycle (#93042): while an update owns a registered
-// SSH connection, the gate pauses new dials and dial-material mutations for
-// that connection id; the durable recovery journal below survives a crash
-// mid-transaction so the next launch can restore every drained scope.
-const managedConnectionUpdateGate = new ManagedConnectionUpdateGate(
-  connectionId =>
-    readManagedSshRecoveryRecords().find(record => record.connectionId === connectionId)?.correlationId || null
-)
-
-const managedConnectionUpdates = new Map<string, Promise<any>>()
-const managedConnectionRecoveries = new Map<string, Promise<void>>()
-const managedPrimaryRestoreOwners = new Map<string, { correlationId: string; profile: string; source: any }>()
-let managedUpdateQuitWait: Promise<void> | null = null
-let managedUpdateQuitWaitDone = false
-
-function assertCanMutateManagedPrimaryRouting() {
-  const durableIds = readManagedSshRecoveryRecords().map(record => record.connectionId)
-
-  const ids = new Set([
-    ...managedConnectionUpdates.keys(),
-    ...managedConnectionRecoveries.keys(),
-    ...managedPrimaryRestoreOwners.keys(),
-    ...durableIds
-  ])
-
-  if (ids.size > 0) {
-    const error: any = new Error(
-      `Primary connection routing cannot change while managed SSH update recovery is pending for ${[...ids].join(', ')}.`
-    )
-
-    error.code = 'managed-update-in-progress'
-    throw error
-  }
-}
-
-function readManagedSshRecoveryRecords(): any[] {
-  try {
-    const stat = fs.lstatSync(DESKTOP_MANAGED_SSH_RECOVERY_PATH)
-
-    if (!stat.isFile() || stat.isSymbolicLink() || !tightenSecretFileMode(DESKTOP_MANAGED_SSH_RECOVERY_PATH)) {
-      throw new Error('Managed SSH recovery journal is not a safe owner-only file.')
-    }
-
-    const payload = JSON.parse(fs.readFileSync(DESKTOP_MANAGED_SSH_RECOVERY_PATH, 'utf8'))
-
-    if (payload?.version !== 1 || !Array.isArray(payload.records)) {
-      throw new Error('Managed SSH recovery journal has an unsupported shape.')
-    }
-
-    const valid = payload.records.every(record => {
-      if (
-        !record ||
-        typeof record !== 'object' ||
-        typeof record.connectionId !== 'string' ||
-        record.source?.kind !== 'ssh' ||
-        record.source?.id !== record.connectionId ||
-        !['prepared', 'launching'].includes(record.phase) ||
-        !Array.isArray(record.scopes) ||
-        record.scopes.length > 256
-      ) {
-        return false
-      }
-
-      try {
-        validateCorrelationId(record.correlationId)
-      } catch {
-        return false
-      }
-
-      const scopesValid = record.scopes.every(
-        scope =>
-          scope &&
-          typeof scope === 'object' &&
-          typeof scope.key === 'string' &&
-          scope.key.length <= 256 &&
-          typeof scope.profile === 'string' &&
-          scope.profile.length > 0 &&
-          scope.profile.length <= 128 &&
-          ['legacy', 'primary', 'registry'].includes(scope.kind) &&
-          (scope.kind === 'primary' || scope.key.length > 0)
-      )
-
-      const identities = record.scopes.map(scope => `${scope.kind}\0${scope.key}\0${scope.profile}`)
-
-      return (
-        scopesValid &&
-        new Set(identities).size === identities.length &&
-        record.scopes.filter(scope => scope.kind === 'primary').length <= 1
-      )
-    })
-
-    if (!valid) {
-      throw new Error('Managed SSH recovery journal contains an invalid record.')
-    }
-
-    return payload.records
-  } catch (cause: any) {
-    if (cause?.code === 'ENOENT') {
-      return []
-    }
-
-    const error: any = new Error(
-      'Managed SSH recovery state is unreadable or malformed; refusing connection startup and edits.'
-    )
-
-    error.code = 'managed-update-recovery-unavailable'
-    error.cause = cause
-    throw error
-  }
-}
-
-function writeManagedSshRecoveryRecords(records) {
-  fs.mkdirSync(path.dirname(DESKTOP_MANAGED_SSH_RECOVERY_PATH), { recursive: true })
-  writeSecretFileAtomic(
-    DESKTOP_MANAGED_SSH_RECOVERY_PATH,
-    JSON.stringify({ version: 1, records, updatedAt: new Date().toISOString() }, null, 2)
-  )
-}
-
-function persistManagedSshRecovery(source, correlationId, scopes) {
-  const prefix = backendScopePrefix(source.id)
-  const recoveryScopes = managedSshRecoveryScopes(scopes, prefix)
-
-  const records = readManagedSshRecoveryRecords().filter(record => record.connectionId !== source.id)
-  records.push({
-    connectionId: source.id,
-    correlationId: validateCorrelationId(correlationId),
-    createdAt: new Date().toISOString(),
-    phase: 'prepared',
-    scopes: recoveryScopes,
-    // Registry secrets are already safeStorage envelopes. Persist the exact
-    // connection snapshot so crash recovery does not silently switch hosts or
-    // credentials after a Settings edit.
-    source
-  })
-  writeManagedSshRecoveryRecords(records)
-}
-
-function markManagedSshRecoveryLaunching(connectionId, correlationId) {
-  const records = readManagedSshRecoveryRecords()
-
-  const index = records.findIndex(
-    record => record.connectionId === connectionId && record.correlationId === correlationId
-  )
-
-  if (index < 0) {
-    throw new Error('Managed SSH recovery record disappeared before remote update launch.')
-  }
-
-  records[index] = { ...records[index], phase: 'launching' }
-  writeManagedSshRecoveryRecords(records)
-}
-
-function clearManagedSshRecovery(connectionId, correlationId) {
-  const records = readManagedSshRecoveryRecords()
-
-  const remaining = records.filter(
-    record => record.connectionId !== connectionId || record.correlationId !== correlationId
-  )
-
-  if (remaining.length === records.length) {
-    return
-  }
-
-  if (remaining.length > 0) {
-    writeManagedSshRecoveryRecords(remaining)
-  } else {
-    try {
-      fs.unlinkSync(DESKTOP_MANAGED_SSH_RECOVERY_PATH)
-    } catch (error: any) {
-      if (error?.code !== 'ENOENT') {
-        throw error
-      }
-    }
-  }
-}
-
-const sshBootstrapCoordinator = createBootstrapCoordinator()
-
-let sshQuitTeardownDone = false
-let backendQuitTeardownDone = false
-
-function sshScopeKey(profile) {
-  return connectionScopeKey(profile) || ''
-}
-
-function sshOwnershipKey(profile) {
-  return sshOwnershipId(desktopInstallationId, sshScopeKey(profile))
-}
-
-function sshRememberLog(chunk) {
-  rememberLog(redactSecrets(String(chunk == null ? '' : chunk)))
-}
-
-async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
-  try {
-    const proof: any = await fetchJson(`${baseUrl}/api/ssh/ownership`, token)
-
-    return remoteLifecycle.classifySshReuseProof(proof, spawnNonce)
-  } catch (error: any) {
-    if (/^(401|403|404):/.test(String(error?.message || ''))) {
-      return 'authenticated-stale'
-    }
-
-    throw error
-  }
-}
-
-async function teardownSshConnection(profile) {
-  const scope = sshScopeKey(profile)
-  const state = sshConnections.get(scope)
-
-  if (!state) {
-    return
-  }
-
-  sshConnections.delete(scope)
-
-  terminalIpc.disposeTerminalSessionsForSshScope(scope)
-
-  // Kill the owned remote serve --isolated *before* closing the SSH
-  // transport. Spawn detaches with setsid/nohup, so closing the tunnel
-  // alone leaves the backend at pid 1 holding state.db (#91668).
-  // Windows remotes use a different lifecycle (connectWindowsRemote) and
-  // are left to a follow-up; POSIX is the leak that OOM'd gateways.
-  await teardownSshState(
-    {
-      ...state,
-      ownershipId: state.ownershipId || sshOwnershipKey(profile)
-    },
-    {
-      cleanupRemote:
-        state.remotePlatform === 'Windows'
-          ? async () => {
-              // connectWindowsRemote does not share POSIX lock/kill. Stay
-              // silent on the kill path, but leave a log so quit is not a
-              // mysterious no-op on Windows remotes.
-              sshRememberLog('[ssh] skip remote serve teardown on Windows remotes; POSIX disconnect does not apply')
-            }
-          : remoteLifecycle.disconnect
-    }
-  )
-}
-
-// CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
-// any cached SSH state. A per-profile token/OAuth override wins over a global
-// SSH connection — so if the active profile resolves to a NON-SSH backend, the
-// terminal must NOT fall through to a global SSH host.
-function activeSshTerminalTarget(webContentsId?: number) {
-  const windowRoute = typeof webContentsId === 'number' ? windowConnectionRoutes.get(webContentsId) : null
-
-  if (windowRoute?.registryScoped && windowRoute.connectionId) {
-    const scope = registrySshScopeForWindowRoute(windowRoute, readDesktopConnectionsRegistry())
-
-    if (!scope) {
-      return null
-    }
-
-    const state = sshConnections.get(scope)
-
-    return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
-  }
-
-  const profile = windowRoute?.profile ?? primaryProfileKey()
-  const config = readDesktopConnectionConfig()
-
-  const route = resolveDesktopRemoteRoute({
-    config,
-    env: {
-      token: process.env.HERMES_DESKTOP_REMOTE_TOKEN,
-      url: process.env.HERMES_DESKTOP_REMOTE_URL
-    },
-    profile,
-    registry: readDesktopConnectionsRegistry()
-  })
-
-  if (!route || route.kind !== 'ssh') {
-    return null
-  }
-
-  const scope = route.connectionId
-    ? backendScopeKey(route.connectionId, profile)
-    : sshScopeKey(route.source === 'profile' ? profile : null)
-
-  const state = sshConnections.get(scope)
-
-  return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
-}
-
-async function ensureTerminalBackend(webContentsId: number) {
-  const windowRoute = windowConnectionRoutes.get(webContentsId)
-
-  // Claim-guarded (#90812): opening a terminal pane can race a renderer's own
-  // reconnect dial for the same (connectionId, profile) scope; coalescing
-  // here avoids bootstrapping a second SSH tunnel / remote dashboard.
-  if (windowRoute?.registryScoped && windowRoute.connectionId) {
-    return backendDialClaims.run(backendScopeKey(windowRoute.connectionId, windowRoute.profile), () =>
-      ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)
-    )
-  }
-
-  const profile = windowRoute?.profile ?? primaryProfileKey()
-
-  return backendDialClaims.run(backendScopeKey(null, profile), () => ensureBackend(profile))
-}
-
-// Loopback reach for the browser pane. Scoped to the SSH connection that
-// authorized it: a different host (or none) must never inherit live forwards
-// into somebody else's machine.
-const previewReachByWebContents = new Map<number, { registry: PreviewReachRegistry; scope: string }>()
-
-async function resetPreviewReach(webContentsId?: number) {
-  if (typeof webContentsId === 'number') {
-    const current = previewReachByWebContents.get(webContentsId)
-
-    previewReachByWebContents.delete(webContentsId)
-
-    if (current) {
-      await current.registry.closeAll()
-    }
-
-    return
-  }
-
-  const open = [...previewReachByWebContents.values()]
-
-  previewReachByWebContents.clear()
-  await Promise.allSettled(open.map(entry => entry.registry.closeAll()))
-}
-
-/**
- * Rewrite a gateway-loopback URL into one this machine can actually load.
- *
- * Returns the URL unchanged when no rewrite is needed or possible — a local
- * backend (the address is already true), a non-loopback host, or a url/cloud
- * remote with no tunnel to borrow. Callers must not treat an unchanged URL as
- * failure; the pane explains an unreachable one on its own.
- */
-async function reachablePreviewUrl(webContentsId: number, rawUrl: string): Promise<string> {
-  let target = activeSshTerminalTarget(webContentsId)
-
-  if (target === 'pending') {
-    await ensureTerminalBackend(webContentsId).catch(() => undefined)
-    target = activeSshTerminalTarget(webContentsId)
-  }
-
-  if (!target || target === 'pending') {
-    // No SSH transport behind this renderer's gateway. Another window's
-    // forward must never be reused for this preview.
-    await resetPreviewReach(webContentsId)
-
-    return rawUrl
-  }
-
-  const { scope, ssh } = target as { scope: string; ssh: any }
-  let reach = previewReachByWebContents.get(webContentsId)
-
-  if (!reach || reach.scope !== scope) {
-    await resetPreviewReach(webContentsId)
-    reach = { registry: new PreviewReachRegistry(), scope }
-    previewReachByWebContents.set(webContentsId, reach)
-  }
-
-  try {
-    const rewritten = await reach.registry.resolve(rawUrl, {
-      cancel: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
-      forward: (localPort, remotePort, remoteHost) => ssh.forward(localPort, remotePort, remoteHost),
-      isCurrent: () => sshConnections.get(scope)?.ssh === ssh,
-      // pickLocalPort predates the typed surface here and infers `unknown`.
-      pickLocalPort: () => pickLocalPort() as Promise<number>
-    })
-
-    return rewritten || rawUrl
-  } catch (error: any) {
-    sshRememberLog(`preview reach failed for ${rawUrl}: ${error?.message || error}`)
-
-    return rawUrl
-  }
-}
-
-async function effectiveSshConfigFingerprint(sshConfig) {
-  const ssh =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-      : 'ssh'
-
-  const args = ['-G']
-
-  if (sshConfig.port) {
-    args.push('-p', String(sshConfig.port))
-  }
-
-  if (sshConfig.keyPath) {
-    args.push('-i', sshConfig.keyPath)
-  }
-
-  args.push('--', sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host)
-  const output = await execText(ssh, args, { timeout: 10_000 })
-
-  return crypto.createHash('sha256').update(output).digest('hex')
-}
-
-async function bootstrapSshConnection(
-  profile,
-  sshConfig,
-  reuseToken,
-  source,
-  resolvedEffectiveFingerprint?,
-  metadata: any = {}
-) {
-  const scope = sshScopeKey(profile)
-  const effectiveConfigFingerprint = resolvedEffectiveFingerprint || (await effectiveSshConfigFingerprint(sshConfig))
-  const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
-  const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
-
-  return sshBootstrapCoordinator.start(
-    scope,
-    fingerprint,
-    lease => bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, metadata, fingerprint, lease),
-    metadata
-  )
-}
-
-// Tear down a bootstrap result whose publication lost the managed-update
-// fence: exact-terminate the serve this bootstrap owns (never a foreign one),
-// drop its forward and transport, and surface a fence error so the managed
-// updater refuses to mutate a remote install with an unfenced serve.
-async function rollbackSshBootstrapResult(ssh, result, profile, sshConfig, boundaryError) {
-  const cleanupErrors: string[] = []
-  const scope = sshScopeKey(profile)
-
-  try {
-    const expected = {
-      ownershipId: result.ownershipId,
-      pid: result.pid,
-      spawnNonce: result.spawnNonce,
-      profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
-      hermesPath: result.hermesPath,
-      hermesHome: result.hermesHome,
-      startedAt: result.startedAt,
-      creationTimeNs: result.creationTimeNs,
-      creationTime: result.creationTime
-    }
-
-    if (result.platform?.os === 'Windows') {
-      await terminateOwnedWindowsDashboardForUpdate(
-        ssh,
-        { hermesPath: result.hermesPath, hermesHome: result.hermesHome, python: result.pythonPath },
-        expected
-      )
-    } else if (result.platform?.os === 'Linux' || result.platform?.os === 'Darwin') {
-      await remoteLifecycle.terminateOwnedDashboardForUpdate(ssh, expected)
-    } else {
-      cleanupErrors.push(`unsupported remote platform ${result.platform?.os || 'unknown'}`)
-    }
-  } catch (error: any) {
-    cleanupErrors.push(String(error?.message || error))
-  }
-
-  try {
-    await ssh.cancelForward(result.localPort, result.remotePort)
-  } catch (error: any) {
-    cleanupErrors.push(String(error?.message || error))
-  }
-
-  try {
-    await ssh.close()
-  } catch (error: any) {
-    cleanupErrors.push(String(error?.message || error))
-  }
-
-  if (sshConnections.get(scope)?.ssh === ssh) {
-    sshConnections.delete(scope)
-  }
-
-  if (cleanupErrors.length > 0) {
-    const unsafe: any = new Error(
-      `An SSH bootstrap crossed the managed-update gate and its exact owned serve could not be fenced: ${cleanupErrors.join('; ')}`
-    )
-
-    unsafe.code = 'managed-update-bootstrap-fence-failed'
-    unsafe.unsafeManagedBootstrap = true
-    unsafe.cause = boundaryError
-    throw unsafe
-  }
-}
-
-async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, source, metadata, fingerprint, lease) {
-  const scope = sshScopeKey(profile)
-  const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
-  const existing = sshConnections.get(scope)
-
-  if (existing && existing.fingerprint !== fingerprint) {
-    await teardownSshConnection(profile)
-  }
-
-  let ssh = sshConnections.get(scope)?.ssh
-
-  if (ssh && !(await ssh.isAlive())) {
-    try {
-      await ssh.close()
-    } catch {
-      void 0
-    }
-
-    ssh = null
-    sshConnections.delete(scope)
-  }
-
-  const created = !ssh
-
-  let removeForceCleanup = () => {}
-
-  if (created) {
-    ssh = new SshConnection(
-      { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
-      {
-        rememberLog: sshRememberLog,
-        ownershipId: sshOwnershipKey(profile),
-        scope,
-        effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint
-      }
-    )
-    removeForceCleanup = lease.onForceCleanup(() => ssh.close())
-    await ssh.open({ signal: lease.signal })
-  }
-
-  let result: any
-
-  try {
-    if (metadata.registryConnectionId) {
-      managedConnectionUpdateGate.assertCanDial(metadata.registryConnectionId, metadata.managedUpdateCorrelation || '')
-    }
-
-    const platform = await detectRemotePlatform(ssh, sshConfig.remoteHermesPath || '')
-    const lifecycle = platform.os === 'Windows' ? connectWindowsRemote : remoteLifecycle.connect
-    result = await lifecycle({
-      ssh,
-      profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
-      remoteHermesPath: sshConfig.remoteHermesPath || '',
-      ownershipId: sshOwnershipKey(profile),
-      reuseToken: reuseToken || '',
-      forward: (localPort, remotePort) => ssh.forward(localPort, remotePort),
-      cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
-      pickLocalPort,
-      waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token'),
-      probeReuseProof: sshProbeReuseProof,
-      adoptServedToken: adoptServedDashboardToken,
-      rememberLog: sshRememberLog,
-      signal: lease.signal
-    })
-  } catch (error: any) {
-    if (created) {
-      try {
-        await ssh.close()
-      } catch {
-        void 0
-      }
-    } else {
-      // The cached master was reused but the lifecycle probe against it
-      // failed ("Could not verify the existing SSH backend"). Keeping the
-      // stale entry means every subsequent boot re-attempts through the same
-      // wedged master/tunnel and fails identically until the user re-enters
-      // the connection details (whose changed fingerprint forces a teardown).
-      // Tear it down now so the next attempt — automatic retry included —
-      // bootstraps a fresh master, which is exactly what manual re-entry
-      // did (#82679).
-      try {
-        await teardownSshConnection(profile)
-      } catch {
-        void 0
-      }
-    }
-
-    const err = new Error(error.message) as any
-    err.sshError = error.kind || 'unknown'
-    err.isSshBootstrap = true
-    throw err
-  }
-
-  try {
-    lease.assertCurrent()
-  } catch (error) {
-    await rollbackSshBootstrapResult(ssh, result, profile, sshConfig, error)
-    throw error
-  }
-
-  await fenceManagedSshBootstrapPublication({
-    assertCanPublish: () => {
-      if (metadata.registryConnectionId) {
-        managedConnectionUpdateGate.assertCanDial(
-          metadata.registryConnectionId,
-          metadata.managedUpdateCorrelation || ''
-        )
-      }
-    },
-    publish: () => {
-      persistSshConnectionToken(profile, source, result.token, metadata.registryConnectionId)
-      removeForceCleanup()
-      sshConnections.set(scope, {
-        ssh,
-        fingerprint,
-        ownershipId: result.ownershipId || sshOwnershipKey(profile),
-        localPort: result.localPort,
-        remotePort: result.remotePort,
-        pid: result.pid,
-        host: sshConfig.host,
-        hostLabel,
-        hermesVersion: result.hermesVersion || '',
-        remotePlatform: result.platform?.os || '',
-        reused: result.reused,
-        spawnNonce: result.spawnNonce,
-        creationTimeNs: result.creationTimeNs,
-        creationTime: result.creationTime,
-        startedAt: result.startedAt,
-        hermesPath: result.hermesPath,
-        hermesHome: result.hermesHome,
-        pythonPath: result.pythonPath,
-        remoteProfile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
-        registryConnectionId:
-          metadata.registryConnectionId ||
-          (typeof source === 'string' && source.startsWith('registry:') ? source.slice('registry:'.length) : ''),
-        // Never infer primary ownership from a non-composite scope key: legacy
-        // per-profile pools also use bare keys. Only startHermes' explicit call
-        // site may label a registry-qualified SSH scope as the primary backend.
-        primaryRegistryScope: metadata.primaryRegistryScope === true
-      })
-    },
-    rollback: error => rollbackSshBootstrapResult(ssh, result, profile, sshConfig, error)
-  })
-
-  sshRememberLog(
-    `[ssh] connection ${result.reused ? 'REUSED' : 'spawned'} dashboard: ` +
-      `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
-  )
-
-  const connection = await buildRemoteConnection(
-    result.baseUrl,
-    'token',
-    result.token,
-    source,
-    hostLabel,
-    'ssh',
-    result.ownershipId
-  )
-
-  return {
-    ...connection,
-    remoteHermesVersion: result.hermesVersion || '',
-    ssh: {
-      effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint,
-      host: sshConfig.host,
-      keyPath: sshConfig.keyPath,
-      port: sshConfig.port,
-      remoteHermesPath: sshConfig.remoteHermesPath,
-      remoteProfile: sshConfig.remoteProfile,
-      user: sshConfig.user
-    }
-  }
-}
-
-function persistSshConnectionToken(profile, source, token, registryConnectionId = '') {
-  try {
-    const persistence = managedSshTokenPersistencePlan(source, registryConnectionId)
-    const id = persistence.registryConnectionId
-    const encrypted = encryptDesktopSecret(token)
-
-    // A primary legacy route can also be qualified with a stable registry id.
-    // Mirror the adopted per-serve token to both stores so the next primary
-    // launch and a later registry-scoped launch reuse the same owned process.
-    if (id) {
-      const registry = readDesktopConnectionsRegistry()
-      const entry = registry.connections.find(c => c.id === id)
-
-      if (entry && entry.kind === 'ssh') {
-        writeDesktopConnectionsRegistry(upsertConnection(registry, { ...entry, token: encrypted }))
-      }
-    }
-
-    if (!persistence.legacySource) {
-      return
-    }
-
-    const config = readDesktopConnectionConfig()
-
-    if (persistence.legacySource === 'profile') {
-      const key = connectionScopeKey(profile)
-
-      if (key && config.profiles?.[key]?.mode === 'ssh') {
-        config.profiles[key].token = encrypted
-        writeDesktopConnectionConfig(config)
-      }
-    } else if (config.mode === 'ssh' && config.remote) {
-      config.remote.token = encrypted
-      writeDesktopConnectionConfig(config)
-    }
-  } catch (error: any) {
-    sshRememberLog(`[ssh] could not persist served token: ${error.message}`)
-  }
-}
+// Secret-storage cluster moved to shard modules.
 
 // Resolve the remote backend for a given profile, or null when that profile
 // should run a LOCAL backend. Precedence:
@@ -11126,8 +7874,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       return {
         ...primaryDescriptor,
         profile: profileKey,
-        connectionId: id,
-        sharedRemote: true
+        connectionId: id
       }
     }
   }
@@ -13513,11 +10260,6 @@ function spawnHudWindow(sessionId, profile) {
     // `hermes:hud:set-bounds`, which flips resizable on for the call — the
     // same pattern the pet overlay uses for its wheel-scale.
     resizable: false,
-    // macOS AppKit's constrainFrameRect clamps setBounds to the current
-    // display unless this is on. The HUD is moved by renderer-driven
-    // setBounds (not a native titlebar drag), so without it the bar cannot
-    // be dragged onto another monitor. No-op on Windows/Linux.
-    enableLargerThanScreen: true,
     movable: true,
     minimizable: false,
     maximizable: false,
@@ -16818,10 +13560,6 @@ registerFsIpc({
 // Git-driven features (worktrees, review pane, repo scan) — see git-ipc.ts.
 registerGitIpc({ resolveGitBinary, resolveGhBinary })
 
-// Client-side loopback callback for MCP OAuth against remote backends — see
-// mcp-oauth-callback-ipc.ts.
-registerMcpOauthCallbackIpc()
-
 // Embedded terminal PTY host (hermes:terminal:*) — see terminal-ipc.ts.
 const terminalIpc = registerTerminalIpc({
   isWindows: IS_WINDOWS,
@@ -17303,6 +14041,208 @@ app.on('open-url', (event, url) => {
   event.preventDefault()
   handleDeepLink(url)
 })
+
+
+function initializeSecretStorageShards() {
+  ({ OAUTH_SESSION_PARTITION, getOauthSession, oauthSessionsByPartition, resolveOauthPartitionForUrl, getOauthSessionForUrl, oauthCookieWarmups, warmOauthCookieStore, hasOauthSessionCookie, hasLiveOauthSession, clearOauthSession, openOauthLoginWindow, fetchJsonViaOauthSession, _nativeTokens, _nativeTokenStorePath, _nativeTokenStoreIo, _persistNativeTokens, _loadNativeTokens, _storeNativeTokens, _clearNativeTokens, hasNativeSession, postJsonNoAuth, ensureNativeAccessToken, downloadViaOauthSessionToFile, finalizeGatewayDownload, readGatewayErrorText, gatedFileAuth, gatewayFileRequestPath, saveGatewayFile, saveGatewayFileViaDataUrl, mintGatewayWsTicket, freshGatewayWsUrl, DEFAULT_NOUS_PORTAL_URL, resolvePortalBaseUrl, hasLivePortalSession, hasPortalAccessToken, portalAccessRenewal, renewPortalAccessSilently, openPortalLoginWindow, discoverCloudAgents, trimCloudOrg, parseOrgSelectionError, trimCloudAgents } = createSecretStorageOauth({
+    BrowserWindow,
+    DEFAULT_FETCH_TIMEOUT_MS,
+    LEGACY_OAUTH_PARTITION,
+    app,
+    buildGatewayWsUrlWithTicket,
+    cookiesHaveLiveSession,
+    cookiesHavePrivyAccessToken,
+    cookiesHavePrivySession,
+    cookiesHaveSession,
+    dialog,
+    downloadViaTokenToFile,
+    electronNet,
+    ensureBackend,
+    ensureRegistryBackend,
+    fetchJson,
+    filenameFromContentDisposition,
+    fs,
+    gatewayFilePath,
+    gatewayFileRequestPaths,
+    http,
+    https,
+    installWindowRendererLifecycle,
+    isNotFoundError,
+    loadNativeTokenSet,
+    mainWindow,
+    nativeRefreshUrl,
+    normalizeRemoteBaseUrl,
+    oauthSession,
+    parseDataUrlToBuffer,
+    parseTokenResponse,
+    path,
+    pathForRegistryBackendRequest,
+    pathWithGlobalRemoteProfile,
+    persistNativeTokenSet,
+    profileRouteOptions,
+    protocol,
+    pumpStreamToFile,
+    rememberLog,
+    resolveGatedDownloadAuth,
+    resolveJsonBody,
+    resolveOauthPartition,
+    resolveRemoteBackend,
+    resolveTimeoutMs,
+    safeStorage,
+    screen,
+    serializeJsonBody,
+    session,
+    setJsonRequestHeaders,
+    startHermes,
+    tokenNeedsRefresh,
+    withTransientRetries,
+    writeSecretFileAtomic,
+    encryptDesktopSecret,
+    decryptDesktopSecret,
+    rememberRemoteWsHeaders: (...args: any[]) => rememberRemoteWsHeaders(...args),
+    headersForRemoteRequest: (...args: any[]) => headersForRemoteRequest(...args),
+    readDesktopConnectionConfig: (...args: any[]) => readDesktopConnectionConfig(...args),
+    readDesktopConnectionsRegistry: (...args: any[]) => readDesktopConnectionsRegistry(...args),
+    resolveGatewayFileBackend
+  }));
+  ({ cloudAgentSilentSignIn, SECRET_STORAGE_POLICY_PATH, _secretStoragePolicyIo, _secretStoragePolicy, secretStoragePolicy, setSecretStoragePolicy, encryptDesktopSecret, decryptDesktopSecret, decryptRemoteHeaders, encryptIncomingRemoteHeaders, probeSecureTokenStorage, rewriteAllStoredSecrets, SECRET_STORAGE_TRANSITION_PATH, writeSecretStorageTransition, readSecretStorageTransition, clearSecretStorageTransition, decryptSecretForMigration, runSecretStorageTransition, recoverSecretStorageTransition, migrateLegacyEncryptedSecretsOnce, applySecretStorageEncryption, rememberRemoteWsHeaders, headersForRemoteRequest, installRemoteHeaderRules, sanitizeConnectionProfiles, readDesktopConnectionConfig, writeDesktopConnectionConfig, readDesktopConnectionsRegistry, preserveCorruptRegistrySidecar, writeDesktopConnectionsRegistry, sanitizeRegistryConnection, sanitizeConnectionsRegistry, saveRegistryConnection, readActiveDesktopProfile, writeActiveDesktopProfile, sanitizeDesktopConnectionConfig, buildRemoteBlock, coerceDesktopConnectionConfig, buildSshBlock, buildRemoteConnection } = createSecretStorageConnections({
+    DESKTOP_CONNECTIONS_REGISTRY_PATH,
+    DESKTOP_CONNECTION_CONFIG_PATH,
+    DESKTOP_PROFILE_CONFIG_PATH,
+    HERMES_HOME,
+    PROFILE_NAME_RE,
+    SAFE_STORAGE_ENCODING,
+    SECRET_STORAGE_POLICY_FILE,
+    app,
+    applyRemoteRequestHeaders,
+    broadcastConnectionsChanged,
+    buildGatewayWsUrl,
+    buildGatewayWsUrlWithTicket,
+    classifyStoredSecret,
+    connectionConfigCache,
+    connectionConfigCacheMtime,
+    connectionDialFieldsChanged,
+    connectionInstallIds,
+    connectionRegistryCache,
+    connectionRegistryCacheMtime,
+    connectionScopeKey,
+    createDesktopSecretStorage,
+    dialog,
+    encryptDesktopSecretStrict,
+    fs,
+    gatewayAuthProviders,
+    gatewayTicketFailure,
+    helper,
+    hostLabelFromBaseUrl,
+    localProfileEntry,
+    makeNousCloudBackendDownError,
+    makeUnsignedOauthError,
+    mergeConnectionInput,
+    migrateV1ToRegistry,
+    modeIsRemoteLike,
+    normAuthMode,
+    normalizeConnectionInput,
+    normalizeRegistry,
+    normalizeRemoteBaseUrl,
+    normalizeRemoteHeaders,
+    normalizeSshConfig,
+    oauthGuardMayHardFail,
+    oauthSessionIsLive,
+    oauthTicketFailureAuthMessage,
+    path,
+    profileRemoteOverride,
+    profileSshOverride,
+    readSecretStoragePolicy,
+    reconcileRegistryDrift,
+    rememberLog,
+    remoteHeaderRulesInstalled,
+    remoteRequestMatchesBaseUrl,
+    remoteWsHeaderStore,
+    resolveAuthMode,
+    resolvePersistedRemoteToken,
+    resolveRemoteBackend,
+    rewriteNativeTokenStore,
+    safeStorage,
+    savedProfileSsh,
+    session,
+    spawn,
+    stopRegistryConnectionBackends,
+    tightenSecretFileMode,
+    tokenPreview,
+    upsertConnection,
+    writeFileAtomic,
+    writeSecretFileAtomic,
+    writeSecretStoragePolicy,
+    hasOauthSessionCookie: (...args: any[]) => hasOauthSessionCookie(...args),
+    hasLiveOauthSession: (...args: any[]) => hasLiveOauthSession(...args),
+    openOauthLoginWindow: (...args: any[]) => openOauthLoginWindow(...args),
+    _nativeTokenStoreIo: _nativeTokenStoreIo,
+    hasNativeSession: (...args: any[]) => hasNativeSession(...args),
+    mintGatewayWsTicket: (...args: any[]) => mintGatewayWsTicket(...args),
+    hasLivePortalSession: (...args: any[]) => hasLivePortalSession(...args),
+    hasPortalAccessToken: (...args: any[]) => hasPortalAccessToken(...args),
+    renewPortalAccessSilently: (...args: any[]) => renewPortalAccessSilently(...args),
+    managedConnectionUpdateGate,
+    persistSshConnectionToken: (...args: any[]) => persistSshConnectionToken(...args)
+  }));
+  ({ sshConnections, desktopInstallationId, managedConnectionUpdateGate, managedConnectionUpdates, managedConnectionRecoveries, managedPrimaryRestoreOwners, managedUpdateQuitWait, managedUpdateQuitWaitDone, assertCanMutateManagedPrimaryRouting, readManagedSshRecoveryRecords, writeManagedSshRecoveryRecords, persistManagedSshRecovery, markManagedSshRecoveryLaunching, clearManagedSshRecovery, sshBootstrapCoordinator, sshQuitTeardownDone, backendQuitTeardownDone, sshScopeKey, sshOwnershipKey, sshRememberLog, sshProbeReuseProof, teardownSshConnection, activeSshTerminalTarget, ensureTerminalBackend, previewReachByWebContents, resetPreviewReach, reachablePreviewUrl, effectiveSshConfigFingerprint, bootstrapSshConnection, rollbackSshBootstrapResult, bootstrapSshConnectionInner, persistSshConnectionToken } = createSecretStorageSsh({
+    DESKTOP_INSTALLATION_PATH,
+    DESKTOP_MANAGED_SSH_RECOVERY_PATH,
+    ManagedConnectionUpdateGate,
+    PreviewReachRegistry,
+    SshConnection,
+    adoptServedDashboardToken,
+    backendDialClaims,
+    backendScopeKey,
+    backendScopePrefix,
+    connectWindowsRemote,
+    connectionScopeKey,
+    createBootstrapCoordinator,
+    crypto,
+    detectRemotePlatform,
+    ensureBackend,
+    ensureRegistryBackend,
+    execText,
+    fenceManagedSshBootstrapPublication,
+    fetchJson,
+    fs,
+    loadOrCreateInstallationId,
+    managedSshRecoveryScopes,
+    managedSshTokenPersistencePlan,
+    os,
+    path,
+    pickLocalPort,
+    primaryProfileKey,
+    redactSecrets,
+    registrySshScopeForWindowRoute,
+    rememberLog,
+    remoteLifecycle,
+    resolveDesktopRemoteRoute,
+    resolveRemoteBackend,
+    resolveRemoteSshDashboardProfile,
+    safeStorage,
+    sshConfigFingerprint,
+    sshOwnershipId,
+    startHermes,
+    teardownSshState,
+    terminalIpc,
+    terminateOwnedWindowsDashboardForUpdate,
+    tightenSecretFileMode,
+    upsertConnection,
+    validateCorrelationId,
+    waitForHermes,
+    windowConnectionRoutes,
+    writeSecretFileAtomic,
+    encryptDesktopSecret,
+    readDesktopConnectionConfig: (...args: any[]) => readDesktopConnectionConfig(...args),
+    writeDesktopConnectionConfig: (...args: any[]) => writeDesktopConnectionConfig(...args),
+    readDesktopConnectionsRegistry: (...args: any[]) => readDesktopConnectionsRegistry(...args),
+    writeDesktopConnectionsRegistry: (...args: any[]) => writeDesktopConnectionsRegistry(...args),
+    buildRemoteConnection: (...args: any[]) => buildRemoteConnection(...args)
+  }))
+}
+
+initializeSecretStorageShards()
 
 app.whenReady().then(() => {
   // Warm the login-shell PATH resolution immediately so it usually completes
