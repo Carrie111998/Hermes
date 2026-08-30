@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pytest
 
 from pathlib import Path
@@ -703,6 +704,34 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         assert kb.list_notify_subs(conn) == []
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_create_json_over_limit_returns_structured_error(kanban_home):
+    """A long ``create --json`` response must not be sliced into invalid JSON."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    body = "Created t_deadbeef " + "x" * 5000
+    event = SimpleNamespace(
+        text=f'/kanban create "long json" --body "{body}" --json',
+        source=SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_id="chat1",
+            chat_type="dm",
+            thread_id=None,
+            user_id="u1",
+        ),
+    )
+
+    output = await GatewayRunner._handle_kanban_command(runner, event)
+
+    payload = json.loads(output)
+    assert payload == {"error": "output_too_long", "limit": 3800}
+    assert len(output) <= 3800
+    with kb.connect() as conn:
+        assert kb.list_notify_subs(conn) == []
 
 
 @pytest.mark.parametrize(

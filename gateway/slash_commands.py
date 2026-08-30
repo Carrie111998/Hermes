@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -508,11 +509,24 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
+        # A successful ``create --json`` response is valid JSON. Detect that
+        # before looking for the human-readable "Created t_abcd" line so a
+        # task body containing that text cannot trigger an auto-subscription
+        # or append non-JSON gateway text to a machine-readable response.
+        is_json_output = False
+        if is_create and output:
+            try:
+                json.loads(output)
+            except (TypeError, json.JSONDecodeError):
+                pass
+            else:
+                is_json_output = True
+
         # Auto-subscribe on create. Parse the task id from the CLI's standard
         # success line ("Created t_abcd  (ready, assignee=...)"). If the user
         # passed --json we don't subscribe; they're clearly scripting and
         # can call /kanban notify-subscribe explicitly.
-        if is_create and output:
+        if is_create and output and not is_json_output:
             m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
             if m:
                 task_id = m.group(1)
@@ -568,9 +582,14 @@ class GatewaySlashCommandsMixin:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
 
         # Gateway messages have practical length caps; truncate long
-        # listings to keep the UX reasonable.
+        # listings to keep the UX reasonable. Never slice a JSON response:
+        # return a small structured error instead so callers can still parse
+        # the result and know why the task payload was omitted.
         if len(output) > 3800:
-            output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
+            if is_json_output:
+                output = json.dumps({"error": "output_too_long", "limit": 3800})
+            else:
+                output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
