@@ -1100,6 +1100,27 @@ class TestActiveAgentsTurnBoundaryWrite:
 
         rec = status.read_runtime_status()
         assert rec["active_agents"] == 2
+
+    def test_admission_snapshot_is_persisted_without_clobbering_state(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        status.write_runtime_status(gateway_state="running", active_agents=1)
+
+        status.write_runtime_status(
+            admission={
+                "active_workers": 1,
+                "queued_tasks": 2,
+                "active_task_ids": ["task-1"],
+                "queued_task_ids": ["task-2", "task-3"],
+            }
+        )
+
+        rec = status.read_runtime_status()
+        assert rec["gateway_state"] == "running"
+        assert rec["active_agents"] == 1
+        assert rec["admission"]["queued_tasks"] == 2
+        assert rec["admission"]["queued_task_ids"] == ["task-2", "task-3"]
         # The state must survive the per-turn write — this is what makes the
         # _persist_active_agents helper safe to call on every turn.
         assert rec["gateway_state"] == "running"
@@ -1436,4 +1457,3 @@ def test_strict_gateway_identity_rejects_reused_pid(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="identity changed"):
         status.get_running_pid_identity_strict(pid_path)
-

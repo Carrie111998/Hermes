@@ -185,7 +185,10 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
         # Wayland dev box) can't add a `--help` capability-probe subprocess.run
         # call that the fixed two-entry side_effect below doesn't budget for.
         cua_backend, "_cua_no_overlay", return_value=False,
-    ), patch.object(cua_backend.subprocess, "Popen", return_value=process) as popen, patch.object(
+    ), patch(
+        "tools.process_registry.build_gateway_worker_scope_argv",
+        side_effect=lambda argv, **kwargs: (argv, "hermes-worker-cua.scope"),
+    ) as worker_scope, patch.object(cua_backend.subprocess, "Popen", return_value=process) as popen, patch.object(
         cua_backend.subprocess, "run", side_effect=[status, stopped]
     ):
         daemon.start()
@@ -200,6 +203,9 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
     assert "--dangerously-bypass-approvals" in command
     assert env["CUA_DRIVER_PERMISSION_MODE"] == "unrestricted"
     assert env["CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS"] == "1"
+    worker_scope.assert_called_once()
+    assert worker_scope.call_args.kwargs["unit_suffix"].startswith("cua-embedded-")
+    assert worker_scope.call_args.kwargs["environment"] is env
     assert proxy_command == "/opt/cua-driver"
     assert proxy_args == ["mcp", "--embedded", "--socket", daemon.socket_path]
 

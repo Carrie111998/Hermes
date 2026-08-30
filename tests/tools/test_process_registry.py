@@ -1786,11 +1786,15 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        assert "OOMPolicy=kill" in properties
+        assert "MemorySwapMax=0" in properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )
         assert int(memory_max.split("=", 1)[1]) > 0
+        memory_high = next(
+            value for value in properties if value.startswith("MemoryHigh=")
+        )
+        assert 0 < int(memory_high.split("=", 1)[1]) < int(memory_max.split("=", 1)[1])
         # The original shell command must still be present at the tail,
         # after the ``--`` separator that prevents systemd-run from
         # interpreting command flags as its own.
@@ -2122,6 +2126,71 @@ class TestSystemdCgroupIsolation:
 
         warning.assert_not_called()
         assert f"MemoryMax={123 * 1024 * 1024}" in argv
+
+    def test_system_scope_keeps_worker_uid_and_uses_root_manager(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(
+            "shutil.which",
+            lambda name: {"systemd-run": "/usr/bin/systemd-run", "sudo": "/usr/bin/sudo"}.get(name),
+        )
+        monkeypatch.setattr(pr.os, "getuid", lambda: 996)
+        monkeypatch.setattr(pr.os, "getgid", lambda: 996)
+
+        argv = pr._build_systemd_scope_argv(
+            ["/bin/bash", "-c", "true"], "test", backend="system"
+        )
+
+        assert argv[:4] == ["/usr/bin/sudo", "-n", "/usr/bin/systemd-run", "--system"]
+        assert argv[argv.index("--uid") + 1] == "996"
+        assert argv[argv.index("--gid") + 1] == "996"
+        assert "MemorySwapMax=0" in argv
+        assert "hermes-worker-system-test" in argv
+
+    def test_system_scope_preserves_sanitized_worker_environment(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(
+            "shutil.which",
+            lambda name: {
+                "systemd-run": "/usr/bin/systemd-run",
+                "sudo": "/usr/bin/sudo",
+            }.get(name),
+        )
+        argv = pr._build_systemd_scope_argv(
+            ["/usr/bin/env"],
+            "browser-test",
+            backend="system",
+            environment={
+                "AGENT_BROWSER_SOCKET_DIR": "/tmp/socket",
+                "DISPLAY": ":99",
+                "PATH": "/custom/bin",
+            },
+        )
+
+        preserve = next(value for value in argv if value.startswith("--preserve-env="))
+        assert "AGENT_BROWSER_SOCKET_DIR" in preserve
+        assert "DISPLAY" in preserve
+        assert "PATH" not in preserve
+        assert "/tmp/socket" not in " ".join(argv)
+
+    def test_required_worker_cgroup_refuses_unisolated_spawn(
+        self, registry, monkeypatch, _gateway_identity
+    ):
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr("tools.process_registry._worker_cgroup_mode", lambda: "required")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available", lambda: False
+        )
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_system_scope_available", lambda: False
+        )
+        monkeypatch.setattr("gateway.restart.is_gateway_supervisor_process", lambda: True)
+
+        with patch("subprocess.Popen") as spawn:
+            with pytest.raises(RuntimeError, match="cgroup isolation is required"):
+                registry.spawn_local("echo unsafe", cwd="/tmp", use_pty=False)
+        spawn.assert_not_called()
 
     def test_worker_memory_limit_caps_oversized_local_guard_override(
         self, monkeypatch

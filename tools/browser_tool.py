@@ -62,6 +62,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
@@ -141,6 +142,23 @@ def _build_browser_env() -> dict:
         if _key in os.environ:
             env[_key] = os.environ[_key]
     return env
+
+
+def _scope_browser_workload(
+    argv: List[str],
+    *,
+    environment: Dict[str, str],
+    session_name: str,
+) -> List[str]:
+    """Place agent-browser and all inherited Chrome children in a worker scope."""
+    from tools.process_registry import build_gateway_worker_scope_argv
+
+    scoped, _unit = build_gateway_worker_scope_argv(
+        argv,
+        unit_suffix=f"browser-{session_name}-{uuid.uuid4().hex[:8]}",
+        environment=environment,
+    )
+    return scoped
 
 try:
     from tools.website_policy import check_website_access
@@ -1339,6 +1357,11 @@ def _run_chrome_fallback_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
+            full = _scope_browser_workload(
+                full,
+                environment=browser_env,
+                session_name=tmp_session,
+            )
             proc = subprocess.Popen(
                 full, stdout=stdout_fd, stderr=stderr_fd,
                 stdin=subprocess.DEVNULL, env=browser_env,
@@ -3735,6 +3758,11 @@ def _run_browser_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
+            cmd_parts = _scope_browser_workload(
+                cmd_parts,
+                environment=browser_env,
+                session_name=session_info["session_name"],
+            )
             proc = subprocess.Popen(
                 cmd_parts,
                 stdout=stdout_fd,

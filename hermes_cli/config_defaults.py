@@ -375,6 +375,13 @@ DEFAULT_CONFIG = {
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
+        # Gateway-spawned background commands get independent cgroups when
+        # systemd user scopes are available. "required" refuses an expensive
+        # spawn if isolation cannot be established; "off" disables scopes.
+        "worker_cgroup_mode": "auto",  # auto|required|user|system|off
+        # Finite MemoryMax per worker. null derives a conservative host/cgroup
+        # bound (never above 4 GiB); values below 64 MiB are rejected.
+        "local_memory_max_mb": None,
         # Remote-backend graceful degradation: when a connection-class
         # infrastructure failure occurs (SSH host unreachable, Docker daemon
         # down), "warn" (default) returns a structured degraded tool result
@@ -3150,6 +3157,14 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Resource-aware admission protects the messaging control plane. The
+        # legacy global max_concurrent_sessions remains the fallback cap.
+        "admission": {
+            "max_parallel_agents": 3,
+            "min_host_memory_headroom_mb": 2048,
+            "queue_limit": 16,
+            "poll_interval_seconds": 2.0,
+        },
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
