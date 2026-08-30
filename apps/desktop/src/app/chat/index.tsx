@@ -255,6 +255,7 @@ function ChatRuntimeBoundary({
   if (windowSessionKey !== runtimeId) {
     setWindowSessionKey(runtimeId)
     setWindowPages(1)
+    setRevealTarget(null)
     windowStateRef.current = null
   }
 
@@ -267,6 +268,8 @@ function ChatRuntimeBoundary({
   }, [messages, windowPages])
 
   const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
+
+  const cancelReveal = useCallback(() => setRevealTarget(null), [])
 
   const revealMessage = useCallback(
     (messageId: string) => {
@@ -381,8 +384,15 @@ function ChatRuntimeBoundary({
   )
 
   const transcriptWindow = useMemo(
-    () => ({ olderAvailable, expandWindow, revealMessage, revealScope: runtimeId || storedId || '', timelineEntries }),
-    [expandWindow, olderAvailable, revealMessage, runtimeId, storedId, timelineEntries]
+    () => ({
+      cancelReveal,
+      olderAvailable,
+      expandWindow,
+      revealMessage,
+      revealScope: runtimeId || storedId || '',
+      timelineEntries
+    }),
+    [cancelReveal, expandWindow, olderAvailable, revealMessage, runtimeId, storedId, timelineEntries]
   )
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
