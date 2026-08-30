@@ -1,5 +1,6 @@
 import { atom } from 'nanostores'
 
+import { type ProfileScope, profileScopeCacheKey } from '@/api/client'
 import { sessionTitle } from '@/lib/chat-runtime'
 import type { PreviewServerRestart } from '@/store/preview'
 import type { ActionStatusResponse, SessionInfo } from '@/types/hermes'
@@ -24,8 +25,14 @@ export interface DesktopActionTask {
 
 export const $desktopActionTasks = atom<Record<string, DesktopActionTask>>({})
 
-export function upsertDesktopActionTask(status: ActionStatusResponse): void {
-  $desktopActionTasks.set(prune({ ...$desktopActionTasks.get(), [status.name]: { status, updatedAt: Date.now() } }))
+export function desktopActionTaskKey(name: string, scope?: ProfileScope): string {
+  return `${profileScopeCacheKey(scope)}:${name}`
+}
+
+export function upsertDesktopActionTask(status: ActionStatusResponse, scope?: ProfileScope): void {
+  const key = desktopActionTaskKey(status.name, scope)
+
+  $desktopActionTasks.set(prune({ ...$desktopActionTasks.get(), [key]: { status, updatedAt: Date.now() } }))
 }
 
 export function buildRailTasks(
@@ -61,8 +68,8 @@ export function buildRailTasks(
       ]
     : []
 
-  const actions: RailTask[] = Object.values(actionTasks).map(({ status, updatedAt }) => ({
-    id: `action:${status.name}`,
+  const actions: RailTask[] = Object.entries(actionTasks).map(([key, { status, updatedAt }]) => ({
+    id: `action:${key}`,
     label: status.name,
     detail: actionDetail(status),
     status: actionStatus(status),
@@ -93,7 +100,7 @@ function prune(tasks: Record<string, DesktopActionTask>): Record<string, Desktop
 
   return Object.fromEntries(
     Object.entries(tasks)
-      .filter(([, task]) => task.status.running || now - task.updatedAt <= COMPLETED_TTL_MS)
+      .filter(([, task]) => now - task.updatedAt <= COMPLETED_TTL_MS)
       .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
       .slice(0, HISTORY_LIMIT)
   )

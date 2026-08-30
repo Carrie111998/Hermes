@@ -40,6 +40,7 @@ _profile_cli_args = late("_profile_cli_args")
 _profile_scope = late("_profile_scope")
 _resolve_toolset_model_plugin = late("_resolve_toolset_model_plugin")
 _spawn_hermes_action = late("_spawn_hermes_action")
+_ACTION_PROCS = LateState("_ACTION_PROCS")
 _toolset_model_catalog = late("_toolset_model_catalog")
 load_config = late("load_config")
 save_config = late("save_config")
@@ -817,6 +818,9 @@ async def grant_computer_use_permissions(profile: Optional[str] = None):
             status_code=400,
             detail="Computer Use permission grants are a macOS concept.",
         )
+    existing = _ACTION_PROCS.get("computer-use-grant")
+    if existing is not None and existing.poll() is None:
+        return {"ok": True, "pid": existing.pid, "name": "computer-use-grant"}
     try:
         proc = _spawn_hermes_action(
             _profile_cli_args(profile)

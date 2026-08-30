@@ -153,6 +153,30 @@ export function profileScopeKey(scope?: ProfileScope): string {
   return (scope ?? '').trim() || 'default'
 }
 
+/** Selector / ownership identity. Unlike profileScopeKey, a local pin is never
+ *  collapsed onto the ambient default — `local::default` and a remote
+ *  `gw::default` stay distinct so same-named profiles can switch. */
+export function profileScopeRouteKey(scope?: ProfileScope, ambientConnectionId?: null | string): string {
+  if (scope && typeof scope === 'object') {
+    const profile = (scope.profile ?? '').trim() || 'default'
+    const connectionId = (scope.connectionId ?? '').trim() || 'local'
+
+    return `${connectionId}::${profile}`
+  }
+
+  const profile = (scope ?? '').trim() || 'default'
+  const connectionId = (ambientConnectionId ?? '').trim() || 'local'
+
+  return `${connectionId}::${profile}`
+}
+
+/** Backend-owned cache / ledger identity. Always includes the ambient
+ *  registry connection so a remote `default` and an explicit local pin
+ *  never share a row. */
+export function profileScopeCacheKey(scope?: ProfileScope): string {
+  return profileScopeRouteKey(scope, getApiRequestConnection())
+}
+
 /** Registry connection id that connection-scoped WS calls should target
  *  (null → the local pool). Read-only twin of setApiRequestConnection. */
 export function getApiRequestConnection(): null | string {

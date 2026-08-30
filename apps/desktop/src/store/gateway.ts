@@ -145,6 +145,18 @@ interface GatewayRegistryState {
   turnLeaseReleaseTimers: Map<string, ReturnType<typeof setTimeout>>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
   $activeProfile: ReturnType<typeof atom<string>>
+  $route: ReturnType<typeof atom<GatewayRouteScope>>
+}
+
+/** The EXACT active route as one immutable snapshot: the registry connection
+ *  serving the active socket (null = the local/legacy pool) plus the bare
+ *  profile that socket is routed to. React surfaces subscribe to this instead
+ *  of $activeGatewayProfile when they must also see SAME-PROFILE backend
+ *  switches (remote default ↔ local default) — the bare-profile atom cannot
+ *  move across those, by definition. */
+export interface GatewayRouteScope {
+  connectionId: null | string
+  profile: string
 }
 
 const STATE_KEY = Symbol.for('hermes.desktop.gatewayRegistryState')
@@ -171,7 +183,47 @@ function createRegistryState(): GatewayRegistryState {
     // the split-brain where an eviction re-pointed activeKey at the primary
     // while the profile atom kept naming the evicted bot routed every
     // "loki" session.resume to the default backend (#89206 wake failures).
-    $activeProfile: atom<string>('default')
+    $activeProfile: atom<string>('default'),
+    // The EXACT route (connection + profile) of the same selection, published
+    // by publishActiveRoute() in the frames below. Deduped on the pair so
+    // re-activations never churn subscribers.
+    $route: atom<GatewayRouteScope>({ connectionId: null, profile: 'default' })
+  }
+}
+
+/**
+ * Reconstruct the exact route snapshot from a container's own fields — the
+ * dev-HMR migration for containers that predate the `$route` atom. Deliberately
+ * does NOT call activeGatewayConnectionId()/applyActive(): those read `g`,
+ * which is not yet assigned while gatewayState() is still running, and the
+ * primary's descriptor fallback (`config.activeConnectionId`) is a closure
+ * into the connection store, never into this module's state. Best-effort and
+ * fail-open: any lookup failure yields a local-pool route that the next
+ * activation/republish corrects.
+ */
+function routeScopeFromContainer(s: {
+  activeKey: string
+  config: RegistryConfig | null
+  primaryConnectionId: null | string
+  primaryProfile: string
+  secondaries: Map<string, Secondary>
+}): GatewayRouteScope {
+  const isPrimary = s.activeKey === s.primaryProfile
+  const entry = isPrimary ? undefined : s.secondaries.get(s.activeKey)
+
+  let connectionId = (isPrimary ? s.primaryConnectionId : (entry?.connectionId ?? null)) ?? null
+
+  if (isPrimary && connectionId === null) {
+    try {
+      connectionId = s.config?.activeConnectionId?.()?.trim() || null
+    } catch {
+      connectionId = null
+    }
+  }
+
+  return {
+    connectionId: connectionId ?? null,
+    profile: isPrimary ? s.primaryProfile : (entry?.profile ?? s.primaryProfile)
   }
 }
 
@@ -190,6 +242,10 @@ function gatewayState(): GatewayRegistryState {
     // Existing dev-HMR containers predate whole-turn leases.
     store[STATE_KEY].turnLeases ??= new Map()
     store[STATE_KEY].turnLeaseReleaseTimers ??= new Map()
+
+    // ...and predate the exact-route snapshot atom: reconstruct it from the
+    // container's own state so `$activeGatewayScope` is always a live atom.
+    store[STATE_KEY].$route ??= atom<GatewayRouteScope>(routeScopeFromContainer(store[STATE_KEY]))
 
     return store[STATE_KEY]
   }
@@ -216,9 +272,31 @@ export const $gateway = g.$gateway
 // instead of writing their own copy.
 export const $activeGatewayRoute = g.$activeProfile
 
+// The EXACT active route (registry connection + bare profile), published in
+// the same synchronous applyActive frame as the socket selection. Stable
+// binding for the same HMR reason as $gateway above.
+export const $activeGatewayScope = g.$route
+
 /** Bare profile name the active gateway serves (never a composite scope). */
 export function activeGatewayProfileKey(): string {
   return g.$activeProfile.get()
+}
+
+/**
+ * Publish the active route as one (connectionId, profile) snapshot. Deduped on
+ * the pair: re-activations of an unchanged route (no-op ensure calls,
+ * reconnects) keep the previous object identity, so subscribers that bail out
+ * on reference equality never re-render.
+ */
+function publishActiveRoute(profile: string): void {
+  const connectionId = activeGatewayConnectionId()
+  const current = g.$route.get()
+
+  if (current.connectionId === connectionId && current.profile === profile) {
+    return
+  }
+
+  g.$route.set({ connectionId, profile })
 }
 
 export function configureGatewayRegistry(cfg: RegistryConfig): void {
@@ -258,6 +336,9 @@ export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'defa
 
   if (g.activeKey === g.primaryProfile) {
     setApiRequestConnection(g.primaryConnectionId)
+    // Same-profile primary re-home (remote apply / boot descriptor publish):
+    // the bare profile is unchanged but the route's connection moved.
+    publishActiveRoute(g.primaryProfile)
   }
 }
 
@@ -277,6 +358,7 @@ export function setPrimaryGatewayConnectionId(connectionId: null | string | unde
 
   if (g.activeKey === g.primaryProfile) {
     setApiRequestConnection(g.primaryConnectionId)
+    publishActiveRoute(g.primaryProfile)
   }
 }
 
@@ -411,6 +493,11 @@ function applyActive(profile: string, activationEpoch: number): boolean {
     g.activeKey === g.primaryProfile ? g.primaryProfile : (g.secondaries.get(g.activeKey)?.profile ?? g.primaryProfile)
 
   g.$activeProfile.set(routeProfile)
+  // Publish the EXACT route in the same frame: a same-profile backend switch
+  // (remote default ↔ local default) moves the connectionId while the bare
+  // profile atom above cannot change, so this snapshot is the only signal
+  // route-aware surfaces can subscribe to.
+  publishActiveRoute(routeProfile)
   g.config?.onActiveRouteChanged?.(routeProfile)
 
   return true

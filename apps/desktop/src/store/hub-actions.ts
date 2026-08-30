@@ -97,7 +97,7 @@ async function runHubAction(
         return
       }
 
-      upsertDesktopActionTask(status)
+      upsertDesktopActionTask(status, profile)
       $hubActions.setKey(key, { kind, running: status.running, lines: status.lines })
 
       if (!status.running) {

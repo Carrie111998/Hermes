@@ -28,7 +28,7 @@ import {
   type McpCatalogEntry,
   type McpTestResult,
   type ProfileScope,
-  profileScopeKey,
+  profileScopeCacheKey,
   saveMcpServers,
   testMcpServer
 } from '@/hermes'
@@ -43,7 +43,7 @@ import { getServers, isServerShape, type McpServers, normalizeEntry } from '@/li
 import { countEnabledTools, isToolEnabled, toggleToolInServer } from '@/lib/mcp-tool-filter'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId } from '@/store/session'
 
 import { hermesConfigCacheWriter, useHermesConfigRecord } from '../hooks/use-config-record'
@@ -359,7 +359,7 @@ export function McpTab({ gateway, profile }: { gateway: HermesGateway | null; pr
   // profile's servers (AGENTS.md scope-in-key). When no override is passed this
   // resolves to $activeGatewayProfile, so behavior is identical to before.
   const appProfile = useStore($activeGatewayProfile)
-  const scopeProfileKey = profile != null ? profileScopeKey(profile) : normalizeProfileKey(appProfile)
+  const scopeProfileKey = profileScopeCacheKey(profile ?? appProfile)
 
   // Shared config cache (see use-config-record): revisiting the tab paints the
   // cached record instantly; mutations write through `setConfig` and stay

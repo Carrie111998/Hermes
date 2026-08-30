@@ -21,7 +21,7 @@ import {
   getToolsets,
   getUsageAnalytics,
   type ProfileScope,
-  profileScopeKey,
+  profileScopeCacheKey,
   setSkillEnabled,
   setToolsetEnabled
 } from '@/hermes'
@@ -32,9 +32,9 @@ import { queryClient } from '@/lib/query-client'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
 import { useStoreSelector } from '@/lib/use-session-slice'
-import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
+import { $activeGatewayScope, $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { normalizeProfileKey } from '@/store/profile'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
 
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
@@ -106,6 +106,10 @@ async function loadToolCalls(
   toolCallsCache.set(scopeKey, { at: Date.now(), value })
 
   return value
+}
+
+export function resetToolCallsCache(): void {
+  toolCallsCache.clear()
 }
 
 const usageOf = (skill: SkillInfo): number => (typeof skill.usage === 'number' ? skill.usage : 0)
@@ -192,7 +196,10 @@ interface SkillsViewProps extends React.ComponentProps<'section'> {
   embedded?: boolean
   /** Pin the WHOLE view to one profile: the scope selector is hidden and
    *  every tab reads/writes THAT profile. This is the plugin door — Bot Mode
-   *  renders the real Capabilities surface pinned to a bot. */
+   *  renders the real Capabilities surface pinned to a bot. Without a
+   *  `fixedConnection` the pinned profile rides the ACTIVE connection as an
+   *  exact (connectionId, profile) snapshot, so a same-profile backend flip
+   *  re-points every read/write (grant lifecycle included). */
   fixedProfile?: string
   /** Pin the view to a REGISTERED gateway connection alongside `fixedProfile`:
    *  every read/write routes to that machine's backend instead of the active
@@ -218,6 +225,14 @@ export function SkillsView({
   // $gateway only feeds the MCP tab — gate the subscription so Skills/Toolsets
   // tabs don't re-render on connect/disconnect/reconnect.
   const gateway = useStoreSelector($gateway, g => (mode === 'mcp' ? g : null))
+  // The EXACT active route — the registry connection serving the active socket
+  // plus the bare profile, published together by the gateway registry. This
+  // subscription is deliberately UNGATED: a same-profile app-wide backend
+  // switch (remote default ↔ local default) republishes this snapshot while
+  // $activeGatewayProfile keeps saying "default", and the ambient scope
+  // resolution below must re-point or every scoped cache silently keeps the
+  // previous machine's data.
+  const activeScope = useStore($activeGatewayScope)
 
   const [query, setQuery] = useState('')
 
@@ -237,32 +252,50 @@ export function SkillsView({
   // multi-connection desktop the selector offers every (connection, profile)
   // pair from the union agent roster and an explicit pick routes every
   // read/write to that machine's backend. Defaults to the app-wide active
-  // profile (unchanged behavior). A `fixedProfile` (+ optional
-  // `fixedConnection`) pins the scope outright (selector hidden).
-  const activeProfile = useStore($activeGatewayProfile)
+  // route (unchanged behavior). A `fixedProfile` (+ optional `fixedConnection`)
+  // pins the scope outright (selector hidden).
   const [scopeOverride, setScopeOverride] = useState<null | string | { connectionId: string; profile: string }>(null)
 
-  const scopeProfile: ProfileScope = useMemo(
-    () =>
-      fixedProfile
-        ? fixedConnection
-          ? { connectionId: fixedConnection, profile: fixedProfile }
-          : fixedProfile
-        : (scopeOverride ?? activeProfile ?? null),
-    [activeProfile, fixedConnection, fixedProfile, scopeOverride]
-  )
+  // Every scope resolves to an EXPLICIT (connectionId, profile) snapshot taken
+  // from ONE source — the subscribed exact-route atom — never a bare profile
+  // name whose cache key would re-read the mutable ambient connection tag
+  // outside React's knowledge. profileScopeCacheKey of an object is a pure
+  // function of this snapshot, so a same-profile backend switch re-keys every
+  // scoped query (and the Computer Use grant lifecycle) through ordinary React
+  // re-render.
+  const scopeProfile: ProfileScope = useMemo(() => {
+    // A fixed profile rides the ACTIVE connection unless an explicit
+    // fixedConnection pin says otherwise; '' / 'local' mean the local pool
+    // (documented), so only an ABSENT fixedConnection follows the active route.
+    if (fixedProfile) {
+      return fixedConnection === undefined
+        ? { connectionId: activeScope.connectionId ?? 'local', profile: fixedProfile }
+        : { connectionId: fixedConnection, profile: fixedProfile }
+    }
 
-  const scopeKey = profileScopeKey(scopeProfile)
+    // The ambient route: connection and profile are ONE published pair — the
+    // registry writes both in the same frame, so the snapshot can never name a
+    // (connection, profile) combination that was never active.
+    return (
+      scopeOverride ?? {
+        connectionId: activeScope.connectionId ?? 'local',
+        profile: normalizeProfileKey(activeScope.profile)
+      }
+    )
+  }, [activeScope, fixedConnection, fixedProfile, scopeOverride])
 
-  // The registry connection an explicit override pins — null for the ambient
-  // active-profile path and for fixed-profile pins without a connection.
+  const scopeKey = profileScopeCacheKey(scopeProfile)
+
+  // The registry connection a scope carries — null only for a legacy bare-name
+  // override pick; every object snapshot (ambient route, fixed profile) names
+  // its own ('local' for the local pool).
   const scopeConnectionId =
     scopeProfile && typeof scopeProfile === 'object' ? (scopeProfile.connectionId ?? '').trim() || 'local' : null
 
   // Scoped to a DIFFERENT backend than the window's active gateway? The MCP
   // tab's live-reload RPC rides the active gateway socket, which would reload
   // the wrong machine — withhold it for cross-backend scopes.
-  const crossBackendScope = scopeConnectionId !== null && scopeConnectionId !== (activeGatewayConnectionId() ?? 'local')
+  const crossBackendScope = scopeConnectionId !== null && scopeConnectionId !== (activeScope.connectionId ?? 'local')
 
   const { data: profilesData } = useQuery({
     queryKey: ['capabilities-profiles'],
@@ -324,9 +357,21 @@ export function SkillsView({
   // tool name -> call count over the analytics window. null = still loading
   // (badges show skeletons); {} = loaded empty / unavailable backend.
   const [toolCalls, setToolCalls] = useState<Record<string, number> | null>(null)
-  // Bumped on profile switch so a slow analytics load from profile A can't set
+  // Bumped on scope change so a slow analytics load from scope A can't set
   // toolCalls after the user moved to B.
   const toolCallsEpoch = useRef(0)
+
+  // ANY scope change — an app-wide profile switch, a same-profile backend
+  // switch (the active route re-pointed), or a selector pick — re-points every
+  // scope-keyed cache. The analytics mirror is one of them: reset it so the
+  // lazy Toolsets loader below re-runs for the new key instead of pinning the
+  // previous scope's call counts. Declared BEFORE the lazy effect so the
+  // first-mount bump happens before that load captures its epoch.
+  useEffect(() => {
+    toolCallsEpoch.current += 1
+    setToolCalls(null)
+  }, [scopeKey])
+
   const skillsSortDesc = useStore($skillsSortDesc)
   const toolsetsSortDesc = useStore($toolsetsSortDesc)
   const [bulkBusy, setBulkBusy] = useState(false)
@@ -383,16 +428,12 @@ export function SkillsView({
     return () => void (cancelled = true)
   }, [mode, scopeKey, scopeProfile, toolCalls])
 
-  // On an app-wide profile switch the analytics cache is scope-keyed, but our
-  // local toolCalls state isn't — leaving it non-null would keep the lazy
-  // effect from ever re-running, so badges/sort would show the previous
-  // profile's counts. Reset to null so the next Toolsets view reloads for the
-  // active profile. The switch also drops any scope override — the user just
+  // On an app-wide profile switch drop any scope override — the user just
   // changed what "here" means, and a stale override pointing at the previous
-  // selection would be surprising.
+  // selection would be surprising. The scope-keyed effects above/below cover
+  // the analytics mirror and the editor dialogs; an explicit override survives
+  // a backend switch it did not name.
   useOnProfileSwitch(() => {
-    toolCallsEpoch.current += 1
-    setToolCalls(null)
     setScopeOverride(null)
   })
 
@@ -598,15 +639,17 @@ export function SkillsView({
   // A can't reopen the editor with A's content after switching to B.
   const skillEditorEpoch = useRef(0)
 
-  // A profile switch swaps the backend under the open editor/archive dialog —
-  // their targets belong to profile A, so a save/archive would hit B. Drop them
-  // so nothing edits or archives against the newly active profile.
-  useOnProfileSwitch(() => {
+  // Any scope change swaps the backend under an open editor/archive dialog —
+  // their targets belong to the previous scope, so a save/archive would hit
+  // the new one. Drop them (and strand in-flight opens via the epoch) whenever
+  // the scope key moves; the profile-switch override drop above is the one
+  // reset this effect deliberately does NOT own.
+  useEffect(() => {
     skillEditorEpoch.current += 1
     setSkillEditor(null)
     setSkillDraft('')
     setArchiveTarget(null)
-  })
+  }, [scopeKey])
 
   const openSkillEditor = async (name: string) => {
     const epoch = skillEditorEpoch.current
@@ -670,12 +713,10 @@ export function SkillsView({
     </DetailPane>
   )
 
-  // Selecting a different scope is the same staleness hazard as an app-wide
-  // profile switch: in-flight analytics belong to the previous scope's cache
-  // key, and an open skill editor / archive dialog targets the PREVIOUS
-  // scope's skill (a save/archive would hit the new one). Reset both here —
-  // this handler is the only way the scope changes besides an app profile
-  // switch, which useOnProfileSwitch already covers.
+  // Selecting a different scope re-points every scope-keyed cache — the same
+  // staleness hazard as an app-wide profile switch or a same-profile backend
+  // switch. The scope-keyed effects above own those resets (analytics mirror,
+  // open editor/archive dialogs); this handler only records the override.
   //
   // Selector option values are `connectionId::profile` on multi-connection
   // desktops (the roster path) and bare profile names otherwise, so one
@@ -688,17 +729,11 @@ export function SkillsView({
     // bare-name picks stay strings so cache keys and routing are unchanged.
     const next: ProfileScope = sep >= 0 ? { connectionId: value.slice(0, sep), profile: value.slice(sep + 2) } : value
 
-    if (profileScopeKey(next) === scopeKey) {
+    if (profileScopeCacheKey(next) === profileScopeCacheKey(scopeProfile)) {
       return
     }
 
     setScopeOverride(next as string | { connectionId: string; profile: string })
-    toolCallsEpoch.current += 1
-    setToolCalls(null)
-    skillEditorEpoch.current += 1
-    setSkillEditor(null)
-    setSkillDraft('')
-    setArchiveTarget(null)
   }
 
   // Scope-selector rows. Multi-connection desktops list every reachable
@@ -706,7 +741,7 @@ export function SkillsView({
   // is configured ON ITS OWN GATEWAY. Otherwise the legacy per-profile list.
   const scopeOptions: { key: string; label: string; value: string }[] = useMemo(() => {
     if (multiConnection && rosterData?.agents?.length) {
-      const activeId = activeGatewayConnectionId() ?? 'local'
+      const activeId = activeScope.connectionId ?? 'local'
 
       return rosterData.agents.map((agent: DesktopRosterAgent) => ({
         key: `${agent.connectionId}::${agent.profile}`,
@@ -723,22 +758,23 @@ export function SkillsView({
       label: p.is_default ? 'Hermes (default)' : p.name,
       value: p.name
     }))
-  }, [multiConnection, profilesData, rosterData])
+  }, [activeScope, multiConnection, profilesData, rosterData])
 
   // The selector's current value must match one option's value exactly. On the
-  // roster path an ambient (non-override) scope is the active gateway's
-  // profile, which lives at `activeConnectionId::profile`.
+  // roster path every scope (ambient snapshot included) names its exact
+  // (connection, profile) row; on the legacy per-profile list, bare names —
+  // so an object scope still selects by its profile there.
   const scopeSelectValue = useMemo(() => {
-    if (scopeProfile && typeof scopeProfile === 'object') {
-      return `${(scopeProfile.connectionId ?? '').trim() || 'local'}::${scopeProfile.profile ?? ''}`
-    }
-
     if (multiConnection && rosterData?.agents?.length) {
-      return `${activeGatewayConnectionId() ?? 'local'}::${normalizeProfileKey(scopeProfile)}`
+      if (scopeProfile && typeof scopeProfile === 'object') {
+        return `${(scopeProfile.connectionId ?? '').trim() || 'local'}::${scopeProfile.profile ?? ''}`
+      }
+
+      return `${activeScope.connectionId ?? 'local'}::${normalizeProfileKey(scopeProfile)}`
     }
 
-    return scopeProfile ?? ''
-  }, [multiConnection, rosterData, scopeProfile])
+    return scopeProfile && typeof scopeProfile === 'object' ? (scopeProfile.profile ?? '') : (scopeProfile ?? '')
+  }, [activeScope, multiConnection, rosterData, scopeProfile])
 
   // Scope selector, shown above EVERY Capabilities tab (Skills, Tools, MCP,
   // Browse Hub). Lets the user configure ANY profile's capabilities — on any
@@ -1049,7 +1085,7 @@ function SkillDetail({
   // provenance, scoped to the Capabilities profile selector. The row list only
   // carries name/description; the pane shows the whole thing.
   const contentQuery = useQuery({
-    queryKey: ['skill-content', skill.name, profileScopeKey(profile)],
+    queryKey: ['skill-content', skill.name, profileScopeCacheKey(profile)],
     queryFn: () => getSkillContent(skill.name, profile),
     staleTime: 60_000
   })
@@ -1165,10 +1201,12 @@ function ToolsetDetail({
           </div>
         </div>
       )}
-      {toolset.name === 'computer_use' && <ComputerUsePanel onConfiguredChange={onConfiguredChange} />}
+      {toolset.name === 'computer_use' && (
+        <ComputerUsePanel onConfiguredChange={onConfiguredChange} profile={profile} />
+      )}
       {toolset.name === 'terminal' && <TerminalBackendPanel onConfiguredChange={onConfiguredChange} />}
       <ToolsetConfigPanel
-        key={`${toolset.name}:${profileScopeKey(profile)}`}
+        key={`${toolset.name}:${profileScopeCacheKey(profile)}`}
         onConfiguredChange={onConfiguredChange}
         profile={profile}
         toolset={toolset.name}

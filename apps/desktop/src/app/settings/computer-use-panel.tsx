@@ -1,18 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
-import { getActionStatus, getComputerUseStatus, grantComputerUsePermissions } from '@/hermes'
+import { getActionStatus, getComputerUseStatus, grantComputerUsePermissions, type ProfileScope } from '@/hermes'
 import { AlertTriangle, Check, ExternalLink, Loader2, RefreshCw, X } from '@/lib/icons'
 import { upsertDesktopActionTask } from '@/store/activity'
 import { notify, notifyError } from '@/store/notifications'
 import type { ComputerUseStatus } from '@/types/hermes'
 
+import {
+  forgetComputerUseGrant,
+  peekComputerUseGrant,
+  rememberComputerUseGrant
+} from './computer-use-grants'
 import { Pill } from './primitives'
 
 interface ComputerUsePanelProps {
   /** Re-read the parent toolset list after a permission/install change so the
    *  "Configured / Needs keys" pill stays in sync. */
   onConfiguredChange?: () => void
+  profile?: ProfileScope
 }
 
 // Per-OS one-liner shown when there's no TCC grant flow (Windows/Linux). macOS
@@ -60,39 +66,144 @@ function PermissionRow({ granted, label, hint }: { granted: boolean | null; labe
  * Binary install/upgrade stays in the cua-driver provider's post-setup runner
  * below this card (the generic ToolsetConfigPanel).
  */
-export function ComputerUsePanel({ onConfiguredChange }: ComputerUsePanelProps) {
+export function ComputerUsePanel({ onConfiguredChange, profile }: ComputerUsePanelProps) {
   const [status, setStatus] = useState<ComputerUseStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [granting, setGranting] = useState(false)
   const activeRef = useRef(false)
+  const scopeGenerationRef = useRef(0)
+  const refreshRequestRef = useRef(0)
 
   const refresh = useCallback(async () => {
+    const generation = scopeGenerationRef.current
+    const request = ++refreshRequestRef.current
+
     try {
-      setStatus(await getComputerUseStatus())
+      const nextStatus = await getComputerUseStatus(profile)
+
+      if (activeRef.current && generation === scopeGenerationRef.current && request === refreshRequestRef.current) {
+        setStatus(nextStatus)
+      }
     } catch (err) {
-      notifyError(err, 'Could not read Computer Use status')
+      if (activeRef.current && generation === scopeGenerationRef.current && request === refreshRequestRef.current) {
+        notifyError(err, 'Could not read Computer Use status')
+      }
     } finally {
-      setLoading(false)
+      if (activeRef.current && generation === scopeGenerationRef.current && request === refreshRequestRef.current) {
+        setLoading(false)
+      }
     }
-  }, [])
+  }, [profile])
+
+  const pollGrant = useCallback(
+    async (name: string, generation: number) => {
+      for (
+        let attempt = 0;
+        attempt < 150 && activeRef.current && generation === scopeGenerationRef.current;
+        attempt += 1
+      ) {
+        await new Promise(resolve => window.setTimeout(resolve, 1500))
+
+        if (!activeRef.current || generation !== scopeGenerationRef.current) {
+          return
+        }
+
+        const polled = await getActionStatus(name, 200, profile)
+
+        if (!activeRef.current || generation !== scopeGenerationRef.current) {
+          return
+        }
+
+        upsertDesktopActionTask(polled, profile)
+
+        if (!polled.running) {
+          forgetComputerUseGrant(profile)
+
+          return
+        }
+      }
+    },
+    [profile]
+  )
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     activeRef.current = true
+    scopeGenerationRef.current += 1
+    const generation = scopeGenerationRef.current
+    setStatus(null)
+    setLoading(true)
+    setGranting(false)
     void refresh()
 
-    return () => void (activeRef.current = false)
-  }, [refresh])
+    const liveName = peekComputerUseGrant(profile)
+
+    if (liveName) {
+      setGranting(true)
+      void pollGrant(liveName, generation)
+        .catch(err => {
+          if (activeRef.current && generation === scopeGenerationRef.current) {
+            notifyError(err, 'Could not request permissions')
+          }
+        })
+        .finally(() => {
+          if (activeRef.current && generation === scopeGenerationRef.current) {
+            setGranting(false)
+            void refresh()
+            onConfiguredChange?.()
+          }
+        })
+    }
+
+    return () => {
+      activeRef.current = false
+      scopeGenerationRef.current += 1
+    }
+  }, [onConfiguredChange, pollGrant, profile, refresh])
+
+  // Shared successful post-poll completion for BOTH grant paths in `grant()`
+  // (a fresh spawn and an existing-grant retry): once the poll settles, re-read
+  // the status card and tell the parent so the "Configured / Needs keys" pill
+  // follows the grant. The retry branch previously returned straight after the
+  // poll, leaving both stale until the next manual recheck.
+  const finishGrantPoll = useCallback(
+    async (name: string, generation: number) => {
+      await pollGrant(name, generation)
+
+      if (activeRef.current && generation === scopeGenerationRef.current) {
+        await refresh()
+        onConfiguredChange?.()
+      }
+    },
+    [onConfiguredChange, pollGrant, refresh]
+  )
 
   const grant = useCallback(async () => {
+    const generation = scopeGenerationRef.current
     setGranting(true)
 
     try {
-      const started = await grantComputerUsePermissions()
+      const existing = peekComputerUseGrant(profile)
+
+      if (existing) {
+        await finishGrantPoll(existing, generation)
+
+        return
+      }
+
+      const started = await grantComputerUsePermissions(profile)
 
       if (!started.ok) {
-        notifyError(new Error('spawn failed'), 'Could not request permissions')
+        if (activeRef.current && generation === scopeGenerationRef.current) {
+          notifyError(new Error('spawn failed'), 'Could not request permissions')
+        }
 
+        return
+      }
+
+      rememberComputerUseGrant(profile, started.name)
+
+      if (!activeRef.current || generation !== scopeGenerationRef.current) {
         return
       }
 
@@ -102,36 +213,17 @@ export function ComputerUsePanel({ onConfiguredChange }: ComputerUsePanelProps) 
         message: 'macOS will show a permission dialog attributed to CuaDriver. Approve it, then return here.'
       })
 
-      // The driver waits for the user to flip the switch — poll until it exits.
-      for (let attempt = 0; attempt < 150 && activeRef.current; attempt += 1) {
-        await new Promise(resolve => window.setTimeout(resolve, 1500))
-
-        if (!activeRef.current) {
-          break
-        }
-
-        const polled = await getActionStatus(started.name, 200)
-        upsertDesktopActionTask(polled)
-
-        if (!polled.running) {
-          break
-        }
-      }
-
-      if (activeRef.current) {
-        await refresh()
-        onConfiguredChange?.()
-      }
+      await finishGrantPoll(started.name, generation)
     } catch (err) {
-      if (activeRef.current) {
+      if (activeRef.current && generation === scopeGenerationRef.current) {
         notifyError(err, 'Could not request permissions')
       }
     } finally {
-      if (activeRef.current) {
+      if (activeRef.current && generation === scopeGenerationRef.current) {
         setGranting(false)
       }
     }
-  }, [onConfiguredChange, refresh])
+  }, [finishGrantPoll, profile])
 
   if (loading) {
     return (
