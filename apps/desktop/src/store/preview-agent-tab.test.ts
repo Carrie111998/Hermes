@@ -11,8 +11,9 @@
 
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { selectRightRailTab } from './layout'
+import { $rightRailActiveTabId, selectRightRailTab } from './layout'
 import {
+  $browserSessionId,
   $dockedPreviewTabs,
   $previewTabs,
   agentPreviewTabId,
@@ -36,14 +37,28 @@ const url = (host: string) => ({
   url: `https://${host}`
 })
 
+
+/** The runtime session ids of two conversations browsing at once. Every agent
+ *  open below carries one: ownership is per RUNTIME session, so a tool-result
+ *  open with no session belongs to nobody and can be taken by nobody. */
+const A = 'runtime-a'
+const B = 'runtime-b'
+
+/** An agent open, from session A unless told otherwise. */
+const agentOpen = (
+  target: Parameters<typeof openPreview>[0],
+  options: { newTab?: boolean; reveal?: boolean; sessionId?: string } = {}
+) => openPreview(target, 'tool-result', { sessionId: A, ...options })
+
 beforeEach(() => {
   closeRightRail()
+  $browserSessionId.set(null)
 })
 
 describe('agent browser tabs', () => {
   it('opens its own tab instead of replacing the page you are reading', () => {
     openPreview(url('example.com'))
-    openPreview(url('docs.rs'), 'tool-result')
+    agentOpen(url('docs.rs'))
 
     const tabs = $previewTabs.get()
 
@@ -56,9 +71,9 @@ describe('agent browser tabs', () => {
 
   // A tab per navigation would bury the strip within one task.
   it('re-uses its own tab across a whole task', () => {
-    openPreview(url('a.com'), 'tool-result')
-    openPreview(url('b.com'), 'tool-result')
-    openPreview(url('c.com'), 'tool-result')
+    agentOpen(url('a.com'))
+    agentOpen(url('b.com'))
+    agentOpen(url('c.com'))
 
     const tabs = $previewTabs.get()
 
@@ -69,14 +84,14 @@ describe('agent browser tabs', () => {
   // The dangerous case: the agent's tab exists but the person is looking at
   // their own. Resolving by "active tab" would clobber theirs.
   it('does not follow your focus onto a tab it does not own', () => {
-    openPreview(url('agent-page.com'), 'tool-result')
+    agentOpen(url('agent-page.com'))
     newBrowserTab()
 
     const mine = $previewTabs.get().at(-1)?.id
 
     expect(mine).toBeDefined()
     selectRightRailTab(mine!)
-    openPreview(url('agent-next.com'), 'tool-result')
+    agentOpen(url('agent-next.com'))
 
     const tabs = $previewTabs.get()
 
@@ -87,9 +102,9 @@ describe('agent browser tabs', () => {
   })
 
   it('mints a fresh tab when its own has been closed', () => {
-    openPreview(url('first.com'), 'tool-result')
+    agentOpen(url('first.com'))
     closeRightRail()
-    openPreview(url('second.com'), 'tool-result')
+    agentOpen(url('second.com'))
 
     const tabs = $previewTabs.get()
 
@@ -101,7 +116,7 @@ describe('agent browser tabs', () => {
   // Visiting is not taking over: the tab keeps answering to the agent, so the
   // agent's next step doesn't strand it and mint a duplicate.
   it('keeps ownership when you open a link in its tab', () => {
-    openPreview(url('agent.com'), 'tool-result')
+    agentOpen(url('agent.com'))
     openPreview(url('link.com'), 'explicit-link')
 
     expect($previewTabs.get()).toHaveLength(1)
@@ -125,7 +140,7 @@ describe('agent browser tabs', () => {
   // weeks ago would still answer to a later session's agent — the same clobber,
   // deferred. Losing it costs one extra tab and cannot cost a page.
   it('does not carry ownership across a restart', () => {
-    openPreview(url('agent.com'), 'tool-result')
+    agentOpen(url('agent.com'))
 
     const restored = decodePreviewTabs(previewTabsStorage())
 
@@ -136,14 +151,14 @@ describe('agent browser tabs', () => {
   // The user's tab, adopted long ago, comes back with no owner — so the next
   // session's agent opens beside it instead of taking it.
   it('leaves a restored tab alone and opens its own', () => {
-    openPreview(url('mine.com'), 'tool-result')
+    agentOpen(url('mine.com'))
     $previewTabs.set(decodePreviewTabs(previewTabsStorage()))
 
     const mine = $previewTabs.get()[0]
 
     expect(mine?.agent).toBeFalsy()
     selectRightRailTab(mine!.id)
-    openPreview(url('agent-next.com'), 'tool-result')
+    agentOpen(url('agent-next.com'))
 
     const tabs = $previewTabs.get()
 
@@ -154,8 +169,8 @@ describe('agent browser tabs', () => {
 
   // Two pages side by side — comparing them, or holding a reference open.
   it('can ask for a second tab of its own', () => {
-    openPreview(url('first.com'), 'tool-result')
-    openPreview(url('second.com'), 'tool-result', { newTab: true })
+    agentOpen(url('first.com'))
+    agentOpen(url('second.com'), { newTab: true })
 
     const tabs = $previewTabs.get()
 
@@ -168,16 +183,16 @@ describe('agent browser tabs', () => {
   // the newest tab and the first is unreachable, since no tool selects one.
   // Re-opening a page it already holds is that way back.
   it('returns to an earlier tab by opening the page it holds', () => {
-    openPreview(url('docs.com'), 'tool-result')
-    openPreview(url('app.com'), 'tool-result', { newTab: true })
+    agentOpen(url('docs.com'))
+    agentOpen(url('app.com'), { newTab: true })
 
-    openPreview(url('docs.com'), 'tool-result')
+    agentOpen(url('docs.com'))
 
     expect($previewTabs.get()).toHaveLength(2)
-    expect(agentPreviewTabId()).toBe($previewTabs.get()[0]?.id)
+    expect(agentPreviewTabId(A)).toBe($previewTabs.get()[0]?.id)
 
     // And work now lands there rather than in the newest tab.
-    openPreview(url('docs.com/page2'), 'tool-result')
+    agentOpen(url('docs.com/page2'))
 
     const tabs = $previewTabs.get()
 
@@ -190,9 +205,9 @@ describe('agent browser tabs', () => {
   // reviving the first — otherwise the agent cannot work in the tab it just
   // made.
   it('works in the newest tab it opened', () => {
-    openPreview(url('first.com'), 'tool-result')
-    openPreview(url('second.com'), 'tool-result', { newTab: true })
-    openPreview(url('third.com'), 'tool-result')
+    agentOpen(url('first.com'))
+    agentOpen(url('second.com'), { newTab: true })
+    agentOpen(url('third.com'))
 
     const tabs = $previewTabs.get()
 
@@ -205,8 +220,8 @@ describe('agent browser tabs', () => {
   it('ignores newTab for a file, which is addressed by its path', () => {
     const file = { kind: 'file' as const, label: 'a.ts', source: '/a.ts', url: 'file:///a.ts' }
 
-    openPreview(file, 'tool-result', { newTab: true })
-    openPreview(file, 'tool-result', { newTab: true })
+    agentOpen(file, { newTab: true })
+    agentOpen(file, { newTab: true })
 
     expect($previewTabs.get()).toHaveLength(1)
   })
@@ -217,8 +232,8 @@ describe('agent browser tabs', () => {
   // from; a tab missing from it has been popped out into its own window,
   // which only the pop-out button does. Nothing on the agent's path calls it.
   it('opens a tab in the same browser, not a window', () => {
-    openPreview(url('first.com'), 'tool-result')
-    openPreview(url('second.com'), 'tool-result', { newTab: true })
+    agentOpen(url('first.com'))
+    agentOpen(url('second.com'), { newTab: true })
 
     const docked = $dockedPreviewTabs.get()
 
@@ -232,12 +247,188 @@ describe('agent browser tabs', () => {
   // `openBrowserTab` is the hotkey: "show me the browser". With only the
   // agent's tab open that is the browser it should front.
   it('lets the hotkey front the agent tab rather than blanking it', () => {
-    openPreview(url('agent.com'), 'tool-result')
+    agentOpen(url('agent.com'))
     openBrowserTab()
 
     const tabs = $previewTabs.get()
 
     expect(tabs).toHaveLength(1)
     expect(tabs[0]?.target.url).toBe('https://agent.com')
+  })
+})
+
+/**
+ * TWO CONVERSATIONS, TWO BROWSERS.
+ *
+ * `agentTabId` used to be one module-level variable and `browserTabId` fell
+ * back to "the agent tab" for everyone, so the second chat to open a page
+ * inherited the first one's tab: one browser wearing N conversations, with
+ * every click, read and navigation landing on whichever page won last.
+ */
+describe('agent browser tabs across sessions', () => {
+  it('gives each conversation its own tab', () => {
+    agentOpen(url('a-side.com'))
+    agentOpen(url('b-side.com'), { sessionId: B })
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(2)
+    expect(tabs.map(tab => tab.target.url)).toEqual(['https://a-side.com', 'https://b-side.com'])
+    expect(tabs.map(tab => tab.owner)).toEqual([A, B])
+  })
+
+  // THE discriminating case. A browser tab id was once derived from the url, so
+  // two chats opening the same address collided by construction — an ownership
+  // field alone passes the different-urls test above and still fails here.
+  it('gives each conversation its own tab for the SAME url', () => {
+    agentOpen(url('same.com'))
+    agentOpen(url('same.com'), { sessionId: B })
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(2)
+    expect(new Set(tabs.map(tab => tab.id)).size).toBe(2)
+    expect(tabs.map(tab => tab.owner)).toEqual([A, B])
+  })
+
+  // What `read_preview` resolves through. Answering from the other chat's page
+  // is how an agent reads, reasons about and reports a page it never opened.
+  it('resolves each conversation to its own tab', () => {
+    agentOpen(url('a-side.com'))
+    agentOpen(url('b-side.com'), { sessionId: B })
+
+    const [tabA, tabB] = $previewTabs.get()
+
+    expect(agentPreviewTabId(A)).toBe(tabA?.id)
+    expect(agentPreviewTabId(B)).toBe(tabB?.id)
+  })
+
+  // Selection is global and the rail is one surface, so B's tab being fronted
+  // must not re-point A.
+  it('keeps each conversation on its own tab whichever one is selected', () => {
+    agentOpen(url('a-side.com'))
+    agentOpen(url('b-side.com'), { sessionId: B })
+
+    const [tabA, tabB] = $previewTabs.get()
+
+    selectRightRailTab(tabB!.id)
+    expect(agentPreviewTabId(A)).toBe(tabA?.id)
+
+    selectRightRailTab(tabA!.id)
+    expect(agentPreviewTabId(B)).toBe(tabB?.id)
+  })
+
+  it('keeps each conversation navigating only its own tab', () => {
+    agentOpen(url('a1.com'))
+    agentOpen(url('b1.com'), { sessionId: B })
+
+    agentOpen(url('a2.com'))
+    agentOpen(url('b2.com'), { sessionId: B })
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(2)
+    expect(tabs.map(tab => tab.target.url)).toEqual(['https://a2.com', 'https://b2.com'])
+  })
+
+  // A second tab for one chat is not a second tab for the other.
+  it('scopes newTab to the conversation that asked', () => {
+    agentOpen(url('a1.com'))
+    agentOpen(url('b1.com'), { sessionId: B })
+    agentOpen(url('a2.com'), { newTab: true })
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(3)
+    expect(tabs.filter(tab => tab.owner === A)).toHaveLength(2)
+    expect(tabs.filter(tab => tab.owner === B)).toHaveLength(1)
+    // And B still works in its own, not in the newest tab on screen.
+    agentOpen(url('b2.com'), { sessionId: B })
+    expect($previewTabs.get()).toHaveLength(3)
+    expect($previewTabs.get().find(tab => tab.owner === B)?.target.url).toBe('https://b2.com')
+  })
+
+  // Closing one chat's tab is not closing the other's.
+  it('leaves the other conversation intact when one tab closes', () => {
+    agentOpen(url('a-side.com'))
+    agentOpen(url('b-side.com'), { sessionId: B })
+
+    const tabA = $previewTabs.get()[0]
+
+    $previewTabs.set($previewTabs.get().filter(tab => tab.id !== tabA!.id))
+
+    expect($previewTabs.get()).toHaveLength(1)
+    expect(agentPreviewTabId(B)).toBe($previewTabs.get()[0]?.id)
+  })
+
+  // A background turn creating its tab must not pull the rail off the page you
+  // are reading. The caller decides; the store obeys.
+  it('does not front a tab opened for a conversation you are not in', () => {
+    agentOpen(url('mine.com'))
+
+    const mine = $previewTabs.get()[0]
+
+    agentOpen(url('theirs.com'), { reveal: false, sessionId: B })
+
+    expect($previewTabs.get()).toHaveLength(2)
+    expect($rightRailActiveTabId.get()).toBe(mine?.id)
+  })
+
+  // The arm that had no test and leaked: a conversation that has opened nothing
+  // of its own falls back to "the page you are looking at" — but another chat's
+  // owned tab is not a page it is looking at. Unfiltered, an agent's very first
+  // `read_preview` answered from whichever tab was active.
+  it('gives a conversation that has opened nothing no claim on another\'s tab', () => {
+    agentOpen(url('a-side.com'))
+
+    const tabA = $previewTabs.get()[0]
+
+    selectRightRailTab(tabA!.id)
+
+    expect(agentPreviewTabId(B)).toBeNull()
+  })
+
+  // But a page the PERSON opened is still everyone's, which is the whole point
+  // of the fallback and must survive the fix above.
+  it('still falls back to a page you opened yourself', () => {
+    openPreview(url('mine.com'))
+
+    expect(agentPreviewTabId(B)).toBe($previewTabs.get()[0]?.id)
+  })
+
+  // The strip's "+" joins the browser you are LOOKING at, which belongs to a
+  // conversation — so the tab does too, rather than becoming a stray everyone
+  // sees. Deliberate change: it used to make an unowned tab.
+  it('gives a new tab to the conversation whose browser is open', () => {
+    $browserSessionId.set(A)
+    newBrowserTab()
+
+    expect($previewTabs.get().at(-1)?.owner).toBe(A)
+  })
+
+  // A chat that has never browsed gets a browser of its own — not the other
+  // chat's page, and not that page navigated to about:blank.
+  it('opens a blank browser owned by the conversation that asked', () => {
+    agentOpen(url('a-side.com'))
+
+    openBrowserTab(B)
+
+    const mine = $previewTabs.get().filter(tab => tab.owner === B)
+
+    expect(mine).toHaveLength(1)
+    expect(mine[0]?.target.url).toBe('about:blank')
+    // A's page is untouched — this is the clobber the direct-select fixed.
+    expect($previewTabs.get().find(tab => tab.owner === A)?.target.url).toBe('https://a-side.com')
+  })
+
+  it('fronts a conversation own browser and points the rail at it', () => {
+    agentOpen(url('a-side.com'))
+    agentOpen(url('b-side.com'), { sessionId: B })
+    $browserSessionId.set(A)
+
+    openBrowserTab(B)
+
+    expect($browserSessionId.get()).toBe(B)
+    expect($rightRailActiveTabId.get()).toBe($previewTabs.get().find(tab => tab.owner === B)?.id)
   })
 })

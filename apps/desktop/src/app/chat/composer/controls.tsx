@@ -8,6 +8,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { AudioLines, Ear, EarOff, iconSize, Layers3, Loader2, Square, Volume2, VolumeX } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $hudMode, closeHud, resetHudLayout } from '@/store/hud'
+import { $browserSessionId, $dockedPreviewTabs, openBrowserTab, previewTabBelongsToSession } from '@/store/preview'
 import { $wakeWord, toggleWakeWord } from '@/store/wake-word'
 
 import { ACTIVE_ICON_BTN, GHOST_ICON_BTN, PRIMARY_ICON_BTN } from './control-classes'
@@ -108,6 +109,7 @@ export function ComposerControls({
       {minimal ? null : (
         <>
           <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
+          <BrowserButton disabled={disabled} />
           {voiceControls}
         </>
       )}
@@ -175,6 +177,44 @@ export function ComposerControls({
           things you can press. */}
       {hudMode ? <HudWindowButtons /> : null}
     </div>
+  )
+}
+
+/** THIS conversation's browser.
+ *
+ *  Every chat gets one, because the rail holds one browser per conversation
+ *  now and there was no way to ask for yours — the only route in was an agent
+ *  opening a page, and the only route back was hunting the strip.
+ *
+ *  It takes no session prop and does not need one: pressing a button in a chat
+ *  puts the pointer down in that chat's pane first, which is what moves
+ *  `$browserSessionId`. By the time the click runs, "the conversation you are
+ *  in" is already this one — the same reason the send button next to it does
+ *  not need to be told which chat it belongs to.
+ *
+ *  Filled dot = this conversation already has pages open, so the button reads
+ *  as "go back to my browser" rather than "open a blank one". */
+function BrowserButton({ disabled }: { disabled: boolean }) {
+  const { t } = useI18n()
+  const label = t.shell.statusbar.showBrowser
+  const sessionId = useStore($browserSessionId)
+  const tabs = useStore($dockedPreviewTabs)
+  const has = tabs.some(tab => tab.target.kind === 'url' && tab.owner && previewTabBelongsToSession(tab, sessionId))
+
+  return (
+    <Tip label={<TipKeybindLabel actionId="view.showBrowser" text={label} />}>
+      <Button
+        aria-label={label}
+        className={cn(GHOST_ICON_BTN, 'p-0', has && ACTIVE_ICON_BTN)}
+        disabled={disabled}
+        onClick={() => openBrowserTab()}
+        size="icon"
+        type="button"
+        variant="ghost"
+      >
+        <Codicon name="globe" size="0.875rem" />
+      </Button>
+    </Tip>
   )
 }
 

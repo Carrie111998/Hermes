@@ -30,8 +30,8 @@ export function registerPreviewScriptRunner(tabId: string, runner: PreviewScript
 }
 
 /** The AGENT's tab's script runner — where its engine and handle book live. */
-export function agentPreviewScriptRunner(): PreviewScriptRunner | null {
-  const id = agentPreviewTabId()
+export function agentPreviewScriptRunner(sessionId: null | string): PreviewScriptRunner | null {
+  const id = agentPreviewTabId(sessionId)
 
   return (id && runners.get(id)) || null
 }

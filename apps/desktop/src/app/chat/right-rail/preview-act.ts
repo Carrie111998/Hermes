@@ -492,13 +492,14 @@ async function driveScroll(
  *  string: the verb arrives off the wire, and the history ones never reach
  *  the in-page engine. */
 export async function actOnActivePreview(
-  action: Omit<PreviewActAction, 'kind'> & { kind: string }
+  action: Omit<PreviewActAction, 'kind'> & { kind: string },
+  sessionId: null | string = null
 ): Promise<PreviewActResult> {
-  const result = await runPreviewAction(action)
+  const result = await runPreviewAction(action, sessionId)
   // Stamped here rather than at each return: the agent should learn that the
   // page started throwing no matter WHICH action provoked it, and a single
   // seam cannot be forgotten by a future verb.
-  const since = consoleSinceForAgentTab()
+  const since = consoleSinceForAgentTab(sessionId)
 
   return since ? { ...result, console_since_last_call: since } : result
 }
@@ -506,17 +507,18 @@ export async function actOnActivePreview(
 /** The agent's tab, for the console breadcrumb. Resolved the same way the act
  *  path resolves everything else, so the counts always describe the page that
  *  was just acted on. */
-function consoleSinceForAgentTab() {
-  const id = agentPreviewTabId()
+function consoleSinceForAgentTab(sessionId: null | string) {
+  const id = agentPreviewTabId(sessionId)
 
   return id ? consoleSince(id) : null
 }
 
 async function runPreviewAction(
-  action: Omit<PreviewActAction, 'kind'> & { kind: string }
+  action: Omit<PreviewActAction, 'kind'> & { kind: string },
+  sessionId: null | string
 ): Promise<PreviewActResult> {
   if (action.kind === 'navigate') {
-    const handle = agentPreviewNav()
+    const handle = agentPreviewNav(sessionId)
 
     if (!handle) {
       return { error: NOTHING_OPEN, success: false }
@@ -542,7 +544,7 @@ async function runPreviewAction(
   const nav = NAV_ACTIONS.find(verb => verb === action.kind)
 
   if (nav) {
-    const handle = agentPreviewNav()
+    const handle = agentPreviewNav(sessionId)
 
     if (!handle) {
       return { error: NOTHING_OPEN, success: false }
@@ -555,7 +557,7 @@ async function runPreviewAction(
     return { acted: nav, note: NAVIGATED_NOTE, success: true }
   }
 
-  const run = agentPreviewScriptRunner()
+  const run = agentPreviewScriptRunner(sessionId)
 
   if (!run) {
     return { error: NOTHING_OPEN, success: false }
@@ -584,7 +586,7 @@ async function runPreviewAction(
     return trip.kind === 'answered' ? trip.result : { acted: typed.kind, note: NAVIGATED, success: true }
   }
 
-  const input = agentPreviewInput()
+  const input = agentPreviewInput(sessionId)
 
   if (input && DRIVEN.indexOf(typed.kind) !== -1) {
     return driveAction(run, input, typed)

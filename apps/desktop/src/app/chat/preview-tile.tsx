@@ -13,7 +13,13 @@
 import { useStore } from '@nanostores/react'
 
 import { findGroup } from '@/components/pane-shell/tree/model'
-import { $activeTreeGroup, $layoutTree, revealTreePane, treePanesWithPrefix } from '@/components/pane-shell/tree/store'
+import {
+  $activeTreeGroup,
+  $layoutTree,
+  revealTreePane,
+  setTreePaneHidden,
+  treePanesWithPrefix
+} from '@/components/pane-shell/tree/store'
 import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
@@ -22,6 +28,7 @@ import { openExternalLink } from '@/lib/external-link'
 import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '@/store/layout'
 import {
   $browserPages,
+  $browserSessionId,
   $dockedPreviewTabs,
   $previewTabs,
   adoptPersistedBrowserTab,
@@ -31,8 +38,10 @@ import {
   markBrowserTabPopped,
   newBrowserTab,
   popOutBrowserTab,
+  previewTabBelongsToSession,
   type PreviewTarget
 } from '@/store/preview'
+import { runtimeHasOpenSurface } from '@/store/session-states'
 import { canOpenBrowserWindow } from '@/store/windows'
 
 import { paneMirror } from './pane-mirror'
@@ -190,11 +199,43 @@ function existingPreviewAnchor(tabId: string): string | undefined {
   return other ? previewPaneId(other.id) : undefined
 }
 
+/** Show the browser of the conversation you are in, and only that one.
+ *
+ *  HIDES rather than filters. The pane mirror's source list decides which panes
+ *  EXIST — dropping a tab from it calls `removeTreePane`, which destroys the
+ *  pane and the live page in it, so switching chats would tear down whatever
+ *  the other agent was driving and reload it on the way back. `setTreePaneHidden`
+ *  leaves the pane registered and its content mounted; it just stops the strip
+ *  from drawing the tab. Nobody's tabs — a file you opened, a link you clicked,
+ *  an artifact — are never hidden, which is the arm whose absence once made a
+ *  clicked link in Bot Mode look like a no-op.
+ *
+ *  Not persisted: the ids are runtime sessions, and hides that outlived them
+ *  would leave a tab invisible from every conversation forever. */
+export function syncBrowserSessionPanes(): void {
+  const sessionId = $browserSessionId.get()
+
+  for (const tab of $previewTabs.get()) {
+    // Hidden only while its conversation is still around to go back to. A tab
+    // whose owner has ended is an ORPHAN: scoped to a runtime id that will
+    // never be current again, it would be invisible from every conversation
+    // and unreachable until a restart, which reads as "my tab vanished".
+    // Orphans belong to nobody, which is the same thing as belonging to all.
+    const owned = Boolean(tab.owner) && runtimeHasOpenSurface(tab.owner ?? null)
+
+    setTreePaneHidden(previewPaneId(tab.id), owned && !previewTabBelongsToSession(tab, sessionId))
+  }
+}
+
 /** Keep pane contributions mirroring `$previewTabs`, keep the store's selection
- *  and the tree's active pane agreeing, and front a tile when its tab is
- *  selected. Call once from the root. */
+ *  and the tree's active pane agreeing, front a tile when its tab is selected,
+ *  and show only the current conversation's browser. Call once from the root. */
 export function watchPreviewTiles(): void {
   watchPreviewTileMirror()
+
+  syncBrowserSessionPanes()
+  $browserSessionId.listen(syncBrowserSessionPanes)
+  $previewTabs.listen(syncBrowserSessionPanes)
 
   window.hermesDesktop?.onBrowserPopoutClosed?.(tabId => {
     adoptPersistedBrowserTab(tabId)

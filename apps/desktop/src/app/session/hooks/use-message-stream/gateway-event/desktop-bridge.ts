@@ -103,7 +103,11 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
       const start = typeof payload?.start === 'number' ? payload.start : undefined
       const count = typeof payload?.count === 'number' ? payload.count : undefined
 
-      void readActivePreview({ count, start }).then(result => {
+      // Scoped to the asking session: the rail is one surface holding every
+      // conversation's tabs, so an unscoped read answers from whichever agent
+      // tab was newest — one chat reading, reasoning about and reporting a
+      // page another chat opened.
+      void readActivePreview({ count, sessionId, start }).then(result => {
         void $gateway.get()?.request('preview.read.respond', {
           request_id: requestId,
           text: result ? JSON.stringify(result) : ''
@@ -147,9 +151,9 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
           text: result ? JSON.stringify(result) : ''
         })
 
-      if (isActiveEvent) {
+      if (isActiveEvent || runtimeHasOpenSurface(sessionId)) {
         void loadPreviewEngine()
-          .then(run => run(previewActionFromPayload(payload)))
+          .then(run => run(previewActionFromPayload(payload), sessionId))
           .then(answer, error =>
             answer({ error: error instanceof Error ? error.message : String(error), success: false })
           )

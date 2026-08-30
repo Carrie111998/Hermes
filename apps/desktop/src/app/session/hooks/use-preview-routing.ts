@@ -13,8 +13,8 @@ import {
   progressPreviewServerRestart,
   requestPreviewReload
 } from '@/store/preview'
-import { $activeSessionId, $currentCwd } from '@/store/session'
-import { $focusedRuntimeId, $sessionTiles } from '@/store/session-states'
+import { $currentCwd } from '@/store/session'
+import { $focusedRuntimeId, runtimeHasOpenSurface } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
 type EventHandler = (event: RpcEvent) => void
@@ -27,14 +27,6 @@ interface PreviewRoutingOptions {
 
 function asRecord(payload: unknown): Record<string, unknown> {
   return payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {}
-}
-
-function sessionIsOnScreen(sessionId: string): boolean {
-  return (
-    sessionId === $focusedRuntimeId.get() ||
-    sessionId === $activeSessionId.get() ||
-    $sessionTiles.get().some(tile => tile.runtimeId === sessionId)
-  )
 }
 
 export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestGateway }: PreviewRoutingOptions) {
@@ -86,7 +78,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         const { url, label, new_tab: newTab } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
 
-        if (target && (!event.session_id || sessionIsOnScreen(event.session_id))) {
+        if (target && (!event.session_id || runtimeHasOpenSurface(event.session_id))) {
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(
             async resolved => {
               if (!resolved) {
@@ -101,7 +93,13 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
               const reached = url === resolved.url ? resolved : { ...resolved, label: resolved.label || target, url }
 
               openPreview(trimmedLabel ? { ...reached, label: trimmedLabel } : reached, 'tool-result', {
-                newTab: newTab === true
+                newTab: newTab === true,
+                // Front the rail only for the conversation you are actually
+                // in. An on-screen tile whose turn opens a page gets its tab
+                // — it does not get to pull the rail off the page you are
+                // reading in the chat you are typing in.
+                reveal: !event.session_id || event.session_id === $focusedRuntimeId.get(),
+                sessionId: event.session_id || null
               })
             }
           )
@@ -117,7 +115,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         const { url } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
 
-        if (event.session_id && !sessionIsOnScreen(event.session_id)) {
+        if (event.session_id && !runtimeHasOpenSurface(event.session_id)) {
           return
         }
 

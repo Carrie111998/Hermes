@@ -12,6 +12,7 @@ import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { $previewTabSources, closePreviewForSource, openPreview } from '@/store/preview'
 import { type PreviewArtifact } from '@/store/preview-status'
+import { $focusedRuntimeId } from '@/store/session-states'
 
 interface PreviewStatusRowProps {
   item: PreviewArtifact
@@ -50,7 +51,10 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
     setOpening(true)
 
     try {
-      openPreview(await resolveTarget(), 'tool-result')
+      // Your click, but into the agent's tab for THIS chat — the row is the
+      // agent's preview, so re-opening it must land where that agent browses,
+      // not in whichever conversation's tab happens to be newest.
+      openPreview(await resolveTarget(), 'tool-result', { sessionId: $focusedRuntimeId.get() })
     } catch (error) {
       notifyError(error, t.preview.unavailable)
     } finally {
@@ -69,7 +73,7 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
       // (Remote HTML stays on openPreviewTargetInBrowser, which stages a
       // sanitized local copy before opening it.)
       if (target.kind === 'file' && target.previewKind !== 'html' && isDesktopFsRemoteMode()) {
-        openPreview(target, 'tool-result')
+        openPreview(target, 'tool-result', { sessionId: $focusedRuntimeId.get() })
 
         return
       }

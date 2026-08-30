@@ -47,9 +47,10 @@ export function activePreviewNav(): PreviewNavHandle | null {
 }
 
 /** The commands for the tab the AGENT drives — its own, so `drive_preview`
- *  cannot send the page you are reading back through history. */
-export function agentPreviewNav(): PreviewNavHandle | null {
-  const id = agentPreviewTabId()
+ *  cannot send the page you are reading back through history, and `sessionId`
+ *  so it cannot send another conversation's page there either. */
+export function agentPreviewNav(sessionId: null | string): PreviewNavHandle | null {
+  const id = agentPreviewTabId(sessionId)
 
   return (id && handles.get(id)) || null
 }

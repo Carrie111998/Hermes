@@ -20,6 +20,10 @@ import { nudgeOverlay } from './preview-nudge'
 export interface PreviewReadOptions {
   /** Characters to return from `start` (capped at PREVIEW_READ_MAX_CHARS). */
   count?: number
+  /** Runtime session doing the reading. Without it a read resolves to any
+   *  agent tab, so one conversation answers from another's page — the same
+   *  cross-tab silence described below, one conversation over. */
+  sessionId?: null | string
   /** 0-indexed character offset into the page text. */
   start?: number
 }
@@ -95,7 +99,7 @@ function windowText(
  */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
-  const tabId = agentPreviewTabId()
+  const tabId = agentPreviewTabId(opts.sessionId ?? null)
   const tab = tabs.find(t => t.id === tabId) ?? tabs[0]
 
   if (!tab) {
@@ -114,7 +118,7 @@ export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<
       // side of it — so a run of reads used to leave the pane dark for the
       // twenty seconds it took to page through a document, immediately after
       // the one moment that showed anything.
-      nudgeOverlay('read')
+      nudgeOverlay('read', opts.sessionId ?? null)
 
       return windowText(
         {

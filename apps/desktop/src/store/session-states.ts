@@ -35,6 +35,7 @@ import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
 import type { SessionInfo } from '@/types/hermes'
 
+import { $browserSessionId } from './preview'
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait'
 import {
@@ -1690,6 +1691,38 @@ export const $focusedRuntimeId = computed(
     return primaryRuntime
   }
 )
+
+/** Preview panes are panes too, and taking the interaction tracker is how any
+ *  pane announces a click. See `$browserSessionId`. */
+const PREVIEW_PANE_PREFIX = 'preview-tile:'
+
+/** Point `$browserSessionId` at the conversation being interacted with.
+ *
+ *  Deliberately NOT a plain mirror of `$focusedRuntimeId`. Focus moves to the
+ *  preview pane the instant you click in it, and `$focusedStoredSessionId` then
+ *  falls back off the tile you were in to the primary selection. A tab strip
+ *  filtered on focus would therefore empty itself the moment you touched the
+ *  page it was showing. This follows focus only while the thing being
+ *  interacted with is a CONVERSATION surface, so clicking into the browser
+ *  leaves it where it is. */
+function syncBrowserSession(): void {
+  const groupId = $activeTreeGroup.get()
+  const tree = $layoutTree.get()
+  const active = groupId && tree ? findGroup(tree, groupId)?.active : undefined
+
+  if (active?.startsWith(PREVIEW_PANE_PREFIX)) {
+    return
+  }
+
+  const next = $focusedRuntimeId.get()
+
+  if (next && next !== $browserSessionId.get()) {
+    $browserSessionId.set(next)
+  }
+}
+
+$focusedRuntimeId.subscribe(syncBrowserSession)
+$activeTreeGroup.listen(syncBrowserSession)
 
 /** The focused session's state slice (undefined while unresolved/unbound). */
 export const $focusedSessionState = computed([$focusedRuntimeId, $sessionStates], (runtimeId, states) =>

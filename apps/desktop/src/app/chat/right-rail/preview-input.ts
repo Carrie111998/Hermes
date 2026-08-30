@@ -49,8 +49,8 @@ export function registerPreviewInput(tabId: string, handle: PreviewInputHandle):
 /** The AGENT's tab's input channel — its own, so real Chromium input never
  *  lands on the page you are reading. Null = nothing real to drive, and the
  *  caller falls back to synthesizing events inside the page. */
-export function agentPreviewInput(): PreviewInputHandle | null {
-  const id = agentPreviewTabId()
+export function agentPreviewInput(sessionId: null | string): PreviewInputHandle | null {
+  const id = agentPreviewTabId(sessionId)
 
   return (id && handles.get(id)) || null
 }
