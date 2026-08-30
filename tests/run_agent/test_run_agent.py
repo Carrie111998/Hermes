@@ -4205,6 +4205,74 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_reasoning_available_carries_extracted_reasoning_not_answer_copy(self, agent):
+        """reasoning.available payload is the model's reasoning, never the answer.
+
+        Regression for the D2 defect (#44): the gateway streamed
+        assistant_message.content[:500] as the reasoning.available payload, so
+        the collapsed "Analyzing..." card showed a copy of the answer. The
+        payload must come from extract_reasoning() instead.
+        """
+        self._setup_agent(agent)
+        events = []
+        agent.tool_progress_callback = (
+            lambda event, name, preview, args, **kw: events.append((event, name, preview))
+        )
+        reasoning_text = "First I need to look up the current weather.\nThen I compare forecasts."
+        answer_text = "Here is the final answer: it will rain tomorrow."
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content=answer_text, finish_reason="stop", reasoning=reasoning_text
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("what's the weather?")
+        assert result["final_response"] == answer_text
+
+        ra_events = [e for e in events if e[0] == "reasoning.available"]
+        assert len(ra_events) == 1
+        _, tool_name, preview = ra_events[0]
+        assert tool_name == "_thinking"
+        # Payload is the extracted reasoning (truncated to 500), never the answer.
+        assert preview == reasoning_text[:500]
+        assert preview != answer_text
+        assert answer_text not in preview
+
+    def test_reasoning_available_empty_when_no_reasoning(self, agent):
+        """Without reasoning, reasoning.available must not leak the answer.
+
+        The old code fell back to assistant_message.content[:500], so an
+        answer-only turn streamed a copy of the answer as thinking. With no
+        reasoning there is nothing to relay: no reasoning.available event may
+        fire, and no event may carry the answer text.
+        """
+        self._setup_agent(agent)
+        events = []
+        agent.tool_progress_callback = (
+            lambda event, name, preview, args, **kw: events.append((event, name, preview))
+        )
+        answer_text = "Plain answer with no reasoning."
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content=answer_text, finish_reason="stop"
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+        assert result["final_response"] == answer_text
+
+        assert not any(e[0] == "reasoning.available" for e in events), (
+            "reasoning.available must not fire (or carry answer text) when the "
+            "model produced no reasoning"
+        )
+        assert not any(answer_text in (e[2] or "") for e in events), (
+            "no progress event may carry a copy of the answer as thinking"
+        )
+
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
         agent._cached_system_prompt = "stable instructions\n\nsession context"

@@ -5189,7 +5189,10 @@ def run_conversation(
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
             if (assistant_message.content and agent.tool_progress_callback):
-                _think_text = assistant_message.content.strip()
+                # reasoning.available must carry the model's actual reasoning,
+                # never a copy of the answer. Extract structured reasoning
+                # fields; fall back to empty string when none exist.
+                _think_text = (agent._extract_reasoning(assistant_message) or "").strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
                     r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
