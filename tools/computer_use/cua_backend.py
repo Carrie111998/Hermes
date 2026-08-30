@@ -682,6 +682,11 @@ class _EmbeddedCuaDaemon:
     """
 
     _START_TIMEOUT_SECONDS = 15.0
+    # A readiness probe opens the daemon socket and waits for a reply. Two
+    # seconds is under what a cold `open -n -g -a` launch needs on macOS, so
+    # every probe timed out and the daemon was declared dead while it was
+    # still coming up.
+    _PROBE_TIMEOUT_SECONDS = 6.0
 
     def __init__(
         self,
@@ -730,6 +735,7 @@ class _EmbeddedCuaDaemon:
         self._running = False
         self._launch_via_app = False
         self._stderr_tail: deque[str] = deque(maxlen=20)
+        self._probe_timeouts = 0
         self._stderr_thread: Optional[threading.Thread] = None
         token = uuid.uuid4().hex[:12]
         if sys.platform == "win32":
@@ -824,7 +830,9 @@ class _EmbeddedCuaDaemon:
         )
         self._stderr_thread.start()
 
-        deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
+        deadline = (
+            time.monotonic() + self._START_TIMEOUT_SECONDS
+        )  # started after the spawn: the budget is the daemon's, not discovery's
         while time.monotonic() < deadline:
             return_code = self._process.poll()
             if return_code is not None and (
@@ -840,9 +848,17 @@ class _EmbeddedCuaDaemon:
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
-                    timeout=2.0,
+                    timeout=self._PROBE_TIMEOUT_SECONDS,
                     env=env,
                 )
+            except subprocess.TimeoutExpired:
+                # A probe that runs out of time says nothing about the daemon:
+                # `status` opens the socket and waits for a reply, so a daemon
+                # still binding answers late rather than never. Swallowing this
+                # as "not ready" is what turned a slow start into a silent
+                # 15-second timeout with an empty stderr tail.
+                self._probe_timeouts += 1
+                probe = None
             except (OSError, subprocess.SubprocessError):
                 probe = None
             if probe is not None and probe.returncode == 0:
@@ -851,7 +867,18 @@ class _EmbeddedCuaDaemon:
             time.sleep(0.1)
 
         self.stop()
-        detail = "; ".join(self._stderr_tail) or "daemon did not become ready"
+        detail = "; ".join(self._stderr_tail)
+        if not detail:
+            # An empty tail means the daemon never spoke. Say which way it went
+            # quiet — a probe that kept timing out is a different failure from a
+            # daemon that came up and stayed silent, and reporting them the same
+            # way sent this bug's diagnosis down the wrong path for hours.
+            detail = (
+                f"readiness probe timed out {self._probe_timeouts}x at "
+                f"{self._PROBE_TIMEOUT_SECONDS:g}s each; the daemon may still be starting"
+                if self._probe_timeouts
+                else "daemon did not become ready"
+            )
         raise RuntimeError(f"embedded cua-driver startup timed out: {detail}")
 
     def proxy_invocation(self) -> Tuple[str, List[str]]:
@@ -901,7 +928,15 @@ class _EmbeddedCuaDaemon:
                 pass
 
 
-def _resolve_mcp_invocation(
+# Discovery result per driver binary. `cua-driver manifest` describes a CLI
+# surface that only changes when the binary does, but every embedded daemon
+# start re-ran it and paid the round-trip again. Keyed by path so an upgrade
+# that swaps the binary is not served a stale answer.
+_MCP_INVOCATION_CACHE: Dict[str, Tuple[str, List[str]]] = {}
+_MCP_INVOCATION_CACHE_LOCK = threading.Lock()
+
+
+def _resolve_mcp_invocation_uncached(
     driver_cmd: str,
     *,
     timeout: float = 6.0,
@@ -976,6 +1011,46 @@ def _resolve_mcp_invocation(
     # an unknown flag (or silently keep an unwanted overlay).
     return command, _mcp_args_with_overlay_flag(args, driver_cmd=command)
 
+
+
+
+def _reset_mcp_invocation_cache() -> None:
+    """Forget every resolved CLI surface.
+
+    Discovery is keyed by binary path, which is stable in production but shared
+    across tests that each stub a different driver. Callers that swap the
+    driver under a fixed path — tests, and an in-place upgrade — clear it here.
+    """
+    with _MCP_INVOCATION_CACHE_LOCK:
+        _MCP_INVOCATION_CACHE.clear()
+
+
+def _resolve_mcp_invocation(
+    driver_cmd: str,
+    *,
+    timeout: float = 6.0,
+) -> Tuple[str, List[str]]:
+    """Cached front for :func:`_resolve_mcp_invocation_uncached`.
+
+    The uncached call spawns `cua-driver manifest` and waits on it. Inside
+    the embedded daemon's bounded startup that wait competes with the
+    daemon it is supposed to precede, so a slow discovery could exhaust the
+    budget and surface as "daemon did not become ready" — blaming the daemon
+    for time it never received. Resolving once per binary keeps the hop off
+    every subsequent start.
+    """
+    key = str(driver_cmd or "")
+    with _MCP_INVOCATION_CACHE_LOCK:
+        hit = _MCP_INVOCATION_CACHE.get(key)
+    if hit is not None:
+        command, args = hit
+        return command, list(args)
+    # Resolved through the module namespace so a test (or any caller) that
+    # patches the uncached resolver is honoured rather than bypassed.
+    command, args = globals()["_resolve_mcp_invocation_uncached"](driver_cmd, timeout=timeout)
+    with _MCP_INVOCATION_CACHE_LOCK:
+        _MCP_INVOCATION_CACHE[key] = (command, list(args))
+    return command, list(args)
 
 def _mcp_args_with_overlay_flag(
     args: List[str],
