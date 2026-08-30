@@ -7,7 +7,10 @@ import { test } from 'vitest'
 import { normalizeRemoteHeaders } from './connection-config'
 import { createDesktopSecretStorage } from './desktop-secret-storage'
 import { createSecretStorageConnections } from './secret-storage-connections'
+import { createSecretStorageOauth } from './secret-storage-oauth'
 import { classifyStoredSecret, readSecretStoragePolicy, writeSecretStoragePolicy } from './secret-storage-policy'
+
+const mainSource = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
 
 function storageFixture(available = true) {
   let encryptCalls = 0
@@ -61,6 +64,71 @@ test('original namespace aliases resolve to the extracted codec function objects
   for (const name of Object.keys(originalNamespace) as Array<keyof typeof originalNamespace>) {
     assert.strictEqual(originalNamespace[name], codec[name])
     assert.equal(typeof originalNamespace[name], 'function')
+  }
+})
+
+test('native OAuth composition keeps crypto late-bound after storage shard initialization', () => {
+  let encryptDesktopSecret: ((value: string) => unknown) | undefined
+  let decryptDesktopSecret: ((value: unknown) => string) | undefined
+  const root = fs.mkdtempSync('C:/TEMP/hermes-redteam-f751a8c5/r3-cand-005-composition-')
+  const safeStorage = {
+    isEncryptionAvailable: () => true,
+    encryptString: (value: string) => Buffer.from(value),
+    decryptString: (value: Buffer) => value.toString()
+  }
+  fs.writeFileSync(path.join(root, 'secret-storage-policy.json'), JSON.stringify({ on: true, migrated: true }))
+
+  try {
+    const oauth = createSecretStorageOauth({
+      LEGACY_OAUTH_PARTITION: 'test-oauth',
+      app: { isReady: () => false },
+      encryptDesktopSecret: (...args: any[]) => encryptDesktopSecret?.(args[0]),
+      decryptDesktopSecret: (...args: any[]) => decryptDesktopSecret?.(args[0]),
+      fs,
+      path,
+      rememberLog: () => undefined
+    })
+
+    // This is the production shard initialization order: OAuth first, then the
+    // connections shard publishes the storage-policy crypto functions.
+    const connections = createSecretStorageConnections({
+      _nativeTokenStoreIo: oauth._nativeTokenStoreIo,
+      HERMES_HOME: root,
+      SECRET_STORAGE_POLICY_FILE: 'secret-storage-policy.json',
+      app: { getPath: () => root },
+      classifyStoredSecret,
+      createDesktopSecretStorage,
+      encryptDesktopSecretStrict: (value: string, api: any) => ({
+        encoding: 'safeStorage',
+        value: api.encryptString(value).toString('base64')
+      }),
+      fs,
+      normalizeRemoteHeaders,
+      path,
+      readSecretStoragePolicy,
+      safeStorage,
+      SAFE_STORAGE_ENCODING: 'safeStorage',
+      writeSecretFileAtomic: (target: string, text: string) => fs.writeFileSync(target, text),
+      writeSecretStoragePolicy
+    })
+    encryptDesktopSecret = connections.encryptDesktopSecret
+    decryptDesktopSecret = connections.decryptDesktopSecret
+
+    const io = oauth._nativeTokenStoreIo()
+
+    assert.equal(typeof io.encrypt, 'function')
+    assert.equal(typeof io.decrypt, 'function')
+    const encrypted = io.encrypt('token-bytes')
+    assert.equal(encrypted?.encoding, 'safeStorage')
+    assert.equal(io.decrypt(encrypted), 'token-bytes')
+
+    const oauthInitStart = mainSource.indexOf('function initializeSecretStorageShards()')
+    const oauthInitEnd = mainSource.indexOf('\n  ({ cloudAgentSilentSignIn', oauthInitStart)
+    const oauthInit = mainSource.slice(oauthInitStart, oauthInitEnd)
+    assert.match(oauthInit, /encryptDesktopSecret: \(\.\.\.args: any\[\]\) => encryptDesktopSecret\(\.\.\.args\)/)
+    assert.match(oauthInit, /decryptDesktopSecret: \(\.\.\.args: any\[\]\) => decryptDesktopSecret\(\.\.\.args\)/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
