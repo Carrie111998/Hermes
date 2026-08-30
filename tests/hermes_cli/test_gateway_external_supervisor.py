@@ -41,8 +41,32 @@ def test_gateway_run_external_supervisor_flag_marks_process(monkeypatch):
     assert observed == ["1"]
 
 
-def test_gateway_run_external_supervisor_marker_enables_takeover(monkeypatch):
+def test_gateway_run_external_supervisor_flag_enables_takeover(monkeypatch):
     """A wrapped runtime owns its slot and must replace an orphaned holder."""
+    monkeypatch.setenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
+    monkeypatch.setattr(
+        gateway, "_maybe_redirect_run_to_s6_supervision", lambda _args: False
+    )
+    observed = []
+    monkeypatch.setattr(
+        gateway,
+        "run_gateway",
+        lambda *_args, **kwargs: observed.append(kwargs["replace"]),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(
+            gateway_command="run",
+            external_supervisor=True,
+            replace=False,
+        )
+    )
+
+    assert observed == [True]
+
+
+def test_inherited_external_supervisor_marker_does_not_enable_takeover(monkeypatch):
+    """A gateway descendant must not inherit destructive restart authority."""
     monkeypatch.setenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
     monkeypatch.setattr(
         gateway, "_maybe_redirect_run_to_s6_supervision", lambda _args: False
@@ -62,7 +86,7 @@ def test_gateway_run_external_supervisor_marker_enables_takeover(monkeypatch):
         )
     )
 
-    assert observed == [True]
+    assert observed == [False]
 
 
 def test_plain_gateway_run_does_not_enable_takeover(monkeypatch):

@@ -48,4 +48,5 @@ def test_non_pid_one_dispatch_marks_external_supervisor(tmp_path):
         "1",
         "gateway",
         "run",
+        "--external-supervisor",
     ]
