@@ -1448,6 +1448,35 @@ def cmd_sessions(args, sessions_parser=None):
         if db_path.exists():
             size_mb = os.path.getsize(db_path) / (1024 * 1024)
             print(f"Database size: {size_mb:.1f} MB")
+        # #98743: surface an interrupted CJK FTS backfill here too — the
+        # markers freeze forever otherwise and CJK search quietly stays on
+        # trigram/LIKE. Same read-only probe doctor uses; never raises.
+        try:
+            from hermes_state import collect_state_db_stats
+
+            state_stats = collect_state_db_stats(db_path)
+            if state_stats.get("fts_cjk_rebuild_pending"):
+                cjk_hw = state_stats.get("fts_cjk_rebuild_high_water")
+                cjk_done = state_stats.get("fts_cjk_rebuild_progress")
+                pct = (
+                    min(100, int(100 * cjk_done / cjk_hw))
+                    if isinstance(cjk_hw, int) and cjk_hw > 0
+                    and isinstance(cjk_done, int)
+                    else None
+                )
+                progress = (
+                    f" at {pct}% ({cjk_done:,}/{cjk_hw:,} rows)"
+                    if pct is not None
+                    else ""
+                )
+                print(
+                    f"Note: CJK FTS backfill interrupted{progress} — CJK "
+                    "search falls back to trigram/LIKE; it resumes on the "
+                    "next writable open with the CJK extension (or run "
+                    "'hermes sessions optimize-storage')."
+                )
+        except Exception:
+            pass
 
     else:
         sessions_parser.print_help()

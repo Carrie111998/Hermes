@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
@@ -433,6 +434,123 @@ class SessionSearchMixin:
         self._fts_cjk_available = True
         logger.info("CJK FTS index backfill complete — serving CJK search.")
 
+    # ── Background auto-resume of an interrupted cjk backfill (#98743) ──
+
+    def cjk_backfill_resume_active(self) -> bool:
+        """True while this instance's background cjk backfill resume runs."""
+        thread = getattr(self, "_cjk_resume_thread", None)
+        stop = getattr(self, "_cjk_resume_stop", None)
+        return bool(thread and thread.is_alive() and not (stop and stop.is_set()))
+
+    def _maybe_start_cjk_backfill_resume(self) -> None:
+        """Auto-resume a pending (interrupted) cjk backfill, in the background.
+
+        Before #98743 the cjk markers were advanced ONLY by the foreground
+        loop inside ``optimize_fts_storage()``; a run interrupted by Ctrl-C,
+        a crash, or shutdown left ``fts_cjk_rebuild_progress`` frozen
+        forever with ``_fts_cjk_available=False`` — CJK search permanently
+        fell back to trigram/LIKE and no surface showed why.
+
+        Deliberately narrower than the opt-in v23 storage optimize: this
+        only resumes an ALREADY-CLAIMED incremental backfill (chunked
+        INSERTs under the same duty-cycle throttle); it never demotes
+        legacy tables, tears down trash, or vacuums. Skipped for read-only
+        connections, tokenizer-less hosts, stale indexes (an unknown-gap
+        from-scratch rebuild stays with ``optimize-storage``), and when a
+        resume is already running for this instance. Best-effort: any
+        failure to start leaves the pre-fix behavior (resume on the next
+        `hermes sessions optimize-storage`) intact.
+        """
+        try:
+            if (
+                self.read_only
+                or not self._fts_enabled
+                or not self._fts_cjk_loaded
+                or self.cjk_backfill_resume_active()
+            ):
+                return
+            if self.get_meta(FTS_CJK_STALE_KEY) is not None:
+                return
+            if self.fts_cjk_rebuild_status() is None:
+                return
+            with self._cjk_resume_lock:
+                if self.cjk_backfill_resume_active():
+                    return
+                stop = threading.Event()
+                thread = threading.Thread(
+                    target=self._cjk_backfill_resume_loop,
+                    args=(stop,),
+                    name="session-db-cjk-backfill",
+                    daemon=True,
+                )
+                self._cjk_resume_stop = stop
+                self._cjk_resume_thread = thread
+                thread.start()
+            logger.info(
+                "Interrupted CJK FTS backfill detected — resuming it in the "
+                "background (throttled). `hermes sessions optimize-storage` "
+                "remains the full foreground optimize."
+            )
+        except Exception:
+            logger.debug("cjk backfill resume failed to start", exc_info=True)
+
+    def _cjk_backfill_resume_loop(self, stop: threading.Event) -> None:
+        """Throttled chunk loop mirroring optimize_fts_storage's Phase 1b.
+
+        Chunk claiming lives inside ``fts_cjk_rebuild_step``'s BEGIN
+        IMMEDIATE (progress re-read per chunk), so this loop can interleave
+        safely with the foreground optimize and with other processes. The
+        duty-cycle pause keeps a live gateway sharing the DB responsive.
+
+        A short initial grace lets short-lived opens (CLI one-shots,
+        ``doctor``-style probes, test fixtures that assert the pending
+        state right after construction) observe the markers before any
+        chunk is claimed.
+        """
+        if stop.wait(self._FTS_REBUILD_MIN_PAUSE):
+            return
+        while not stop.is_set():
+            _t0 = time.monotonic()
+            try:
+                more = self.fts_cjk_rebuild_step()
+            except Exception:
+                # Connection closed under us, or an unexpected engine error:
+                # stop silently — the durable progress marker keeps whatever
+                # completed, and the next writable open resumes again.
+                logger.debug("cjk backfill resume chunk failed", exc_info=True)
+                return
+            if not more:
+                return
+            if self.get_meta(FTS_CJK_STALE_KEY) is not None:
+                # A tokenizer-less process staled the index mid-resume. The
+                # gap's extent is unknown; incremental INSERTs are no longer
+                # safe. Leave the markers for optimize-storage's reset path.
+                logger.warning(
+                    "CJK index went stale during the background backfill "
+                    "resume — stopping; run `hermes sessions "
+                    "optimize-storage` on a host with the CJK extension "
+                    "to rebuild it from scratch."
+                )
+                return
+            stop.wait(max(
+                self._FTS_REBUILD_MIN_PAUSE,
+                (time.monotonic() - _t0) * self._FTS_REBUILD_DUTY_FACTOR,
+            ))
+
+    def _stop_cjk_backfill_resume(self, *, join_timeout_s: float = 5.0) -> None:
+        """Signal the background resume loop to stop (close()/optimize).
+
+        Bounded join so a foreground ``optimize_fts_storage`` takeover (E8)
+        and ``close()`` both wait for the in-flight chunk — its transaction
+        commits in milliseconds — without ever hanging on a stuck loop.
+        """
+        stop = getattr(self, "_cjk_resume_stop", None)
+        thread = getattr(self, "_cjk_resume_thread", None)
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=join_timeout_s)
+
     def _fts_cjk_reset_if_stale(self) -> None:
         """Rebuild path for a stale cjk index (triggers were dropped).
 
@@ -441,6 +559,10 @@ class SessionSearchMixin:
         recreate via ``_ensure_fts_cjk_schema`` (which sets fresh backfill
         markers on a populated DB). Called from ``optimize_fts_storage`` on
         a tokenizer-capable host; no-op when not stale.
+
+        When the reset discards completed backfill work (markers present,
+        progress > 0), a warning names the discarded percentage so an
+        interrupted-then-staled index never loses progress silently (#98743).
         """
         if not self._fts_cjk_loaded:
             return
@@ -452,6 +574,27 @@ class SessionSearchMixin:
             ).fetchone()
             if not stale:
                 return False
+            hw_row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_cjk_rebuild_high_water'"
+            ).fetchone()
+            progress_row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_cjk_rebuild_progress'"
+            ).fetchone()
+            if hw_row is not None and progress_row is not None:
+                try:
+                    hw = int(hw_row[0])
+                    done = int(progress_row[0])
+                except (TypeError, ValueError):
+                    hw, done = 0, 0
+                if hw > 0 and done > 0:
+                    logger.warning(
+                        "Stale cjk index reset is discarding a %d%%-complete "
+                        "backfill (%d/%d rows) — the rebuild restarts from "
+                        "zero because the trigger gap's extent is unknown.",
+                        min(100, int(100 * done / hw)), done, hw,
+                    )
             for trig in _FTS_CJK_TRIGGERS:
                 conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
             conn.execute("DROP TABLE IF EXISTS messages_fts_cjk")
@@ -765,6 +908,13 @@ class SessionSearchMixin:
             return {"ok": False, "reason": "fts5_unavailable"}
         if self.read_only:
             return {"ok": False, "reason": "read_only"}
+
+        # #98743: the foreground optimize owns the cjk backfill from here —
+        # stop this instance's background auto-resume loop so the two never
+        # interleave (chunk claims would still be correct — disjoint ranges
+        # under BEGIN IMMEDIATE — but the progress bar and the Phase-1b
+        # completion bookkeeping must be single-writer).
+        self._stop_cjk_backfill_resume()
 
         # Heal empty-index / orphan-marker bookkeeping from an interrupted
         # demote *before* deciding whether to demote again. This re-seeds

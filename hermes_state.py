@@ -4109,6 +4109,12 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
       finished (high_water present and progress < high_water)
     - ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` — raw ints
     - ``fts_rebuild_deferral`` — durable blocked-repair diagnostic, when present
+    - ``fts_cjk_rebuild_pending`` / ``fts_cjk_rebuild_high_water`` /
+      ``fts_cjk_rebuild_progress`` — same triple for the CJK-bigram index
+      (#98743: an interrupted cjk backfill leaves these markers frozen
+      forever; stats/doctor make the stuck state visible)
+    - ``fts_cjk_stale`` — True when the tokenizer-less-process breadcrumb
+      is present (cjk index needs a from-scratch rebuild)
     """
     stats: Dict[str, Any] = {
         "page_count": None,
@@ -4125,6 +4131,10 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         "fts_rebuild_high_water": None,
         "fts_rebuild_progress": None,
         "fts_rebuild_deferral": None,
+        "fts_cjk_rebuild_pending": None,
+        "fts_cjk_rebuild_high_water": None,
+        "fts_cjk_rebuild_progress": None,
+        "fts_cjk_stale": None,
     }
 
     # WAL sidecar size needs no connection at all.
@@ -4215,6 +4225,27 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
             stats["fts_rebuild_pending"] = False
         else:
             stats["fts_rebuild_pending"] = (progress or 0) < high_water
+
+        # CJK-bigram backfill markers (#98743) — same shape as the base
+        # rebuild triple so doctor renders both identically.
+        cjk_hw = _meta_int("fts_cjk_rebuild_high_water")
+        cjk_progress = _meta_int("fts_cjk_rebuild_progress")
+        stats["fts_cjk_rebuild_high_water"] = cjk_hw
+        stats["fts_cjk_rebuild_progress"] = cjk_progress
+        if cjk_hw is None:
+            stats["fts_cjk_rebuild_pending"] = False
+        else:
+            stats["fts_cjk_rebuild_pending"] = (cjk_progress or 0) < cjk_hw
+        try:
+            stats["fts_cjk_stale"] = (
+                conn.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                    (FTS_CJK_STALE_KEY,),
+                ).fetchone()
+                is not None
+            )
+        except Exception:
+            pass
         try:
             row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ? LIMIT 1",
@@ -4591,6 +4622,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # _init_schema / _probe_fts_cjk.
         self._fts_cjk_loaded = False
         self._fts_cjk_available = False
+        # Background auto-resume of an interrupted cjk backfill (#98743).
+        # The lock guards thread/stop creation; the thread is daemon so an
+        # interpreter exit never waits on it (progress markers are durable).
+        self._cjk_resume_lock = threading.Lock()
+        self._cjk_resume_thread: Optional[threading.Thread] = None
+        self._cjk_resume_stop: Optional[threading.Event] = None
         self._fts_unavailable_warned = False
         self._conn = None
         # Async token accounting (see queue_token_counts). The condition
@@ -4787,6 +4824,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # racing session lifecycle and the surprise disk/latency cost on
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
+            # #98743 — an interrupted *cjk backfill* (the incremental phase
+            # of an ALREADY-demoted v23 DB) is the one piece that does
+            # auto-resume: the demote opt-in already happened, and the
+            # markers freeze forever otherwise. Throttled background loop,
+            # never DDL — see _maybe_start_cjk_backfill_resume.
+            self._maybe_start_cjk_backfill_resume()
             initialization_complete = True
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
@@ -5790,6 +5833,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         races the gateway's live writer and tears B-tree pages — issue
         #45383). Read-only connections never request a checkpoint.
         """
+        # Stop the #98743 background cjk backfill resume BEFORE draining
+        # anything — its loop shares self._lock/self._conn with this closer.
+        self._stop_cjk_backfill_resume(join_timeout_s=2.0)
         self._stop_token_writer()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
