@@ -19099,6 +19099,11 @@ def _mount_plugin_router(router, plugin_name: str) -> int:
     return len(new_routes)
 
 
+# Serialize runtime plugin-route swaps: only the route-table mutation
+# section is guarded — the (slow) plugin re-import happens outside it.
+_plugin_route_swap_lock = threading.Lock()
+
+
 def _reload_plugin_api_routes(plugin_name: str) -> Dict[str, Any]:
     """Re-import and re-mount one plugin's backend API routes at runtime.
 
@@ -19163,14 +19168,33 @@ def _reload_plugin_api_routes(plugin_name: str) -> Dict[str, Any]:
             }
 
         prefix = f"/api/plugins/{plugin_name}"
-        stale_routes = [
-            r for r in app.router.routes
-            if getattr(r, "path", "") == prefix
-            or getattr(r, "path", "").startswith(prefix + "/")
-        ]
-        for route in stale_routes:
-            app.router.routes.remove(route)
-        mounted = _mount_plugin_router(router, plugin_name)
+        # Serialize the route-table swap: two concurrent reloads of the
+        # same (or different) plugins must not interleave stale-removal
+        # and mounting, or one reload can delete routes the other just
+        # installed and leave the table incoherent.  The import above
+        # stays outside the lock (it is the slow part and touching only
+        # its own module object); only the mutation of the shared route
+        # list is serialized.
+        with _plugin_route_swap_lock:
+            prefix = f"/api/plugins/{plugin_name}"
+            stale_routes = [
+                r for r in app.router.routes
+                if getattr(r, "path", "") == prefix
+                or getattr(r, "path", "").startswith(prefix + "/")
+            ]
+            # Snapshot the route list so a failure while removing stale
+            # routes or mounting the new ones can be rolled back, leaving
+            # the serving process with the exact route table it had
+            # before the reload attempt (import-before-remove already
+            # protects import failures; this covers the swap itself).
+            saved_routes = list(app.router.routes)
+            try:
+                for route in stale_routes:
+                    app.router.routes.remove(route)
+                mounted = _mount_plugin_router(router, plugin_name)
+            except Exception:
+                app.router.routes[:] = saved_routes
+                raise
         _log.info(
             "Reloaded plugin API routes: /api/plugins/%s/ (%d routes, %d stale removed)",
             plugin_name, mounted, len(stale_routes),

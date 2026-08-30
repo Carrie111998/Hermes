@@ -4337,6 +4337,53 @@ class TestPluginAPIRuntimeReload:
         resp = self.unauth_client.post("/api/plugins/example/reload")
         assert resp.status_code == 401
 
+    def test_reload_mount_failure_rolls_back_route_table(self, monkeypatch):
+        """A failure while swapping routes (after a successful import) must
+        restore the previous route list exactly — no partial route set, and
+        the old routes keep serving."""
+        from hermes_cli import web_server
+
+        snapshot_before = list(web_server.app.router.routes)
+
+        def _boom(router, plugin_name):
+            raise RuntimeError("mount exploded mid-swap")
+
+        monkeypatch.setattr(web_server, "_mount_plugin_router", _boom)
+        self._write_plugin_api(
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/hello')\n"
+            "async def hello():\n"
+            "    return {'version': '3.0.0'}\n"
+        )
+        result = web_server._reload_plugin_api_routes("example")
+        assert result["ok"] is False
+
+        # Route table restored to its pre-reload contents, in order.
+        assert list(web_server.app.router.routes) == snapshot_before
+        # The boot-time mount still answers.
+        resp = self.client.get("/api/plugins/example/hello")
+        assert resp.status_code == 200
+        assert resp.json()["version"] == "1.0.0"
+
+    def test_reload_fail_closed_when_config_read_fails(self, monkeypatch):
+        """If the enabled/disabled sets can't be read, user plugins must be
+        treated as NOT enabled (fail-closed), never fail-open."""
+        from hermes_cli import web_server
+
+        def _broken():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins_cmd._get_enabled_set", _broken
+        )
+        result = web_server._reload_plugin_api_routes("example")
+        assert result["ok"] is False
+        assert "disabled" in result["error"] or "may not" in result["error"]
+        # And the HTTP gate keeps the same story (no name oracle, no mount).
+        resp = self.client.post("/api/plugins/example/reload")
+        assert resp.status_code == 404
+
 
 class TestDashboardPluginManifestExtensions:
     """Tests for the extended plugin manifest fields (tab.override,
