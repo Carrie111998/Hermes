@@ -5874,10 +5874,15 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
+                if result.ambiguous:
+                    return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
-                if not (result.retryable or self._is_retryable_error(error_str)):
+                is_network = result.retryable or self._is_retryable_error(error_str)
+                if not is_network and self._is_timeout_error(error_str):
+                    return result
+                if not is_network:
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user
