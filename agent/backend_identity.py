@@ -91,8 +91,13 @@ def _norm_model(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
-def _norm_base_url(value: Optional[str]) -> str:
-    """Normalize URL authority without changing route-sensitive components."""
+def normalize_base_url(value: Optional[str]) -> str:
+    """Normalize URL authority without changing route-sensitive components.
+
+    This is the shared endpoint canonicalizer. Callers that derive an identity
+    component outside :class:`BackendIdentity` must use this function too so
+    equivalent URL spellings produce equivalent identities.
+    """
     raw = (value or "").strip()
     if not raw:
         return ""
@@ -132,6 +137,10 @@ def _norm_base_url(value: Optional[str]) -> str:
         return raw.rstrip("/")
 
 
+# Backwards-compatible private alias for in-module callers and downstream tests.
+_norm_base_url = normalize_base_url
+
+
 def _credential_fingerprint(value: Optional[str]) -> str:
     """Return a stable, non-secret credential identity."""
     normalized = str(value or "").strip()
@@ -166,7 +175,7 @@ class BackendIdentity:
         return cls(
             provider=_norm_provider(provider),
             model=_norm_model(model),
-            base_url=_norm_base_url(base_url),
+            base_url=normalize_base_url(base_url),
             credential_id=_credential_fingerprint(credential_id or api_key),
         )
 

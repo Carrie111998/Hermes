@@ -13,15 +13,25 @@ import ssl
 from typing import Optional
 
 
-_TLS_ALERT_RE = re.compile(r"\b(?:ssl|tls)(?:v?\d+)?_alert_[a-z0-9_]+\b")
+_TLS_ALERT_RE = re.compile(r"\b(?:ssl|tls)(?:v?\d+)?_alert_[a-z0-9_]+\b", re.IGNORECASE)
+_TLS_NEGOTIATION_RE = re.compile(
+    r"(?:\b(?:tls|ssl)[\s/_:-]*version[\s/_:-]*mismatch\b"
+    r"|\b(?:tls|ssl)[\s/_:-]*protocol[\s/_:-]*version[\s/_:-]*"
+    r"(?:mismatch|incompatible)\b"
+    r"|\b(?:tls|ssl)[\s/_:-]*v?\d*[\s/_:-]*alert[\s/_:-]*"
+    r"(?:protocol|version)[\s/_:-]*(?:version|mismatch|failure)\b)",
+    re.IGNORECASE,
+)
 
 
 def is_deterministic_tls_failure_text(text: str) -> bool:
-    """Recognize OpenSSL alert text that deterministically invalidates a route."""
+    """Recognize deterministic TLS/protocol-negotiation failure text."""
+    normalized = str(text or "")
     return bool(
-        _TLS_ALERT_RE.search(text)
-        or "alert handshake failure" in text
-        or "alert protocol failure" in text
+        _TLS_ALERT_RE.search(normalized)
+        or _TLS_NEGOTIATION_RE.search(normalized)
+        or re.search(r"alert handshake failure", normalized, re.IGNORECASE)
+        or re.search(r"alert protocol failure", normalized, re.IGNORECASE)
     )
 
 

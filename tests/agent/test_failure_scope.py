@@ -2,6 +2,8 @@
 
 import logging
 import ssl
+
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +14,7 @@ from agent.backend_identity import (
     FailureScope,
     classify_failure_scope,
     same_credential_surface,
+    should_skip_candidate,
 )
 from agent.auxiliary_client import (
     _is_connection_error as is_connection_error,
@@ -108,6 +111,20 @@ class TestTransportClassification:
         assert is_connection_error(error)
         assert not is_endpoint_unreachable_error(error)
         assert is_transient_transport_error(error)
+
+    def test_tls_version_mismatch_is_endpoint_scoped_case_insensitively(self):
+        import httpx
+
+        errors = [
+            ssl.SSLError("TLS version mismatch"),
+            ssl.SSLError("[SSL: TLS version mismatch] tls version mismatch"),
+            httpx.ConnectError("[SSL: TLS version mismatch]"),
+        ]
+        for error in errors:
+            assert is_connection_error(error)
+            assert is_endpoint_unreachable_error(error)
+            assert not is_transient_transport_error(error)
+        assert classify_failure_scope("[SSL: TLS VERSION MISMATCH]") is FailureScope.ENDPOINT
 
     def test_nested_reset_driven_tls_eof_is_model_scoped(self):
         import httpx
@@ -345,6 +362,32 @@ class TestCredentialSurfaceRegression:
         b = BackendIdentity.build(base_url="https://tenant-b.example/v1")
         assert not same_credential_surface(a, b)
 
+    def test_pool_identity_uses_canonical_endpoint_and_preserves_route_sensitivity(self):
+        from agent.auxiliary_client import _backend_identity_for_entry
+
+        upper = {
+            "provider": "custom",
+            "model": "model-a",
+            "base_url": "HTTPS://H/v1/",
+            "credential_pool": "pool-a",
+        }
+        equivalent = {
+            "provider": "custom",
+            "model": "model-b",
+            "base_url": "https://h/v1",
+            "credential_pool": "pool-a",
+        }
+        different_path = {**equivalent, "base_url": "https://h/v2"}
+        different_query = {**equivalent, "base_url": "https://h/v1?tenant=other"}
+
+        failed = _backend_identity_for_entry(upper)
+        sibling = _backend_identity_for_entry(equivalent)
+        assert failed.base_url == sibling.base_url == "https://h/v1"
+        assert failed.credential_id == sibling.credential_id
+        assert should_skip_candidate(sibling, failed, FailureScope.CREDENTIAL)
+        assert _backend_identity_for_entry(different_path).credential_id != failed.credential_id
+        assert _backend_identity_for_entry(different_query).credential_id != failed.credential_id
+
 
 class TestOpenRouterPolicyAdditions:
     def test_resolver_forwards_explicit_free_model_to_gate(self, monkeypatch):
@@ -528,3 +571,60 @@ async def test_async_alert_form_tls_failure_skips_same_endpoint_retry(monkeypatc
     assert primary.chat.completions.create.await_count == 1
     assert chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
     assert chain.call_args.kwargs["failed_model"] is None
+
+
+def test_sync_literal_tls_version_mismatch_skips_same_endpoint_retry(monkeypatch):
+    primary = MagicMock(base_url="https://untrusted.example/v1")
+    primary.chat.completions.create.side_effect = ssl.SSLError("TLS version mismatch")
+    fallback = MagicMock(base_url="https://healthy.example/v1")
+    fallback.chat.completions.create.return_value = {"fallback": True}
+    monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 2)
+    p1, p2, p3 = _patches(primary)
+    with p1, p2, p3, patch(
+        "agent.auxiliary_client._try_configured_fallback_chain",
+        return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+    ) as chain:
+        result = call_llm(task="session_search", messages=[{"role": "user", "content": "hi"}])
+    assert result == {"fallback": True}
+    assert primary.chat.completions.create.call_count == 1
+    assert chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+    assert chain.call_args.kwargs["failed_model"] is None
+
+
+@pytest.mark.asyncio
+async def test_async_literal_tls_version_mismatch_skips_same_endpoint_retry(monkeypatch):
+    primary = MagicMock(base_url="https://untrusted.example/v1")
+    primary.chat.completions.create = AsyncMock(
+        side_effect=httpx.ConnectError("[SSL: TLS version mismatch]")
+    )
+    fallback = MagicMock(base_url="https://healthy.example/v1")
+    fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+    monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 2)
+    p1, p2, p3, p4, p5 = TestAsyncFallbackScope()._run_patches(primary, fallback)
+    with p1, p2, p3, p4 as chain, p5:
+        result = await async_call_llm(task="session_search", messages=[{"role": "user", "content": "hi"}])
+    assert result == {"fallback": True}
+    assert primary.chat.completions.create.await_count == 1
+    assert chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+    assert chain.call_args.kwargs["failed_model"] is None
+
+
+def test_fallback_logs_do_not_echo_provider_exception_text(monkeypatch, caplog):
+    sentinel = "credential-sentinel-should-never-be-logged"
+    primary = MagicMock(base_url="https://untrusted.example/v1")
+    primary.chat.completions.create.side_effect = ssl.SSLError(
+        f"TLS version mismatch; api_key={sentinel}"
+    )
+    monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 0)
+    p1, p2, p3 = _patches(primary)
+    with (
+        p1,
+        p2,
+        p3,
+        patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")),
+        patch("agent.auxiliary_client._try_main_agent_model_fallback", return_value=(None, None, "")),
+        caplog.at_level(logging.INFO, logger="agent.auxiliary_client"),
+    ):
+        with pytest.raises(ssl.SSLError, match=sentinel):
+            call_llm(task="session_search", messages=[{"role": "user", "content": "hi"}])
+    assert all(sentinel not in record.getMessage() for record in caplog.records)

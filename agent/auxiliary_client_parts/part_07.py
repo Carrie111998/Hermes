@@ -369,7 +369,7 @@ def _call_llm_impl(
                     "Auxiliary %s: provider rejected the structured-output "
                     "format field; retrying once without it (schema "
                     "enforcement degrades to prompt compliance): %s",
-                    task or "call", first_err,
+                    task or "call", _safe_provider_exception_text(first_err),
                 )
                 try:
                     return _validate_llm_response(
@@ -708,7 +708,7 @@ def _call_llm_impl(
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, resolved_provider, _safe_provider_exception_text(first_err))
 
             # Keep the failure scope attached to the failed route. Endpoint
             # failures invalidate every model behind that URL; timeouts,
@@ -1166,7 +1166,7 @@ async def _async_call_llm_impl(
                     "structured-output format field; retrying once without "
                     "it (schema enforcement degrades to prompt "
                     "compliance): %s",
-                    task or "call", first_err,
+                    task or "call", _safe_provider_exception_text(first_err),
                 )
                 try:
                     return _validate_llm_response(
@@ -1457,7 +1457,7 @@ async def _async_call_llm_impl(
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+                        task or "call", reason, resolved_provider, _safe_provider_exception_text(first_err))
 
             # Keep the failure scope attached to the failed route. Endpoint
             # failures invalidate every model behind that URL; timeouts,

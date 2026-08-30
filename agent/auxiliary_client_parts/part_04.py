@@ -1,5 +1,15 @@
 
 
+def _safe_provider_exception_text(exc: BaseException) -> str:
+    """Return only stable exception metadata for provider-facing logs.
+
+    Provider exception messages can echo credentials, URLs, or request bodies.
+    Keep the original exception object untouched for re-raising, but never put
+    its raw text on a fallback log path.
+    """
+    return type(exc).__name__ or "Exception"
+
+
 def _complete_fallback_destination(
     provider: str,
     base_url: str,
@@ -194,7 +204,7 @@ def _call_fallback_candidate_sync(
                 _mark_provider_unhealthy(_fallback_provider_from_label(fb_label))
             logger.warning(
                 "Auxiliary %s: fallback candidate %s failed (%s) — continuing chain",
-                task or "call", fb_label, fb_err,
+                task or "call", fb_label, _safe_provider_exception_text(fb_err),
             )
             if fallback_error_sink is not None:
                 fallback_error_sink.append(fb_err)
@@ -215,7 +225,7 @@ def _call_fallback_candidate_sync(
             logger.warning(
                 "Auxiliary %s: isolated fallback candidate %s has a stale "
                 "credential (%s) — continuing chain",
-                task or "call", fb_label, fb_err,
+                task or "call", fb_label, _safe_provider_exception_text(fb_err),
             )
             return None
         fb_provider = _auth_refresh_provider_for_route(
@@ -291,7 +301,7 @@ def _call_fallback_candidate_sync(
                         logger.warning(
                             "Auxiliary %s: refreshed fallback candidate %s failed "
                             "(%s) — continuing chain",
-                            task or "call", fb_label, retry_err,
+                            task or "call", fb_label, _safe_provider_exception_text(retry_err),
                         )
                         if fallback_error_sink is not None:
                             fallback_error_sink.append(retry_err)
@@ -312,7 +322,7 @@ def _call_fallback_candidate_sync(
         logger.warning(
             "Auxiliary %s: fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            task or "call", fb_label, _safe_provider_exception_text(fb_err),
         )
         return None
 
@@ -375,7 +385,7 @@ async def _call_fallback_candidate_async(
                 _mark_provider_unhealthy(_fallback_provider_from_label(fb_label))
             logger.warning(
                 "Auxiliary %s: fallback candidate %s failed (%s) — continuing chain",
-                task or "call", fb_label, fb_err,
+                task or "call", fb_label, _safe_provider_exception_text(fb_err),
             )
             if fallback_error_sink is not None:
                 fallback_error_sink.append(fb_err)
@@ -396,7 +406,7 @@ async def _call_fallback_candidate_async(
             logger.warning(
                 "Auxiliary %s: isolated fallback candidate %s has a stale "
                 "credential (%s) — continuing chain",
-                task or "call", fb_label, fb_err,
+                task or "call", fb_label, _safe_provider_exception_text(fb_err),
             )
             return None
         fb_provider = _auth_refresh_provider_for_route(
@@ -447,7 +457,7 @@ async def _call_fallback_candidate_async(
                         logger.warning(
                             "Auxiliary %s: refreshed fallback candidate %s failed "
                             "(%s) — continuing chain",
-                            task or "call", fb_label, retry_err,
+                            task or "call", fb_label, _safe_provider_exception_text(retry_err),
                         )
                         if fallback_error_sink is not None:
                             fallback_error_sink.append(retry_err)
@@ -462,7 +472,7 @@ async def _call_fallback_candidate_async(
         logger.warning(
             "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            task or "call", fb_label, _safe_provider_exception_text(fb_err),
         )
         return None
 
@@ -759,7 +769,7 @@ def _candidate_context_window(
     except Exception as exc:
         logger.debug(
             "Auxiliary fallback: could not resolve context window for %s/%s: %s",
-            provider, model, exc,
+            provider, model, _safe_provider_exception_text(exc),
         )
         return None
     # ``get_model_context_length`` returns an int (with a 256K default
@@ -953,7 +963,9 @@ def _fallback_entry_credential_id(
     pool = str(entry.get("credential_pool") or "").strip()
     if pool:
         provider = str(entry.get("provider") or "").strip().lower()
-        base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+        from agent.backend_identity import normalize_base_url
+
+        base_url = normalize_base_url(entry.get("base_url"))
         # Pool labels are scoped by provider in auth.json, and custom pools
         # are additionally scoped by endpoint. Keep that scope in the
         # non-secret identity so equal labels never become one ambient route.
@@ -1046,7 +1058,7 @@ def _try_main_fallback_chain(
 
         chain = get_fallback_chain(load_config_readonly())
     except Exception as exc:
-        logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
+        logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", _safe_provider_exception_text(exc))
         return None, None, ""
 
     if not chain:
@@ -1108,7 +1120,7 @@ def _try_main_fallback_chain(
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
-            logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
+            logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, _safe_provider_exception_text(exc))
             fb_client, resolved_model = None, None
         if fb_client is not None:
             if min_ctx is not None:
