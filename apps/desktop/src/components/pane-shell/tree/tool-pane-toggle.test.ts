@@ -90,6 +90,17 @@ const stackTree = (options?: { active?: string; tabStrip?: 'always' | 'never' })
   )
 }
 
+describe('revealing a contributed pane missing from a custom layout', () => {
+  it('re-adopts the pane before trying to show it', () => {
+    $layoutTree.set(group(['workspace'], { active: 'workspace', id: 'grp-main' }))
+
+    revealTreePane('files')
+
+    expect(allPaneIds($layoutTree.get()!)).toContain('files')
+    expect(isPaneVisible('files')).toBe(true)
+  })
+})
+
 describe('binding a tool panel on boot', () => {
   it('does not front itself over the tab the persisted tree had active', () => {
     stackTree({ active: 'terminal' })
