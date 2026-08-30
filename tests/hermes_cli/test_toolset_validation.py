@@ -46,5 +46,21 @@ def test_mixed_valid_and_invalid_flags_only_the_invalid():
     assert "unknown toolset 'bogus'" in warnings[0]
 
 
+def test_dynamic_platform_entries_are_accepted():
+    cfg = {
+        "webhook": ["beca-webhook"],
+        "cron": ["no_mcp"],
+        "discord": ["attio"],
+    }
+
+    warnings = validate_platform_toolsets(
+        cfg,
+        _is_valid,
+        additional_valid_names={"beca-webhook", "no_mcp", "attio"},
+    )
+
+    assert warnings == []
+
+
 
 
