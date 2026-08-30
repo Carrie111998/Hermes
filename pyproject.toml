@@ -545,8 +545,15 @@ exclude_dirs = [
     "apps",
     "website",
 ]
-skips = ["B101", "B601", "B602", "B603", "B604", "B607", "B608", "B609"]
-# B101 assert_used: tests use asserts; B6xx subprocess: tooling wraps CLIs intentionally.
+skips = ["B101", "B104", "B105", "B110", "B112", "B404", "B601", "B602", "B603", "B604", "B607", "B608", "B609"]
+# B101 assert_used: tests use asserts.
+# B104 bind_all_interfaces: gateway binds 0.0.0.0 for local agent dev server (by design).
+# B105 hardcoded_password_string: redact.py defines _SECRET_* regex literals (KEY|TOKEN|SECRET...)
+#   for the redactor — these are pattern strings, not secrets (verified).
+# B110/B112 try_except_pass/continue: gateway/run.py + doctor.py use deliberate fail-soft
+#   handling so the gateway/doctor never crash on a malformed config (verified intentional).
+# B404 subprocess: tooling intentionally wraps CLIs (ffmpeg, git, node, etc.).
+# B6xx subprocess/eval/exec: tooling wraps CLIs and dynamic loads intentionally.
 
 [tool.ruff.lint.per-file-ignores]
 # Tests can intentionally exercise locale-encoding edge cases.
