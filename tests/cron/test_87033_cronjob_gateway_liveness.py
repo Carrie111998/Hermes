@@ -162,14 +162,12 @@ from contextlib import ExitStack
 
 
 class _LivenessPatches:
-    """Context manager patching the provider/gateway-pid probes.
+    """Context manager patching provider and shared-owner probes.
 
-    Also pins the gateway runtime lock probe to *inactive* by default so
-    these tests are deterministic even when a real gateway (holding the
-    real lock) runs on the developer's machine — the lock-first check in
-    ``_builtin_gateway_liveness`` would otherwise short-circuit to True
-    and mask the pid-scan behavior under test. Pass ``lock_active=True``
-    to exercise the lock-first path itself.
+    ``pids`` remains the compact fixture input used by the pre-existing tests:
+    a non-empty list models a locally visible owner, ``lock_active=True`` models
+    a shared owner outside this PID namespace, and neither models an inactive
+    runtime lock.
     """
 
     def __init__(self, *, provider, pids, lock_active=False):
@@ -193,17 +191,26 @@ class _LivenessPatches:
                 side_effect=_fake_provider_name,
             )
         )
+        if self._lock_active:
+            owner_status = {
+                "state": "shared_lock_active",
+                "pid": self._pids[0] if self._pids else None,
+                "message": "Gateway owner may be in another namespace/container",
+            }
+        elif self._pids:
+            owner_status = {
+                "state": "local_pid_running",
+                "pid": self._pids[0],
+                "message": "Gateway PID is running in this namespace",
+            }
+        else:
+            owner_status = {
+                "state": "not_running",
+                "pid": None,
+                "message": "No active gateway runtime lock found",
+            }
         self._stack.enter_context(
-            patch(
-                "hermes_cli.gateway.find_gateway_pids",
-                return_value=list(self._pids),
-            )
-        )
-        self._stack.enter_context(
-            patch(
-                "gateway.status.is_gateway_runtime_lock_active",
-                return_value=self._lock_active,
-            )
+            patch("hermes_cli.cron._gateway_owner_status", return_value=owner_status)
         )
         return self
 
@@ -237,34 +244,7 @@ class TestRuntimeLockFirstLiveness:
         assert result["gateway_running"] is True
         assert "warning" not in result
 
-    def test_lock_inactive_falls_back_to_pid_scan(self):
-        from unittest.mock import patch
-
-        import hermes_cli.cron as cron_cli
-
-        with (
-            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
-            patch("gateway.status.is_gateway_runtime_lock_active", return_value=False),
-            patch("hermes_cli.gateway.find_gateway_pids", return_value=[424242]),
-        ):
-            assert cron_cli._builtin_gateway_liveness() is True
-
-    def test_no_lock_no_pids_is_false(self):
-        from unittest.mock import patch
-
-        import hermes_cli.cron as cron_cli
-
-        with (
-            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
-            patch("gateway.status.is_gateway_runtime_lock_active", return_value=False),
-            patch("hermes_cli.gateway.find_gateway_pids", return_value=[]),
-        ):
-            assert cron_cli._builtin_gateway_liveness() is False
-
-    def test_lock_probe_failure_still_falls_back(self):
-        """A crashing lock probe must not poison the tri-state helper —
-        the pid scan still decides (the outer except returns None only
-        when both probes fail)."""
+    def test_local_owner_reports_alive(self):
         from unittest.mock import patch
 
         import hermes_cli.cron as cron_cli
@@ -272,12 +252,40 @@ class TestRuntimeLockFirstLiveness:
         with (
             patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
             patch(
-                "gateway.status.is_gateway_runtime_lock_active",
-                side_effect=OSError("lock probe failed"),
+                "hermes_cli.cron._gateway_owner_status",
+                return_value={"state": "local_pid_running", "pid": 424242},
             ),
-            patch("hermes_cli.gateway.find_gateway_pids", return_value=[424242]),
         ):
             assert cron_cli._builtin_gateway_liveness() is True
+
+    def test_inactive_runtime_lock_is_false(self):
+        from unittest.mock import patch
+
+        import hermes_cli.cron as cron_cli
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch(
+                "hermes_cli.cron._gateway_owner_status",
+                return_value={"state": "not_running", "pid": None},
+            ),
+        ):
+            assert cron_cli._builtin_gateway_liveness() is False
+
+    def test_unverifiable_owner_stays_neutral(self):
+        """An unreadable lock must not be collapsed into an inactive owner."""
+        from unittest.mock import patch
+
+        import hermes_cli.cron as cron_cli
+
+        with (
+            patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
+            patch(
+                "hermes_cli.cron._gateway_owner_status",
+                return_value={"state": "unverifiable", "pid": None},
+            ),
+        ):
+            assert cron_cli._builtin_gateway_liveness() is None
 
 
 class TestCronStatusLockFirst:
@@ -296,15 +304,29 @@ class TestCronStatusLockFirst:
 
         import hermes_cli.cron as cron_cli
 
+        if lock_active:
+            owner_status = {
+                "state": "shared_lock_active",
+                "pid": lock_pid,
+                "message": "Gateway owner may be in another namespace/container",
+            }
+        elif pids:
+            owner_status = {
+                "state": "local_pid_running",
+                "pid": pids[0],
+                "message": "Gateway PID is running in this namespace",
+            }
+        else:
+            owner_status = {
+                "state": "not_running",
+                "pid": None,
+                "message": "No active gateway runtime lock found",
+            }
+
         out = io.StringIO()
         with (
             patch("hermes_cli.cron._active_cron_provider_name", return_value="builtin"),
-            patch("hermes_cli.gateway.find_gateway_pids", return_value=list(pids)),
-            patch(
-                "gateway.status.is_gateway_runtime_lock_active",
-                return_value=lock_active,
-            ),
-            patch("gateway.status.get_running_pid", return_value=lock_pid),
+            patch("hermes_cli.cron._gateway_owner_status", return_value=owner_status),
             redirect_stdout(out),
         ):
             cron_cli.cron_status()
@@ -313,7 +335,7 @@ class TestCronStatusLockFirst:
     def test_lock_active_suppresses_not_running_false_alarm(self, hermes_env):
         text = self._run_status(pids=[], lock_active=True, lock_pid=4242)
         assert "NOT fire" not in text
-        assert "Gateway is running" in text or "running" in text
+        assert "runtime lock is active" in text
 
     def test_no_lock_no_pids_still_warns(self, hermes_env):
         text = self._run_status(pids=[], lock_active=False)
