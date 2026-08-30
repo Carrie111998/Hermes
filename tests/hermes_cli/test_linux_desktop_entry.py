@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import stat
 from pathlib import Path
 
@@ -107,7 +108,9 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    # Keep the venv path intact. Resolving this symlink would point the
+    # desktop entry at the base interpreter and bypass pyvenv.cfg.
+    interpreter = sys.executable
     assert exec_line.split(" ")[0].strip('"') == interpreter
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
@@ -127,6 +130,22 @@ def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypat
 
     # A bash wrapper execs the venv python itself — no interpreter prefix.
     assert exec_line == f"{hermes_bin} desktop"
+
+
+def test_needs_interpreter_warns_when_launcher_cannot_be_read(tmp_path, monkeypatch, caplog):
+    hermes_bin = tmp_path / "bin" / "hermes"
+
+    def unreadable(*_args, **_kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("builtins.open", unreadable)
+
+    with caplog.at_level(logging.WARNING, logger=lde.__name__):
+        assert lde._needs_interpreter(hermes_bin) is False
+
+    assert "Could not inspect desktop launcher" in caplog.text
+    assert str(hermes_bin) in caplog.text
+    assert "permission denied" in caplog.text
 
 
 def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch):

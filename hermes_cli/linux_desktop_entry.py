@@ -25,6 +25,7 @@ Electron main process both use this without loading the full CLI.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 DESKTOP_ENTRY_NAME = "hermes.desktop"
+logger = logging.getLogger(__name__)
 
 
 def is_supported() -> bool:
@@ -78,11 +80,14 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # Do not resolve the venv interpreter symlink. Python finds
+            # ``pyvenv.cfg`` relative to the original venv path; resolving it
+            # would invoke the base interpreter and lose Hermes' packages.
+            argv = [str(sys.executable), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [str(sys.executable), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
@@ -92,7 +97,14 @@ def _needs_interpreter(bin_path: Path) -> bool:
     try:
         with open(bin_path, "rb") as fh:
             head = fh.readline(256)
-    except OSError:
+    except OSError as exc:
+        # Keep the launcher best-effort, but make the fallback diagnosable:
+        # Terminal=false otherwise hides the same failure from the user.
+        logger.warning(
+            "Could not inspect desktop launcher %s; using it without an explicit interpreter: %s",
+            bin_path,
+            exc,
+        )
         return False
     if not head.startswith(b"#!"):
         # Native binary (uv tool shim, PyInstaller, distro package) — its own
@@ -100,8 +112,10 @@ def _needs_interpreter(bin_path: Path) -> bool:
         return False
     shebang = head.decode("utf-8", errors="replace").strip().lower()
     if "python" not in shebang:
-        # A shell wrapper (e.g. the installer's bash launcher) execs the venv
-        # python itself — leave it alone.
+        # Shell wrappers are intentionally outside this check. Hermes' own
+        # wrappers exec an absolute venv interpreter. A third-party wrapper
+        # that later resolves bare ``hermes`` remains PATH-dependent, but
+        # pinning it safely would require understanding its shell semantics.
         return False
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
