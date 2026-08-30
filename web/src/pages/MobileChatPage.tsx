@@ -36,6 +36,7 @@ import {
   MessageSquarePlus,
   RefreshCw,
   Send,
+  Settings,
   Sparkles,
   X,
 } from "lucide-react";
@@ -181,6 +182,7 @@ function isInjectedSystemNote(text: string): boolean {
    no longer dumps the user into an empty new chat. */
 const SS_SESSION_KEY = "hermes.m.activeSession";
 const SS_TITLE_KEY = "hermes.m.activeTitle";
+const BUILD_TAG = "build 2026-08-30.24 · settings";
 
 function ssGet(key: string): string {
   try {
@@ -341,7 +343,30 @@ export default function MobileChatPage() {
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [sessionErr, setSessionErr] = useState<string | null>(null);
+  const [sessionFilter, setSessionFilter] = useState("");
   const [activeTitle, setActiveTitle] = useState("");
+
+  // Settings sheet.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [thinkingOpen, setThinkingOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("hermes.mobile.thinking-open") === "1";
+    } catch {
+      return false;
+    }
+  });
+
+  const onToggleThinking = useCallback(() => {
+    setThinkingOpen((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("hermes.mobile.thinking-open", next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
@@ -1010,6 +1035,28 @@ export default function MobileChatPage() {
     setBusy(false);
   }, [patchLastAssistant]);
 
+  /* ---- refresh transcript ---- */
+  // Re-pulls the authoritative REST history for the CURRENT session. Use
+  // case: resuming a past chat can land on a stale snapshot (session was
+  // active on another surface — desktop, another device — and REST served
+  // the page before those turns persisted). The refresh button re-fetches
+  // and keeps scroll pinned to the newest message.
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshTranscript = useCallback(async () => {
+    const storedId = ssGet(SS_SESSION_KEY);
+    if (!storedId || refreshing) return;
+    setRefreshing(true);
+    try {
+      const msgsRes = await api.getSessionMessages(storedId);
+      const hist = mapHistoryMessages(msgsRes.messages || []);
+      if (hist.length) setMessages(hist);
+    } catch {
+      /* keep current view; a failed refresh shouldn't blank the chat */
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshing]);
+
   /* ---- manual reconnect (header refresh button) ---- */
   const manualReconnect = useCallback(() => {
     const gw = gwRef.current;
@@ -1132,6 +1179,15 @@ export default function MobileChatPage() {
         )}
         <button
           type="button"
+          onClick={() => void refreshTranscript()}
+          aria-label="Refresh messages"
+          title="Refresh messages"
+          className="rounded-md p-1.5 text-muted-foreground transition-colors hover:text-foreground active:text-foreground"
+        >
+          <RefreshCw className={cn("h-5 w-5", refreshing && "animate-spin")} />
+        </button>
+        <button
+          type="button"
           onClick={() => void openHistory()}
           aria-label="Past chats"
           title="Past chats"
@@ -1143,9 +1199,19 @@ export default function MobileChatPage() {
           type="button"
           onClick={() => void startNewChat()}
           aria-label="New chat"
+          title="New chat"
           className="rounded-md p-1.5 text-muted-foreground transition-colors hover:text-foreground active:text-foreground"
         >
           <MessageSquarePlus className="h-5 w-5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => setSettingsOpen(true)}
+          aria-label="Settings"
+          title="Settings"
+          className="rounded-md p-1.5 text-muted-foreground transition-colors hover:text-foreground active:text-foreground"
+        >
+          <Settings className="h-5 w-5" />
         </button>
       </header>
 
@@ -1164,7 +1230,7 @@ export default function MobileChatPage() {
             {/* Build tag: lets Eric (and me) verify at a glance which bundle
                 the phone is actually running — iOS caches PWAs aggressively. */}
             <p className="text-[0.65rem] text-muted-foreground/40 select-none">
-              build 2026-08-30.21 · orange-bubbles
+              {BUILD_TAG}
             </p>
             {bootError && (
               <p className="text-[0.78rem] text-destructive">{bootError}</p>
@@ -1220,7 +1286,7 @@ export default function MobileChatPage() {
                         </div>
                       </details>
                     )}
-                    <Markdown content={m.text} streaming={m.inProgress} />
+                    <Markdown content={m.text} streaming={m.inProgress} codeCopy />
                     {m.tools && m.tools.length > 0 && (
                       <div className="mt-2 flex flex-wrap gap-1 text-[0.7rem] text-muted-foreground">
                         {m.tools.map((t) => (
@@ -1477,39 +1543,132 @@ export default function MobileChatPage() {
                 No past chats yet.
               </p>
             ) : (
-              <ul className="divide-y divide-border/40" data-testid="mobile-chats-list">
-                {sessions.map((s) => (
-                  <li key={s.id}>
-                    <button
-                      type="button"
-                      onClick={() => void resumeSession(s.id, s.title || "")}
-                      data-testid="mobile-chat-row"
-                      className="w-full px-4 py-3 text-left"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="min-w-0 flex-1 truncate text-[0.9rem] font-medium text-foreground">
-                          {cleanPreview(s.title) ||
-                            cleanPreview(s.preview) ||
-                            "Untitled"}
-                        </span>
-                        {s.message_count > 0 && (
-                          <span className="shrink-0 text-[0.68rem] text-muted-foreground">
-                            {s.message_count}{" "}
-                            {s.message_count === 1 ? "msg" : "msgs"} ·{" "}
-                            {timeAgo(s.last_active)}
-                          </span>
-                        )}
-                      </div>
-                      {cleanPreview(s.preview) && (
-                        <p className="mt-0.5 truncate text-[0.78rem] text-muted-foreground">
-                          {cleanPreview(s.preview)}
-                        </p>
-                      )}
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              <>
+                <input
+                  type="search"
+                  value={sessionFilter}
+                  onChange={(e) => setSessionFilter(e.target.value)}
+                  placeholder="Search chats"
+                  aria-label="Search chats"
+                  className="mb-1 block w-full border-b border-border/40 bg-transparent px-4 py-2.5 text-[16px] text-foreground outline-none placeholder:text-muted-foreground/60"
+                  data-testid="mobile-chats-search"
+                />
+                {(() => {
+                  const needle = sessionFilter.trim().toLowerCase();
+                  const visible = needle
+                    ? sessions.filter((s) =>
+                        (s.title || s.preview || "").toLowerCase().includes(needle),
+                      )
+                    : sessions;
+                  if (!visible.length) {
+                    return (
+                      <p className="px-4 py-8 text-center text-[0.85rem] text-muted-foreground">
+                        No matches for “{sessionFilter}”.
+                      </p>
+                    );
+                  }
+                  return (
+                    <ul className="divide-y divide-border/40" data-testid="mobile-chats-list">
+                      {visible.map((s) => (
+                        <li key={s.id}>
+                          <button
+                            type="button"
+                            onClick={() => void resumeSession(s.id, s.title || "")}
+                            data-testid="mobile-chat-row"
+                            className="w-full px-4 py-3 text-left"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="min-w-0 flex-1 truncate text-[0.9rem] font-medium text-foreground">
+                                {cleanPreview(s.title) ||
+                                  cleanPreview(s.preview) ||
+                                  "Untitled"}
+                              </span>
+                              {s.message_count > 0 && (
+                                <span className="shrink-0 text-[0.68rem] text-muted-foreground">
+                                  {s.message_count}{" "}
+                                  {s.message_count === 1 ? "msg" : "msgs"} ·{" "}
+                                  {timeAgo(s.last_active)}
+                                </span>
+                              )}
+                            </div>
+                            {cleanPreview(s.preview) && (
+                              <p className="mt-0.5 truncate text-[0.78rem] text-muted-foreground">
+                                {cleanPreview(s.preview)}
+                              </p>
+                            )}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  );
+                })()}
+              </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Settings sheet */}
+      {settingsOpen && (
+        <div
+          className="absolute inset-0 z-40 flex flex-col bg-background-base"
+          style={{ background: "var(--background-base)" }}
+          data-testid="mobile-settings-sheet"
+        >
+          <header className="flex shrink-0 items-center gap-2 border-b border-border/40 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-3">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(false)}
+              aria-label="Back"
+              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:text-foreground active:text-foreground"
+            >
+              <ChevronLeft className="h-5 w-5" />
+            </button>
+            <h2 className="flex-1 text-[1rem] font-bold text-foreground">Settings</h2>
+          </header>
+          <div
+            className="flex-1 overflow-y-auto p-4 space-y-4"
+            style={{ WebkitOverflowScrolling: "touch" }}
+          >
+            {/* Palette note */}
+            <div className="rounded-xl border border-border/40 bg-card p-3.5">
+              <p className="text-[0.78rem] leading-relaxed text-muted-foreground">
+                Hermes mobile uses the scoped Nous-dark palette.
+              </p>
+            </div>
+
+            {/* Show thinking by default toggle */}
+            <div className="flex items-center justify-between rounded-xl border border-border/40 bg-card p-3.5">
+              <span className="text-[0.88rem] font-medium text-foreground">
+                Show thinking by default
+              </span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={thinkingOpen}
+                onClick={onToggleThinking}
+                aria-label="Show thinking by default"
+                className={cn(
+                  "relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none",
+                  thinkingOpen ? "bg-primary" : "bg-muted",
+                )}
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out",
+                    thinkingOpen ? "translate-x-5" : "translate-x-0",
+                  )}
+                />
+              </button>
+            </div>
+
+            {/* Version line */}
+            <div className="rounded-xl border border-border/40 bg-card p-3.5">
+              <p className="text-[0.78rem] text-muted-foreground select-none">
+                {BUILD_TAG}
+              </p>
+            </div>
           </div>
         </div>
       )}
