@@ -98,8 +98,13 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # token orders because real reproductions show both.
     # Leading \b ensures we match "pkill" or "kill" as whole words, not as
     # suffixes of other words (e.g. "skill" -> "kill").
-    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # The gaps are bounded ({0,200}) rather than [^\n]* because "kill" is a
+    # common English word: on a single-line data file (e.g. a compact 1 MB
+    # JSON) an unbounded gap let three unrelated words ("…skill", "gateway",
+    # "Hermes") span ~650 KB and falsely block plain data processing (#98869).
+    # A real `pkill … gateway … hermes` command fits well within 200 chars.
+    r"|(?:\bp?kill\b[^\n]{0,200}\bhermes\b[^\n]{0,200}\bgateway)"
+    r"|(?:\bp?kill\b[^\n]{0,200}\bgateway\b[^\n]{0,200}\bhermes)"
 )
 
 
