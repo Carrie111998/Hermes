@@ -2717,7 +2717,7 @@ def _systemd_user_unit_dir() -> Path:
     try:
         import pwd  # windows-footgun: ok — POSIX-only module inside try/except
 
-        pw_dir = pwd.getpwuid(os.getuid()).pw_dir.strip()
+        pw_dir = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX-only module inside try/except
     except Exception:
         pw_dir = ""
     if pw_dir:
