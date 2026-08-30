@@ -4755,12 +4755,23 @@ def _detect_venv_python_processes(
 
     matches: list[tuple[int, str, str]] = []
     try:
-        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+        # First pass: names only (cheap per process). On hosts with
+        # hundreds of processes the expensive attributes (cmdline, exe,
+        # cwd) each trigger a separate cross-process API call on Windows.
+        # Filtering to Python processes before reading those attributes
+        # cuts the probe's wall-clock by ~40x (#98377).
+        name_iter = psutil.process_iter(["name"])
     except Exception:
         return []
-    for proc in proc_iter:
+    for name_proc in name_iter:
         try:
-            info = proc.info
+            pname = (name_proc.info.get("name") or "").lower()
+        except Exception:
+            continue
+        if not pname.startswith(("python", "py")):
+            continue
+        try:
+            info = name_proc.as_dict(["pid", "exe", "name", "cmdline", "cwd"])
         except Exception:
             continue
         pid = info.get("pid")
