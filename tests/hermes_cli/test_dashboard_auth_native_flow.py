@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import json
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -31,7 +32,7 @@ from hermes_cli.dashboard_auth import (
     register_provider,
 )
 from hermes_cli.dashboard_auth import native_flow
-from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth.base import ProviderError, Session
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
@@ -588,3 +589,53 @@ def test_native_refresh_dead_token_returns_401(gated_client):
     )
     assert r.status_code == 401
     assert r.json()["error"] == "session_expired"
+
+
+class _UnreachableRefreshProvider(StubAuthProvider):
+    """A session provider whose IDP is unreachable during refresh."""
+
+    name = "flaky"
+
+    def refresh_session(self, *, refresh_token: str) -> Session:
+        raise ProviderError("stub IDP unreachable")
+
+
+def test_native_refresh_provider_unreachable_is_audited(tmp_path, monkeypatch):
+    """A provider outage on ``/auth/native/refresh`` must reach the audit
+    log, not just agent.log — mirroring ``_attempt_refresh``'s dual-logging
+    in middleware.py. Before the fix, the 503 path here returned without
+    ever calling ``audit_log``, so an unreachable-IDP refresh storm was
+    invisible in the audit trail."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    clear_providers()
+    register_provider(_UnreachableRefreshProvider())
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.bound_host = "fly-app.fly.dev"
+    web_server.app.state.bound_port = 443
+    web_server.app.state.auth_required = True
+    client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    try:
+        r = client.post(
+            "/auth/native/refresh",
+            json={"refresh_token": "whatever", "provider": "flaky"},
+        )
+        assert r.status_code == 503
+    finally:
+        clear_providers()
+        web_server.app.state.bound_host = prev_host
+        web_server.app.state.bound_port = prev_port
+        web_server.app.state.auth_required = prev_required
+
+    log_path = home / "logs" / "dashboard-auth.log"
+    assert log_path.exists(), "provider-unreachable native refresh must be audited"
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(
+        rec["event"] == "refresh_failure" and rec.get("reason") == "provider_unreachable"
+        for rec in records
+    ), f"no provider_unreachable audit record written: {records}"
