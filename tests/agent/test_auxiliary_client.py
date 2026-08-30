@@ -4959,6 +4959,59 @@ def test_auxiliary_recovery_combines_top_level_text_with_output_tool(response):
     assert message.tool_calls[0].function.arguments == '{"city":"Warsaw"}'
 
 
+def test_auxiliary_recovery_uses_top_level_text_for_empty_output_messages():
+    """A compatibility projection must not be masked by empty message items."""
+    from agent.auxiliary_client import _validate_llm_response
+
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="message", content=[]),
+            SimpleNamespace(type="reasoning", summary=[]),
+            SimpleNamespace(type="message", content=[]),
+            SimpleNamespace(
+                type="function_call",
+                call_id="call_weather",
+                name="weather",
+                arguments='{"city":"Warsaw"}',
+            ),
+        ],
+        output_text="generated answer",
+        usage=SimpleNamespace(output_tokens=2),
+    )
+
+    recovered = _validate_llm_response(response, task="compression")
+
+    assert len(recovered.choices) == 2
+    assert [choice.message.content for choice in recovered.choices] == [
+        "generated answer",
+        None,
+    ]
+    assert recovered.choices[0].message.tool_calls[0].id == "call_weather"
+
+
+def test_auxiliary_recovery_does_not_replace_output_message_text_with_projection():
+    from agent.auxiliary_client import _validate_llm_response
+
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="message", content=[]),
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="real choice text")],
+            ),
+        ],
+        output_text="compatibility projection",
+        usage=SimpleNamespace(output_tokens=3),
+    )
+
+    recovered = _validate_llm_response(response, task="compression")
+
+    assert [choice.message.content for choice in recovered.choices] == [
+        None,
+        "real choice text",
+    ]
+
+
 def _multi_choice_stream_chunks():
     return [
         SimpleNamespace(

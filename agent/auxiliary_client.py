@@ -9327,7 +9327,19 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
                 finish_reason=_obj_get(item, "finish_reason") or "stop",
             ))
     output_text = _obj_get(response, "output_text")
-    if not choices and isinstance(output_text, str):
+    if (
+        choices
+        and isinstance(output_text, str)
+        and output_text
+        and not any(
+            isinstance(choice.message.content, str) and choice.message.content
+            for choice in choices
+        )
+    ):
+        # Some Responses-compatible endpoints leave every output message empty
+        # while publishing the generated text only through this projection.
+        choices[0].message.content = output_text
+    elif not choices and isinstance(output_text, str):
         # ``output_text`` is a compatibility projection, but some adapters
         # populate it alongside an ``output`` list containing only function
         # calls. Keep both forms of evidence in the recovered chat message.
