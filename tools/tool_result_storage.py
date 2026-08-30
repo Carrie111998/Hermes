@@ -32,7 +32,6 @@ import threading
 import tempfile
 import time
 import uuid
-
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -58,13 +57,11 @@ _spillover_prune_lock = threading.Lock()
 _spillover_publish_lock = threading.Lock()
 _spillover_pruned_once = False
 
-
 def get_spillover_dir():
     """Return $HERMES_HOME/cache/spillover as a Path (not created)."""
     from hermes_constants import get_hermes_home
 
     return get_hermes_home() / SPILLOVER_SUBDIR
-
 
 def cleanup_spillover_cache(max_age_hours: int = SPILLOVER_MAX_AGE_HOURS) -> int:
     """Delete spillover files older than *max_age_hours*.
@@ -89,7 +86,6 @@ def cleanup_spillover_cache(max_age_hours: int = SPILLOVER_MAX_AGE_HOURS) -> int
             continue
     return removed
 
-
 def _prune_spillover_once() -> None:
     """Best-effort prune, at most once per process.
 
@@ -109,7 +105,6 @@ def _prune_spillover_once() -> None:
     except Exception as exc:
         logger.debug("Spillover prune failed: %s", sanitize_exception_for_sink(exc))
 
-
 def _is_host_side_env(env) -> bool:
     """True when the spill file should be written by this process directly.
 
@@ -127,7 +122,6 @@ def _is_host_side_env(env) -> bool:
         return isinstance(env, LocalEnvironment)
     except Exception:
         return False
-
 
 def _write_to_spillover(content, filename: str):
     """Atomically publish sanitized content without same-name aliasing."""
@@ -169,7 +163,6 @@ def _write_to_spillover(content, filename: str):
     _prune_spillover_once()
     return str(path)
 
-
 def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
     """Return the readable remote path for a host spill, if mounted."""
     try:
@@ -201,7 +194,6 @@ def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
         )
     return None
 
-
 def _resolve_storage_dir(env) -> str:
     """Return the best temp-backed storage dir for this environment."""
     if env is not None:
@@ -220,19 +212,16 @@ def _resolve_storage_dir(env) -> str:
                     return f"{temp_dir}/hermes-results"
     return STORAGE_DIR
 
-
 def _safe_result_filename(tool_use_id: str) -> str:
     """Return a digest-only filename that never exposes a caller-supplied id."""
     raw_id = tool_use_id if isinstance(tool_use_id, str) else "tool_result"
     digest = hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:24]
     return f"tool_result_{digest}.txt"
 
-
 def _safe_result_id_label(tool_use_id: str) -> str:
     """Return a short non-reusable correlation label for logs."""
     raw_id = tool_use_id if isinstance(tool_use_id, str) else "tool_result"
     return hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:12]
-
 
 def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool]:
     """Truncate at last newline within max_chars. Returns (preview, has_more)."""
@@ -244,13 +233,11 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
         truncated = truncated[:last_nl + 1]
     return truncated, True
 
-
 def _heredoc_marker(content: str) -> str:
     """Return a heredoc delimiter that doesn't collide with content."""
     if HEREDOC_MARKER not in content:
         return HEREDOC_MARKER
     return f"HERMES_PERSIST_{uuid.uuid4().hex[:8]}"
-
 
 def _write_to_sandbox(content, remote_path: str, env) -> bool:
     """Write sanitized content into the sandbox via env.execute().
@@ -270,7 +257,6 @@ def _write_to_sandbox(content, remote_path: str, env) -> bool:
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
     result = env.execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
-
 
 def _build_persisted_message(
     preview: str,
@@ -300,10 +286,7 @@ def _build_persisted_message(
         msg += "\n..."
     msg += f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
     return msg
-
-
 _PERSISTED_PATH_RE = re.compile(r"^Full output saved to: (.+)$", re.MULTILINE)
-
 
 def extract_persisted_path(content: str) -> str | None:
     """Return the file path from a <persisted-output> replacement block.
