@@ -202,7 +202,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("btw", "Ask a side question about the current conversation without interrupting it", "Session",
                args_hint="<question>", busy_policy="dispatch"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
-               aliases=("tasks",), busy_policy="dispatch"),
+               aliases=("tasks",), args_hint="[--all]", busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
                "Session", aliases=("learning", "memory-graph"), cli_only=True,
                args_hint="[list|delete <id>|edit <id>]",
