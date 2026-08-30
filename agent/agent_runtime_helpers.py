@@ -1861,14 +1861,20 @@ def restore_primary_runtime(agent) -> bool:
         # turns the pool may have rotated (token revocation, billing/rate-limit
         # exhaustion, cooldown), leaving the snapshot key stale.  Restoring it
         # blindly re-fails on the first request and burns through the remaining
-        # pool entries before cross-provider fallback even gets a chance.  Ask
-        # the pool for its current best entry and swap the live credential in.
-        # When the pool is absent, empty, or the entry has no usable key, we
-        # keep the snapshot key (the existing behavior).  Fixes #25205.
+        # pool entries before cross-provider fallback even gets a chance.  Reuse
+        # this session's pinned seat when it is still available so a live chat
+        # does not hop SuperGrok accounts (and dump the xAI prefix cache) on
+        # every restore.  Only assign a new seat when the pin is gone/exhausted.
+        pinned_id = getattr(agent, "_credential_pool_entry_id", None)
         agent._credential_pool_entry_id = None
         pool = getattr(agent, "_credential_pool", None)
         if pool is not None and pool.has_available():
-            entry = pool.select()
+            reuse = getattr(pool, "select_or_reuse", None)
+            entry = (
+                reuse(pinned_id if isinstance(pinned_id, str) else None)
+                if callable(reuse)
+                else pool.select()
+            )
             if entry is not None:
                 entry_provider = str(getattr(entry, "provider", "") or "").strip().lower()
                 entry_matches_primary = credential_pool_matches_provider(
@@ -1886,6 +1892,17 @@ def restore_primary_runtime(agent) -> bool:
                     # reapplies base-url-scoped headers, and carries the
                     # accumulated base_url / OAuth-detection fixes (#33163).
                     agent._swap_credential(entry)
+                    try:
+                        from agent.credential_pool import apply_session_seat_notice
+
+                        apply_session_seat_notice(
+                            agent,
+                            entry,
+                            reused=isinstance(pinned_id, str)
+                            and pinned_id == getattr(entry, "id", None),
+                        )
+                    except Exception:
+                        pass
                     logger.info(
                         "Restore re-selected pool entry %s (%s)",
                         getattr(entry, "id", "?"),

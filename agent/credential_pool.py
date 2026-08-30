@@ -719,6 +719,65 @@ def _write_through_provider_state_to_global_root(
         )
 
 
+def format_pool_seat_notice(
+    entry: Optional[PooledCredential],
+    *,
+    provider: str = "",
+) -> str:
+    """One-line notice naming the subscription/credential a session landed on.
+
+    Labels only — never tokens or emails. Empty when there is no entry.
+    """
+    if entry is None:
+        return ""
+    label = str(getattr(entry, "label", None) or getattr(entry, "id", None) or "").strip()
+    if not label:
+        label = "unnamed"
+    prov = (provider or getattr(entry, "provider", None) or "").strip().lower()
+    if prov in {"xai-oauth", "x-ai-oauth", "grok-oauth", "xai-grok-oauth"}:
+        return f"🎫 SuperGrok seat: {label}"
+    if prov:
+        return f"🎫 Credential seat: {label} ({prov})"
+    return f"🎫 Credential seat: {label}"
+
+
+def apply_session_seat_notice(agent: Any, entry: Optional[PooledCredential], *, reused: bool = False) -> str:
+    """Queue (and optionally emit) a one-shot seat line for this session.
+
+    Reuse of the same seat is silent after the first notice. A hop to a new
+    seat (exhausted pin, rotation) emits again.
+    """
+    notice = format_pool_seat_notice(
+        entry, provider=str(getattr(agent, "provider", None) or "")
+    )
+    if not notice:
+        return ""
+    entry_id = getattr(entry, "id", None)
+    last = getattr(agent, "_emitted_seat_notice", None)
+    if reused and last == entry_id:
+        return ""
+    agent._pending_seat_notice = notice
+    agent._emitted_seat_notice = entry_id
+    emit = getattr(agent, "_emit_status", None)
+    if callable(emit):
+        try:
+            emit(notice)
+        except Exception:
+            pass
+    return notice
+
+
+def consume_pending_seat_notice(agent: Any, response_text: str) -> str:
+    """Append a pending seat notice to the first user-visible final once."""
+    notice = getattr(agent, "_pending_seat_notice", None)
+    if not notice or not response_text:
+        return response_text
+    agent._pending_seat_notice = None
+    if notice in response_text:
+        return response_text
+    return response_text.rstrip() + "\n\n" + notice
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
@@ -2146,6 +2205,34 @@ class CredentialPool:
                 self._unmatched_rotation_streak = 0
         return entry
 
+    def select_or_reuse(self, pinned_id: Optional[str] = None) -> Optional[PooledCredential]:
+        """Reuse *pinned_id* when that seat is still available; else ``select()``.
+
+        New Desktop/CLI sessions assign a seat with ``select()``. A live
+        session must keep that seat across turn-start restore so xAI prompt
+        cache stays warm. Exhausted/dead pins fall through to a new assignment.
+        Reuse does not increment ``request_count``.
+        """
+        pinned = (pinned_id or "").strip()
+        if pinned:
+            available, pending_refresh = self._select_under_lock_available()
+            if pending_refresh:
+                self._refresh_pending_entries(pending_refresh)
+                available, _ = self._select_under_lock_available(refresh=False)
+            match = next((entry for entry in available if entry.id == pinned), None)
+            if match is not None:
+                with self._lock:
+                    self._current_id = match.id
+                self._unmatched_rotation_streak = 0
+                return match
+        return self.select()
+
+    def _select_under_lock_available(
+        self, *, refresh: bool = True
+    ) -> Tuple[List[PooledCredential], List[tuple]]:
+        with self._lock:
+            return self._available_entries(clear_expired=True, refresh=refresh)
+
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""
         with self._lock:
@@ -2372,9 +2459,12 @@ class CredentialPool:
 
         if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
             entry = min(available, key=lambda e: e.request_count)
-            # Increment usage counter so subsequent selections distribute load
+            # Increment usage counter so subsequent selections distribute load.
+            # Persist: every Desktop/gateway session calls load_pool() fresh,
+            # so an in-memory-only increment never spreads seats (#session-sticky).
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
+            self._persist()
             self._current_id = entry.id
             return updated, pending_refresh
 

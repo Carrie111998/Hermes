@@ -1700,6 +1700,220 @@ class TestLeastUsedStrategy:
             "least_used should alternate or increment"
         )
 
+    def test_least_used_request_count_survives_reload(self, tmp_path, monkeypatch):
+        """New sessions call load_pool() fresh. Counts must persist or every
+        Desktop chat re-selects p0 and three SuperGrok seats never spread."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr(
+            "agent.credential_pool.get_pool_strategy",
+            lambda _provider: "least_used",
+        )
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_singletons",
+            lambda provider, entries: (False, set()),
+        )
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_env",
+            lambda provider, entries: (False, set()),
+        )
+        _write_auth_store(
+            tmp_path,
+            {
+                "version": 1,
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "seat-a",
+                            "label": "getlasso",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "tok-a",
+                            "request_count": 0,
+                        },
+                        {
+                            "id": "seat-b",
+                            "label": "clearplan",
+                            "auth_type": "oauth",
+                            "priority": 1,
+                            "source": "manual:device_code",
+                            "access_token": "tok-b",
+                            "request_count": 0,
+                        },
+                    ]
+                },
+            },
+        )
+        from agent.credential_pool import load_pool
+
+        first = load_pool("xai-oauth").select()
+        assert first is not None
+        second = load_pool("xai-oauth").select()
+        assert second is not None
+        assert second.id != first.id
+
+    def test_select_or_reuse_keeps_pinned_seat(self, tmp_path, monkeypatch):
+        """A live session must stay on its assigned seat even if least_used
+        would now prefer another account."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr(
+            "agent.credential_pool.get_pool_strategy",
+            lambda _provider: "least_used",
+        )
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_singletons",
+            lambda provider, entries: (False, set()),
+        )
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_env",
+            lambda provider, entries: (False, set()),
+        )
+        _write_auth_store(
+            tmp_path,
+            {
+                "version": 1,
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "seat-a",
+                            "label": "getlasso",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "tok-a",
+                            "request_count": 5,
+                        },
+                        {
+                            "id": "seat-b",
+                            "label": "clearplan",
+                            "auth_type": "oauth",
+                            "priority": 1,
+                            "source": "manual:device_code",
+                            "access_token": "tok-b",
+                            "request_count": 0,
+                        },
+                    ]
+                },
+            },
+        )
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("xai-oauth")
+        reused = pool.select_or_reuse("seat-a")
+        assert reused is not None
+        assert reused.id == "seat-a"
+        # Reuse must not increment as a new assignment.
+        reloaded = load_pool("xai-oauth")
+        counts = {e.id: e.request_count for e in reloaded.entries()}
+        assert counts["seat-a"] == 5
+        assert counts["seat-b"] == 0
+
+    def test_select_or_reuse_assigns_when_pin_exhausted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setattr(
+            "agent.credential_pool.get_pool_strategy",
+            lambda _provider: "least_used",
+        )
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_singletons",
+            lambda provider, entries: (False, set()),
+        )
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_env",
+            lambda provider, entries: (False, set()),
+        )
+        now = time.time()
+        _write_auth_store(
+            tmp_path,
+            {
+                "version": 1,
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "seat-a",
+                            "label": "getlasso",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "tok-a",
+                            "last_status": "exhausted",
+                            "last_status_at": now,
+                            "last_error_code": 402,
+                            "last_error_reset_at": now + 3600,
+                            "request_count": 3,
+                        },
+                        {
+                            "id": "seat-b",
+                            "label": "clearplan",
+                            "auth_type": "oauth",
+                            "priority": 1,
+                            "source": "manual:device_code",
+                            "access_token": "tok-b",
+                            "request_count": 0,
+                        },
+                    ]
+                },
+            },
+        )
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("xai-oauth")
+        entry = pool.select_or_reuse("seat-a")
+        assert entry is not None
+        assert entry.id == "seat-b"
+
+
+class TestPoolSeatNotice:
+    def test_format_xai_oauth_uses_label_only(self):
+        from agent.credential_pool import PooledCredential, format_pool_seat_notice
+
+        entry = PooledCredential(
+            provider="xai-oauth",
+            id="13932f",
+            label="premium-plus-getlasso",
+            auth_type="oauth",
+            source="manual:device_code",
+            access_token="tok",
+            priority=0,
+        )
+        notice = format_pool_seat_notice(entry)
+        assert "premium-plus-getlasso" in notice
+        assert "tok" not in notice
+        assert "SuperGrok seat" in notice
+
+    def test_apply_then_consume_appends_once(self):
+        from types import SimpleNamespace
+        from agent.credential_pool import (
+            PooledCredential,
+            apply_session_seat_notice,
+            consume_pending_seat_notice,
+        )
+
+        seen = []
+        agent = SimpleNamespace(
+            provider="xai-oauth",
+            _emit_status=seen.append,
+        )
+        entry = PooledCredential(
+            provider="xai-oauth",
+            id="seat-a",
+            label="premium-plus-gmail",
+            auth_type="oauth",
+            source="manual:device_code",
+            access_token="secret-token",
+            priority=0,
+        )
+        notice = apply_session_seat_notice(agent, entry, reused=False)
+        assert notice
+        assert seen == [notice]
+        first = consume_pending_seat_notice(agent, "Hello")
+        assert first.endswith(notice)
+        assert "secret-token" not in first
+        # Second consume is a no-op.
+        assert consume_pending_seat_notice(agent, first) == first
+        # Same-seat reuse is silent.
+        assert apply_session_seat_notice(agent, entry, reused=True) == ""
+
 
 # ── PR #10160 salvage: Nous OAuth cross-process sync tests ─────────────────
 
