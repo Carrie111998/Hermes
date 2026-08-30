@@ -25,6 +25,7 @@ DEFAULT_BROWSER_CDP_URL = f"http://127.0.0.1:{DEFAULT_BROWSER_CDP_PORT}"
 
 _DARWIN_APPS = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Dia.app/Contents/MacOS/Dia",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
@@ -91,7 +92,7 @@ _LINUX_INSTALL_PATHS = tuple(path for _, paths in _LINUX_BROWSER_GROUPS for path
 # ---------------------------------------------------------------------------
 
 # Canonical Chromium browser keys we support for real-profile driving.
-_CHROMIUM_BROWSERS = ("chrome", "edge", "brave", "chromium")
+_CHROMIUM_BROWSERS = ("chrome", "edge", "brave", "chromium", "dia")
 
 # Windows UserChoice ProgId prefixes → canonical browser key. Matched
 # case-insensitively by prefix so version suffixes (e.g. ``ChromeHTML.X``)
@@ -157,6 +158,7 @@ _LINUX_SNAP_PROFILE_PARTS = {
 # prefix): ``com.google.chrome.beta`` must not be read as ``com.google.chrome``.
 _DARWIN_BUNDLE_MAP = (
     ("com.google.chrome", "chrome"),
+    ("company.thebrowser.dia", "dia"),
     ("com.microsoft.edgemac", "edge"),
     ("com.brave.browser", "brave"),
     ("org.chromium.chromium", "chromium"),
@@ -198,6 +200,11 @@ def _real_profile_relparts(browser: str) -> tuple:
             ("Chromium",),
             ("Chromium", "User Data"),
             "chromium",
+        ),
+        "dia": (
+            ("Dia", "User Data"),
+            ("Dia", "User Data"),
+            "Dia/User Data",
         ),
     }[browser]
 
@@ -254,6 +261,7 @@ def chromium_executable(browser: str, system: str | None = None) -> str | None:
     if system == "Darwin":
         app = {
             "chrome": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "dia": "/Applications/Dia.app/Contents/MacOS/Dia",
             "chromium": "/Applications/Chromium.app/Contents/MacOS/Chromium",
             "brave": "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
             "edge": "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
