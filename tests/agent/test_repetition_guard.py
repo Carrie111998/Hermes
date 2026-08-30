@@ -63,3 +63,23 @@ class TestRepetitionGuard:
             {"type": "text", "text": "Unique body part detailing verification steps."},
         ]
         assert is_repetition_dominated(parts) is False
+
+    def test_multipart_with_images_and_tool_calls_not_flagged(self):
+        """Non-text parts (images, tool_use) must not be stringified into false repetition signals."""
+        parts = [
+            {"type": "text", "text": "Here is the screenshot requested:"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "tool_use", "id": "call_1", "name": "screenshot", "input": {}},
+        ]
+        assert is_repetition_dominated(parts) is False
+
+    def test_multipart_repeated_table_syntax_below_dominance_not_flagged(self):
+        """Legitimate repeated markdown tables or code syntax below dominance threshold must pass."""
+        table_rows = ["| col1 | col2 | col3 |", "| --- | --- | --- |"] + [
+            f"| data_{i} | value_{i} | result_{i} |" for i in range(100)
+        ]
+        parts = [
+            {"type": "text", "text": "\n".join(table_rows)},
+        ]
+        assert is_repetition_dominated(parts) is False
+
