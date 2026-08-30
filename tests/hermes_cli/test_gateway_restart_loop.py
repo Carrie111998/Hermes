@@ -1000,6 +1000,115 @@ class TestLifecycleGuardModule:
             is False
         )
 
+    def test_markdown_link_chain_not_blocked(self, tmp_path):
+        """#98801: content-derived bare-path recursion must not reach docs.
+
+        A Python heredoc reads a Markdown file whose prose links to another
+        doc that legitimately contains `hermes gateway stop` in a fenced
+        block. The walk used to tokenize the Markdown as shell, follow the
+        link target, and scan its prose — blocking a read-only command.
+        Bare-path references derived from file *contents* now require a
+        shell-looking target (shell suffix or shebang), so the chain stops.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "gateway-doc.md").write_text(
+            "# Gateway internals\n\nTo stop the gateway run:\n\n"
+            "```bash\nhermes gateway stop\n```\n",
+            encoding="utf-8",
+        )
+        notes = tmp_path / "notes.md"
+        notes.write_text(
+            "# Harmless notes\n\nSee [internals](sub/gateway-doc.md) for details.\n"
+            "Nothing dangerous here.\n",
+            encoding="utf-8",
+        )
+        command = (
+            "python3 - <<'PY'\n"
+            "from pathlib import Path\n"
+            f'p = Path("{notes}")\n'
+            "print(p.read_text())\n"
+            "PY"
+        )
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                command, cwd=str(tmp_path)
+            )
+            is False
+        )
+
+    def test_direct_lifecycle_negative_controls_still_block(self):
+        """#98801 negative controls: the direct scans must stay untouched."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        for command in (
+            "hermes gateway restart",
+            "systemctl restart hermes-gateway",
+            "pkill -f 'hermes gateway'",
+        ):
+            assert (
+                contains_gateway_lifecycle_command_or_referenced_script(command)
+                is True
+            )
+
+    def test_executed_markdown_still_scanned(self, tmp_path):
+        """The fix must not open a `bash data-file` bypass.
+
+        Executable-form references (``bash x``, ``source x``) state the
+        interpreter explicitly and never consult the shell-shape gate, so a
+        Markdown-named file handed to bash is still scanned.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        doc = tmp_path / "notes.md"
+        doc.write_text("# not a script\nhermes gateway stop\n", encoding="utf-8")
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(f"bash {doc}")
+            is True
+        )
+
+    def test_suffixless_shebang_reference_in_wrapper_scanned(self, tmp_path):
+        """A wrapper script's bare `./run` (shebang, no suffix) stays tracked.
+
+        The shell-shape gate accepts a ``#!`` line, so content-derived
+        references to real suffixless scripts keep working.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        run = tmp_path / "run"
+        run.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        wrapper = tmp_path / "wrapper.sh"
+        wrapper.write_text(f"#!/bin/bash\ncd {tmp_path}\n./run\n", encoding="utf-8")
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"bash {wrapper}"
+            )
+            is True
+        )
+
+    def test_shell_suffix_reference_in_wrapper_scanned(self, tmp_path):
+        """A wrapper's bare `scripts/evil.sh` (suffix, no shebang) stays tracked."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "evil.sh").write_text(
+            "hermes gateway stop\n", encoding="utf-8"
+        )
+        wrapper = tmp_path / "w2.sh"
+        wrapper.write_text("exec scripts/evil.sh\n", encoding="utf-8")
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"bash {wrapper}"
+            )
+            is True
+        )
+
     def test_prompt_with_command_raises(self):
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         with pytest.raises(GatewayLifecycleBlocked) as exc:
