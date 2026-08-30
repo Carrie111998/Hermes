@@ -77,6 +77,7 @@ from agent.model_metadata import (
     estimate_request_tokens_rough,
 )
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
+from hermes_cli.route_identity import normalize_route_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -1775,9 +1776,9 @@ def check_compression_model_feasibility(agent: Any) -> None:
         same_model = str(aux_model or "").strip() == str(
             getattr(agent, "model", "") or ""
         ).strip()
-        same_route = str(aux_base_url or "").rstrip("/") == str(
-            getattr(agent, "base_url", "") or ""
-        ).rstrip("/")
+        same_route = normalize_route_base_url(
+            aux_base_url
+        ) == normalize_route_base_url(getattr(agent, "base_url", ""))
         if aux_context_override is None and same_model and same_route:
             aux_context_override = getattr(agent, "_config_context_length", None)
 

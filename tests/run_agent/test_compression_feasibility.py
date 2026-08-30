@@ -202,7 +202,9 @@ def test_inherited_aux_route_reuses_main_context_override(mock_get_client, mock_
     agent = _make_agent(main_context=1_048_576, threshold_percent=0.50)
     agent.model = "glm-5.3-flash"
     agent.provider = "custom"
-    agent.base_url = "https://relay.example.invalid/v1"
+    # The OpenAI client canonicalizes these equivalent URL components. The
+    # configured runtime route may retain its original spelling.
+    agent.base_url = "HTTPS://RELAY.EXAMPLE.INVALID:443/v1"
     agent._config_context_length = 1_048_576
     mock_client = MagicMock()
     mock_client.base_url = "https://relay.example.invalid/v1/"
