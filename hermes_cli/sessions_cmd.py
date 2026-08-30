@@ -1107,8 +1107,14 @@ def cmd_sessions(args, sessions_parser=None):
                 suffix = f"  ({title})" if title else ""
                 print(f"Unhidden session '{resolved}'.{suffix}")
             else:
-                print(f"Session '{raw_id}' not found.")
-                failures += 1
+                # resolve_session_id() already proved the row exists, so a
+                # False here is the setter's "no rows changed" return — the
+                # session (and its whole lineage) was already visible.
+                # Reporting "not found" would be wrong AND would bump
+                # failures toward exit 1, making an idempotent second unhide
+                # of the same id look like a failure. set_session_hidden
+                # contract: True only when at least one row changed.
+                print(f"Session '{resolved}' is already visible — nothing to unhide.")
         if failures:
             return 1
 
