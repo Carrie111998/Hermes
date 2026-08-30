@@ -127,6 +127,52 @@ async def test_reconnect_recovery_does_not_rerun_active_handler(tmp_path: Path) 
     assert calls == 1
     release.set()
     assert await handling == DeferredQuestionResult.done("Consent recorded.")
+    await asyncio.sleep(0)
+    assert service._handling_retry_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_reconnect_wake_retries_after_active_handler_fails(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from gateway.deferred_questions import DeferredQuestionResult
+
+    service = _service(tmp_path / "questions.sqlite3")
+    question, _adapter = _awaiting_question(service)
+    service.handling_retry_seconds = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handle(_record, _answer):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("temporary")
+        return DeferredQuestionResult.done("Consent recorded.")
+
+    service.register_handler("plow-chat", "invite-consent", handle)
+    handling = asyncio.create_task(
+        service.handle_response(question.session_key, "Sure!")
+    )
+    await started.wait()
+
+    assert await service.retry_handling() == []
+    release.set()
+    with pytest.raises(RuntimeError, match="temporary"):
+        await handling
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    retry_tasks = tuple(service._handling_retry_tasks.values())
+    await asyncio.gather(*retry_tasks)
+
+    assert calls == 2
+    with pytest.raises(KeyError):
+        service.get(question.id)
 
 
 @pytest.mark.asyncio
@@ -904,4 +950,6 @@ async def test_slash_command_bypasses_pending_deferred_question(tmp_path: Path) 
 
     assert service.get(question.id).state == "awaiting"
     adapter._message_handler.assert_awaited_once()
-    assert adapter.sent == [("home", "status response", "msg-command", {"notify": True})]
+    assert adapter.sent == [
+        ("home", "status response", "msg-command", {"notify": True})
+    ]
