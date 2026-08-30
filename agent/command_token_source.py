@@ -36,12 +36,30 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 import threading
 import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# Shell metachars that indicate shell-only syntax — blocked in the default
+# argv-only mode. Keeps a single semicolon from becoming RCE via crafted YAML.
+_SHELL_METACHARS = frozenset(";|&`$(){}!*?[]#~<>")
+
+def _allow_shell_key_cmd() -> bool:
+    """True when `security.allow_shell_key_cmd` is explicitly enabled."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        sec = cfg.get("security") if isinstance(cfg, dict) else None
+        if isinstance(sec, dict):
+            return bool(sec.get("allow_shell_key_cmd"))
+    except Exception:
+        pass
+    return False
 
 # Treat a cached token as spent slightly before its stated expiry, so a request
 # can't be signed with a token that dies in flight. 60s matches the leeway used
@@ -65,10 +83,39 @@ class CommandTokenError(RuntimeError):
 
 def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
     """Run *command*, returning ``(token, ttl_seconds_or_None)``."""
+    # Default: argv-only (no shell) — prevents `; rm -rf /` via crafted YAML.
+    # Shell form is gated behind `security.allow_shell_key_cmd: true`.
+    use_shell = _allow_shell_key_cmd()
+    if not use_shell:
+        # Default argv-only: shell metachars are neutralized by not using a
+        # shell. `echo pwned; id` becomes ["echo","pwned;","id"] — harmless.
+        # Explicit shell users: either use `/bin/sh -c '...'` (argv-safe) or
+        # set `security.allow_shell_key_cmd: true` to restore shell=True.
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            raise CommandTokenError(
+                f"key_cmd for provider {label!r} could not be parsed: {exc}. "
+                "Use an argv-style command or set security.allow_shell_key_cmd: true for shell form."
+            ) from exc
+        if not argv:
+            raise CommandTokenError(
+                f"key_cmd for provider {label!r} is empty after parsing"
+            )
+        run_args: str | list[str] = argv
+        run_shell = False
+    else:
+        logger.warning(
+            "key_cmd for provider %r using shell=True (security.allow_shell_key_cmd=true)",
+            label,
+        )
+        run_args = command
+        run_shell = True
+
     try:
         completed = subprocess.run(
-            command,
-            shell=True,
+            run_args,
+            shell=run_shell,
             capture_output=True,
             text=True,
             timeout=_MINT_TIMEOUT_SECONDS,
