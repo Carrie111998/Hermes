@@ -361,6 +361,8 @@ class TestLegacyToolsetMap:
         for name in expected:
             assert name in _LEGACY_TOOLSET_MAP, f"Missing legacy toolset: {name}"
 
+    def test_skills_legacy_toolset_includes_outcome_reporting(self):
+        assert "skill_report_outcome" in _LEGACY_TOOLSET_MAP["skills_tools"]
 
 
 # =========================================================================
