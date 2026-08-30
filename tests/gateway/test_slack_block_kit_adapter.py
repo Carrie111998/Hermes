@@ -199,3 +199,73 @@ class TestMarkdownBlockMode:
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
 
 
+class SlackRejectedThread(Exception):
+    def __init__(self, error="cannot_reply_to_message"):
+        super().__init__(f"Slack API rejected thread reply: {error}")
+        self.response = {"error": error}
+
+
+class TestThreadReplyFallback:
+    """``cannot_reply_to_message`` on a non-threadable root (e.g. a Slack
+    system event) falls back to a top-level channel message instead of
+    dropping the response (#98285)."""
+
+    @pytest.mark.asyncio
+    async def test_cannot_reply_retries_as_top_level_message(self):
+        adapter, client = _make_adapter({"reply_broadcast": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[SlackRejectedThread(), {"ts": "333.444"}]
+        )
+
+        result = await adapter.send(
+            "C1",
+            "final answer",
+            reply_to="222.000",
+            metadata={"thread_id": "222.000"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "333.444"
+        assert client.chat_postMessage.await_count == 2
+        first = client.chat_postMessage.await_args_list[0].kwargs
+        second = client.chat_postMessage.await_args_list[1].kwargs
+        assert first["thread_ts"] == "222.000"
+        assert first["reply_broadcast"] is True
+        # fallback is a plain top-level post: no thread targeting at all
+        assert "thread_ts" not in second
+        assert "reply_broadcast" not in second
+        assert second["text"] == first["text"]
+        assert "blocks" not in second
+
+    @pytest.mark.asyncio
+    async def test_other_thread_errors_still_fail(self):
+        adapter, client = _make_adapter()
+        client.chat_postMessage = AsyncMock(
+            side_effect=SlackRejectedThread("thread_not_found")
+        )
+
+        result = await adapter.send(
+            "C1",
+            "final answer",
+            reply_to="222.000",
+            metadata={"thread_id": "222.000"},
+        )
+
+        assert result.success is False
+        assert client.chat_postMessage.await_count == 1
+        assert "thread_not_found" in result.error
+
+    @pytest.mark.asyncio
+    async def test_cannot_reply_without_thread_target_does_not_retry(self):
+        # top-level send (no thread_ts): error is surfaced, not retried
+        adapter, client = _make_adapter()
+        client.chat_postMessage = AsyncMock(
+            side_effect=[SlackRejectedThread(), {"ts": "333.444"}]
+        )
+
+        result = await adapter.send("C1", "final answer")
+
+        assert result.success is False
+        assert client.chat_postMessage.await_count == 1
+
+
