@@ -81,6 +81,105 @@ def test_ensure_docker_available_logs_and_raises_when_not_found(monkeypatch, cap
     )
 
 
+def test_ensure_docker_available_logs_and_raises_on_timeout(monkeypatch, caplog):
+    """When docker version times out, surface a helpful error instead of hanging."""
+
+    def _raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["/custom/docker", "version"], timeout=5)
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/custom/docker")
+    monkeypatch.setattr(docker_env.subprocess, "run", _raise_timeout)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError) as excinfo:
+            _make_dummy_env()
+
+    assert "Docker daemon is not responding" in str(excinfo.value)
+    assert any(
+        "/custom/docker version' timed out" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_ensure_docker_available_uses_resolved_executable(monkeypatch):
+    """When docker is found outside PATH, preflight should use that resolved path."""
+
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/opt/homebrew/bin/docker")
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    docker_env._ensure_docker_available()
+
+    assert calls == [
+        (["/opt/homebrew/bin/docker", "version"], {
+            "capture_output": True,
+            "text": True,
+            "timeout": 5,
+            "stdin": subprocess.DEVNULL,
+        })
+    ]
+
+
+def test_recreate_container_calls_passwd_entry_setup(monkeypatch):
+    """Recovery must invoke _ensure_host_passwd_entry after settling
+    self._container_id, regardless of which recovery branch ran."""
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(run_as_host_user=True)
+    env._image = "python:3.11"
+    monkeypatch.setattr(env, "_find_reusable_container", lambda *a, **k: None)
+    monkeypatch.setattr(env, "init_session", lambda: None)
+    entry_calls = []
+    monkeypatch.setattr(env, "_ensure_host_passwd_entry", lambda: entry_calls.append(True))
+
+    result = env._recreate_container()
+
+    assert result is True
+    assert entry_calls == [True]
+
+
+def test_run_bash_includes_user_flag_when_host_user_enabled(monkeypatch):
+    """docker exec must receive -u <uid:gid> when run_as_host_user is set."""
+    _mock_subprocess_run(monkeypatch)  # docker version/run calls during __init__
+    env = _make_dummy_env(run_as_host_user=True)
+    env._container_id = "fake_container_id"
+
+    captured_cmds = []
+    def _fake_popen_bash(cmd, stdin_data):
+        captured_cmds.append(cmd)
+        return None  # return value unused by this test
+
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1001:1001")
+    monkeypatch.setattr(docker_env, "_popen_bash", _fake_popen_bash)
+
+    env._run_bash("echo hi")
+
+    assert len(captured_cmds) == 1
+    cmd = captured_cmds[0]
+    assert "-u" in cmd
+    assert cmd[cmd.index("-u") + 1] == "1001:1001"
+
+
+def test_run_bash_omits_user_flag_when_host_user_disabled(monkeypatch):
+    """Sanity check: the -u flag must NOT appear when run_as_host_user is False,
+    confirming the flag is conditional, not always-on."""
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(run_as_host_user=False)
+    env._container_id = "fake_container_id"
+
+    captured_cmds = []
+    monkeypatch.setattr(docker_env, "_popen_bash",
+                         lambda cmd, stdin_data: captured_cmds.append(cmd))
+
+    env._run_bash("echo hi")
+
+    assert "-u" not in captured_cmds[0]
+
+
 def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     """Opt-in docker cwd mounting should bind the host cwd to /workspace."""
     project_dir = tmp_path / "my-project"
@@ -160,6 +259,7 @@ def _make_execute_only_env(forward_env=None):
     env.timeout = 60
     env._forward_env = forward_env or []
     env._env = {}
+    env._run_as_host_user = False
     env._prepare_command = lambda command: (command, None)
     env._timeout_result = lambda timeout: {"output": f"timed out after {timeout}", "returncode": 124}
     env._container_id = "test-container"

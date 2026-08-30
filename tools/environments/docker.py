@@ -939,7 +939,10 @@ class DockerEnvironment(BaseEnvironment):
         self._container_name: str = ""
         self._image_uses_s6_init: bool = False
         self._all_run_args: list[str] = []
+        self._run_as_host_user = run_as_host_user 
         logger.info("DockerEnvironment volumes: %s", volumes)
+
+
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
             logger.warning("docker_volumes config is not a list: %r", volumes)
@@ -1551,6 +1554,8 @@ class DockerEnvironment(BaseEnvironment):
             self._container_id = result.stdout.strip()
             logger.info("Started container %s (%s)", container_name, self._container_id[:12])
 
+        self._ensure_host_passwd_entry()
+
         # Build the init-time env forwarding args used to seed the snapshot.
         self._init_env_args = self._build_init_env_args()
 
@@ -1637,6 +1642,10 @@ class DockerEnvironment(BaseEnvironment):
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
         cmd = [self._docker_exe, "exec"]
+        if self._run_as_host_user:
+            user_spec = _resolve_host_user_spec()
+            if user_spec is not None:
+                cmd.extend(["-u", user_spec])
         if stdin_data is not None:
             cmd.append("-i")
 
@@ -1678,6 +1687,43 @@ class DockerEnvironment(BaseEnvironment):
     def _is_container_gone(self, output: str) -> bool:
         """Return True if the output indicates the container no longer exists."""
         return any(p in output for p in self._NO_CONTAINER_PATTERNS)
+
+    def _ensure_host_passwd_entry(self) -> None:
+        """Ensure /etc/passwd has an entry for the host UID we're running as.
+    
+        The image's baked-in users don't know about arbitrary host UIDs,
+        and tools like ssh/git call getpwuid() internally and fail hard
+        with "No user exists for uid N" if it's missing. Idempotent: the
+        `id -u` guard skips re-adding on container reuse. Must be called
+        after any path that (re)establishes self._container_id — initial
+        creation, container reuse, and recovery-created replacements alike
+        — since a nameless UID left over from a missed call site would
+        silently reintroduce the same ssh/git failure after recovery.
+        """
+        if not self._run_as_host_user:
+            return
+        user_spec = _resolve_host_user_spec()
+        if user_spec is None:
+            return
+        uid, gid = user_spec.split(":")
+        setup_cmd = [
+            self._docker_exe, "exec", "-u", "root", self._container_id,
+            "bash", "-c",
+            f"id -u {uid} >/dev/null 2>&1 || "
+            f"(echo 'hermes:x:{uid}:{gid}:Hermes User:/root:/bin/bash' >> /etc/passwd && "
+            f"echo 'hermes:x:{gid}:' >> /etc/group)"
+        ]
+        try:
+            result = subprocess.run(setup_cmd, capture_output=True, timeout=10,
+                                     stdin=subprocess.DEVNULL)
+            if result.returncode != 0:
+                logger.warning(
+                    "passwd entry setup exited %d for uid %s: %s",
+                    result.returncode, uid,
+                    result.stderr.decode(errors="replace").strip(),
+                )
+        except Exception as e:
+            logger.warning("Failed to add passwd entry for host UID: %s", e)
 
     def _recreate_container(self) -> bool:
         """Recreate the container after it was removed out-of-band.
@@ -1751,6 +1797,10 @@ class DockerEnvironment(BaseEnvironment):
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                 logger.error("Recovery: failed to create new container: %s", e)
                 return False
+
+        # After any recovery path (reuse, restart, or fresh create) has
+        # settled self._container_id, before resuming normal init.
+        self._ensure_host_passwd_entry()
 
         # 3. Re-initialize session snapshot in the (re)created container.
         try:
