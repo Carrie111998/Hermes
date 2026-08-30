@@ -3010,7 +3010,7 @@ class ShellFileOperations(FileOperations):
             extra = len(per_file) - cap
             return shown + (f" (+{extra} more)" if extra > 0 else "")
 
-        glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        glob_expr = f" --glob {self._escape_shell_literal(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
             f"{self._escape_shell_literal(pattern)} {self._escape_native_tool_arg(path)} "
@@ -3272,7 +3272,7 @@ class ShellFileOperations(FileOperations):
 
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--glob", self._escape_shell_literal(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -3428,7 +3428,7 @@ class ShellFileOperations(FileOperations):
         
         # Add file pattern filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--include", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--include", self._escape_shell_literal(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -3502,7 +3502,7 @@ class ShellFileOperations(FileOperations):
             "-type f",
         ]
         if file_glob:
-            find_parts.extend(["-name", self._escape_shell_arg(file_glob)])
+            find_parts.extend(["-name", self._escape_shell_literal(file_glob)])
         find_parts.extend(["-exec", *grep_parts, "{}", "+"])
         fetch_limit = limit + offset + (200 if context > 0 else 0)
         cmd = (

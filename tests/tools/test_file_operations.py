@@ -992,3 +992,54 @@ class TestSearchPatternIsNotAPath:
         rg_cmds = [c for c in commands if "rg " in c]
         assert any("'C:/Users/alice/project'" in c for c in rg_cmds), rg_cmds
         assert all("/c/Users" not in c for c in rg_cmds), rg_cmds
+
+    @pytest.mark.parametrize(
+        "file_glob",
+        [r"src\*.py", r"**/*.{ts,tsx}", r"tests\**\test_*.py", r"a\b*.md"],
+    )
+    def test_rg_glob_filter_keeps_its_backslashes(
+        self, mock_env, monkeypatch, file_glob
+    ):
+        r"""A glob is not a path either: its backslashes are pattern syntax.
+
+        ``--glob src\*.py`` went through the path translator and reached rg as
+        ``src/*.py``, which selects a different set of files — and a ``\**\``
+        glob matches nothing at all once its separators are rewritten.
+        """
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = self._capture(mock_env)
+        ops = self._ops(mock_env)
+        ops._search_with_rg("needle", r"C:\repo", file_glob, 50, 0, "content", 0)
+        rg_cmds = [c for c in commands if "rg " in c]
+        assert rg_cmds, f"no rg command captured in: {commands}"
+        assert any(file_glob in c for c in rg_cmds), rg_cmds
+
+    @pytest.mark.parametrize("file_glob", [r"src\*.py", r"tests\**\test_*.py"])
+    def test_grep_include_filter_keeps_its_backslashes(
+        self, mock_env, monkeypatch, file_glob
+    ):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = self._capture(mock_env)
+        ops = self._ops(mock_env)
+        ops._search_with_grep("needle", r"C:\repo", file_glob, 50, 0, "content", 0)
+        grep_cmds = [c for c in commands if "grep " in c]
+        assert grep_cmds, f"no grep command captured in: {commands}"
+        assert any(file_glob in c for c in grep_cmds), grep_cmds
+
+    def test_glob_fix_does_not_touch_the_path_argument(self, mock_env, monkeypatch):
+        """Glob stays literal and the path still gets translated — same command."""
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = self._capture(mock_env)
+        ops = self._ops(mock_env)
+        ops._search_with_rg(
+            "needle", r"C:\Users\alice\project", r"src\*.py", 50, 0, "content", 0
+        )
+        rg_cmds = [c for c in commands if "rg " in c]
+        assert any(r"src\*.py" in c for c in rg_cmds), rg_cmds
+        assert any("'C:/Users/alice/project'" in c for c in rg_cmds), rg_cmds
