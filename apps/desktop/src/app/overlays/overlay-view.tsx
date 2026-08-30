@@ -143,8 +143,17 @@ export function OverlayView({
 
         {/* Sibling of the card, not a child: the card clips its own overflow
             (rounded corners), and the badge deliberately straddles the top
-            border — half above, half below. */}
-        {edgeBadge && <div className="absolute left-1/2 top-0 z-20 -translate-x-1/2 -translate-y-1/2">{edgeBadge}</div>}
+            border — half above, half below. Must stay opaque under Glass so the
+            card's top border does not bleed through the straddling badge.
+            Contract: `[data-glass-opaque]` in styles.css. */}
+        {edgeBadge && (
+          <div
+            className="absolute left-1/2 top-0 z-20 -translate-x-1/2 -translate-y-1/2"
+            data-glass-opaque=""
+          >
+            {edgeBadge}
+          </div>
+        )}
       </div>
     </div>
   )
