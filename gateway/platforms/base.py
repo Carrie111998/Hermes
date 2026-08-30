@@ -3012,6 +3012,52 @@ def _strip_media_directives(text: str) -> str:
     return _strip_media_tag_directives(text)
 
 
+# Typographic Unicode that survives messaging rendering and copy-paste but
+# breaks shell parsing: curly quotes, dash lookalikes, invisible space
+# variants, and ellipsis. LLM prose (and Apple/Google smart punctuation)
+# emits these; a command copied from a phone bubble then fails in a terminal
+# with "command not found" or syntax errors even though the text "looks
+# right". Outbound text is forced to ASCII equivalents so copied commands
+# run unchanged.
+_TYPOGRAPHIC_TO_ASCII = str.maketrans({
+    "\u2018": "'",  # ‘ LEFT SINGLE QUOTATION MARK
+    "\u2019": "'",  # ’ RIGHT SINGLE QUOTATION MARK
+    "\u201a": "'",  # ‚ SINGLE LOW-9 QUOTATION MARK
+    "\u201b": "'",  # ‛ SINGLE HIGH-REVERSED-9 QUOTATION MARK
+    "\u201c": '"',  # “ LEFT DOUBLE QUOTATION MARK
+    "\u201d": '"',  # ” RIGHT DOUBLE QUOTATION MARK
+    "\u201e": '"',  # „ DOUBLE LOW-9 QUOTATION MARK
+    "\u201f": '"',  # ‟ DOUBLE HIGH-REVERSED-9 QUOTATION MARK
+    "\u2010": "-",  # ‐ HYPHEN
+    "\u2011": "-",  # ‑ NON-BREAKING HYPHEN
+    "\u2012": "-",  # ‒ FIGURE DASH
+    "\u2013": "-",  # – EN DASH
+    "\u2014": "-",  # — EM DASH
+    "\u2015": "-",  # ― HORIZONTAL BAR
+    "\u2212": "-",  # − MINUS SIGN
+    "\u00a0": " ",  # NO-BREAK SPACE
+    "\u202f": " ",  # NARROW NO-BREAK SPACE
+    "\u2009": " ",  # THIN SPACE
+    "\u2026": "...",  # … HORIZONTAL ELLIPSIS
+})
+_TYPOGRAPHIC_DROP = frozenset("\u200b\u200c\u200d\u2060\ufeff")  # zero-width / BOM
+
+
+def sanitize_outbound_typography(text: str) -> str:
+    """Replace typographic Unicode with ASCII equivalents.
+
+    Curly quotes become straight quotes, en/em dashes become a single hyphen
+    (matching ``iconv -t ASCII//TRANSLIT`` so behaviour is predictable),
+    non-breaking/thin spaces become ordinary spaces, ellipsis becomes
+    ``...``, and zero-width characters are dropped entirely. Everything else
+    — CJK, emoji, real non-ASCII filenames — is left untouched.
+    """
+    text = text.translate(_TYPOGRAPHIC_TO_ASCII)
+    if _TYPOGRAPHIC_DROP.intersection(text):
+        text = "".join(ch for ch in text if ch not in _TYPOGRAPHIC_DROP)
+    return text
+
+
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.

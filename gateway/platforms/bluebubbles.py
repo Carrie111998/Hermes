@@ -31,6 +31,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_document_from_bytes,
+    sanitize_outbound_typography,
 )
 from .media_cache import ext_for_mime
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
@@ -541,7 +542,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        text = self.format_message(content)
+        text = sanitize_outbound_typography(self.format_message(content))
         if not text:
             return SendResult(success=False, error="BlueBubbles send requires text")
         # Split on paragraph breaks first (double newlines) so each thought

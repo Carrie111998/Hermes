@@ -41,6 +41,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_url,
+    sanitize_outbound_typography,
     utf16_len,
 )
 from gateway.platforms.helpers import redact_phone
@@ -1172,6 +1173,7 @@ class SignalAdapter(BasePlatformAdapter):
         await self._stop_typing_indicator(chat_id)
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        content = sanitize_outbound_typography(content)
 
         base_params: Dict[str, Any] = {"account": self.account}
         if chat_id.startswith("group:"):
