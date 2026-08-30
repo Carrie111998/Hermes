@@ -157,13 +157,24 @@ export function useDesktopIntegrations({
     // non-overlay route (a page like /skills, or a session route) per profile.
     // Session-shaped routes require an explicit matching owner; unresolved and
     // wrong-profile rows must not replace known-safe navigation.
-    if (routedSessionId && sessionBelongsToProfile(sessions, routedSessionId, activeProfile)) {
+    // The resume-exhausted session must not be written back into remembered
+    // navigation: the cleanup effect above drops it once, but this
+    // persistence effect re-runs on every session-list refresh while its
+    // deps are unchanged — without the barrier the dead id outlives every
+    // restart and the window boots into the resume-error screen each time.
+    const exhausted = routedSessionId !== null && routedSessionId === resumeExhaustedSessionId
+
+    if (
+      routedSessionId &&
+      !exhausted &&
+      sessionBelongsToProfile(sessions, routedSessionId, activeProfile)
+    ) {
       setRememberedSessionId(routedSessionId, activeProfile)
       setRememberedRoute(locationPathname, activeProfile)
     } else if (!routedSessionId && !isOverlayView(appViewForPath(locationPathname))) {
       setRememberedRoute(locationPathname, activeProfile)
     }
-  }, [activeProfile, locationPathname, navigate, profileReady, routedSessionId, sessions])
+  }, [activeProfile, locationPathname, navigate, profileReady, resumeExhaustedSessionId, routedSessionId, sessions])
 
   useEffect(() => {
     if (!profileReady || !resumeExhaustedSessionId) {
