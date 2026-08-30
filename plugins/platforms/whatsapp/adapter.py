@@ -488,10 +488,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
 
-    @property
-    def is_connected(self) -> bool:
-        """Require bridge health, not merely a running local HTTP process."""
-        return self._running and bool(getattr(self, "_bridge_health_connected", False))
+    def notify_deferred_questions_connected(self) -> None:
+        """Publish deferred readiness only when WhatsApp itself is usable."""
+        if getattr(self, "_bridge_health_connected", False):
+            super().notify_deferred_questions_connected()
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -997,6 +997,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             sent_message_ids.append(str(last_message_id))
                     else:
                         error = await resp.text()
+                        if resp.status == 503:
+                            self._publish_bridge_health(False)
                         return SendResult(
                             success=False,
                             error=error,

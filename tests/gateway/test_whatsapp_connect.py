@@ -101,7 +101,7 @@ async def test_health_reconnect_publishes_deferred_readiness() -> None:
     session.get.return_value = _AsyncCM(response)
     adapter._http_session = session
 
-    assert not adapter.is_connected
+    assert adapter.is_connected
     assert not await adapter._refresh_bridge_health()
     adapter.notify_deferred_questions_connected.assert_not_called()
 
@@ -112,12 +112,31 @@ async def test_health_reconnect_publishes_deferred_readiness() -> None:
     adapter.notify_deferred_questions_disconnected.assert_not_called()
 
 
+def test_deferred_readiness_requires_connected_bridge_health() -> None:
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    adapter = WhatsAppAdapter(PlatformConfig(enabled=True))
+    adapter._running = True
+    adapter._set_deferred_transport_ready = MagicMock()
+
+    adapter._bridge_health_connected = False
+    adapter.notify_deferred_questions_connected()
+    adapter._set_deferred_transport_ready.assert_not_called()
+
+    adapter._bridge_health_connected = True
+    adapter.notify_deferred_questions_connected()
+    adapter._set_deferred_transport_ready.assert_called_once_with(True)
+
+
 @pytest.mark.asyncio
 async def test_bridge_503_send_is_retryable() -> None:
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     adapter = WhatsAppAdapter(PlatformConfig(enabled=True))
     adapter._running = True
+    adapter._bridge_health_connected = True
+    adapter.notify_deferred_questions_disconnected = MagicMock()
+    adapter._write_runtime_status_safe = MagicMock()
     adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
     response = MagicMock(status=503)
     response.text = AsyncMock(return_value='{"error":"Not connected to WhatsApp"}')
@@ -129,6 +148,8 @@ async def test_bridge_503_send_is_retryable() -> None:
 
     assert not result.success
     assert result.retryable
+    assert not adapter._bridge_health_connected
+    adapter.notify_deferred_questions_disconnected.assert_called_once_with()
 
 
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):

@@ -647,35 +647,6 @@ async def test_deferred_delivery_restores_slack_workspace_and_thread() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deferred_delivery_stays_on_service_selected_adapter() -> None:
-    from gateway.authz_mixin import GatewayAuthorizationMixin
-    from gateway.session import SessionSource
-
-    primary = _GatewayAdapter()
-    secondary = _GatewayAdapter()
-
-    class Runner(GatewayAuthorizationMixin):
-        pass
-
-    runner = Runner()
-    runner.adapters = {Platform.TELEGRAM: primary}
-    runner._profile_adapters = {"secondary": {Platform.TELEGRAM: secondary}}
-    primary.gateway_runner = runner
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="home",
-        chat_type="dm",
-        profile="secondary",
-        adapter_profile="primary",
-    )
-
-    await primary.deliver_deferred_message(source.to_dict(), "May I send invites?")
-
-    assert primary.sent == [("home", "May I send invites?", None, {"notify": True})]
-    assert secondary.sent == []
-
-
-@pytest.mark.asyncio
 async def test_relay_deferred_delivery_uses_transport_and_restores_routing(
     tmp_path: Path,
 ) -> None:
@@ -909,6 +880,7 @@ async def test_reply_exposed_during_idle_delivery_is_captured(tmp_path: Path) ->
 async def test_profile_owned_adapter_delivers_its_own_questions(tmp_path: Path) -> None:
     import asyncio
 
+    from gateway.authz_mixin import GatewayAuthorizationMixin
     from gateway.deferred_questions import DeferredQuestionResult
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource, build_session_key
@@ -926,6 +898,14 @@ async def test_profile_owned_adapter_delivers_its_own_questions(tmp_path: Path) 
     secondary.set_deferred_question_service(service)
     secondary.set_authorization_check(lambda *_args: True)
     secondary._message_handler = AsyncMock(return_value="ordinary")
+
+    class Runner(GatewayAuthorizationMixin):
+        pass
+
+    runner = Runner()
+    runner.adapters = {Platform.TELEGRAM: secondary}
+    runner._profile_adapters = {"work": {Platform.TELEGRAM: primary}}
+    primary.gateway_runner = runner
     handled = []
 
     async def handle(record, answer):
