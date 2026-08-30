@@ -2260,15 +2260,16 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             result = make_targz(base, tmpdir, "default")
             return Path(result)
 
-    # Named profiles — stage a filtered copy to exclude credentials
+    # Named profiles — stage a filtered copy using the same policy enforced by
+    # archive validation/import.  Runtime state must not make an exported
+    # named profile impossible to round-trip.
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
         shutil.copytree(
             profile_dir,
             staged,
             symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            ignore=lambda d, contents: _PROFILE_ARCHIVE_FORBIDDEN_NAMES & set(contents),
         )
         _stage_extras(staged)
         _scrub_export_secrets(staged)
@@ -2438,17 +2439,17 @@ def import_profile(
     """Import a profile from a tar.gz archive, or return a dry-run plan."""
     import tempfile
 
+    archive = Path(archive_path)
+    if not dry_run and not archive.is_file():
+        raise FileNotFoundError(f"Archive not found: {archive}")
+
     plan = validate_profile_archive(archive_path, name=name)
     if dry_run:
         return plan
     if not plan["valid"]:
         raise ValueError("; ".join(plan["errors"]))
 
-    archive = Path(archive_path)
-    if not archive.exists():
-        raise FileNotFoundError(f"Archive not found: {archive}")
-
-    top_dirs = archive_root_dirs(archive)
+    top_dirs = _inspect_profile_archive_roots(archive)
     archive_root = top_dirs.pop() if len(top_dirs) == 1 else None
     inferred_name = name or archive_root
     if not inferred_name:

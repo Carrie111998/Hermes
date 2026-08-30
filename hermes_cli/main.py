@@ -11420,7 +11420,7 @@ def cmd_profile(args):
         else:
             status = "valid" if result["valid"] else "invalid"
             print(f"Archive: {result['archive']} ({status})")
-            if result["archive_root"]:
+            if result["profile_name"]:
                 print(f"Profile: {result['profile_name']}")
             for error in result["errors"]:
                 print(f"Error: {error}")

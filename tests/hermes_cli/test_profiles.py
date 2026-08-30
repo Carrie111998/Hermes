@@ -835,6 +835,65 @@ class TestExportImport:
         assert result["profile_name"] == "preview"
         assert not (tmp_path / ".hermes" / "profiles" / "preview").exists()
 
+    def test_named_export_excludes_every_forbidden_archive_name(self, profile_env, tmp_path):
+        profile_dir = create_profile("coder", no_alias=True)
+        forbidden = (
+            "auth.json", ".env", "auth.lock", "gateway.pid",
+            "gateway_state.json", "processes.json", "state.db",
+            "state.db-wal", "state.db-shm",
+        )
+        for filename in forbidden:
+            (profile_dir / filename).write_text("runtime or secret")
+        (profile_dir / "config.yaml").write_text("model: test")
+
+        archive = export_profile("coder", str(tmp_path / "coder.tar.gz"))
+
+        with tarfile.open(archive, "r:gz") as tf:
+            names = {Path(member).name for member in tf.getnames()}
+        assert names.isdisjoint(forbidden)
+        assert "config.yaml" in names
+
+    def test_import_missing_archive_raises_file_not_found(self, profile_env, tmp_path):
+        missing = tmp_path / "does-not-exist.tar.gz"
+
+        with pytest.raises(FileNotFoundError, match="Archive not found"):
+            import_profile(str(missing))
+
+    def test_validate_cli_does_not_print_none_profile(self, profile_env, tmp_path, capsys):
+        from hermes_cli.main import cmd_profile
+
+        archive = tmp_path / "invalid.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            info = tarfile.TarInfo("bad.name/config.yaml")
+            data = b"model: test\n"
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+        with pytest.raises(SystemExit):
+            cmd_profile(type("Args", (), {
+                "profile_action": "validate",
+                "archive": str(archive),
+                "json_output": False,
+            })())
+
+        output = capsys.readouterr().out
+        assert "Profile: None" not in output
+        assert "invalid archive profile name" in output
+
+    def test_dashboard_missing_archive_is_not_a_bad_request(self, profile_env, tmp_path):
+        import asyncio
+        from fastapi import HTTPException
+        from hermes_cli.web_models import ProfileImport
+        from hermes_cli.web_routers.profiles import import_profile_endpoint
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(import_profile_endpoint(ProfileImport(
+                archive=str(tmp_path / "missing.tar.gz"),
+            )))
+
+        assert exc_info.value.status_code == 404
+        assert "Archive not found" in str(exc_info.value.detail)
+
     # ---------------------------------------------------------------
 
     # ---------------------------------------------------------------
