@@ -115,3 +115,83 @@ def test_codex_no_start_completion_callback_sanitizes_name_args_and_result():
     assert "redacted" in repr(call).lower()
     progress = agent.tool_progress_callback.call_args
     assert MARKER not in repr(progress)
+
+
+def _assistant_tool_call_with_marker():
+    arguments = json.dumps(
+        {
+            "ordinary": MARKER,
+            "nested": {"items": [MARKER]},
+            "url": f"https://example.test/callback?state={MARKER}",
+        }
+    )
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"function": {"name": "demo", "arguments": arguments}}],
+    }
+
+
+def test_malformed_trajectory_arguments_never_reach_logs(caplog):
+    """Malformed argument diagnostics must not log attacker-controlled bytes."""
+    agent = SimpleNamespace(_format_tools_for_system_message=lambda: "")
+    malformed = (
+        '{"ordinary":"%s","nested":{"value":"%s"},'
+        '"url":"https://example.test/callback?state=%s"'
+    ) % (MARKER, MARKER, MARKER)
+    messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "demo", "arguments": malformed}}
+            ],
+        },
+    ]
+
+    with caplog.at_level("WARNING"):
+        trajectory = convert_to_trajectory_format(agent, messages, "hello", True)
+
+    assert MARKER not in caplog.text
+    assert MARKER not in json.dumps(trajectory)
+
+
+def test_trajectory_assistant_tool_call_arguments_are_sanitized_before_write(tmp_path):
+    """Assistant arguments must be projected before trajectory JSONL output."""
+    agent = SimpleNamespace(_format_tools_for_system_message=lambda: "")
+    trajectory = convert_to_trajectory_format(
+        agent,
+        [{"role": "user", "content": "hello"}, _assistant_tool_call_with_marker()],
+        "hello",
+        True,
+    )
+    output = tmp_path / "assistant-args-trajectory.jsonl"
+    save_trajectory(trajectory, "test-model", True, str(output))
+
+    assert MARKER.encode() not in output.read_bytes()
+
+
+def test_session_snapshot_assistant_tool_call_arguments_are_sanitized(tmp_path):
+    """Assistant arguments must be projected before session JSON snapshot output."""
+    agent = AIAgent.__new__(AIAgent)
+    agent._session_json_enabled = True
+    agent.logs_dir = tmp_path
+    agent.session_id = "r3-assistant-args"
+    agent.model = "test-model"
+    agent.base_url = "https://example.test/v1"
+    agent.platform = "test"
+    agent.session_start = datetime.now()
+    agent._cached_system_prompt = ""
+    agent.tools = []
+    agent.verbose_logging = False
+
+    agent._save_session_log(
+        [
+            {"role": "user", "content": "hello"},
+            _assistant_tool_call_with_marker(),
+        ]
+    )
+
+    snapshot = (tmp_path / "session_r3-assistant-args.json").read_bytes()
+    assert MARKER.encode() not in snapshot
