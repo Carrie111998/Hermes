@@ -4,9 +4,9 @@ import json
 import sqlite3
 import pytest
 import time
-from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
+from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor import (
     ContextCompressor,
     HISTORICAL_TASK_HEADING,
@@ -24,60 +24,6 @@ class StubProviderError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.response = response
-
-
-def test_lean_chunk_digests_stop_after_host_cancellation(compressor, monkeypatch):
-    """A cancelled total-deadline candidate must not dispatch another digest."""
-    import agent.context_compressor as context_compressor_module
-
-    cancelled = False
-    calls = 0
-
-    def fake_call_llm(**_kwargs):
-        nonlocal cancelled, calls
-        calls += 1
-        cancelled = True
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="digest"))]
-        )
-
-    monkeypatch.setattr(context_compressor_module, "_LEAN_DIGEST_CHUNK_CHARS", 20)
-    monkeypatch.setattr(context_compressor_module, "_LEAN_DIGEST_MAX_CHUNKS", 8)
-    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
-    compressor._compression_cancelled_check = lambda: cancelled
-
-    result = compressor._build_chunk_digests(
-        [{"role": "tool", "content": "x" * 200, "tool_call_id": "call-1"}]
-    )
-
-    assert calls == 1
-    assert "Segment 2/" not in result
-
-
-def test_lean_chunk_digests_do_not_start_after_deadline(compressor, monkeypatch):
-    """The shared compaction deadline is checked before the first digest."""
-    import agent.context_compressor as context_compressor_module
-    from agent.conversation_compression import CompressionCommitFence
-
-    calls = 0
-
-    def fake_call_llm(**_kwargs):
-        nonlocal calls
-        calls += 1
-        raise AssertionError("digest request started after total deadline")
-
-    fence = CompressionCommitFence(total_ceiling_seconds=1.0)
-    compressor._compression_cancelled_check = lambda: fence.is_cancelled
-    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
-
-    with patch(
-        "agent.conversation_compression.time.monotonic",
-        return_value=time.monotonic() + 2.0,
-    ):
-        assert compressor._build_chunk_digests(
-            [{"role": "user", "content": "late digest"}]
-        ) == ""
-    assert calls == 0
 
 
 @pytest.fixture()
@@ -697,6 +643,47 @@ class TestGenerateSummaryNoneContent:
             summary = c._generate_summary(messages)
         assert isinstance(summary, str)
         assert summary.startswith(SUMMARY_PREFIX)
+
+
+class TestGenerateSummaryTotalDeadline:
+    def test_expired_deadline_prevents_single_auxiliary_request(self, compressor):
+        compressor._compression_cancelled_check = lambda: True
+
+        with (
+            patch("agent.context_compressor.call_llm") as call_llm,
+            pytest.raises(AuxiliaryExplicitCancellation),
+        ):
+            compressor._generate_summary(
+                [{"role": "user", "content": "do not dispatch this request"}]
+            )
+
+        call_llm.assert_not_called()
+
+    def test_deadline_winning_during_request_discards_response(self, compressor):
+        cancelled = False
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "late summary"
+
+        def complete_after_deadline(**_kwargs):
+            nonlocal cancelled
+            cancelled = True
+            return response
+
+        compressor._compression_cancelled_check = lambda: cancelled
+
+        with (
+            patch(
+                "agent.context_compressor.call_llm",
+                side_effect=complete_after_deadline,
+            ) as call_llm,
+            pytest.raises(AuxiliaryExplicitCancellation),
+        ):
+            compressor._generate_summary(
+                [{"role": "user", "content": "discard the late result"}]
+            )
+
+        call_llm.assert_called_once()
 
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
