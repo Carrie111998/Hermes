@@ -15,6 +15,44 @@ export interface PendingClarifyResumeState {
   request: ClarifyRequest | null
 }
 
+export function pendingClarifyRequestFromSnapshot(
+  response: Pick<SessionResumeResponse, 'pending_clarify'>,
+  sessionId: string
+): ClarifyRequest | null {
+  const pending = response.pending_clarify
+
+  if (!pending || typeof pending.request_id !== 'string') {
+    return null
+  }
+
+  const questions = normalizeQuestions(pending.questions)
+  const question = typeof pending.question === 'string' ? pending.question : ''
+
+  if (!question && questions.length === 0) {
+    return null
+  }
+
+  const choices = normalizeChoices(pending.choices)
+
+  const lockedAnswers =
+    typeof pending.answers === 'object' && pending.answers !== null
+      ? Object.fromEntries(
+          Object.entries(pending.answers).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+        )
+      : undefined
+
+  return {
+    choices: choices.length > 0 ? choices : null,
+    lockedAnswers,
+    multiSelect: pending.multi_select === true,
+    question,
+    receivedAt: Date.now() / 1000,
+    requestId: pending.request_id,
+    sessionId,
+    ...(questions.length > 0 ? { questions } : {})
+  }
+}
+
 /**
  * Restore a pending clarify from a resume/activate snapshot onto `sessionId`.
  *
@@ -33,8 +71,13 @@ export function restorePendingClarifyFromSnapshot(
   response: Pick<SessionResumeResponse, 'pending_clarify'>,
   sessionId: string,
   resumeStartedAt: number,
-  requestIdAtStart?: string
+  requestIdAtStart?: string | null,
+  preserveCurrentClarifyRequest = false
 ): PendingClarifyResumeState {
+  if (preserveCurrentClarifyRequest) {
+    return { authoritativeAbsent: false, cleared: null, request: null }
+  }
+
   const pending = response.pending_clarify
 
   if (!pending || typeof pending.request_id !== 'string') {
@@ -53,31 +96,10 @@ export function restorePendingClarifyFromSnapshot(
     return { authoritativeAbsent: true, cleared: null, request: null }
   }
 
-  const questions = normalizeQuestions(pending.questions)
-  const question = typeof pending.question === 'string' ? pending.question : ''
+  const request = pendingClarifyRequestFromSnapshot(response, sessionId)
 
-  if (!question && questions.length === 0) {
+  if (!request) {
     return { authoritativeAbsent: false, cleared: null, request: null }
-  }
-
-  const choices = normalizeChoices(pending.choices)
-
-  const lockedAnswers =
-    typeof pending.answers === 'object' && pending.answers !== null
-      ? Object.fromEntries(
-          Object.entries(pending.answers).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
-        )
-      : undefined
-
-  const request: ClarifyRequest = {
-    choices: choices.length > 0 ? choices : null,
-    lockedAnswers,
-    multiSelect: pending.multi_select === true,
-    question,
-    receivedAt: Date.now() / 1000,
-    requestId: pending.request_id,
-    sessionId,
-    ...(questions.length > 0 ? { questions } : {})
   }
 
   setClarifyRequest(request)

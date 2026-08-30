@@ -103,6 +103,37 @@ describe('restorePendingClarifyFromSnapshot', () => {
     )
   })
 
+  it('preserves the current request when activation was superseded', () => {
+    $clarifyRequests.set({
+      'sess-current': {
+        choices: ['new'],
+        multiSelect: false,
+        question: 'New question?',
+        requestId: 'new-rid',
+        sessionId: 'sess-current'
+      }
+    })
+
+    const state = restorePendingClarifyFromSnapshot(
+      {
+        pending_clarify: {
+          choices: ['old'],
+          question: 'Old question?',
+          request_id: 'old-rid'
+        }
+      },
+      'sess-current',
+      resumeStartedAt,
+      null,
+      true
+    )
+
+    expect(state).toEqual({ authoritativeAbsent: false, cleared: null, request: null })
+    expect(setClarifyRequestMock).not.toHaveBeenCalled()
+    expect(clearClarifyRequestMock).not.toHaveBeenCalled()
+    expect($clarifyRequests.get()['sess-current']?.requestId).toBe('new-rid')
+  })
+
   it('rejects a payload with neither form (no request restored)', () => {
     const state = restorePendingClarifyFromSnapshot(
       { pending_clarify: { request_id: 'rid4' } },
