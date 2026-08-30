@@ -4015,6 +4015,11 @@ _GITHUB_ACTIONS_MUTATION_ENDPOINT = re.compile(
     re.IGNORECASE,
 )
 
+_GITHUB_PULL_REQUEST_CREATION_ENDPOINT = re.compile(
+    r"(?:^|/)repos/[^/]+/[^/]+/pulls(?:$|[/?#])",
+    re.IGNORECASE,
+)
+
 
 def _kanban_github_actions_mutation(command: str) -> bool:
     """Detect GitHub Actions mutations forbidden to autonomous Kanban workers.
@@ -4051,6 +4056,51 @@ def _kanban_github_actions_mutation(command: str) -> bool:
     return False
 
 
+def _kanban_pull_request_creation(command: str) -> bool:
+    """Detect pull-request creation attempts by autonomous Kanban workers.
+
+    A worker may create a pull request only through the governed publication
+    path, which validates a fresh exact-head local-CI receipt before writing to
+    GitHub.  Raw ``gh`` and ``curl`` creation routes are denied before any
+    container or yolo bypass can grant them authority.
+    """
+
+    if not os.environ.get("HERMES_KANBAN_TASK", "").strip():
+        return False
+    for variant in _command_detection_variants(command):
+        for segment in _iter_top_level_shell_segments(variant):
+            for start, _, word in _iter_shell_command_word_spans(segment):
+                executable = os.path.basename(
+                    _deobfuscate_shell_word_for_detection(word)
+                ).casefold()
+                if executable not in {"gh", "curl"}:
+                    continue
+                tokens = _shell_segment_tokens(segment, start)
+                if not tokens:
+                    continue
+                lowered = [token.casefold() for token in tokens[1:]]
+                if executable == "gh" and ("pr", "create") in set(zip(lowered, lowered[1:])):
+                    return True
+                if not any(
+                    _GITHUB_PULL_REQUEST_CREATION_ENDPOINT.search(token)
+                    for token in lowered
+                ):
+                    continue
+                if any(token in {"post", "-xpost", "--request=post"} for token in lowered):
+                    return True
+                if any(token in {"-x", "--request"} for token in lowered):
+                    for index, token in enumerate(lowered[:-1]):
+                        if token in {"-x", "--request"} and lowered[index + 1] == "post":
+                            return True
+                if executable == "gh" and any(
+                    token in {"-f", "--raw-field", "--field", "-fhead", "-fbase"}
+                    or token.startswith("-f")
+                    for token in lowered
+                ):
+                    return True
+    return False
+
+
 def _kanban_github_actions_block_result() -> dict:
     return {
         "approved": False,
@@ -4060,6 +4110,18 @@ def _kanban_github_actions_block_result() -> dict:
             "start, rerun, or cancel hosted CI. This consumes operator-owned "
             "Actions budget and requires an explicit operator action outside "
             "the worker."
+        ),
+    }
+
+
+def _kanban_pull_request_creation_block_result() -> dict:
+    return {
+        "approved": False,
+        "kanban_policy": "pull_request_creation_requires_exact_head_ci_receipt",
+        "message": (
+            "BLOCKED: Autonomous workers may not create pull requests through raw GitHub "
+            "commands. Run the governed pre-publication local-CI audit for the exact branch "
+            "head, then use the receipt-bound publication path."
         ),
     }
 
@@ -4099,6 +4161,9 @@ def check_dangerous_command(command: str, env_type: str,
     if _kanban_github_actions_mutation(command):
         logger.warning("Kanban GitHub Actions mutation blocked: %s", command[:200])
         return _kanban_github_actions_block_result()
+    if _kanban_pull_request_creation(command):
+        logger.warning("Kanban pull-request creation blocked: %s", command[:200])
+        return _kanban_pull_request_creation_block_result()
 
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
@@ -4740,6 +4805,9 @@ def check_all_command_guards(command: str, env_type: str,
     if _kanban_github_actions_mutation(command):
         logger.warning("Kanban GitHub Actions mutation blocked: %s", command[:200])
         return _kanban_github_actions_block_result()
+    if _kanban_pull_request_creation(command):
+        logger.warning("Kanban pull-request creation blocked: %s", command[:200])
+        return _kanban_pull_request_creation_block_result()
 
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
