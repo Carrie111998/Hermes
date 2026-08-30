@@ -5855,6 +5855,7 @@ class TurnRunner:
             self._runner._apply_fallback_chain_to_agent(
                 agent, self._runner._refresh_fallback_model(),
             )
+            agent._gateway_conversation_epoch = getattr(ctx, "conversation_epoch", 1) or 1
 
         # Lock released — now schedule cleanup of any cross-process-evicted
         # agent on a daemon thread so memory-provider shutdown / socket
@@ -5908,6 +5909,7 @@ class TurnRunner:
                 chat_type=ctx.source.chat_type,
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
+                gateway_conversation_epoch=getattr(ctx, "conversation_epoch", 1) or 1,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
@@ -29547,6 +29549,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        _session_epoch = 1
+        if session_key and getattr(self, "session_store", None) is not None:
+            _get_epoch = getattr(self.session_store, "get_conversation_epoch", None)
+            if callable(_get_epoch):
+                _session_epoch = _get_epoch(session_key)
+            else:
+                _entry = getattr(self.session_store, "_entries", {}).get(session_key)
+                if _entry is not None:
+                    _session_epoch = getattr(_entry, "conversation_epoch", 1) or 1
+
         turn_ctx = TurnContext(
             source=source,
             _run_still_current=_run_still_current,
@@ -29584,6 +29596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel_prompt=channel_prompt,
             session_id=session_id,
             session_key=session_key,
+            conversation_epoch=_session_epoch,
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,

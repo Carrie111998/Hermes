@@ -831,6 +831,12 @@ class SessionEntry:
     # context-note prepend — both wrong for an explicit manual reset.
     # See issue #6508.
     is_fresh_reset: bool = False
+
+    # Conversation generation / epoch for prompt cache affinity scoping.
+    # Incremented on reset_session() (/new) and on auto-resets so declared
+    # conversation scopes rotate on /new while staying stable across
+    # per-response sessions (#96811).
+    conversation_epoch: int = 1
     
     # Set by the background expiry watcher after it finalizes an expired
     # session (invoking on_session_finalize hooks and evicting the cached
@@ -905,6 +911,7 @@ class SessionEntry:
                 else None
             ),
             "is_fresh_reset": self.is_fresh_reset,
+            "conversation_epoch": self.conversation_epoch,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
@@ -998,6 +1005,7 @@ class SessionEntry:
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
+            conversation_epoch=int(data.get("conversation_epoch", 1) or 1),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
@@ -2502,6 +2510,15 @@ class SessionStore:
             return False
         return bool(row is not None and row.get("end_reason") is not None)
 
+    def get_conversation_epoch(self, session_key: str) -> int:
+        """Return the conversation generation for *session_key* (defaults to 1)."""
+        if not session_key:
+            return 1
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            return (getattr(entry, "conversation_epoch", 1) or 1) if entry is not None else 1
+
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
         """
         Check if a session should be reset based on policy.
@@ -2804,6 +2821,7 @@ class SessionStore:
         auto_reset_reason = None
         reset_had_activity = False
         prev_session_id: Optional[str] = None
+        auto_reset_epoch: Optional[int] = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -2842,6 +2860,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        auto_reset_epoch = (getattr(entry, "conversation_epoch", 1) or 1) + 1
                     entry = None
                     _needs_recover = True
                 elif entry.session_id != _stale_session_id:
@@ -2860,6 +2879,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        auto_reset_epoch = (getattr(entry, "conversation_epoch", 1) or 1) + 1
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2889,6 +2909,7 @@ class SessionStore:
                     reset_had_activity = recovered.reset_had_activity
                     db_end_session_id = recovered.session_id
                     prev_session_id = recovered.session_id
+                    auto_reset_epoch = (getattr(recovered, "conversation_epoch", 1) or 1) + 1
                 else:
                     try:
                         self._db.reopen_session(recovered.session_id)
@@ -2923,6 +2944,7 @@ class SessionStore:
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
                 prev_session_id=prev_session_id,
+                conversation_epoch=auto_reset_epoch if was_auto_reset and auto_reset_epoch is not None else 1,
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -3444,6 +3466,7 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                conversation_epoch=getattr(old_entry, "conversation_epoch", 1) + 1,
             )
 
             self._entries[session_key] = new_entry

@@ -83,6 +83,7 @@ class TurnContext:
     channel_prompt: Optional[str] = None
     session_id: Optional[str] = None
     session_key: Optional[str] = None
+    conversation_epoch: int = 1
     run_generation: Optional[int] = None
     process_task_id: str = ""
     process_baseline: frozenset[str] = field(default_factory=frozenset)

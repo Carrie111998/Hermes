@@ -53,11 +53,12 @@ def db(tmp_path):
         session_db.close()
 
 
-def _agent(session_id, session_db=None, key=None):
+def _agent(session_id, session_db=None, key=None, epoch=1):
     return SimpleNamespace(
         session_id=session_id,
         _session_db=session_db,
         _gateway_session_key=key,
+        _gateway_conversation_epoch=epoch,
     )
 
 
@@ -98,6 +99,37 @@ class TestDeclaredConversationScope:
         assert resolve_prompt_cache_scope(
             _agent(RUN_1, db, CHAT_KEY)
         ) != resolve_prompt_cache_scope(other)
+
+    def test_scope_rotates_on_epoch_advance_or_new(self, db):
+        """Epoch advance (/new or auto-reset) rotates the declared gwk_ scope."""
+        db.create_session(RUN_1, source="api_server")
+        scope_ep1 = resolve_prompt_cache_scope(_agent(RUN_1, db, CHAT_KEY, epoch=1))
+        scope_ep2 = resolve_prompt_cache_scope(_agent(RUN_1, db, CHAT_KEY, epoch=2))
+        scope_ep3 = resolve_prompt_cache_scope(_agent(RUN_1, db, CHAT_KEY, epoch=3))
+
+        assert scope_ep1.startswith("gwk_")
+        assert scope_ep2.startswith("gwk_")
+        assert scope_ep3.startswith("gwk_")
+        assert scope_ep1 != scope_ep2
+        assert scope_ep2 != scope_ep3
+        assert scope_ep1 != scope_ep3
+
+    def test_memo_invalidated_on_epoch_change(self, db):
+        """When an agent's epoch changes, the memoized scope re-resolves to the new epoch."""
+        db.create_session(RUN_1, source="api_server")
+        agent = _agent(RUN_1, db, CHAT_KEY, epoch=1)
+
+        # First resolution memoizes epoch=1 scope
+        scope_1 = resolve_prompt_cache_scope(agent)
+        assert scope_1.startswith("gwk_")
+        # Second call hits memo
+        assert resolve_prompt_cache_scope(agent) == scope_1
+
+        # Advance epoch on the same agent instance
+        agent._gateway_conversation_epoch = 2
+        scope_2 = resolve_prompt_cache_scope(agent)
+        assert scope_2.startswith("gwk_")
+        assert scope_2 != scope_1
 
     def test_scope_never_carries_the_raw_key(self, db):
         """The scope leaves the process verbatim (sticky id, x-grok-conv-id).
@@ -363,3 +395,203 @@ class TestProviderStickyKeys:
             reset_affinity_scope(token)
 
         assert body["session_id"] == body_next["session_id"] == scope
+
+    def test_nested_child_turn_shadows_parent_affinity_scope(self):
+        """A nested child turn shadows parent affinity scope to None and restores parent scope on exit."""
+        from providers import get_provider_profile
+
+        parent_scope = "gwk_parent_1111111111111111"
+        token_parent = set_affinity_scope(parent_scope)
+        try:
+            assert get_affinity_scope() == parent_scope
+
+            # Nested turn (e.g. fork child or delegate with no declared key)
+            token_child = set_affinity_scope(None)
+            try:
+                assert get_affinity_scope() is None
+                profile = get_provider_profile("openrouter")
+                body = profile.build_extra_body(session_id="child-sess-42")
+                # Fallback to physical session_id works because get_affinity_scope() is None
+                assert body.get("session_id") == "child-sess-42"
+            finally:
+                reset_affinity_scope(token_child)
+
+            # When child finishes, parent context is fully restored
+            assert get_affinity_scope() == parent_scope
+        finally:
+            reset_affinity_scope(token_parent)
+
+        assert get_affinity_scope() is None
+
+    def test_agent_run_turn_shadows_parent_affinity_scope_live(self, tmp_path):
+        """Live AIAgent.run_turn shadows parent affinity scope to None during child turns."""
+        from unittest.mock import patch
+        from run_agent import AIAgent
+
+        db_path = tmp_path / "live_turn_test.db"
+        db = SessionDB(db_path)
+        db.create_session("parent-sess", source="telegram")
+        db.create_session(
+            "child-fork",
+            source="telegram",
+            parent_session_id="parent-sess",
+            model_config={"_branched_from": "parent-sess"},
+        )
+
+        with patch("run_agent.get_tool_definitions", return_value=[]), \
+             patch("run_agent.check_toolset_requirements", return_value={}), \
+             patch("run_agent.OpenAI"):
+
+            parent_agent = AIAgent(
+                session_id="parent-sess",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                provider="openrouter",
+                gateway_session_key=CHAT_KEY,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            parent_agent._session_db = db
+
+            child_agent = AIAgent(
+                session_id="child-fork",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                provider="openrouter",
+                gateway_session_key=CHAT_KEY,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            child_agent._session_db = db
+
+            child_observed_scope = "UNSET"
+            parent_inside_turn_scope = "UNSET"
+
+            def fake_child_run_conv(*args, **kwargs):
+                nonlocal child_observed_scope
+                child_observed_scope = get_affinity_scope()
+                return "child-done"
+
+            def fake_parent_run_conv(*args, **kwargs):
+                nonlocal parent_inside_turn_scope
+                parent_inside_turn_scope = get_affinity_scope()
+                # Nested child turn runs inside parent turn
+                with patch("agent.conversation_loop.run_conversation", side_effect=fake_child_run_conv):
+                    child_agent.run_conversation("child prompt")
+                # Parent scope should still be intact after child returns
+                assert get_affinity_scope() == parent_inside_turn_scope
+                return "parent-done"
+
+            assert get_affinity_scope() is None
+            with patch("agent.conversation_loop.run_conversation", side_effect=fake_parent_run_conv):
+                parent_agent.run_conversation("parent prompt")
+
+            assert parent_inside_turn_scope.startswith("gwk_")
+            assert child_observed_scope is None
+            assert get_affinity_scope() is None
+
+
+class TestGatewaySessionStoreResetEpoch:
+    """SessionStore advances conversation_epoch on reset_session (/new) and auto-resets."""
+
+    def test_session_store_reset_advances_epoch(self, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import Platform, SessionSource, SessionStore
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+        entry_1 = store.get_or_create_session(source)
+        assert entry_1.conversation_epoch == 1
+
+        entry_2 = store.reset_session(entry_1.session_key)
+        assert entry_2 is not None
+        assert entry_2.session_id != entry_1.session_id
+        assert entry_2.conversation_epoch == 2
+
+    def test_turn_context_and_agent_epoch_propagation(self):
+        from gateway.turn_context import TurnContext
+
+        ctx = TurnContext(
+            session_id="sess-1",
+            session_key="agent:main:telegram:dm:12345",
+            conversation_epoch=3,
+        )
+        assert ctx.conversation_epoch == 3
+
+    def test_auto_reset_advances_epoch_and_gwk_scope(self, tmp_path):
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.session import Platform, SessionSource, SessionStore
+        from agent.prompt_cache_scope import declared_conversation_scope
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-auto-1", chat_type="dm")
+        entry_1 = store.get_or_create_session(source)
+        assert entry_1.conversation_epoch == 1
+        assert store.get_conversation_epoch(entry_1.session_key) == 1
+
+        agent_1 = _agent(entry_1.session_id, None, entry_1.session_key, epoch=1)
+        scope_1 = declared_conversation_scope(agent_1)
+
+        # Trigger auto-reset by forcing _should_reset to return "idle"
+        with patch.object(store, "_should_reset", return_value="idle"):
+            entry_2 = store.get_or_create_session(source)
+
+        assert entry_2.session_id != entry_1.session_id
+        assert entry_2.was_auto_reset is True
+        assert entry_2.auto_reset_reason == "idle"
+        assert entry_2.conversation_epoch == 2
+        assert store.get_conversation_epoch(entry_2.session_key) == 2
+
+        agent_2 = _agent(entry_2.session_id, None, entry_2.session_key, epoch=2)
+        scope_2 = declared_conversation_scope(agent_2)
+
+        assert scope_1.startswith("gwk_")
+        assert scope_2.startswith("gwk_")
+        assert scope_1 != scope_2
+
+    def test_mixed_new_and_auto_reset_never_rolls_back_epoch_aba(self, tmp_path):
+        from unittest.mock import patch
+        from gateway.config import GatewayConfig
+        from gateway.session import Platform, SessionSource, SessionStore
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-aba-1", chat_type="dm")
+        
+        # Epoch 1: initial session
+        entry_1 = store.get_or_create_session(source)
+        assert entry_1.conversation_epoch == 1
+
+        # Epoch 2: explicit /new
+        entry_2 = store.reset_session(entry_1.session_key)
+        assert entry_2.conversation_epoch == 2
+
+        # Epoch 3: policy auto-reset (must be 3, NEVER rolling back to 1)
+        with patch.object(store, "_should_reset", return_value="daily"):
+            entry_3 = store.get_or_create_session(source)
+
+        assert entry_3.was_auto_reset is True
+        assert entry_3.conversation_epoch == 3
+        assert store.get_conversation_epoch(entry_3.session_key) == 3
+
+    def test_persistence_and_reload_preserves_epoch_before_reset(self, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import Platform, SessionSource, SessionStore
+
+        config = GatewayConfig()
+        store_1 = SessionStore(sessions_dir=tmp_path, config=config)
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-persist-1", chat_type="dm")
+        
+        entry_1 = store_1.get_or_create_session(source)
+        entry_2 = store_1.reset_session(entry_1.session_key)
+        assert entry_2.conversation_epoch == 2
+
+        # Instantiate fresh SessionStore from the same directory to simulate service restart
+        store_2 = SessionStore(sessions_dir=tmp_path, config=config)
+        assert store_2.get_conversation_epoch(entry_2.session_key) == 2
+
+        # Subsequent reset on reloaded store advances to epoch 3
+        entry_3 = store_2.reset_session(entry_2.session_key)
+        assert entry_3.conversation_epoch == 3

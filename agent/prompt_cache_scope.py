@@ -43,9 +43,11 @@ host has to declare it, and one carrier already means exactly that:
 ``gateway_session_key`` — the "stable per-chat key" (``agent:main:telegram:
 dm:123``) built by ``gateway.session.build_session_key`` from the
 ``X-Hermes-Session-Key`` header, which branching deliberately does NOT key
-off. ``declared_conversation_scope()`` consumes it, and it wins over the
-lineage walk because it is stable across rotation AND across per-response
-ids. Two boundaries it must not cross:
+off. Together with ``gateway_conversation_epoch`` (incremented on ``/new`` /
+``reset_session()`` and on idle/daily policy auto-resets),
+``declared_conversation_scope()`` consumes it, and it wins over the lineage
+walk because it is stable across per-response ids while rotating on ``/new``.
+Two boundaries it must not cross:
 
 - explicit fork children (``/branch``, delegate subagents, tool children)
   share their parent's chat key but are separate conversations — the row's
@@ -53,10 +55,12 @@ ids. Two boundaries it must not cross:
 - background-review forks run on a clone of the live runtime, so they are
   excluded by ``_persist_disabled`` for the same reason.
 
-The declared key is hashed into ``gwk_<sha256[:24]>`` before it becomes a
-scope: unlike a session id it embeds platform/chat/user identifiers, and
-this value leaves the process verbatim as OpenRouter's sticky ``session_id``
-and xAI's ``x-grok-conv-id``.
+The declared key and epoch are hashed into ``gwk_<sha256[:24]>`` before
+becoming a scope: unlike a session id the key embeds platform/chat/user
+identifiers, and this value leaves the process verbatim as OpenRouter's
+sticky ``session_id`` and xAI's ``x-grok-conv-id``.  The epoch is mixed as
+``key:epoch`` (omitted when epoch is 1 for backward-compatible hashes on
+hosts that never reset).
 
 The resolution is memoized per (agent, session_id): the lineage walk runs
 once per transcript segment — NOT per API call — and re-runs only when
@@ -101,9 +105,14 @@ def declared_conversation_scope(agent: Any) -> Optional[str]:
     """Return the host-declared logical conversation scope, or None.
 
     Resolved from ``agent._gateway_session_key`` (the ``X-Hermes-Session-Key``
-    /``build_session_key`` per-chat key), hashed into ``gwk_<sha256[:24]>``
-    so no platform/chat/user identifier reaches a provider on the wire and
-    the value stays inside every caller's length/charset budget.
+    /``build_session_key`` per-chat key) and ``agent._gateway_conversation_epoch``,
+    hashed into ``gwk_<sha256[:24]>`` so no platform/chat/user identifier
+    reaches a provider on the wire and the value stays inside every caller's
+    length/charset budget.
+
+    The epoch is mixed as ``key:epoch`` when epoch > 1 (``/new``, auto-reset)
+    so the scope rotates on conversation boundaries while staying stable
+    across per-response physical session ids within one logical conversation.
 
     None — meaning "fall back to the physical-id scope" — when no key was
     declared, when this agent is a background-review fork (``_persist_disabled``:
@@ -127,7 +136,9 @@ def declared_conversation_scope(agent: Any) -> Optional[str]:
             # fork onto its parent's key on a transient DB failure.
             logger.debug("declared-scope fork check failed", exc_info=True)
             return None
-    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
+    epoch = getattr(agent, "_gateway_conversation_epoch", 1) or 1
+    carrier = f"{key}:{epoch}" if epoch != 1 else key
+    digest = hashlib.sha256(carrier.encode("utf-8", errors="replace")).hexdigest()[:24]
     return f"{_DECLARED_SCOPE_PREFIX}{digest}"
 
 
@@ -145,10 +156,13 @@ def resolve_prompt_cache_scope(agent: Any) -> str:
     if not sid:
         return ""
     db = getattr(agent, "_session_db", None)
+    epoch = getattr(agent, "_gateway_conversation_epoch", 1) or 1
     # Memo key includes DB presence: an agent that starts DB-less and gains a
     # handle later (run_agent._get_session_db_for_recall lazily attaches one)
     # must re-resolve instead of staying pinned to the physical id.
-    key = (sid, db is not None)
+    # Epoch is included so /new (which increments the epoch on the same chat
+    # key) invalidates the memoized scope and triggers a fresh resolution.
+    key = (sid, db is not None, epoch)
     memo = getattr(agent, _MEMO_ATTR, None)
     if isinstance(memo, tuple) and len(memo) == 2 and memo[0] == key:
         return memo[1]
