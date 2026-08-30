@@ -200,3 +200,30 @@ class TestDegradesSafely:
         cfg = load_config()
 
         assert cfg["agent"]["max_turns"] == 7
+
+    def test_a_nested_inherit_is_reported_instead_of_ignored(
+        self, hermes_root, capsys
+    ):
+        """`inherit` inside a section does nothing, so it must not do it quietly.
+
+        The misplaced key leaves the section empty, and the user meets a missing
+        model rather than a misplaced line. Naming the key is the difference
+        between a two-second fix and a debugging session.
+        """
+        write_root, load_profile = hermes_root
+        write_root({"model": {"default": "root-model"}})
+
+        cfg = load_profile("nested", {"model": {"inherit": True}})
+
+        assert cfg.get("model", {}).get("default") != "root-model"
+        assert "model.inherit" in capsys.readouterr().err
+
+    def test_a_top_level_inherit_warns_about_nothing(self, hermes_root, capsys):
+        """The correct spelling must stay silent."""
+        write_root, load_profile = hermes_root
+        write_root({"model": {"default": "root-model"}})
+
+        cfg = load_profile("correct", {"inherit": True})
+
+        assert cfg["model"]["default"] == "root-model"
+        assert "has no effect" not in capsys.readouterr().err
