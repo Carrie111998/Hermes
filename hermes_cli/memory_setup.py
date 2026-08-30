@@ -7,6 +7,7 @@ the provider's config schema. Writes config to config.yaml + .env.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
@@ -14,6 +15,8 @@ import shlex
 
 from hermes_constants import get_hermes_home
 from hermes_cli.secret_prompt import masked_secret_prompt
+
+logger = logging.getLogger(__name__)
 
 _CANCELLED = -1
 
@@ -206,19 +209,37 @@ def _get_available_providers() -> list:
 
     Returns list of (name, description, provider_instance) tuples.
     """
-    try:
-        from plugins.memory import discover_memory_providers, load_memory_provider
-        raw = discover_memory_providers()
-    except Exception:
-        raw = []
+    providers, _ = _scan_providers()
+    return providers
+
+
+def _scan_providers() -> tuple[list, list[str]]:
+    """Discover providers, keeping failures visible instead of masking them.
+
+    Returns ``(providers, skipped)``: the loadable ``(name, setup_hint,
+    provider)`` tuples plus one human-readable reason per discovered
+    provider that was dropped. A discovery crash (broken import of
+    ``plugins.memory`` itself, missing bridge dependency) is re-raised
+    after being logged — the wizard used to flatten it into "no plugins
+    detected", sending users to reinstall plugins that were already
+    installed and working.
+    """
+    from plugins.memory import discover_memory_providers, load_memory_provider
+
+    raw = discover_memory_providers()
 
     results = []
+    skipped: list[str] = []
     for name, desc, available in raw:
         try:
             provider = load_memory_provider(name)
             if not provider:
+                skipped.append(f"{name}: provider module did not expose an instance")
                 continue
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to load memory provider '%s': %s", name, exc)
+            logger.debug("Provider load traceback", exc_info=True)
+            skipped.append(f"{name}: {exc}")
             continue
 
         schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
@@ -234,7 +255,7 @@ def _get_available_providers() -> list:
             setup_hint = "local"
 
         results.append((name, setup_hint, provider))
-    return results
+    return results, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +266,14 @@ def cmd_setup_provider(provider_name: str) -> None:
     """Run memory setup for a specific provider, skipping the picker."""
     from hermes_cli.config import load_config, save_config
 
-    providers = _get_available_providers()
+    try:
+        providers, skipped = _scan_providers()
+    except Exception as exc:
+        print("\n  Failed to discover memory provider plugins:")
+        print(f"    {exc}")
+        print("\n  Fix the error above before running setup again.\n")
+        return
+
     match = None
     for name, desc, provider in providers:
         if name == provider_name:
@@ -254,7 +282,12 @@ def cmd_setup_provider(provider_name: str) -> None:
 
     if not match:
         print(f"\n  Memory provider '{provider_name}' not found.")
-        print("  Run 'hermes memory setup' to see available providers.\n")
+        if skipped:
+            print(f"  {len(skipped)} installed provider(s) could not be loaded:")
+            for reason in skipped:
+                print(f"    - {reason}")
+        else:
+            print("  Run 'hermes memory setup' to see available providers.\n")
         return
 
     name, _, provider = match
@@ -283,12 +316,30 @@ def cmd_setup(args) -> None:
     """Interactive memory provider setup wizard."""
     from hermes_cli.config import load_config, save_config
 
-    providers = _get_available_providers()
+    try:
+        providers, skipped = _scan_providers()
+    except Exception as exc:
+        print("\n  Failed to discover memory provider plugins:")
+        print(f"    {exc}")
+        print("\n  Fix the error above before running setup again.\n")
+        return
 
     if not providers:
-        print("\n  No memory provider plugins detected.")
-        print("  Install a plugin to ~/.hermes/plugins/ and try again.\n")
+        if skipped:
+            print("\n  No memory provider plugins could be loaded.")
+            print("  The following installed plugins failed:")
+            for reason in skipped:
+                print(f"    - {reason}")
+            print()
+        else:
+            print("\n  No memory provider plugins detected.")
+            print("  Install a plugin to ~/.hermes/plugins/ and try again.\n")
         return
+
+    if skipped:
+        print(f"\n  ⚠ {len(skipped)} installed provider(s) could not be loaded:")
+        for reason in skipped:
+            print(f"    - {reason}")
 
     # Build picker items
     items = []
