@@ -2457,6 +2457,8 @@ export interface MoaConfigResponse {
     aggregator_temperature: number;
     reference_timeout: number | null;
     degraded_reference_policy: "loud" | "silent";
+    advisory_context?: "auto" | "none";
+    advisory_max_chars?: number | null;
     max_tokens: number;
     /** Optional advisor output cap — round-tripped, not edited here. */
     reference_max_tokens?: number | null;
@@ -2470,6 +2472,8 @@ export interface MoaConfigResponse {
   aggregator_temperature: number;
   reference_timeout: number | null;
   degraded_reference_policy: "loud" | "silent";
+  advisory_context?: "auto" | "none";
+  advisory_max_chars?: number | null;
   max_tokens: number;
   enabled: boolean;
 }
