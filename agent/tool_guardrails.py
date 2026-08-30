@@ -263,8 +263,7 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     if result is None:
         return False, ""
     if not isinstance(result, str):
-        # Structured results (e.g. multimodal content dicts from
-        # tool_executor) carry no textual error signal to classify.
+        # Structured results carry no textual error signal to classify.
         return False, ""
     if file_mutation_result_landed(tool_name, result):
         return False, ""
@@ -452,14 +451,10 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
-        # No-progress tracking applies to every tool, not just read-only ones:
-        # a successful call repeated with identical arguments that keeps
-        # returning the identical result (e.g. the same `terminal` command
-        # producing the same output) is definitionally making no progress.
-        # Only plain-string results participate: the guidance text cannot be
-        # appended to multimodal content lists anyway, and _result_hash is
-        # only defined on str — a structured result (e.g. a multimodal dict
-        # from tool_executor) breaks the streak and passes through untracked.
+        # No-progress tracking applies to every tool, not just read-only
+        # ones. Only plain-string results participate: _result_hash is only
+        # defined on str, and structured results (e.g. multimodal dicts from
+        # tool_executor) break the streak.
         if result is not None and not isinstance(result, str):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)

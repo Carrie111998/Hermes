@@ -187,11 +187,9 @@ def test_no_progress_streak_resets_when_result_changes():
 
 
 def test_non_string_result_skips_no_progress_tracking_without_crashing():
-    # tool_executor can hand structured multimodal results (dicts with
-    # content lists) to after_call. _result_hash is only defined on str, so
-    # these must bypass no-progress tracking entirely rather than crashing
-    # on .encode() — the guidance text can't be appended to multimodal
-    # content anyway.
+    # tool_executor can hand structured multimodal results (dicts) to
+    # after_call; _result_hash is only defined on str, so these must bypass
+    # no-progress tracking rather than crash on .encode().
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
             hard_stop_enabled=True,
