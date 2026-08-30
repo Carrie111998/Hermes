@@ -6,6 +6,7 @@ import pytest
 import time
 from unittest.mock import patch, MagicMock
 
+from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor import (
     ContextCompressor,
     HISTORICAL_TASK_HEADING,
@@ -642,6 +643,47 @@ class TestGenerateSummaryNoneContent:
             summary = c._generate_summary(messages)
         assert isinstance(summary, str)
         assert summary.startswith(SUMMARY_PREFIX)
+
+
+class TestGenerateSummaryTotalDeadline:
+    def test_expired_deadline_prevents_single_auxiliary_request(self, compressor):
+        compressor._compression_cancelled_check = lambda: True
+
+        with (
+            patch("agent.context_compressor.call_llm") as call_llm,
+            pytest.raises(AuxiliaryExplicitCancellation),
+        ):
+            compressor._generate_summary(
+                [{"role": "user", "content": "do not dispatch this request"}]
+            )
+
+        call_llm.assert_not_called()
+
+    def test_deadline_winning_during_request_discards_response(self, compressor):
+        cancelled = False
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "late summary"
+
+        def complete_after_deadline(**_kwargs):
+            nonlocal cancelled
+            cancelled = True
+            return response
+
+        compressor._compression_cancelled_check = lambda: cancelled
+
+        with (
+            patch(
+                "agent.context_compressor.call_llm",
+                side_effect=complete_after_deadline,
+            ) as call_llm,
+            pytest.raises(AuxiliaryExplicitCancellation),
+        ):
+            compressor._generate_summary(
+                [{"role": "user", "content": "discard the late result"}]
+            )
+
+        call_llm.assert_called_once()
 
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""

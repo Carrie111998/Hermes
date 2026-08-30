@@ -637,7 +637,7 @@ class CompressionCommitFence:
     fully complete before the caller proceeds.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, total_ceiling_seconds: float | None = None) -> None:
         self._lock = threading.Lock()
         self._cancelled = False
         self._commit_started = False
@@ -672,6 +672,18 @@ class CompressionCommitFence:
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
         self._last_progress = time.monotonic()
+        self._progress_observed = False
+        self._deadline: float | None = None
+        self._retain_cancelled_lock_until_worker_done = False
+        if total_ceiling_seconds is not None:
+            self.set_total_ceiling_seconds(total_ceiling_seconds)
+
+    def set_total_ceiling_seconds(self, seconds: float) -> None:
+        """Arm the wall-clock deadline shared by the host and worker."""
+        seconds = float(seconds)
+        if seconds <= 0:
+            raise ValueError("total compression ceiling must be positive")
+        self._deadline = time.monotonic() + seconds
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
@@ -681,6 +693,17 @@ class CompressionCommitFence:
         CPython, so no lock is needed.
         """
         self._last_progress = time.monotonic()
+        self._progress_observed = True
+
+    @property
+    def progress_observed(self) -> bool:
+        """Whether semantic provider progress was reported for this attempt."""
+        return self._progress_observed
+
+    @property
+    def deadline_exceeded(self) -> bool:
+        deadline = self._deadline
+        return deadline is not None and time.monotonic() >= deadline
 
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""
@@ -723,7 +746,7 @@ class CompressionCommitFence:
         """Atomically admit commit unless a hard cancellation already won."""
         self._lock.acquire()
         if (
-            self._cancelled
+            self.is_cancelled
             or self._admission_revoked
             or (cancel_event is not None and bool(cancel_event.is_set()))
         ):
@@ -771,7 +794,11 @@ class CompressionCommitFence:
     @property
     def is_cancelled(self) -> bool:
         """True after cancellation won before the commit boundary."""
-        return self._cancelled or self._admission_revoked
+        return self._cancelled or self._admission_revoked or self.deadline_exceeded
+
+    def retain_compression_lock_until_worker_done(self) -> None:
+        """Prevent a timed-out live worker from overlapping a retry."""
+        self._retain_cancelled_lock_until_worker_done = True
 
     def revoke_commit_admission(self) -> None:
         """Revoke FUTURE commit admission without blocking on the fence lock.
@@ -830,7 +857,7 @@ class CompressionCommitFence:
         the durable lock and making its cancellation cleanup callable.
         """
         self._lock.acquire()
-        if self._cancelled or self._admission_revoked:
+        if self.is_cancelled or self._admission_revoked:
             self._lock.release()
             return False
         return True
@@ -868,6 +895,8 @@ class CompressionCommitFence:
         publication is retained and fulfilled synchronously when the worker
         publishes the hook.
         """
+        if self._retain_cancelled_lock_until_worker_done:
+            return
         with self._lock_release_guard:
             self._cancelled_lock_release_requested = True
             release = self._cancelled_lock_release
@@ -1073,6 +1102,7 @@ def _retry_compression_on_fallback_chain(
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     on_commit_overrun: Optional[Callable[[float, float], None]] = None,
+    on_timeout_cause: Optional[Callable[[bool, bool], None]] = None,
     telemetry_agent: Any = None,
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
 ) -> Optional[Tuple[list, str]]:
@@ -1147,6 +1177,7 @@ def _retry_compression_on_fallback_chain(
                 idle_timeout_seconds=idle,
                 total_ceiling_seconds=ceiling,
                 on_commit_overrun=on_commit_overrun,
+                on_timeout_cause=on_timeout_cause,
                 fence=retry_fence,
                 telemetry_agent=telemetry_agent,
                 stall_fallback=False,
@@ -1184,6 +1215,7 @@ def run_compress_context_with_progress_timeout(
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     on_timeout: Optional[Callable[[float, float, float], None]] = None,
+    on_timeout_cause: Optional[Callable[[bool, bool], None]] = None,
     on_commit_overrun: Optional[Callable[[float, float], None]] = None,
     fence: Optional[CompressionCommitFence] = None,
     telemetry_agent: Any = None,
@@ -1218,7 +1250,10 @@ def run_compress_context_with_progress_timeout(
 
     ``system_prompt_fallback`` may be a string or a zero-arg callable resolved
     only on the timeout path, so successful compression never pays for (or
-    fails on) an eager prompt rebuild.
+    fails on) an eager prompt rebuild. ``on_timeout_cause`` receives whether
+    the total ceiling expired and whether provider progress was observed before
+    ``on_timeout`` runs, allowing hosts to report the timeout accurately while
+    preserving the existing three-argument timeout callback contract.
 
     ``stall_fallback`` (default on) makes an aborted stall attempt the
     configured ``auxiliary.compression.fallback_chain`` once — pinned onto a
@@ -1244,9 +1279,10 @@ def run_compress_context_with_progress_timeout(
             return system_prompt_fallback()
         return system_prompt_fallback
 
-    fence = fence if fence is not None else CompressionCommitFence()
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
+    fence = fence if fence is not None else CompressionCommitFence()
+    fence.set_total_ceiling_seconds(ceiling)
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -1286,6 +1322,10 @@ def run_compress_context_with_progress_timeout(
         # (worker slot freed late). Check the fence BEFORE any expensive
         # summary work so a stale job never burns an LLM call; its return
         # value is discarded by the already-departed host.
+        if worker_fence.deadline_exceeded:
+            raise concurrent.futures.TimeoutError(
+                "compression deadline expired before worker start"
+            )
         if worker_fence.is_cancelled:
             logger.info(
                 "Skipping stale compression job: fence cancelled before start"
@@ -1332,7 +1372,11 @@ def run_compress_context_with_progress_timeout(
             except concurrent.futures.TimeoutError:
                 waited = time.monotonic() - wait_started
                 since_progress = fence.seconds_since_progress()
-                if since_progress < idle and waited < ceiling:
+                if (
+                    not fence.deadline_exceeded
+                    and since_progress < idle
+                    and waited < ceiling
+                ):
                     logger.info(
                         "Context compression still streaming after %.0fs "
                         "(last progress %.1fs ago) — extending wait "
@@ -1347,6 +1391,24 @@ def run_compress_context_with_progress_timeout(
         # F6: a not-yet-started future must not linger as a stale queued job.
         # cancel() is a no-op for a running worker (fence handles that path).
         future.cancel()
+
+        total_exhausted = (
+            time.monotonic() - wait_started >= ceiling or fence.deadline_exceeded
+        )
+        if total_exhausted:
+            # A total-ceiling candidate can still be unwinding a healthy
+            # provider call. Keep its session lease until that worker exits so
+            # another automatic attempt cannot overlap the unchanged source.
+            fence.retain_compression_lock_until_worker_done()
+
+        if on_timeout_cause is not None:
+            try:
+                on_timeout_cause(total_exhausted, fence.progress_observed)
+            except Exception:
+                logger.debug(
+                    "compress_context timeout-cause callback failed",
+                    exc_info=True,
+                )
 
         cancelled: Optional[bool] = None
         while cancelled is None:
@@ -1446,6 +1508,7 @@ def run_compress_context_with_progress_timeout(
                 idle_timeout_seconds=idle,
                 total_ceiling_seconds=ceiling,
                 on_commit_overrun=on_commit_overrun,
+                on_timeout_cause=on_timeout_cause,
                 telemetry_agent=telemetry_agent,
                 new_fence=new_fence,
             )
