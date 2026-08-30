@@ -1220,6 +1220,21 @@ class KawaiiSpinner:
                 time.sleep(0.5)
             return
 
+        # When a print_fn is configured, the \r-based animation must not run:
+        #   * CLI routes output through _cprint (cli_agent_setup_mixin.py)
+        #     → prompt_toolkit print_formatted_text, which appends a newline
+        #     per call — so every frame would land on its own line and flood
+        #     the terminal, regardless of frame width.
+        #   * The CLI TUI already renders spinner state via a dedicated
+        #     widget (_spinner_text → _render_spinner_text → get_spinner_text),
+        #     so a \r animation here would also fight the widget for the same
+        #     status line (visual flicker on Windows conhost).
+        # Same rationale as the StdoutProxy branch below.
+        if self._print_fn is not None:
+            while self.running:
+                time.sleep(0.1)
+            return
+
         # When running inside prompt_toolkit's patch_stdout context the CLI
         # renders spinner state via a dedicated TUI widget (_spinner_text).
         # Driving a \r-based animation here too causes visual overdraw: the
@@ -1286,9 +1301,12 @@ class KawaiiSpinner:
             self.thread.join(timeout=0.5)
 
         is_tty = self._is_tty
-        if is_tty:
+        if is_tty and self._print_fn is None:
             # Clear the spinner line with spaces instead of \033[K to avoid
             # garbled escape codes when prompt_toolkit's patch_stdout is active.
+            # Skip when a print_fn is configured: the animation never drew a
+            # \r line to clear (see _animate), and the blanks would otherwise
+            # be emitted through print_fn as a stray line of spaces.
             blanks = ' ' * max(self.last_line_len + 5, 40)
             self._write(f"\r{blanks}\r", end='', flush=True)
         if final_message:

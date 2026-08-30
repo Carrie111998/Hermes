@@ -314,3 +314,60 @@ class TestBuildStatusPhrase:
             assert build_status_phrase("terminal", {"command": "ls"}) is None
         finally:
             set_friendly_tool_labels(True)
+
+
+def test_kawaii_spinner_skips_animation_when_print_fn_set(monkeypatch):
+    """When a print_fn is configured, _animate() must not run \r-based
+    animation — the CLI routes through _cprint which appends a newline per
+    frame (flood), and the TUI widget already drives spinner display. The
+    print_fn should receive only the start-of-task message (if any) and an
+    optional final completion line, not per-frame \r output."""
+    from agent.display import KawaiiSpinner
+    import time
+
+    calls = []
+
+    class FakeTty:
+        def isatty(self):
+            return True
+        def write(self, *a):
+            pass
+        def flush(self):
+            pass
+
+    spinner = KawaiiSpinner("test task", print_fn=lambda t: calls.append(t))
+    spinner._out = FakeTty()
+    spinner.start()
+    time.sleep(0.5)  # enough for several animation frames
+    spinner.stop(final_message="done")
+
+    # None of the calls should be \r-prefixed animation frames
+    for c in calls:
+        assert not c.startswith("\r"), f"print_fn received \r-animated frame: {c!r}"
+    # The final completion message should be present
+    assert any("done" in c for c in calls), "final completion message not through print_fn"
+
+
+def test_kawaii_spinner_animate_runs_when_no_print_fn(monkeypatch):
+    """Without print_fn, the \r animation runs normally on a tty."""
+    from agent.display import KawaiiSpinner
+    import time
+
+    writes = []
+
+    class FakeTty:
+        def isatty(self):
+            return True
+        def write(self, text, *a):
+            writes.append(text)
+        def flush(self):
+            pass
+
+    spinner = KawaiiSpinner("test task")
+    spinner._out = FakeTty()
+    spinner.start()
+    time.sleep(0.5)
+    spinner.stop()
+
+    # Should have seen \r-prefixed animation frames
+    assert any(w.startswith("\r") for w in writes), "no \r animation frames on tty without print_fn"
