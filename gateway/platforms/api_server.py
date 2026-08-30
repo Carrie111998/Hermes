@@ -3162,8 +3162,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        try:
+            from agent.runtime_identity import get_runtime_identity
+            ident = get_runtime_identity(public=True)
+        except Exception:
+            ident = {}
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version(), "runtime_identity": ident}
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":

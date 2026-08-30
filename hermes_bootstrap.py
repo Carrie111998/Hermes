@@ -237,3 +237,12 @@ suppress_platform_ver_console()
 # packages installed into the data volume on a previous run are importable
 # this run, before any backend module imports its SDK. No-op when unset.
 activate_durable_lazy_target()
+
+
+def get_bootstrap_identity() -> dict:
+    """Return runtime identity for bootstrap validation."""
+    try:
+        from agent.runtime_identity import get_runtime_identity
+        return get_runtime_identity(public=False)
+    except Exception:
+        return {}

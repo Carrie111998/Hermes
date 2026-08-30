@@ -673,6 +673,11 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "updated_at": _utc_now_iso(),
     })
     payload.update(_get_code_identity_fields())
+    try:
+        from agent.runtime_identity import get_runtime_identity
+        payload["runtime_identity"] = get_runtime_identity(public=False)
+    except Exception:
+        pass
     return payload
 
 

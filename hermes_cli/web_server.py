@@ -1072,12 +1072,18 @@ class DashboardHealth:
         """Public component payload: status enum + counts + timestamps only."""
         errors = self.recent_error_count()
         status = "degraded" if (errors or self.selftest_status == "failing") else "ok"
-        return {
+        payload = {
             "status": status,
             "recent_unhandled_errors": errors,
             "last_error_at": self.last_error_at,
             "selftest": self.selftest_status,
         }
+        try:
+            from agent.runtime_identity import get_runtime_identity
+            payload["runtime_identity"] = get_runtime_identity(public=True)
+        except Exception:
+            pass
+        return payload
 
 
 DASHBOARD_HEALTH = DashboardHealth()
@@ -4001,6 +4007,11 @@ async def get_status(profile: Optional[str] = None):
             "auth_flows": auth_flows,
             "nous_session_valid": nous_session_valid,
         }
+        try:
+            from agent.runtime_identity import get_runtime_identity
+            status["runtime_identity"] = get_runtime_identity(public=True)
+        except Exception:
+            pass
 
         # Stable per-install identity (see get_install_id above). First call
         # may touch disk, so keep it off the event loop; afterwards it is a
