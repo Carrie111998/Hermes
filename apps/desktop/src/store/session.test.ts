@@ -704,13 +704,13 @@ describe('workspaceCwdForNewSession', () => {
     expect(workspaceCwdForNewSession()).toBe('')
 
     setCurrentCwd('/backend/project-a')
-    expect(workspaceCwdForNewSession()).toBe('/backend/project-a')
+    expect(workspaceCwdForNewSession()).toBe('')
 
     $connection.set({ baseUrl: 'http://backend-b', mode: 'remote' } as never)
     expect(workspaceCwdForNewSession()).toBe('')
 
     setCurrentCwd('/backend/project-b')
-    expect(workspaceCwdForNewSession()).toBe('/backend/project-b')
+    expect(workspaceCwdForNewSession()).toBe('')
 
     // Back on local with no configured default: a bare new chat is detached and
     // never reads the remote keys (nor inherits the sticky local workspace).
@@ -729,7 +729,7 @@ describe('workspaceCwdForNewSession', () => {
     setCurrentCwdTransient('/backend/some-other-project')
 
     expect($currentCwd.get()).toBe('/backend/some-other-project')
-    expect(workspaceCwdForNewSession()).toBe('/backend/picked')
+    expect(workspaceCwdForNewSession()).toBe('')
   })
 
   it('settling a resumed session does not move where the next new chat starts', () => {
@@ -743,7 +743,7 @@ describe('workspaceCwdForNewSession', () => {
     setSelectedStoredSessionId('sess-in-project')
     commitWorkspaceCwdForSelectedSession('/backend/last-project')
 
-    expect(workspaceCwdForNewSession()).toBe('/backend/picked')
+    expect(workspaceCwdForNewSession()).toBe('')
   })
 })
 

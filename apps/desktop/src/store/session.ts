@@ -1230,9 +1230,11 @@ export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number 
 }
 
 export const workspaceCwdForNewSession = (): string => {
-  if ($connection.get()?.mode === 'remote') {
-    return getRememberedWorkspaceCwd()
-  }
+  // A bare new chat starts DETACHED for both local and remote connections. The
+  // remembered cwd is for restoring an existing workspace/session, not for
+  // silently attaching a new conversation to the last repository visited.
+  // Explicit project/workspace selection still attaches through the session
+  // start path, and an explicit configured default remains supported.
 
   // A bare new chat starts DETACHED — no inherited cwd, so the composer's coding
   // rail (which keys off $currentCwd) shows no branch and the first message runs
