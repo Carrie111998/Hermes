@@ -52,6 +52,18 @@ def _parse(byte_seq: str):
     return [kp.key for kp in out]
 
 
+def _parse_details(byte_seq: str):
+    """Feed bytes through prompt_toolkit's VT100 parser and return
+    (key, data) tuples to verify both dispatch key and inserted text."""
+    out = []
+    parser = Vt100Parser(out.append)
+    for ch in byte_seq:
+        parser.feed(ch)
+    parser.flush()
+    return [(kp.key, kp.data) for kp in out]
+
+
+
 # ---------------------------------------------------------------------------
 # Ctrl+letter: a-z
 # ---------------------------------------------------------------------------
@@ -250,18 +262,37 @@ def test_install_is_idempotent():
 @pytest.mark.parametrize("letter", [chr(c) for c in range(ord('a'), ord('z') + 1)])
 def test_modify_other_keys_shift_letter_produces_uppercase(letter):
     """Shift+<letter> under modifyOtherKeys must produce the uppercase
-    character, not leak as literal escape text — the 'caps locked' bug."""
+    character and set KeyPress.data to the character, not leak as literal
+    escape text in the prompt buffer (#97413)."""
     upper = letter.upper()
-    # modifyOtherKeys format
-    mok_seq = f"\x1b[27;2;{ord(letter)}~"
-    assert _parse(mok_seq) == [upper], (
-        f"modifyOtherKeys Shift+{letter} ({mok_seq!r}) should produce '{upper}'"
-    )
-    # CSI-u format
-    csiu_seq = f"\x1b[{ord(letter)};2u"
-    assert _parse(csiu_seq) == [upper], (
-        f"CSI-u Shift+{letter} ({csiu_seq!r}) should produce '{upper}'"
-    )
+    # modifyOtherKeys format (lowercase and uppercase codepoints)
+    for cp in (ord(letter), ord(upper)):
+        mok_seq = f"\x1b[27;2;{cp}~"
+        assert _parse(mok_seq) == [upper], (
+            f"modifyOtherKeys Shift+{letter} ({mok_seq!r}) should produce '{upper}'"
+        )
+        assert _parse_details(mok_seq) == [(upper, upper)], (
+            f"modifyOtherKeys Shift+{letter} ({mok_seq!r}) data should be '{upper}'"
+        )
+
+    # CSI-u format (lowercase and uppercase codepoints)
+    for cp in (ord(letter), ord(upper)):
+        csiu_seq = f"\x1b[{cp};2u"
+        assert _parse(csiu_seq) == [upper], (
+            f"CSI-u Shift+{letter} ({csiu_seq!r}) should produce '{upper}'"
+        )
+        assert _parse_details(csiu_seq) == [(upper, upper)], (
+            f"CSI-u Shift+{letter} ({csiu_seq!r}) data should be '{upper}'"
+        )
+
+
+def test_ghostty_shift_letter_does_not_insert_raw_escape_sequence():
+    """Specific regression test for #97413: pressing Shift+S in Ghostty
+    emits `\x1b[27;2;83~`. KeyPress.data must be 'S', preventing prompt_toolkit's
+    self_insert from inserting `^[[27;2;83~` into the input buffer."""
+    seq = "\x1b[27;2;83~"  # Shift+S in modifyOtherKeys=2
+    assert _parse_details(seq) == [("S", "S")]
+
 
 
 def test_does_not_clobber_shift_enter_alias():
