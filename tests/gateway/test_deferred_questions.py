@@ -108,6 +108,46 @@ def test_pending_uses_queue_tiebreaker_for_equal_timestamps(tmp_path: Path) -> N
     assert service.pending_for_session(lower_id.session_key) == lower_id
 
 
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX file modes")
+@pytest.mark.parametrize("shared_deployment", [False, True])
+def test_database_creation_uses_deployment_aware_private_mode(
+    tmp_path: Path, monkeypatch, shared_deployment: bool
+) -> None:
+    import os
+    import stat
+
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "is_managed", lambda: shared_deployment)
+    monkeypatch.setattr(hermes_config, "_is_container", lambda: False)
+    previous_umask = os.umask(0o022)
+    try:
+        path = tmp_path / "questions.sqlite3"
+        _service(path)
+    finally:
+        os.umask(previous_umask)
+
+    expected = 0o644 if shared_deployment else 0o600
+    assert stat.S_IMODE(path.stat().st_mode) == expected
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX file modes")
+def test_existing_database_mode_is_tightened(tmp_path: Path, monkeypatch) -> None:
+    import stat
+
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "is_managed", lambda: False)
+    monkeypatch.setattr(hermes_config, "_is_container", lambda: False)
+    path = tmp_path / "questions.sqlite3"
+    path.touch(mode=0o644)
+    path.chmod(0o644)
+
+    _service(path)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 def test_each_transaction_closes_its_sqlite_connection(tmp_path: Path) -> None:
     import sqlite3
 
@@ -685,7 +725,9 @@ async def test_relay_deferred_delivery_uses_transport_and_restores_routing(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_path", ["cleanup", "direct", "stale_heal"])
+@pytest.mark.parametrize(
+    "release_path", ["cleanup", "direct", "stale_heal", "cleanup_concurrent"]
+)
 async def test_busy_question_wakes_only_after_session_guard_is_released(
     tmp_path: Path,
     release_path: str,
@@ -731,7 +773,7 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
     assert session_key in adapter._session_idle_callbacks
     if release_path == "cleanup":
         adapter._cleanup_finished_session_task(session_key, guard)
-    elif release_path == "stale_heal":
+    elif release_path in {"stale_heal", "cleanup_concurrent"}:
         from gateway.platforms.base import MessageEvent, MessageType
 
         finish_turn = asyncio.Event()
@@ -753,6 +795,9 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
 
         adapter._message_handler = handle_unrelated
         adapter.send = block_deferred_send
+        if release_path == "cleanup_concurrent":
+            adapter._cleanup_finished_session_task(session_key, guard)
+            await delivery_started.wait()
         first_ingress = asyncio.create_task(
             adapter.handle_message(
                 MessageEvent(
@@ -763,7 +808,8 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
                 )
             )
         )
-        await delivery_started.wait()
+        if release_path == "stale_heal":
+            await delivery_started.wait()
         second_ingress = asyncio.create_task(
             adapter.handle_message(
                 MessageEvent(
@@ -786,7 +832,7 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
 
     state_before_turn_finishes = service.get(question.id).state
     sent_before_turn_finishes = list(adapter.sent)
-    if release_path == "stale_heal":
+    if release_path in {"stale_heal", "cleanup_concurrent"}:
         finish_turn.set()
         await asyncio.gather(*tuple(adapter._background_tasks))
         assert not handler_started_before_delivery

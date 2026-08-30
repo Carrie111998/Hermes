@@ -3183,9 +3183,9 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
-        # Concurrent webhook tasks share stale-session recovery so none can
-        # reacquire the guard before deferred idle delivery finishes.
-        self._session_ingress_handoffs: Dict[str, asyncio.Task[bool]] = {}
+        # Concurrent webhook tasks share session-idle delivery so none can
+        # reacquire a released guard before its deferred callback finishes.
+        self._session_idle_handoffs: Dict[str, asyncio.Task[None]] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -6114,7 +6114,7 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         *,
         guard: Optional[asyncio.Event] = None,
-    ) -> Optional[asyncio.Task[None]]:
+    ) -> None:
         """Release the adapter-level guard for a session.
 
         When ``guard`` is provided, only release the entry if it still points
@@ -6124,17 +6124,23 @@ class BasePlatformAdapter(ABC):
         """
         current_guard = self._active_sessions.get(session_key)
         if current_guard is None:
-            return None
+            return
         if guard is not None and current_guard is not guard:
-            return None
+            return
         del self._active_sessions[session_key]
         callback = self._session_idle_callbacks.pop(session_key, None)
         if callable(callback):
             task = asyncio.create_task(self._run_session_idle_callback(callback))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
-            return task
-        return None
+            self._session_idle_handoff_store()[session_key] = task
+
+    def _session_idle_handoff_store(self) -> Dict[str, asyncio.Task[None]]:
+        """Return the handoff map, including for lightweight test adapters."""
+        handoffs = getattr(self, "_session_idle_handoffs", None)
+        if handoffs is None:
+            handoffs = self._session_idle_handoffs = {}
+        return handoffs
 
     def _session_task_is_stale(self, session_key: str) -> bool:
         """Return True if the owner task for ``session_key`` is done/cancelled.
@@ -6153,7 +6159,7 @@ class BasePlatformAdapter(ABC):
         done = getattr(task, "done", None)
         return bool(done and done())
 
-    async def _heal_stale_session_lock(self, session_key: str) -> bool:
+    def _heal_stale_session_lock(self, session_key: str) -> bool:
         """Clear a stale session lock if the owner task is already gone.
 
         Returns True if a stale lock was healed.  Returns False if there is
@@ -6174,29 +6180,20 @@ class BasePlatformAdapter(ABC):
             self.name,
             session_key,
         )
-        idle_callback_task = self._release_session_guard(session_key)
+        self._release_session_guard(session_key)
         self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
-        if idle_callback_task is not None:
-            await idle_callback_task
         return True
 
-    async def _await_stale_session_handoff(self, session_key: str) -> bool:
-        """Join the one stale-session recovery transition for this session."""
-        handoffs = getattr(self, "_session_ingress_handoffs", None)
-        if handoffs is None:
-            handoffs = self._session_ingress_handoffs = {}
+    async def _await_session_idle_handoff(self, session_key: str) -> None:
+        """Wait for the callback attached to the latest guard release."""
+        handoffs = self._session_idle_handoff_store()
         handoff = handoffs.get(session_key)
         if handoff is None:
-            if session_key not in self._active_sessions:
-                return False
-            if not self._session_task_is_stale(session_key):
-                return False
-            handoff = asyncio.create_task(self._heal_stale_session_lock(session_key))
-            handoffs[session_key] = handoff
+            return
         try:
-            return await asyncio.shield(handoff)
+            await asyncio.shield(handoff)
         finally:
             if handoff.done() and handoffs.get(session_key) is handoff:
                 handoffs.pop(session_key, None)
@@ -6499,7 +6496,9 @@ class BasePlatformAdapter(ABC):
         # cancelled), the lock is stale.  Clear it and fall through to
         # normal dispatch so the user isn't trapped behind a dead guard —
         # this is the split-brain tail described in issue #11016.
-        await self._await_stale_session_handoff(session_key)
+        if session_key in self._active_sessions:
+            self._heal_stale_session_lock(session_key)
+        await self._await_session_idle_handoff(session_key)
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
