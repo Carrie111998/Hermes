@@ -25,6 +25,7 @@ from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, b
 
 from hermes_constants import OPENROUTER_MODELS_URL
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
+from agent.ssl_verify import CA_BUNDLE_ENV_VARS
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +62,9 @@ def _resolve_requests_verify(base_url: str = "") -> bool | str:
        provider's configured bundle (not the process ``SSL_CERT_FILE``) logs a
        spurious CERTIFICATE_VERIFY_FAILED on every probe even though the chat
        path succeeds (per-provider ``ssl_ca_cert`` was reaching only httpx).
-    3. Env vars ``HERMES_CA_BUNDLE`` / ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE``
-       (a single var covers both ``requests`` and ``httpx`` in-process).
+    3. Env vars ``HERMES_CA_BUNDLE`` / ``SSL_CERT_FILE`` /
+       ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE`` (a single var covers both
+       ``requests`` and ``httpx`` in-process).
     4. ``True`` — defer to the requests default (certifi).
 
     ``base_url`` is optional so existing callers (OpenRouter, etc.) keep the
@@ -80,7 +82,7 @@ def _resolve_requests_verify(base_url: str = "") -> bool | str:
                 return ca
         except Exception:
             pass  # fall through to env vars — never break a probe on config lookup
-    for env_var in ("HERMES_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+    for env_var in CA_BUNDLE_ENV_VARS:
         val = os.getenv(env_var)
         if val and os.path.isfile(val):
             return val

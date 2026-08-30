@@ -10,6 +10,22 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+CA_BUNDLE_ENV_VARS: tuple[str, ...] = (
+    "HERMES_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
+
+
+def resolve_ca_bundle_env() -> str:
+    """Return the first configured CA bundle using Hermes' canonical order."""
+    for env_var in CA_BUNDLE_ENV_VARS:
+        value = os.getenv(env_var, "").strip()
+        if value:
+            return value
+    return ""
+
 
 def _coerce_insecure(ssl_verify: Any) -> bool:
     if ssl_verify is False:
@@ -45,13 +61,7 @@ def resolve_httpx_verify(
         )
         return False
 
-    effective_ca = (
-        (ca_bundle or "").strip()
-        or os.getenv("HERMES_CA_BUNDLE", "").strip()
-        or os.getenv("SSL_CERT_FILE", "").strip()
-        or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
-        or os.getenv("CURL_CA_BUNDLE", "").strip()
-    )
+    effective_ca = (ca_bundle or "").strip() or resolve_ca_bundle_env()
     if effective_ca:
         ca_path = str(Path(effective_ca).expanduser())
         if os.path.isfile(ca_path):
