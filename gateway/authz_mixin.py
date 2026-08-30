@@ -400,9 +400,19 @@ class GatewayAuthorizationMixin:
         # Home Assistant events are system-generated (state changes), not
         # user-initiated messages.  The HASS_TOKEN already authenticates the
         # connection, so HA events are always authorized.
+        if source.platform == Platform.HOMEASSISTANT:
+            return True
+
         # Webhook events are authenticated via HMAC signature validation in
-        # the adapter itself — no user allowlist applies.
-        if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
+        # the adapter itself. When an intake callback specifies an action tool
+        # invocation, verify it against the intake action ledger. Fail closed
+        # if the action is not authorized.
+        if source.platform == Platform.WEBHOOK:
+            action_tool = getattr(source, "action_tool", None)
+            action_args = getattr(source, "action_args", None) or {}
+            if action_tool:
+                session_id = source.chat_id or getattr(source, "user_id", "") or ""
+                return self._is_intake_action_authorized(session_id, action_tool, action_args)
             return True
 
         adapter_profile = self._adapter_profile_for_source(source)
@@ -895,3 +905,33 @@ class GatewayAuthorizationMixin:
             return "ignore"
 
         return "pair"
+
+    def _is_intake_action_authorized(
+        self, session_id: str, tool_name: str, args: dict[str, Any]
+    ) -> bool:
+        """Verify whether an action invoked by an agent run is authorized by a callback ledger."""
+        if not session_id or not tool_name:
+            return False
+        try:
+            from hermes_cli.intake_reply_tokens import claim_action_tool
+            return claim_action_tool(session_id, tool_name, args)
+        except Exception:
+            return False
+
+    def check_intake_tool_authorization(
+        self,
+        source: Optional[SessionSource],
+        tool_name: str,
+        args: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Verify whether a tool execution from an intake session is authorized.
+
+        Fails closed: missing source, missing session, missing tool name, or ledger error
+        returns False.
+        """
+        if not source or not tool_name:
+            return False
+        session_id = source.chat_id or getattr(source, "user_id", "") or ""
+        if not session_id:
+            return False
+        return self._is_intake_action_authorized(session_id, tool_name, args or {})
