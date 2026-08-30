@@ -152,6 +152,11 @@ def _channel_type_name(type_id: int) -> str:
     return _CHANNEL_TYPE_NAMES.get(type_id, f"unknown({type_id})")
 
 
+# Channel types whose thread creation requires a starter message object
+# (Discord "Start Thread in Forum" API): forum (15) and media (16).
+_FORUM_CHANNEL_TYPES = frozenset({15, 16})
+
+
 # ---------------------------------------------------------------------------
 # Capability detection (application intents)
 # ---------------------------------------------------------------------------
@@ -587,9 +592,22 @@ def _create_thread(
     token: str, channel_id: str, name: str,
     message_id: Optional[str] = None,
     auto_archive_duration: int = 1440,
+    content: str = "",
     **_kwargs: Any,
 ) -> str:
-    """Create a thread in a channel."""
+    """Create a thread in a channel, or a post in a forum channel.
+
+    Forum/media channels (types 15/16) don't accept the plain thread
+    creation payload — they use the "Start Thread in Forum" API, which
+    requires a ``message`` object carrying the post's starter content.
+    The channel type is resolved via ``GET /channels/{id}`` on the
+    standalone path (no anchor message) so forum channels work without
+    the caller having to know the type.  If no ``content`` is given for
+    a forum post, the thread name doubles as the starter content
+    (mirrors the gateway adapter's ``_send_to_forum`` fallback).
+    """
+    starter = (content or "").strip()
+
     if message_id:
         # Create thread from an existing message
         path = f"/channels/{channel_id}/messages/{message_id}/threads"
@@ -597,20 +615,54 @@ def _create_thread(
             "name": name,
             "auto_archive_duration": auto_archive_duration,
         }
+        is_forum = False
     else:
-        # Create a standalone thread
+        # Create a standalone thread — resolve the channel type first so
+        # forum/media channels take the message-bearing payload.
+        channel = _discord_request("GET", f"/channels/{channel_id}", token)
+        is_forum = channel.get("type") in _FORUM_CHANNEL_TYPES
         path = f"/channels/{channel_id}/threads"
-        body = {
-            "name": name,
-            "auto_archive_duration": auto_archive_duration,
-            "type": 11,  # PUBLIC_THREAD
-        }
+        if is_forum:
+            body = {
+                "name": name,
+                "auto_archive_duration": auto_archive_duration,
+                "type": 11,  # PUBLIC_THREAD
+                # Forum/media channels require a starter message object.
+                # Without caller content, the thread name doubles as the
+                # post body (mirrors the adapter's _send_to_forum fallback).
+                "message": {"content": starter or name},
+            }
+        else:
+            body = {
+                "name": name,
+                "auto_archive_duration": auto_archive_duration,
+                "type": 11,  # PUBLIC_THREAD
+            }
+
     thread = _discord_request("POST", path, token, body=body)
-    return json.dumps({
+    thread_id = thread["id"]
+
+    starter_message_id = None
+    # Non-forum threads have no starter-message field — deliver optional
+    # content as the thread's first message instead.
+    if starter and not is_forum:
+        msg = _discord_request(
+            "POST", f"/channels/{thread_id}/messages", token,
+            body={"content": starter},
+        )
+        starter_message_id = msg.get("id")
+
+    result: Dict[str, Any] = {
         "success": True,
-        "thread_id": thread["id"],
+        "thread_id": thread_id,
         "name": thread.get("name"),
-    })
+    }
+    if is_forum:
+        result["forum_post"] = True
+        result["starter_content"] = starter or name
+    if starter_message_id:
+        result["starter_message_id"] = starter_message_id
+    return json.dumps(result)
 
 
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
@@ -669,7 +721,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("pin_message", "(channel_id, message_id)", "pin a message"),
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
-    ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("create_thread", "(channel_id, name, [content])", "create a public thread or forum post (content = starter message); optional message_id anchor"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -852,6 +904,15 @@ def _build_schema(
             "type": "string",
             "description": "New thread name (create_thread).",
         },
+        "content": {
+            "type": "string",
+            "description": (
+                "Starter message content (create_thread). Optional for normal "
+                "threads (sent as first thread message); for forum channels it "
+                "becomes the post's first message (falls back to the thread "
+                "name when omitted)."
+            ),
+        },
         "limit": {
             "type": "integer",
             "minimum": 1,
@@ -930,7 +991,8 @@ _ACTION_403_HINT = {
         "Bot lacks MANAGE_MESSAGES permission in this channel, or cannot view the channel/message."
     ),
     "create_thread": (
-        "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it."
+        "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it. "
+        "Forum channels additionally need SEND_MESSAGES to create posts."
     ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
@@ -998,6 +1060,7 @@ def _run_discord_action(
     before: str = "",
     after: str = "",
     auto_archive_duration: int = 1440,
+    content: str = "",
 ) -> str:
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
@@ -1051,6 +1114,7 @@ def _run_discord_action(
             before=before,
             after=after,
             auto_archive_duration=auto_archive_duration,
+            content=content,
         )
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
@@ -1080,6 +1144,7 @@ _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "content": "",
 }
 
 

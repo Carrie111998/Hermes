@@ -3,7 +3,7 @@
 import json
 import urllib.error
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -283,15 +283,20 @@ class TestCreateThread:
     @patch("tools.discord_tool._discord_request")
     def test_create_standalone_thread(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        mock_req.return_value = {"id": "800", "name": "New Thread"}
+        mock_req.side_effect = [
+            {"id": "11", "type": 0},               # GET /channels/11 → text
+            {"id": "800", "name": "New Thread"},   # POST /channels/11/threads
+        ]
         result = json.loads(discord_core(action="create_thread", channel_id="11", name="New Thread"))
         assert result["success"] is True
         assert result["thread_id"] == "800"
-        # Verify the API call
-        mock_req.assert_called_once_with(
-            "POST", "/channels/11/threads", "test-token",
-            body={"name": "New Thread", "auto_archive_duration": 1440, "type": 11},
-        )
+        # Two API calls: channel-type lookup, then thread creation.
+        # Text channels keep the legacy payload — no starter message field.
+        assert mock_req.call_args_list == [
+            call("GET", "/channels/11", "test-token"),
+            call("POST", "/channels/11/threads", "test-token",
+                 body={"name": "New Thread", "auto_archive_duration": 1440, "type": 11}),
+        ]
 
     @patch("tools.discord_tool._discord_request")
     def test_create_thread_from_message(self, mock_req, monkeypatch):
@@ -301,10 +306,142 @@ class TestCreateThread:
             action="create_thread", channel_id="11", name="Discussion", message_id="1001",
         ))
         assert result["success"] is True
+        # Anchored path needs no channel-type lookup.
         mock_req.assert_called_once_with(
             "POST", "/channels/11/messages/1001/threads", "test-token",
             body={"name": "Discussion", "auto_archive_duration": 1440},
         )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_forum_post_with_content(self, mock_req, monkeypatch):
+        """Forum channel (type 15): name + content become a forum post via
+        the Start-Thread-in-Forum payload."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "15", "type": 15},               # GET /channels/15 → forum
+            {"id": "900", "name": "Build Status"},  # POST /channels/15/threads
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="15", name="Build Status",
+            content="All checks passed.",
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "900"
+        assert result["forum_post"] is True
+        assert result["starter_content"] == "All checks passed."
+        assert mock_req.call_args_list == [
+            call("GET", "/channels/15", "test-token"),
+            call("POST", "/channels/15/threads", "test-token",
+                 body={
+                     "name": "Build Status",
+                     "auto_archive_duration": 1440,
+                     "type": 11,
+                     "message": {"content": "All checks passed."},
+                 }),
+        ]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_forum_post_without_content_falls_back_to_name(self, mock_req, monkeypatch):
+        """Discord requires a message object for forum posts; without
+        content the thread name doubles as the starter content."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "15", "type": 15},
+            {"id": "901", "name": "Weekly Digest"},
+        ]
+        result = json.loads(discord_core(action="create_thread", channel_id="15", name="Weekly Digest"))
+        assert result["success"] is True
+        assert result["forum_post"] is True
+        assert result["starter_content"] == "Weekly Digest"
+        assert mock_req.call_args_list[1] == call(
+            "POST", "/channels/15/threads", "test-token",
+            body={
+                "name": "Weekly Digest",
+                "auto_archive_duration": 1440,
+                "type": 11,
+                "message": {"content": "Weekly Digest"},
+            },
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_media_channel_post_treated_like_forum(self, mock_req, monkeypatch):
+        """Media channels (type 16) share the forum creation payload."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "16", "type": 16},
+            {"id": "902", "name": "Screenshots"},
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="16", name="Screenshots",
+            content="See attached.",
+        ))
+        assert result["success"] is True
+        assert result["forum_post"] is True
+        assert mock_req.call_args_list[1] == call(
+            "POST", "/channels/16/threads", "test-token",
+            body={
+                "name": "Screenshots",
+                "auto_archive_duration": 1440,
+                "type": 11,
+                "message": {"content": "See attached."},
+            },
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_text_thread_with_content_sends_starter_message(self, mock_req, monkeypatch):
+        """Normal threads have no starter-message field — optional content
+        is delivered as the thread's first message after creation."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "11", "type": 0},
+            {"id": "800", "name": "New Thread"},
+            {"id": "5000", "content": "first message"},
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="New Thread",
+            content="first message",
+        ))
+        assert result["success"] is True
+        assert result["starter_message_id"] == "5000"
+        assert mock_req.call_args_list == [
+            call("GET", "/channels/11", "test-token"),
+            call("POST", "/channels/11/threads", "test-token",
+                 body={"name": "New Thread", "auto_archive_duration": 1440, "type": 11}),
+            call("POST", "/channels/800/messages", "test-token",
+                 body={"content": "first message"}),
+        ]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_thread_from_message_with_content(self, mock_req, monkeypatch):
+        """Anchored creation ignores no channel lookup; content still lands
+        in the new thread afterwards."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "801", "name": "Discussion"},
+            {"id": "5001"},
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="Discussion",
+            message_id="1001", content="kickoff note",
+        ))
+        assert result["success"] is True
+        assert result["starter_message_id"] == "5001"
+        assert mock_req.call_args_list == [
+            call("POST", "/channels/11/messages/1001/threads", "test-token",
+                 body={"name": "Discussion", "auto_archive_duration": 1440}),
+            call("POST", "/channels/801/messages", "test-token",
+                 body={"content": "kickoff note"}),
+        ]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_channel_lookup_failure_returns_error_without_creation(self, mock_req, monkeypatch):
+        """If the channel-type lookup fails, no thread creation is attempted."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = DiscordAPIError(404, '{"message": "Unknown Channel"}')
+        result = json.loads(discord_core(action="create_thread", channel_id="99", name="X"))
+        assert "error" in result
+        assert "404" in result["error"]
+        assert mock_req.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +484,16 @@ class TestRegistration:
         """Core + admin actions should cover all known actions."""
         assert set(_CORE_ACTIONS.keys()) | set(_ADMIN_ACTIONS.keys()) == set(_ACTIONS.keys())
         assert set(_CORE_ACTIONS.keys()) & set(_ADMIN_ACTIONS.keys()) == set()
+
+    def test_create_thread_schema_exposes_content_param(self):
+        """The discord tool schema must document the optional content param
+        (starter message / forum post body) so the model can use it."""
+        from tools.discord_tool import _STATIC_CORE_SCHEMA
+        assert _STATIC_CORE_SCHEMA is not None
+        props = _STATIC_CORE_SCHEMA["parameters"]["properties"]
+        assert "content" in props
+        assert props["content"]["type"] == "string"
+        assert "forum" in props["content"]["description"]
 
 
 # ---------------------------------------------------------------------------
