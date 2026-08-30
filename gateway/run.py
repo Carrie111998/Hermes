@@ -16827,11 +16827,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             with _profile_runtime_scope(transport_home):
                 claim_sender_allowed = (
-                    claim["allowed_senders"] is not None
-                    and str(getattr(source, "user_id", "")).strip().lower()
+                    claim["allowed_senders"] is None
+                    or str(getattr(source, "user_id", "")).strip().lower()
                     in claim["allowed_senders"]
                 )
-                if not claim_sender_allowed and not self._is_user_authorized_for_source(source):
+                if not claim_sender_allowed or not self._is_user_authorized_for_source(source):
                     logger.warning(
                         "Unauthorized sender dropped from exclusive inbound claim "
                         "on %s/%s",

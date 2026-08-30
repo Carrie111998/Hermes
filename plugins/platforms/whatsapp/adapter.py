@@ -1361,10 +1361,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 native_type = str(
                                     (event.metadata or {}).get("whatsapp_native_type") or ""
                                 ).lower()
-                                is_poll_update = native_type.startswith("poll")
+                                is_stock_interaction = native_type.startswith(("poll", "reaction"))
                                 claimed = (
                                     False
-                                    if is_poll_update
+                                    if is_stock_interaction
                                     else await self.dispatch_exclusive_inbound(event)
                                 )
                                 # Fire-and-forget: a slow bridge /read must not

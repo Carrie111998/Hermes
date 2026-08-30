@@ -93,8 +93,8 @@ async def test_exact_chat_awaits_one_registered_durable_admission(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_claim_sender_allowlist_authorizes_without_broad_gateway_grant(monkeypatch):
-    runner = _runner(authorized=False)
+async def test_claim_sender_allowlist_and_gateway_authorization_are_both_required(monkeypatch):
+    runner = _runner(authorized=True)
     adapter = _Adapter(_sender_claim())
     manager = PluginManager()
     context = PluginContext(PluginManifest(name="bridge"), manager)
@@ -113,8 +113,20 @@ async def test_claim_sender_allowlist_authorizes_without_broad_gateway_grant(mon
 
 
 @pytest.mark.asyncio
-async def test_claim_sender_allowlist_still_drops_other_sender(monkeypatch):
+async def test_claim_sender_allowlist_cannot_bypass_revoked_gateway_authorization(monkeypatch):
     runner = _runner(authorized=False)
+    adapter = _Adapter(_sender_claim())
+    get_manager = MagicMock()
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
+    runner._configure_exclusive_inbound(adapter)
+
+    assert await adapter.exclusive_handler(_event()) is True
+    get_manager.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_sender_allowlist_still_drops_other_sender(monkeypatch):
+    runner = _runner(authorized=True)
     adapter = _Adapter(_sender_claim())
     get_manager = MagicMock()
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
