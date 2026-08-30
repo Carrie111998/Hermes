@@ -716,6 +716,9 @@ class WebSocketRelayTransport:
     ) -> None:
         """Publish usable-socket transitions to the owning adapter."""
         self._connection_state_handler = handler
+        self._publish_connection_state(
+            self._ws is not None and not self._closing
+        )
 
     def _publish_connection_state(self, connected: bool) -> None:
         handler = getattr(self, "_connection_state_handler", None)

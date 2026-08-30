@@ -956,7 +956,8 @@ class RelayAdapter(BasePlatformAdapter):
         )
         if callable(set_connection_state):
             set_connection_state(self._on_transport_connection_state)
-        self._mark_connected()
+        else:
+            self._mark_connected()
         # Inbound (messages + interrupts) is delivered over the outbound WS via
         # the connector's relay bus — there is NO inbound HTTP endpoint (hosted
         # gateways have no public IP). The transport's reader already dispatches

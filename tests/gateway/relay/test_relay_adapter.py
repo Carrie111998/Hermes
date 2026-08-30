@@ -129,14 +129,23 @@ async def test_send_preserves_transport_retryability():
 
 
 class _LifecycleTransport(_CaptureTransport):
+    def __init__(self, *, drop_after_handshake=False):
+        super().__init__()
+        self.connected = False
+        self.drop_after_handshake = drop_after_handshake
+
     async def connect(self):
+        self.connected = True
         return True
 
     async def handshake(self):
+        if self.drop_after_handshake:
+            self.connected = False
         return make_desc()
 
     def set_connection_state_handler(self, handler):
         self.connection_state_handler = handler
+        handler(self.connected)
 
 
 @pytest.mark.asyncio
@@ -155,6 +164,23 @@ async def test_transport_reconnect_updates_adapter_readiness():
 
     assert adapter.is_connected
     assert states == [True, False, True]
+
+
+@pytest.mark.asyncio
+async def test_connect_replays_drop_between_handshake_and_handler_install():
+    transport = _LifecycleTransport(drop_after_handshake=True)
+    adapter = RelayAdapter(PlatformConfig(), make_desc(), transport=transport)
+    states = []
+    adapter._set_deferred_transport_ready = lambda ready: states.append(ready)
+
+    assert await adapter.connect()
+
+    assert not adapter.is_connected
+    assert states == [False]
+
+    transport.connection_state_handler(True)
+    assert adapter.is_connected
+    assert states == [False, True]
 
 
 def _make_event(chat_id="chan-1", scope_id="scope-9"):

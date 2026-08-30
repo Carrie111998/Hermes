@@ -322,7 +322,7 @@ async def test_send_after_drop_with_reconnect_disabled_fails_fast():
     await _run_reader_to_exit(t, fake)
 
     assert t._ws is None, "dead socket handle must not survive the reader"
-    assert connection_states == [False]
+    assert connection_states == [True, False]
 
     result = await asyncio.wait_for(
         t.send_outbound({"op": "send_message", "text": "hi"}), timeout=2.0

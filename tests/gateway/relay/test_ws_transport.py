@@ -107,10 +107,10 @@ async def test_handshake_negotiates_descriptor(server):
         hello = next(f for f in server.received if f["type"] == "hello")
         assert hello["platform"] == "discord"
         assert hello["botId"] == "appShared"
-        assert connection_states == [True]
+        assert connection_states == [False, True]
     finally:
         await t.disconnect()
-    assert connection_states == [True, False]
+    assert connection_states == [False, True, False]
 
 
 @pytest.mark.asyncio
@@ -210,4 +210,3 @@ async def test_4401_after_handshake_is_terminal_no_reconnect():
     finally:
         await t.disconnect()
         await srv.stop()
-
