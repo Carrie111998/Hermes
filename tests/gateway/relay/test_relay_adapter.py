@@ -128,6 +128,27 @@ async def test_send_preserves_transport_retryability():
     assert result.retryable
 
 
+@pytest.mark.asyncio
+async def test_text_sends_preserve_transport_ambiguity():
+    t = _CaptureTransport()
+
+    async def lost_ack(_action, *, platform=None):
+        return {
+            "success": False,
+            "error": "relay transport connection lost",
+            "ambiguous": True,
+        }
+
+    t.send_outbound = lost_ack
+    t._identities = [(Platform.TELEGRAM.value, "bot")]
+    adapter = RelayAdapter(PlatformConfig(), make_desc(), transport=t)
+
+    assert (await adapter.send("chat", "prompt")).ambiguous
+    assert (
+        await adapter.send_for_platform(Platform.TELEGRAM, "chat", "prompt")
+    ).ambiguous
+
+
 class _LifecycleTransport(_CaptureTransport):
     def __init__(self, *, drop_after_handshake=False):
         super().__init__()

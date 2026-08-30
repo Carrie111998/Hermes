@@ -1891,6 +1891,7 @@ class RelayAdapter(BasePlatformAdapter):
             message_id=result.get("message_id"),
             error=result.get("error"),
             retryable=bool(result.get("retryable")),
+            ambiguous=bool(result.get("ambiguous")),
             raw_response=result,
         )
 
@@ -2101,6 +2102,7 @@ class RelayAdapter(BasePlatformAdapter):
             message_id=result.get("message_id"),
             error=result.get("error"),
             retryable=bool(result.get("retryable")),
+            ambiguous=bool(result.get("ambiguous")),
         )
 
     def auto_thread_info_for_chat(

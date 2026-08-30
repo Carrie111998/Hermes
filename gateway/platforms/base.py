@@ -2603,6 +2603,10 @@ class SendResult:
     # stream consumer can send the missing tail instead of marking a clipped
     # response complete.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # True when a non-idempotent send may have reached the provider but its
+    # acknowledgement was lost. Retrying or formatting-fallback would risk a
+    # duplicate, so _send_with_retry returns these failures unchanged.
+    ambiguous: bool = False
     # Server-requested retry delay in seconds (e.g. Telegram FloodWait retry_after).
     # When present, _send_with_retry() honors this instead of its default backoff.
     retry_after: Optional[float] = None
@@ -5832,6 +5836,9 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
+            return result
+
+        if result.ambiguous:
             return result
 
         error_str = result.error or ""

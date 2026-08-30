@@ -123,6 +123,26 @@ class TestSendWithRetryNetworkRetry:
         assert not result.success
         assert len(adapter._send_calls) == 1
 
+    @pytest.mark.asyncio
+    async def test_ambiguous_failure_is_never_retried_or_reformatted(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="relay transport connection lost",
+                ambiguous=True,
+            ),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry(
+                "chat1", "hello", max_retries=3, base_delay=0
+            )
+
+        mock_sleep.assert_not_called()
+        assert result.ambiguous
+        assert len(adapter._send_calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # _send_with_retry — all retries exhausted → user notification
@@ -205,4 +225,3 @@ class TestSendWithRetryAfter:
         # Second sleep should use the retry_after from the second result
         second_sleep = mock_sleep.call_args_list[1][0][0]
         assert second_sleep >= 29.0  # 30 - 1 (max jitter)
-
