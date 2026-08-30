@@ -4898,11 +4898,40 @@ def _cron_sig():
 
 
 def _sessions_sig():
-    """Newest mtime across state.db and its WAL — the cross-process change
-    signal. Messaging-gateway turns and cron runs are written by OTHER
-    processes that never touch this gateway's transports; the shared SQLite
-    file is the one thing they all move (#58671)."""
+    """Highest ``last_activity_at`` across the sessions table.
+
+    The ``state.db`` file mtime used previously flipped on EVERY db write,
+    including the cross-backend heartbeat that refreshes
+    ``gateway_heartbeats`` every 60 s (#94895).  Those ghost writes
+    produced a ``sessions.changed`` broadcast with no real session change,
+    and the desktop remounted the chat on every one of them — yanking the
+    transcript scroll back to the bottom on a 60 s idle beat (#38015
+    gateway half, #98005).
+
+    Querying the sessions table instead filters out heartbeat-only writes:
+    they don't touch any ``last_activity_at`` column so the signature
+    remains stable between real changes.  Fall back to the mtime-based
+    signature when the table read is unavailable (first startup before the
+    table exists or a corrupt DB in recovery).
+    """
     home = _watcher_home()
+    try:
+        import sqlite3
+
+        db = sqlite3.connect(
+            f"file:{home / 'state.db'}?mode=ro", uri=True, timeout=5
+        )
+        try:
+            row = db.execute(
+                "SELECT COALESCE(MAX(last_activity_at), '') FROM sessions"
+            ).fetchone()
+        finally:
+            db.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    # Graceful fallback — same mtime-based signal as before.
     sig = None
     for name in ("state.db", "state.db-wal"):
         try:

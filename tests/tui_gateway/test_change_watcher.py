@@ -262,3 +262,48 @@ def test_broken_probe_never_kills_the_pass(watcher_home, monkeypatch):
 
     # The broken cron probe is skipped; sessions still broadcasts.
     assert ("sessions.changed", {}) in events
+
+
+def test_heartbeat_only_write_does_not_broadcast_sessions_changed(watcher_home):
+    """A gateway_heartbeats write bumps state.db mtime but no session row —
+    the new table-based signature must NOT broadcast on that ghost write
+    (#98005)."""
+    home, events = watcher_home
+    import sqlite3
+
+    db_path = home / "state.db"
+
+    # Bootstrap a real SQLite db with the two tables the signal
+    # probes — no session rows yet, so MAX(last_activity_at) is NULL
+    # and the fallback handles it.
+    db = sqlite3.connect(str(db_path))
+    db.execute("CREATE TABLE sessions (last_activity_at TEXT)")
+    db.execute("CREATE TABLE gateway_heartbeats (profile TEXT)")
+    db.execute("INSERT INTO gateway_heartbeats VALUES ('default')")
+    db.commit()
+    db.close()
+
+    server._broadcast_watched_changes(now=0.0)
+
+    # Bump only the heartbeat table — no session row touched.
+    db2 = sqlite3.connect(str(db_path))
+    db2.execute(
+        "UPDATE gateway_heartbeats SET profile='default' WHERE profile='default'"
+    )
+    db2.commit()
+    db2.close()
+    server._broadcast_watched_changes(now=10.0)
+
+    assert ("sessions.changed", {}) not in events
+
+    # A real session activity must still fire.
+    db3 = sqlite3.connect(str(db_path))
+    db3.execute(
+        "INSERT INTO sessions (last_activity_at) "
+        "VALUES ('2026-08-29T12:00:00Z')"
+    )
+    db3.commit()
+    db3.close()
+    server._broadcast_watched_changes(now=20.0)
+
+    assert ("sessions.changed", {}) in events
