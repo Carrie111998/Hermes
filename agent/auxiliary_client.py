@@ -9218,7 +9218,13 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
+        # A host timeout revokes the compression fence before detaching the
+        # worker. Stop consuming the provider stream as soon as its next event
+        # arrives so empty keepalives cannot keep a cancelled logical attempt
+        # alive (or trigger fallback calls) until the much larger wire ceiling.
+        cancel_check = _capture_aux_cancel_check()
+        if callable(cancel_check) and _captured_aux_cancel_requested(cancel_check):
+            raise AuxiliaryExplicitCancellation()
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -9249,7 +9255,16 @@ class _ChatStreamAccumulator:
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
-        for tc in (getattr(delta, "tool_calls", None) or []):
+        tool_call_deltas = getattr(delta, "tool_calls", None) or []
+        # Only model output is forward progress. OpenAI-compatible relays may
+        # emit empty SSE keepalive chunks indefinitely; counting those as
+        # progress resets the host's inactivity timer and turns a 120-second
+        # no-output budget into the full 600-second compression ceiling.
+        # Reasoning and tool-call deltas are genuine generation and continue
+        # to keep slow-but-working models alive.
+        if piece or reasoning_piece or tool_call_deltas:
+            _notify_aux_progress()
+        for tc in tool_call_deltas:
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
                 idx, {"id": "", "name": "", "arguments": []}

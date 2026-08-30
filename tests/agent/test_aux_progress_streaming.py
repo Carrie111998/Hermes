@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.auxiliary_client import (
+    AuxiliaryExplicitCancellation,
     _acreate_with_stream,
     _aggregate_chat_stream,
     _aggregate_chat_stream_async,
@@ -22,6 +23,7 @@ from agent.auxiliary_client import (
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
+    aux_interrupt_protection,
     aux_progress_hook,
 )
 from agent.conversation_compression import CompressionCommitFence
@@ -131,8 +133,27 @@ class TestCreateWithProgress:
         assert result.choices[0].message.reasoning == "thinking..."
         assert result.choices[0].finish_reason == "stop"
         assert result.usage.total_tokens == 7
-        # 1 dispatch tick + 1 per chunk
+        # 1 dispatch tick + 1 per content/reasoning chunk
         assert len(ticks) >= len(chunks) + 1
+
+    def test_empty_keepalive_chunks_do_not_reset_progress_timeout(self):
+        chunks = [
+            SimpleNamespace(id="keepalive", model="m1", choices=[], usage=None),
+            _chunk(content=None),
+            _chunk(content="summary", finish_reason="stop"),
+        ]
+        client = _FakeClient(stream_chunks=chunks)
+        ticks = []
+
+        with aux_progress_hook(lambda: ticks.append(1)):
+            result = _create_with_progress(
+                client, {"model": "m1", "messages": [], "timeout": 30},
+            )
+
+        assert result.choices[0].message.content == "summary"
+        # Request dispatch and the actual summary token count as progress;
+        # empty SSE keepalives must not keep a stalled attempt alive.
+        assert len(ticks) == 2
 
     def test_streaming_rejected_falls_back_to_plain_call(self):
         client = _FakeClient(
@@ -177,6 +198,27 @@ class TestAggregateChatStream:
         assert tool_calls[0].function.name == "do_thing"
         assert tool_calls[0].function.arguments == '{"a": 1}'
         assert result.choices[0].finish_reason == "tool_calls"
+
+    def test_cancelled_compression_stops_keepalive_stream(self):
+        closed = []
+        fence = CompressionCommitFence()
+        assert fence.try_cancel_before_commit() is True
+
+        class _KeepaliveStream:
+            def __iter__(self):
+                while True:
+                    yield SimpleNamespace(
+                        id="keepalive", model="m1", choices=[], usage=None
+                    )
+
+            def close(self):
+                closed.append(True)
+
+        with aux_interrupt_protection(cancel_check=lambda: fence.is_cancelled):
+            with pytest.raises(AuxiliaryExplicitCancellation):
+                _aggregate_chat_stream(_KeepaliveStream())
+
+        assert closed == [True]
 
 
     def test_stream_close_is_called(self):

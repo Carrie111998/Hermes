@@ -51,6 +51,7 @@ def _make_agent(
     agent.tool_progress_callback = None
     agent._compression_warning = None
     agent._aux_compression_context_length_config = None
+    agent._config_context_length = None
     agent._custom_providers = []
     agent.tools = []
 
@@ -192,6 +193,48 @@ def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ct
         provider="openrouter",
         custom_providers=[],
     )
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=1_048_576)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_inherited_aux_route_reuses_main_context_override(mock_get_client, mock_ctx_len):
+    """An aux route inherited from main must share its explicit context pin."""
+    agent = _make_agent(main_context=1_048_576, threshold_percent=0.50)
+    agent.model = "glm-5.3-flash"
+    agent.provider = "custom"
+    agent.base_url = "https://relay.example.invalid/v1"
+    agent._config_context_length = 1_048_576
+    mock_client = MagicMock()
+    mock_client.base_url = "https://relay.example.invalid/v1/"
+    mock_client.api_key = "sk-custom"
+    mock_get_client.return_value = (mock_client, "glm-5.3-flash")
+
+    agent._emit_status = lambda msg: None
+    agent._check_compression_model_feasibility()
+
+    assert mock_ctx_len.call_args.kwargs["config_context_length"] == 1_048_576
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=256_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_distinct_aux_route_does_not_reuse_main_context_override(
+    mock_get_client, mock_ctx_len
+):
+    """A separately routed aux model must resolve its own context window."""
+    agent = _make_agent(main_context=1_048_576, threshold_percent=0.50)
+    agent.model = "glm-5.3-flash"
+    agent.provider = "custom"
+    agent.base_url = "https://relay.example.invalid/v1"
+    agent._config_context_length = 1_048_576
+    mock_client = MagicMock()
+    mock_client.base_url = "https://aux.example.invalid/v1"
+    mock_client.api_key = "sk-aux"
+    mock_get_client.return_value = (mock_client, "summary-model")
+
+    agent._emit_status = lambda msg: None
+    agent._check_compression_model_feasibility()
+
+    assert mock_ctx_len.call_args.kwargs["config_context_length"] is None
 
 
 

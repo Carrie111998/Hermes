@@ -1760,11 +1760,32 @@ def check_compression_model_feasibility(agent: Any) -> None:
         _raw_aux_key = getattr(client, "api_key", "")
         aux_api_key = "" if (callable(_raw_aux_key) and not isinstance(_raw_aux_key, str)) else str(_raw_aux_key or "")
 
+        # When auxiliary.compression inherits the exact main runtime, its
+        # context window has the same source of truth as the main request.
+        # Reusing only the auxiliary-specific override here made a configured
+        # model.context_length disappear at the feasibility boundary: the main
+        # compressor used the explicit value while this probe fell back to the
+        # generic custom-endpoint tier. Besides contradictory telemetry, that
+        # could lower the live compression threshold to a value the user had
+        # explicitly overridden. A separately routed aux model must still
+        # resolve independently.
+        aux_context_override = getattr(
+            agent, "_aux_compression_context_length_config", None
+        )
+        same_model = str(aux_model or "").strip() == str(
+            getattr(agent, "model", "") or ""
+        ).strip()
+        same_route = str(aux_base_url or "").rstrip("/") == str(
+            getattr(agent, "base_url", "") or ""
+        ).rstrip("/")
+        if aux_context_override is None and same_model and same_route:
+            aux_context_override = getattr(agent, "_config_context_length", None)
+
         aux_context = get_model_context_length(
             aux_model,
             base_url=aux_base_url,
             api_key=aux_api_key,
-            config_context_length=getattr(agent, "_aux_compression_context_length_config", None),
+            config_context_length=aux_context_override,
             # Each model must be resolved with its own provider so that
             # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
             # are invoked for the correct client, not inherited from the main model.
@@ -3150,6 +3171,13 @@ def compress_context(
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
         # Event atomically; never infer cause from the racy message fields.
         _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+
+        def _compression_cancel_requested() -> bool:
+            return bool(
+                (_hard_cancel_event is not None and _hard_cancel_event.is_set())
+                or (commit_fence is not None and commit_fence.is_cancelled)
+            )
+
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -3162,7 +3190,7 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_check=_compression_cancel_requested
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
