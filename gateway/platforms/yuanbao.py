@@ -1143,14 +1143,21 @@ class RecallGuardMiddleware(InboundMiddleware):
             for _ in range(30):
                 await asyncio.sleep(0.5)
                 try:
-                    transcript = store.load_transcript(sid)
+                    transcript, revision = store.load_transcript(
+                        sid, with_revision=True
+                    )
                 except Exception:
                     continue
                 for entry in transcript:
                     if entry.get("role") == "user" and entry.get("content") == recalled_text:
                         entry["content"] = cls._REDACTED
                         try:
-                            store.rewrite_transcript(sid, transcript, active_only=True)
+                            store.rewrite_transcript(
+                                sid,
+                                transcript,
+                                active_only=True,
+                                expected_revision=revision,
+                            )
                             logger.info("[%s] Recall redact: session %s", adapter.name, session_key[:30])
                         except Exception as exc:
                             logger.warning("[%s] Recall redact failed: %s", adapter.name, exc)
@@ -1182,7 +1189,9 @@ class RecallGuardMiddleware(InboundMiddleware):
         # for any message that was observed with one — Branch A1 (exact id
         # match) is the canonical path again.
         try:
-            transcript = store.load_transcript(sid)
+            transcript, revision = store.load_transcript(
+                sid, with_revision=True
+            )
         except Exception as exc:
             logger.warning("[%s] Recall: failed to load transcript: %s", adapter.name, exc)
             return
@@ -1210,7 +1219,12 @@ class RecallGuardMiddleware(InboundMiddleware):
         if target is not None:
             target["content"] = cls._REDACTED
             try:
-                store.rewrite_transcript(sid, transcript, active_only=True)
+                store.rewrite_transcript(
+                    sid,
+                    transcript,
+                    active_only=True,
+                    expected_revision=revision,
+                )
                 logger.info("[%s] Recall: redacted msg_id=%s (%s)", adapter.name, recalled_id, branch_label)
             except Exception as exc:
                 logger.warning("[%s] Recall: rewrite_transcript failed: %s", adapter.name, exc)
