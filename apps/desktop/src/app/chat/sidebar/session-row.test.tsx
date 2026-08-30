@@ -478,6 +478,7 @@ describe('Inbox-style session card', () => {
     expect(workspace.className).toMatch(/\btruncate\b/)
     // The fixed 74px card estimate accounts for a bounded two-line, 13px title.
     expect(title!.className).toMatch(/\bline-clamp-2\b/)
+    expect(title!.className).toMatch(/\bbreak-words\b/)
     expect(title!.className).toMatch(/\bleading-none\b/)
     expect(title!.className).not.toMatch(/\btruncate\b/)
     expect(screen.getByText('133 messages')).toBeTruthy()
