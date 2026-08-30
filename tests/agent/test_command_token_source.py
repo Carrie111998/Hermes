@@ -489,25 +489,30 @@ class Test98831Beyond97217:
     97217 blocks direct shells + 12 wrappers + shell syntax. 98831 adds:
     bwrap/firejail/flatpak/nsenter/chroot/proot/docker/podman/runc/crun,
     capsh/su/sg/systemd-run/unshare/fakeroot, LOLBins (rundll32/regsvr32/mshta),
-    env-prefix, length/token/control-char limits, and warning audit trail.
-    Each test is a pre-effect regression: monkeypatched subprocess.run must
-    NOT be called (fails if process creation occurs).
+    length/token/control-char limits, and warning audit trail.
+    Each blocked test is a pre-effect process-boundary regression: it drives
+    _mint() with subprocess.run monkeypatched to fail if reached. Each allowed
+    test drives _mint() with a fake runner and asserts exact argv + shell=False.
     """
 
-    def _assert_blocked(self, monkeypatch, command: str):
-        """Helper: command must be rejected before subprocess.run."""
+    def _assert_blocked_via_mint(self, monkeypatch, caplog, command: str, expect_log: str | None = None):
+        """Helper: command must be rejected BEFORE subprocess.run (pre-effect)."""
         called = {}
 
         def fake_run(*a, **k):
             called["ran"] = True
-            return SimpleNamespace(returncode=0, stdout="tok", stderr="")
+            raise AssertionError(f"{command!r} reached subprocess.run — must be rejected pre-effect")
 
         monkeypatch.setattr("agent.command_token_source.subprocess.run", fake_run)
+        caplog.clear()
         with pytest.raises(CommandTokenError):
-            _parse_command_argv(command, "test")
+            _mint(command, "test")
         assert "ran" not in called, f"{command!r} should not reach subprocess.run"
+        if expect_log:
+            # warning audit trail (SOC visibility) must be observable
+            assert expect_log in caplog.text, f"expected warning {expect_log!r} not in caplog: {caplog.text!r}"
 
-    def test_extended_wrappers_blocked(self, monkeypatch):
+    def test_extended_wrappers_blocked(self, monkeypatch, caplog):
         for cmd in [
             "bwrap --ro-bind / / helper",
             "firejail helper --arg",
@@ -527,9 +532,9 @@ class Test98831Beyond97217:
             "fakeroot helper",
             "fakechroot helper",
         ]:
-            self._assert_blocked(monkeypatch, cmd)
+            self._assert_blocked_via_mint(monkeypatch, caplog, cmd, expect_log="blocked wrapper")
 
-    def test_lolbins_blocked(self, monkeypatch):
+    def test_lolbins_blocked(self, monkeypatch, caplog):
         for cmd in [
             "rundll32 javascript:evil",
             "rundll32.exe javascript:evil",
@@ -538,48 +543,72 @@ class Test98831Beyond97217:
             "mshta http://evil",
             "mshta.exe http://evil",
         ]:
-            self._assert_blocked(monkeypatch, cmd)
+            self._assert_blocked_via_mint(monkeypatch, caplog, cmd, expect_log="blocked LOLBin")
 
-    def test_busybox_without_exe_blocked(self, monkeypatch):
+    def test_busybox_without_exe_blocked(self, monkeypatch, caplog):
         # 97217 had busybox.exe but not busybox (POSIX); 98831 fixes
-        self._assert_blocked(monkeypatch, "busybox sh -c 'echo hi'")
-        self._assert_blocked(monkeypatch, "busybox --help")
+        self._assert_blocked_via_mint(monkeypatch, caplog, "busybox sh -c 'echo hi'", expect_log="blocked shell")
+        self._assert_blocked_via_mint(monkeypatch, caplog, "busybox --help", expect_log="blocked shell")
 
-    def test_env_prefix_blocked(self, monkeypatch):
-        self._assert_blocked(monkeypatch, "FOO=bar helper --arg")
-        self._assert_blocked(monkeypatch, "AWS_PROFILE=prod my-auth-cli token")
-
-    def test_length_and_token_limits(self, monkeypatch):
+    def test_length_and_token_limits(self, monkeypatch, caplog):
         # _MAX_COMMAND_CHARS=4096, _MAX_ARGV_TOKENS=64
         long_cmd = "helper " + "x" * 5000
-        self._assert_blocked(monkeypatch, long_cmd)
+        self._assert_blocked_via_mint(monkeypatch, caplog, long_cmd)
         many_tokens = "helper " + " ".join(f"arg{i}" for i in range(70))
-        self._assert_blocked(monkeypatch, many_tokens)
+        self._assert_blocked_via_mint(monkeypatch, caplog, many_tokens)
 
-    def test_control_chars_blocked(self, monkeypatch):
-        self._assert_blocked(monkeypatch, "helper\x00injected")
-        self._assert_blocked(monkeypatch, "helper\x01bad")
-        self._assert_blocked(monkeypatch, "helper\rbad")
-        self._assert_blocked(monkeypatch, "helper\nbad")
+    def test_control_chars_blocked(self, monkeypatch, caplog):
+        self._assert_blocked_via_mint(monkeypatch, caplog, "helper\x00injected")
+        self._assert_blocked_via_mint(monkeypatch, caplog, "helper\x01bad")
+        self._assert_blocked_via_mint(monkeypatch, caplog, "helper\rbad")
+        self._assert_blocked_via_mint(monkeypatch, caplog, "helper\nbad")
 
     def test_legitimate_helpers_still_allowed(self, monkeypatch):
-        # Allowed-case controls: these must NOT be blocked (97217 parity)
-        allowed = {}
+        # Allowed-case positive execution controls: must reach subprocess.run
+        # with exact argv and shell=False and return the token.
+        cases = [
+            ("my-auth-cli print-token --profile prod", ["my-auth-cli", "print-token", "--profile", "prod"]),
+            ("python my-helper.py --arg", ["python", "my-helper.py", "--arg"]),
+            ("/usr/local/bin/helper --config /tmp/x", ["/usr/local/bin/helper", "--config", "/tmp/x"]),
+        ]
+        # Windows native quoting preserves backslashes; on POSIX shlex mangles
+        # C:\tmp -> C:tmp, so only assert the Windows exe case on Windows.
+        if sys.platform == "win32":
+            cases.append(('"C:\\Program Files\\helper.exe" --path C:\\tmp\\token', ["C:\\Program Files\\helper.exe", "--path", "C:\\tmp\\token"]))
+        for cmd, expected_argv in cases:
+            seen = {}
 
-        def fake_run(argv, **k):
-            allowed["argv"] = argv
-            return SimpleNamespace(returncode=0, stdout="tok", stderr="")
+            def fake_run(argv, **kwargs):
+                seen["argv"] = argv
+                seen["shell"] = kwargs.get("shell")
+                return SimpleNamespace(returncode=0, stdout="tok", stderr="")
 
-        monkeypatch.setattr("agent.command_token_source.subprocess.run", fake_run)
-        # Real helpers
-        for cmd, expected_first in [
-            ("my-auth-cli print-token --profile prod", "my-auth-cli"),
-            ("python my-helper.py --arg", "python"),
-            ("/usr/local/bin/helper --config /tmp/x", "/usr/local/bin/helper"),
-            ('"C:\\Program Files\\helper.exe" --path C:\\tmp\\token', "C:\\Program Files\\helper.exe"),
-        ]:
-            # Use _mint via fake_run to verify argv without shell
-            argv = _parse_command_argv(cmd, "test")
-            assert argv[0] == expected_first
-            # Ensure it would run (not blocked)
-            assert _parse_command_argv(cmd, "test") == argv
+            monkeypatch.setattr("agent.command_token_source.subprocess.run", fake_run)
+            result = _mint(cmd, "test")
+            assert result == ("tok", None), f"{cmd!r} should mint tok"
+            assert seen["argv"] == expected_argv, f"{cmd!r} argv mismatch"
+            assert seen["shell"] is False, f"{cmd!r} must use shell=False"
+
+    def test_executable_path_with_equals_allowed(self, monkeypatch):
+        # argv contract must not reserve "=": ./auth=prod, bin/auth=prod,
+        # and Windows C:\Tools\auth=prod.exe are valid executable names.
+        cases = [
+            ("./auth=prod --token", "./auth=prod"),
+            ("bin/auth=prod --flag", "bin/auth=prod"),
+            ("/opt/auth=prod/helper --x", "/opt/auth=prod/helper"),
+        ]
+        if sys.platform == "win32":
+            cases.append(('"C:\\Tools\\auth=prod.exe" --arg', "C:\\Tools\\auth=prod.exe"))
+        for cmd, expected_first in cases:
+            seen = {}
+
+            def fake_run(argv, **kwargs):
+                seen["argv"] = argv
+                seen["shell"] = kwargs.get("shell")
+                return SimpleNamespace(returncode=0, stdout="tok-equals", stderr="")
+
+            monkeypatch.setattr("agent.command_token_source.subprocess.run", fake_run)
+            result = _mint(cmd, "test")
+            assert result == ("tok-equals", None)
+            assert seen["argv"][0] == expected_first
+            assert seen["shell"] is False

@@ -176,13 +176,12 @@ def _reject_shell_launcher(argv: list[str], label: str) -> None:
             f"key_cmd for provider {label!r} cannot launch interpreter {executable!r}; "
             "use a standalone credential helper"
         )
-    # 98831 beyond 97217: env-prefix injection (FOO=bar cmd) is a wrapper bypass
-    if "=" in argv[0] and not argv[0].startswith("/"):
-        # e.g. "AWS_PROFILE=prod my-helper" — treat as env wrapper
-        raise CommandTokenError(
-            f"key_cmd for provider {label!r} cannot use env-prefix syntax; "
-            "pass environment via the helper's own config"
-        )
+    # env-prefix (FOO=bar helper) is shell syntax, but after native
+    # argv parsing + shell=False, "FOO=bar" is just a program name
+    # (e.g. ./auth=prod, bin/auth=prod, C:\Tools\auth=prod.exe are valid
+    # executables). Blocking "=" here incorrectly reserves a filename char.
+    # Structured env policy belongs outside the command string (future
+    # externally-anchored allowlist), not in this argv gate.
 
 
 def _has_unquoted_shell_syntax_posix(command: str) -> bool:
