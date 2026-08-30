@@ -32,8 +32,8 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +107,6 @@ class HeartbeatState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
-    # Originating platform/chat/thread (gateway only). Lets the gateway
-    # rebuild a MessageEvent source and re-arm the in-memory watch after a
-    # restart, instead of requiring the user to touch /heartbeat again.
-    route: Dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -118,7 +114,6 @@ class HeartbeatState:
     @classmethod
     def from_json(cls, raw: str) -> "HeartbeatState":
         data = json.loads(raw)
-        route = data.get("route")
         return cls(
             prompt=str(data.get("prompt") or ""),
             interval_seconds=int(data.get("interval_seconds", 0) or 0),
@@ -126,7 +121,6 @@ class HeartbeatState:
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_fired_at=float(data.get("last_fired_at", 0.0) or 0.0),
             fire_count=int(data.get("fire_count", 0) or 0),
-            route=route if isinstance(route, dict) else {},
         )
 
     def is_due(self, now: Optional[float] = None) -> bool:
@@ -209,7 +203,11 @@ def list_active_heartbeats() -> List[Tuple[str, HeartbeatState]]:
     Used by the gateway at startup to re-arm ``_heartbeat_watch`` from
     persisted state — the in-memory watch is empty on every process boot,
     so without this an active heartbeat is orphaned (state survives in the
-    DB, but nothing polls it) until the user runs /heartbeat again.
+    DB, but nothing polls it) until the user runs /heartbeat again. The
+    gateway resolves routing for each session via the durable
+    ``SessionEntry.origin`` (see ``_gateway_session_origin_for_id``), so
+    this list only needs to report which sessions are active — not carry
+    routing of its own.
     Best-effort: any DB error yields ``[]``.
     """
     db = _get_session_db()
@@ -278,12 +276,7 @@ class HeartbeatManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(
-        self,
-        prompt: str,
-        interval_seconds: int,
-        route: Optional[Dict[str, str]] = None,
-    ) -> HeartbeatState:
+    def set(self, prompt: str, interval_seconds: int) -> HeartbeatState:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("heartbeat prompt is empty")
@@ -295,7 +288,6 @@ class HeartbeatManager:
             interval_seconds=interval_seconds,
             status="active",
             created_at=time.time(),
-            route=dict(route or {}),
         )
         self._state = state
         save_heartbeat(self.session_id, state)

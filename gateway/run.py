@@ -22982,20 +22982,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         The watch dict is process-memory only and starts empty on every
         gateway boot, so an active heartbeat set before a restart would
         otherwise be orphaned — its state survives in SessionDB, but nothing
-        polls it — until the user ran /heartbeat again. Gateway heartbeats
-        persist their originating platform/chat/thread in
-        ``HeartbeatState.route`` (mirrors /loop's restart recovery via
-        ``_loop_wakeup_watcher``), so this rebuilds the watch without any
-        user interaction.
+        polls it — until the user ran /heartbeat again. Routing is resolved
+        through ``_gateway_session_origin_for_id``, the same durable,
+        fully-qualified ``SessionEntry.origin`` lookup ``/resume`` already
+        relies on, rather than a heartbeat-local routing snapshot — so this
+        also recovers heartbeats that predate this fix (nothing to persist
+        up front) and stays correct for profile/workspace-qualified
+        sessions.
 
         Like ``_loop_wakeup_watcher``, this is a ``while self._running``
         ticker rather than a one-shot scan: a transient failure on any
-        given tick (adapter not yet connected, session_store not yet warm)
-        would otherwise orphan that heartbeat for the rest of the process's
-        life, with nothing left to retry it. Each tick only touches
-        sessions not already present in ``_heartbeat_watch``, so a heartbeat
-        that's already re-armed is left alone. A CLI-owned heartbeat carries
-        no route and is driven by its own watchdog thread instead.
+        given tick (session_store not yet warm) would otherwise orphan that
+        heartbeat for the rest of the process's life, with nothing left to
+        retry it. Each tick only touches sessions not already present in
+        ``_heartbeat_watch``, so a heartbeat that's already re-armed is left
+        alone. A session with no persisted origin (CLI-only) is left to its
+        own watchdog thread instead.
         """
         await asyncio.sleep(5)  # let platforms finish connecting
         while self._running:
@@ -23005,24 +23007,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._warm_goals_session_db("heartbeat resume")
                 watch = getattr(self, "_heartbeat_watch", None) or {}
                 resumed_sids = {sid for _source, sid in watch.values()}
-                for sid, state in list_active_heartbeats():
+                for sid, _state in list_active_heartbeats():
                     if sid in resumed_sids:
                         continue
-                    route = state.route or {}
-                    platform_name = route.get("platform", "")
-                    chat_id = route.get("chat_id", "")
-                    if not platform_name or not chat_id:
-                        continue
-                    evt_stub = {
-                        "session_key": "",
-                        "platform": platform_name,
-                        "chat_id": chat_id,
-                        "chat_type": route.get("chat_type", ""),
-                        "thread_id": route.get("thread_id", ""),
-                        "user_id": route.get("user_id", ""),
-                        "user_name": route.get("user_name", ""),
-                    }
-                    source = self._build_process_event_source(evt_stub)
+                    source = self._gateway_session_origin_for_id(sid)
                     if source is None:
                         continue
                     try:

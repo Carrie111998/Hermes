@@ -1,5 +1,6 @@
 """Tests for /heartbeat (hermes_cli/heartbeat.py)."""
 
+import json
 import time
 
 import pytest
@@ -206,24 +207,38 @@ def test_migrate_noop_without_source():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# restart recovery — route persistence + list_active_heartbeats
+# restart recovery — list_active_heartbeats
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_state_roundtrip_defaults_route_to_empty_dict():
+def test_state_roundtrip_has_no_route_field():
+    """Routing lives in ``SessionEntry.origin`` (gateway/run.py), not on
+    ``HeartbeatState`` — this used to be a heartbeat-local snapshot that
+    dropped profile/scope qualifiers and left pre-existing rows unable to
+    recover after upgrading. See gateway/run.py::_gateway_session_origin_for_id.
+    """
     s = HeartbeatState(prompt="check CI", interval_seconds=600)
-    assert s.route == {}
+    assert not hasattr(s, "route")
     loaded = HeartbeatState.from_json(s.to_json())
-    assert loaded.route == {}
+    assert not hasattr(loaded, "route")
 
 
-def test_manager_set_persists_route_across_instances():
-    route = {"platform": "telegram", "chat_id": "12345"}
-    mgr = HeartbeatManager(session_id="hb-route-sid")
-    mgr.set("watch it", 600, route=route)
-
-    again = HeartbeatManager(session_id="hb-route-sid")
-    assert again.state.route == route
+def test_state_roundtrip_ignores_legacy_route_key():
+    """A row persisted by a prior build of this fix carried a ``route`` key
+    in its JSON; loading it must not choke, and the field is simply dropped
+    since routing is now resolved from SessionEntry.origin instead.
+    """
+    raw = json.dumps(
+        {
+            "prompt": "check CI",
+            "interval_seconds": 600,
+            "status": "active",
+            "route": {"platform": "telegram", "chat_id": "999"},
+        }
+    )
+    loaded = HeartbeatState.from_json(raw)
+    assert loaded.prompt == "check CI"
+    assert not hasattr(loaded, "route")
 
 
 def test_list_active_heartbeats(hermes_home):
@@ -237,16 +252,13 @@ def test_list_active_heartbeats(hermes_home):
     assert "hb-b" not in active
 
 
-def test_list_active_heartbeats_carries_route_for_restart_recovery(hermes_home):
-    """The gateway rebuilds its in-memory watch from this on every boot.
-
-    Without a persisted route, a heartbeat set on a gateway platform has no
-    way to resume firing after the process restarts (the in-memory
-    ``_heartbeat_watch`` registry starts empty on every boot) short of the
-    user re-touching /heartbeat.
+def test_list_active_heartbeats_reports_a_legacy_row_with_no_route(hermes_home):
+    """A heartbeat set before this fix landed (or with no gateway routing at
+    all) must still show up as active — the gateway resolves its routing
+    separately, from SessionEntry.origin keyed by session_id, so there is
+    nothing route-shaped this list needs to carry.
     """
-    route = {"platform": "telegram", "chat_id": "999", "user_id": "42"}
-    HeartbeatManager(session_id="hb-gateway-sid").set("watch deploy", 600, route=route)
+    HeartbeatManager(session_id="hb-legacy-sid").set("watch deploy", 600)
 
     active = dict(list_active_heartbeats())
-    assert active["hb-gateway-sid"].route == route
+    assert "hb-legacy-sid" in active

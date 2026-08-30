@@ -5,6 +5,14 @@ orphaning the heartbeat forever, and that the resulting watch entry lets a
 due heartbeat fire through the real poller — not just that the CLI-layer
 persistence (hermes_cli/heartbeat.py) round-trips.
 
+Routing is resolved via ``_gateway_session_origin_for_id`` — the same
+durable ``SessionEntry.origin`` lookup ``/resume`` already relies on —
+rather than a heartbeat-local routing snapshot, so a heartbeat that
+predates this fix (no routing of its own) still recovers, and whatever
+``SessionSource`` origin carries (including profile/scope qualifiers) is
+handed to the poller unmodified rather than being rebuilt from a reduced
+dict.
+
 Exercised against the real GatewayRunner methods bound onto a lightweight
 stand-in (booting a full gateway is unnecessary for this logic and would be
 slow/flaky), following the pattern in test_scale_to_zero_watcher.py.
@@ -21,7 +29,11 @@ from gateway.run import GatewayRunner
 from hermes_cli.heartbeat import HeartbeatState
 
 
-def _runner_with(monkeypatch, *, source=None):
+def _runner_with(monkeypatch, *, origins=None):
+    """``origins`` maps session_id -> SessionSource (or None), mirroring
+    ``_gateway_session_origin_for_id``'s persisted-lookup contract.
+    """
+    origins = origins or {}
     r = GatewayRunner.__new__(GatewayRunner)
     r._running = True
     r._heartbeat_watch = {}
@@ -34,7 +46,7 @@ def _runner_with(monkeypatch, *, source=None):
     monkeypatch.setattr(r, "_warm_goals_session_db", _warm, raising=False)
     monkeypatch.setattr(r, "_start_heartbeat_poller", lambda: None, raising=False)
     monkeypatch.setattr(
-        r, "_build_process_event_source", lambda _evt: source, raising=False
+        r, "_gateway_session_origin_for_id", lambda sid: origins.get(sid), raising=False
     )
     monkeypatch.setattr(
         r, "_session_key_for_source", lambda _source: "quick_key", raising=False
@@ -68,14 +80,9 @@ async def _run_one_tick(r, monkeypatch):
 @pytest.mark.asyncio
 async def test_resume_scan_registers_persisted_heartbeat(monkeypatch):
     fake_source = object()
-    r = _runner_with(monkeypatch, source=fake_source)
+    r = _runner_with(monkeypatch, origins={"sid-1": fake_source})
 
-    state = HeartbeatState(
-        prompt="check ci",
-        interval_seconds=600,
-        status="active",
-        route={"platform": "discord", "chat_id": "123"},
-    )
+    state = HeartbeatState(prompt="check ci", interval_seconds=600, status="active")
     monkeypatch.setattr(
         heartbeat_mod, "list_active_heartbeats", lambda: [("sid-1", state)]
     )
@@ -86,12 +93,34 @@ async def test_resume_scan_registers_persisted_heartbeat(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resume_scan_ignores_heartbeats_with_no_route(monkeypatch):
-    r = _runner_with(monkeypatch, source=object())
+async def test_resume_scan_rearms_a_legacy_heartbeat_with_no_persisted_route(monkeypatch):
+    """A heartbeat set before this fix carries no routing of its own — it
+    must still recover as long as its session has a persisted origin, since
+    routing no longer comes from the heartbeat row at all.
+    """
+    fake_source = object()
+    r = _runner_with(monkeypatch, origins={"sid-1": fake_source})
 
-    state = HeartbeatState(
-        prompt="check ci", interval_seconds=600, status="active", route={}
+    # No route-shaped data on the state at all — this is the legacy shape.
+    state = HeartbeatState(prompt="check ci", interval_seconds=600, status="active")
+    assert not hasattr(state, "route")
+    monkeypatch.setattr(
+        heartbeat_mod, "list_active_heartbeats", lambda: [("sid-1", state)]
     )
+
+    await _run_one_tick(r, monkeypatch)
+
+    assert r._heartbeat_watch == {"quick_key": (fake_source, "sid-1")}
+
+
+@pytest.mark.asyncio
+async def test_resume_scan_ignores_sessions_with_no_persisted_origin(monkeypatch):
+    """CLI-only sessions (and any session the store has no origin for) have
+    nothing to re-arm — they're driven by their own watchdog thread.
+    """
+    r = _runner_with(monkeypatch, origins={})
+
+    state = HeartbeatState(prompt="check ci", interval_seconds=600, status="active")
     monkeypatch.setattr(
         heartbeat_mod, "list_active_heartbeats", lambda: [("sid-1", state)]
     )
@@ -102,6 +131,33 @@ async def test_resume_scan_ignores_heartbeats_with_no_route(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resume_scan_preserves_the_origins_own_qualified_source(monkeypatch):
+    """A profile/workspace-qualified session must re-arm through the exact
+    SessionSource its SessionEntry.origin carries — not a reconstruction
+    that could drop qualifiers like profile or scope_id.
+    """
+    qualified_source = object()  # stands in for a SessionSource with profile/scope_id set
+    seen = []
+    r = _runner_with(monkeypatch, origins={"sid-1": qualified_source})
+    monkeypatch.setattr(
+        r,
+        "_session_key_for_source",
+        lambda source: seen.append(source) or "quick_key",
+        raising=False,
+    )
+
+    state = HeartbeatState(prompt="check ci", interval_seconds=600, status="active")
+    monkeypatch.setattr(
+        heartbeat_mod, "list_active_heartbeats", lambda: [("sid-1", state)]
+    )
+
+    await _run_one_tick(r, monkeypatch)
+
+    assert seen == [qualified_source]
+    assert r._heartbeat_watch == {"quick_key": (qualified_source, "sid-1")}
+
+
+@pytest.mark.asyncio
 async def test_resume_scan_self_heals_after_a_transient_failure(monkeypatch):
     """A one-shot scan would orphan this heartbeat forever if the very first
     attempt raises. The persistent ticker must retry on the next tick and
@@ -109,14 +165,9 @@ async def test_resume_scan_self_heals_after_a_transient_failure(monkeypatch):
     _resume_heartbeat_watches (gateway/run.py).
     """
     fake_source = object()
-    r = _runner_with(monkeypatch, source=fake_source)
+    r = _runner_with(monkeypatch, origins={"sid-1": fake_source})
 
-    state = HeartbeatState(
-        prompt="check ci",
-        interval_seconds=600,
-        status="active",
-        route={"platform": "discord", "chat_id": "123"},
-    )
+    state = HeartbeatState(prompt="check ci", interval_seconds=600, status="active")
     monkeypatch.setattr(
         heartbeat_mod, "list_active_heartbeats", lambda: [("sid-1", state)]
     )
@@ -150,24 +201,19 @@ async def test_resume_scan_leaves_already_registered_sessions_alone(monkeypatch)
     """Idempotency: a session already re-armed (by an earlier tick, or by the
     user re-touching /heartbeat) must not be re-scanned/re-registered.
     """
-    r = _runner_with(monkeypatch, source=object())
+    r = _runner_with(monkeypatch, origins={"sid-1": object()})
     existing_source = object()
     r._heartbeat_watch = {"already-there": (existing_source, "sid-1")}
 
     calls = []
     monkeypatch.setattr(
         r,
-        "_build_process_event_source",
-        lambda evt: calls.append(evt) or object(),
+        "_gateway_session_origin_for_id",
+        lambda sid: calls.append(sid) or object(),
         raising=False,
     )
 
-    state = HeartbeatState(
-        prompt="check ci",
-        interval_seconds=600,
-        status="active",
-        route={"platform": "discord", "chat_id": "123"},
-    )
+    state = HeartbeatState(prompt="check ci", interval_seconds=600, status="active")
     monkeypatch.setattr(
         heartbeat_mod, "list_active_heartbeats", lambda: [("sid-1", state)]
     )
@@ -185,14 +231,9 @@ async def test_resumed_watch_lets_a_due_heartbeat_fire_through_the_poller(monkey
     proving the rebuilt watch entry is functional, not just present.
     """
     fake_source = object()
-    r = _runner_with(monkeypatch, source=fake_source)
+    r = _runner_with(monkeypatch, origins={"sid-1": fake_source})
 
-    state = HeartbeatState(
-        prompt="check ci",
-        interval_seconds=600,
-        status="active",
-        route={"platform": "discord", "chat_id": "123"},
-    )
+    state = HeartbeatState(prompt="check ci", interval_seconds=600, status="active")
     monkeypatch.setattr(
         heartbeat_mod, "list_active_heartbeats", lambda: [("sid-1", state)]
     )
