@@ -5810,6 +5810,31 @@ class BasePlatformAdapter(ABC):
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
 
+    async def deliver_deferred_message(
+        self, delivery_source: dict[str, object], content: str
+    ) -> "SendResult":
+        """Deliver durable plugin output through the canonical adapter policy."""
+        from gateway.session import SessionSource
+
+        source = SessionSource.from_dict(delivery_source)
+        delivery_adapter = self._final_delivery_adapter(source)
+        reply_to = getattr(source, "message_id", None)
+        if (
+            _platform_name(source.platform) == "telegram"
+            and source.thread_id
+            and source.chat_type != "dm"
+        ):
+            reply_to = None
+        metadata = _mark_notify_metadata(
+            _thread_metadata_for_source(source, reply_to_message_id=reply_to)
+        )
+        return await delivery_adapter._send_with_retry(
+            source.chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
         """Merge a new caption into existing text, avoiding duplicates.
@@ -6285,7 +6310,7 @@ class BasePlatformAdapter(ABC):
                 event.source.chat_type,
                 event.source.chat_id,
             )
-            if authorized is False:
+            if authorized is not True:
                 return
             try:
                 deferred_result = await deferred_service.handle_response(

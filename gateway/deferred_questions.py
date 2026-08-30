@@ -25,15 +25,21 @@ class DeferredQuestion:
     plugin_id: str
     platform: str
     session_key: str
-    chat_id: str
+    delivery_source: dict[str, object]
     question: str
     handler_name: str
     context: dict[str, object]
     dedupe_key: str
     state: QuestionState
     response: str | None
+    result: DeferredQuestionResult | None
     created_at: float
     updated_at: float
+
+    @property
+    def chat_id(self) -> str:
+        """Compatibility accessor; the routing envelope is canonical."""
+        return str(self.delivery_source["chat_id"])
 
 
 @dataclass(frozen=True)
@@ -66,9 +72,7 @@ class DeferredQuestionService:
         self._handlers: dict[tuple[str, str], DeferredQuestionHandler] = {}
         self._adapters: dict[str, tuple[Any, asyncio.AbstractEventLoop]] = {}
         self._busy_callbacks: set[str] = set()
-        self._retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._recovery_task: asyncio.Task[None] | None = None
-        self.delivery_retry_seconds = 5.0
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -95,7 +99,10 @@ class DeferredQuestionService:
                     ),
                     response TEXT,
                     created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    delivery_source_json TEXT NOT NULL,
+                    result_json TEXT,
+                    delivery_attempted INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS
                     uq_deferred_questions_dedupe
@@ -105,6 +112,38 @@ class DeferredQuestionService:
                 ON deferred_questions(session_key, state, created_at);
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(deferred_questions)")
+            }
+            if "delivery_source_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE deferred_questions ADD COLUMN delivery_source_json TEXT"
+                )
+            if "result_json" not in columns:
+                conn.execute("ALTER TABLE deferred_questions ADD COLUMN result_json TEXT")
+            if "delivery_attempted" not in columns:
+                conn.execute(
+                    "ALTER TABLE deferred_questions "
+                    "ADD COLUMN delivery_attempted INTEGER NOT NULL DEFAULT 0"
+                )
+            rows = conn.execute(
+                """
+                SELECT id, platform, chat_id FROM deferred_questions
+                WHERE delivery_source_json IS NULL
+                """
+            ).fetchall()
+            for row in rows:
+                source_json = json.dumps(
+                    {"platform": row["platform"], "chat_id": row["chat_id"]},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    "UPDATE deferred_questions SET delivery_source_json = ? "
+                    "WHERE id = ?",
+                    (source_json, row["id"]),
+                )
 
     @staticmethod
     def _from_row(row: sqlite3.Row | None) -> DeferredQuestion | None:
@@ -113,18 +152,36 @@ class DeferredQuestionService:
         context = json.loads(row["context_json"])
         if not isinstance(context, dict):
             raise ValueError("deferred question context must be a JSON object")
+        delivery_source = json.loads(row["delivery_source_json"])
+        if not isinstance(delivery_source, dict):
+            raise ValueError("deferred question delivery source must be a JSON object")
+        result = None
+        if row["result_json"] is not None:
+            result_data = json.loads(row["result_json"])
+            if not isinstance(result_data, dict):
+                raise ValueError("deferred question result must be a JSON object")
+            result = DeferredQuestionResult(
+                resolved=bool(result_data["resolved"]),
+                reply=str(result_data["reply"]),
+                question=(
+                    str(result_data["question"])
+                    if result_data.get("question") is not None
+                    else None
+                ),
+            )
         return DeferredQuestion(
             id=row["id"],
             plugin_id=row["plugin_id"],
             platform=row["platform"],
             session_key=row["session_key"],
-            chat_id=row["chat_id"],
+            delivery_source=delivery_source,
             question=row["question"],
             handler_name=row["handler_name"],
             context=context,
             dedupe_key=row["dedupe_key"],
             state=row["state"],
             response=row["response"],
+            result=result,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -146,13 +203,20 @@ class DeferredQuestionService:
         plugin_id: str,
         platform: str,
         session_key: str,
-        chat_id: str,
+        delivery_source: dict[str, object],
         question: str,
         handler_name: str,
         context: dict[str, object],
         dedupe_key: str,
     ) -> DeferredQuestion:
         context_json = json.dumps(context, sort_keys=True, separators=(",", ":"))
+        delivery_source_json = json.dumps(
+            delivery_source, sort_keys=True, separators=(",", ":")
+        )
+        chat_id = str(delivery_source.get("chat_id") or "")
+        source_platform = str(delivery_source.get("platform") or "")
+        if source_platform != platform:
+            raise ValueError("delivery source platform must match platform")
         if not all(
             value.strip()
             for value in (
@@ -175,8 +239,9 @@ class DeferredQuestionService:
                     INSERT INTO deferred_questions (
                         id, plugin_id, platform, session_key, chat_id, question,
                         handler_name, context_json, dedupe_key, state, response,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, ?, ?)
+                        created_at, updated_at, delivery_source_json, result_json,
+                        delivery_attempted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, ?, ?, ?, NULL, 0)
                     """,
                     (
                         question_id,
@@ -190,6 +255,7 @@ class DeferredQuestionService:
                         dedupe_key,
                         now,
                         now,
+                        delivery_source_json,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -245,7 +311,8 @@ class DeferredQuestionService:
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
-                UPDATE deferred_questions SET state = 'awaiting', updated_at = ?
+                UPDATE deferred_questions
+                SET state = 'awaiting', delivery_attempted = 0, updated_at = ?
                 WHERE id = ? AND state = 'delivering'
                 """,
                 (time.time(), question_id),
@@ -256,7 +323,8 @@ class DeferredQuestionService:
             conn.execute(
                 """
                 UPDATE deferred_questions
-                SET state = 'queued', response = NULL, updated_at = ?
+                SET state = 'queued', response = NULL, delivery_attempted = 0,
+                    updated_at = ?
                 WHERE id = ? AND state = 'delivering'
                 """,
                 (time.time(), question_id),
@@ -294,6 +362,7 @@ class DeferredQuestionService:
                 """
                 UPDATE deferred_questions SET state = 'queued', updated_at = ?
                 WHERE platform = ? AND state = 'delivering'
+                  AND delivery_attempted = 0
                 """,
                 (time.time(), platform),
             )
@@ -328,28 +397,15 @@ class DeferredQuestionService:
         if loop.is_running():
             loop.call_soon_threadsafe(schedule, context=contextvars.Context())
 
-    def _schedule_delivery_retry(self, record: DeferredQuestion) -> None:
-        if record.id in self._retry_tasks:
-            return
-        binding = self._adapters.get(record.platform)
-        if binding is None:
-            return
-        _adapter, loop = binding
-
-        async def retry() -> None:
-            try:
-                await asyncio.sleep(self.delivery_retry_seconds)
-                self._retry_tasks.pop(record.id, None)
-                await self.deliver_ready(record.platform, record.session_key)
-            finally:
-                self._retry_tasks.pop(record.id, None)
-
-        def schedule() -> None:
-            task = asyncio.create_task(retry())
-            self._retry_tasks[record.id] = task
-
-        if loop.is_running():
-            loop.call_soon_threadsafe(schedule, context=contextvars.Context())
+    def _mark_delivery_attempted(self, question_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE deferred_questions SET delivery_attempted = 1, updated_at = ?
+                WHERE id = ? AND state IN ('delivering', 'handling')
+                """,
+                (time.time(), question_id),
+            )
 
     def _queued(
         self, platform: str, session_key: str | None = None
@@ -408,10 +464,13 @@ class DeferredQuestionService:
             claimed = self.claim_for_delivery(record.id)
             if claimed is None:
                 continue
-            result = await adapter.send(claimed.chat_id, claimed.question)
+            self._mark_delivery_attempted(claimed.id)
+            result = await adapter.deliver_deferred_message(
+                claimed.delivery_source, claimed.question
+            )
             if not getattr(result, "success", False):
-                self.requeue(claimed.id)
-                self._schedule_delivery_retry(claimed)
+                if getattr(result, "retryable", False):
+                    self.requeue(claimed.id)
             else:
                 self.mark_awaiting(claimed.id)
 
@@ -451,9 +510,29 @@ class DeferredQuestionService:
             )
         if record.response is None:
             raise ValueError("handling question has no captured response")
-        result = await handler(record, record.response)
-        if not isinstance(result, DeferredQuestionResult):
-            raise TypeError("deferred question handler returned an invalid result")
+        result = record.result
+        if result is None:
+            result = await handler(record, record.response)
+            if not isinstance(result, DeferredQuestionResult):
+                raise TypeError("deferred question handler returned an invalid result")
+            result_json = json.dumps(
+                {
+                    "resolved": result.resolved,
+                    "reply": result.reply,
+                    "question": result.question,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE deferred_questions
+                    SET result_json = ?, delivery_attempted = 0, updated_at = ?
+                    WHERE id = ? AND state = 'handling' AND result_json IS NULL
+                    """,
+                    (result_json, time.time(), record.id),
+                )
         reply = result.reply if result.resolved else result.question
         if not result.resolved and (not reply or not reply.strip()):
             raise ValueError("clarification result requires a question")
@@ -462,8 +541,21 @@ class DeferredQuestionService:
             raise RuntimeError(f"no adapter bound for {record.platform}")
         adapter, _loop = binding
         if reply:
-            delivered = await adapter.send(record.chat_id, reply)
+            self._mark_delivery_attempted(record.id)
+            delivered = await adapter.deliver_deferred_message(
+                record.delivery_source, reply
+            )
             if not getattr(delivered, "success", False):
+                if getattr(delivered, "retryable", False):
+                    with self._lock, self._connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE deferred_questions
+                            SET delivery_attempted = 0, updated_at = ?
+                            WHERE id = ? AND state = 'handling'
+                            """,
+                            (time.time(), record.id),
+                        )
                 raise RuntimeError(
                     getattr(delivered, "error", None)
                     or "deferred-question reply delivery failed"
@@ -483,7 +575,7 @@ class DeferredQuestionService:
                     """
                     UPDATE deferred_questions
                     SET state = 'awaiting', question = ?, response = NULL,
-                        updated_at = ?
+                        result_json = NULL, delivery_attempted = 0, updated_at = ?
                     WHERE id = ? AND state = 'handling'
                     """,
                     (result.question, now, record.id),
@@ -502,7 +594,9 @@ class DeferredQuestionService:
             rows = conn.execute(
                 """
                 SELECT * FROM deferred_questions
-                WHERE state = 'handling' ORDER BY created_at ASC
+                WHERE state = 'handling'
+                  AND (result_json IS NULL OR delivery_attempted = 0)
+                ORDER BY created_at ASC
                 """
             ).fetchall()
         results = []
@@ -559,7 +653,7 @@ class DeferredQuestionClient:
         *,
         platform: str,
         session_key: str,
-        chat_id: str,
+        delivery_source: dict[str, object],
         question: str,
         context: dict[str, object],
         dedupe_key: str,
@@ -569,7 +663,7 @@ class DeferredQuestionClient:
             plugin_id=self._plugin_id,
             platform=platform,
             session_key=session_key,
-            chat_id=chat_id,
+            delivery_source=delivery_source,
             question=question,
             handler_name=handler_name,
             context=context,
