@@ -391,6 +391,37 @@ describe('usePromptActions /title', () => {
   })
 })
 
+describe('usePromptActions /skills desktop scope', () => {
+  beforeEach(() => {
+    setSessions(() => [sessionInfo()])
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('refuses CLI-hub mutations before the desktop slash worker', async () => {
+    // A current Desktop must keep this boundary even when an older backend
+    // catalog has no subcommand-scope metadata. The explicit compatibility
+    // spec is authoritative for the review-only slice.
+    const refreshSessions = vi.fn(async () => undefined)
+    const requestGateway = vi.fn(async () => ({ output: 'installed' }) as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/skills install my-skill')
+
+    expect(requestGateway).not.toHaveBeenCalledWith(
+      'slash.exec',
+      expect.objectContaining({ command: 'skills install my-skill' })
+    )
+  })
+})
+
 // Helper: extract rendered text parts from captured updateSessionState seeds.
 function renderedSeedTexts(seeds: Record<string, unknown>[]): string[] {
   return seeds.flatMap(state => {
