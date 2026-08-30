@@ -30,6 +30,7 @@ interface PreviewBrowserBarProps {
   devToolsOpen: boolean
   loading: boolean
   onBack: () => void
+  onClose?: () => void
   onForward: () => void
   onNavigate: (url: string) => void
   onOpenExternal?: () => void
@@ -95,6 +96,7 @@ export function PreviewBrowserBar({
   devToolsOpen,
   loading,
   onBack,
+  onClose,
   onForward,
   onNavigate,
   onOpenExternal,
@@ -237,6 +239,13 @@ export function PreviewBrowserBar({
         label={devToolsOpen ? copy.hideDevTools : copy.openDevTools}
         onSelect={onToggleDevTools}
       />
+      {onClose && (
+        <PaneStripGlyph
+          icon={<Codicon name="close" size="0.8125rem" />}
+          label={t.preview.closePane}
+          onSelect={onClose}
+        />
+      )}
     </div>
   )
 }

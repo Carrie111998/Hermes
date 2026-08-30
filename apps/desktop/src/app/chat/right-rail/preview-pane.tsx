@@ -105,6 +105,7 @@ interface GuestContextMenuParams {
 
 interface PreviewPaneProps {
   embedded?: boolean
+  onClose?: () => void
   onRestartServer?: (url: string, context?: string) => Promise<string>
   reloadRequest?: number
   /** The preview tab this pane renders. Keys the per-tab console store the
@@ -219,7 +220,7 @@ function PreviewLoadError({
   )
 }
 
-export function PreviewPane({ embedded = false, onRestartServer, reloadRequest = 0, tabId, target }: PreviewPaneProps) {
+export function PreviewPane({ embedded = false, onClose, onRestartServer, reloadRequest = 0, tabId, target }: PreviewPaneProps) {
   const { t } = useI18n()
   const copy = t.preview.web
   // The console store belongs to the TAB, not this render: the toggles live on
@@ -1029,6 +1030,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             devToolsOpen={devtoolsOpen}
             loading={loading}
             onBack={goBack}
+            onClose={onClose}
             onForward={goForward}
             onNavigate={navigateTo}
             onOpenExternal={
