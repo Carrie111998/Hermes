@@ -255,6 +255,12 @@ class _ManagedEmbeddedHindsight:
         return self._manager.get_url(self.profile)
 
     @property
+    def client(self):
+        """Return the high-level client, matching HindsightEmbedded's contract."""
+        self._ensure_started()
+        return self._client
+
+    @property
     def is_running(self) -> bool:
         return (
             self._started

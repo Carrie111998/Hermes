@@ -399,6 +399,7 @@ class TestConfig:
         )
         assert created[0].kwargs == {"base_url": "http://127.0.0.1:9177"}
         assert client.url == "http://127.0.0.1:9177"
+        assert getattr(client, "client") is created[0]
 
 
 class TestPostSetup:
