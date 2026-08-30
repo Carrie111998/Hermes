@@ -215,6 +215,27 @@ def test_model_pause_updates_cached_cli_lifecycle_manager(tmp_path, monkeypatch)
     assert goals.load_goal(session_id).status == "paused"
 
 
+def test_stale_manager_refreshes_inside_the_mutation_lock(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-refresh-race"
+    controller = goals.GoalManager(session_id=session_id, default_max_turns=4)
+    controller.set("Keep going")
+    stale_manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
+
+    controller.pause(reason="model-paused")
+
+    def _unexpected_judge(*_args, **_kwargs):
+        raise AssertionError("a stale active goal reached the judge")
+
+    monkeypatch.setattr(goals, "judge_goal", _unexpected_judge)
+    decision = stale_manager.evaluate_after_turn("work completed this turn")
+
+    assert decision["verdict"] == "inactive"
+    assert decision["status"] == "paused"
+    assert stale_manager.state is not None
+    assert stale_manager.state.status == "paused"
+
+
 def test_resume_does_not_reactivate_cleared_goal(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     _call("set", session_id="session-current", condition="Terminal goal")

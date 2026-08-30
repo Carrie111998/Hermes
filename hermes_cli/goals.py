@@ -719,8 +719,19 @@ def _serialized_goal_mutation(method):
     """Keep one manager transition atomic with same-session controls."""
     @wraps(method)
     def locked(self, *args, **kwargs):
-        with _goal_state_lock(self.session_id):
-            return method(self, *args, **kwargs)
+        with goal_state_transaction(self.session_id):
+            # The caller may have refreshed immediately before entering this
+            # method, but another manager can mutate the same session in that
+            # gap. Re-check the process-local generation while holding the
+            # session lock so stale state cannot reach a judge or overwrite a
+            # newer transition.
+            self.refresh_if_stale()
+            result = method(self, *args, **kwargs)
+            # A successful mutation can bump this session's generation. Mark
+            # the manager current before releasing the lock so its own
+            # in-memory state is not mistaken for stale on the next call.
+            self._seen_generation = _goal_generation(self.session_id)
+            return result
 
     return locked
 
