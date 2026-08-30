@@ -345,14 +345,31 @@ class TestConfig:
         assert env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "0"
 
 
-    def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
-        captured = {}
+    def test_get_client_uses_embed_manager_without_importing_hindsight_all(self, monkeypatch):
+        manager = MagicMock()
+        manager.ensure_running.return_value = True
+        manager.get_url.return_value = "http://127.0.0.1:9177"
+        manager.is_running.return_value = True
 
-        class FakeHindsightEmbedded:
+        created = []
+
+        class FakeHindsight:
             def __init__(self, **kwargs):
-                captured.update(kwargs)
+                self.kwargs = kwargs
+                created.append(self)
 
-        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight_embed",
+            SimpleNamespace(get_embed_manager=lambda: manager),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight_client",
+            SimpleNamespace(Hindsight=FakeHindsight),
+        )
+        monkeypatch.delitem(sys.modules, "hindsight", raising=False)
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
 
         p = HindsightMemoryProvider()
@@ -366,13 +383,53 @@ class TestConfig:
         }
         p._llm_base_url = "http://localhost:8060/v1"
 
-        p._get_client()
+        client = p._get_client()
+        client._ensure_started()
 
-        assert captured["idle_timeout"] == 0
-        assert captured["llm_provider"] == "openai"
+        manager.ensure_running.assert_called_once_with(
+            {
+                "HINDSIGHT_API_LLM_PROVIDER": "openai",
+                "HINDSIGHT_API_LLM_API_KEY": "test-key",
+                "HINDSIGHT_API_LLM_MODEL": "test-model",
+                "HINDSIGHT_API_LOG_LEVEL": "info",
+                "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": "0",
+                "HINDSIGHT_API_LLM_BASE_URL": "http://localhost:8060/v1",
+            },
+            "hermes",
+        )
+        assert created[0].kwargs == {"base_url": "http://127.0.0.1:9177"}
+        assert client.url == "http://127.0.0.1:9177"
 
 
 class TestPostSetup:
+    def test_local_embedded_setup_installs_lightweight_runtime_with_extended_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.lazy_deps as lazy_deps_mod
+
+        selections = iter([1, 0])  # local_embedded, openai
+        monkeypatch.setattr(
+            "hermes_cli.memory_setup._curses_select",
+            lambda *args, **kwargs: next(selections),
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "test-key")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+        calls = []
+
+        def fake_install_specs(specs, timeout=120):
+            calls.append((list(specs), timeout))
+            return lazy_deps_mod.InstallSpecsResult(ok=True)
+
+        monkeypatch.setattr(lazy_deps_mod, "install_specs", fake_install_specs)
+
+        HindsightMemoryProvider().post_setup(str(tmp_path), {"memory": {}})
+
+        assert calls == [
+            (["hindsight-client==0.9.2", "hindsight-embed==0.9.2"], 600)
+        ]
+
     def test_setup_cancel_at_mode_picker_writes_nothing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"

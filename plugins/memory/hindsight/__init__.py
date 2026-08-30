@@ -72,7 +72,9 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.9.2"
+_CLIENT_RUNTIME_SPEC = "hindsight-client==0.9.2"
+_EMBED_RUNTIME_SPEC = "hindsight-embed==0.9.2"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -152,25 +154,18 @@ def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
 
 
 def _check_local_runtime() -> tuple[bool, str | None]:
-    """Return whether local embedded Hindsight imports cleanly.
+    """Return whether Hermes can manage a local embedded Hindsight daemon.
 
-    On older CPUs, importing the local Hindsight stack can raise a runtime
-    error from NumPy before the daemon starts. Treat that as "unavailable"
-    so Hermes can degrade gracefully instead of repeatedly trying to start
-    a broken local memory backend.
-
-    The embedded daemon computes embeddings via ``sentence_transformers``
-    (transformers + huggingface-hub). Importing ``hindsight`` /
-    ``hindsight_embed`` alone succeeds even when that stack is broken, so
-    without importing it here the probe would falsely report the backend
-    healthy and ``hermes memory status`` would stay green while the daemon
-    aborts at startup on every retain/recall. Import it too so the probe (and
-    status) reports the real ImportError.
+    Do not import the ``hindsight`` all-in-one facade here. It eagerly imports
+    the API server and FastMCP stack into Hermes' process, where Hindsight's
+    MCP-1 requirement conflicts with Hermes' MCP-2 client. The lightweight
+    embed manager already launches the API out of process through its isolated,
+    version-matched ``uvx`` fallback; Hermes only needs that manager and the
+    HTTP client in its own environment (#95855).
     """
     try:
-        importlib.import_module("hindsight")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
-        importlib.import_module("sentence_transformers")
+        importlib.import_module("hindsight_client").Hindsight
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -179,26 +174,103 @@ def _check_local_runtime() -> tuple[bool, str | None]:
 def _local_runtime_hint(reason: str | None) -> str:
     """Actionable install guidance when the local_embedded runtime is missing.
 
-    ``local_embedded`` imports ``from hindsight import HindsightEmbedded``, which
-    is provided only by the ``hindsight-all`` package (its wheel ships the
-    top-level ``hindsight`` module). ``plugin.yaml`` declares only
-    ``hindsight-client`` (enough for cloud / local_external), so a user who
-    selected local_embedded without going through ``hermes memory setup`` — a
-    hand-written config, the legacy ``"mode": "local"`` alias, or a restored
-    backup — hits ``ModuleNotFoundError: No module named 'hindsight'``.
-    NousResearch/hermes-agent#7718.
+    ``local_embedded`` uses Hindsight's lightweight embed manager plus its HTTP
+    client. A hand-written/restored config can omit either package, so point the
+    operator back to the supported setup flow without suggesting
+    ``hindsight-all`` (which conflicts with Hermes' MCP-2 runtime).
     """
     text = (reason or "").lower()
-    if "no module named" in text and ("hindsight'" in text or 'hindsight"' in text
-                                      or "hindsight_embed" in text):
+    if "no module named" in text and (
+        "hindsight_embed" in text or "hindsight_client" in text
+    ):
         return (
-            f" Install the embedded runtime with: uv pip install --python "
-            f"{sys.executable} hindsight-all — or run 'hermes memory setup'. "
-            "(local_embedded needs the 'hindsight-all' package, which provides the "
-            "top-level 'hindsight' module; 'hindsight-client' alone only covers "
-            "cloud / local_external.)"
+            f" Run 'hermes memory setup' to restore the supported local_embedded "
+            f"runtime (hindsight-client + hindsight-embed) for {sys.executable}."
         )
     return ""
+
+
+class _ManagedEmbeddedHindsight:
+    """Hindsight client backed by the upstream out-of-process embed manager.
+
+    This mirrors the lifecycle surface Hermes used from ``HindsightEmbedded``
+    without importing the all-in-one server facade into the Hermes process.
+    Dependency and daemon version selection remain owned by the published
+    Hindsight packages: ``hindsight-embed`` resolves ``hindsight-api`` at its
+    own version through ``uvx`` when no compatible sibling binary is present.
+    """
+
+    def __init__(self, *, profile: str, daemon_config: dict[str, str]):
+        from hindsight_client import Hindsight
+        from hindsight_embed import get_embed_manager
+
+        self.profile = profile
+        self.config = dict(daemon_config)
+        self._client_type = Hindsight
+        self._manager = get_embed_manager()
+        self._client = None
+        self._lock = threading.Lock()
+        self._started = False
+        self._closed = False
+
+    def _discard_stale_client(self) -> None:
+        client = self._client
+        self._client = None
+        self._started = False
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logger.debug("Error closing stale Hindsight client", exc_info=True)
+
+    def _ensure_started(self) -> None:
+        if self._started and self._client is not None:
+            if self._manager.is_running(self.profile):
+                return
+            self._discard_stale_client()
+
+        with self._lock:
+            if self._started and self._client is not None:
+                if self._manager.is_running(self.profile):
+                    return
+                self._discard_stale_client()
+            if self._closed:
+                raise RuntimeError("Cannot use embedded Hindsight after it has been closed")
+            if not self._manager.ensure_running(self.config, self.profile):
+                raise RuntimeError(
+                    f"Failed to start daemon for Hindsight profile '{self.profile}'"
+                )
+            self._client = self._client_type(
+                base_url=self._manager.get_url(self.profile)
+            )
+            self._started = True
+
+    def __getattr__(self, name: str):
+        self._ensure_started()
+        return getattr(self._client, name)
+
+    @property
+    def url(self) -> str:
+        self._ensure_started()
+        return self._manager.get_url(self.profile)
+
+    @property
+    def is_running(self) -> bool:
+        return (
+            self._started
+            and not self._closed
+            and self._client is not None
+            and self._manager.is_running(self.profile)
+        )
+
+    def close(self, stop_daemon: bool = False) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._discard_stale_client()
+            if stop_daemon:
+                self._manager.stop(self.profile)
+            self._closed = True
 
 
 def _ensure_cloud_client_dependency() -> None:
@@ -982,10 +1054,9 @@ class HindsightMemoryProvider(MemoryProvider):
         env_writes: dict = {}
 
         # Step 2: Install/upgrade deps for selected mode
-        cloud_dep = f"hindsight-client>={_MIN_CLIENT_VERSION}"
-        local_dep = "hindsight-all"
+        cloud_dep = _CLIENT_RUNTIME_SPEC
         if mode == "local_embedded":
-            deps_to_install = [local_dep]
+            deps_to_install = [cloud_dep, _EMBED_RUNTIME_SPEC]
         elif mode == "local_external":
             deps_to_install = [cloud_dep]
         else:
@@ -1015,9 +1086,13 @@ class HindsightMemoryProvider(MemoryProvider):
         print("\n  Checking dependencies...")
         # Environment-aware install: sealed hosted venvs redirect to the durable
         # data-volume target instead of writing to /opt/hermes (NS-605).
+        from hermes_cli.memory_setup import _dependency_install_timeout
         from tools.lazy_deps import install_specs
 
-        outcome = install_specs(deps_to_install, timeout=120)
+        outcome = install_specs(
+            deps_to_install,
+            timeout=_dependency_install_timeout(deps_to_install),
+        )
         if outcome.ok:
             print("  ✓ Dependencies up to date")
         elif outcome.blocked:
@@ -1247,40 +1322,46 @@ class HindsightMemoryProvider(MemoryProvider):
                     pass
                 except Exception as _e:
                     raise ImportError(str(_e))
-                from hindsight import HindsightEmbedded
-                HindsightEmbedded.__del__ = lambda self: None
-                llm_provider = self._config.get("llm_provider", "")
-                if llm_provider in {"openai_compatible", "openrouter"}:
-                    llm_provider = "openai"
-                logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
-                             self._config.get("profile", "hermes"), llm_provider)
-                kwargs = dict(
-                    profile=self._config.get("profile", "hermes"),
-                    llm_provider=llm_provider,
-                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or get_secret("HINDSIGHT_LLM_API_KEY", ""),
-                    llm_model=self._config.get("llm_model", ""),
-                )
-                if self._llm_base_url:
-                    kwargs["llm_base_url"] = self._llm_base_url
+                base_config = self._config if isinstance(self._config, dict) else {}
                 idle_timeout = _parse_int_setting(
-                    self._config.get("idle_timeout")
-                    if self._config.get("idle_timeout") is not None
+                    base_config.get("idle_timeout")
+                    if base_config.get("idle_timeout") is not None
                     else os.environ.get("HINDSIGHT_IDLE_TIMEOUT", self._idle_timeout),
                     _DEFAULT_IDLE_TIMEOUT,
                 )
                 self._idle_timeout = idle_timeout
-                kwargs["idle_timeout"] = idle_timeout
-                self._client = HindsightEmbedded(**kwargs)
+                runtime_config: dict[str, Any] = dict(base_config)
+                runtime_config["idle_timeout"] = idle_timeout
+                if self._llm_base_url:
+                    runtime_config["llm_base_url"] = self._llm_base_url
+                llm_api_key = (
+                    base_config.get("llmApiKey")
+                    or base_config.get("llm_api_key")
+                    or get_secret("HINDSIGHT_LLM_API_KEY", "")
+                )
+                profile = base_config.get("profile", "hermes")
+                logger.debug(
+                    "Creating managed embedded Hindsight client (profile=%s)",
+                    profile,
+                )
+                self._client = _ManagedEmbeddedHindsight(
+                    profile=profile,
+                    daemon_config=_build_embedded_profile_env(
+                        runtime_config,
+                        llm_api_key=llm_api_key,
+                    ),
+                )
             else:
                 _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight
                 timeout = self._timeout or _DEFAULT_TIMEOUT
-                kwargs = {"base_url": self._api_url, "timeout": float(timeout)}
-                if self._api_key:
-                    kwargs["api_key"] = self._api_key
                 logger.debug("Creating Hindsight cloud client (url=%s, has_key=%s, timeout=%s)",
-                             self._api_url, bool(self._api_key), kwargs["timeout"])
-                self._client = Hindsight(**kwargs)
+                             self._api_url, bool(self._api_key), float(timeout))
+                self._client = Hindsight(
+                    base_url=self._api_url,
+                    api_key=self._api_key or None,
+                    timeout=float(timeout),
+                )
         return self._client
 
     def _run_sync(self, coro):
@@ -1810,18 +1891,19 @@ class HindsightMemoryProvider(MemoryProvider):
                     dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
 
                     client = self._get_client()
-                    profile = self._config.get("profile", "hermes")
+                    base_config = self._config if isinstance(self._config, dict) else {}
+                    profile = base_config.get("profile", "hermes")
 
                     # Update the profile .env to match our current config so
                     # the daemon always starts with the right settings.
                     # If the config changed and the daemon is running, stop it.
-                    profile_env = _embedded_profile_env_path(self._config)
-                    expected_env = _build_embedded_profile_env(self._config)
+                    profile_env = _embedded_profile_env_path(base_config)
+                    expected_env = _build_embedded_profile_env(base_config)
                     saved = _load_simple_env(profile_env)
                     config_changed = saved != expected_env
 
                     if config_changed:
-                        profile_env = _materialize_embedded_profile_env(self._config)
+                        profile_env = _materialize_embedded_profile_env(base_config)
                         if client._manager.is_running(profile):
                             with open(log_path, "a", encoding="utf-8") as f:
                                 f.write("\n=== Config changed, restarting daemon ===\n")
@@ -2440,7 +2522,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     if inner_client is not None and hasattr(inner_client, "aclose"):
                         _run_sync(inner_client.aclose())
                         try:
-                            self._client._client = None
+                            setattr(self._client, "_client", None)
                         except Exception:
                             pass
                     try:

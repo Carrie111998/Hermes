@@ -17,6 +17,9 @@ from hermes_constants import get_hermes_home
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 _CANCELLED = -1
+_DEFAULT_DEPENDENCY_INSTALL_TIMEOUT = 120
+_HEAVY_DEPENDENCY_INSTALL_TIMEOUT = 600
+_HINDSIGHT_EMBED_SPEC = "hindsight-embed==0.9.2"
 
 
 def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
@@ -24,11 +27,11 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
 
     ``plugin.yaml`` declares the provider's baseline bridge packages, but
     some providers install mode-dependent extras at setup time that the
-    manifest can't express. Hindsight's ``local_embedded`` mode installs
-    ``hindsight-all`` (daemon + embedder + client) during
-    ``hermes memory setup`` — if the update-time refresh only reinstalled
-    the declared ``hindsight-client``, the embedded daemon would stay
-    broken after a venv rebuild stripped ``hindsight-embed`` (#70636).
+    manifest can't express. Hindsight's ``local_embedded`` mode needs its
+    lightweight embed manager in addition to the client. The manager launches
+    ``hindsight-api`` out of process (using its version-matched ``uvx`` fallback),
+    which keeps the API's MCP-1 dependency tree separate from Hermes' MCP-2
+    client while preserving the official setup/update lifecycle (#95855).
     """
     deps = list(declared or [])
     if provider_name == "hindsight":
@@ -39,10 +42,27 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
             mode = cfg.get("mode", "")
             # "local" is a legacy alias for "local_embedded"
             if mode in {"local", "local_embedded"}:
-                deps.append("hindsight-all")
+                deps.append(_HINDSIGHT_EMBED_SPEC)
         except Exception:
             pass
     return deps
+
+
+def _dependency_install_timeout(pip_deps: list[str]) -> int:
+    """Return the provider install budget for a dependency set.
+
+    The Hindsight embed manager is small, but first use may resolve its
+    version-matched API runtime and the setup/update contract must allow the
+    same multi-minute window as a cold local-embedded install. Other memory
+    bridges retain the existing fast-fail budget.
+    """
+    names = {
+        (re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*", spec) or [spec])[0].lower()
+        for spec in pip_deps
+    }
+    if "hindsight-embed" in names:
+        return _HEAVY_DEPENDENCY_INSTALL_TIMEOUT
+    return _DEFAULT_DEPENDENCY_INSTALL_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +160,7 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
         "honcho-ai": "honcho",
         "mem0ai": "mem0",
         "hindsight-client": "hindsight_client",
-        "hindsight-all": "hindsight",
+        "hindsight-embed": "hindsight_embed",
     }
 
     # Check which packages need installation.
@@ -170,7 +190,7 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
     try:
-        outcome = install_specs(missing, timeout=120)
+        outcome = install_specs(missing, timeout=_dependency_install_timeout(missing))
         if outcome.ok:
             print(f"  ✓ Installed {', '.join(missing)}")
         elif outcome.blocked:

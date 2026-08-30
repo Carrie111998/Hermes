@@ -6296,7 +6296,7 @@ _MEMORY_PROVIDER_IMPORT_NAMES = {
     "honcho-ai": "honcho",
     "mem0ai": "mem0",
     "hindsight-client": "hindsight_client",
-    "hindsight-all": "hindsight",
+    "hindsight-embed": "hindsight_embed",
 }
 
 

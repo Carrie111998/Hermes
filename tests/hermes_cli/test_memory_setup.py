@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -67,6 +68,45 @@ def test_write_env_vars_strips_line_separators_and_nul(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_local_embedded_uses_lightweight_upstream_runtime_packages(tmp_path, monkeypatch):
+    """The official update path must not install hindsight-all beside MCP 2.x."""
+    hermes_home = tmp_path / "hermes-home"
+    config_path = hermes_home / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"mode": "local_embedded"}), encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: hermes_home)
+
+    deps = memory_setup._provider_pip_dependencies(
+        "hindsight", ["hindsight-client==0.9.2"]
+    )
+
+    assert deps == ["hindsight-client==0.9.2", "hindsight-embed==0.9.2"]
+    assert all(not spec.startswith("hindsight-all") for spec in deps)
+
+
+def test_local_external_keeps_client_only(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    config_path = hermes_home / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"mode": "local_external"}), encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: hermes_home)
+
+    deps = memory_setup._provider_pip_dependencies(
+        "hindsight", ["hindsight-client==0.9.2"]
+    )
+
+    assert deps == ["hindsight-client==0.9.2"]
+
+
+def test_dependency_install_timeout_extends_embedded_manager_only():
+    assert memory_setup._dependency_install_timeout(
+        ["hindsight-client==0.9.2", "hindsight-embed==0.9.2"]
+    ) == 600
+    assert memory_setup._dependency_install_timeout(
+        ["hindsight-client==0.9.2"]
+    ) == 120
+
+
 
 
 
@@ -96,6 +136,38 @@ def test_install_dependencies_force_reinstalls_versioned_specs(tmp_path, monkeyp
 
     assert installed, "force=True must reach the install step"
     assert any("mem0ai>=2.0.10,<3" in specs for specs in installed)
+
+
+def test_update_reinstalls_official_local_embedded_dependencies(tmp_path, monkeypatch):
+    """`hermes update` force-refresh preserves the complete embedded contract."""
+    import yaml as _yaml
+
+    plugin_dir = tmp_path / "hindsight-plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.yaml").write_text(
+        _yaml.safe_dump({"pip_dependencies": ["hindsight-client==0.9.2"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("plugins.memory.find_provider_dir", lambda name: plugin_dir)
+    hermes_home = tmp_path / "hermes-home"
+    config_path = hermes_home / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"mode": "local_embedded"}), encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: hermes_home)
+
+    installed = []
+
+    def fake_install_specs(specs, timeout=120):
+        installed.append((list(specs), timeout))
+        return SimpleNamespace(ok=True, blocked=False, reason="", stderr="")
+
+    monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install_specs)
+
+    memory_setup._install_dependencies("hindsight", force=True)
+
+    assert installed == [
+        (["hindsight-client==0.9.2", "hindsight-embed==0.9.2"], 600)
+    ]
 
 
 def test_cmd_status_memory_tool_gate_disabled(capsys, monkeypatch):

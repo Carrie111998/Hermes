@@ -286,6 +286,30 @@ def test_build_system_requires_exempt_from_exclude_newer():
     )
 
 
+def test_hindsight_client_pin_and_embedded_runtime_versions_stay_aligned():
+    """Setup, update, lazy repair, and lockfile must select one Hindsight line."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert data["project"]["optional-dependencies"]["hindsight"] == [
+        "hindsight-client==0.9.2"
+    ]
+    assert data["tool"]["uv"]["exclude-newer-package"].get("hindsight-client") is False
+    assert _locked_versions("hindsight-client") == {"0.9.2"}
+
+    plugin_manifest = (REPO_ROOT / "plugins" / "memory" / "hindsight" / "plugin.yaml").read_text(
+        encoding="utf-8"
+    )
+    lazy_deps = (REPO_ROOT / "tools" / "lazy_deps.py").read_text(encoding="utf-8")
+    setup = (REPO_ROOT / "hermes_cli" / "memory_setup.py").read_text(encoding="utf-8")
+    provider = (REPO_ROOT / "plugins" / "memory" / "hindsight" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"hindsight-client==0.9.2"' in plugin_manifest
+    assert '"memory.hindsight": ("hindsight-client==0.9.2",)' in lazy_deps
+    assert '_HINDSIGHT_EMBED_SPEC = "hindsight-embed==0.9.2"' in setup
+    assert '_CLIENT_RUNTIME_SPEC = "hindsight-client==0.9.2"' in provider
+    assert '_EMBED_RUNTIME_SPEC = "hindsight-embed==0.9.2"' in provider
+
+
 
 
 def _lazy_deps_by_feature():

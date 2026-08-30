@@ -1,11 +1,4 @@
-"""NousResearch/hermes-agent#7718 — actionable message when local_embedded
-runtime (`hindsight-all`) is missing.
-
-`local_embedded` imports `from hindsight import HindsightEmbedded`, provided
-only by `hindsight-all`. When it's absent the provider disables itself; the
-disable warning should point the user at the fix rather than just echoing
-`No module named 'hindsight'`.
-"""
+"""Actionable local_embedded runtime checks for the MCP-2-safe package split."""
 
 import sys
 
@@ -13,16 +6,35 @@ import plugins.memory.hindsight as hs
 from plugins.memory.hindsight import HindsightMemoryProvider, _local_runtime_hint
 
 
-def test_hint_for_missing_hindsight_all():
-    hint = _local_runtime_hint("No module named 'hindsight'")
-    assert "hindsight-all" in hint
+def test_hint_for_missing_hindsight_embed():
+    hint = _local_runtime_hint("No module named 'hindsight_embed'")
+    assert "hindsight-embed" in hint
+    assert "hindsight-all" not in hint
     assert "hermes memory setup" in hint
     assert sys.executable in hint
 
 
-def test_hint_for_missing_hindsight_embed():
-    hint = _local_runtime_hint("No module named 'hindsight_embed.daemon_embed_manager'")
-    assert "hindsight-all" in hint
+def test_hint_for_missing_hindsight_client():
+    hint = _local_runtime_hint("No module named 'hindsight_client'")
+    assert "hindsight-client" in hint
+    assert "hindsight-all" not in hint
+
+
+def test_local_runtime_probe_avoids_full_server_stack(monkeypatch):
+    calls = []
+
+    def fake_import(name):
+        calls.append(name)
+        if name == "hindsight_client":
+            return type("ClientModule", (), {"Hindsight": object})
+        return object()
+
+    monkeypatch.setattr(hs.importlib, "import_module", fake_import)
+
+    assert hs._check_local_runtime() == (True, None)
+    assert calls == ["hindsight_embed.daemon_embed_manager", "hindsight_client"]
+    assert "hindsight" not in calls
+    assert "sentence_transformers" not in calls
 
 
 def test_no_hint_for_unrelated_runtime_error():
@@ -37,9 +49,10 @@ def test_no_hint_for_unrelated_runtime_error():
 
 def test_unavailable_reason_surfaces_hint_for_local_embedded(monkeypatch):
     monkeypatch.setattr(hs, "_load_config", lambda: {"mode": "local_embedded"})
-    monkeypatch.setattr(hs, "_check_local_runtime", lambda: (False, "No module named 'hindsight'"))
+    monkeypatch.setattr(hs, "_check_local_runtime", lambda: (False, "No module named 'hindsight_embed'"))
     reason = HindsightMemoryProvider().unavailable_reason()
-    assert "hindsight-all" in reason
+    assert "hindsight-embed" in reason
+    assert "hindsight-all" not in reason
     assert reason == reason.strip()  # no leading/trailing whitespace
 
 

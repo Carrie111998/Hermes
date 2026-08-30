@@ -28,7 +28,7 @@ Connects to the Hindsight Cloud API. Requires an API key from [ui.hindsight.vect
 
 ### Local Embedded
 
-Hermes spins up a local Hindsight daemon with built-in PostgreSQL. Requires an LLM API key for memory extraction and synthesis. The daemon starts automatically in the background on first use and stops after 5 minutes of inactivity.
+Hermes manages a local Hindsight daemon with built-in PostgreSQL through Hindsight's published embed manager. The manager launches a version-matched `hindsight-api` process (using its isolated `uvx` fallback when needed), so the daemon's dependencies do not replace Hermes' own MCP client packages. The daemon starts automatically in the background on first use and stops after 5 minutes of inactivity.
 
 Supports any OpenAI-compatible LLM endpoint (llama.cpp, vLLM, LM Studio, etc.) — pick `openai_compatible` as the provider and enter the base URL.
 
@@ -145,6 +145,6 @@ Available in `hybrid` and `tools` memory modes:
 | `HINDSIGHT_BUDGET` | Override recall budget |
 | `HINDSIGHT_MODE` | Override mode (`cloud`, `local_embedded`, `local_external`) |
 
-## Client Version
+## Runtime Versions
 
-Requires `hindsight-client >= 0.6.1`. The plugin auto-upgrades on session start if an older version is detected.
+Hermes pins `hindsight-client == 0.9.2`. `local_embedded` additionally uses `hindsight-embed == 0.9.2`; install and repair both through `hermes memory setup` / `hermes update` rather than installing `hindsight-all` into the Hermes environment.
