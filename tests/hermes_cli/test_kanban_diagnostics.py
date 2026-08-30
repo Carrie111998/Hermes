@@ -341,3 +341,50 @@ def test_role_assignee_mismatch_recognizes_installed_custom_profiles(tmp_path, m
     reassign_actions = [a for a in d.actions if a.kind == "reassign" and a.suggested]
     assert len(reassign_actions) == 1
     assert reassign_actions[0].payload["suggested_assignee"] == "fable"
+
+
+def test_role_assignee_mismatch_suppresses_suggested_reassign_for_tombstoned_profile(tmp_path, monkeypatch):
+    """When a profile directory exists on disk but has a tombstone (.deleted marker),
+    profile_exists('ghost') is False. The role mismatch warning is still emitted,
+    but reassign action is not suggested."""
+    from hermes_constants import mark_named_profile_deleted
+    from hermes_cli.profiles import profile_exists
+
+    now = int(time.time())
+    hermes_root = tmp_path / ".hermes"
+    ghost_dir = hermes_root / "profiles" / "ghost"
+    ghost_dir.mkdir(parents=True)
+    (ghost_dir / "config.yaml").write_text("model: ghost-model\n")
+    mark_named_profile_deleted(ghost_dir)
+
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: hermes_root)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_root)
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: hermes_root / "profiles")
+
+    assert not profile_exists("ghost"), "Tombstoned profile must not exist in live profile registry"
+
+    task = _task(title="Ghost: cleanup phantom memory", assignee="reviewer", status="ready")
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+    assert len(mismatches) == 1
+    d = mismatches[0]
+    assert d.severity == "warning"
+    assert d.data["role_prefix"] == "Ghost"
+    assert d.data["expected_assignee"] == "ghost"
+    # Actionable reassign must NOT be suggested for tombstoned profile
+    suggested_actions = [a for a in d.actions if a.suggested]
+    assert len(suggested_actions) == 0, f"Tombstoned profile must not have suggested action: {suggested_actions}"
+    reassign_actions = [a for a in d.actions if a.kind == "reassign"]
+    assert len(reassign_actions) == 0, f"Tombstoned profile must not have reassign actions: {reassign_actions}"
+
+    # Also assert dispatcher contract: ready tasks assigned to tombstoned ghost are skipped_nonspawnable
+    import hermes_cli.kanban_db as kb
+    conn = kb.connect()
+    try:
+        t_id = kb.create_task(conn, title="Ghost task", assignee="ghost")
+        dispatch_result = kb.dispatch_once(conn)
+        assert t_id in dispatch_result.skipped_nonspawnable, (
+            f"Expected {t_id} in skipped_nonspawnable, got {dispatch_result.skipped_nonspawnable}"
+        )
+    finally:
+        conn.close()

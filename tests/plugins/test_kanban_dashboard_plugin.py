@@ -1172,9 +1172,166 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     assert "t_ffff00001234" in row["diagnostics"][0]["data"]["phantom_ids"]
 
 
+def _render_dashboard_diagnostic_card(
+    diag: dict,
+    task: dict,
+    board_slug: str = "default",
+    assignees: list[str] | None = None,
+) -> dict:
+    """Execute DiagnosticCard from plugins/kanban/dashboard/dist/index.js in Node.js
+    and capture rendered DOM state plus executed network POST actions."""
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle_path = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+
+    runner_script = """
+const fs = require("fs");
+
+let registeredPage = null;
+const postCalls = [];
+
+const React = {
+  Component: class Component {},
+  createElement: (type, props, ...children) => {
+    return { type, props: props || {}, children: children.flat(Infinity) };
+  }
+};
+
+let hookState = [];
+let hookIdx = 0;
+function useState(initial) {
+  const idx = hookIdx++;
+  if (hookState[idx] === undefined) {
+    hookState[idx] = typeof initial === "function" ? initial() : initial;
+  }
+  const setter = (val) => {
+    hookState[idx] = typeof val === "function" ? val(hookState[idx]) : val;
+  };
+  return [hookState[idx], setter];
+}
+
+const SDK = {
+  React,
+  components: {
+    Button: (props) => React.createElement("button", props),
+    Input: (props) => React.createElement("input", props),
+    Label: (props) => React.createElement("label", props),
+    Select: (props) => React.createElement("select", props),
+    SelectOption: (props) => React.createElement("option", props),
+    Card: (props) => React.createElement("div", props),
+    CardContent: (props) => React.createElement("div", props),
+    Badge: (props) => React.createElement("span", props),
+  },
+  hooks: {
+    useState,
+    useEffect: (fn) => fn(),
+    useCallback: (fn) => fn,
+    useMemo: (fn) => fn(),
+    useRef: (initial) => ({ current: initial }),
+  },
+  utils: {
+    cn: (...args) => args.filter(Boolean).join(" "),
+    timeAgo: () => "just now",
+  },
+  useI18n: () => ({ t: {}, locale: "en" }),
+  fetchJSON: async (url, opts) => {
+    postCalls.push({ url, opts });
+    return { ok: true, task: {} };
+  }
+};
+
+globalThis.window = {
+  __HERMES_PLUGIN_SDK__: SDK,
+  __HERMES_PLUGINS__: {
+    register: (name, component) => {
+      registeredPage = component;
+    }
+  },
+  prompt: (msg, val) => val,
+  navigator: {
+    clipboard: {
+      writeText: async (text) => {},
+    },
+  },
+};
+globalThis.document = {
+  querySelector: () => null,
+};
+
+const bundleCode = fs.readFileSync(process.argv[1], "utf8");
+eval(bundleCode);
+
+const DiagnosticCard = (globalThis.window.HermesKanban && globalThis.window.HermesKanban.DiagnosticCard) ||
+  (registeredPage && registeredPage.DiagnosticCard);
+
+if (!DiagnosticCard) {
+  throw new Error("DiagnosticCard component not exposed on HermesKanban or registeredPage");
+}
+
+const rawInput = fs.readFileSync(0, "utf8");
+const inputData = JSON.parse(rawInput);
+const vdom = DiagnosticCard(inputData);
+
+function findInTree(node, predicate) {
+  const res = [];
+  if (!node) return res;
+  if (predicate(node)) res.push(node);
+  if (node.children) {
+    for (const c of node.children) {
+      res.push(...findInTree(c, predicate));
+    }
+  }
+  return res;
+}
+
+const selectNodes = findInTree(vdom, n => n.type === "select");
+const selectedValue = selectNodes.length > 0 ? selectNodes[0].props.value : null;
+
+const btnNodes = findInTree(vdom, n => n.type && (n.type.name === "DiagnosticActionButton" || n.type === "button"));
+for (const btn of btnNodes) {
+  if (btn.props && typeof btn.props.onExec === "function" && btn.props.action && btn.props.action.kind === "reassign") {
+    btn.props.onExec(btn.props.action);
+  }
+}
+
+console.log(JSON.stringify({
+  selectedValue,
+  postCalls,
+}));
+"""
+
+    payload = {
+        "diag": diag,
+        "task": task,
+        "boardSlug": board_slug,
+        "assignees": assignees or ["coder", "reviewer"],
+    }
+    from hermes_constants import find_hermes_node_executable
+    import shutil
+    node_bin = find_hermes_node_executable("node") or shutil.which("node") or "node"
+    proc = subprocess.run(
+        [node_bin, "-e", runner_script, str(bundle_path)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Node execution failed (rc={proc.returncode}):\n"
+            f"cmd: {[node_bin, '-e', '...', str(bundle_path)]}\n"
+            f"stdout: {proc.stdout}\n"
+            f"stderr: {proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
 def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clears_it(client, kanban_home):
     """Consumer contract: task with role prefix gets suggested_assignee in diagnostic action,
-    posting that suggested assignee updates durable state and clears the diagnostic."""
+    dashboard DiagnosticCard renders suggested assignee in the picker and POSTs it,
+    updating durable state and clearing the diagnostic."""
     # Ensure coder profile exists on disk so it is recognized as spawnable
     coder_dir = kanban_home / "profiles" / "coder"
     coder_dir.mkdir(parents=True, exist_ok=True)
@@ -1198,15 +1355,26 @@ def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clear
     suggested = reassign_actions[0]["payload"]["suggested_assignee"]
     assert suggested == "coder"
 
-    # Simulate UI execution: POST /reassign using suggested_assignee target
+    # Execute actual dashboard UI consumer component (DiagnosticCard) on the payload
+    task_data = {"id": t, "title": "Coder: fix bug", "assignee": "reviewer"}
+    consumer_result = _render_dashboard_diagnostic_card(diag, task_data, board_slug="default")
+    assert consumer_result["selectedValue"] == "coder", (
+        f"DiagnosticCard picker default expected 'coder', got {consumer_result['selectedValue']}"
+    )
+    assert len(consumer_result["postCalls"]) == 1
+    post_call = consumer_result["postCalls"][0]
+    captured_body = json.loads(post_call["opts"]["body"])
+    assert captured_body["profile"] == "coder"
+
+    # Send the captured UI consumer POST payload to the API
     post_r = client.post(
-        f"/api/plugins/kanban/tasks/{t}/reassign",
-        json={"profile": suggested, "reclaim_first": False},
+        post_call["url"],
+        json=captured_body,
     )
     assert post_r.status_code == 200, post_r.text
     assert post_r.json()["assignee"] == "coder"
 
-    # Re-check diagnostics — warning should now be cleared
+    # Re-check diagnostics -- warning should now be cleared
     r2 = client.get("/api/plugins/kanban/diagnostics")
     assert r2.status_code == 200
     mismatch_rows2 = [row for row in r2.json()["diagnostics"] if row["task_id"] == t]

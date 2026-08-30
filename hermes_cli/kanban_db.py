@@ -11999,7 +11999,7 @@ def read_worker_log(
 # ---------------------------------------------------------------------------
 
 def list_profiles_on_disk() -> list[str]:
-    """Return the set of assignee/profile names discovered on disk.
+    """Return the set of live (non-tombstoned) assignee/profile names discovered on disk.
 
     Includes:
     - named profiles under ``<default-root>/profiles/<name>/config.yaml``
@@ -12010,7 +12010,7 @@ def list_profiles_on_disk() -> list[str]:
     path).
     """
     try:
-        from hermes_constants import get_default_hermes_root
+        from hermes_constants import get_default_hermes_root, named_profile_is_deleted
         default_root = get_default_hermes_root()
         profiles_dir = default_root / "profiles"
     except Exception:
@@ -12024,6 +12024,8 @@ def list_profiles_on_disk() -> list[str]:
         try:
             for entry in sorted(profiles_dir.iterdir()):
                 if not entry.is_dir():
+                    continue
+                if named_profile_is_deleted(entry):
                     continue
                 if (entry / "config.yaml").is_file():
                     names.add(entry.name)

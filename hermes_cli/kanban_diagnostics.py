@@ -1103,21 +1103,22 @@ _ROLE_PREFIX_PATTERN = re.compile(
 
 
 def _discover_installed_profiles() -> set[str]:
-    """Discover installed profile names from disk."""
+    """Discover live (non-tombstoned) installed profile names from disk."""
     profiles: set[str] = set()
     try:
-        from hermes_cli.kanban_db import list_profiles_on_disk
-        for p in list_profiles_on_disk():
+        from hermes_cli.profiles import list_profile_names, profile_exists
+        for p in list_profile_names():
             s = str(p).strip().lower()
-            if s:
+            if s and profile_exists(s):
                 profiles.add(s)
     except Exception:
         pass
     try:
-        from hermes_cli.profiles import list_profile_names
-        for p in list_profile_names():
+        from hermes_cli.kanban_db import list_profiles_on_disk
+        from hermes_cli.profiles import profile_exists
+        for p in list_profiles_on_disk():
             s = str(p).strip().lower()
-            if s:
+            if s and profile_exists(s):
                 profiles.add(s)
     except Exception:
         pass
@@ -1163,10 +1164,21 @@ def _rule_role_assignee_mismatch(task, events, runs, now, cfg) -> list[Diagnosti
                 except Exception:
                     continue
 
+    recognized_roles: set[str] = set(COMMON_ROLE_PREFIXES)
     if not cfg_has_explicit_profiles:
         installed_profiles = _discover_installed_profiles()
+        try:
+            from hermes_cli.profiles import list_profile_names
+            for p in list_profile_names():
+                s = str(p).strip().lower()
+                if s:
+                    recognized_roles.add(s)
+        except Exception:
+            pass
+    else:
+        recognized_roles |= installed_profiles
 
-    known_roles = set(COMMON_ROLE_PREFIXES) | installed_profiles
+    known_roles = recognized_roles | installed_profiles
     if role_norm not in known_roles:
         return []
 

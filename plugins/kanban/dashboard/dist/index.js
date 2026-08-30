@@ -4784,4 +4784,13 @@
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
     window.__HERMES_PLUGINS__.register("kanban", KanbanPage);
   }
+  KanbanPage.DiagnosticCard = DiagnosticCard;
+  KanbanPage.DiagnosticsSection = DiagnosticsSection;
+  if (typeof window !== "undefined") {
+    window.HermesKanban = {
+      KanbanPage: KanbanPage,
+      DiagnosticCard: DiagnosticCard,
+      DiagnosticsSection: DiagnosticsSection,
+    };
+  }
 })();
