@@ -3850,9 +3850,12 @@ class BasePlatformAdapter(ABC):
     def _set_deferred_transport_ready(self, ready: bool) -> None:
         """Publish every transport transition through one durable-work seam."""
         services = getattr(self, "_deferred_question_services", None)
-        if not isinstance(services, dict):
-            service = getattr(self, "_deferred_question_service", None)
-            services = {"": service} if service is not None else {}
+        services = dict(services) if isinstance(services, dict) else {}
+        service = getattr(self, "_deferred_question_service", None)
+        if service is not None and all(
+            registered is not service for registered in services.values()
+        ):
+            services[""] = service
         if not services:
             return
         platform_name = getattr(self.platform, "value", str(self.platform))
