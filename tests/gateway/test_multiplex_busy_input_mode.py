@@ -1,6 +1,7 @@
 """Profile-specific busy-input behavior for multiplexed gateways."""
 
 import asyncio
+import weakref
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +39,8 @@ def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._busy_input_mode = default_mode
     runner._busy_text_mode = "queue" if default_mode == "queue" else "interrupt"
+    runner._busy_input_modes_by_profile = {}
+    runner._busy_text_modes_by_profile = {}
     runner._profile_adapters = {}
     runner.adapters = {}
     runner._sessions = {}
@@ -74,6 +77,26 @@ def _adapter() -> _ProfileAdapter:
         Platform.TELEGRAM,
     )
     return adapter
+
+
+def test_busy_mode_cache_helpers_tolerate_bare_runner():
+    """Gateway helpers keep bare-runner tests on the production fallbacks."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    source = _event(profile="research").source
+
+    assert runner._effective_busy_input_mode(source) == "interrupt"
+    assert runner._effective_busy_text_mode(source) == "interrupt"
+
+    runner._snapshot_profile_busy_modes(
+        "research",
+        {"display": {"busy_input_mode": "queue"}},
+    )
+
+    assert runner._effective_busy_input_mode(source) == "queue"
+    assert runner._effective_busy_text_mode(source) == "queue"
 
 
 async def _load_profile_snapshot(
@@ -194,8 +217,25 @@ async def test_busy_status_dispatches_through_active_session_path(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_busy_change_updates_only_routed_profile(tmp_path, monkeypatch):
-    """A routed /busy change persists and refreshes only that profile."""
+@pytest.mark.parametrize(
+    ("adapter_kind", "requested_mode", "legacy_text_mode", "expected_text_mode"),
+    [
+        ("primary", "queue", None, "queue"),
+        ("primary", "steer", None, "interrupt"),
+        ("secondary", "queue", "interrupt", "queue"),
+        ("secondary", "steer", None, "interrupt"),
+        ("secondary", "interrupt", "queue", "interrupt"),
+    ],
+)
+async def test_active_adapter_busy_change_updates_only_routed_profile(
+    tmp_path,
+    monkeypatch,
+    adapter_kind,
+    requested_mode,
+    legacy_text_mode,
+    expected_text_mode,
+):
+    """Active primary and secondary adapters persist /busy in the routed profile."""
     default_home = tmp_path / "default"
     default_home.mkdir()
     default_config = default_home / "config.yaml"
@@ -207,28 +247,65 @@ async def test_busy_change_updates_only_routed_profile(tmp_path, monkeypatch):
 
     runner = _runner(default_mode="interrupt")
     profile_home = tmp_path / "research"
-    adapter = await _load_profile_snapshot(
-        runner,
-        profile_home,
-        "queue",
-    )
-    event = _event(profile="research")
-    event.text = "/busy steer"
     monkeypatch.setattr(
         "hermes_cli.profiles.get_profile_dir",
         lambda _profile_name: profile_home,
     )
-    # Isolate the wrapper's profile scope; active-session dispatch is covered above.
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda _profile_name: True,
+    )
+    if adapter_kind == "secondary":
+        adapter = await _load_profile_snapshot(
+            runner,
+            profile_home,
+            "queue",
+            legacy_text_mode=legacy_text_mode,
+        )
+    else:
+        profile_home.mkdir()
+        profile_home.joinpath("config.yaml").write_text(
+            "display:\n  busy_input_mode: queue\n",
+            encoding="utf-8",
+        )
+        adapter = _adapter()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        adapter.set_message_handler(runner._make_default_profile_message_handler())
+    event = _event(profile="research")
+    event.source._transport_adapter_ref = weakref.ref(adapter)
+    event.text = f"/busy {requested_mode}"
     runner._handle_message = runner._handle_busy_command
+    session_key = build_session_key(event.source, profile="research")
+    adapter._active_sessions[session_key] = asyncio.Event()
 
-    response = await runner._make_profile_message_handler("research")(event)
+    await adapter.handle_message(event)
 
-    assert "steer" in str(response).lower()
-    assert "busy_input_mode: steer" in (profile_home / "config.yaml").read_text()
-    assert "busy_input_mode: interrupt" in default_config.read_text()
+    saved = profile_home.joinpath(
+        "config.yaml"
+    ).read_text(encoding="utf-8")
+    assert f"busy_input_mode: {requested_mode}" in saved
+    assert (
+        f"busy_text_mode: {'queue' if requested_mode == 'queue' else 'interrupt'}"
+        in saved
+    )
+    assert "busy_input_mode: interrupt" in default_config.read_text(
+        encoding="utf-8"
+    )
     assert runner._busy_input_mode == "interrupt"
-    assert runner._effective_busy_input_mode(event.source) == "steer"
-    assert adapter._busy_text_mode == "interrupt"
+    assert runner._effective_busy_input_mode(event.source) == requested_mode
+    assert adapter._busy_text_mode == expected_text_mode
+
+    if requested_mode == "queue":
+        adapter._busy_text_debounce_seconds = 0
+        routed_handler = AsyncMock(return_value=None)
+        runner._handle_message = routed_handler
+        follow_up = _event(profile="research")
+
+        await adapter.handle_message(follow_up)
+        assert await adapter._flush_text_debounce_now(session_key) is True
+
+        assert adapter._pending_messages[session_key] is follow_up
+        routed_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio

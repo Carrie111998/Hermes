@@ -28,6 +28,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     Platform,
+    SendResult,
     SessionSource,
     build_session_key,
 )
@@ -67,6 +68,7 @@ def _make_runner():
     runner._busy_text_mode = "interrupt"
     runner.adapters = {}
     runner.config = MagicMock()
+    runner.config.multiplex_profiles = False
     runner.config.group_sessions_per_user = True
     runner.config.thread_sessions_per_user = False
     runner.session_store = None
@@ -82,7 +84,9 @@ def _make_adapter(platform_val="telegram"):
     """Build a minimal adapter mock."""
     adapter = MagicMock()
     adapter._pending_messages = {}
-    adapter._send_with_retry = AsyncMock()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="ack")
+    )
     adapter.config = MagicMock()
     adapter.config.extra = {}
     adapter.platform = MagicMock(value=platform_val)
@@ -469,5 +473,3 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
-
