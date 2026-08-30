@@ -30,6 +30,7 @@ def register(ctx):
     ctx.register_middleware("llm_execution", on_llm_execution)
     ctx.register_middleware("tool_request", on_tool_request)
     ctx.register_middleware("tool_execution", on_tool_execution)
+    ctx.register_middleware("turn_route", on_turn_route)
 ```
 
 Every middleware callback receives:
@@ -48,6 +49,15 @@ Supported middleware kinds:
 | `tool_request` | `tool_name`, `args`, `original_args` | `{"args": {...}}` | Replace effective tool args before hooks, guardrails, approvals, and execution. |
 | `llm_execution` | `request`, `original_request`, `next_call` | Any provider response | Wrap or replace the actual provider call. |
 | `tool_execution` | `tool_name`, `args`, `original_args`, `next_call` | Any tool result | Wrap or replace the actual tool call. |
+| `turn_route` | `route`, `original_route`, `user_message`, `session_id` | `{"route": {...}}` | Select public model/provider metadata before agent construction. |
+
+`turn_route` is called once for an external user turn before Hermes constructs
+the provider client or agent. The callback receives no credentials, API keys,
+or provider clients. It may replace `model`, `provider`, `requested_provider`,
+and non-secret runtime hints. Hermes resolves credentials for the selected
+provider through its normal resolver afterwards. Internal events and tool
+continuations must set `internal` or `tool_continuation` and bypass this phase.
+Routing failures are fail-open and retain the host route.
 
 Request middleware can return optional trace fields:
 
@@ -87,6 +97,10 @@ For each provider request, Hermes applies middleware in this order:
 3. Emit `pre_api_request` observer hooks with the effective request.
 4. Run provider execution through `llm_execution` middleware.
 5. Emit `post_api_request` or `api_request_error` observer hooks.
+
+For each external user turn, `turn_route` runs before agent/provider-client
+construction. It is not part of the provider request middleware chain and must
+never issue a provider call itself.
 
 Request middleware sees the full provider kwargs, including `messages` or
 Responses API `input`, model settings, tool definitions, stream options, and

@@ -5844,6 +5844,16 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
+        _routed = self._runner._apply_turn_route_middleware(
+            message=ctx.message or "",
+            model=model,
+            runtime_kwargs=runtime_kwargs,
+            session_id=ctx.session_id,
+            source=ctx.source,
+            internal=bool(ctx.persist_user_display_kind),
+        )
+        if isinstance(_routed, tuple) and len(_routed) == 3:
+            model, runtime_kwargs, _turn_trace = _routed
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
         # Per-platform skip_context_files — messaging platforms can opt out
@@ -8739,6 +8749,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             overrides or {},
         )
         return route
+
+    def _apply_turn_route_middleware(
+        self,
+        *,
+        message: str,
+        model: str,
+        runtime_kwargs: dict,
+        session_id: Optional[str],
+        source: Optional[SessionSource],
+        internal: bool = False,
+    ) -> tuple[str, dict, list[dict]]:
+        """Apply pre-agent routing and resolve host-owned credentials once.
+
+        Middleware receives a redacted public route. If it selects another
+        provider, Hermes resolves that provider through its normal credential
+        resolver before constructing the agent; no provider execution occurs
+        during this phase. Failures are fail-open to the configured route.
+        """
+        if internal:
+            return model, runtime_kwargs, []
+        try:
+            from hermes_cli.middleware import apply_turn_route_middleware
+
+            public_route = {
+                "model": model,
+                "provider": runtime_kwargs.get("provider"),
+                "requested_provider": runtime_kwargs.get("requested_provider"),
+                "runtime": {
+                    key: runtime_kwargs.get(key)
+                    for key in ("provider", "requested_provider", "api_mode", "command", "args")
+                    if runtime_kwargs.get(key) not in (None, "")
+                },
+            }
+            result = apply_turn_route_middleware(
+                public_route,
+                user_message=message,
+                session_id=session_id,
+                source=source.platform.value if source and source.platform else "gateway",
+                is_user_turn=True,
+                is_first_turn=False,
+                internal=False,
+                tool_continuation=False,
+            )
+            selected = result.payload if result.changed and isinstance(result.payload, dict) else None
+            selected_model = selected.get("model") if selected else None
+            selected_provider = (
+                (selected or {}).get("provider")
+                or (selected or {}).get("requested_provider")
+            )
+            if not (
+                isinstance(selected_model, str)
+                and selected_model.strip()
+                and isinstance(selected_provider, str)
+                and selected_provider.strip()
+            ):
+                return model, runtime_kwargs, result.trace
+            selected_model = selected_model.strip()
+            selected_provider = selected_provider.strip()
+            selected_runtime = dict(runtime_kwargs)
+            if selected_provider != runtime_kwargs.get("provider"):
+                selected_runtime = _resolve_runtime_agent_kwargs_for_provider(selected_provider)
+            selected_runtime["provider"] = selected_runtime.get("provider") or selected_provider
+            selected_runtime["requested_provider"] = selected_provider
+            self._last_turn_route_trace = result.trace
+            logger.info(
+                "Turn route middleware selected model=%s provider=%s session=%s",
+                selected_model,
+                selected_provider,
+                session_id or "",
+            )
+            return selected_model, selected_runtime, result.trace
+        except Exception as exc:
+            logger.warning("Turn-route middleware failed open: %s", exc)
+            return model, runtime_kwargs, []
 
     def _sync_session_model_from_agent(self, session_id: str, agent: Any) -> None:
         """Persist the runtime model/provider actually used by a gateway turn.
@@ -19040,14 +19124,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugin-registered slash commands
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_command_handler,
+                    invoke_plugin_command,
+                )
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    result = invoke_plugin_command(
+                        plugin_handler,
+                        user_args,
+                        session_id=_quick_key,
+                        platform=source.platform.value if source.platform else None,
+                    )
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None

@@ -2186,7 +2186,10 @@ class PluginContext:
     ) -> Optional[PluginRegistration]:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
-        The handler signature is ``fn(raw_args: str) -> str | None``.
+        The handler signature is ``fn(raw_args: str) -> str | None``. New
+        handlers may also accept keyword context (for example,
+        ``session_id`` and ``platform``); legacy one-argument handlers remain
+        supported unchanged.
         It may also be an async callable — the gateway dispatch handles both.
 
         Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
@@ -7046,6 +7049,40 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def invoke_plugin_command(handler: Callable, raw_args: str, **context: Any) -> Any:
+    """Invoke a slash-command handler with optional session context.
+
+    Existing plugins keep the original ``handler(raw_args)`` contract. New
+    plugins may declare a ``context`` keyword or ``**kwargs`` to receive host
+    metadata such as ``session_id`` and ``platform``. Signature inspection is
+    used instead of catching ``TypeError`` so errors raised inside a handler
+    are never accidentally retried and duplicated.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return handler(raw_args)
+    parameter_list = list(parameters)
+    accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameter_list
+    )
+    accepted_names = {
+        parameter.name
+        for parameter in parameter_list
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    if not accepts_kwargs and not accepted_names.intersection(context):
+        return handler(raw_args)
+    if accepts_kwargs:
+        return handler(raw_args, **context)
+    return handler(
+        raw_args,
+        **{name: value for name, value in context.items() if name in accepted_names},
+    )
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
