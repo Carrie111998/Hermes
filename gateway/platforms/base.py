@@ -5908,7 +5908,7 @@ class BasePlatformAdapter(ABC):
         from gateway.session import SessionSource
 
         source = SessionSource.from_dict(delivery_source)
-        delivery_adapter = self._final_delivery_adapter(source)
+        delivery_adapter = self
         if getattr(source, "delivery_transport", None) == "relay":
             prime = getattr(delivery_adapter, "prime_routing_cache", None)
             if callable(prime):
@@ -6424,6 +6424,14 @@ class BasePlatformAdapter(ABC):
             )
             return
 
+        # Finish any guard-release delivery before classifying this message.
+        # A prompt is externally visible before its send coroutine returns;
+        # waiting here ensures a fast reply observes the resulting `awaiting`
+        # row instead of slipping into an ordinary agent turn.
+        if session_key in self._active_sessions:
+            self._heal_stale_session_lock(session_key)
+        await self._await_session_idle_handoff(session_key)
+
         # A deferred question owns the next non-command reply in this session.
         # Resolve it before the active-session guard so an answer cannot become
         # an out-of-band correction to unrelated work that started after the
@@ -6490,15 +6498,6 @@ class BasePlatformAdapter(ABC):
                     return
             else:
                 deferred_service.park_awaiting(pending_deferred.id)
-
-        # On-entry self-heal: if the adapter still has an _active_sessions
-        # entry for this key but the owner task has already exited (done or
-        # cancelled), the lock is stale.  Clear it and fall through to
-        # normal dispatch so the user isn't trapped behind a dead guard —
-        # this is the split-brain tail described in issue #11016.
-        if session_key in self._active_sessions:
-            self._heal_stale_session_lock(session_key)
-        await self._await_session_idle_handoff(session_key)
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:

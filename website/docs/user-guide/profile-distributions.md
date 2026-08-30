@@ -163,9 +163,6 @@ hermes_state.db
 response_store.db
 response_store.db-shm
 response_store.db-wal
-deferred_questions.db
-deferred_questions.db-shm
-deferred_questions.db-wal
 gateway.pid
 gateway_state.json
 processes.json

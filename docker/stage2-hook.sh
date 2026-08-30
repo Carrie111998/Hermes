@@ -348,7 +348,6 @@ for f in \
     state.db state.db-shm state.db-wal \
     hermes_state.db \
     response_store.db response_store.db-shm response_store.db-wal \
-    deferred_questions.db deferred_questions.db-shm deferred_questions.db-wal \
     gateway.pid gateway.lock gateway_state.json processes.json \
     active_profile; do
     if [ -e "$HERMES_HOME/$f" ]; then

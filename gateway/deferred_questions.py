@@ -6,7 +6,6 @@ import json
 import asyncio
 import contextvars
 import logging
-import os
 import sqlite3
 import threading
 import time
@@ -16,8 +15,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
-
-import hermes_cli.config as hermes_config
 
 
 QuestionState = Literal["queued", "delivering", "awaiting", "handling"]
@@ -79,7 +76,6 @@ class DeferredQuestionService:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._prepare_database_file()
         self._lock = threading.RLock()
         self._handlers: dict[
             tuple[str, str], tuple[DeferredQuestionHandler, contextvars.Context]
@@ -96,25 +92,15 @@ class DeferredQuestionService:
         self.handling_retry_seconds = 5.0
         self._initialize()
 
-    def _prepare_database_file(self) -> None:
-        """Create and reconcile the ledger under Hermes' private-file policy."""
-        shared = hermes_config.is_managed() or hermes_config._is_container()
-        try:
-            descriptor = os.open(
-                self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666 if shared else 0o600
-            )
-        except FileExistsError:
-            pass
-        else:
-            os.close(descriptor)
-        hermes_config._secure_file(self.path)
-
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         """Commit or roll back each operation and always close its connection."""
         conn = sqlite3.connect(self.path, timeout=10)
-        conn.row_factory = sqlite3.Row
         try:
+            from hermes_state import apply_durability_barriers
+
+            apply_durability_barriers(conn)
+            conn.row_factory = sqlite3.Row
             with conn:
                 yield conn
         finally:
@@ -894,6 +880,6 @@ def get_deferred_question_service() -> DeferredQuestionService:
     with _singleton_lock:
         service = _singletons.get(home)
         if service is None:
-            service = DeferredQuestionService(home / "deferred_questions.db")
+            service = DeferredQuestionService(home / "state.db")
             _singletons[home] = service
         return service

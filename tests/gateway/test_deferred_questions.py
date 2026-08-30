@@ -108,46 +108,6 @@ def test_pending_uses_queue_tiebreaker_for_equal_timestamps(tmp_path: Path) -> N
     assert service.pending_for_session(lower_id.session_key) == lower_id
 
 
-@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX file modes")
-@pytest.mark.parametrize("shared_deployment", [False, True])
-def test_database_creation_uses_deployment_aware_private_mode(
-    tmp_path: Path, monkeypatch, shared_deployment: bool
-) -> None:
-    import os
-    import stat
-
-    import hermes_cli.config as hermes_config
-
-    monkeypatch.setattr(hermes_config, "is_managed", lambda: shared_deployment)
-    monkeypatch.setattr(hermes_config, "_is_container", lambda: False)
-    previous_umask = os.umask(0o022)
-    try:
-        path = tmp_path / "questions.sqlite3"
-        _service(path)
-    finally:
-        os.umask(previous_umask)
-
-    expected = 0o644 if shared_deployment else 0o600
-    assert stat.S_IMODE(path.stat().st_mode) == expected
-
-
-@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX file modes")
-def test_existing_database_mode_is_tightened(tmp_path: Path, monkeypatch) -> None:
-    import stat
-
-    import hermes_cli.config as hermes_config
-
-    monkeypatch.setattr(hermes_config, "is_managed", lambda: False)
-    monkeypatch.setattr(hermes_config, "_is_container", lambda: False)
-    path = tmp_path / "questions.sqlite3"
-    path.touch(mode=0o644)
-    path.chmod(0o644)
-
-    _service(path)
-
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-
-
 def test_each_transaction_closes_its_sqlite_connection(tmp_path: Path) -> None:
     import sqlite3
 
@@ -687,6 +647,35 @@ async def test_deferred_delivery_restores_slack_workspace_and_thread() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deferred_delivery_stays_on_service_selected_adapter() -> None:
+    from gateway.authz_mixin import GatewayAuthorizationMixin
+    from gateway.session import SessionSource
+
+    primary = _GatewayAdapter()
+    secondary = _GatewayAdapter()
+
+    class Runner(GatewayAuthorizationMixin):
+        pass
+
+    runner = Runner()
+    runner.adapters = {Platform.TELEGRAM: primary}
+    runner._profile_adapters = {"secondary": {Platform.TELEGRAM: secondary}}
+    primary.gateway_runner = runner
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="home",
+        chat_type="dm",
+        profile="secondary",
+        adapter_profile="primary",
+    )
+
+    await primary.deliver_deferred_message(source.to_dict(), "May I send invites?")
+
+    assert primary.sent == [("home", "May I send invites?", None, {"notify": True})]
+    assert secondary.sent == []
+
+
+@pytest.mark.asyncio
 async def test_relay_deferred_delivery_uses_transport_and_restores_routing(
     tmp_path: Path,
 ) -> None:
@@ -840,6 +829,80 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
     assert sent_before_turn_finishes == [
         ("home", "May I send invites?", None, {"notify": True})
     ]
+
+
+@pytest.mark.asyncio
+async def test_reply_exposed_during_idle_delivery_is_captured(tmp_path: Path) -> None:
+    import asyncio
+
+    from gateway.deferred_questions import DeferredQuestionResult
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource, build_session_key
+
+    service = _service(tmp_path / "questions.sqlite3")
+    adapter = _GatewayAdapter()
+    adapter._running = True
+    adapter.set_deferred_question_service(service)
+    adapter.set_authorization_check(lambda *_args: True)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="home",
+        chat_type="dm",
+        user_id="owner",
+    )
+    session_key = build_session_key(source)
+    handled = []
+
+    async def handle_deferred(_record, answer):
+        handled.append(answer)
+        return DeferredQuestionResult.done("")
+
+    service.register_handler("plow-chat", "invite-consent", handle_deferred)
+    service.enqueue(
+        plugin_id="plow-chat",
+        session_key=session_key,
+        delivery_source=source.to_dict(),
+        question="May I send invites?",
+        handler_name="invite-consent",
+        context={},
+        dedupe_key="invite-consent",
+    )
+    guard = asyncio.Event()
+    adapter._active_sessions[session_key] = guard
+    adapter._session_tasks[session_key] = asyncio.current_task()
+    await service.deliver_ready("telegram")
+
+    delivery_exposed = asyncio.Event()
+    finish_delivery = asyncio.Event()
+    original_send = adapter.send
+
+    async def expose_then_block(*args, **kwargs):
+        result = await original_send(*args, **kwargs)
+        delivery_exposed.set()
+        await finish_delivery.wait()
+        return result
+
+    adapter.send = expose_then_block
+    ordinary_handler = AsyncMock(return_value="ordinary")
+    adapter._message_handler = ordinary_handler
+    adapter._cleanup_finished_session_task(session_key, guard)
+    await delivery_exposed.wait()
+    reply = asyncio.create_task(
+        adapter.handle_message(
+            MessageEvent(
+                text="yes",
+                source=source,
+                message_id="fast-reply",
+                message_type=MessageType.TEXT,
+            )
+        )
+    )
+    finish_delivery.set()
+    await reply
+    await asyncio.gather(*tuple(adapter._background_tasks))
+
+    assert handled == ["yes"]
+    ordinary_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1392,7 +1455,7 @@ def test_host_service_is_scoped_to_the_active_hermes_home(
     assert second is not first
     assert first.path.parent == tmp_path / "profile-a"
     assert second.path.parent == tmp_path / "profile-b"
-    assert first.path.name == "deferred_questions.db"
+    assert first.path.name == "state.db"
 
 
 def test_gateway_setup_surfaces_deferred_store_failure(

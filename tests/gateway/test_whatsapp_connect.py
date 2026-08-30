@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,53 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
     mock_session.get = MagicMock(return_value=_AsyncCM(mock_resp))
 
     return MagicMock(return_value=_AsyncCM(mock_session))
+
+
+@pytest.mark.asyncio
+async def test_health_reconnect_publishes_deferred_readiness() -> None:
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    adapter = WhatsAppAdapter(PlatformConfig(enabled=True))
+    adapter._running = True
+    adapter._bridge_health_connected = False
+    adapter.notify_deferred_questions_connected = MagicMock()
+    adapter.notify_deferred_questions_disconnected = MagicMock()
+    response = MagicMock(status=200)
+    response.json = AsyncMock(
+        side_effect=[{"status": "connecting"}, {"status": "connected"}]
+    )
+    session = MagicMock()
+    session.get.return_value = _AsyncCM(response)
+    adapter._http_session = session
+
+    assert not adapter.is_connected
+    assert not await adapter._refresh_bridge_health()
+    adapter.notify_deferred_questions_connected.assert_not_called()
+
+    assert await adapter._refresh_bridge_health()
+    assert adapter.is_connected
+
+    adapter.notify_deferred_questions_connected.assert_called_once_with()
+    adapter.notify_deferred_questions_disconnected.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bridge_503_send_is_retryable() -> None:
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    adapter = WhatsAppAdapter(PlatformConfig(enabled=True))
+    adapter._running = True
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    response = MagicMock(status=503)
+    response.text = AsyncMock(return_value='{"error":"Not connected to WhatsApp"}')
+    session = MagicMock()
+    session.post.return_value = _AsyncCM(response)
+    adapter._http_session = session
+
+    result = await adapter.send("15551234567", "hello")
+
+    assert not result.success
+    assert result.retryable
 
 
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):

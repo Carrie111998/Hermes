@@ -1443,7 +1443,6 @@ _QUICK_STATE_FILES = (
     "channel_aliases.json",
     "processes.json",
     "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
-    "deferred_questions.db",          # durable plugin questions awaiting delivery/answer
     # Per-profile user-created stores that live outside the git checkout and
     # are therefore destroyed if the update flow removes/replaces the file and
     # the post-update schema-init re-creates an empty one (issue #52889). All
