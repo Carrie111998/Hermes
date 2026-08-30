@@ -930,6 +930,74 @@ class TestDefaultInteractionDispatch:
 
 
     @pytest.mark.asyncio
+    async def test_approval_click_on_dm_key_from_c2c_operator_resolves(self):
+        """Regression: C2C DMs build session keys with ``chat_type="dm"``
+        (``build_source(chat_type="dm")`` in the adapter), but the
+        authorization check only accepted the literal ``"c2c"`` — so every
+        approval-button click on a 1:1 QQ DM was rejected as unauthorized,
+        the agent sat until its 5-minute approval timeout, and multi-turn
+        sessions stalled.
+
+        The key's ``chat_id`` segment and the clicking operator's openid are
+        the same ``user_openid`` for C2C, so a ``dm`` key with a matching
+        operator must resolve.
+        """
+        adapter = self._make_adapter()
+        resolve_calls = []
+
+        def fake_resolve(session_key, choice, resolve_all=False):
+            resolve_calls.append((session_key, choice, resolve_all))
+            return 1
+
+        import tools.approval
+        orig = tools.approval.resolve_gateway_approval
+        tools.approval.resolve_gateway_approval = fake_resolve
+        try:
+            from gateway.platforms.qqbot.keyboards import parse_interaction_event
+            event = parse_interaction_event({
+                "id": "i",
+                "chat_type": 2,  # QQ wire scene: 2 = c2c
+                "user_openid": "u-42",
+                "data": {"resolved": {
+                    "button_data": "approve:agent:main:qqbot:dm:u-42:allow-once",
+                }},
+            })
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            tools.approval.resolve_gateway_approval = orig
+
+        assert resolve_calls == [("agent:main:qqbot:dm:u-42", "once", False)]
+
+    @pytest.mark.asyncio
+    async def test_approval_click_on_dm_key_rejects_other_operator(self):
+        """The ``dm`` relaxation must still reject a non-owner operator."""
+        adapter = self._make_adapter()
+        resolve_calls = []
+
+        def fake_resolve(session_key, choice, resolve_all=False):
+            resolve_calls.append((session_key, choice, resolve_all))
+            return 1
+
+        import tools.approval
+        orig = tools.approval.resolve_gateway_approval
+        tools.approval.resolve_gateway_approval = fake_resolve
+        try:
+            from gateway.platforms.qqbot.keyboards import parse_interaction_event
+            event = parse_interaction_event({
+                "id": "i",
+                "chat_type": 2,
+                "user_openid": "attacker",
+                "data": {"resolved": {
+                    "button_data": "approve:agent:main:qqbot:dm:u-42:allow-once",
+                }},
+            })
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            tools.approval.resolve_gateway_approval = orig
+
+        assert resolve_calls == []
+
+    @pytest.mark.asyncio
     async def test_approval_click_rejects_unauthorized_operator(self):
         adapter = self._make_adapter()
         resolve_calls = []

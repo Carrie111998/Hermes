@@ -1131,7 +1131,14 @@ class QQAdapter(BasePlatformAdapter):
 
         chat_type = parsed.get("chat_type", "")
         chat_id = parsed.get("chat_id", "")
-        if chat_type == "c2c":
+        if chat_type in {"c2c", "dm"}:
+            # 1:1 C2C DMs build their session key via
+            # ``build_source(chat_type="dm")`` (see _on_c2c_message), so the
+            # key carries the literal ``"dm"`` while interaction events
+            # arrive with the QQ wire scene ``c2c``. Both name the same
+            # private chat whose chat_id IS the owner's user_openid, so a
+            # matching operator is the session owner regardless of which
+            # spelling the key used.
             return bool(chat_id) and operator == chat_id
 
         if chat_type in {"group", "guild"}:
