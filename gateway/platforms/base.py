@@ -2411,6 +2411,7 @@ class MessageType(Enum):
     DOCUMENT = "document"
     STICKER = "sticker"
     COMMAND = "command"  # /command style
+    CONTACT = "contact"
 
 
 class ProcessingOutcome(Enum):
