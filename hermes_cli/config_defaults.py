@@ -2778,6 +2778,13 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Terminal execution-ledger retention: cron/executions.db keeps the N
+        # most recent terminal rows (completed/failed/unknown) and prunes older
+        # ones on each terminal write. Claimed/running rows are never pruned.
+        # This is a ROW cap, not a day count — size it from the fleet's measured
+        # runs per day. Non-positive values fall back to the default rather than
+        # wiping the audit trail. Default 1000.
+        "execution_retention": 1000,
         # Timeout (seconds) for a no-agent cron script. Also overridable via
         # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
