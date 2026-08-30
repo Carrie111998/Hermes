@@ -35,6 +35,9 @@ export interface PreviewTarget {
   label: string
   large?: boolean
   language?: string
+  /** Read this file from the local shell even while the active session uses a
+   * remote gateway. Set only by local-origin attachment chips. */
+  localFile?: boolean
   mimeType?: string
   path?: string
   previewKind?: 'binary' | 'html' | 'image' | 'pdf' | 'text'

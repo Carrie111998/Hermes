@@ -415,7 +415,8 @@ export function useComposerActions({
           label: pathLabel(path),
           detail: rel,
           refText: `@${kind}:${formatRefValue(rel)}`,
-          path
+          path,
+          localFile: kind === 'file'
         })
       }
     },
@@ -456,7 +457,8 @@ export function useComposerActions({
         label: pathLabel(filePath),
         detail: rel,
         refText: `@file:${formatRefValue(rel)}`,
-        path: filePath
+        path: filePath,
+        localFile: true
       })
 
       return true
@@ -587,6 +589,55 @@ export function useComposerActions({
     },
     [attachImagePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardImage]
   )
+
+  const pasteClipboardText = useCallback(async () => {
+    try {
+      const result = await window.hermesDesktop?.saveClipboardText()
+
+      if (!result || result.status === 'empty') {
+        notify({
+          kind: 'warning',
+          title: copy.clipboard,
+          message: copy.noClipboardText
+        })
+
+        return false
+      }
+
+      if (result.status === 'image') {
+        notify({
+          kind: 'warning',
+          title: copy.clipboard,
+          message: copy.clipboardImageInstead
+        })
+
+        return false
+      }
+
+      if (result.status === 'too_large') {
+        notify({
+          kind: 'warning',
+          title: copy.clipboard,
+          message: copy.clipboardTextTooLarge
+        })
+
+        return false
+      }
+
+      return attachContextFilePath(result.path)
+    } catch (err) {
+      notifyError(err, copy.clipboardPasteFailed)
+
+      return false
+    }
+  }, [
+    attachContextFilePath,
+    copy.clipboard,
+    copy.clipboardImageInstead,
+    copy.clipboardPasteFailed,
+    copy.clipboardTextTooLarge,
+    copy.noClipboardText
+  ])
 
   const attachContextFolderPath = useCallback(
     (folderPath: string) => {
@@ -734,6 +785,7 @@ export function useComposerActions({
     attachPrCommentUrl,
     insertContextPathInlineRef,
     pasteClipboardImage,
+    pasteClipboardText,
     pickContextPaths,
     pickImages,
     removeAttachment

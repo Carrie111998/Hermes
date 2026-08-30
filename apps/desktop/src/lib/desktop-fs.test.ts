@@ -12,6 +12,7 @@ import {
   readDesktopFileDataUrl,
   readDesktopFileDataUrlLocalFirst,
   readDesktopFileText,
+  readDesktopFileTextLocalFirst,
   selectDesktopPaths,
   setDesktopFsRemotePicker
 } from './desktop-fs'
@@ -135,6 +136,33 @@ describe('desktop filesystem facade', () => {
     await expect(readDesktopFileDataUrlLocalFirst('/remote/image.png')).resolves.toBe('data:text/plain;base64,cmVtb3Rl')
     expect(readFileDataUrl).toHaveBeenCalledOnce()
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-data-url?path=%2Fremote%2Fimage.png' })
+  })
+
+  it('prefers local text reads in remote mode', async () => {
+    $connection.set({ mode: 'remote' } as never)
+
+    await expect(readDesktopFileTextLocalFirst('/local/note.md')).resolves.toMatchObject({ text: 'local' })
+    expect(readFileText).toHaveBeenCalledWith('/local/note.md')
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('falls back from local text reads to the active gateway in remote mode', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    readFileText.mockRejectedValueOnce(new Error('not on host'))
+
+    await expect(readDesktopFileTextLocalFirst('/remote/note.md')).resolves.toMatchObject({ text: 'remote' })
+    expect(readFileText).toHaveBeenCalledOnce()
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-text?path=%2Fremote%2Fnote.md' })
+  })
+
+  it('signals a stale preload instead of reading a local-origin path from the gateway', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    Object.defineProperty(window.hermesDesktop, 'readFileText', { configurable: true, value: undefined })
+
+    await expect(readDesktopFileTextLocalFirst('/local/note.md')).rejects.toThrow(
+      "No handler registered for 'hermes:readFileText'"
+    )
+    expect(api).not.toHaveBeenCalled()
   })
 
   it('targets the active profile backend so a remote profile never reads local disk', async () => {

@@ -256,6 +256,7 @@ function TileChat({
           onDismissError={actions.dismissError}
           onEdit={actions.editMessage}
           onPasteClipboardImage={onPasteClipboardImage}
+          onPasteClipboardText={composer.pasteClipboardText}
           onPickFiles={onPickFiles}
           onPickFolders={onPickFolders}
           onPickImages={onPickImages}

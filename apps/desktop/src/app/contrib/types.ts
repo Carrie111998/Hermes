@@ -38,6 +38,7 @@ export type ChatActions = Pick<
   | 'onDismissError'
   | 'onEdit'
   | 'onPasteClipboardImage'
+  | 'onPasteClipboardText'
   | 'onPickFiles'
   | 'onPickFolders'
   | 'onPickImages'

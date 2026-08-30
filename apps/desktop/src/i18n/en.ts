@@ -2451,6 +2451,7 @@ export const en: Translations = {
     folder: 'Folder…',
     images: 'Images…',
     pasteImage: 'Paste image',
+    pasteAsFile: 'Paste clipboard as file',
     url: 'URL…',
     promptSnippets: 'Prompt snippets…',
     tipPre: 'Tip: type ',
@@ -3465,6 +3466,9 @@ export const en: Translations = {
     attachImages: 'Attach images',
     clipboard: 'Clipboard',
     noClipboardImage: 'No image found in clipboard',
+    noClipboardText: 'No text in clipboard',
+    clipboardImageInstead: 'Clipboard contains an image. Use Paste image instead.',
+    clipboardTextTooLarge: 'Clipboard text is too large to attach (maximum 10 MB)',
     clipboardPasteFailed: 'Clipboard paste failed',
     dropFiles: 'Drop files',
     handoff: {

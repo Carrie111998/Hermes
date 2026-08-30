@@ -26,8 +26,11 @@ import {
   desktopFsCacheKey,
   desktopGitRoot,
   readDesktopFileDataUrl,
+  readDesktopFileDataUrlLocalFirst,
   readDesktopFileText,
-  writeDesktopFileText
+  readDesktopFileTextLocalFirst,
+  writeDesktopFileText,
+  writeDesktopFileTextLocal
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
@@ -265,9 +268,9 @@ function dataUrlToBlob(dataUrl: string) {
   return new Blob([bytes], { type: 'application/pdf' })
 }
 
-async function readTextPreview(filePath: string) {
+async function readTextPreview(filePath: string, localFile = false) {
   try {
-    return await readDesktopFileText(filePath)
+    return await (localFile ? readDesktopFileTextLocalFirst(filePath) : readDesktopFileText(filePath))
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
 
@@ -278,7 +281,9 @@ async function readTextPreview(filePath: string) {
 
   // Back-compat for a running Electron process whose preload hasn't been
   // restarted since readFileText was added. readFileDataUrl already existed.
-  const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath)
+  const dataUrl = localFile
+    ? await readDesktopFileDataUrlLocalFirst(filePath)
+    : await window.hermesDesktop.readFileDataUrl(filePath)
   const [, metadata = '', data = ''] = dataUrl.match(/^data:([^,]*),(.*)$/) || []
   const base64 = metadata.includes(';base64')
   const mimeType = metadata.replace(/;base64$/, '') || undefined
@@ -766,7 +771,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
           return
         }
 
-        const result = await readTextPreview(filePath)
+        const result = await readTextPreview(filePath, target.localFile)
 
         if (active) {
           const shouldBlock = !forcePreview && (result.binary || (result.byteSize ?? 0) > TEXT_PREVIEW_MAX_BYTES)
@@ -783,7 +788,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
           // Best-effort: fetch the file's working-tree-vs-HEAD diff so the
           // preview can offer a DIFF view when there are uncommitted changes.
           // Empty (clean file / not a repo / remote) just hides the option.
-          if (!shouldBlock) {
+          if (!shouldBlock && !target.localFile) {
             try {
               const root = await desktopGitRoot(filePath)
               const diff = root ? await desktopFileDiff(root, filePath) : ''
@@ -822,6 +827,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     reloadKey,
     selfReload,
     target.dataUrl,
+    target.localFile,
     target.language
   ])
 
@@ -955,7 +961,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       // choice. `force` is the user picking "overwrite" from that banner.
       if (!force) {
         try {
-          const current = await readTextPreview(filePath)
+          const current = await readTextPreview(filePath, target.localFile)
 
           if (!current.binary && (current.text ?? '') !== baselineRef.current) {
             setConflict(true)
@@ -968,12 +974,16 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
         }
       }
 
-      await writeDesktopFileText(filePath, draftRef.current)
+      await (target.localFile
+        ? writeDesktopFileTextLocal(filePath, draftRef.current)
+        : writeDesktopFileText(filePath, draftRef.current))
       baselineRef.current = draftRef.current
       setDirty(false)
       setConflict(false)
       setEditing(false)
-      notifyWorkspaceChanged()
+      if (!target.localFile) {
+        notifyWorkspaceChanged()
+      }
       setSelfReload(n => n + 1)
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error))

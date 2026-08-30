@@ -669,3 +669,41 @@ describe('attachImagePath thumbnail separation', () => {
     expect(attachment?.thumbnailUrl).toBeUndefined()
   })
 })
+
+describe('pasteClipboardText', () => {
+  afterEach(() => {
+    Reflect.deleteProperty(window, 'hermesDesktop')
+    vi.restoreAllMocks()
+  })
+
+  it('marks a saved clipboard file as local-origin', async () => {
+    const path = '/Users/test/Library/Application Support/Hermes/composer-files/clipboard.md'
+    const add = vi.fn<(attachment: ComposerAttachment) => void>()
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { saveClipboardText: vi.fn(async () => ({ path, status: 'saved' as const })) }
+    })
+
+    const { result } = renderHook(() =>
+      useComposerActions({
+        activeSessionId: null,
+        currentCwd: '/Users/test/project',
+        requestGateway: vi.fn(),
+        scope: {
+          add,
+          remove: vi.fn(() => null),
+          target: 'test-composer',
+          update: vi.fn(() => true),
+          updateIfCurrent: vi.fn(() => true)
+        }
+      })
+    )
+
+    await act(async () => {
+      await expect(result.current.pasteClipboardText()).resolves.toBe(true)
+    })
+
+    expect(add).toHaveBeenCalledWith(expect.objectContaining({ kind: 'file', localFile: true, path }))
+  })
+})

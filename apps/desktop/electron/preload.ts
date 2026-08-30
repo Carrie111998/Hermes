@@ -251,6 +251,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   },
   saveImageBuffer: (data, ext) => ipcRenderer.invoke('hermes:saveImageBuffer', { data, ext }),
   saveClipboardImage: () => ipcRenderer.invoke('hermes:saveClipboardImage'),
+  saveClipboardText: () => ipcRenderer.invoke('hermes:saveClipboardText'),
   getPathForFile: file => {
     try {
       return webUtils.getPathForFile(file) || ''

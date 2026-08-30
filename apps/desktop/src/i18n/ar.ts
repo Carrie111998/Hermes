@@ -1908,6 +1908,7 @@ export const ar = defineLocale({
     folder: 'مجلد',
     images: 'صور',
     pasteImage: 'لصق صورة',
+    pasteAsFile: 'لصق الحافظة كملف',
     url: 'رابط',
     promptSnippets: 'مقتطفات جاهزة',
     tipPre: 'نصيحة: اكتب ',
@@ -2826,6 +2827,9 @@ export const ar = defineLocale({
     attachImages: 'إرفاق الصور',
     clipboard: 'الحافظة',
     noClipboardImage: 'لا توجد صورة في الحافظة',
+    noClipboardText: 'لا يوجد نص في الحافظة',
+    clipboardImageInstead: 'تحتوي الحافظة على صورة. استخدم «لصق صورة» بدلًا من ذلك.',
+    clipboardTextTooLarge: 'نص الحافظة كبير جدًا ولا يمكن إرفاقه (الحد الأقصى 10 ميغابايت)',
     clipboardPasteFailed: 'فشل اللصق من الحافظة',
     dropFiles: 'أفلت الملفات هنا',
     handoff: {

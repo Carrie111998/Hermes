@@ -87,6 +87,44 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
   return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path))
 }
 
+/** Read an explicitly local-origin attachment from the shell, falling back to
+ * the active gateway only when the local path cannot be read. */
+export async function readDesktopFileTextLocalFirst(path: string): Promise<HermesReadFileTextResult> {
+  const readFileText = window.hermesDesktop?.readFileText
+
+  if (typeof readFileText !== 'function') {
+    throw new Error("No handler registered for 'hermes:readFileText'")
+  }
+
+  try {
+    const local = await readFileText(path)
+
+    if (local) {
+      return local
+    }
+  } catch (error) {
+    if (!isDesktopFsRemoteMode()) {
+      throw error
+    }
+
+    // Not on this machine (or unreadable locally) — try the active gateway.
+  }
+
+  return readDesktopFileText(path)
+}
+
+/** Write an explicitly local-origin attachment through Electron, even when the
+ * active gateway is remote. */
+export async function writeDesktopFileTextLocal(path: string, content: string): Promise<{ path: string }> {
+  const writeTextFile = bridge().writeTextFile
+
+  if (!writeTextFile) {
+    throw new Error('Saving is not available')
+  }
+
+  return writeTextFile(path, content)
+}
+
 // Save UTF-8 text back to a file. Local writes go through the hardened Electron
 // IPC; remote writes hit the dashboard's POST /api/fs/write-text (same path
 // hardening, parent-must-exist, size cap) so the editor behaves identically in

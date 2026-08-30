@@ -19,6 +19,9 @@ export interface ComposerAttachment {
   /** Downscaled data URL for the attachment card and optimistic bubble only. */
   thumbnailUrl?: string
   path?: string
+  /** This path was supplied by the local shell (picker, clipboard, or OS
+   * drop), rather than the active gateway workspace. */
+  localFile?: boolean
   attachedSessionId?: string
   /** Set while the file/image bytes are being staged into the session
    * workspace (remote upload or local stage), and 'error' if that failed.

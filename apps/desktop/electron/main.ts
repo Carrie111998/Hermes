@@ -87,6 +87,13 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
+import {
+  clipboardTextExtension,
+  type ClipboardTextSaveResult,
+  composerTextFilenamePrefix,
+  hasClipboardText,
+  isClipboardTextTooLarge
+} from './composer-clipboard'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -5853,6 +5860,73 @@ async function saveImageFromUrl(rawUrl) {
   return true
 }
 
+// Composer attachments are a transient handoff cache, not user-visible
+// storage. Bound each cache independently so frequent clipboard pastes cannot
+// leave an unbounded hidden directory behind.
+const COMPOSER_CACHE_MAX_FILES = 100
+const COMPOSER_CACHE_MAX_BYTES = 100 * 1024 * 1024
+
+async function pruneComposerCache(dir, preservePath) {
+  let entries
+
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+
+  const files = (
+    await Promise.all(
+      entries
+        .filter(entry => entry.isFile())
+        .map(async entry => {
+          const filePath = path.join(dir, entry.name)
+
+          try {
+            const stat = await fs.promises.stat(filePath)
+
+            return { filePath, mtimeMs: stat.mtimeMs, size: stat.size }
+          } catch {
+            return null
+          }
+        })
+    )
+  )
+    .filter(Boolean)
+    .sort((left, right) => left.mtimeMs - right.mtimeMs)
+
+  let totalBytes = files.reduce((total, file) => total + file.size, 0)
+  let remainingFiles = files.length
+
+  for (const file of files) {
+    if (remainingFiles <= COMPOSER_CACHE_MAX_FILES && totalBytes <= COMPOSER_CACHE_MAX_BYTES) {
+      break
+    }
+
+    // The write that triggered pruning must remain available to the composer.
+    if (file.filePath === preservePath) {
+      continue
+    }
+
+    try {
+      await fs.promises.unlink(file.filePath)
+      totalBytes -= file.size
+      remainingFiles -= 1
+    } catch {
+      // Another renderer/process may already have removed the cache entry.
+    }
+  }
+}
+
+async function writeComposerCacheFile(dir, filename, data) {
+  await fs.promises.mkdir(dir, { recursive: true })
+  const filePath = path.join(dir, filename)
+  await fs.promises.writeFile(filePath, data)
+  await pruneComposerCache(dir, filePath)
+
+  return filePath
+}
+
 async function writeComposerImage(buffer, ext = '.png') {
   const rawExt = String(ext || '.png')
     .trim()
@@ -5861,13 +5935,20 @@ async function writeComposerImage(buffer, ext = '.png') {
   const normalizedExt = rawExt.startsWith('.') ? rawExt : `.${rawExt}`
   const safeExt = /^\.[a-z0-9]{1,5}$/.test(normalizedExt) ? normalizedExt : '.png'
   const dir = path.join(app.getPath('userData'), 'composer-images')
-  await fs.promises.mkdir(dir, { recursive: true })
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')
   const random = crypto.randomBytes(3).toString('hex')
-  const filePath = path.join(dir, `composer_${stamp}_${random}${safeExt}`)
-  await fs.promises.writeFile(filePath, buffer)
 
-  return filePath
+  return writeComposerCacheFile(dir, `composer_${stamp}_${random}${safeExt}`, buffer)
+}
+
+async function writeComposerText(text) {
+  const safePreview = composerTextFilenamePrefix(text)
+
+  const dir = path.join(app.getPath('userData'), 'composer-files')
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')
+  const random = crypto.randomBytes(3).toString('hex')
+
+  return writeComposerCacheFile(dir, `${safePreview}_${stamp}_${random}${clipboardTextExtension(text)}`, text)
 }
 
 function previewLabelForUrl(url) {
@@ -16406,6 +16487,26 @@ ipcMain.handle('hermes:saveClipboardImage', async () => {
   }
 
   return ''
+})
+
+ipcMain.handle('hermes:saveClipboardText', async () => {
+  const text = clipboard.readText()
+
+  if (!hasClipboardText(text)) {
+    const image = clipboard.readImage()
+
+    if (image && !image.isEmpty()) {
+      return { status: 'image' } satisfies ClipboardTextSaveResult
+    }
+
+    return { status: 'empty' } satisfies ClipboardTextSaveResult
+  }
+
+  if (isClipboardTextTooLarge(text)) {
+    return { status: 'too_large' } satisfies ClipboardTextSaveResult
+  }
+
+  return { status: 'saved', path: await writeComposerText(text) } satisfies ClipboardTextSaveResult
 })
 
 ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
