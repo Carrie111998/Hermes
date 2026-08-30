@@ -311,3 +311,26 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     # Budget 2 total across both lanes, reservation notwithstanding.
     assert len(res.spawned) == 2
+
+def test_non_dispatchable_assignee_skipped_before_profile_check(
+    dispatch_env,
+):
+    """A real profile listed in kanban.non_dispatchable_assignees is
+    bucketed as nonspawnable and never spawned, even though profile_exists
+    would return True for it (human-owner lane)."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch = dispatch_env['monkeypatch']
+    conn = dispatch_env['conn']
+
+    monkeypatch.setattr(cfgmod, 'load_config', lambda: {'kanban': {'non_dispatchable_assignees': ['human-owner']}})
+    monkeypatch.setattr(profmod, 'profile_exists', lambda name: True)
+
+    kb.create_task(conn, key='HO-1', title='Human decision', column='todo', assignee='human-owner')
+    kb.recompute_ready(conn)
+
+    res = kb.dispatch_once(conn, dry_run=True)
+    assert res.skipped_nonspawnable == ['HO-1']
+    assert res.spawned == []
+
