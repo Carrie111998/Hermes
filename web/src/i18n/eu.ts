@@ -368,7 +368,7 @@ export const eu = defineLocale({
     modelOptional: 'Modeloa (aukerakoa)',
     modelInherit: 'Heredatu klonetik / lehenetsitik',
     modelLoading: 'Modeloak kargatzen…',
-    modelNone: 'Ez dago autentifikatutako provider-rik — ezarri gako bat lehenengo',
+    modelNone: 'Ez dago autentifikatutako hornitzaile-rik — ezarri gako bat lehenengo',
     editModel: 'Aldatu modeloa',
     modelSaved: 'Modeloa eguneratuta',
     modelSelect: 'Hautatu modelo bat',
@@ -377,7 +377,7 @@ export const eu = defineLocale({
 
   pluginsPage: {
     contextEngineLabel: 'Testuinguru-motorra',
-    dashboardSlots: 'Dashboard slot-ak',
+    dashboardSlots: 'Aginte-panelaren slot-ak',
     disableRuntime: 'Desgaitu',
     enableAfterInstall: 'Gaitu instalatu ondoren',
     enableRuntime: 'Gaitu',
@@ -390,25 +390,25 @@ export const eu = defineLocale({
     installHeading: 'Instalatu GitHub-etik / Git URL-tik',
     installHint:
       'Erabili jabe/errepo laburdura edo https:// edo git@ klonazio-URL oso bat. Azpidirektorio bateko plugin batentzat, gehitu bidea: owner/repo/path/to/plugin (edo <url>#path/to/plugin).',
-    memoryProviderLabel: 'Memoria-provider-a',
+    memoryProviderLabel: 'Memoria-hornitzailea',
     missingEnvWarn: 'Ezarri hauek Gakoak atalean plugina exekutatu aurretik:',
-    noDashboardTab: 'Ez du dashboard fitxarik',
+    noDashboardTab: 'Ez du aginte-panel fitxarik',
     openTab: 'Ireki',
-    orphanHeading: 'Soilik dashboard-erako luzapenak (ez dute agent plugin.yaml-rekin bat egiten)',
+    orphanHeading: 'Soilik aginte-panel-erako luzapenak (ez dute agent plugin.yaml-rekin bat egiten)',
     pluginListHeading: 'Instalatutako plugin-ak',
     providerDefaults: 'barnekoa / lehenetsia',
-    providersHeading: 'Exekuzio-denborako provider plugin-ak',
+    providersHeading: 'Exekuzio-denborako hornitzaile-plugin-ak',
     providersHint:
       'memory.provider (hutsik = barnekoa) eta context.engine idazten ditu config.yaml-en. Hurrengo saioan du eragina.',
-    refreshDashboard: 'Berriro eskaneatu dashboard-luzapenak',
+    refreshDashboard: 'Berriro eskaneatu aginte-panel-luzapenak',
     removeConfirm: 'Kendu plugin hau ~/.hermes/plugins/ -tik?',
     removeHint: 'Erabiltzaileak instalatutako plugin-ak soilik ken daitezke ~/.hermes/plugins azpian.',
     rescanHeading: 'SPA plugin-erregistroa',
     rescanHint:
-      'Eskaneatu berriro diskoan fitxategiak gehitu ondoren, dashboardeko alboko barrak manifestu berriak har ditzan.',
+      'Eskaneatu berriro diskoan fitxategiak gehitu ondoren, aginte-panelaren alboko barrak manifestu berriak har ditzan.',
     runtimeHeading: 'Gateway runtime-a (YAML plugin-ak)',
-    saveProviders: 'Gorde provider-ezarpenak',
-    savedProviders: 'Provider-ezarpenak gordeta.',
+    saveProviders: 'Gorde hornitzaile-ezarpenak',
+    savedProviders: 'Hornitzaile-ezarpenak gordeta.',
     sourceBadge: 'Iturburua',
     authRequired: 'Autentifikazioa beharrezkoa',
     authRequiredHint: 'Exekutatu komando hau autentifikatzeko:',
@@ -439,7 +439,124 @@ export const eu = defineLocale({
     profileSelector: 'Profila',
     currentProfile: 'uneko ({name})',
     managingProfile:
-      '„{name}“ profila kudeatzen — aldaketak profil horri aplikatzen zaizkio, ez dashboard honi.'
+      '„{name}“ profila kudeatzen — aldaketak profil horri aplikatzen zaizkio, ez aginte-panel honi.'
+  },
+
+  config: {
+    configPath: '~/.hermes/config.yaml',
+    filters: 'Iragazkiak',
+    sections: 'Atalak',
+    exportConfig: 'Esportatu konfigurazioa JSON gisa',
+    importConfig: 'Inportatu konfigurazioa JSON-etik',
+    resetDefaults: 'Berrezarri lehenetsiak',
+    resetScopeTooltip: 'Berrezarri {scope} lehenetsietara',
+    confirmResetScope:
+      'Berrezarri {scope} ezarpen guztiak lehenetsietara? Honek formularioa soilik eguneratzen du — aldaketak ez dira config.yaml-en idazten Gorde sakatzen duzun arte.',
+    resetScopeToast: '{scope} lehenetsietara berrezarrita — berrikusi eta Gorde iraunarazteko',
+    rawYaml: 'YAML konfigurazio gordina',
+    searchResults: 'Bilaketa-emaitzak',
+    fields: 'eremu',
+    noFieldsMatch: 'Ez dago "{query}"-rekin bat datorren eremurik',
+    configSaved: 'Konfigurazioa gordeta',
+    yamlConfigSaved: 'YAML konfigurazioa gordeta',
+    failedToSave: 'Ezin izan da gorde',
+    failedToSaveYaml: 'Ezin izan da YAML gorde',
+    failedToLoadRaw: 'Ezin izan da konfigurazio gordina kargatu',
+    configImported: 'Konfigurazioa inportatuta — berrikusi eta gorde',
+    invalidJson: 'JSON fitxategi baliogabea',
+    categories: {
+      general: 'Orokorra',
+      agent: 'Agentea',
+      terminal: 'Terminal',
+      display: 'Pantaila',
+      delegation: 'Delegazioa',
+      memory: 'Memoria',
+      compression: 'Konpresioa',
+      security: 'Segurtasuna',
+      browser: 'Nabigatzailea',
+      voice: 'Ahotsa',
+      tts: 'Testu-ahotsa',
+      stt: 'Ahots-testua',
+      logging: 'Log-a',
+      discord: 'Discord',
+      auxiliary: 'Laguntza-lanak'
+    }
+  },
+
+  env: {
+    changesNote:
+      'Aldaketak berehala gordetzen dira diskoan. Saio aktiboek gako berriak automatikoki hartzen dituzte.',
+    confirmClearMessage:
+      'Aldagai honen gordetako balioa zure .env fitxategitik kenduko da. Ezin da desegin interfazetik.',
+    confirmClearTitle: 'Gako hau garbitu?',
+    description: 'Kudeatu hemen gordetako API gakoak eta sekretuak',
+    hideAdvanced: 'Ezkutatu aurreratuak',
+    showAdvanced: 'Erakutsi aurreratuak',
+    showLess: 'Erakutsi gutxiago',
+    showMore: 'Erakutsi gehiago',
+    llmProviders: 'LLM hornitzaileak',
+    providersConfigured: '{configured} / {total} hornitzaile konfiguratuta',
+    getKey: 'Lortu gakoa',
+    notConfigured: '{count} konfiguratu gabe',
+    notSet: 'Ez dago ezarrita',
+    keysCount: '{count} gako',
+    enterValue: 'Sartu balioa…',
+    replaceCurrentValue: 'Ordeztu uneko balioa ({preview})',
+    showValue: 'Erakutsi benetako balioa',
+    hideValue: 'Ezkutatu balioa',
+    customTitle: 'Gako pertsonalizatuak',
+    customHint:
+      'Hermes-ek ezagutzen ez dituen eta zure .env fitxategian gordetako ingurune-aldagai arbitrarioak. Erabili hauek gaitasunetarako (skills), MCP zerbitzarietarako edo zure tresnetarako ingurune-aldagaiak txertatzeko.',
+    customConfigured: '{count} gako pertsonalizatu ezarrita',
+    addCustomKey: 'Gehitu gako pertsonalizatu bat',
+    customKeyName: 'Aldagaiaren izena',
+    customKeyNamePlaceholder: 'adib. MY_SERVICE_API_KEY',
+    add: 'Gehitu',
+    invalidKeyName:
+      'Erabili letrak, zenbakiak eta azpimarrak soilik (letra edo azpimarrarekin hasi behar da).'
+  },
+
+  oauth: {
+    title: 'Hasi saioa hornitzaileekin (OAuth)',
+    providerLogins: 'Hasi saioa hornitzaileekin (OAuth)',
+    description:
+      '{connected} / {total} OAuth hornitzaileak konektatuta daude. Erabili saio-hasiera aginte-panelak onartzen dituen prozesuetarako; CLI komandoak eskuragarri jarraitzen dute kanpoko konfiguraziorako edo ordezko aukera gisa.',
+    connected: 'Konektatuta',
+    expired: 'Iraungita',
+    notConnected:
+      'Ez dago konektatuta. Erabili saio-hasiera eskuragarri dagoenean, edo exekutatu {command} terminal batean.',
+    runInTerminal: 'terminal batean.',
+    noProviders: 'Ez da OAuth hornitzaile-rik detektatu.',
+    login: 'Hasi saioa',
+    disconnect: 'Deskonektatu',
+    managedExternally: 'Kanpotik kudeatuta',
+    copied: 'Kopiatuta ✓',
+    copyCode: 'Kopiatu kodea',
+    copyFailed: 'Ezin izan da automatikoki kopiatu. Hautatu kodea eta kopiatu eskuz.',
+    cli: 'Kopiatu',
+    copyCliCommand: 'Kopiatu CLI komandoa (kanpokoa / ordezkoa)',
+    connect: 'Konektatu',
+    sessionExpires: 'Saioa {time} barru iraungitzen da',
+    initiatingLogin: 'Saio-hasiera abiarazten…',
+    exchangingCode: 'Kodea token-engatik trukatzen…',
+    connectedClosing: 'Konektatuta! Ixten…',
+    loginFailed: 'Saio-hasierak huts egin du.',
+    sessionExpired: 'Saioa iraungita. Egin klik Saiatu berriro saio berri bat hasteko.',
+    reOpenAuth: 'Ireki berriro autentifikazio-orria',
+    reOpenVerification: 'Ireki berriro egiaztapen-orria',
+    submitCode: 'Bidali kodea',
+    pasteCode: 'Itsatsi baimen-kodea (#state atzizkia ondo dago)',
+    waitingAuth: 'Nabigatzailean baimena emateko zain…',
+    enterCodePrompt: 'Fitxa berri bat ireki da. Sartu kode hau eskatzen bazaizu:',
+    pkceStep1: 'Fitxa berri bat ireki da claude.ai-n. Hasi saioa eta egin klik Baimendu-n.',
+    pkceStep2: 'Kopiatu baimena eman ondoren agertzen den baimen-kodea.',
+    pkceStep3: 'Itsatsi behean eta bidali.',
+    flowLabels: {
+      pkce: 'Nabigatzaileko saio-hasiera (PKCE)',
+      device_code: 'Gailu-kodea',
+      external: 'Kanpoko CLI'
+    },
+    expiresIn: '{time} barru iraungitzen da'
   },
 
   language: {
@@ -455,5 +572,305 @@ export const eu = defineLocale({
     fontSans: 'Sans',
     fontSerif: 'Serif',
     fontMono: 'Mono'
+  },
+
+  achievements: {
+    hero: {
+      kicker: 'Gamerscore agentikoa',
+      title: 'Hermes lorpenak',
+      subtitle:
+        'Benetako saio-historiarekin irabazitako Hermes txapa-bildumak. Ezagutzen diren lorpen amaitu gabeak Aurkituak gisa erakusten dira; lorpen sekretuak ezkutatuta egoten dira bat datorren lehen jokabidea agertu arte.',
+      scan_subtitle:
+        'Hermes-en saio-historia eskaneatzen. Lehenengo eskaneatzeak 5–10 segundo har ditzake historia handietan.'
+    },
+    actions: {
+      rescan: 'Berriro eskaneatu'
+    },
+    stats: {
+      unlocked: 'Desblokeatuta',
+      unlocked_hint: 'irabazitako txapak',
+      discovered: 'Aurkitua',
+      discovered_hint: 'ezaguna, oraindik irabazi gabea',
+      secrets: 'Sekretuak',
+      secrets_hint: 'lehen seinalera arte ezkutatuta',
+      highest_tier: 'Maila gorena',
+      highest_tier_hint: 'Copper → Silver → Gold → Diamond → Olympian',
+      latest: 'Azkena',
+      latest_hint_empty: 'erabili gehiago Hermes',
+      none_yet: 'Oraindik bat ere ez'
+    },
+    state: {
+      unlocked: 'Desblokeatuta',
+      discovered: 'Aurkitua',
+      secret: 'Sekretua'
+    },
+    tier: {
+      target: 'Helburua: {tier}',
+      hidden: 'Ezkutatua',
+      complete: 'Osatua',
+      objective: 'Helburua'
+    },
+    progress: {
+      hidden: 'ezkutatua'
+    },
+    scan: {
+      building_headline: 'Lorpen-profila eraikitzen…',
+      building_detail: 'Saioak, tool deialdiak, modeloaren metadatuak eta desblokeatze-egoera irakurtzen.',
+      starting_headline: 'Lorpen-eskaneatzea hasten…',
+      progress_detail:
+        '{total} saiotik {scanned} eskaneatuta · {pct}%. Txapak desblokeatzen dira historia gehiago iritsi ahala.',
+      idle_detail:
+        'Saioak, tool deialdiak, modeloaren metadatuak eta desblokeatze-egoera irakurtzen. Txapak hemen agertzen dira desblokeatzen diren heinean.'
+    },
+    guide: {
+      tiers_header: 'Mailak',
+      secret_header: 'Lorpen sekretuak',
+      secret_body:
+        'Sekretuek ezkutatzen dute haien eragile zehatza. Hermes-ek erlazionatutako seinale bat ikusten duenean, txartela Aurkitua bihurtzen da eta bere baldintza erakusten du.',
+      scan_status_header: 'Eskaneatze-egoera',
+      scan_status_body:
+        'Hermes-ek tokiko historia behin eskaneatzen du, eta gero txartelak automatikoki agertuko dira. Ez da ezer trabatzen ari segundo batzuk behar baditu.',
+      what_scanned_header: 'Zer eskaneatzen den',
+      what_scanned_body:
+        'Saioak, tool deialdiak, modeloaren metadatuak, erroreak, lorpenak eta tokiko desblokeatze-egoera.'
+    },
+    card: {
+      share_title: 'Partekatu lorpen hau',
+      share_label: 'Partekatu {name}',
+      share_text: 'Partekatu',
+      how_to_reveal: 'Nola agerian utzi',
+      what_counts: 'Zer balio duen',
+      evidence_label: 'Ebidentzia',
+      evidence_session_fallback: 'saioa',
+      no_evidence: 'Oraindik ez dago ebidentziarik'
+    },
+    latest: {
+      header: 'Azken desblokeoak'
+    },
+    empty: {
+      no_secrets_header: 'Ez da sekretu ezkuturik geratzen eskaneatze honetan.',
+      no_secrets_body:
+        'Arrastoa: sekretuak normalean ohiz kanpoko hutsegite edo power-user ereduetatik hasten dira — ataka-gatazkak, baimen-hormak, falta diren env aldagaiak, YAML akatsak, Docker talkak, rollback/checkpoint erabilera, cache-hitzak edo testu gorri askoren ondorengo konponketa txikiak.'
+    },
+    filters: {
+      all_categories: 'Guztiak',
+      visibility_all: 'guztiak',
+      visibility_unlocked: 'desblokeatuta',
+      visibility_discovered: 'aurkitua',
+      visibility_secret: 'sekretua'
+    },
+    share: {
+      dialog_label: 'Partekatu lorpena',
+      header: 'Partekatu: {name}',
+      close: 'Itxi',
+      rendering: 'Errendatzen…',
+      card_alt: '{name} partekatze-txartela',
+      error_generic: 'Zerbait gaizki joan da.',
+      x_title: 'X irekitzen du aurrez betetako mezu batekin',
+      x_button: 'Partekatu X-n',
+      copy_title: 'Kopiatu irudia zure mezuan itsasteko',
+      copy_button: 'Kopiatu irudia',
+      copied: 'Kopiatuta ✓',
+      download_button: 'Deskargatu PNG',
+      hint:
+        'Partekatu X-n aurrez betetako mezu bat irekitzen du fitxa berri batean. Egin klik Kopiatu irudia lehenengo 1200×630 txapa erantsita nahi baduzu — X-ek tweet-konpositorean zuzenean itsastea uzten dizu. Deskargatu PNG-k fitxategia gordetzen du edonon erabiltzeko.',
+      clipboard_unsupported:
+        'Arbelaren irudi-kopiatzea ez dago onartuta nabigatzaile honetan — erabili Deskargatu.',
+      tweet_text: 'Oraintxe desblokeatu dut {tier_part}"{name}" Hermes Agent-en ☤'
+    }
+  },
+
+  kanban: {
+    loading: 'Kanban taula kargatzen…',
+    loadFailed: 'Ezin izan da Kanban taula kargatu: ',
+    loadFailedHint:
+      'Backend-ak kanban.db automatikoki sortzen du lehen irakurketan. Honek irauten badu, egiaztatu aginte-panelaren log-ak.',
+    board: 'Taula',
+    newBoard: '+ Taula berria',
+    newBoardTitle: 'Taula berria',
+    newBoardDescription:
+      'Taula bakoitzak lan-ildo ezberdinak bereizteko aukera ematen du — bat projektu, errepo edo domeinu bakoitzeko. Taula bateko langileek ez dute beste taula bateko zereginik ikusten.',
+    slug: 'Slug',
+    slugHint: '— letra xeheak, gidoiak, adib. atm10-server',
+    displayName: 'Erakusteko izena',
+    displayNameHint: '(aukerakoa)',
+    description: 'Deskribapena',
+    descriptionHint: '(aukerakoa)',
+    icon: 'Ikonoa',
+    iconHint: '(karaktere bakarra edo emoji-a)',
+    switchAfterCreate: 'Aldatu taula honetara sortu ondoren',
+    cancel: 'Utzi',
+    creating: 'Sortzen…',
+    createBoard: 'Sortu taula',
+    search: 'Bilatu',
+    filterCards: 'Iragazi txartelak…',
+    tenant: 'Tenant',
+    allTenants: 'Tenant guztiak',
+    assignee: 'Esleitua',
+    allProfiles: 'Profil guztiak',
+    showArchived: 'Erakutsi artxibatutakoak',
+    lanesByProfile: 'Profilaren araberako errailak',
+    nudgeDispatcher: 'Bultza ezazu dispatcher-a',
+    refresh: 'Freskatu',
+    selected: 'hautatuta',
+    complete: 'Osatu',
+    archive: 'Artxibatu',
+    apply: 'Aplikatu',
+    clear: 'Garbitu',
+    createTask: 'Sortu zeregina zutabe honetan',
+    noTasks: '— ez dago zereginik —',
+    unassigned: 'esleitu gabe',
+    needsAssignee: 'Esleipena behar du',
+    needsAssigneeHint:
+      'Menpekotasunak beteta daude, baina dispatcher-ak zeregina saltatzen du profila esleitu arte.',
+    untitled: '(izenik gabe)',
+    loadingDetail: 'Kargatzen…',
+    addComment: 'Gehitu iruzkin bat… (Sartu bidaltzeko)',
+    comment: 'Iruzkina',
+    status: 'Egoera',
+    workspace: 'Lan-eremua',
+    skills: 'Skills-ak',
+    createdBy: 'Sortzailea',
+    result: 'Emaitza',
+    comments: 'Iruzkinak',
+    events: 'Gertaerak',
+    runHistory: 'Exekuzio-historia',
+    workerLog: 'Langilearen log-a',
+    loadingLog: 'Log-a kargatzen…',
+    noWorkerLog:
+      '— oraindik ez dago langilearen log-ik (zeregina ez da abiarazi edo log-a biratu da) —',
+    noDescription: '— ez dago deskribapenik —',
+    noComments: '— ez dago iruzkinik —',
+    edit: 'editatu',
+    save: 'Gorde',
+    dependencies: 'Menpekotasunak',
+    parents: 'Gurasoak:',
+    children: 'Seme-alabak:',
+    none: 'bat ere ez',
+    addParent: '— gehitu gurasoa —',
+    addChild: '— gehitu seme-alaba —',
+    removeDependency: 'Kendu menpekotasuna',
+    block: 'Blokeatu',
+    unblock: 'Desblokeatu',
+    notifyHomeChannels: 'Jakinarazi etxeko kanalei',
+    diagnostics: 'Diagnostikoak',
+    hide: 'Ezkutatu',
+    show: 'Erakutsi',
+    attention: 'Arreta',
+    tasksNeedAttention: 'zereginak arreta behar dute',
+    taskNeedsAttention: 'zeregin batek arreta behar du',
+    diagnostic: 'diagnostikoa',
+    open: 'Ireki',
+    close: 'Itxi (Esc)',
+    reassignTo: 'Berriro esleitu honi:',
+    copied: 'Kopiatuta',
+    copyCommand: 'Kopiatu komandoa arbelera',
+    reclaim: 'Berreskuratu',
+    reassign: 'Berriro esleitu',
+    renderingError: 'Kanban fitxak errendatze-errore bat izan du',
+    reloadView: 'Kargatu berriro ikuspegia',
+    wsAuthFailed:
+      'WebSocket autentifikazioak huts egin du — kargatu berriro orria saio-tokena freskatzeko.',
+    markDone: '{n} zeregin osatutzat markatu?',
+    markArchived: '{n} zeregin artxibatu?',
+    warning: 'Abisua',
+    phantomIds: 'Fantasma-id-ak:',
+    active: 'aktiboa',
+    ended: 'amaituta',
+    noProfile: '(profilik gabe)',
+    showAllAttempts: 'Erakutsi saiakera guztiak',
+    sendingUpdates: 'Eguneraketak bidaltzen hona:',
+    sendNotifications: 'Bidali osatuta / blokeatuta / utzitako jakinarazpenak hona:',
+    archiveBoardConfirm:
+      "'{name}' taula artxibatu? boards/_archived/ karpetara eramango da gero berreskuratu ahal izateko. Taula honetako zereginak ez dira gehiago agertuko interfazean inon.",
+    archiveBoardTitle: 'Artxibatu taula hau',
+    boardSwitcherHint: 'Taula bakoitzak lan-ildo ezberdinak bereizteko aukera ematen du',
+    taskCreatedWarning: 'Zeregina sortuta, baina: ',
+    moveFailed: 'Mugimenduak huts egin du: ',
+    bulkFailed: 'Multzokoa: ',
+    completionBlockedHallucination: '⚠ Osaketa blokeatuta — fantasma txartel-id-ak',
+    suspectedHallucinatedReferences: '⚠ Testuak fantasma txartel-id-ak aipatu ditu',
+    pickProfileFirst: 'Hautatu profila lehenengo.',
+    unblockedMessage: '{id} desblokeatuta. Zeregina hurrengo tarterako prest dago.',
+    unblockFailed: 'Desblokeatzeak huts egin du: ',
+    reclaimedMessage: '{id} berreskuratuta. Zeregina prest-egoerara itzuli da.',
+    reclaimFailed: 'Berreskuratzeak huts egin du: ',
+    reassignedMessage: '{id} {profile}-ri berriro esleitua.',
+    reassignFailed: 'Berriro esleitzeko saiakerak huts egin du: ',
+    selectForBulk: 'Hautatu ekintza multzoketarako',
+    clickToEdit: 'Egin klik editatzeko',
+    clickToEditAssignee: 'Egin klik esleitua editatzeko',
+    emptyAssignee: '(hutsik = esleitu gabe utzi)',
+    columnLabels: {
+      triage: 'Sailkapena',
+      todo: 'Egitekoak',
+      scheduled: 'Programatuta',
+      ready: 'Prest',
+      running: 'Martxan',
+      blocked: 'Blokeatuta',
+      done: 'Eginda',
+      archived: 'Artxibatuta'
+    },
+    columnHelp: {
+      triage: 'Ideia gordinak — zehaztaile batek zehaztuko du espezifikazioa',
+      todo: 'Menpekotasunen zain edo esleitu gabe',
+      scheduled: 'Denbora-atzerapen jakin baten edo programatutako jarraipenaren zain',
+      ready: 'Menpekotasunak beteta; esleitu profila bidaltzeko',
+      running: 'Langile batek eskatua — martxan',
+      blocked: 'Langileak giza ekarpena eskatu du',
+      done: 'Osatuta',
+      archived: 'Artxibatuta'
+    },
+    confirmDone:
+      'Zeregin hau osatutzat markatu? Langilearen eskaria askatzen da eta menpeko seme-alabak prest jartzen dira.',
+    confirmArchive: 'Zeregin hau artxibatu? Taula-ikuspegi lehenetsitik desagertzen da.',
+    confirmBlocked: 'Zeregin hau blokeatutzat markatu? Langilearen eskaria askatzen da.',
+    confirmScheduled:
+      'Zeregin hau Programatuta-ra eraman? Erabili denbora-atzerapen jakinetarako, giza blokeatzaileetarako baino.',
+    confirmDoneMany:
+      '{n} zeregin osatutzat markatu? Langileen eskariek askatzen dira eta menpeko seme-alabak prest jartzen dira.',
+    confirmArchiveMany: '{n} zeregin artxibatu? Taula-ikuspegi lehenetsitik desagertzen dira.',
+    confirmBlockedMany: '{n} zeregin blokeatutzat markatu? Langileen eskariek askatzen dira.',
+    completionSummary:
+      '{label}-ren osaketa-laburpena. Zereginaren emaitza gisa gordetzen da.',
+    completionSummaryRequired:
+      'Osaketa-laburpena beharrezkoa da zeregina egindatzat markatu aurretik.',
+    triagePlaceholder: 'Ideia gordina — AI-ak zehaztuko du…',
+    taskTitlePlaceholder: 'Zeregin-izen berria…',
+    specifier: 'zehaztailea',
+    assigneePlaceholder: 'esleitua',
+    priority: 'Lehentasuna',
+    skillsPlaceholder:
+      'skills-ak (aukerakoa, komekin bereizia): translation, github-code-review',
+    noParent: '— ez dago gurasorik —',
+    workspacePathDir: 'lan-eremuaren bidea (beharrezkoa, adib. ~/projects/my-app)',
+    workspacePathOptional:
+      'lan-eremuaren bidea (aukerakoa, esleituarenetik eratorria hutsik badago)',
+    logTruncated: '(azken 100 KB erakusten — log osoa hemen: ',
+    logAt: ')',
+    newTaskTitle: 'Zeregin berria — {column}',
+    taskTitleLabel: 'Izenburua',
+    assigneeLabel: 'Esleitua',
+    assigneeLabelHint: '(hutsik = dispatcher-ak aukeratzen du)',
+    skillsLabel: 'Skills-ak',
+    skillsLabelHint: '(aukerakoa, komekin bereizia)',
+    parentLabel: 'Guraso-zeregina',
+    parentLabelHint: '(seme-alaba blokeatuta egoten da gurasoa amaitu arte)',
+    create: 'Sortu',
+    boardSettings: 'Ezarpenak',
+    boardSettingsTitle:
+      'Taularen ezarpenak — izena, deskribapena eta zeregin berriek heredatzen duten lehenetsitako projektu-direktorioa',
+    boardSettingsTitleFor: 'Taularen ezarpenak — {name}',
+    projectDirectoryOverrideHint:
+      'Zeregin berriek hau heredatzen dute lan-eremu lehenetsi gisa; zeregin bakoitzak oraindik gainidatzi dezake sortze-elkarrizketan.',
+    saving: 'Gordetzen…',
+    commentHint:
+      'Iruzkinak langilearengana iristen dira hurrengo exekuzioan edo kanban_show()-n — ez da beharrezkoa zeregina lehenengo blokeatzea.',
+    commentHintTitle:
+      'Iruzkinak dira zeregin baten langilearekin hitz egiteko kanala. Harian berehala jartzen dira — ez da beharrezkoa zeregina lehenengo blokeatzea. Martxan dagoen langile batek haria jasotzen du hurrengo kanban_show() edo respawn-ean; blokeatzea soilik langilea GELDITU eta zure ekarpenaren zain egotea nahi duzunerako da.',
+    trash: {
+      confirmTitle: 'Zeregina ezabatu?',
+      confirmManyTitle: '{n} zeregin ezabatu?'
+    }
   }
 })
