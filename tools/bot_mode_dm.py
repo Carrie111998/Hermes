@@ -238,6 +238,44 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
     return json.dumps(payload)
 
 
+def _command_contains_tokens(command: str, expected: list[str]) -> bool:
+    """Return whether *expected* appears contiguously in a shell command."""
+    if not command or not expected:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    width = len(expected)
+    return any(parts[index : index + width] == expected for index in range(len(parts) - width + 1))
+
+
+def _active_delivery_to_target(agent: Any, transport_argv: list[str]) -> str | None:
+    """Return a running DM process id for this Bot Chat + transport target."""
+    session_key = str(getattr(agent, "session_id", "") or "").strip()
+    if not session_key:
+        return None
+    try:
+        from tools.process_registry import process_registry
+
+        for entry in process_registry.list_sessions(session_key=session_key):
+            if entry.get("status") != "running":
+                continue
+            proc_id = str(entry.get("session_id") or "").strip()
+            process = process_registry.get(proc_id) if proc_id else None
+            if process is not None and process.exited:
+                continue
+            # list_sessions intentionally truncates commands for display. Use
+            # the registry object when available so long install/temp paths do
+            # not hide the transport target beyond that preview boundary.
+            command = str(getattr(process, "command", "") or entry.get("command") or "")
+            if _command_contains_tokens(command, transport_argv):
+                return proc_id or "running"
+    except Exception:
+        logger.debug("message_agent in-flight lookup failed", exc_info=True)
+    return None
+
+
 def message_agent_tool(
     target: str = "",
     message: str = "",
@@ -303,8 +341,16 @@ def message_agent_tool(
             )
         dm_target = f"{peer_name}/{peer_profile}" if peer_profile else peer_name
         label = f"@{peer_profile or peer_name} on peer '{peer_name}'"
+        transport_argv = ["hermes", "peer", "dm", dm_target]
+        active = _active_delivery_to_target(agent, transport_argv)
+        if active:
+            return _err(
+                f"A message to {label} is already in flight ({active}). "
+                "Do not retry or duplicate it; finish this turn and wait for the "
+                "completion notification."
+            )
         return _start_delivery(
-            ["hermes", "peer", "dm", dm_target],
+            transport_argv,
             prefix + body,
             label,
             stdin_file=True,
@@ -344,21 +390,31 @@ def message_agent_tool(
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
+    transport_argv = [
+        "hermes",
+        "-p",
+        resolved,
+        "chat",
+        "--in",
+        "~",
+        "-c",
+        "Bot Chat",
+        "--create-if-missing",
+        "-Q",
+    ]
+    label = f"@{_handle(resolved)}"
+    active = _active_delivery_to_target(agent, transport_argv)
+    if active:
+        return _err(
+            f"A message to {label} is already in flight ({active}). "
+            "Do not retry or duplicate it; finish this turn and wait for the "
+            "completion notification."
+        )
+
     return _start_delivery(
-        [
-            "hermes",
-            "-p",
-            resolved,
-            "chat",
-            "--in",
-            "~",
-            "-c",
-            "Bot Chat",
-            "--create-if-missing",
-            "-Q",
-        ],
+        transport_argv,
         prefix + body,
-        f"@{_handle(resolved)}",
+        label,
         stdin_file=False,
         task_id=task_id,
         agent=agent,

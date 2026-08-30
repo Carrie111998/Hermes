@@ -217,6 +217,126 @@ def _runner_parts(command):
     return parts[marker + 1], parts[marker + 2], parts[marker + 3 :]
 
 
+
+
+def _mock_tracked_delivery(monkeypatch, command, *, proc_id="proc_pending", exited=False):
+    import tools.process_registry as process_registry_module
+
+    class _Process:
+        def __init__(self):
+            self.command = command
+            self.exited = exited
+
+    monkeypatch.setattr(
+        process_registry_module.process_registry,
+        "list_sessions",
+        lambda **_kwargs: [
+            {
+                "session_id": proc_id,
+                "status": "running",
+                "command": command[:80],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        process_registry_module.process_registry,
+        "get",
+        lambda session_id: _Process() if session_id == proc_id else None,
+    )
+
+
+def test_same_target_delivery_is_rejected_while_in_flight(tmp_path, monkeypatch):
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    transport_argv = [
+        "hermes", "-p", "researcher", "chat", "--in", "~", "-c", "Bot Chat",
+        "--create-if-missing", "-Q",
+    ]
+    command = bot_mode_dm._delivery_command(
+        transport_argv, "/tmp/hermes-dm/already-running.txt", stdin_file=False
+    )
+    _mock_tracked_delivery(monkeypatch, command)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target="researcher", message="second send", agent=agent)
+    )
+
+    assert "error" in result
+    assert "already in flight" in result["error"]
+    assert "proc_pending" in result["error"]
+    assert "Do not retry" in result["error"]
+    assert calls == []
+
+
+def test_different_target_delivery_is_allowed_while_other_target_is_in_flight(
+    tmp_path, monkeypatch
+):
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher", "coder"))
+    agent = _FakeAgent(home, title="Bot Chat")
+    coder_argv = [
+        "hermes", "-p", "coder", "chat", "--in", "~", "-c", "Bot Chat",
+        "--create-if-missing", "-Q",
+    ]
+    command = bot_mode_dm._delivery_command(
+        coder_argv, "/tmp/hermes-dm/coder-running.txt", stdin_file=False
+    )
+    _mock_tracked_delivery(monkeypatch, command, proc_id="proc_coder")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="researcher", message="independent send", agent=agent
+        )
+    )
+
+    assert result["status"] == "sent"
+    assert len(calls) == 1
+
+
+def test_finished_same_target_delivery_does_not_block_new_send(tmp_path, monkeypatch):
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    transport_argv = [
+        "hermes", "-p", "researcher", "chat", "--in", "~", "-c", "Bot Chat",
+        "--create-if-missing", "-Q",
+    ]
+    command = bot_mode_dm._delivery_command(
+        transport_argv, "/tmp/hermes-dm/finished.txt", stdin_file=False
+    )
+    _mock_tracked_delivery(monkeypatch, command, proc_id="proc_done", exited=True)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target="researcher", message="new send", agent=agent)
+    )
+
+    assert result["status"] == "sent"
+    assert len(calls) == 1
+
+
+def test_peer_same_target_delivery_is_rejected_while_in_flight(tmp_path, monkeypatch):
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, peers=("spark",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    transport_argv = ["hermes", "peer", "dm", "spark/researcher"]
+    command = bot_mode_dm._delivery_command(
+        transport_argv, "/tmp/hermes-dm/peer-running.txt", stdin_file=True
+    )
+    _mock_tracked_delivery(monkeypatch, command, proc_id="proc_peer")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="spark/researcher", message="duplicate peer send", agent=agent
+        )
+    )
+
+    assert "error" in result
+    assert "already in flight" in result["error"]
+    assert "proc_peer" in result["error"]
+    assert calls == []
+
+
 def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     calls = _capture_spawn(monkeypatch)
     home = _managed_home(tmp_path, teammates=("researcher",))
