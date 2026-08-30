@@ -154,7 +154,10 @@ agent.chat("Write a Python function to sort a list")
 # Saves to trajectory_samples.jsonl.gz in ShareGPT format
 ```
 
-Each conversation is appended as a single gzip-compressed JSONL line, making it easy to collect datasets from automated runs. Pass an explicit `.jsonl` filename to retain the legacy plain-text format.
+Each conversation is appended as a complete gzip member containing one JSONL
+line. Concurrent processes are serialized, and an append is reported as saved
+only after the write is synced. Pass an explicit `.jsonl` filename to retain
+the legacy plain-text format.
 
 ---
 

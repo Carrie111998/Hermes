@@ -20,6 +20,18 @@ Hermes Agent 以 ShareGPT 兼容的 JSONL 格式保存对话轨迹，用于训�
 可通过 `save_trajectory()` 的 `filename` 参数覆盖文件名。
 显式使用 `.jsonl` 文件名时仍保留旧的纯文本格式。
 
+每次 gzip 追加都会写入一个完整的 gzip member。只有在完整 member 已写入、
+刷新并同步到文件系统后，`save_trajectory()` 才返回 `True`；序列化、
+加锁、写入或同步失败时返回 `False` 并记录警告。若捕获到部分写入，
+会先把文件截断到先前有效的字节长度，再释放锁。如果回滚本身也失败，Hermes
+会记录回滚错误并仍返回 `False`；调用方必须把 `False` 视为“不保证已保存”，
+而不能盲目重试。
+
+写入方通过进程内锁以及持久化的 `<trajectory>.lock` sidecar 上的操作系统锁
+进行串行化，加锁等待上限为 10 秒。sidecar 不会被删除：所有权由内核锁表示，
+而不是由文件是否存在或文件内容表示，因此进程终止后遗留的文件不会阻塞后续写入，
+同时也避免了删除并重建锁文件的竞态。
+
 
 ## JSONL 条目格式
 
@@ -204,6 +216,17 @@ ds = load_dataset("json", data_files="trajectory_samples.jsonl.gz")
 
 规范化的 `tool_stats` schema 确保所有条目具有相同的列，
 防止数据集加载时出现 Arrow schema 不匹配错误。
+
+Python 的 gzip 读取器和 Hermes 的 `_open_jsonl()` 都能读取串联的 gzip
+member。如果进程在写入最后一个 member 时终止，两个读取器都会保留此前完整的
+记录，但可能先产出不完整 member 中已解压的字节，然后在下一次读取时抛出
+`EOFError`。出现此异常时应把整个读取视为失败；只有数据流正常到达 EOF 时，
+才能接受最后一条记录。
+
+`trajectory_compressor.py` 可处理同时包含 `.jsonl` 和 `.jsonl.gz`
+的目录，对发现的路径去重，并在目录输出中保留各输入文件的后缀。单文件输出名以
+`.jsonl.gz` 结尾时写入 gzip；显式使用 `.jsonl` 时保持纯文本。
+`scripts/sample_and_compress.py` 合并输出时遵循相同规则。
 
 
 ## 控制轨迹保存

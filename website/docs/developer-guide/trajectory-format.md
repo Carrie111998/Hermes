@@ -21,6 +21,20 @@ The batch runner (`batch_runner.py`) writes to a custom output file per batch
 You can override the filename via the `filename` parameter in `save_trajectory()`.
 Explicit `.jsonl` filenames retain the legacy plain-text format.
 
+Each gzip append is a complete gzip member. `save_trajectory()` returns
+`True` only after that member has been written, flushed, and synced to the
+filesystem; it returns `False` and logs a warning on serialization, lock,
+write, or sync failure. A caught partial write is truncated back to the
+previous valid byte length before the lock is released. If that rollback also
+fails, Hermes logs the rollback error and still returns `False`; callers must
+treat `False` as having no saved-data guarantee rather than retrying blindly.
+
+Writers serialize through a process-local lock and an OS lock on the persistent
+`<trajectory>.lock` sidecar. Lock acquisition has a 10-second bound. The
+sidecar file is intentionally not deleted: the kernel lock, not the file's
+existence or contents, represents ownership, so a file left by a terminated
+process is harmless and avoids unlink/recreate races.
+
 
 ## JSONL Entry Format
 
@@ -214,6 +228,19 @@ ds = load_dataset("json", data_files="trajectory_samples.jsonl.gz")
 
 The normalized `tool_stats` schema ensures all entries have the same columns,
 preventing Arrow schema mismatch errors during dataset loading.
+
+Python's gzip reader and Hermes' `_open_jsonl()` both read concatenated gzip
+members. If a process is terminated during the final member, both readers
+preserve earlier complete records but may yield decompressed bytes from the
+incomplete member before raising `EOFError` on the next read. Treat any such
+exception as a failed read and do not accept the final record unless the stream
+reaches clean EOF.
+
+`trajectory_compressor.py` accepts directories containing any mix of
+`.jsonl` and `.jsonl.gz`, de-duplicates discovered paths, and preserves
+each input suffix for directory output. A single-file output ending in
+`.jsonl.gz` is written as gzip; an explicit `.jsonl` output stays plain.
+`scripts/sample_and_compress.py` follows the same rules when merging output.
 
 
 ## Controlling Trajectory Saving

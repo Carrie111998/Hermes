@@ -2558,7 +2558,7 @@ class AIAgent:
             return
         
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
-        _save_trajectory_to_file(trajectory, self.model, completed)
+        return _save_trajectory_to_file(trajectory, self.model, completed)
 
     @staticmethod
     def _is_entitlement_failure(

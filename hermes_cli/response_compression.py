@@ -8,58 +8,108 @@ responses and exports are the primary bandwidth target.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from starlette.datastructures import Headers
 from starlette.middleware.gzip import GZipMiddleware, GZipResponder
 
 
-_COMPRESSIBLE_CONTENT_TYPES = (
+_COMPRESSIBLE_CONTENT_TYPES = {
     "application/json",
     "application/javascript",
     "application/xml",
     "image/svg+xml",
     "text/css",
     "text/plain",
+}
+_MEDIA_TYPE_RE = re.compile(
+    r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
 )
-_EXCLUDED_PATH_PREFIXES = (
+_QVALUE_RE = re.compile(r"^(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)$")
+
+# Exact responses that can contain unredacted credentials or arbitrary local
+# file/log content. Query strings are not part of ASGI ``scope['path']``.
+_EXCLUDED_EXACT_PATHS = {
     "/api/env/reveal",
-    "/api/config/raw",
-    "/api/auth/",
-    "/auth/",
+    "/api/files/read",
+    "/api/fs/read-data-url",
+    "/api/fs/read-text",
+    "/api/logs",
+    "/api/media",
+}
+# Route families that contain one-time tokens, secrets, raw configuration, or
+# authentication/session material. Match only the root or a slash descendant.
+_EXCLUDED_PATH_TREES = (
+    "/api/auth",
+    "/api/config",
+    "/api/mcp/oauth",
+    "/api/pairing",
+    "/api/providers/oauth",
+    "/api/webhooks",
+    "/auth",
 )
 
 
-def _is_compressible_content_type(content_type: str) -> bool:
+def _is_compressible_content_type(content_types: list[str]) -> bool:
+    if len(content_types) != 1:
+        return False
+    content_type = content_types[0]
     media_type = content_type.split(";", 1)[0].strip().lower()
-    return media_type.startswith(_COMPRESSIBLE_CONTENT_TYPES) or media_type.endswith(
-        "+json"
+    if not _MEDIA_TYPE_RE.fullmatch(media_type):
+        return False
+    if media_type in _COMPRESSIBLE_CONTENT_TYPES:
+        return True
+    top_level, subtype = media_type.split("/", 1)
+    return top_level == "application" and subtype.endswith("+json")
+
+
+def _quality(parameters: list[str]) -> float:
+    quality = 1.0
+    seen = False
+    for parameter in parameters:
+        name, separator, raw_value = parameter.partition("=")
+        if name.strip().lower() != "q":
+            continue
+        if seen or not separator:
+            return 0.0
+        seen = True
+        raw_value = raw_value.strip()
+        if not _QVALUE_RE.fullmatch(raw_value):
+            return 0.0
+        quality = float(raw_value)
+    return quality
+
+
+def _accepts_gzip(values: list[str]) -> bool:
+    """Return whether ``Accept-Encoding`` permits gzip compression."""
+    gzip_qualities: list[float] = []
+    wildcard_qualities: list[float] = []
+    for value in values:
+        for item in value.split(","):
+            parts = [part.strip() for part in item.split(";")]
+            encoding = parts[0].lower()
+            if not encoding:
+                continue
+            quality = _quality(parts[1:])
+            if encoding == "gzip":
+                gzip_qualities.append(quality)
+            elif encoding == "*":
+                wildcard_qualities.append(quality)
+    if gzip_qualities:
+        return all(quality > 0 for quality in gzip_qualities)
+    return bool(wildcard_qualities) and all(
+        quality > 0 for quality in wildcard_qualities
     )
 
 
-def _accepts_gzip(value: str) -> bool:
-    """Return whether ``Accept-Encoding`` permits gzip compression."""
-    wildcard_allowed = False
-    for item in value.split(","):
-        parts = [part.strip() for part in item.split(";")]
-        encoding = parts[0].lower()
-        quality = 1.0
-        for parameter in parts[1:]:
-            name, separator, raw_value = parameter.partition("=")
-            if name.lower() == "q" and separator:
-                try:
-                    quality = float(raw_value)
-                except ValueError:
-                    quality = 0.0
-        if encoding == "gzip":
-            return quality > 0
-        if encoding == "*":
-            wildcard_allowed = quality > 0
-    return wildcard_allowed
-
-
 def _is_excluded_path(path: str) -> bool:
-    return path.startswith(_EXCLUDED_PATH_PREFIXES)
+    if path in _EXCLUDED_EXACT_PATHS:
+        return True
+    return any(
+        path == root or path.startswith(f"{root}/")
+        for root in _EXCLUDED_PATH_TREES
+    )
 
 
 class _SelectiveGZipResponder(GZipResponder):
@@ -74,7 +124,7 @@ class _SelectiveGZipResponder(GZipResponder):
             headers = Headers(raw=self.initial_message["headers"])
             self.content_encoding_set = "content-encoding" in headers
             self.content_type_is_excluded = not _is_compressible_content_type(
-                headers.get("content-type", "")
+                headers.getlist("content-type")
             )
             return
 
@@ -102,7 +152,7 @@ class SelectiveGZipMiddleware(GZipMiddleware):
             scope["type"] != "http"
             or _is_excluded_path(scope.get("path", ""))
             or not _accepts_gzip(
-                Headers(scope=scope).get("Accept-Encoding", "")
+                Headers(scope=scope).getlist("Accept-Encoding")
             )
         ):
             await self.app(scope, receive, send)

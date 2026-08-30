@@ -63,6 +63,17 @@ def _open_jsonl(path: Path, mode: str = "rt"):
     return opener(path, mode, encoding="utf-8")
 
 
+def _discover_jsonl_files(directory: Path) -> List[Path]:
+    """Return each plain or gzip JSONL input exactly once in stable order."""
+    return sorted(
+        {
+            path
+            for pattern in ("*.jsonl", "*.jsonl.gz")
+            for path in directory.glob(pattern)
+        }
+    )
+
+
 def _default_output_path(input_path: Path, suffix: str = "_compressed") -> Path:
     """Build a plain JSONL output path without duplicating compression suffixes."""
     name = input_path.name
@@ -1101,13 +1112,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         start_time = time.time()
         
         # Find all JSONL files
-        jsonl_files = sorted(
-            {
-                path
-                for pattern in ("*.jsonl", "*.jsonl.gz")
-                for path in input_dir.glob(pattern)
-            }
-        )
+        jsonl_files = _discover_jsonl_files(input_dir)
         
         if not jsonl_files:
             self.logger.warning("No JSONL files found in %s", input_dir)
@@ -1573,13 +1578,7 @@ def main(
                 total_sampled = 0
                 
                 # Sample from each JSONL file
-                jsonl_files = sorted(
-                    {
-                        path
-                        for pattern in ("*.jsonl", "*.jsonl.gz")
-                        for path in input_path.glob(pattern)
-                    }
-                )
+                jsonl_files = _discover_jsonl_files(input_path)
                 for jsonl_file in jsonl_files:
                     entries = []
                     with _open_jsonl(jsonl_file) as f:
