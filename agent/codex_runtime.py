@@ -772,8 +772,29 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # A native app-server turn encompasses Codex's complete agent/tool loop,
+    # so the conversation run budget is also this call's hard deadline.  Pass
+    # the remaining budget rather than the configured original value: turn
+    # setup and persistence have already consumed part of the same run.
+    #
+    # Provider ``request_timeout_seconds`` is deliberately not reused here.
+    # It bounds one provider HTTP request, while an app-server turn may contain
+    # many provider requests and tool executions owned by the Codex process.
+    # Without a run budget Hermes therefore waits for protocol completion;
+    # explicit interrupts, subprocess death, and the post-tool quiet watchdog
+    # still terminate unhealthy turns.
+    turn_timeout = None
+    run_budget = getattr(agent, "run_budget_seconds", None)
+    run_started_at = getattr(agent, "_run_budget_started_at", None)
+    if run_budget is not None and run_started_at is not None:
+        elapsed = max(0.0, time.time() - run_started_at)
+        turn_timeout = max(0.0, float(run_budget) - elapsed)
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            turn_timeout=turn_timeout,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

@@ -186,6 +186,18 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_explicit_interrupt_remains_terminal_without_a_deadline(self):
+        client = FakeClient()
+        session = make_session(client)
+        session.request_interrupt()
+
+        result = session.run_turn("hi")
+
+        assert result.interrupted is True
+        assert result.error is None
+        assert result.should_retire is False
+        assert not any(method == "turn/start" for method, _ in client.requests)
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -704,14 +716,22 @@ class TestSessionRetirement:
 
 
 
-    def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
+    @pytest.mark.parametrize("phase", [None, "commentary"])
+    def test_nonfinal_agent_message_without_turn_completed_times_out(self, phase):
+        """An agentMessage item is not proof that the whole turn completed.
+
+        Codex may emit several completed agentMessage items as interim progress
+        while it continues working.  Without ``turn/completed`` the adapter
+        must interrupt and retire instead of promoting the latest text to a
+        successful terminal response.
         """
         client = FakeClient()
+        item = {"type": "agentMessage", "id": "m1", "text": "done"}
+        if phase is not None:
+            item["phase"] = phase
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            item=item,
             threadId="t",
             turnId="tu1",
         )
@@ -722,13 +742,95 @@ class TestSessionRetirement:
             notification_poll_timeout=0.01,
         )
         assert r.final_text == "done"
-        assert r.interrupted is False
-        assert r.error is None
-        assert r.should_retire is False
+        assert r.interrupted is True
+        assert r.error and "timed out" in r.error
+        assert r.should_retire is True
         assert any(
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_protocol_final_answer_without_turn_completed_is_recovered(self):
+        """The explicit final_answer phase preserves the legacy fallback."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "text": "done",
+                "phase": "final_answer",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+
+        r = make_session(client).run_turn(
+            "hi",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+
+        assert r.final_text == "done"
+        assert r.interrupted is False
+        assert r.error is None
+        assert r.should_retire is False
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_progress_messages_can_continue_past_ten_minutes_before_completion(
+        self, monkeypatch
+    ):
+        """A caller-granted long deadline must not retain the old 600s cutoff."""
+        client = FakeClient()
+        clock = {"now": 0.0, "progress_sent": False, "complete_sent": False}
+
+        def take_notification(timeout: float = 0.0):
+            clock["now"] += 100.0
+            if not clock["progress_sent"]:
+                clock["progress_sent"] = True
+                return {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "progress-1",
+                            "text": "Still working",
+                            "phase": "commentary",
+                        },
+                        "threadId": "thread-fake-001",
+                        "turnId": "turn-fake-001",
+                    },
+                }
+            if clock["now"] >= 700.0 and not clock["complete_sent"]:
+                clock["complete_sent"] = True
+                return {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-fake-001",
+                        "turn": {
+                            "id": "turn-fake-001",
+                            "status": "completed",
+                            "error": None,
+                        },
+                    },
+                }
+            return None
+
+        monkeypatch.setattr(client, "take_notification", take_notification)
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        r = make_session(client).run_turn(
+            "long task",
+            turn_timeout=1200.0,
+            notification_poll_timeout=0.0,
+        )
+
+        assert clock["now"] >= 700.0
+        assert r.final_text == "Still working"
+        assert r.interrupted is False
+        assert r.error is None
+        assert r.should_retire is False
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
 
@@ -753,7 +855,6 @@ class TestSessionRetirement:
         ):
             r = s.run_turn(
                 "tool then silence",
-                turn_timeout=5.0,
                 notification_poll_timeout=0.0,
                 post_tool_quiet_timeout=0.15,
             )
@@ -895,4 +996,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

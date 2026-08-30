@@ -92,6 +92,23 @@ class TurnResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
+def _is_completed_final_answer_item(note: dict) -> bool:
+    """Whether *note* is protocol-grounded terminal assistant output.
+
+    A completed ``agentMessage`` alone is not terminal: Codex uses the same
+    item type for commentary/progress.  Newer app-server builds distinguish
+    the terminal item with ``phase=final_answer``; that is the only safe
+    compatibility signal when ``turn/completed`` is missing.
+    """
+    if note.get("method") != "item/completed":
+        return False
+    item = (note.get("params") or {}).get("item") or {}
+    return (
+        item.get("type") == "agentMessage"
+        and item.get("phase") == "final_answer"
+    )
+
+
 def _notification_scope_ids(
     note: dict,
 ) -> tuple[Optional[str], Optional[str]]:
@@ -471,13 +488,18 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: Optional[float] = None,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
+
+        turn_timeout: optional hard wall-clock cap for the whole native Codex
+        turn. ``None`` waits for protocol completion without an arbitrary cap;
+        explicit interrupts, subprocess failure, and the post-tool watchdog
+        remain active.
 
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
@@ -559,15 +581,23 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = time.monotonic() + turn_timeout
+        deadline = (
+            time.monotonic() + max(0.0, turn_timeout)
+            if turn_timeout is not None
+            else None
+        )
         turn_complete = False
+        saw_completed_final_answer = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
+        while (
+            (deadline is None or time.monotonic() < deadline)
+            and not turn_complete
+        ):
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -649,6 +679,8 @@ class CodexAppServerSession:
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
+                    if _is_completed_final_answer_item(pending):
+                        saw_completed_final_answer = True
                     if proj.messages:
                         result.projected_messages.extend(proj.messages)
                     if proj.is_tool_iteration:
@@ -703,6 +735,8 @@ class CodexAppServerSession:
 
             # Project into messages
             projection = projector.project(note)
+            if _is_completed_final_answer_item(note):
+                saw_completed_final_answer = True
             if projection.messages:
                 result.projected_messages.extend(projection.messages)
             if projection.is_tool_iteration:
@@ -760,13 +794,14 @@ class CodexAppServerSession:
         if (
             not turn_complete
             and not result.interrupted
+            and saw_completed_final_answer
             and result.final_text
             and result.error is None
         ):
             logger.warning(
                 "codex app-server turn reached deadline after a completed "
-                "assistant message but before turn/completed; accepting "
-                "the assistant text as the terminal response"
+                "final_answer item but before turn/completed; accepting the "
+                "protocol-marked final text as the terminal response"
             )
             turn_complete = True
 
