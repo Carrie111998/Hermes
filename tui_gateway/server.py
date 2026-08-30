@@ -6558,6 +6558,31 @@ def _tui_compression_config_signature(cfg: dict | None) -> tuple:
     compression = cfg.get("compression") if isinstance(cfg, dict) and isinstance(cfg.get("compression"), dict) else {}
     for extra in ("idle_compact_after_seconds", "tail_mode"):
         picked[f"compression.{extra}"] = compression.get(extra)
+    # Named custom providers can pin context per model instead of using the
+    # route-scoped model.context_length key. Include only that non-secret
+    # metadata in the signature so editing the active model's pin is adopted
+    # by an already-open Desktop/TUI session on its next turn.
+    provider_model_contexts: list[tuple[str, str, str, str]] = []
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+
+        for entry in get_compatible_custom_providers(cfg):
+            models = entry.get("models")
+            if not isinstance(models, dict):
+                continue
+            identity = str(entry.get("provider_key") or entry.get("name") or "")
+            base_url = str(entry.get("base_url") or "").rstrip("/").lower()
+            for model, metadata in models.items():
+                if not isinstance(metadata, dict) or "context_length" not in metadata:
+                    continue
+                provider_model_contexts.append(
+                    (identity, base_url, str(model), repr(metadata.get("context_length")))
+                )
+    except Exception:
+        pass
+    picked["providers.model_context_lengths"] = tuple(
+        sorted(provider_model_contexts)
+    )
     return tuple(sorted(picked.items()))
 
 
@@ -6647,7 +6672,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     compression = cfg.get("compression") if isinstance(cfg.get("compression"), dict) else {}
-    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    raw_model_cfg = cfg.get("model")
+    model_cfg = raw_model_cfg if isinstance(raw_model_cfg, dict) else {}
 
     enabled_raw = compression.get("enabled", True)
     if isinstance(enabled_raw, bool):
@@ -6764,13 +6790,87 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     except (TypeError, ValueError):
         pass
 
+    custom_providers: list[dict] = []
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+
+        custom_providers = get_compatible_custom_providers(cfg)
+        agent._custom_providers = custom_providers
+    except Exception:
+        existing_custom_providers = getattr(agent, "_custom_providers", None)
+        if isinstance(existing_custom_providers, list):
+            custom_providers = existing_custom_providers
+
+    configured_default = model_cfg.get("default") or model_cfg.get("model")
+    configured_provider = model_cfg.get("provider")
+    try:
+        from hermes_cli.config import split_model_config_default
+
+        configured_model, embedded_provider = split_model_config_default(
+            configured_default
+        )
+        configured_provider = embedded_provider or configured_provider
+    except Exception:
+        configured_model = configured_default
+
+    configured_base_url = model_cfg.get("base_url")
+    if not configured_base_url and configured_provider and custom_providers:
+        try:
+            from agent.agent_init import _custom_provider_runtime_ids
+
+            configured_ids = _custom_provider_runtime_ids(configured_provider)
+            for entry in custom_providers:
+                entry_ids = _custom_provider_runtime_ids(
+                    entry.get("provider_key")
+                ) | _custom_provider_runtime_ids(entry.get("name"))
+                if configured_ids & entry_ids:
+                    configured_base_url = entry.get("base_url")
+                    break
+        except Exception:
+            configured_base_url = model_cfg.get("base_url")
+
     raw_ctx = model_cfg.get("context_length")
+    if raw_ctx is not None:
+        try:
+            from hermes_cli.route_identity import should_clear_context_pin
+
+            if should_clear_context_pin(
+                configured_model,
+                getattr(agent, "model", "") or "",
+                configured_base_url,
+                getattr(agent, "base_url", "") or "",
+                configured_provider,
+                getattr(agent, "provider", "") or "",
+            ):
+                raw_ctx = None
+        except Exception:
+            # Fail closed toward the active route: a default-model pin whose
+            # identity cannot be proven must not inflate another model's
+            # compressor window.
+            raw_ctx = None
+    if raw_ctx is None:
+        # ``agent_init`` accepts either the route-scoped global pin above or a
+        # per-model pin declared on a named custom provider.  Preserve that
+        # same precedence during Desktop/TUI hot reload: treating the absence
+        # of model.context_length as "no override" used to erase a valid
+        # providers.<name>.models.<model>.context_length on the first turn.
+        try:
+            from hermes_cli.config import get_custom_provider_context_length
+
+            raw_ctx = get_custom_provider_context_length(
+                model=getattr(agent, "model", "") or "",
+                base_url=getattr(agent, "base_url", "") or "",
+                custom_providers=custom_providers,
+            )
+        except Exception:
+            raw_ctx = None
     if raw_ctx is not None:
         try:
             new_ctx = int(raw_ctx)
         except (TypeError, ValueError):
             new_ctx = 0
         if new_ctx > 0:
+            agent._config_context_length = new_ctx
             cc._config_context_length = new_ctx
             try:
                 cc.context_length = new_ctx
@@ -6782,8 +6882,10 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         # deferred get_model_context_length resolution agent construction
         # uses (#32221). The re-resolve also re-applies the small-context
         # threshold floor for the genuinely re-inferred window.
+        agent._config_context_length = None
         cc._config_context_length = None
         cc._resolved_context_length = None
+        cc._max_summary_tokens = None
 
     coerce_cap = getattr(cc, "_coerce_threshold_tokens_cap", None)
     if callable(coerce_cap):
