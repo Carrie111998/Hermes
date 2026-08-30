@@ -6889,6 +6889,80 @@ class CompressionLockHeld(Exception):
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
 
 
+def _prepare_session_compress(
+    session: dict,
+    raw_args: str | None,
+) -> tuple[str, dict | None]:
+    """Normalize raw ``/compress`` args and short-circuit read-only modes.
+
+    ``session.compress`` clients send the complete argument string here.  The
+    returned string contains only the positional compression mode/focus and is
+    safe to pass to :func:`_compress_session_history`.  Preview and unsupported
+    aggressive requests return an immediate result without calling the model or
+    mutating session state.
+    """
+    from agent.model_metadata import estimate_request_tokens_rough
+    from hermes_cli.partial_compress import (
+        extract_compress_flags,
+        parse_partial_compress_args,
+        summarize_compress_preview,
+    )
+
+    args, preview, aggressive = extract_compress_flags(raw_args or "")
+    if aggressive and not preview:
+        return args, {
+            "status": "aborted",
+            "removed": 0,
+            "summary": {
+                "aborted": True,
+                "headline": "Compression not started.",
+                "noop": True,
+                "note": (
+                    "--aggressive is not supported; use '/compress here [N]' "
+                    "to keep only recent exchanges, or /undo to drop turns."
+                ),
+            },
+        }
+    if not preview:
+        return args, None
+
+    partial, keep_last, focus_topic = parse_partial_compress_args(args)
+    with session["history_lock"]:
+        history = list(session.get("history", []))
+    agent = session.get("agent")
+    system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+    tools = getattr(agent, "tools", None) or None
+    approx_tokens = estimate_request_tokens_rough(
+        history,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
+    report = summarize_compress_preview(
+        history,
+        partial,
+        keep_last,
+        focus_topic,
+        approx_tokens,
+    )
+    lines = list(report["lines"])
+    if aggressive:
+        lines.append(
+            "--aggressive is not supported; preview uses the regular "
+            "compression boundary."
+        )
+    return args, {
+        "status": "preview",
+        "removed": 0,
+        "summary": {
+            "headline": lines[0],
+            "token_line": lines[1] if len(lines) > 1 else None,
+            "note": "\n".join(lines[2:]) or None,
+            "noop": True,
+            "preview": True,
+        },
+    }
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
@@ -16190,6 +16264,19 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             from agent.conversation_compression import (
                 finalize_context_engine_compression_notification,
             )
+
+            arg, _immediate = _prepare_session_compress(session, arg)
+            if _immediate is not None:
+                _summary = _immediate.get("summary") or {}
+                return "\n".join(
+                    str(line)
+                    for line in (
+                        _summary.get("headline"),
+                        _summary.get("token_line"),
+                        _summary.get("note"),
+                    )
+                    if line
+                )
 
             with session["history_lock"]:
                 _before_messages = list(session.get("history", []))

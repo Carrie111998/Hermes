@@ -308,10 +308,12 @@ export interface SessionCompressResponse {
   info?: SessionInfo
   messages?: GatewayTranscriptMessage[]
   removed?: number
+  status?: string
   summary?: {
     headline?: string
     noop?: boolean
     note?: null | string
+    preview?: boolean
     token_line?: string
   }
   usage?: Usage

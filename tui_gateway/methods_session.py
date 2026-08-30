@@ -2887,10 +2887,15 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     assert session is not None
+    # ``args`` is the canonical raw string after /compress.  Keep accepting
+    # ``focus_topic`` from older Desktop/TUI clients, but parse flags before the
+    # value can reach the compression model as a literal focus topic.
+    raw_args = str(
+        params.get("args", params.get("focus_topic", "")) or ""
+    ).strip()
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
-        focus_topic = str(params.get("focus_topic", "") or "").strip()
-        command = "/compress" + (f" {focus_topic}" if focus_topic else "")
+        command = "/compress" + (f" {raw_args}" if raw_args else "")
         try:
             ack = _send_compute_host_control(
                 sid,
@@ -2903,15 +2908,20 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
         if ack.get("type") in {"control.error", "error"}:
             return _err(rid, 4009, str(ack.get("message") or "compute-host compress failed"))
-        _apply_compute_host_metadata_mirror(session, ack)
         host_result = ack.get("result")
         if isinstance(host_result, dict):
+            # A preview is a strict read-only operation. Even refreshing the
+            # serving process's metadata mirror would write session state, so
+            # only non-preview acknowledgements reconcile it.
+            if host_result.get("status") != "preview":
+                _apply_compute_host_metadata_mirror(session, ack)
             # The host owns the isolated session's agent/history, so preserve
             # its structured compression result verbatim. In particular this
             # carries `status: aborted` and `summary.aborted`; flattening the
             # old text-only acknowledgement made Desktop show aborted work as a
             # success toast.
             return _ok(rid, {**host_result, "turn_isolation": True})
+        _apply_compute_host_metadata_mirror(session, ack)
         host_info = ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
         host_messages = _history_to_messages(ack.get("messages")) if isinstance(ack.get("messages"), list) else []
         # `messages` is returned at top level for the desktop transcript
@@ -2936,12 +2946,15 @@ def _(rid, params: dict) -> dict:
         return _err(
             rid, 4009, "session busy — /interrupt the current turn before /compress"
         )
+    compress_args, immediate = _prepare_session_compress(session, raw_args)
+    if immediate is not None:
+        return _ok(rid, immediate)
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
     )
 
     sid = params.get("session_id", "")
-    focus_topic = str(params.get("focus_topic", "") or "").strip()
+    focus_topic = compress_args
     try:
         from agent.manual_compression_feedback import summarize_manual_compression
         from agent.model_metadata import estimate_request_tokens_rough

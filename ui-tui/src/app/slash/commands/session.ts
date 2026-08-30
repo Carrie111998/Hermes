@@ -242,7 +242,7 @@ export const sessionCommands: SlashCommand[] = [
       ctx.gateway
         .rpc<SessionCompressResponse>('session.compress', {
           session_id: ctx.sid,
-          ...(arg ? { focus_topic: arg } : {})
+          ...(arg ? { args: arg } : {})
         })
         .then(
           ctx.guarded<SessionCompressResponse>(r => {

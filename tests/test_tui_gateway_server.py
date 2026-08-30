@@ -10180,6 +10180,69 @@ def test_session_compress_normalizes_messages_for_desktop_transcript(monkeypatch
     assert "very sensitive tool output" not in str(response["result"]["messages"])
 
 
+@pytest.mark.parametrize("flag", ["--preview", "--dry-run"])
+def test_session_compress_preview_is_side_effect_free(monkeypatch, flag):
+    history = list(_PARTIAL_FAKE_HISTORY)
+    agent = _partial_compress_agent([])
+    session = _session(agent=agent, history=list(history))
+    session["history_version"] = 7
+    session["session_key"] = "original-key"
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_compress_session_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must not invoke compression")
+        ),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.compress",
+                "params": {"session_id": "sid", "args": f"{flag} here 1"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["status"] == "preview"
+    assert response["result"]["summary"]["noop"] is True
+    assert "no changes made" in response["result"]["summary"]["headline"].lower()
+    assert session["history"] == history
+    assert session["history_version"] == 7
+    assert session["session_key"] == "original-key"
+
+
+def test_session_compress_preview_accepts_legacy_focus_topic_param(monkeypatch):
+    history = list(_PARTIAL_FAKE_HISTORY)
+    session = _session(agent=_partial_compress_agent([]), history=list(history))
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_compress_session_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy preview must not invoke compression")
+        ),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.compress",
+                "params": {"session_id": "sid", "focus_topic": "--preview auth"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["status"] == "preview"
+    assert 'Focus topic: "auth"' in response["result"]["summary"]["note"]
+    assert session["history"] == history
+
+
 def test_session_compress_returns_compute_host_history(monkeypatch):
     session = _session(agent=None, _compute_host_active=True)
     server._sessions["sid"] = session
@@ -10207,6 +10270,48 @@ def test_session_compress_returns_compute_host_history(monkeypatch):
         "messages": [{"role": "user", "text": "compressed context"}],
         "usage": {"total": 42},
     }
+
+
+def test_session_compress_preview_round_trips_through_compute_host(monkeypatch):
+    session = _session(agent=None, _compute_host_active=True)
+    server._sessions["sid"] = session
+    calls = []
+
+    def send_control(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "type": "control.ack",
+            "session_key": "must-not-replace",
+            "history_version": 99,
+            "message_count": 1,
+            "session_info": {"model": "must-not-mirror"},
+            "result": {
+                "status": "preview",
+                "removed": 0,
+                "summary": {"headline": "Preview — no changes made.", "noop": True},
+            },
+        }
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_send_compute_host_control", send_control)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.compress",
+                "params": {"session_id": "sid", "args": "--dry-run here 2"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["status"] == "preview"
+    assert response["result"]["turn_isolation"] is True
+    assert calls[0][1]["command"] == "/compress --dry-run here 2"
+    assert session["session_key"] != "must-not-replace"
+    assert session["history_version"] != 99
+    assert "_metadata_mirror" not in session
 
 
 def test_session_compress_forwards_120_second_budget_to_compute_host(monkeypatch):
@@ -13813,6 +13918,28 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
     assert "Compressed:" in warning
     assert "6 → 1 messages" in warning
     assert "tokens" in warning
+
+
+def test_mirror_slash_compress_preview_is_side_effect_free(monkeypatch):
+    history = list(_PARTIAL_FAKE_HISTORY)
+    session = _session(agent=_partial_compress_agent([]), history=list(history))
+    session["history_version"] = 11
+    monkeypatch.setattr(
+        server,
+        "_compress_session_history",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must not invoke compression")
+        ),
+    )
+
+    output = server._mirror_slash_side_effects(
+        "sid", session, "/compress --preview here 1"
+    )
+
+    assert "no changes made" in output.lower()
+    assert "last 1 exchange" in output
+    assert session["history"] == history
+    assert session["history_version"] == 11
 
 
 _PARTIAL_FAKE_HISTORY = [

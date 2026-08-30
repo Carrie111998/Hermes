@@ -152,6 +152,49 @@ def _record_finalize(monkeypatch, events: list[str], *sids: str) -> None:
     )
 
 
+def test_compute_host_forwards_raw_compress_args(monkeypatch):
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    seen = []
+    session = {
+        "agent": object(),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 3,
+        "running": False,
+        "session_key": "key",
+    }
+    monkeypatch.setitem(server._sessions, "sid", session)
+    monkeypatch.setitem(
+        server._methods,
+        "session.compress",
+        lambda request_id, params: (
+            seen.append((request_id, params))
+            or {
+                "result": {
+                    "status": "preview",
+                    "summary": {"headline": "Preview — no changes made.", "noop": True},
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+
+    host._handle_control(
+        {
+            "type": "control",
+            "sid": "sid",
+            "request_id": "req",
+            "route_name": "session.compress",
+            "command": "/compress --dry-run here 2",
+        }
+    )
+
+    assert seen == [("req", {"session_id": "sid", "args": "--dry-run here 2"})]
+    ack = _json_lines(out)[-1]
+    assert ack["result"]["status"] == "preview"
+
+
 def _register_turn(host: ComputeHost, fn, sid: str = "s1") -> None:
     """Submit a turn exactly the way ``_handle_turn_start`` does."""
     host._track_turn_future(host._executor.submit(fn), sid)

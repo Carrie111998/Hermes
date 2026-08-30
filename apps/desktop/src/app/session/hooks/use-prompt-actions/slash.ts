@@ -520,7 +520,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           const { render: renderSlashOutput, sessionId: initialSessionId, storedSessionId } = resolved
           let sessionId = initialSessionId
-          const focusTopic = ctx.arg.trim()
+          const compressArgs = ctx.arg.trim()
+          const preview = /(?:^|\s)--(?:preview|dry-run|dryrun)(?:\s|$)/i.test(compressArgs)
           const noticeId = `session-compress:${sessionId}`
 
           // Coalesce concurrent compress requests for the same session so a
@@ -534,7 +535,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             durationMs: 0,
             id: noticeId,
             kind: 'info',
-            message: focusTopic ? `compressing context for: ${focusTopic}` : 'compressing context...'
+            message: preview
+              ? 'previewing compression...'
+              : compressArgs
+                ? `compressing context for: ${compressArgs}`
+                : 'compressing context...'
           })
 
           try {
@@ -551,7 +556,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
                   'session.compress',
                   {
                     session_id: liveId,
-                    ...(focusTopic ? { focus_topic: focusTopic } : {})
+                    ...(compressArgs ? { args: compressArgs } : {})
                   },
                   SESSION_COMPRESS_TIMEOUT_MS
                 ),

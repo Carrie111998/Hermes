@@ -73,6 +73,7 @@ export interface SessionCompressResponse {
     headline?: string
     noop?: boolean
     note?: null | string
+    preview?: boolean
     token_line?: string
   }
   usage?: Partial<UsageStats>

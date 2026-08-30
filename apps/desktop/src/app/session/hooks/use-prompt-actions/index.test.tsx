@@ -784,7 +784,7 @@ describe('usePromptActions /compress', () => {
     )
   })
 
-  it('passes a focus topic through as focus_topic', async () => {
+  it('passes the raw compression arguments through the canonical args field', async () => {
     const requestGateway = vi.fn(
       async (_method: string, _params?: Record<string, unknown>, _timeoutMs?: number) => ({ removed: 0 }) as never
     )
@@ -798,8 +798,53 @@ describe('usePromptActions /compress', () => {
 
     expect(requestGateway).toHaveBeenCalledWith(
       'session.compress',
-      expect.objectContaining({ focus_topic: 'the auth refactor' }),
+      expect.objectContaining({ args: 'the auth refactor' }),
       120_000
+    )
+  })
+
+  it('passes preview flags as raw args and renders the read-only report', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.compress') {
+        return {
+          status: 'preview',
+          removed: 0,
+          summary: {
+            headline: 'Preview — no changes made.',
+            noop: true,
+            preview: true,
+            token_line: 'Would compress 4 of 6 messages.'
+          }
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/compress --dry-run here 2')
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.compress',
+      expect.objectContaining({ args: '--dry-run here 2' }),
+      120_000
+    )
+    expect(renderedSeedTexts(seeds).some(text => text.includes('Preview — no changes made.'))).toBe(true)
+    expect($notifications.get()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'success', message: expect.stringContaining('Preview — no changes made.') })
+      ])
     )
   })
 
