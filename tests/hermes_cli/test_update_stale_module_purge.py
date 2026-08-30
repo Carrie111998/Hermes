@@ -82,6 +82,41 @@ def test_purge_protects_executing_modules():
     assert "hermes_cli" in sys.modules
 
 
+def test_purge_preserves_inflight_update_receipt_singleton(tmp_path, monkeypatch):
+    """The in-flight receipt must survive the purge fired by the catch-up (#98436).
+
+    ``begin_update_receipt`` stores the receipt in the module-level
+    ``_current`` singleton. The fleet-restart catch-up
+    (``_run_pending_fleet_restart``) purges cached Hermes modules mid-update,
+    before the command boundary runs ``from hermes_cli.update_receipt import
+    finalize_pending_update_receipt``. If the purge evicts that module, the
+    from-import rebuilds a fresh module whose ``_current`` is None and the
+    exactly-once finalize no-ops — the Windows hand-off child that did the
+    real dependency work leaves no receipt on disk.
+    """
+    from hermes_cli import update_receipt
+
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: tmp_path)
+
+    update_receipt.begin_update_receipt()
+    assert update_receipt._current is not None, "precondition: receipt is open"
+
+    cli_main._purge_stale_hermes_modules()
+
+    # The purge must not evict the module holding the in-flight receipt: the
+    # later from-import binds to the SAME module object, singleton intact.
+    assert sys.modules.get("hermes_cli.update_receipt") is update_receipt
+
+    from hermes_cli.update_receipt import finalize_pending_update_receipt
+
+    path = finalize_pending_update_receipt(stop_reason="cmd boundary")
+
+    assert path is not None and path.exists(), (
+        "receipt finalized after purge must be persisted"
+    )
+    assert update_receipt._current is None
+
+
 def test_purge_leaves_prefix_lookalikes_alone():
     # `gateway_foo` starts with the string prefix "gateway" but is NOT the
     # gateway package — the root-segment check must spare it.
