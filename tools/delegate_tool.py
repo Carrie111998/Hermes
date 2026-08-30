@@ -2089,6 +2089,10 @@ def _build_child_agent(
                 log_prefix=f"[subagent-{task_index}]",
                 platform="subagent",
                 skip_context_files=True,
+                # Keep only the active profile's persona: project context and
+                # memory remain isolated. This adds SOUL.md to the child's
+                # cached prompt (and therefore to its configured provider),
+                # but does not add a model call.
                 load_soul_identity=True,
                 skip_memory=True,
                 clarify_callback=None,
