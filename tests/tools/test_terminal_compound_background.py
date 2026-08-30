@@ -100,3 +100,44 @@ class TestEdgeCases:
 
     def test_tabs_between_tokens(self):
         assert rewrite("A\t&&\tB\t&") == "A\t&&\t{ B\t& }"
+
+
+class TestStatementAfterBackground:
+    """A statement after the `&` needs a separator after the closing `}`.
+
+    bash requires a list terminator before the next command: ``{ B & } echo``
+    is a hard syntax error (``syntax error near unexpected token 'echo'``),
+    which is exactly how the #98222 kernel-spawn template died — the
+    rewritten ``cd … && nohup … & echo PID:$!`` never returned a PID, so
+    every execute_code call on docker/ssh/modal fell off the persistent
+    kernel. ``{ B & }; echo`` parses and keeps ``$!`` pointing at B.
+    """
+
+    def test_kernel_spawn_shape_gains_separator(self):
+        cmd = (
+            "cd /tmp/hermes_rkernel_04dcca && "
+            "nohup env -i python3 kernel_runner.py > runner.log 2>&1 & "
+            "echo PID:$!"
+        )
+        assert rewrite(cmd) == (
+            "cd /tmp/hermes_rkernel_04dcca && "
+            "{ nohup env -i python3 kernel_runner.py > runner.log 2>&1 & }; "
+            "echo PID:$!"
+        )
+
+
+    def test_simple_command_tail_gains_separator(self):
+        assert rewrite("A && B & echo done") == "A && { B & }; echo done"
+
+
+    def test_newline_tail_already_separates(self):
+        assert rewrite("A && B &\nC") == "A && { B & }\nC"
+
+
+    def test_comment_tail_already_separates(self):
+        assert rewrite("A && B & # note") == "A && { B & } # note"
+
+
+    def test_rewrite_with_tail_stays_idempotent(self):
+        once = rewrite("A && B & echo PID:$!")
+        assert rewrite(once) == once

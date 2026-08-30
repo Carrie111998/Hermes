@@ -1017,7 +1017,20 @@ def _rewrite_compound_background(command: str) -> str:
         suffix = result[amp_pos + 1 :]
         # `{` needs a trailing space in bash; the closing `}` needs to be
         # preceded by `;` or `&` — we're providing `&` from the backgrounding.
-        result = prefix + "{ " + middle + "& }" + suffix
+        # A statement following the `&` on the same line additionally needs a
+        # list separator after the `}`: bash rejects `{ B & } echo` outright
+        # while `{ B & }; echo` keeps `$!` pointing at the backgrounded B
+        # (#98222 — the kernel-spawn `cd … && nohup … & echo PID:$!` template
+        # died on this exact syntax error). Newlines, `;`, `&&`/`||`, pipes,
+        # and comments already separate statements, so only plain commands
+        # get the injected `;`.
+        separator_needed = False
+        tail = suffix.lstrip(" \t")
+        if tail and not tail.startswith(("\n", ";", "&", "|", "#")):
+            separator_needed = True
+        result = prefix + "{ " + middle + "& }" + (
+            "; " + tail if separator_needed else suffix
+        )
 
     return result
 
