@@ -1029,7 +1029,11 @@ class WebSocketRelayTransport:
             for _rid, fut in list(self._pending.items()):
                 if not fut.done():
                     fut.set_result(
-                        {"success": False, "error": "relay transport connection lost"}
+                        {
+                            "success": False,
+                            "error": "relay transport connection lost",
+                            "ambiguous": True,
+                        }
                     )
             self._pending.clear()
 

@@ -173,7 +173,7 @@ async def test_connect_replays_drop_between_handshake_and_handler_install():
     states = []
     adapter._set_deferred_transport_ready = lambda ready: states.append(ready)
 
-    assert await adapter.connect()
+    assert not await adapter.connect()
 
     assert not adapter.is_connected
     assert states == [False]

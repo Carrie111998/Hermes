@@ -967,7 +967,7 @@ class RelayAdapter(BasePlatformAdapter):
         # (the production WebSocket transport); the test/stub transports don't.
         if hasattr(self._transport, "auth_revoked"):
             self._start_revocation_monitor()
-        return True
+        return self.is_connected
 
     def _on_transport_connection_state(self, connected: bool) -> None:
         """Mirror Relay socket recovery through the adapter lifecycle seam."""
