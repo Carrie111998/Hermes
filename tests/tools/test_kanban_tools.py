@@ -264,6 +264,69 @@ def test_request_review_goal_mode_asks_judge_about_implementation_not_review(
     assert "Goal completion rejected by judge" in d2.get("error", "")
 
 
+def test_request_review_goal_mode_note_survives_long_body(monkeypatch, tmp_path):
+    """A goal-mode card with a long title+body (routine: task.body has an
+    8 KB budget elsewhere) must not silently lose the review-scoping note to
+    judge_goal's own 2000-char truncation. Regression for #98160 follow-up:
+    the note used to be appended AFTER title+body, so long cards consumed
+    the whole 2000-char budget before the note was ever reached.
+
+    This deliberately does NOT mock ``judge_goal`` itself (that would bypass
+    its real ``_truncate(goal, 2000)`` call and pass regardless of the bug)
+    — it mocks the LLM transport underneath so the real truncation runs and
+    the prompt actually sent to the model can be inspected.
+    """
+    from unittest.mock import patch
+
+    long_body = "Acceptance criteria:\n" + "\n".join(
+        f"- Bullet point {i} describing a specific requirement in detail."
+        for i in range(60)
+    )
+    assert len(long_body) > 1800  # confirm this body is realistically long
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path, body=long_body)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        run_id = kb.get_task(conn, tid).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    captured = {}
+
+    class _FakeMsg:
+        content = ""
+
+    class _FakeChoice:
+        message = _FakeMsg()
+
+    class _FakeResp:
+        choices = [_FakeChoice()]
+
+    def _fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        prompt = next(
+            (m["content"] for m in kwargs.get("messages", []) if m["role"] == "user"), ""
+        )
+        note_present = "do not withhold DONE merely because" in prompt
+        _FakeMsg.content = json.dumps({
+            "done": note_present,
+            "reason": "implementation evidence present" if note_present
+            else "no reviewer approval evidence yet",
+        })
+        return _FakeResp()
+
+    with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+        out = kt._handle_request_review({"summary": "Implemented X; ready for review."})
+
+    assert captured, "judge_goal never reached the LLM transport"
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})
@@ -277,7 +340,7 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
-def _make_goal_mode_worker_env(monkeypatch, tmp_path):
+def _make_goal_mode_worker_env(monkeypatch, tmp_path, body="Must achieve X."):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
     from pathlib import Path as _Path
@@ -296,7 +359,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
-            body="Must achieve X.", goal_mode=True,
+            body=body, goal_mode=True,
         )
         kb.claim_task(conn, goal_task_id)
     finally:

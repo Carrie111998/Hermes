@@ -276,6 +276,12 @@ def _goal_mode_handoff_rejection(
         return None
     goal = f"{task.title}\n\n{task.body or ''}".strip()
     if handoff == "review":
+        # judge_goal truncates its goal argument to 2000 chars before sending
+        # it to the judge; reserve room here so a long title/body can't push
+        # the note itself past that limit and silently drop it (#98160).
+        budget = 2000 - len(_REVIEW_READINESS_NOTE)
+        if len(goal) > budget:
+            goal = goal[:budget]
         goal = f"{goal}{_REVIEW_READINESS_NOTE}"
     verdict = "done"
     reason = ""
