@@ -110,8 +110,15 @@ def test_midcall_child_exit_signals_reconnect(monkeypatch, tmp_path):
         mcp_tool, "srv-midcall", _hanging_call, children_dead=lambda: False
     )
 
-    async def _watch_children():
-        return  # children die immediately → watcher resolves first
+    watcher_calls = {"n": 0}
+
+    def _watch_children():
+        watcher_calls["n"] += 1
+
+        async def _wait():
+            return  # children die immediately → watcher resolves first
+
+        return _wait()
 
     server._watch_stdio_children = _watch_children
     mcp_tool._ensure_mcp_loop()
@@ -122,5 +129,6 @@ def test_midcall_child_exit_signals_reconnect(monkeypatch, tmp_path):
         assert "error" in parsed, parsed
         assert "exited mid-call" in parsed["error"], parsed
         assert server._reconnect_event.set_calls == 1
+        assert watcher_calls["n"] == 1
     finally:
         _cleanup(mcp_tool, "srv-midcall")
