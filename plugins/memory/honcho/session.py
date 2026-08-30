@@ -151,6 +151,8 @@ class HonchoSessionManager:
         self._cache_lock = threading.RLock()
         self._peers_cache: dict[str, Any] = {}
         self._sessions_cache: dict[str, Any] = {}
+        # honcho_session_id -> author peer IDs already joined to that session.
+        self._joined_author_peers: dict[str, set[str]] = {}
         # Bumped (under _cache_lock) whenever _force_reauth rebuilds the client.
         # In-flight resolvers compare it around their SDK fetch so an object
         # bound to the discarded client is never stored into the fresh cache.
@@ -598,6 +600,56 @@ class HonchoSessionManager:
 
         return self._session_key_fallback_peer_id(key)
 
+    def _peer_id_for_runtime_id(self, runtime_id: str) -> str:
+        """Map one gateway runtime identity onto its Honcho peer ID.
+
+        Same alias-then-prefix resolution ``_resolve_user_peer_id`` applies to
+        the session's own identity, so an account aliased to a named peer lands
+        on that peer no matter which turn it authored.
+        """
+        aliases = getattr(self._config, "user_peer_aliases", {}) if self._config else {}
+        if isinstance(aliases, dict):
+            alias = aliases.get(runtime_id)
+            if isinstance(alias, str) and alias.strip():
+                return self._sanitize_id(alias.strip())
+
+        prefix = getattr(self._config, "runtime_peer_prefix", "") if self._config else ""
+        prefix = prefix.strip() if isinstance(prefix, str) else ""
+        if prefix:
+            return self._generated_runtime_peer_id(prefix, runtime_id)
+        return self._sanitize_id(runtime_id)
+
+    def resolve_author_peer_id(
+        self,
+        key: str,
+        author_id: str | None,
+        author_name: str | None = None,
+    ) -> str | None:
+        """Peer ID for the turn's author, or None to keep the session's peer.
+
+        Returns None when the transport named no author, when the author is
+        the session's own peer, or when ``pinPeerName`` collapses every
+        identity onto one peer by operator request. ``author_name`` is a
+        display name — attacker-influenceable on most platforms, so it never
+        becomes a peer ID.
+        """
+        runtime_id = str(author_id).strip() if author_id else ""
+        if not runtime_id:
+            return None
+
+        pin_peer_name = (
+            self._config is not None
+            and bool(getattr(self._config, "peer_name", None))
+            and getattr(self._config, "pin_peer_name", False) is True
+        )
+        if pin_peer_name:
+            return None
+
+        peer_id = self._peer_id_for_runtime_id(runtime_id)
+        if peer_id == self._resolve_user_peer_id(key):
+            return None
+        return peer_id
+
     def get_or_create(self, key: str) -> HonchoSession:
         """
         Get an existing session or create a new one.
@@ -657,6 +709,37 @@ class HonchoSessionManager:
             self._cache[key] = session
         return session
 
+    def _author_peer_for_session(
+        self, honcho_session: Any, honcho_session_id: str, author_peer_id: str
+    ) -> Any:
+        """Return the author's peer, joining it to the session on first sight.
+
+        A shared session's participant list is open — people and other agents
+        arrive after the session exists — so peers are added when they first
+        write rather than enumerated at init. Joins are remembered per session
+        to keep this to one API call per author.
+        """
+        peer = self._get_or_create_peer(author_peer_id)
+        with self._cache_lock:
+            joined = self._joined_author_peers.setdefault(honcho_session_id, set())
+            if author_peer_id in joined:
+                return peer
+        try:
+            from honcho.session import SessionPeerConfig
+            config = SessionPeerConfig(
+                observe_me=self._user_observe_me,
+                observe_others=self._user_observe_others,
+            )
+            honcho_session.add_peers([(peer, config)])
+        except Exception as e:
+            # The write still lands under the right peer; only the session
+            # membership (and so the observe config) is missing.
+            logger.debug("Honcho author peer join failed for %s: %s", author_peer_id, e)
+            return peer
+        with self._cache_lock:
+            self._joined_author_peers.setdefault(honcho_session_id, set()).add(author_peer_id)
+        return peer
+
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
         if not session.messages:
@@ -675,10 +758,21 @@ class HonchoSessionManager:
                 honcho_session, _ = self._get_or_create_honcho_session(
                     session.honcho_session_id, user_peer, assistant_peer
                 )
-            honcho_messages = [
-                (user_peer if m["role"] == "user" else assistant_peer).message(m["content"])
-                for m in new_messages
-            ]
+
+            honcho_messages = []
+            for m in new_messages:
+                if m["role"] != "user":
+                    honcho_messages.append(assistant_peer.message(m["content"]))
+                    continue
+                author_peer_id = m.get("author_peer_id")
+                if not author_peer_id:
+                    honcho_messages.append(user_peer.message(m["content"]))
+                    continue
+                author_peer = self._author_peer_for_session(
+                    honcho_session, session.honcho_session_id, author_peer_id
+                )
+                honcho_messages.append(author_peer.message(m["content"]))
+
             honcho_session.add_messages(honcho_messages)
             return len(honcho_messages)
 

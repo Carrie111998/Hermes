@@ -6645,6 +6645,14 @@ class TurnRunner:
             _conversation_kwargs = {
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
+                # Who wrote THIS turn. Sent on every transport, not just
+                # shared sessions: a provider deciding whether a turn may
+                # write to durable memory needs the bot flag in a DM too.
+                "turn_author": {
+                    "id": ctx.source.user_id or None,
+                    "name": ctx.source.user_name or None,
+                    "is_bot": bool(getattr(ctx.source, "is_bot", False)),
+                },
             }
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
@@ -27291,6 +27299,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.pin_peer_name",
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
+        "honcho.session_peer_prefix",
+        "honcho.session_ai_peer_prefix",
     )
     _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
 
@@ -27322,6 +27332,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
+                "honcho.session_peer_prefix": bool(hcfg.session_peer_prefix),
+                "honcho.session_ai_peer_prefix": bool(hcfg.session_ai_peer_prefix),
             }
             cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
             return dict(values)

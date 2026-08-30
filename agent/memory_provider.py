@@ -23,6 +23,7 @@ Lifecycle (called by MemoryManager, wired in run_agent.py):
 
 Optional hooks (override to opt in):
   on_turn_start(turn, message, **kwargs) — per-turn tick with runtime context
+                                          (includes this turn's author)
   on_session_end(messages)               — end-of-session extraction
   on_session_switch(new_session_id, **kwargs) — mid-process session_id rotation
   on_pre_compress(messages) -> str       — extract before context compression
@@ -256,8 +257,15 @@ class MemoryProvider(ABC):
 
         Use for turn-counting, scope management, periodic maintenance.
 
-        kwargs may include: remaining_tokens, model, platform, tool_count.
+        kwargs may include: remaining_tokens, model, platform, tool_count,
+        author_id, author_name, author_is_bot.
         Providers use what they need; extras are ignored.
+
+        The author trio identifies who wrote THIS turn. A shared session
+        (group, channel, thread) carries turns from several participants and
+        from other agents, so a provider that keys durable state on identity
+        must read it per turn rather than resolving one identity at init.
+        All three are absent when the transport never supplied an author.
         """
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:

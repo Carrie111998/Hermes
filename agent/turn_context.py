@@ -517,6 +517,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    turn_author: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -1424,10 +1425,20 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
+    # The author trio rides along so a provider keying durable state on
+    # identity can attribute THIS turn instead of the one identity it
+    # resolved at init — a shared session carries several participants.
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+            _author = turn_author if isinstance(turn_author, dict) else {}
+            agent._memory_manager.on_turn_start(
+                agent._user_turn_count,
+                _turn_msg,
+                author_id=_author.get("id") or None,
+                author_name=_author.get("name") or None,
+                author_is_bot=bool(_author.get("is_bot")),
+            )
         except Exception:
             pass
 
