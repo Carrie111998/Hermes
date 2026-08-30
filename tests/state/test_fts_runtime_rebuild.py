@@ -394,6 +394,12 @@ class TestRuntimeFtsRebuild:
         with pytest.raises(sqlite3.DatabaseError, match="writable open refused"):
             SessionDB(db_path=db_path)
 
+        report = hermes_state.repair_state_db_schema(db_path, backup=False)
+        assert report["repaired"] is True
+        reopened = SessionDB(db_path=db_path)
+        reopened.create_session("repaired-restored-generation", source="test")
+        reopened.close()
+
     def test_quarantine_publication_precedes_waiting_sibling_write(self, tmp_path):
         db_path = tmp_path / "state.db"
         first = SessionDB(db_path=db_path)

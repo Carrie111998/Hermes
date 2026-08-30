@@ -3483,19 +3483,26 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 before_mode = _probe_journal_mode_for_repair(db_path)
                 # Snapshot ownership before surgery. A quarantine published only
                 # after this repair began belongs to the post-repair generation
-                # and must never be retired by this pass.
+                # and must never be retired by this pass. The retained generation
+                # marker is also authoritative when old quarantined bytes are
+                # restored without their active marker.
+                generation = _read_db_generation_token(db_path)
                 had_active_quarantine = _active_structural_quarantine_path(
                     db_path
                 ).exists()
+                had_generation_quarantine = bool(
+                    generation
+                    and _structural_quarantine_path(db_path, generation).exists()
+                )
                 result = _repair_state_db_schema_locked(
                     db_path, backup=backup, report=report
                 )
                 if result.get("repaired"):
                     result["journal_mode_before"] = before_mode
                     _restore_journal_mode_after_repair(db_path, before_mode)
-                    if had_active_quarantine and not _finalize_structural_repair(
-                        db_path
-                    ):
+                    if (
+                        had_active_quarantine or had_generation_quarantine
+                    ) and not _finalize_structural_repair(db_path):
                         result["repaired"] = False
                         result["error"] = (
                             "state.db was repaired, but its structural-quarantine "
