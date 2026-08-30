@@ -27,12 +27,40 @@ export PATH="/command:/package/admin/s6/command:${PATH}"
 "$STAGE2"
 
 # The platform wrapper owns this process slot just as systemd/launchd/s6 own
-# theirs. Mark only the gateway process that the wrapper launches directly;
-# descendants inherit the environment marker, so takeover authorization must
-# remain on the explicit CLI flag rather than the ambient environment.
-if [ "${1:-}" = "gateway" ] && [ "${2:-}" = "run" ]; then
-    export HERMES_GATEWAY_EXTERNAL_SUPERVISOR=1
-    exec "$WRAPPER" "$@" --external-supervisor
+# theirs. Mark only a gateway process that the wrapper launches directly;
+# descendants inherit environment markers, so takeover authorization remains
+# on the explicit CLI flag rather than ambient state.
+if [ "${1:-}" = "gateway" ]; then
+    if [ "$#" -eq 1 ]; then
+        exec "$WRAPPER" gateway run --external-supervisor
+    elif [ "${2:-}" = "run" ]; then
+        exec "$WRAPPER" "$@" --external-supervisor
+    fi
+elif [ "${1:-}" = "hermes" ] && [ "${2:-}" = "gateway" ]; then
+    if [ "$#" -eq 2 ]; then
+        exec "$WRAPPER" hermes gateway run --external-supervisor
+    elif [ "${3:-}" = "run" ]; then
+        exec "$WRAPPER" "$@" --external-supervisor
+    fi
+elif { [ "${1:-}" = "--profile" ] || [ "${1:-}" = "-p" ]; } && \
+     [ "${3:-}" = "gateway" ]; then
+    if [ "$#" -eq 3 ]; then
+        exec "$WRAPPER" "$@" run --external-supervisor
+    elif [ "${4:-}" = "run" ]; then
+        exec "$WRAPPER" "$@" --external-supervisor
+    fi
+else
+    case "${1:-}" in
+        --profile=*)
+            if [ "${2:-}" = "gateway" ]; then
+                if [ "$#" -eq 2 ]; then
+                    exec "$WRAPPER" "$@" run --external-supervisor
+                elif [ "${3:-}" = "run" ]; then
+                    exec "$WRAPPER" "$@" --external-supervisor
+                fi
+            fi
+            ;;
+    esac
 fi
 
 exec "$WRAPPER" "$@"
