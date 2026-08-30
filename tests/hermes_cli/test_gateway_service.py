@@ -679,14 +679,30 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-        # Shorten the retry window so the test doesn't hang.
-        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 0.1)
+        # Refresh floors the in-process retry window at 30s
+        # (max(30.0, _get_restart_drain_timeout())). Keep the real
+        # retry + launchctl-list registration check, but expire that
+        # window after the first failed verification so CI does not sleep.
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            return clock["t"]
+
+        def fake_sleep(_seconds):
+            clock["t"] += 100.0
+
+        monkeypatch.setattr(gateway_cli.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(gateway_cli.time, "sleep", fake_sleep)
 
         result = gateway_cli.refresh_launchd_plist_if_needed()
 
         assert result is False
-        # Bootstrap was attempted but failed to register.
-        assert any("bootstrap" in str(c) for c in run_calls)
+        # Bootstrap was attempted and retried, but never registered a PID.
+        bootstrap_calls = [c for c in run_calls if len(c) > 1 and c[1] == "bootstrap"]
+        list_calls = [c for c in run_calls if c[:2] == ["launchctl", "list"]]
+        assert bootstrap_calls
+        assert list_calls
+        assert len(bootstrap_calls) >= 2
 
 
     def test_launchd_start_skips_kickstart_after_successful_refresh(self, tmp_path, monkeypatch):
