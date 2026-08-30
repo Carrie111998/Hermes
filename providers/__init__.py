@@ -214,6 +214,35 @@ def _discover_entry_point_providers() -> None:
                 "entry-point provider %r skipped: not enabled in config", ep.name
             )
             continue
+        # Import-free ownership precheck (#98438): this group is shared with
+        # the general PluginManager, which classifies entry points WITHOUT
+        # importing them and loads platform plugins lazily. Importing a
+        # platform adapter here breaks it — documented adapters do
+        # ``from gateway.config import Platform`` at module top, and when
+        # this scan runs inside the ``gateway.config -> hermes_cli.config``
+        # import chain (provider env injection at the bottom of
+        # hermes_cli/config.py) ``gateway.config`` is still half-initialized,
+        # so the import fails and the platform silently disappears. Skip
+        # entry points that are provably NOT model providers: a
+        # ``<name>-platform`` name (the manager's platform-id convention) or
+        # a memory-provider source signature. Anything else falls through to
+        # the load below — a real provider must never be dropped just
+        # because its source could not be classified.
+        try:
+            from hermes_cli.plugins import _classify_entrypoint_value_kind
+
+            value = getattr(ep, "value", "")
+            if ep.name.endswith("-platform") or (
+                value and _classify_entrypoint_value_kind(value) == "exclusive"
+            ):
+                logger.debug(
+                    "entry-point %r skipped by provider scan: platform or "
+                    "memory-provider plugin owned by the PluginManager",
+                    ep.name,
+                )
+                continue
+        except Exception:
+            pass  # classification unavailable — keep the historical behavior
         try:
             loaded = ep.load()
         except Exception as exc:
