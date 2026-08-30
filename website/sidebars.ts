@@ -390,6 +390,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/creative/creative-kanban-video-orchestrator',
                     'user-guide/skills/optional/creative/creative-meme-generation',
                     'user-guide/skills/optional/creative/creative-pixel-art',
+                    'user-guide/skills/optional/creative/creative-sepia',
                     'user-guide/skills/optional/creative/creative-simple-english',
                     'user-guide/skills/optional/creative/creative-social-media-content-calendar',
                     'user-guide/skills/optional/creative/creative-tldraw-offline',
