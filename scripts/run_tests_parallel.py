@@ -80,20 +80,16 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
 #
-# Set to 360s (6 min) deliberately generous: the per-test subprocess
-# isolation plugin spawns a fresh Python process per test, so a
-# large-collection file pays N × (interpreter startup + import) of
-# overhead before any test logic runs — and that overhead dilates under
-# load on shared CI runners, producing false "no tests ran" timeouts on
-# files that finish in ~100s on a quiet box. The Docker build matrix jobs
-# take 7-10 min anyway, so this headroom costs nothing on total CI wall
-# time while keeping a genuinely hung file bounded.
-_DEFAULT_FILE_TIMEOUT_SECONDS = 360.0
+# Set to 420s (7 min): native-Windows validation has observed a passing
+# test file taking as long as 359.8s. A 360s cap therefore left effectively
+# no scheduling or host-load margin; seven minutes adds about 60s of headroom
+# while keeping a genuinely hung file bounded.
+_DEFAULT_FILE_TIMEOUT_SECONDS = 420.0
 
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
 # but is loudly reported as FLAKY so it gets fixed rather than hidden.
-# Deterministic failures fail both attempts — a real regression can never be
+# Deterministic failures fail every attempt — a real regression can never be
 # laundered into green by this (it would have to flake in our favor twice in
 # a row on the same runner, which is exactly the definition of a flake).
 # Set to 0 to disable (env: HERMES_TEST_FILE_RETRIES).
@@ -619,7 +615,7 @@ def _print_inline_failure(
         print(f"  ║ {line}", flush=True)
     print("  ║", flush=True)
     print(f"  ║  Repro: {repro}", flush=True)
-    print("  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
+    print("  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
     print(flush=True)
 
 
@@ -657,7 +653,6 @@ def _save_durations(
         data[key] = round(t, 3)
     path = repo_root / _DURATIONS_FILE
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
 
 def _compute_lpt_slices(
     files: List[Path],
@@ -997,6 +992,7 @@ def main() -> int:
             roots = [repo_root / p for p in args.paths_positional]
         else:
             roots = [repo_root / p for p in _split_pathspec(args.paths)]
+
         if args.include_integration:
             # Caller takes responsibility — typically used via explicit -k filter.
             global _SKIP_PARTS  # noqa: PLW0603 — config knob
