@@ -123,6 +123,31 @@ class TestTrustLevelFor:
         auth = MagicMock(spec=GitHubAuth)
         return GitHubSource(auth=auth)
 
+    def test_extra_tap_repo_is_operator_trusted(self):
+        auth = MagicMock(spec=GitHubAuth)
+        src = GitHubSource(
+            auth=auth,
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+
+        assert src.trust_level_for("goberomsu/BSTACK/skills/hermes") == "operator"
+
+    def test_operator_trust_requires_exact_extra_tap_repo(self):
+        auth = MagicMock(spec=GitHubAuth)
+        src = GitHubSource(
+            auth=auth,
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+
+        assert src.trust_level_for("GoBeromsu/bstack-evil/skills/hermes") == "community"
+        assert src.trust_level_for("GoBeromsu/other/skills/hermes") == "community"
+        assert src.trust_level_for("malformed") == "community"
+
+    def test_default_tap_is_not_operator_trusted(self):
+        src = self._source()
+
+        assert src.trust_level_for("garrytan/gstack/skills/example") == "community"
+
     def test_trusted_repo(self):
         src = self._source()
         # TRUSTED_REPOS is imported from skills_guard, test with known trusted repo

@@ -717,6 +717,12 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         source_url=source_url_for_bundle(bundle),
         cache_dir=HUB_DIR / "scan-cache",
     )
+    # Source identifiers drive scanner provenance, while the active source
+    # router owns trust classification. Reapply current bundle trust on every
+    # install/update so cached scans cannot retain stale tap membership.
+    result.trust_level = bundle.trust_level
+    result.scan_provenance["trust_level"] = bundle.trust_level
+    scan_provenance["trust_level"] = bundle.trust_level
     c.print(format_scan_report(result))
     freshness = "fresh" if scan_provenance["fresh"] else "cached"
     c.print(

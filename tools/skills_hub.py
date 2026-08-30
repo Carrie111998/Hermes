@@ -690,6 +690,11 @@ class GitHubSource(SkillSource):
 
     def __init__(self, auth: GitHubAuth, extra_taps: Optional[List[Dict]] = None):
         self.auth = auth
+        self._operator_tap_repos = {
+            normalized
+            for tap in (extra_taps or [])
+            if (normalized := self._normalize_repo(tap.get("repo", ""))) is not None
+        }
         self.taps = list(self.DEFAULT_TAPS)
         if extra_taps:
             self.taps.extend(extra_taps)
@@ -712,11 +717,21 @@ class GitHubSource(SkillSource):
         """Whether GitHub API rate limit was hit during operations."""
         return self._rate_limited
 
+    @staticmethod
+    def _normalize_repo(repo: str) -> Optional[str]:
+        parts = str(repo).strip().strip("/").split("/")
+        if len(parts) != 2 or not all(parts):
+            return None
+        return "/".join(parts).casefold()
+
     def trust_level_for(self, identifier: str) -> str:
         # identifier format: "owner/repo/path/to/skill"
         parts = identifier.split("/", 2)
         if len(parts) >= 2:
             repo = f"{parts[0]}/{parts[1]}"
+            normalized_repo = self._normalize_repo(repo)
+            if normalized_repo in self._operator_tap_repos:
+                return "operator"
             if repo in TRUSTED_REPOS:
                 return "trusted"
         return "community"

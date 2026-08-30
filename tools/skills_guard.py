@@ -69,6 +69,9 @@ TRUSTED_REPOS = {
 INSTALL_POLICY = {
     #                  safe      caution    dangerous
     "builtin":       ("allow",  "allow",   "allow"),
+    # Adding a custom tap is the operator's one-time trust decision. Scanning
+    # and findings remain intact, but they are advisory for that source.
+    "operator":      ("allow",  "allow",   "allow"),
     "trusted":       ("allow",  "allow",   "block"),
     "community":     ("allow",  "block",   "block"),
     # Agent-created: "ask" on dangerous surfaces as an error to the agent,
