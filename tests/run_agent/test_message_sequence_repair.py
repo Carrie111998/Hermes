@@ -1480,10 +1480,50 @@ def test_pass3_bridges_leading_assistant_summary_in_history():
 
     assert repairs == 1
     assert messages[0]["role"] == "system"
-    assert messages[1] == {"role": "user", "content": _LEADING_USER_BRIDGE}
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"] == _LEADING_USER_BRIDGE
+    # Write-through path stamps the bridge so persistence invariants
+    # (every DB-materialized row carries a numeric timestamp) hold.
+    assert isinstance(messages[1]["timestamp"], (int, float))
     assert messages[2]["role"] == "assistant"          # assistant->tool intact
     assert messages[2]["tool_calls"][0]["id"] == "t1"
     assert messages[3]["tool_call_id"] == "t1"          # pairing preserved
+
+
+def test_pass3_skips_session_meta_rows():
+    """Hermes transcripts open with a session_meta row; the bridge must go
+    after it, and a transcript already leading with user stays untouched."""
+    agent = _bare_agent()
+    messages = [
+        {"role": "session_meta", "tools": []},
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+    assert AIAgent._repair_message_sequence(agent, messages) == 0
+    assert all(m.get("content") != _LEADING_USER_BRIDGE for m in messages)
+
+
+def test_pass3_no_bridge_without_any_user_turn():
+    """A history with no user turn at all (e.g. an ACP session holding a
+    single assistant message) is not the resumed-lineage case — inserting
+    a bridge would fabricate a user turn the session never had."""
+    agent = _bare_agent()
+    messages = [
+        {"role": "assistant", "content": "hello", "reasoning": "step-by-step"},
+    ]
+    assert AIAgent._repair_message_sequence(agent, messages) == 0
+    assert messages == [
+        {"role": "assistant", "content": "hello", "reasoning": "step-by-step"},
+    ]
+
+
+def test_ensure_user_leads_no_bridge_without_any_user_turn():
+    api_messages = [
+        {"role": "system", "content": "s"},
+        {"role": "assistant", "content": "greeting only"},
+    ]
+    assert ensure_user_leads_api_messages(api_messages) == 0
+    assert [m["role"] for m in api_messages] == ["system", "assistant"]
 
 
 def test_pass3_noop_on_well_formed_history():

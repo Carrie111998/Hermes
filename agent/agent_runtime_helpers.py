@@ -567,6 +567,10 @@ def note_turn_persisted(agent):
 # fresh input; the real current query is still the last user message.
 _LEADING_USER_BRIDGE = "(Conversation resumed — prior context follows below.)"
 
+# Non-conversational rows skipped when scanning for the leading turn:
+# provider envelopes (system) and Hermes transcript metadata (session_meta).
+_LEAD_SKIP_ROLES = ("system", "session_meta")
+
 
 def repair_message_sequence(agent, messages: List[Dict]) -> int:
     """Collapse malformed role-alternation left in the live history.
@@ -938,30 +942,39 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 continue
         merged.append(msg)
 
-    # Pass 3: guarantee the first non-system message is a user turn. A resumed
-    # lineage whose persisted history opens with a context-compaction summary
-    # merged into a leading ``assistant(tool_calls)`` turn otherwise trips
-    # OpenAI-compatible Qwen-derived chat templates ("No user query found in
-    # messages.") and Anthropic's non-user-leading rejection on every request.
+    # Pass 3: guarantee the first conversational message is a user turn. A
+    # resumed lineage whose persisted history opens with a context-compaction
+    # summary merged into a leading ``assistant(tool_calls)`` turn otherwise
+    # trips OpenAI-compatible Qwen-derived chat templates ("No user query found
+    # in messages.") and Anthropic's non-user-leading rejection on every request.
     # Inserting the bridge BEFORE the offending turn preserves assistant->tool
     # adjacency and every tool_call pairing (Pass 1 already dropped any orphan
-    # leading ``tool``, so the first non-system turn here is user or assistant).
-    # Unlike the send-time copy, this writes through to persisted history, so a
-    # legacy malformed lineage is normalized once and stops replaying the broken
-    # shape. No-op on payloads that already lead with a user turn.
+    # leading ``tool``, so the first conversational turn here is user or
+    # assistant). Unlike the send-time copy, this writes through to persisted
+    # history, so a legacy malformed lineage is normalized once and stops
+    # replaying the broken shape. No-op on histories that already lead with a
+    # user turn — and on histories with no user turn at all, where a bridge
+    # would fabricate context the session never had.
     lead = 0
     while (
         lead < len(merged)
         and isinstance(merged[lead], dict)
-        and merged[lead].get("role") == "system"
+        and merged[lead].get("role") in _LEAD_SKIP_ROLES
     ):
         lead += 1
     if (
         lead < len(merged)
         and isinstance(merged[lead], dict)
         and merged[lead].get("role") != "user"
+        and any(
+            isinstance(m, dict) and m.get("role") == "user"
+            for m in merged[lead + 1 :]
+        )
     ):
-        merged.insert(lead, {"role": "user", "content": _LEADING_USER_BRIDGE})
+        merged.insert(
+            lead,
+            {"role": "user", "content": _LEADING_USER_BRIDGE, "timestamp": time.time()},
+        )
         repairs += 1
 
     if repairs > 0:
@@ -999,13 +1012,17 @@ def ensure_user_leads_api_messages(api_messages: List[Dict]) -> int:
         return 0
     idx = 0
     n = len(api_messages)
-    while idx < n and isinstance(api_messages[idx], dict) and api_messages[idx].get("role") == "system":
+    while idx < n and isinstance(api_messages[idx], dict) and api_messages[idx].get("role") in _LEAD_SKIP_ROLES:
         idx += 1
     if idx >= n:
-        return 0  # nothing but system messages — no turn to lead
+        return 0  # nothing but system/meta rows — no turn to lead
     first = api_messages[idx]
     if not isinstance(first, dict) or first.get("role") == "user":
         return 0  # already well-formed
+    if not any(
+        isinstance(m, dict) and m.get("role") == "user" for m in api_messages[idx + 1 :]
+    ):
+        return 0  # no real user turn anywhere — a bridge would fabricate one
     api_messages.insert(idx, {"role": "user", "content": _LEADING_USER_BRIDGE})
     return 1
 
