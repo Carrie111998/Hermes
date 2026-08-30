@@ -597,6 +597,16 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
+                  label: 'seo',
+                  key: 'skills-optional-seo',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/optional/seo/seo-french-seo-writing',
+                    'user-guide/skills/optional/seo/seo-seo-semantic-geo',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'software-development',
                   key: 'skills-optional-software-development',
                   collapsed: true,
