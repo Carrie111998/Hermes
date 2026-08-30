@@ -806,13 +806,18 @@ def cmd_mcp_test(args):
 
 
 # ─── hermes mcp login ────────────────────────────────────────────────────────
-
 def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     """Force a fresh OAuth flow for one server. Returns True on success.
 
+    Snapshots existing credentials before wiping them, then restores on
+    failure so a cancelled/interrupted/timed-out flow does not destroy
+    working access.  The dashboard OAuth re-auth path already used this
+    pattern (web_server.py:13690-13721); the CLI path now matches it
+    exactly, closing the destructive-before-success gap in #98759.
+
     Wipes cached OAuth state (disk + in-process MCPOAuthManager cache),
     re-probes to trigger the browser flow, and verifies a token actually
-    landed before reporting success. Shared by ``hermes mcp login`` and
+    landed before reporting success.  Shared by ``hermes mcp login`` and
     ``hermes mcp reauth`` so both behave identically for a single server.
     """
     url = server_config.get("url")
@@ -824,11 +829,19 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
         return False
 
+    # Snapshot prior credentials so we can restore them if the flow fails.
+    # The dashboard path (web_server.py HermesTokenStorage.snapshot) does
+    # the same thing — the CLI path was the only one missing this safety net.
+    from tools.mcp_oauth import HermesTokenStorage
+    storage = HermesTokenStorage(name)
+    credential_backup = storage.snapshot()
+    previous_entry = None
+
     # Wipe both disk and in-memory cache so the next probe forces a fresh
     # OAuth flow.
     try:
         from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
+        previous_entry = get_manager().remove(name)
     except Exception as exc:
         _warning(f"Could not clear existing OAuth state: {exc}")
 
@@ -872,6 +885,13 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
                 "Server responded, but no OAuth token was obtained — "
                 "authentication did not complete."
             )
+            # Restore prior working credentials so the server remains usable.
+            storage.restore(credential_backup, only_if_absent=True)
+            try:
+                from tools.mcp_oauth_manager import get_manager as _get_mgr
+                _get_mgr().restore_entry(name, previous_entry)
+            except Exception:
+                pass
             print()
             _info(
                 "Some providers (e.g. Google Drive, Atlassian) do not support "
@@ -895,6 +915,13 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _success("Authenticated (server reported no tools)")
         return True
     except Exception as exc:
+        # Restore prior credentials on any failure so the server stays usable.
+        storage.restore(credential_backup, only_if_absent=True)
+        try:
+            from tools.mcp_oauth_manager import get_manager as _get_mgr
+            _get_mgr().restore_entry(name, previous_entry)
+        except Exception:
+            pass
         try:
             from tools.mcp_oauth import humanize_oauth_registration_error
 
@@ -904,6 +931,11 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         except Exception:
             humanized = None
         _error(f"Authentication failed: {humanized or exc}")
+        _info(
+            "Prior credentials were preserved — the server should still work "
+            "with its previous token. Re-run `hermes mcp login " + name + "` "
+            "when ready to retry."
+        )
         return False
 
 
