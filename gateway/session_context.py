@@ -135,6 +135,18 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Whether this request can accept the task-scoped delegation closeout
+# continuation after its originating HTTP/chat turn has returned.  This is
+# deliberately narrower than generic async push delivery: the API server has
+# no push channel, but an identified request can be resumed through its
+# authenticated self-post path.
+#
+# _UNSET inherits _SESSION_ASYNC_DELIVERY so existing gateway/CLI callers need
+# no new binding and retain their current behavior.
+_SESSION_CLOSEOUT_DELIVERY: ContextVar = ContextVar(
+    "HERMES_SESSION_CLOSEOUT_DELIVERY", default=_UNSET
+)
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -240,6 +252,7 @@ def set_session_vars(
     browser_control_transport_family: str = "",
     cwd: str = "",
     async_delivery: bool = True,
+    closeout_delivery: Any = _UNSET,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
 ) -> list:
@@ -257,6 +270,9 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``closeout_delivery`` is the narrower task-scoped closeout capability. If
+    omitted it inherits ``async_delivery`` for backward compatibility.
 
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
@@ -287,6 +303,9 @@ def set_session_vars(
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_CLOSEOUT_DELIVERY.set(
+            _UNSET if closeout_delivery is _UNSET else bool(closeout_delivery)
+        ),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -334,6 +353,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_CLOSEOUT_DELIVERY.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -382,6 +402,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_CLOSEOUT_DELIVERY.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -491,6 +512,9 @@ def declare_stateless_channel() -> None:
     See NousResearch/hermes-agent#53027 and #63142.
     """
     _SESSION_ASYNC_DELIVERY.set(False)
+    # Explicitly mask an inherited API/chat closeout capability. Finite
+    # one-shot callers cannot consume a later closeout continuation.
+    _SESSION_CLOSEOUT_DELIVERY.set(False)
 
 
 def async_delivery_supported() -> bool:
@@ -522,4 +546,22 @@ def async_delivery_supported() -> bool:
     value = _SESSION_ASYNC_DELIVERY.get()
     if value is _UNSET:
         return True
+    return bool(value)
+
+
+def closeout_delivery_supported() -> bool:
+    """Whether this request can receive a task-scoped closeout continuation.
+
+    An explicit request binding wins. Otherwise the capability conservatively
+    inherits generic async delivery, preserving messaging gateway and CLI
+    behavior without requiring every existing binder to change.
+    """
+    import os
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+
+    value = _SESSION_CLOSEOUT_DELIVERY.get()
+    if value is _UNSET:
+        return async_delivery_supported()
     return bool(value)

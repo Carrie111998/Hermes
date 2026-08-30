@@ -44,6 +44,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Mapping
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -996,6 +997,44 @@ _deferred_agent_startup_done = False
 # one-shot CLI runs — which also register _run_cleanup via atexit — don't emit
 # escape codes for modes they never enabled (#36823).
 _tui_input_modes_active = False
+
+
+class _InternalContinuation(NamedTuple):
+    text: str
+    work_id: str
+    generation: int
+    delivery_id: str
+    claim_id: str
+
+
+def _retry_failed_closeout_continuation(
+    continuation: _InternalContinuation,
+) -> bool:
+    """Release a failed CLI handoff and immediately publish its replacement."""
+    from tools.async_delegation import (
+        recover_and_enqueue_work_groups,
+        release_enqueued_work_group_event,
+    )
+    from tools.process_registry import process_registry
+
+    try:
+        released = release_enqueued_work_group_event({
+            "type": "async_delegation_work_closeout",
+            "origin_work_id": continuation.work_id,
+            "work_generation": continuation.generation,
+            "delivery_id": continuation.delivery_id,
+            "claim_id": continuation.claim_id,
+        })
+        if not released:
+            return False
+        recover_and_enqueue_work_groups(
+            consumer="cli-closeout-retry",
+            target_queue=process_registry.completion_queue,
+        )
+        return True
+    except Exception:
+        logging.warning("CLI closeout retry scheduling failed", exc_info=True)
+        return False
 
 
 def _mark_tui_input_modes_active() -> None:
@@ -5533,6 +5572,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._internal_continuations = queue.Queue()
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -10216,6 +10256,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         old_session_id = self.session_id
+        if old_session_id:
+            try:
+                from tools.async_delegation import close_work_groups_for_session
+
+                close_work_groups_for_session(
+                    origin_session=old_session_id,
+                    parent_session_id=old_session_id,
+                    disposition="cancelled",
+                    diagnostics="classic CLI /new reset discarded the owning session",
+                )
+            except Exception:
+                logger.debug("Failed to close delegation groups at /new", exc_info=True)
         _boundary_snapshot = None
         if self.agent and self.conversation_history:
             # Deliver the context-engine boundary synchronously and get back
@@ -13395,7 +13447,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            recover_and_enqueue_work_groups,
+            release_enqueued_work_group_event,
         )
+
+        try:
+            recover_and_enqueue_work_groups(
+                consumer="cli-closeout-poller",
+                target_queue=process_registry.completion_queue,
+            )
+        except Exception:
+            logging.warning("CLI closeout recovery poll failed", exc_info=True)
 
         session_key = getattr(self, "session_id", "") or ""
         for event, synthetic_message in process_registry.drain_notifications(
@@ -13405,8 +13467,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            if event.get("type") == "async_delegation_work_closeout":
+                item = _InternalContinuation(
+                    text=synthetic_message,
+                    work_id=str(event.get("origin_work_id") or ""),
+                    generation=int(event.get("work_generation") or 0),
+                    delivery_id=str(event.get("delivery_id") or ""),
+                    claim_id=str(event.get("claim_id") or ""),
+                )
+                try:
+                    self._internal_continuations.put_nowait(item)
+                except Exception:
+                    release_enqueued_work_group_event(event)
+                    raise
+            else:
+                self._pending_input.put(synthetic_message)
+                complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -16664,7 +16740,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        internal_continuation: _InternalContinuation | None = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -17019,13 +17101,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
+                    conversation_kwargs = {
+                        "user_message": agent_message,
+                        "conversation_history": self.conversation_history[:-1],
+                        "stream_callback": stream_callback,
+                        "task_id": self.session_id,
+                        "persist_user_message": _persist_clean_user_message,
+                        "moa_config": _moa_cfg,
+                    }
+                    if internal_continuation is not None:
+                        _internal_metadata = {
+                            "work_id": internal_continuation.work_id,
+                            "generation": internal_continuation.generation,
+                            "delivery_id": internal_continuation.delivery_id,
+                            "claim_id": internal_continuation.claim_id,
+                        }
+                        conversation_kwargs.update({
+                            "origin_work_id": _internal_metadata["work_id"],
+                            "work_generation": _internal_metadata["generation"],
+                            "work_delivery_id": _internal_metadata["delivery_id"],
+                            "work_claim_id": _internal_metadata["claim_id"],
+                            "persist_user_display_kind": "internal_notification",
+                            "persist_user_display_metadata": _internal_metadata,
+                        })
                     result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=_persist_clean_user_message,
-                        moa_config=_moa_cfg,
+                        **conversation_kwargs,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -17036,6 +17136,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._pending_moa_restore_model = None
                         self._pending_moa_disable_after_turn = False
                 except Exception as exc:
+                    if internal_continuation is not None:
+                        _retry_failed_closeout_continuation(internal_continuation)
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
                     result = {
@@ -18138,6 +18240,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        self._internal_continuations = queue.Queue()
         # Seeded -q handoff: main() can't put directly into _pending_input
         # (this reinit would discard it), so the seeded first message rides
         # in on an attribute and is enqueued into the fresh queue here.
@@ -20759,7 +20862,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 try:
                     # Check for pending input with timeout
                     try:
-                        user_input = self._pending_input.get(timeout=0.1)
+                        try:
+                            user_input = self._pending_input.get_nowait()
+                        except queue.Empty:
+                            user_input = self._internal_continuations.get(timeout=0.1)
                     except queue.Empty:
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
@@ -20789,6 +20895,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
+                    internal_continuation = (
+                        user_input
+                        if isinstance(user_input, _InternalContinuation)
+                        else None
+                    )
+                    if internal_continuation is not None:
+                        user_input = internal_continuation.text
                     if is_voice_input:
                         user_input = user_input.text
 
@@ -20930,7 +21043,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            internal_continuation=internal_continuation,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -21878,6 +21996,11 @@ def main(
         os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
+        from gateway.session_context import set_session_vars, clear_session_vars
+
+        _finite_session_tokens = set_session_vars(
+            async_delivery=False, closeout_delivery=False
+        )
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
@@ -22112,6 +22235,7 @@ def main(
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
         finally:
+            clear_session_vars(_finite_session_tokens)
             _finalize_single_query(cli)
         return
     

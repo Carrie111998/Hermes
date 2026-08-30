@@ -343,6 +343,29 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     return [sid for sid in found if sid not in seeds]
 
 
+def _drop_work_groups_for_deleted_sessions(
+    conn: sqlite3.Connection, session_ids: List[str]
+) -> int:
+    """Terminally disposition groups in this exact SessionDB transaction."""
+    ids = list({sid for sid in session_ids if sid})
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    now = time.time()
+    cursor = conn.execute(
+        "UPDATE async_delegation_work_groups SET state='closed', "
+        "terminal_disposition='dropped', "
+        "terminal_diagnostics='owning session deleted', closed_at=?, updated_at=?, "
+        "closeout_claim=NULL, closeout_claimed_at=NULL, closeout_turn_id=NULL, "
+        "closeout_owner_pid=NULL, closeout_owner_started_at=NULL "
+        "WHERE work_id<>'' AND state IN ('open','sealed','closing') AND ("
+        f"origin_session IN ({placeholders}) OR "
+        f"parent_session_id IN ({placeholders}))",
+        (now, now, *ids, *ids),
+    )
+    return cursor.rowcount
+
+
 def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
     ids = _collect_delegate_child_ids(conn, parent_ids)
     if ids:
@@ -9229,6 +9252,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
+                _drop_work_groups_for_deleted_sessions(conn, ids)
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
@@ -13527,13 +13551,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if cursor.fetchone() is None:
                 return False
+            actual_ids = {
+                session_id,
+                *_collect_delegate_child_ids(conn, [session_id]),
+            }
             if expected_ids is not None:
-                actual_ids = {
-                    session_id,
-                    *_collect_delegate_child_ids(conn, [session_id]),
-                }
                 if actual_ids != expected_ids:
                     return False
+            _drop_work_groups_for_deleted_sessions(conn, list(actual_ids))
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
@@ -13573,6 +13598,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
+            eligible = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? AND title IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM messages "
+                "WHERE messages.session_id = sessions.id) "
+                "AND NOT EXISTS (SELECT 1 FROM sessions child "
+                "WHERE child.parent_session_id = sessions.id)",
+                (session_id,),
+            ).fetchone()
+            if eligible is not None:
+                _drop_work_groups_for_deleted_sessions(conn, [session_id])
             cursor = conn.execute(
                 """
                 DELETE FROM sessions
@@ -13651,6 +13686,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
+            deleted_session_ids = [
+                *existing,
+                *_collect_delegate_child_ids(conn, existing),
+            ]
+            _drop_work_groups_for_deleted_sessions(conn, deleted_session_ids)
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
@@ -13766,6 +13806,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not session_ids:
                 return 0
 
+            _drop_work_groups_for_deleted_sessions(conn, list(session_ids))
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
@@ -14161,6 +14202,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not session_ids:
                 return 0
 
+            _drop_work_groups_for_deleted_sessions(conn, list(session_ids))
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(

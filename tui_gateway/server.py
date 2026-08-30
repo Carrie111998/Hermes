@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
@@ -53,6 +54,15 @@ from tui_gateway.transport import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _InternalContinuation(NamedTuple):
+    text: str
+    work_id: str
+    generation: int
+    delivery_id: str
+    claim_id: str
+    profile_home: str = ""
 
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
@@ -891,6 +901,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    session["_finalize_retryable"] = False
     history_ready = session.get("resume_history_ready")
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
@@ -899,10 +910,6 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         end_reason in _AUTOMATIC_SESSION_END_REASONS
         and _session_source(session).strip().lower() == "desktop"
     )
-    # Automatic Desktop cleanup removes its lease inside the lock-held lifecycle
-    # guard below. Explicit close and non-Desktop paths keep force/end semantics.
-    if not _desktop_automatic_cleanup:
-        _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
@@ -970,13 +977,23 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # Use session_id (from agent.session_id) not session_key — after compression,
     # session_key may be stale (the ended parent) while session_id is the live
     # continuation. Fix for #20001.
-    if _desktop_automatic_cleanup and not session_id:
-        _release_active_session_slot(session)
+    _own_sid = str(session.get("_sid") or "")
+    if not _own_sid:
+        try:
+            with _sessions_lock:
+                for _cand_sid, _cand in _sessions.items():
+                    if _cand is session:
+                        _own_sid = _cand_sid
+                        break
+        except Exception:
+            _own_sid = ""
     _lifecycle_guard = (
         _other_runtime_lease_guard(session_id, session)
         if _desktop_automatic_cleanup and session_id
         else contextlib.nullcontext(False)
     )
+    _lifecycle_failed = False
+    _lifecycle_boundary_started = False
     with _lifecycle_guard as _other_runtime_owns_lifecycle:
         _tui_owns_lifecycle = not _other_runtime_owns_lifecycle
         if _other_runtime_owns_lifecycle:
@@ -1003,9 +1020,55 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                         if _is_gateway_owned_source(source):
                             _tui_owns_lifecycle = False
                         elif _tui_owns_lifecycle:
-                            db.end_session(session_id, end_reason)
-            except Exception:
-                pass
+                            _lifecycle_boundary_started = True
+                            # Group closeout is part of the same lifecycle
+                            # boundary and must land in this session's profile
+                            # ledger before the durable session row is ended.
+                            from tools.async_delegation import (
+                                close_work_groups_for_session,
+                            )
+
+                            with _session_profile_scope(session):
+                                close_work_groups_for_session(
+                                    origin_session=str(session_key or ""),
+                                    origin_ui_session_id=_own_sid,
+                                    parent_session_id=str(session_id or ""),
+                                    disposition="cancelled",
+                                    diagnostics=(
+                                        "TUI/Desktop intentional session close"
+                                        if end_reason == "tui_close"
+                                        else "TUI/Desktop session finalized: "
+                                        f"{end_reason}"
+                                    ),
+                                )
+                            if hasattr(db, "end_session"):
+                                db.end_session(session_id, end_reason)
+            except Exception as exc:
+                if _lifecycle_boundary_started:
+                    _lifecycle_failed = True
+                    logger.warning(
+                        "Could not finalize durable session/group lifecycle for %s: %s",
+                        session_id,
+                        exc,
+                    )
+                else:
+                    logger.debug(
+                        "Could not inspect durable session lifecycle for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+
+    if _lifecycle_failed:
+        # The leading marker is a concurrency guard, not permission to suppress
+        # a failed durable boundary forever. Leave the live session available
+        # for the next reaper/close call to retry the group disposition and
+        # SessionDB.end_session() pair.
+        session["_finalized"] = False
+        session["_finalize_retryable"] = True
+        return
+
+    if not _desktop_automatic_cleanup or _tui_owns_lifecycle or not session_id:
+        _release_active_session_slot(session)
 
     # A session's in-flight async delegations end WITH the session (#55578):
     # once nobody owns the return address, a still-running background subagent
@@ -1017,21 +1080,14 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     try:
         from tools.async_delegation import interrupt_for_session
 
-        _own_sid = str(session.get("_sid") or "")
-        if not _own_sid:
-            try:
-                with _sessions_lock:
-                    for _cand_sid, _cand in _sessions.items():
-                        if _cand is session:
-                            _own_sid = _cand_sid
-                            break
-            except Exception:
-                _own_sid = ""
-        interrupt_for_session(
-            session_key=str(session_key or "") if _tui_owns_lifecycle else "",
-            origin_ui_session_id=_own_sid,
-            reason=end_reason,
-        )
+        with _session_profile_scope(session):
+            interrupt_for_session(
+                session_key=(
+                    str(session_key or "") if _tui_owns_lifecycle else ""
+                ),
+                origin_ui_session_id=_own_sid,
+                reason=end_reason,
+            )
     except Exception:
         pass
 
@@ -1084,7 +1140,7 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
         logger.debug("session.reclaimed broadcast failed", exc_info=True)
 
 
-def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
+def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> bool:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
     Shared by ``session.close`` and the orphaned-WS-session reaper. The
@@ -1095,8 +1151,27 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     make repeat calls harmless.
     """
     if not session:
-        return
+        return False
     _finalize_session(session, end_reason=end_reason)
+    if session.pop("_finalize_retryable", False):
+        # A durable lifecycle failure is retryable. The caller normally popped
+        # the session before teardown; put the same object back so the next
+        # close/reaper pass can retry instead of closing the agent and losing
+        # the only live owner of the unresolved work group.
+        sid = str(session.get("_sid") or "")
+        if sid:
+            session["_closing"] = False
+            with _sessions_lock:
+                _sessions.setdefault(sid, session)
+            old_stop = session.get("_notif_stop")
+            if old_stop is not None:
+                old_stop.set()
+                for stop, thread in list(_notification_pollers):
+                    if stop is old_stop and thread is not threading.current_thread():
+                        thread.join(timeout=1.0)
+                        break
+            session["_notif_stop"] = _start_notification_poller(sid, session)
+        return False
     _announce_session_reclaimed(session, end_reason)
     try:
         from tools.approval import unregister_gateway_notify
@@ -1115,6 +1190,7 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
     # finalize is unregistering the notifier and closing the in-process agent.
+    return True
 
 
 def _attach_worker(sid: str, session: dict, worker) -> None:
@@ -1174,8 +1250,8 @@ def _teardown_popped_session(
                 )
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
-    _teardown_session(session, end_reason=end_reason)
-    return True
+    teardown_result = _teardown_session(session, end_reason=end_reason)
+    return teardown_result is not False
 
 
 def _close_session_by_id(
@@ -4006,6 +4082,18 @@ def _persist_branch_seed(session: dict) -> None:
             if is_disk_full_error(exc):
                 raise
             logger.debug("branch seed persist failed", exc_info=True)
+
+
+@contextlib.contextmanager
+def _session_profile_scope(session: dict):
+    """Bind the session's profile home for profile-scoped ledger operations."""
+    profile_home = session.get("profile_home")
+    token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
 
 
 @contextlib.contextmanager
@@ -9015,6 +9103,7 @@ def _init_session(
             "created_at": now,
             "last_active": now,
             "running": False,
+            "internal_continuations": deque(),
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
@@ -10441,6 +10530,7 @@ def _deferred_session_record(
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,
+        "internal_continuations": deque(),
         "session_key": session_key,
         "show_reasoning": _load_show_reasoning(),
         "slash_worker": None,
@@ -11672,6 +11762,16 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     """
     if session.get("_finalized"):
         return False
+    if evt.get("type") == "async_delegation_work_closeout":
+        ledger_home = str(evt.get("_ledger_profile_home") or "")
+        expected_home = str(session.get("profile_home") or _hermes_home)
+        if not ledger_home:
+            return False
+        try:
+            if Path(ledger_home).resolve() != Path(expected_home).resolve():
+                return False
+        except (OSError, RuntimeError, ValueError):
+            return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True
     evt_key = str(evt.get("session_key") or "")
@@ -12017,13 +12117,25 @@ def _notification_poller_loop(
     same way (status.update + agent turn) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     """
+    from tools.async_delegation import recover_and_enqueue_work_groups
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    _last_closeout_recovery = 0.0
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
+        if _now - _last_closeout_recovery >= _LOOP_POLL_SECONDS:
+            _last_closeout_recovery = _now
+            try:
+                with _session_profile_scope(session):
+                    recover_and_enqueue_work_groups(
+                        consumer="tui-closeout-poller",
+                        target_queue=process_registry.completion_queue,
+                    )
+            except Exception:
+                logger.warning("TUI closeout recovery poll failed", exc_info=True)
         # ── /loop wakeup driver ──────────────────────────────────────
         # Fire a due /loop tick for THIS session while it's idle. Same
         # claim-under-lock pattern as the kanban dispatch below. Active
@@ -12098,6 +12210,12 @@ def _notification_poller_loop(
         # ownerless ordinary notifications retain legacy global delivery.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
+            if evt.get("type") == "async_delegation_work_closeout":
+                # A same-key closeout from another profile is not orphaned; its
+                # profile's poller must retain the chance to claim it.
+                process_registry.completion_queue.put(evt)
+                time.sleep(0.5)
+                continue
             log = (
                 logger.warning
                 if evt.get("type") == "async_delegation"
@@ -12129,6 +12247,25 @@ def _notification_poller_loop(
         if _dedup_key not in _emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
+
+        if evt.get("type") == "async_delegation_work_closeout":
+            with session["history_lock"]:
+                session.setdefault("internal_continuations", deque()).append(
+                    _closeout_continuation(evt, text)
+                )
+                busy = bool(session.get("running"))
+            if not busy:
+                try:
+                    _start_next_internal_continuation(
+                        f"__notif__{int(time.time() * 1000)}", sid, session
+                    )
+                except Exception as exc:
+                    print(
+                        f"[tui_gateway] closeout continuation dispatch failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+            continue
 
         _requeued = False
         with session["history_lock"]:
@@ -12579,7 +12716,16 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    internal_continuation: _InternalContinuation | None = None,
 ) -> bool:
+    if internal_continuation is not None and display_kind is None:
+        display_kind = "internal_notification"
+        display_metadata = {
+            "work_id": internal_continuation.work_id,
+            "generation": internal_continuation.generation,
+            "delivery_id": internal_continuation.delivery_id,
+            "claim_id": internal_continuation.claim_id,
+        }
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -12912,6 +13058,13 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if internal_continuation is not None:
+                run_kwargs.update({
+                    "origin_work_id": internal_continuation.work_id,
+                    "work_generation": internal_continuation.generation,
+                    "work_delivery_id": internal_continuation.delivery_id,
+                    "work_claim_id": internal_continuation.claim_id,
+                })
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -13467,6 +13620,11 @@ def _run_prompt_submit(
         if _drain_queued_prompt(rid, sid, session):
             return
 
+        # Trusted closeouts are a separate FIFO. A real user prompt above wins
+        # this boundary; closeouts are never merged into or substituted for it.
+        if _start_next_internal_continuation(rid, sid, session):
+            return
+
         # Chain a goal-continuation turn if the judge said so. We do
         # this AFTER the finally releases session["running"], so the
         # nested _run_prompt_submit doesn't deadlock on the busy
@@ -13514,6 +13672,12 @@ def _run_prompt_submit(
                 skip_poll_observed=False,
             )
             for index, (_evt, synth) in enumerate(drained):
+                if _evt.get("type") == "async_delegation_work_closeout":
+                    with session["history_lock"]:
+                        session.setdefault("internal_continuations", deque()).append(
+                            _closeout_continuation(_evt, synth)
+                        )
+                    continue
                 with session["history_lock"]:
                     if session.get("running"):
                         for pending_evt, _pending_synth in drained[index:]:
@@ -13539,6 +13703,7 @@ def _run_prompt_submit(
                     )
                     with session["history_lock"]:
                         session["running"] = False
+            _start_next_internal_continuation(rid, sid, session)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -13560,6 +13725,83 @@ def _run_prompt_submit(
         with session["history_lock"]:
             session["running"] = False
     return can_start
+
+
+def _closeout_continuation(evt: dict, text: str) -> _InternalContinuation:
+    return _InternalContinuation(
+        text=text,
+        work_id=str(evt.get("origin_work_id") or ""),
+        generation=int(evt.get("work_generation") or 0),
+        delivery_id=str(evt.get("delivery_id") or ""),
+        claim_id=str(evt.get("claim_id") or ""),
+        profile_home=str(evt.get("_ledger_profile_home") or ""),
+    )
+
+
+def _start_next_internal_continuation(rid, sid: str, session: dict) -> bool:
+    """Start one trusted continuation after the current/user turn boundary."""
+    with session["history_lock"]:
+        pending = session.setdefault("internal_continuations", deque())
+        if session.get("running") or not pending:
+            return False
+        item = pending.popleft()
+        session["running"] = True
+    try:
+        if item.profile_home:
+            expected_home = session.get("profile_home") or _hermes_home
+            try:
+                affinity_matches = (
+                    Path(item.profile_home).resolve() == Path(expected_home).resolve()
+                )
+            except (OSError, RuntimeError, ValueError):
+                affinity_matches = False
+            if not affinity_matches:
+                raise RuntimeError(
+                    "closeout profile affinity does not match target TUI session"
+                )
+        _emit("message.start", sid)
+        if not _run_prompt_submit(
+            rid, sid, session, item.text, internal_continuation=item
+        ):
+            raise RuntimeError("target TUI session cannot resume continuation")
+        return True
+    except Exception:
+        from tools.async_delegation import (
+            recover_and_enqueue_work_groups,
+            release_enqueued_work_group_event,
+        )
+        from tools.process_registry import process_registry
+
+        try:
+            scoped_session = (
+                {"profile_home": item.profile_home}
+                if item.profile_home
+                else session
+            )
+            with _session_profile_scope(scoped_session):
+                released = release_enqueued_work_group_event({
+                    "type": "async_delegation_work_closeout",
+                    "origin_work_id": item.work_id,
+                    "work_generation": item.generation,
+                    "delivery_id": item.delivery_id,
+                    "claim_id": item.claim_id,
+                    "_ledger_profile_home": item.profile_home,
+                })
+                if released:
+                    try:
+                        recover_and_enqueue_work_groups(
+                            consumer="tui-closeout-retry",
+                            target_queue=process_registry.completion_queue,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "TUI closeout immediate recovery failed",
+                            exc_info=True,
+                        )
+        finally:
+            with session["history_lock"]:
+                session["running"] = False
+        raise
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25

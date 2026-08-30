@@ -463,13 +463,22 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
+        # Rehydrate durable delegation completions and grouped closeouts at
+        # registry startup. Consumers inject both as fresh turns through this
+        # existing rail; grouped recovery deliberately targets this instance's
+        # queue so startup does not depend on the module singleton being ready.
         try:
             from tools.async_delegation import restore_undelivered_completions
+
             restore_undelivered_completions(self.completion_queue)
         except Exception as exc:
             logger.warning("Could not restore async delegation completions: %s", exc)
+        try:
+            from tools.async_delegation import recover_and_enqueue_work_groups
+
+            recover_and_enqueue_work_groups(target_queue=self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not restore task-scoped delegation closeouts: %s", exc)
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications

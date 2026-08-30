@@ -6617,6 +6617,12 @@ class AIAgent:
 
     def _reset_stream_delivery_tracking(self) -> None:
         """Reset tracking for text delivered during the current model response."""
+        # A retry/fallback starts a new response admission unit.  Never flush
+        # text retained by the superseded response into the new writer.
+        _discarding_gated_response = bool(
+            getattr(self, "_conversational_response_gated", False)
+        )
+        self._discard_conversational_response()
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
         # turned out not to be a tag prefix should reach the UI.  Then
@@ -6632,29 +6638,99 @@ class AIAgent:
                 ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
                 if ctx_scrubber is not None:
                     think_tail = ctx_scrubber.feed(think_tail)
-                if think_tail:
-                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                        except Exception:
-                            pass
-                    self._record_streamed_assistant_text(think_tail)
+                if think_tail and not _discarding_gated_response:
+                    self._fire_stream_delta(think_tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
         scrubber = getattr(self, "_stream_context_scrubber", None)
         if scrubber is not None:
             tail = scrubber.flush()
-            if tail:
-                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                    except Exception:
-                        pass
-                self._record_streamed_assistant_text(tail)
+            if tail and not _discarding_gated_response:
+                self._fire_stream_delta(tail)
         self._current_streamed_assistant_text = ""
+        self._begin_conversational_response()
+
+    def _conversational_admission_required(self) -> bool:
+        """Whether this top-level response must await complete tool metadata."""
+        if getattr(self, "_delegate_depth", 0) > 0:
+            return False
+        # Existing groups keep draining if creation is subsequently disabled.
+        if getattr(self, "_current_work_id", ""):
+            return True
+        try:
+            from gateway.session_context import closeout_delivery_supported
+            from tools.async_delegation import task_scoped_closeout_enabled
+
+            return (
+                task_scoped_closeout_enabled()
+                and closeout_delivery_supported()
+                and "delegate_task" in (getattr(self, "valid_tool_names", ()) or ())
+            )
+        except Exception:
+            return False
+
+    def _begin_conversational_response(self) -> None:
+        self._conversational_response_gated = self._conversational_admission_required()
+        self._conversational_response_events = []
+        self._conversational_stream_end = None
+        self._conversational_response_suppressed = False
+
+    def _discard_conversational_response(self) -> None:
+        self._conversational_response_events = []
+        self._conversational_response_gated = False
+        self._conversational_stream_end = None
+
+    def _admit_conversational_response(self) -> None:
+        """Release one completed no-tool response through its normal observers."""
+        events = list(getattr(self, "_conversational_response_events", ()) or ())
+        self._conversational_response_events = []
+        self._conversational_response_gated = False
+        for kind, payload in events:
+            if kind == "delta":
+                self._deliver_stream_delta(payload)
+            elif kind == "interim":
+                self._deliver_interim_assistant_message(payload)
+            elif kind == "codex_commentary":
+                self._deliver_streamed_codex_commentary(payload)
+            elif kind == "stream_end":
+                self._deliver_stream_end(**payload)
+
+    def _settle_conversational_response(self, *, has_tool_calls: bool) -> None:
+        """Settle buffering only after provider normalization is complete."""
+        if not getattr(self, "_conversational_response_gated", False):
+            return
+        # Scrubbers may retain a benign partial-tag suffix until response end.
+        # Flush it into this response's buffer before its stream-end observer.
+        think_scrubber = getattr(self, "_stream_think_scrubber", None)
+        if think_scrubber is not None:
+            tail = think_scrubber.flush()
+            if tail:
+                context_scrubber = getattr(self, "_stream_context_scrubber", None)
+                if context_scrubber is not None:
+                    tail = context_scrubber.feed(tail)
+                if tail:
+                    self._fire_stream_delta(tail)
+        context_scrubber = getattr(self, "_stream_context_scrubber", None)
+        if context_scrubber is not None:
+            tail = context_scrubber.flush()
+            if tail:
+                self._fire_stream_delta(tail)
+        stream_end = getattr(self, "_conversational_stream_end", None)
+        self._conversational_stream_end = None
+        if stream_end is not None:
+            self._conversational_response_events.append(("stream_end", stream_end))
+        if has_tool_calls:
+            self._conversational_response_suppressed = True
+            self._discard_conversational_response()
+        else:
+            # A no-tool candidate is not terminal merely because provider
+            # normalization finished: verification-stop hooks may reject it
+            # and a later model response may still dispatch delegated work.
+            # Keep it buffered until conversation_loop reaches the final
+            # admission branch. Work-owned candidates remain buffered even
+            # longer, through transcript persistence and the close-group CAS.
+            return
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -6784,6 +6860,12 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
+        if getattr(self, "_conversational_response_gated", False):
+            self._conversational_response_events.append(("codex_commentary", text))
+            return
+        self._deliver_streamed_codex_commentary(text)
+
+    def _deliver_streamed_codex_commentary(self, text: str) -> None:
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(text, str):
             return
@@ -6813,6 +6895,16 @@ class AIAgent:
         """
         if not isinstance(assistant_msg, dict):
             return
+        if getattr(self, "_conversational_response_gated", False):
+            self._conversational_response_events.append(
+                ("interim", dict(assistant_msg))
+            )
+            return
+        self._deliver_interim_assistant_message(assistant_msg)
+
+    def _deliver_interim_assistant_message(
+        self, assistant_msg: Dict[str, Any]
+    ) -> None:
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: List[str] = []
         pending_keys: set[str] = set()
@@ -6961,6 +7053,14 @@ class AIAgent:
             logger.debug("on_stream_start plugin hook enqueue failed", exc_info=True)
 
     def _emit_stream_end(self, *, final_text: str, finished: bool, error: str | None) -> None:
+        if getattr(self, "_conversational_response_gated", False):
+            self._conversational_stream_end = {
+                "final_text": final_text, "finished": finished, "error": error,
+            }
+            return
+        self._deliver_stream_end(final_text=final_text, finished=finished, error=error)
+
+    def _deliver_stream_end(self, *, final_text: str, finished: bool, error: str | None) -> None:
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -7021,6 +7121,12 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
+        if getattr(self, "_conversational_response_gated", False):
+            self._conversational_response_events.append(("delta", text))
+            return
+        self._deliver_stream_delta(text)
+
+    def _deliver_stream_delta(self, text: str) -> None:
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -7042,6 +7148,31 @@ class AIAgent:
             logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
         if delivered:
             self._record_streamed_assistant_text(text)
+
+    def _fire_suppressed_tool_text(self, text: str) -> None:
+        """Legacy display-only path, routed through admission while gated."""
+        if getattr(self, "_conversational_response_gated", False):
+            # A complete tool-bearing response will discard this event.  Using
+            # the shared buffer closes the historical direct-callback bypass.
+            self._conversational_response_events.append(("delta", text))
+            return
+        if self.stream_delta_callback:
+            try:
+                self.stream_delta_callback(text)
+                self._record_streamed_assistant_text(text)
+            except Exception:
+                pass
+
+    def _close_stream_display_segment(self) -> None:
+        """Close a legacy display segment unless admission suppressed it."""
+        if getattr(self, "_conversational_response_suppressed", False):
+            self._conversational_response_suppressed = False
+            return
+        if self.stream_delta_callback:
+            try:
+                self.stream_delta_callback(None)
+            except Exception:
+                pass
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -8525,20 +8656,84 @@ class AIAgent:
         #     synchronous: the orchestrator needs its workers' results within
         #     its own turn to compose a summary, and a subagent doesn't own the
         #     gateway session the async result would route back to.
-        # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
-        return _delegate_task(
+        closeout_enabled = False
+        async_supported = False
+        if not _is_subagent:
+            try:
+                from gateway.session_context import closeout_delivery_supported
+                from tools.async_delegation import task_scoped_closeout_enabled
+
+                closeout_enabled = task_scoped_closeout_enabled()
+                async_supported = closeout_delivery_supported()
+            except Exception:
+                closeout_enabled = False
+        closeout_active = closeout_enabled or bool(
+            getattr(self, "_current_work_id", "")
+        )
+        explicit_sync = (
+            closeout_active and function_args.get("background") is False
+        )
+        unsupported_closeout_surface = closeout_active and not async_supported
+        background = (
+            not _is_subagent
+            and not explicit_sync
+            and not unsupported_closeout_surface
+        )
+
+        work_id = ""
+        work_generation = 0
+        closeout_delivery_id = ""
+        closeout_claim_id = ""
+        allocated_here = False
+        if closeout_active and background and async_supported:
+            work_id = str(getattr(self, "_current_work_id", "") or "")
+            work_generation = int(
+                getattr(self, "_current_work_generation", 0) or 0
+            )
+            closeout_delivery_id = str(
+                getattr(self, "_current_work_delivery_id", "") or ""
+            )
+            closeout_claim_id = str(
+                getattr(self, "_current_work_claim_id", "") or ""
+            )
+            if closeout_delivery_id and closeout_claim_id:
+                work_generation += 1
+            elif not work_id:
+                work_id = str(uuid.uuid4())
+                allocated_here = True
+
+        result = _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=background,
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
             parent_agent=self,
+            origin_work_id=work_id,
+            work_generation=work_generation,
+            owner_turn_id=str(getattr(self, "_current_turn_id", "") or ""),
+            closeout_delivery_id=closeout_delivery_id,
+            closeout_claim_id=closeout_claim_id,
         )
+        if work_id:
+            try:
+                dispatched = json.loads(result).get("status") == "dispatched"
+            except (TypeError, ValueError, json.JSONDecodeError):
+                dispatched = False
+            if dispatched:
+                self._current_work_id = work_id
+                self._current_work_generation = work_generation
+                # A replacement's first member consumed the closing claim.
+                self._current_work_delivery_id = ""
+                self._current_work_claim_id = ""
+            elif allocated_here:
+                self._current_work_id = ""
+        return result
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
@@ -8642,6 +8837,10 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        origin_work_id: str = "",
+        work_generation: int = 0,
+        work_delivery_id: str = "",
+        work_claim_id: str = "",
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8678,6 +8877,36 @@ class AIAgent:
         relay_turn_id = (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
+        # Trusted internal continuation identity is current-turn state only.
+        # External callers omit these kwargs and therefore always start clean.
+        self._current_work_id = str(origin_work_id or "")
+        self._current_work_generation = int(work_generation or 0)
+        self._current_work_delivery_id = str(work_delivery_id or "")
+        self._current_work_claim_id = str(work_claim_id or "")
+        if self._current_work_id and self._current_work_delivery_id and self._current_work_claim_id:
+            from tools.async_delegation import bind_work_group_closeout_turn
+
+            if not bind_work_group_closeout_turn(
+                self._current_work_id,
+                self._current_work_delivery_id,
+                self._current_work_claim_id,
+                relay_turn_id,
+            ):
+                # A trusted replay can race the original closeout or arrive
+                # after that deterministic delivery already closed. A failed
+                # exact bind means this envelope is stale; surfacing an error
+                # would create a second user-visible terminal result.
+                self._current_work_id = ""
+                self._current_work_generation = 0
+                self._current_work_delivery_id = ""
+                self._current_work_claim_id = ""
+                return {
+                    "messages": list(conversation_history or []),
+                    "final_response": "",
+                    "api_calls": 0,
+                    "completed": True,
+                    "duplicate_closeout": True,
+                }
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
@@ -8937,6 +9166,34 @@ class AIAgent:
                                     "the transcript."
                                 )
                                 return
+                            _work_id = str(
+                                getattr(self, "_current_work_id", "") or ""
+                            )
+                            _delivery_id = str(
+                                getattr(self, "_current_work_delivery_id", "") or ""
+                            )
+                            _claim_id = str(
+                                getattr(self, "_current_work_claim_id", "") or ""
+                            )
+                            if _work_id and _delivery_id and _claim_id:
+                                from tools.async_delegation import (
+                                    renew_work_group_claim,
+                                )
+
+                                if not renew_work_group_claim(
+                                    _work_id,
+                                    int(getattr(self, "_current_work_generation", 0) or 0),
+                                    _delivery_id,
+                                    _claim_id,
+                                    relay_turn_id,
+                                ):
+                                    if durable_turn_lease_stop.is_set():
+                                        return
+                                    _interrupt_turn(
+                                        "Delegation closeout claim lost; stopping "
+                                        "to prevent duplicate reconciliation."
+                                    )
+                                    return
                         except Exception:
                             if durable_turn_lease_stop.is_set():
                                 return
@@ -9109,6 +9366,50 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    # A bound closeout that exits without a durable close or
+                    # replacement reopen must not remain protected merely
+                    # because this gateway process is still alive. Release
+                    # only this exact turn/claim identity; a winner that
+                    # already changed any field is untouched.
+                    _work_id = str(getattr(self, "_current_work_id", "") or "")
+                    _delivery_id = str(
+                        getattr(self, "_current_work_delivery_id", "") or ""
+                    )
+                    _claim_id = str(
+                        getattr(self, "_current_work_claim_id", "") or ""
+                    )
+                    if _work_id and _delivery_id and _claim_id:
+                        try:
+                            from tools.async_delegation import (
+                                release_bound_work_group_closeout,
+                            )
+
+                            release_bound_work_group_closeout(
+                                _work_id,
+                                int(
+                                    getattr(
+                                        self, "_current_work_generation", 0
+                                    )
+                                    or 0
+                                ),
+                                _delivery_id,
+                                _claim_id,
+                                relay_turn_id,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to release delegation closeout turn %s",
+                                relay_turn_id,
+                            )
+                    _discard_response = getattr(
+                        self, "_discard_conversational_response", None
+                    )
+                    if callable(_discard_response):
+                        _discard_response()
+                    self._current_work_id = ""
+                    self._current_work_generation = 0
+                    self._current_work_delivery_id = ""
+                    self._current_work_claim_id = ""
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

@@ -1117,6 +1117,11 @@ def init_agent(
     # commentary when the provider later returns it as a completed interim
     # assistant message.
     agent._current_streamed_assistant_text = ""
+    # Response-scoped conversational admission.  Enabled lazily per provider
+    # attempt only for task-scoped top-level delegation-capable turns.
+    agent._conversational_response_gated = False
+    agent._conversational_response_events = []
+    agent._conversational_stream_end = None
     # Completed interim messages delivered during the current user turn.
     # Unlike token-stream tracking, this spans Codex continuation/tool calls so
     # repeated commentary is not re-sent before normalization can deduplicate it.

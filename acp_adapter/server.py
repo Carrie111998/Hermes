@@ -2028,7 +2028,8 @@ class HermesACPAgent(acp.Agent):
                 # masking any leaked process-global HERMES_CRON_SESSION (#37968).
                 session_tokens = set_session_vars(
                     session_key=session_id, session_id=session_id, cwd=state.cwd,
-                    cron_session="",
+                    cron_session="", async_delivery=False,
+                    closeout_delivery=False,
                 )
             except Exception:
                 session_tokens = None

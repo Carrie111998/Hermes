@@ -26,8 +26,11 @@ rewind cursors / retry instead of silently losing the event.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 from typing import Any, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +62,16 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    profile: str = "",
+    internal_metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
     ``state.db`` key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` used to build the synthetic event — required for
-    push-capable adapters.
+    push-capable adapters. ``profile`` is the trusted multiplex profile used to
+    route a non-push self-post through ``/p/<profile>``.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
@@ -91,11 +97,25 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    self_post_kwargs: Dict[str, Any] = {
+        "text": text,
+        "session_id": session_id,
+    }
+    if internal_metadata is not None:
+        self_post_kwargs["internal_metadata"] = internal_metadata
+    routed_profile = str(profile or getattr(source, "profile", "") or "")
+    if routed_profile:
+        self_post_kwargs["profile"] = routed_profile
+    await _self_post_chat_completion(adapter, **self_post_kwargs)
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any,
+    *,
+    text: str,
+    session_id: str,
+    internal_metadata: Optional[dict[str, Any]] = None,
+    profile: str = "",
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -122,11 +142,21 @@ async def _self_post_chat_completion(
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    profile_prefix = f"/p/{quote(profile, safe='')}" if profile else ""
+    url = f"http://{host}:{port}{profile_prefix}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    if internal_metadata:
+        internal_token = str(getattr(adapter, "_internal_self_post_token", "") or "")
+        if not internal_token:
+            raise RuntimeError("wake self-post internal metadata token is unavailable")
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(internal_metadata, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        headers["X-Hermes-Internal-Auth"] = internal_token
+        headers["X-Hermes-Internal-Continuation"] = encoded
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
         "messages": [{"role": "user", "content": text}],

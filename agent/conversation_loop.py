@@ -2032,6 +2032,8 @@ def run_conversation(
     # user-facing result available; it must not be confused with error or
     # recovery text produced by unrelated exit paths.
     _pending_verification_response = None
+    _delegation_waiting = False
+    _closeout_terminal_candidate = False
     # Tracks whether the pending verification candidate was already streamed
     # to the user as interim content. The finalizer uses this to set
     # ``_response_was_previewed`` ONLY when the pending candidate is actually
@@ -6910,6 +6912,12 @@ def run_conversation(
             # No-op for ordinary providers; see agent/provider_projection.py.
             splice_provider_projection(agent, response, messages)
 
+            # Conversational delivery is response-scoped: only the normalized
+            # response knows the complete provider-independent tool set.
+            agent._settle_conversational_response(
+                has_tool_calls=bool(assistant_message.tool_calls)
+            )
+
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,
@@ -7590,11 +7598,7 @@ def run_conversation(
                 # flushing here prevents it from wrapping tool feed lines.
                 # Only signal the display callback — TTS (_stream_callback)
                 # should NOT receive None (it uses None as end-of-stream).
-                if agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(None)
-                    except Exception:
-                        pass
+                agent._close_stream_display_segment()
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
@@ -8551,6 +8555,56 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # A work-owning turn can never publish its own terminal
+                # candidate.  Seal membership first, retain a provider-valid
+                # hidden assistant closure after the tool tail, and yield an
+                # explicit intentional-waiting result.  A trusted closing
+                # continuation is the sole exception; its answer is closed
+                # durably by finalize_turn only after transcript persistence.
+                _work_id = str(getattr(agent, "_current_work_id", "") or "")
+                _delivery_id = str(
+                    getattr(agent, "_current_work_delivery_id", "") or ""
+                )
+                _claim_id = str(getattr(agent, "_current_work_claim_id", "") or "")
+                if not _work_id:
+                    # All verification/continuation gates have accepted this
+                    # no-tool response and no delegation was dispatched. Only
+                    # now may response-scoped display/TTS/plugin events escape.
+                    agent._admit_conversational_response()
+                if _work_id and not (_delivery_id and _claim_id):
+                    from tools.async_delegation import seal_and_enqueue_work_group
+
+                    append_message(messages, {
+                        "role": "assistant",
+                        "content": (
+                            "Delegated work remains pending; no terminal answer "
+                            "was issued."
+                        ),
+                        "display_kind": "delegation_waiting",
+                        "display_metadata": {"hidden": True},
+                    })
+                    _seal_result = seal_and_enqueue_work_group(_work_id, turn_id)
+                    if (
+                        isinstance(_seal_result, dict)
+                        and _seal_result.get("type")
+                        == "async_delegation_work_seal_error"
+                    ):
+                        # Do not report an intentional wait when the durable
+                        # membership barrier rejected this turn's identity.
+                        messages.pop()
+                        agent._discard_conversational_response()
+                        final_response = None
+                        failed = True
+                        _turn_exit_reason = "delegation_work_seal_failed"
+                        break
+                    agent._discard_conversational_response()
+                    final_response = None
+                    _delegation_waiting = True
+                    _turn_exit_reason = "delegation_waiting"
+                    break
+                if _work_id and _delivery_id and _claim_id:
+                    _closeout_terminal_candidate = True
+
                 append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session
@@ -8754,6 +8808,8 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        delegation_waiting=_delegation_waiting,
+        closeout_terminal_candidate=_closeout_terminal_candidate,
     )
 
 

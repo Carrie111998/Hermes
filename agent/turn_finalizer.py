@@ -143,6 +143,8 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    delegation_waiting=False,
+    closeout_terminal_candidate=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -150,6 +152,64 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    work_id = str(getattr(agent, "_current_work_id", "") or "")
+    delivery_id = str(getattr(agent, "_current_work_delivery_id", "") or "")
+    claim_id = str(getattr(agent, "_current_work_claim_id", "") or "")
+    delegation_diagnostic = None
+    if work_id and not (delivery_id and claim_id):
+        from tools.async_delegation import seal_and_enqueue_work_group
+
+        parent_terminal_failure = bool(interrupted or failed)
+        if not parent_terminal_failure and not (
+            messages
+            and messages[-1].get("display_kind") == "delegation_waiting"
+        ):
+            append_message(messages, {
+                "role": "assistant",
+                "content": (
+                    "Delegated work remains pending; no terminal answer was issued."
+                ),
+                "display_kind": "delegation_waiting",
+                "display_metadata": {"hidden": True},
+            })
+        seal_result = seal_and_enqueue_work_group(
+            work_id,
+            getattr(agent, "_current_turn_id", "") or turn_id,
+            consumer="failed-owner-seal" if parent_terminal_failure else "turn-seal",
+            diagnostics=(
+                f"owner turn ended before closeout: {_turn_exit_reason}"
+                if parent_terminal_failure
+                else None
+            ),
+        )
+        if isinstance(seal_result, dict) and seal_result.get("type") == (
+            "async_delegation_work_seal_error"
+        ):
+            delegation_diagnostic = seal_result
+            failed = True
+            final_response = None
+            _turn_exit_reason = "delegation_work_seal_failed"
+        elif parent_terminal_failure:
+            _owner_exit_reason = str(_turn_exit_reason)
+            delegation_diagnostic = {
+                "ok": True,
+                "code": "owner_failed_group_sealed",
+                "work_id": work_id,
+                "owner_exit_reason": _owner_exit_reason,
+            }
+            # The parent failure is part of the eventual aggregate closeout;
+            # it is not a separate terminal answer. Surfaces must treat the
+            # explicit waiting flag as suppression even though failed remains
+            # true for diagnostics/telemetry.
+            final_response = None
+            delegation_waiting = True
+            _turn_exit_reason = "delegation_waiting_after_owner_failure"
+        agent._discard_conversational_response()
+        if not parent_terminal_failure and delegation_diagnostic is None:
+            final_response = None
+            delegation_waiting = True
+            _turn_exit_reason = "delegation_waiting"
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -159,6 +219,7 @@ def finalize_turn(
         budget_exhausted
         and not interrupted
         and not failed
+        and not delegation_waiting
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     )
     continuation_budget_exhausted = (
@@ -287,6 +348,15 @@ def finalize_turn(
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
+    # A closeout answer is provisional until both transcript persistence and
+    # the exact group CAS succeed. Persist it as a typed hidden sidecar so a
+    # failed candidate cannot reappear through resume/transcript projection.
+    # On success the live/result copy transitions to visible; the durable
+    # hidden copy is honest crash recovery evidence, not an external-delivery
+    # receipt (external delivery is deliberately not claimed exactly-once).
+    _provisional_closeout_message = None
+
+    _session_persisted = False
     try:
         agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
     except Exception as _save_err:
@@ -392,6 +462,34 @@ def finalize_turn(
                 # creating an assistant→assistant pair.
                 _fill_assistant_tail_content(agent, _tail, final_response)
 
+        if closeout_terminal_candidate and messages:
+            candidate = messages[-1]
+            if candidate.get("role") == "assistant" and not candidate.get("tool_calls"):
+                _provisional_closeout_message = candidate
+                candidate["display_kind"] = "delegation_closeout_provisional"
+                candidate["display_metadata"] = {
+                    "hidden": True,
+                    "work_id": work_id,
+                    "generation": int(
+                        getattr(agent, "_current_work_generation", 0) or 0
+                    ),
+                    "delivery_id": delivery_id,
+                    "claim_id": claim_id,
+                    "turn_id": getattr(agent, "_current_turn_id", "") or turn_id,
+                }
+                # A crash after the first provisional append replays the same
+                # deterministic delivery. Reuse that canonical durable row
+                # rather than appending another candidate for reconciliation
+                # to reveal later.
+                from tools.async_delegation import find_closeout_provisional
+
+                canonical = find_closeout_provisional(work_id, delivery_id)
+                if canonical is not None:
+                    candidate["content"] = canonical["content"]
+                    candidate["_row_id"] = canonical["row_id"]
+                    candidate["_db_persisted"] = True
+                    final_response = canonical["content"]
+
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
         # final durable snapshot and returning the continuation history. Earlier
@@ -462,9 +560,60 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        _session_persisted = True
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
+    if closeout_terminal_candidate:
+        _closed = False
+        if _session_persisted:
+            try:
+                from tools.async_delegation import close_work_group
+
+                _closed = close_work_group(
+                    work_id,
+                    int(getattr(agent, "_current_work_generation", 0) or 0),
+                    delivery_id,
+                    claim_id,
+                    getattr(agent, "_current_turn_id", "") or turn_id,
+                )
+            except Exception:
+                logger.exception("delegation closeout commit failed for %s", work_id)
+        if not _closed:
+            # The durable group remains closing and recovery can schedule the
+            # same delivery.  Never externally acknowledge an uncommitted
+            # closeout candidate.
+            final_response = None
+            completed = False
+            failed = True
+            _turn_exit_reason = "delegation_closeout_persistence_failed"
+            agent._discard_conversational_response()
+        else:
+            if _provisional_closeout_message is not None:
+                _provisional_closeout_message.pop("display_kind", None)
+                _provisional_closeout_message.pop("display_metadata", None)
+            agent._current_work_id = ""
+            agent._current_work_generation = 0
+            agent._current_work_delivery_id = ""
+            agent._current_work_claim_id = ""
+            try:
+                # Reveal the canonical durable row after the exact close CAS.
+                from tools.async_delegation import (
+                    reconcile_closed_closeout_provisionals,
+                )
+
+                reconcile_closed_closeout_provisionals()
+                agent._persist_session(messages, conversation_history)
+            except Exception as _reveal_err:
+                _cleanup_errors.append(
+                    f"persist_closeout_reveal: {_reveal_err}"
+                )
+                logger.warning(
+                    "Delegation closeout completed but transcript reveal failed",
+                    exc_info=True,
+                )
+            agent._admit_conversational_response()
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
@@ -559,7 +708,11 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if (
+        not interrupted
+        and not delegation_waiting
+        and not (closeout_terminal_candidate and failed)
+    ):
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -712,6 +865,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "waiting_on_delegates": bool(delegation_waiting),
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
@@ -741,6 +895,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if delegation_diagnostic is not None:
+        result["delegation_diagnostic"] = delegation_diagnostic
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -781,6 +937,9 @@ def finalize_turn(
 
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
+    _discard_response = getattr(agent, "_discard_conversational_response", None)
+    if callable(_discard_response):
+        _discard_response()
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False

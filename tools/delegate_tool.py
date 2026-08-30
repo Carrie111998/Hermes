@@ -3679,6 +3679,11 @@ def delegate_task(
     message: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    origin_work_id: str = "",
+    work_generation: int = 0,
+    owner_turn_id: str = "",
+    closeout_delivery_id: str = "",
+    closeout_claim_id: str = "",
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -4179,34 +4184,37 @@ def delegate_task(
         # SYNCHRONOUS execution so the result returns in this same turn instead
         # of handing out a handle with no durable consumer. Mirrors the
         # pool-at-capacity inline fallback below.
+        _closeout_active = False
         try:
-            from gateway.session_context import async_delivery_supported
-            _async_ok = async_delivery_supported()
+            from gateway.session_context import (
+                async_delivery_supported,
+                closeout_delivery_supported,
+            )
+
+            _closeout_active = _task_scoped_closeout_enabled() or bool(
+                origin_work_id
+            )
+            _async_ok = (
+                closeout_delivery_supported()
+                if _closeout_active
+                else async_delivery_supported()
+            )
         except Exception:
             _async_ok = True
 
-        _wake_sid = ""
-        if not _async_ok:
-            # The adapter itself cannot push, but if a raw session id is
-            # bound (the API server always binds one — see
-            # ApiServerAdapter._bind_api_server_session), gateway.wake can
-            # still reach the session by self-POSTing /v1/chat/completions
-            # with that id in X-Hermes-Session-Id once the batch completes.
-            # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
-            _wake_sid = _origin_wake_sid
-            if _wake_sid:
-                logger.info(
-                    "delegate_task: async delivery unsupported on this "
-                    "session, but a session id is bound (%s) — dispatching "
-                    "in the background and waking the session via self-post "
-                    "when it completes instead of forcing synchronous "
-                    "execution.",
-                    _wake_sid,
-                )
-                _async_ok = True
+        if not _async_ok and not _closeout_active and _origin_wake_sid:
+            # Preserve the pre-feature API behavior. A raw resumable session
+            # id is a durable wake target even though the API adapter cannot
+            # push directly; the completion self-posts to
+            # /v1/chat/completions. Task-scoped closeout uses its narrower
+            # capability above and must still fail closed when unsupported.
+            logger.info(
+                "delegate_task: async delivery unsupported on this session, "
+                "but a resumable session id is bound (%s) — dispatching in "
+                "the background and waking it via self-post on completion.",
+                _origin_wake_sid,
+            )
+            _async_ok = True
 
         if not _async_ok:
             logger.info(
@@ -4336,7 +4344,7 @@ def delegate_task(
             model=creds["model"],
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
-            origin_session_id=_wake_sid,
+            origin_session_id=_origin_wake_sid,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
@@ -4345,6 +4353,11 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            origin_work_id=origin_work_id,
+            work_generation=work_generation,
+            owner_turn_id=owner_turn_id,
+            closeout_delivery_id=closeout_delivery_id,
+            closeout_claim_id=closeout_claim_id,
         )
 
         if dispatch.get("status") == "dispatched":
@@ -4841,6 +4854,14 @@ def _build_top_level_description() -> str:
             "cronjob.\n"
         )
 
+    awaited = ""
+    if _task_scoped_closeout_enabled():
+        awaited = (
+            " Set background=false for a required final read-only review or "
+            "prerequisite whose result must be consumed before you continue. "
+            "Any edit after a review invalidates that verdict and requires a "
+            "fresh review."
+        )
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
@@ -4849,7 +4870,7 @@ def _build_top_level_description() -> str:
         "Runs in the background: dispatch returns immediately with live "
         "transcript paths, and the completed result (one consolidated message, "
         "results in task order) re-enters the conversation on its own. Do NOT "
-        "wait or poll; continue other work. While children run, `action` "
+        f"wait or poll; continue other work.{awaited} While children run, `action` "
         "(list/steer/stop) controls them live — steer when a transcript shows "
         "a child drifting.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
@@ -4926,6 +4947,16 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    if _task_scoped_closeout_enabled():
+        overrides_params["properties"]["background"] = {
+            "type": "boolean",
+            "description": (
+                "Omit or set true to dispatch asynchronously. Set false for a "
+                "required final read-only review or prerequisite whose result must "
+                "be consumed before continuing; any later edit requires a fresh review."
+            ),
+            "default": True,
+        }
 
     return {
         "description": _build_top_level_description(),
@@ -5058,7 +5089,28 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    if is_subagent:
+        return False
+    if _task_scoped_closeout_enabled():
+        if args.get("background") is False:
+            return False
+        try:
+            from gateway.session_context import closeout_delivery_supported
+
+            if not closeout_delivery_supported():
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _task_scoped_closeout_enabled() -> bool:
+    try:
+        from tools.async_delegation import task_scoped_closeout_enabled
+
+        return task_scoped_closeout_enabled()
+    except Exception:
+        return False
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

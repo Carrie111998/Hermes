@@ -216,12 +216,22 @@ class GatewaySlashCommandsMixin:
         # chats are pinned to it via parent_session_id) and by the routing
         # key as a fallback for older records.
         try:
-            from tools.async_delegation import interrupt_for_session
+            from tools.async_delegation import (
+                close_work_groups_for_session,
+                interrupt_for_session,
+            )
 
+            _old_session_id = str(getattr(old_entry, "session_id", "") or "")
             interrupt_for_session(
                 session_key=session_key,
-                parent_session_id=str(getattr(old_entry, "session_id", "") or ""),
+                parent_session_id=_old_session_id,
                 reason="session_reset",
+            )
+            close_work_groups_for_session(
+                origin_session=session_key,
+                parent_session_id=_old_session_id,
+                disposition="cancelled",
+                diagnostics="gateway /new reset discarded the owning session",
             )
         except Exception:
             pass
@@ -1439,6 +1449,12 @@ class GatewaySlashCommandsMixin:
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
+        self._cancel_work_groups_for_session_boundary(
+            session_key,
+            session_entry=session_entry,
+            diagnostics="gateway /stop cancelled outstanding delegation work",
+        )
+
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
@@ -1470,6 +1486,15 @@ class GatewaySlashCommandsMixin:
         sibling_keys = self._sibling_thread_run_keys(source, session_key)
         if sibling_keys and self._is_user_authorized(source):
             for sibling_key in sibling_keys:
+                self._cancel_work_groups_for_session_boundary(
+                    sibling_key,
+                    session_entry=getattr(
+                        self.session_store, "_entries", {}
+                    ).get(sibling_key),
+                    diagnostics=(
+                        "gateway /stop cancelled outstanding delegation work"
+                    ),
+                )
                 await self._interrupt_and_clear_session(
                     sibling_key,
                     source,
