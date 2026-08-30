@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { clearClarifyRequest, setClarifyRequest } from './clarify'
 import {
@@ -17,6 +17,7 @@ import {
   setSudoRequest
 } from './prompts'
 import { $activeSessionId } from './session'
+import { resetBackgroundPollingGuard } from './session-gone'
 
 // Prompts are parked per-session; the exported $*Request views are scoped to the
 // active session, so each test focuses the session it's asserting on.
@@ -128,6 +129,62 @@ describe('approval prompt store', () => {
       ['approval.pending', { session_id: 's1' }],
       ['approval.received', { request_id: 'r1', session_id: 's1' }]
     ])
+  })
+})
+
+describe('replayPendingApproval dead-session guard', () => {
+  beforeEach(() => {
+    resetBackgroundPollingGuard()
+  })
+
+  afterEach(() => {
+    resetBackgroundPollingGuard()
+  })
+
+  it('latches off a reaped runtime instead of re-driving 4001s on every event', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('session not found')
+    })
+
+    // First replay discovers the runtime is gone…
+    await replayPendingApproval({ request } as never, 's1')
+    expect(request).toHaveBeenCalledTimes(1)
+
+    // …and every re-drive after that must skip the wire entirely. The callers
+    // (use-message-stream, assistant-ui/tool/approval) swallow the rejection
+    // and re-drive on each gateway event, so without the latch a reaped
+    // window streams rejected approval.pending RPCs for its whole life.
+    await replayPendingApproval({ request } as never, 's1')
+    await replayPendingApproval({ request } as never, 's1')
+
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('still throws transient failures so callers keep their existing retry semantics', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('request timed out after 30s')
+    })
+
+    await expect(replayPendingApproval({ request } as never, 's1')).rejects.toThrow('timed out')
+
+    // Not latched — the next gateway event may find the session alive again.
+    await expect(replayPendingApproval({ request } as never, 's1')).rejects.toThrow('timed out')
+
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('resumes polling once a fresh runtime rebinds the session', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('session not found')
+    })
+
+    await replayPendingApproval({ request } as never, 's1')
+    expect(request).toHaveBeenCalledTimes(1)
+
+    resetBackgroundPollingGuard('s1')
+
+    await replayPendingApproval({ request } as never, 's1')
+    expect(request).toHaveBeenCalledTimes(2)
   })
 })
 

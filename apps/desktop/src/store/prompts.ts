@@ -2,6 +2,7 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { $clarifyRequest, $clarifyRequests } from './clarify'
 import { $activeSessionId } from './session'
+import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone } from './session-gone'
 
 // Blocking interactive prompts the gateway raises mid-turn. Each maps to a
 // `*.request` event the Python side emits while it blocks the agent thread
@@ -131,9 +132,28 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     return
   }
 
-  const rawResult = await gateway.request('approval.pending', {
-    session_id: sessionId
-  })
+  // A reaped runtime answers 4001 forever; without this latch the replay is
+  // re-driven on every gateway event and the window streams rejected RPCs for
+  // its whole life (the same #94219 failure process.list already guards).
+  if (isSessionGone(sessionId)) {
+    return
+  }
+
+  let rawResult: unknown
+
+  try {
+    rawResult = await gateway.request('approval.pending', {
+      session_id: sessionId
+    })
+  } catch (error) {
+    if (isSessionGoneForBackgroundPolling(error)) {
+      markSessionGone(sessionId)
+
+      return
+    }
+
+    throw error
+  }
 
   const result =
     rawResult && typeof rawResult === 'object' ? (rawResult as { approvals?: PendingApprovalPayload[] }) : {}

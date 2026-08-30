@@ -1,4 +1,3 @@
-import { JsonRpcGatewayError } from '@hermes/shared'
 import { atom, computed } from 'nanostores'
 
 import { translateNow } from '@/i18n'
@@ -10,6 +9,7 @@ import { $goalsBySession, type GoalStatus } from './goals'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
 import { $sessions, lineageAliases } from './session'
+import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone } from './session-gone'
 import { $sessionStates } from './session-states'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
@@ -392,48 +392,18 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
  *  The status stack re-polls `process.list` every 5s while a running row is on
  *  screen, so treating 4001 as transient meant re-sending the same dead id
  *  forever: one runtime id accumulated 18,614 gateway rejections in a single day
- *  (#94219 fallout). Latch the id here and skip it until something rebinds it. */
-const goneSessions = new Set<string>()
-
-/** Gateway JSON-RPC code for "session not found" (tui_gateway _sess_nowait). */
-const GATEWAY_SESSION_NOT_FOUND_CODE = 4001
-
-/** A gone session is unrecoverable for THIS runtime id; a timeout or transport
- *  blip is not. Only the former may stop the poll — misclassifying a transient
- *  failure would silently freeze the status stack on a healthy session.
+ *  (#94219 fallout). Latch the id here and skip it until something rebinds it.
  *
- *  Match the gateway's 4001 code when the error carries one (JsonRpcGatewayError
- *  from a structured RPC rejection) — a message substring alone could latch on
- *  an unrelated error class that merely mentions "session not found" (e.g. a
- *  wrapped tool/report string). The message fallback survives only for errors
- *  with no numeric code at all, where the frame's structure was lost. */
-export function isSessionGoneForBackgroundPolling(error: unknown): boolean {
-  if (error instanceof JsonRpcGatewayError && typeof error.code === 'number') {
-    return error.code === GATEWAY_SESSION_NOT_FOUND_CODE
-  }
-
-  const message = error instanceof Error ? error.message : String(error ?? '')
-
-  return /session not found/i.test(message)
-}
-
-/** Clear the gone-latch. Called with a session id when a fresh runtime binds to
- *  it (so polling resumes), or with no argument to reset everything (tests). */
-export function resetBackgroundPollingGuard(sid?: string): void {
-  if (sid) {
-    goneSessions.delete(sid)
-
-    return
-  }
-
-  goneSessions.clear()
-}
+ *  The latch itself now lives in ./session-gone so approval.pending and the
+ *  goal-status poll share one set AND one clear path (#94219 only ever fixed
+ *  this poller). Re-exported here so existing importers are untouched. */
+export { isSessionGoneForBackgroundPolling, resetBackgroundPollingGuard } from './session-gone'
 
 /** Pull the session's live process snapshot from the gateway. */
 export async function refreshBackgroundProcesses(sid: string): Promise<void> {
   const gateway = $gateway.get()
 
-  if (!sid || !gateway || goneSessions.has(sid)) {
+  if (!sid || !gateway || isSessionGone(sid)) {
     return
   }
 
@@ -445,7 +415,7 @@ export async function refreshBackgroundProcesses(sid: string): Promise<void> {
     // A gone session never comes back under this runtime id: stop polling it,
     // or the 5s timer hammers the gateway with 4001s for the window's lifetime.
     if (isSessionGoneForBackgroundPolling(error)) {
-      goneSessions.add(sid)
+      markSessionGone(sid)
 
       return
     }

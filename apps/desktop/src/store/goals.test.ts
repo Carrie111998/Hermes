@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $goalsBySession, applyGoalStatusText, clearSessionGoal } from './goals'
+import { $gateway } from './gateway'
+import { $goalsBySession, applyGoalStatusText, clearSessionGoal, refreshSessionGoal } from './goals'
+import { resetBackgroundPollingGuard } from './session-gone'
 
 describe('goal store', () => {
   afterEach(() => {
@@ -106,5 +108,49 @@ describe('goal store', () => {
     applyGoalStatusText('s2', '⏸ Goal (paused, 20/20 turns): other work', { hydrate: true })
 
     expect($goalsBySession.get().s2).toMatchObject({ status: 'paused', title: 'other work' })
+  })
+})
+
+describe('refreshSessionGoal dead-session guard', () => {
+  beforeEach(() => {
+    resetBackgroundPollingGuard()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    $goalsBySession.set({})
+    $gateway.set(null as never)
+    resetBackgroundPollingGuard()
+  })
+
+  it('latches off a reaped runtime instead of re-asking on every refresh trigger', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('session not found')
+    })
+
+    $gateway.set({ request } as never)
+
+    await refreshSessionGoal('s1')
+    expect(request).toHaveBeenCalledTimes(1)
+
+    // Before the latch, every refresh trigger re-sent the slash.exec poll to a
+    // runtime the gateway no longer held (#94219 shape).
+    await refreshSessionGoal('s1')
+    await refreshSessionGoal('s1')
+
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not latch on transient failures', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('request timed out after 30s')
+    })
+
+    $gateway.set({ request } as never)
+
+    await refreshSessionGoal('s1')
+    await refreshSessionGoal('s1')
+
+    expect(request).toHaveBeenCalledTimes(2)
   })
 })
