@@ -126,6 +126,28 @@ RUN_BUDGET_WRAPUP_NOTICE = (
 )
 
 
+def _required_assistant_persist_gate_active() -> bool:
+    """Whether a Host owns the terminal assistant body for this process.
+
+    While this gate is installed, model text accompanying a tool call is an
+    untrusted draft: the terminal tool has not run and the Host cannot have
+    authorized that body yet.  If hook inspection itself fails, suppress the
+    draft fail-closed; the required final gate will surface the registration
+    failure at the terminal boundary.
+    """
+    try:
+        from hermes_cli.lifecycle import has_hook
+
+        return bool(has_hook("assistant_persist_gate"))
+    except Exception:
+        logger.warning(
+            "Unable to inspect assistant_persist_gate; suppressing interim "
+            "assistant body fail-closed",
+            exc_info=True,
+        )
+        return True
+
+
 def _review_input_budget_exhausted(agent: Any) -> bool:
     """True when a detached review fork has replayed its aggregate input budget.
 
@@ -1166,11 +1188,10 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
 
 
 # The three _get_continuation_prompt variants below, in named-constant form
-# so agent.context_compressor's _is_synthetic_compression_user_turn can
-# recognize them by content after a crash/interrupt persists one mid-list —
-# these rows carry no durable role beyond driving the retry, and SessionDB
-# projection strips the _length_continuation_nudge metadata tag that marks
-# them in live memory (see agent/context_compressor.py).
+# so agent.context_compressor's _is_synthetic_compression_user_turn can still
+# recognize legacy rows by content.  Current rows carry no durable role beyond
+# driving the retry and are excluded from SessionDB while their private marker
+# remains attached.
 _LENGTH_CONTINUATION_NETWORK_STUB = (
     "[System: The previous response was cut off by a "
     "network error mid-stream. Continue exactly where "
@@ -7433,6 +7454,18 @@ def run_conversation(
                 # stall independently rather than capping the whole run.
                 agent._dropped_toolcall_retries = 0
 
+                # A required Host persist gate owns the only user-visible
+                # assistant body.  Text attached to an earlier tool-call row is
+                # necessarily pre-authorization (the terminal tool has not run
+                # yet), so keep only the call structure for crash-safe replay.
+                # Generic Hermes sessions without the gate retain their normal
+                # interim narration behavior.
+                _hard_output_gate_pending = (
+                    _required_assistant_persist_gate_active()
+                )
+                if _hard_output_gate_pending:
+                    assistant_msg["content"] = ""
+
                 previous_msg = messages[-1] if messages else None
                 current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
                 previous_interim_visible = (
@@ -7508,7 +7541,7 @@ def run_conversation(
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
                 # commentary only after the canonical SessionDB append above.
-                if not duplicate_previous_interim:
+                if not duplicate_previous_interim and not _hard_output_gate_pending:
                     agent._emit_interim_assistant_message(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning
@@ -8213,12 +8246,30 @@ def run_conversation(
                 if truncated_response_parts:
                     final_response = _join_truncated_parts([*truncated_response_parts, final_response])
                     truncated_response_parts = []
+                if length_continue_retries:
                     length_continue_retries = 0
-                    # The continuation recovered, so the fragments stay in the transcript.
-                    for _frag in messages:
-                        if isinstance(_frag, dict):
-                            _frag.pop("_length_continuation_fragment", None)
-                            _frag.pop("_length_continuation_nudge", None)
+                    # The continuation recovered.  Its stitched text is now the
+                    # single terminal response, so current-turn fragments and
+                    # the synthetic user nudge have no durable or visible role.
+                    # Scope removal to this turn so legacy prior-turn rows are
+                    # never silently rewritten.
+                    _turn_start = (
+                        current_turn_user_idx + 1
+                        if isinstance(current_turn_user_idx, int)
+                        and current_turn_user_idx >= 0
+                        else 0
+                    )
+                    messages[_turn_start:] = [
+                        _frag
+                        for _frag in messages[_turn_start:]
+                        if not (
+                            isinstance(_frag, dict)
+                            and (
+                                _frag.get("_length_continuation_fragment")
+                                or _frag.get("_length_continuation_nudge")
+                            )
+                        )
+                    ]
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
                 

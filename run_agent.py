@@ -252,6 +252,13 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # Output-length continuation fragments and their synthetic user nudge are
+    # API retry scaffolding.  The completed response is stitched into one
+    # terminal assistant body; persisting either intermediate row leaks an
+    # internal instruction into the user transcript and can duplicate text
+    # after a later tool-call flush.
+    "_length_continuation_fragment",
+    "_length_continuation_nudge",
 )
 
 
