@@ -56,7 +56,7 @@ Every installed skill is automatically available as a slash command:
 /gif-search funny cats
 /axolotl help me fine-tune Llama 3 on my dataset
 /github-pr-workflow create a PR for the auth refactor
-/plan design a rollout for migrating our auth provider
+/songsee analyze the frequency spread of this mix
 
 # Just the skill name loads it and lets the agent ask what you need:
 /excalidraw
@@ -82,7 +82,7 @@ that happen to start with `/` (like file paths) are never swallowed:
 For combinations you use repeatedly, prefer a [skill bundle](#skill-bundles) —
 same effect under one short command.
 
-The bundled `plan` skill is a good example. Running `/plan [request]` loads the skill's instructions, telling Hermes to inspect context if needed, write a markdown implementation plan instead of executing the task, and save the result under `.hermes/plans/` relative to the active workspace/backend working directory.
+(Plan mode works the same way but is a built-in command now: `/plan [request]` tells Hermes to inspect context if needed, write a markdown implementation plan instead of executing the task, and save the result under `.hermes/plans/` relative to the active workspace/backend working directory.)
 
 You can also interact with skills through natural conversation:
 
@@ -330,6 +330,45 @@ and `examples/`. Unreferenced repository files are not copied. Hermes scans the
 complete quarantined bundle and records the source URL, exact content hash,
 scanner version, findings, timestamp, and fresh-or-cached status in
 `skills/.hub/lock.json`.
+
+### Advisory SkillEvaluator scan
+
+In addition to the built-in security scanner (which enforces the install
+policy above), Hermes can run [NVIDIA SkillEvaluator](https://github.com/NVIDIA/SkillEvaluator)
+Tier 1 checks on every hub install as a second opinion. Tier 1 is
+deterministic and keyless — PII detection (leaked emails, personal paths,
+connection strings), unicode-smuggling detection, script lint, license
+compliance, and a static security scan via
+[NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector).
+
+The scan is **advisory only**: findings are printed with file and line
+before the install confirmation, and the install continues. Findings that
+look like real credentials (private keys, cloud access keys, tokens,
+credentialed connection strings) are highlighted in red so you can review
+the flagged lines before deciding. PII-class findings are informational —
+the upstream scanner has known false-positive classes (e.g.
+`git@github.com` SSH syntax, documentation example emails), so they never
+block anything.
+
+To enable it, install the optional scanner binaries (the second one powers
+the `security` check; without it that check simply reports "not run"):
+
+```bash
+uv tool install --python 3.13 \
+  "skillevaluator @ git+https://github.com/NVIDIA/SkillEvaluator.git@v0.1.0"
+uv tool install "git+https://github.com/NVIDIA/SkillSpector.git@v2.9.5"
+```
+
+Without the binary on PATH the scan is silently skipped. To turn it off
+entirely:
+
+```yaml
+skills:
+  tier1_advisory: false
+```
+
+The dashboard's Browse-hub scan button returns the same advisory data in
+its response (`tier1` field) alongside the built-in scanner's verdict.
 
 ## External Skill Directories
 
