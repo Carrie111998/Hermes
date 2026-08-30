@@ -9,7 +9,10 @@ import react, { reactCompilerPreset } from '@vitejs/plugin-react'
  *  ~750 are React-bearing. */
 function compilerPreset() {
   const preset = reactCompilerPreset()
-  preset.rolldown.filter.code = /\/>|<\/|from\s*['"][^'"]*react/
+  preset.rolldown.filter = {
+    ...preset.rolldown.filter,
+    code: /\/>|<\/|from\s*['"][^'"]*react/
+  }
   return preset
 }
 import tailwindcss from '@tailwindcss/vite'
