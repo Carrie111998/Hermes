@@ -59,7 +59,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
@@ -797,6 +797,28 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
+def _with_google_offline_access(authorization_url: str) -> str:
+    """Request a refresh token from Google's authorization endpoint.
+
+    Google requires ``access_type=offline`` for a refresh token. ``prompt`` is
+    set to ``consent`` so re-authorizing an existing grant also returns one.
+    Other authorization servers retain their original URL unchanged.
+    """
+    try:
+        parsed = urlparse(authorization_url)
+    except ValueError:
+        return authorization_url
+    if parsed.hostname != "accounts.google.com":
+        return authorization_url
+    params = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in {"access_type", "prompt"}
+    ]
+    params.extend((("access_type", "offline"), ("prompt", "consent")))
+    return parsed._replace(query=urlencode(params)).geturl()
+
+
 def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     """Return a redirect handler closure that closes over the given port.
 
@@ -815,6 +837,7 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         Opens the browser automatically when possible; always prints the URL
         as a fallback for headless/SSH/gateway environments.
         """
+        authorization_url = _with_google_offline_access(authorization_url)
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()

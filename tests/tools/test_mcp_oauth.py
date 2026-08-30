@@ -3,6 +3,7 @@
 import json
 import stat
 import sys
+from urllib.parse import parse_qs, urlparse
 from io import BytesIO
 from unittest.mock import patch, MagicMock
 
@@ -22,6 +23,7 @@ from tools.mcp_oauth import (
     _make_callback_handler,
     _make_redirect_handler,
     _paste_callback_reader,
+    _with_google_offline_access,
 )
 
 
@@ -29,6 +31,20 @@ def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
     mock_stdin = MagicMock()
     mock_stdin.isatty.return_value = is_tty
     monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
+
+
+def test_google_authorization_requests_offline_access():
+    url = _with_google_offline_access(
+        "https://accounts.google.com/o/oauth2/v2/auth?state=state&prompt=select_account"
+    )
+    query = parse_qs(urlparse(url).query)
+    assert query["access_type"] == ["offline"]
+    assert query["prompt"] == ["consent"]
+
+
+def test_other_authorization_servers_keep_their_url():
+    url = "https://login.example.com/oauth/authorize?state=state"
+    assert _with_google_offline_access(url) == url
 
 
 def _hit_callback_when_ready(url: str, timeout: float = 15.0) -> None:
