@@ -4926,6 +4926,34 @@ def claim_review_task(
                     },
                 )
             return None
+        authority_row = conn.execute(
+            "SELECT body, assignee FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if authority_row is None:
+            return None
+        try:
+            _validate_pr_task_assignee_authority(
+                body=authority_row["body"],
+                assignee=authority_row["assignee"],
+            )
+        except ValueError as exc:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability' "
+                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "authority_revoked",
+                    "detail": str(exc),
+                    "source_status": "review",
+                },
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6678,7 +6706,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, body, status, claim_lock, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6737,6 +6765,13 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        try:
+            _validate_pr_task_assignee_authority(
+                body=trow["body"],
+                assignee=reviewer if reviewer is not None else implementer,
+            )
+        except ValueError as exc:
+            return _ret(False, str(exc))
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -6821,7 +6856,7 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT body, status, assignee, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6872,6 +6907,14 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
+        implementer = _canonical_assignee(implementer)
+        try:
+            _validate_pr_task_assignee_authority(
+                body=task_row["body"],
+                assignee=implementer,
+            )
+        except ValueError as exc:
+            return False, str(exc)
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
@@ -7115,11 +7158,12 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("review",), now=now,
-            note="invariant recovery on review reopen",
-        )
-        new_status = _landing_status_after_parents(conn, task_id)
+        task_row = conn.execute(
+            "SELECT body, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None or task_row["status"] != "review":
+            return False
         review_event = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id = ? AND kind = 'review_requested' "
@@ -7137,6 +7181,20 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         implementer = handoff.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
+        else:
+            implementer = _canonical_assignee(implementer)
+        try:
+            _validate_pr_task_assignee_authority(
+                body=task_row["body"],
+                assignee=implementer,
+            )
+        except ValueError:
+            return False
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("review",), now=now,
+            note="invariant recovery on review reopen",
+        )
+        new_status = _landing_status_after_parents(conn, task_id)
         assignee_sql = ", assignee = ?" if implementer else ""
         params: tuple[Any, ...] = (
             (new_status, implementer, task_id)
@@ -7372,6 +7430,14 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        effective_body = body if body is not None else existing["body"]
+        effective_assignee = (
+            assignee if assignee is not None else existing["assignee"]
+        )
+        _validate_pr_task_assignee_authority(
+            body=effective_body,
+            assignee=effective_assignee,
+        )
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -7521,7 +7587,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, body, assignee, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7529,6 +7595,14 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        _validate_pr_task_assignee_authority(
+            body=root_row["body"],
+            assignee=(
+                root_assignee
+                if root_assignee is not None
+                else root_row["assignee"]
+            ),
+        )
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
@@ -7546,6 +7620,11 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            stored_body = body if isinstance(body, str) else None
+            _validate_pr_task_assignee_authority(
+                body=stored_body,
+                assignee=assignee,
+            )
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -7575,7 +7654,7 @@ def decompose_triage_task(
                 (
                     new_id,
                     title,
-                    body if isinstance(body, str) else None,
+                    stored_body,
                     assignee,
                     child_ws_kind,
                     child_ws_path,
@@ -10282,26 +10361,64 @@ def _dispatch_once_locked(
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.
                 if not dry_run:
+                    assignment_applied = False
                     try:
                         with write_txn(conn):
-                            conn.execute(
-                                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                                "AND (assignee IS NULL OR assignee = '')",
-                                (_default_assignee, row["id"]),
-                            )
-                            _append_event(
-                                conn, row["id"], "assigned",
-                                {
-                                    "assignee": _default_assignee,
-                                    "source": "kanban.default_assignee",
-                                },
-                            )
+                            current = conn.execute(
+                                "SELECT body, assignee FROM tasks WHERE id = ? "
+                                "AND status = 'ready' AND claim_lock IS NULL",
+                                (row["id"],),
+                            ).fetchone()
+                            if current is not None and not current["assignee"]:
+                                try:
+                                    _validate_pr_task_assignee_authority(
+                                        body=current["body"],
+                                        assignee=_default_assignee,
+                                    )
+                                except ValueError as exc:
+                                    blocked = conn.execute(
+                                        "UPDATE tasks SET status = 'blocked', "
+                                        "block_kind = 'capability' WHERE id = ? "
+                                        "AND status = 'ready' AND claim_lock IS NULL "
+                                        "AND (assignee IS NULL OR assignee = '')",
+                                        (row["id"],),
+                                    )
+                                    if blocked.rowcount == 1:
+                                        _append_event(
+                                            conn,
+                                            row["id"],
+                                            "claim_rejected",
+                                            {
+                                                "reason": "authority_revoked",
+                                                "detail": str(exc),
+                                                "source": "kanban.default_assignee",
+                                            },
+                                        )
+                                else:
+                                    updated = conn.execute(
+                                        "UPDATE tasks SET assignee = ? WHERE id = ? "
+                                        "AND status = 'ready' AND claim_lock IS NULL "
+                                        "AND (assignee IS NULL OR assignee = '')",
+                                        (_default_assignee, row["id"]),
+                                    )
+                                    if updated.rowcount == 1:
+                                        _append_event(
+                                            conn, row["id"], "assigned",
+                                            {
+                                                "assignee": _default_assignee,
+                                                "source": "kanban.default_assignee",
+                                            },
+                                        )
+                                        assignment_applied = True
                     except Exception:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "
                             "to task %s",
                             _default_assignee, row["id"], exc_info=True,
                         )
+                        result.skipped_unassigned.append(row["id"])
+                        continue
+                    if not assignment_applied:
                         result.skipped_unassigned.append(row["id"])
                         continue
                 row_assignee = _default_assignee
