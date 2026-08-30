@@ -4397,6 +4397,30 @@ def _load_cfg() -> dict:
     file.
     """
     cfg = _apply_managed(_load_cfg_raw())
+    # A profile that opted into inheritance carries only its own overrides on
+    # disk; the rest lives in the root config. Resolving it here keeps this
+    # reader agreeing with hermes_cli.config.load_config — without it an
+    # inheriting profile reads as model-less and callers fall through to their
+    # own defaults, which is how a room ended up pinned to a model the
+    # configured provider does not serve.
+    if cfg.get("inherit") is True:
+        try:
+            from hermes_cli.config import (
+                _deep_merge,
+                _load_inherited_config,
+                _normalize_root_model_keys,
+            )
+
+            inherited = _normalize_root_model_keys(
+                _load_inherited_config(Path(_cfg_path or (Path(_hermes_home) / "config.yaml")))
+            )
+            if isinstance(inherited, dict) and inherited:
+                inherited.pop("inherit", None)
+                cfg = _deep_merge(inherited, cfg)
+        except Exception:
+            # Inheritance is an enhancement over the raw read: if it cannot be
+            # resolved, the profile's own config still stands.
+            pass
     try:
         from hermes_cli.config import _expand_env_vars
 
