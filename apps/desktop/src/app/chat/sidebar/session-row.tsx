@@ -553,10 +553,7 @@ function SidebarSessionRowImpl({
                 <div className="flex min-w-0 flex-col gap-[0.15rem]">
                   <OverflowTip label={title}>
                     <SidebarRowLabel
-                      className={cn(
-                        'hover-marquee text-[0.8125rem] font-medium text-(--ui-text-primary) group-data-[working=true]:text-foreground',
-                        SIDEBAR_TRUNCATED_LEADING
-                      )}
+                      className="line-clamp-2 break-words text-[0.8125rem] font-medium leading-none text-(--ui-text-primary) group-data-[working=true]:text-foreground"
                       onPointerEnter={armMarquee}
                       onPointerLeave={disarmMarquee}
                     >
