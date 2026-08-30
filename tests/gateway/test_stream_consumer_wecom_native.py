@@ -257,11 +257,12 @@ class TestNativeStreamingThrottling:
 
         task = asyncio.create_task(consumer.run())
         await asyncio.sleep(0.02)
-        # First chunk well past 20 chars.
-        consumer.on_delta("A" * 40)
+        # Use ordinary prose rather than an all-alphanumeric token-looking
+        # chunk, which streaming redaction must retain until it is delimited.
+        consumer.on_delta("first chunk " * 4)
         await asyncio.sleep(0.05)
         # Second chunk also past 20 chars.
-        consumer.on_delta("B" * 40)
+        consumer.on_delta("second chunk " * 4)
         await asyncio.sleep(0.05)
         consumer.finish()
         await task

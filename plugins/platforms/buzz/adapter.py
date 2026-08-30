@@ -701,7 +701,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 raw_response=data,
             )
         # Markdown renders in Buzz, so a URL arrives as a clickable image link.
-        text = f"{caption}\n{image_url}" if caption else image_url
+        from gateway.platforms.base import sanitize_remote_image_url_for_plaintext
+
+        terminal_url = sanitize_remote_image_url_for_plaintext(image_url)
+        text = f"{caption}\n{terminal_url}" if caption else terminal_url
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:

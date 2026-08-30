@@ -59,6 +59,8 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    redact_transport_error_text,
+    safe_url_for_log,
 )
 from gateway.platforms import helpers as _mdchunk
 from gateway.platforms.helpers import MessageDeduplicator
@@ -3890,14 +3892,20 @@ class MediaSendHandler(ABC):
             return await sender.dispatch_msg_body(chat_id, msg_body, reply_to, group_code=gc)
 
         except ValueError as ve:
-            return SendResult(success=False, error=str(ve))
+            return SendResult(
+                success=False,
+                error=redact_transport_error_text(ve),
+            )
         except Exception as exc:
             handler_name = type(self).__name__
+            safe_error = redact_transport_error_text(exc)
             logger.error(
                 "[%s] %s.handle() failed: %s",
-                adapter.name, handler_name, exc, exc_info=True,
+                adapter.name,
+                handler_name,
+                safe_error,
             )
-            return SendResult(success=False, error=str(exc) or type(exc).__name__)
+            return SendResult(success=False, error=safe_error)
 
 
 class ImageUrlHandler(MediaSendHandler):
@@ -3905,7 +3913,11 @@ class ImageUrlHandler(MediaSendHandler):
 
     async def acquire_file(self, adapter, **kwargs):
         image_url: str = kwargs["image_url"]
-        logger.info("[%s] ImageUrlHandler: downloading %s", adapter.name, image_url)
+        logger.info(
+            "[%s] ImageUrlHandler: downloading %s",
+            adapter.name,
+            safe_url_for_log(image_url),
+        )
         file_bytes, content_type = await media_download_url(
             image_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
         )
@@ -4885,6 +4897,7 @@ class OutboundManager:
 class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
+    supports_native_remote_images = True
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
     splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)

@@ -54,6 +54,8 @@ from gateway.platforms.base import (
     is_host_excluded_by_no_proxy,
     resolve_proxy_url,
     safe_url_for_log,
+    redact_transport_error_text,
+    sanitize_remote_image_url_for_plaintext,
     _ssrf_redirect_guard,
     cache_document_from_bytes,
     cache_video_from_bytes,
@@ -1124,6 +1126,7 @@ class SlackAdapter(BasePlatformAdapter):
     # .setStatus), so the gateway feeds it live per-tool phrases.
     supports_status_text = True
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_native_remote_images = True
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
     # "!" to "/" for known commands (see _handle_slack_message), so "!" is
@@ -4048,7 +4051,7 @@ class SlackAdapter(BasePlatformAdapter):
                                 logger.warning(
                                     "[Slack] Download failed for %s: %s",
                                     safe_url_for_log(image_url),
-                                    dl_err,
+                                    redact_transport_error_text(dl_err),
                                 )
                                 continue
 
@@ -4079,8 +4082,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
                     chunk_idx + 1,
                     len(chunks),
-                    e,
-                    exc_info=True,
+                    redact_transport_error_text(e),
                 )
                 await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay
@@ -4798,7 +4800,11 @@ class SlackAdapter(BasePlatformAdapter):
         if not is_safe_url(image_url):
             logger.warning("[Slack] Blocked unsafe image URL (SSRF protection)")
             return await super().send_image(
-                chat_id, image_url, caption, reply_to, metadata=metadata
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+                metadata=metadata,
             )
 
         try:
@@ -4839,11 +4845,11 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning(
                 "[Slack] Failed to upload image from URL %s, falling back to text: %s",
                 safe_url_for_log(image_url),
-                e,
-                exc_info=True,
+                redact_transport_error_text(e),
             )
             # Fall back to sending the URL as text
-            text = f"{caption}\n{image_url}" if caption else image_url
+            terminal_url = sanitize_remote_image_url_for_plaintext(image_url)
+            text = f"{caption}\n{terminal_url}" if caption else terminal_url
             return await self.send(
                 chat_id=chat_id,
                 content=text,

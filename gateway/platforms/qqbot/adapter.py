@@ -69,6 +69,8 @@ from gateway.platforms.base import (
     _ssrf_redirect_guard,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    redact_transport_error_text,
+    sanitize_remote_image_url_for_plaintext,
 )
 from gateway.platforms.helpers import strip_markdown
 from gateway.platforms.media_cache import ext_for_mime
@@ -182,6 +184,7 @@ class QQAdapter(BasePlatformAdapter):
 
     # QQ Bot API does not support editing sent messages.
     SUPPORTS_MESSAGE_EDITING = False
+    supports_native_remote_images = True
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
@@ -2825,7 +2828,8 @@ class QQAdapter(BasePlatformAdapter):
             self._log_tag,
             result.error,
         )
-        fallback = f"{caption}\n{image_url}" if caption else image_url
+        terminal_url = sanitize_remote_image_url_for_plaintext(image_url)
+        fallback = f"{caption}\n{terminal_url}" if caption else terminal_url
         return await self.send(chat_id=chat_id, content=fallback, reply_to=reply_to)
 
     async def send_image_file(
@@ -3014,8 +3018,9 @@ class QQAdapter(BasePlatformAdapter):
                 retryable=False,
             )
         except Exception as exc:
-            logger.error("[%s] Media send failed: %s", self._log_tag, exc)
-            return SendResult(success=False, error=str(exc) or type(exc).__name__)
+            safe_error = redact_transport_error_text(exc)
+            logger.error("[%s] Media send failed: %s", self._log_tag, safe_error)
+            return SendResult(success=False, error=safe_error)
 
     async def _upload_local_file(
             self,

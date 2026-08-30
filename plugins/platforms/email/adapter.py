@@ -1216,6 +1216,9 @@ class EmailAdapter(BasePlatformAdapter):
         ``metadata`` is accepted to honor the base-class contract; the
         email body send doesn't use it.
         """
+        from gateway.platforms.base import sanitize_remote_image_url_for_plaintext
+
+        image_url = sanitize_remote_image_url_for_plaintext(image_url)
         text = caption or ""
         text += f"\n\nImage: {image_url}"
         return await self.send(chat_id, text.strip(), reply_to)
@@ -1237,6 +1240,7 @@ class EmailAdapter(BasePlatformAdapter):
         if not images:
             return
 
+        from gateway.platforms.base import sanitize_remote_image_url_for_plaintext
         from urllib.parse import unquote as _unquote
 
         body_parts: List[str] = []
@@ -1252,7 +1256,9 @@ class EmailAdapter(BasePlatformAdapter):
                     logger.warning("[Email] Skipping missing image: %s", local_path)
             else:
                 # Remote URLs just get linked in the body (parity with send_image)
-                body_parts.append(f"Image: {image_url}")
+                body_parts.append(
+                    f"Image: {sanitize_remote_image_url_for_plaintext(image_url)}"
+                )
 
         if not local_paths and not body_parts:
             return

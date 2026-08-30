@@ -136,6 +136,8 @@ from gateway.platforms.base import (
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
     _ssrf_redirect_guard,
+    redact_transport_error_text,
+    sanitize_remote_image_url_for_plaintext,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
 
@@ -1175,6 +1177,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
     supports_code_blocks = True  # Matrix renders fenced code blocks (HTML/markdown)
     splits_long_messages = True  # send() chunks via truncate_message(max_message_length)
+    supports_native_remote_images = True
 
     # Matrix clients commonly reserve typed "/" for client-local commands;
     # the adapter accepts "!command" as the alias that always reaches Hermes
@@ -2377,7 +2380,11 @@ class MatrixAdapter(BasePlatformAdapter):
         if not is_safe_url(image_url):
             logger.warning("Matrix: blocked unsafe image URL (SSRF protection)")
             return await super().send_image(
-                chat_id, image_url, caption, reply_to, metadata=metadata
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+                metadata=metadata,
             )
 
         try:
@@ -2386,7 +2393,7 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.warning(
                 "Matrix: failed to download image %s: %s",
                 _redact_url_for_log(image_url),
-                exc,
+                redact_transport_error_text(exc),
             )
             fallback = (
                 "I couldn't download and upload the image to Matrix. "

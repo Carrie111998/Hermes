@@ -264,8 +264,9 @@ class TestNativeFallbackStreamClose:
         cfg = StreamConsumerConfig(chat_type="dm", cursor="", edit_interval=0.01, buffer_threshold=5)
         consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
 
-        # Send short content to minimize frame count
-        consumer.on_delta("X")
+        # Send benign content that the security sanitizer can release before
+        # the terminal flush, so the first content frame exercises fallback.
+        consumer.on_delta("ok")
 
         import asyncio
         task = asyncio.create_task(consumer.run())
@@ -287,14 +288,14 @@ class TestNativeFallbackStreamClose:
         finalize_calls = [c for c in adapter.send_stream_frame_calls if c["finalize"]]
         assert len(finalize_calls) >= 1, "Finalize should be called even though seed had length 0"
 
-        # Fire-and-forget (14c49c781a): with the throttle removed, the 1-char
-        # content "X" is pushed immediately as an intermediate frame instead of
-        # being buffered. That frame fails per the mock, so a proactive send()
+        # Fire-and-forget (14c49c781a): with the throttle removed, content is
+        # pushed immediately as an intermediate frame instead of being
+        # buffered. That frame fails per the mock, so a proactive send()
         # fallback IS expected to deliver the content reliably. (Under the old
         # _MIN_NEW_VISIBLE_CHARS=60 gate this tiny frame was never sent, so the
         # previous assertion of zero send() fallbacks no longer holds.)
         assert len(adapter.send_calls) == 1
-        assert adapter.send_calls[0]["content_preview"] == "X"
+        assert adapter.send_calls[0]["content_preview"] == "ok"
 
     @pytest.mark.asyncio
     async def test_native_fallback_closes_stream_on_success(self):

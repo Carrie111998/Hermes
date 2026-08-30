@@ -69,6 +69,9 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    redact_transport_error_text,
+    safe_url_for_log,
+    sanitize_remote_image_url_for_plaintext,
 )
 from utils import env_float
 
@@ -309,6 +312,7 @@ class WeComAdapter(BasePlatformAdapter):
     # edit-based path. See ``send_stream_frame`` and ``supports_native_streaming``.
     SUPPORTS_NATIVE_STREAMING = True
     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
+    supports_native_remote_images = True
     # Threshold for detecting WeCom client-side message splits.
     # When a chunk is near the 4000-char limit, a continuation is almost certain.
     _SPLIT_THRESHOLD = 3900
@@ -2484,8 +2488,19 @@ class WeComAdapter(BasePlatformAdapter):
         except FileNotFoundError as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as exc:
-            logger.error("[%s] Failed to prepare outbound media %s: %s", self.name, media_source, exc)
-            return SendResult(success=False, error=str(exc))
+            safe_source = (
+                safe_url_for_log(media_source)
+                if self._looks_like_url(media_source)
+                else media_source
+            )
+            safe_error = redact_transport_error_text(exc)
+            logger.error(
+                "[%s] Failed to prepare outbound media %s: %s",
+                self.name,
+                safe_source,
+                safe_error,
+            )
+            return SendResult(success=False, error=safe_error)
 
         if prepared["rejected"]:
             await self._send_followup_markdown(
@@ -2535,8 +2550,19 @@ class WeComAdapter(BasePlatformAdapter):
             logger.error("[%s] TIMEOUT in _send_media_source for %s", self.name, media_source)
             return SendResult(success=False, error="Timeout sending media to WeCom")
         except Exception as exc:
-            logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
-            return SendResult(success=False, error=str(exc))
+            safe_source = (
+                safe_url_for_log(media_source)
+                if self._looks_like_url(media_source)
+                else media_source
+            )
+            safe_error = redact_transport_error_text(exc)
+            logger.error(
+                "[%s] Failed to send media %s: %s",
+                self.name,
+                safe_source,
+                safe_error,
+            )
+            return SendResult(success=False, error=safe_error)
 
         caption_result = None
         downgrade_result = None
@@ -2737,8 +2763,14 @@ class WeComAdapter(BasePlatformAdapter):
         if result.success or not self._looks_like_url(image_url):
             return result
 
-        logger.warning("[%s] Falling back to text send for image URL %s: %s", self.name, image_url, result.error)
-        fallback_text = f"{caption}\n{image_url}" if caption else image_url
+        terminal_url = sanitize_remote_image_url_for_plaintext(image_url)
+        logger.warning(
+            "[%s] Falling back to text send for image URL %s: %s",
+            self.name,
+            safe_url_for_log(image_url),
+            redact_transport_error_text(result.error),
+        )
+        fallback_text = f"{caption}\n{terminal_url}" if caption else terminal_url
         return await self.send(chat_id=chat_id, content=fallback_text, reply_to=reply_to)
 
     async def send_image_file(

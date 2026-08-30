@@ -130,6 +130,9 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    redact_transport_error_text,
+    safe_url_for_log,
+    sanitize_remote_image_url_for_plaintext,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -1486,6 +1489,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_native_remote_images = True
 
     MAX_MESSAGE_LENGTH = 8000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
@@ -2394,10 +2398,14 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             image_path = await self._download_remote_image(image_url)
         except Exception as exc:
-            logger.error("[Feishu] Failed to download image %s: %s", image_url, exc, exc_info=True)
+            logger.error(
+                "[Feishu] Failed to download image %s: %s",
+                safe_url_for_log(image_url),
+                redact_transport_error_text(exc),
+            )
             return await super().send_image(
                 chat_id=chat_id,
-                image_url=image_url,
+                image_url=sanitize_remote_image_url_for_plaintext(image_url),
                 caption=caption,
                 reply_to=reply_to,
                 metadata=metadata,
@@ -2426,7 +2434,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 preferred_name="animation.gif",
             )
         except Exception as exc:
-            logger.error("[Feishu] Failed to download animation %s: %s", animation_url, exc, exc_info=True)
+            logger.error(
+                "[Feishu] Failed to download animation %s: %s",
+                safe_url_for_log(animation_url),
+                redact_transport_error_text(exc),
+            )
             return await super().send_animation(
                 chat_id=chat_id,
                 animation_url=animation_url,

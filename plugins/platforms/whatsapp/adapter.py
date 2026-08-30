@@ -408,6 +408,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     """
 
     # Default bridge location resolved via shared helper
+    supports_native_remote_images = True
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
 
@@ -1229,7 +1230,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             local_path = await cache_image_from_url(image_url)
             return await self._send_media_to_bridge(chat_id, local_path, "image", caption)
         except Exception:
-            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
+            from gateway.platforms.base import sanitize_remote_image_url_for_plaintext
+
+            return await super().send_image(
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+                metadata,
+            )
 
     async def send_image_file(
         self,

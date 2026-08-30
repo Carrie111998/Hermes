@@ -1143,6 +1143,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         inline with markdown so the user still sees the image. Local files need
         OpenAPI media upload and are handled separately.
         """
+        from gateway.platforms.base import sanitize_remote_image_url_for_plaintext
+
+        image_url = sanitize_remote_image_url_for_plaintext(image_url)
         image_block = f"![image]({image_url})"
         content = f"{caption}\n\n{image_block}" if caption else image_block
         return await self.send(
