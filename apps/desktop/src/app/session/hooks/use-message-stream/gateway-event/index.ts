@@ -257,6 +257,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       deps.scheduleSessionsRefresh,
       deps.sessionInterrupted,
       deps.sessionStateByRuntimeIdRef,
+      deps.updateMoaProgress,
       deps.updateSessionState,
       deps.upsertToolCall
     ]

@@ -77,6 +77,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     flushQueuedDeltas,
     nativeSubagentSessionsRef,
     sessionStateByRuntimeIdRef,
+    updateMoaProgress,
     updateSessionState
   } = deps
 
@@ -222,6 +223,14 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'moa.reference') {
+    if (sessionId && updateMoaProgress(sessionId, event.type, payload, occurredAt)) {
+      if (isActiveEvent) {
+        setPetActivity({ reasoning: true })
+      }
+
+      return true
+    }
+
     // MoA reference-model output — surface as a labelled thinking chunk
     // (tagged with the source model) before the aggregator's response, so
     // the mixture-of-agents process is visible. Reuses the reasoning
@@ -272,6 +281,14 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'moa.progress') {
+    if (sessionId && updateMoaProgress(sessionId, event.type, payload, occurredAt)) {
+      if (isActiveEvent) {
+        setPetActivity({ reasoning: true })
+      }
+
+      return true
+    }
+
     // Live reference fan-out progress ("refs k/n") — surfaced in the same
     // reasoning disclosure the references land in. These lines arrive
     // BEFORE any moa.reference event (references are only emitted once the
@@ -296,6 +313,14 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'moa.phase') {
+    if (sessionId && updateMoaProgress(sessionId, event.type, payload, occurredAt)) {
+      if (isActiveEvent) {
+        setPetActivity({ reasoning: true })
+      }
+
+      return true
+    }
+
     // Phase transition — currently only phase="aggregator" (fan-out done,
     // aggregator acting). Append a one-line marker; the first
     // moa.reference that follows replaces the whole block.
@@ -329,6 +354,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     setSessionCompacting(sessionId, false)
 
     flushQueuedDeltas(sessionId)
+    updateMoaProgress(sessionId, event.type, payload, occurredAt)
 
     // Keyed by session so only one window beeps when several are open.
     playCompletionSound(sessionId)

@@ -1093,7 +1093,8 @@ def test_interrupted_but_completed_reference_keeps_real_accounting(monkeypatch):
     # pending (so the interrupt path is taken) even though the underlying
     # call has already completed — the reap must then hit the done() branch
     # and keep the real result instead of writing a placeholder.
-    def fake_wait(pending, timeout=None):
+    def fake_wait(pending, timeout=None, return_when=None):
+        assert return_when is moa_loop.FIRST_COMPLETED
         real_wait(pending)  # let the call actually finish (it billed)
         return set(), set(pending)  # report it as still pending
 

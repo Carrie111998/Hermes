@@ -7751,6 +7751,16 @@ def _on_tool_progress(
                 "label": str(name or ""),
                 "refs_done": int(refs_done),
                 "refs_total": int(refs_total),
+                **(
+                    {"index": int(_kwargs["moa_index"])}
+                    if _kwargs.get("moa_index") is not None
+                    else {}
+                ),
+                **(
+                    {"status": str(_kwargs["moa_status"])}
+                    if _kwargs.get("moa_status")
+                    else {}
+                ),
             },
         )
         return
@@ -7771,6 +7781,19 @@ def _on_tool_progress(
             phase_payload["refs_total"] = int(refs_total)
         if name:
             phase_payload["aggregator"] = str(name)
+        advisors = _kwargs.get("moa_advisors")
+        if isinstance(advisors, list):
+            phase_payload["advisors"] = [str(label) for label in advisors]
+        concurrency = _kwargs.get("moa_concurrency")
+        if concurrency is not None:
+            phase_payload["concurrency"] = int(concurrency)
+        fanout = _kwargs.get("moa_fanout")
+        if fanout:
+            phase_payload["fanout"] = str(fanout)
+        if _kwargs.get("moa_guidance_reused") is not None:
+            phase_payload["guidance_reused"] = bool(
+                _kwargs.get("moa_guidance_reused")
+            )
         _emit("moa.phase", sid, phase_payload)
         return
     if event_type.startswith("subagent."):

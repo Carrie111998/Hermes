@@ -23,6 +23,12 @@ import {
   generatedImageEchoSources,
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
+import {
+  type MoaProgressState,
+  parseMoaProgress,
+  reduceMoaProgress,
+  serializeMoaProgress
+} from '@/lib/moa-progress'
 import { parseTodos } from '@/lib/todos'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notifyError } from '@/store/notifications'
@@ -198,6 +204,7 @@ export function useMessageStream({
   // can cancel it instead of letting parked callbacks pile up while hidden.
   const measureRafRef = useRef<number | null>(null)
   const nativeSubagentSessionsRef = useRef<Set<string>>(new Set())
+  const moaProgressBySessionRef = useRef<Map<string, MoaProgressState>>(new Map())
   // Turns that auto-compacted: skip post-turn hydrate so live scrollback survives.
   const compactedTurnRef = useRef<Set<string>>(new Set())
   // Last session we applied a session.info cwd for — lets us tell an agent
@@ -441,6 +448,51 @@ export function useMessageStream({
       )
     },
     [flushQueuedDeltas, mutateStream, queueDelta]
+  )
+
+  const updateMoaProgress = useCallback(
+    (sessionId: string, eventType: string, payload: GatewayEventPayload | undefined, occurredAt: number) => {
+      const next = reduceMoaProgress(moaProgressBySessionRef.current.get(sessionId), eventType, payload, occurredAt)
+
+      if (!next) {
+        return false
+      }
+
+      moaProgressBySessionRef.current.set(sessionId, next)
+      flushQueuedDeltas(sessionId)
+      const text = serializeMoaProgress(next)
+
+      mutateStream(
+        sessionId,
+        parts => {
+          const index = parts.findIndex(part => part.type === 'reasoning' && parseMoaProgress(part.text))
+
+          if (index < 0) {
+            return appendReasoningPart(parts, text, occurredAt)
+          }
+
+          return parts.map((part, offset) =>
+            offset === index && part.type === 'reasoning'
+              ? ({
+                  ...part,
+                  text,
+                  ...(next.phase === 'settled' ? { completedAt: occurredAt } : {})
+                } as ChatMessagePart)
+              : part
+          )
+        },
+        () => [reasoningPart(text, occurredAt)],
+        {},
+        occurredAt
+      )
+
+      if (next.phase === 'settled') {
+        moaProgressBySessionRef.current.delete(sessionId)
+      }
+
+      return true
+    },
+    [flushQueuedDeltas, mutateStream]
   )
 
   const upsertToolCall = useCallback(
@@ -870,6 +922,7 @@ export function useMessageStream({
     scheduleSessionsRefresh,
     sessionInterrupted,
     sessionStateByRuntimeIdRef,
+    updateMoaProgress,
     updateSessionState,
     upsertToolCall
   })

@@ -7,9 +7,8 @@ complete and the phase transitions from ``reference`` to ``aggregator``:
   - ``moa.progress`` — fired once per reference completion with
                        ``refs_done`` and ``refs_total`` (e.g. drives a
                        status-bar ``MOA: 2/3 refs done`` indicator)
-  - ``moa.phase``    — fired once per phase transition (currently only the
-                       ``phase="aggregator"`` transition right before the
-                       aggregator acts)
+  - ``moa.phase``    — announces the complete advisor roster before dispatch,
+                       then the aggregator transition after every slot settles
 
 These tests exercise the real callback surface end-to-end through the
 display hook (``reference_callback``) — no mocks on the dispatch path.
@@ -19,6 +18,7 @@ real provider.
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -72,8 +72,8 @@ def _collect_emits(facade):
 
 
 
-def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
-    """A single ``moa.phase`` event with ``phase="aggregator"`` fires after the fan-out."""
+def test_moa_phase_announces_parallel_roster_then_aggregator(moa_config, monkeypatch):
+    """The full stable roster is visible before completion events arrive."""
     from agent.moa_loop import MoAChatCompletions
 
     def fake_call_llm(**kwargs):
@@ -92,14 +92,130 @@ def test_moa_phase_transitions_to_aggregator(moa_config, monkeypatch):
     )
 
     phase_events = [(e, k) for (e, k) in captured if e == "moa.phase"]
-    # Exactly one phase event per turn, identifying the aggregator.
-    assert len(phase_events) == 1
-    _event, kwargs = phase_events[0]
+    assert [kwargs["phase"] for _event, kwargs in phase_events] == [
+        "reference",
+        "aggregator",
+    ]
+    _event, start = phase_events[0]
+    assert start["advisors"] == [
+        "openrouter:anthropic/claude-opus-4.8",
+        "openrouter:openai/gpt-5.5",
+        "openrouter:google/gemini-3-pro",
+    ]
+    assert start["concurrency"] == 3
+    assert start["refs_done"] == 0
+    assert start["guidance_reused"] is False
+
+    _event, kwargs = phase_events[1]
     assert kwargs["phase"] == "aggregator"
     assert kwargs["aggregator"] == "openrouter:anthropic/claude-opus-4.8"
     # counts match the configured reference count
     assert kwargs["refs_done"] == 3
     assert kwargs["refs_total"] == 3
+
+    progress = sorted(
+        (kwargs for event, kwargs in captured if event == "moa.progress"),
+        key=lambda item: item["index"],
+    )
+    assert [item["index"] for item in progress] == [1, 2, 3]
+    assert {item["status"] for item in progress} == {"complete"}
+
+
+def test_moa_cache_reuse_is_explicit(moa_config, monkeypatch):
+    from agent.moa_loop import MoAChatCompletions
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", lambda **_kwargs: _response("advice"))
+    facade = MoAChatCompletions("closed")
+    captured = _collect_emits(facade)
+    messages = [{"role": "user", "content": "plan the migration"}]
+
+    facade.create(model="closed", messages=messages)
+    captured.clear()
+    facade.create(model="closed", messages=messages)
+
+    phases = [kwargs for event, kwargs in captured if event == "moa.phase"]
+    assert [phase["phase"] for phase in phases] == ["reference", "aggregator"]
+    assert all(phase["guidance_reused"] is True for phase in phases)
+    assert not [event for event, _kwargs in captured if event == "moa.progress"]
+
+
+def test_moa_progress_reports_failed_slot_without_reordering(moa_config, monkeypatch):
+    from agent.moa_loop import MoAChatCompletions
+
+    def fake_call_llm(**kwargs):
+        if kwargs.get("task") == "moa_reference" and kwargs.get("model") == "openai/gpt-5.5":
+            raise RuntimeError("advisor unavailable")
+        return _response("advice")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    facade = MoAChatCompletions("closed")
+    captured = _collect_emits(facade)
+
+    facade.create(
+        model="closed",
+        messages=[{"role": "user", "content": "plan the migration"}],
+    )
+
+    progress = {kwargs["index"]: kwargs for event, kwargs in captured if event == "moa.progress"}
+    assert progress[2]["label"] == "openrouter:openai/gpt-5.5"
+    assert progress[2]["status"] == "failed"
+    assert progress[1]["status"] == "complete"
+    assert progress[3]["status"] == "complete"
+
+
+def test_moa_progress_emits_later_slot_while_earlier_slot_is_running(monkeypatch):
+    """A settled future updates its stable slot before the whole batch finishes."""
+    from agent import moa_loop
+
+    monkeypatch.setattr(moa_loop, "get_transport", lambda *_args, **_kwargs: None)
+    first_started = threading.Event()
+    later_started = threading.Event()
+    release_first = threading.Event()
+    release_later = threading.Event()
+    later_reported = threading.Event()
+    errors: list[BaseException] = []
+
+    def fake_call_llm(**kwargs):
+        if kwargs["provider"] == "first":
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        else:
+            later_started.set()
+            assert release_later.wait(timeout=5)
+        return _response(f"advice from {kwargs['provider']}")
+
+    def progress(_done, _total, _label, index, status):
+        if index == 2 and status == "complete":
+            later_reported.set()
+
+    def run_fanout():
+        try:
+            moa_loop._run_references_parallel(
+                [
+                    {"provider": "first", "model": "slow"},
+                    {"provider": "later", "model": "fast"},
+                ],
+                [{"role": "user", "content": "review"}],
+                progress_callback=progress,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    worker = threading.Thread(target=run_fanout)
+    worker.start()
+    try:
+        assert first_started.wait(timeout=5)
+        assert later_started.wait(timeout=5)
+        release_later.set()
+        assert later_reported.wait(timeout=2)
+        assert not release_first.is_set()
+    finally:
+        release_first.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
 
 
 

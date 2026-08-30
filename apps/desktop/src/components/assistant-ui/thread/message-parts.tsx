@@ -12,6 +12,7 @@ import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
 import { McpSetupTool } from '@/components/assistant-ui/mcp-setup-tool'
 import { AgentDeliveryNotice, deliveryTargetFromCommand } from '@/components/assistant-ui/thread/agent-delivery'
+import { MoaOrchestration } from '@/components/assistant-ui/thread/moa-orchestration'
 import { TimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { DelegateTool } from '@/components/assistant-ui/tool/delegate'
 import { ToolFallback, ToolGroupSlot } from '@/components/assistant-ui/tool/fallback'
@@ -21,6 +22,7 @@ import { GeneratedImage } from '@/components/chat/generated-image-result'
 import { SCAFFOLD_LABEL_CLASS, SCAFFOLD_META_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
 import { useI18n } from '@/i18n'
 import { generatedImageFromResult } from '@/lib/generated-images'
+import { parseMoaProgress } from '@/lib/moa-progress'
 import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
@@ -301,8 +303,20 @@ const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; star
     }, undefined)
   )
 
+  const moaOnly = useAuiState(s => {
+    const reasoning = s.message.parts
+      .slice(Math.max(0, startIndex), endIndex + 1)
+      .filter(part => part?.type === 'reasoning' && typeof part.text === 'string' && part.text.trim())
+
+    return reasoning.length > 0 && reasoning.every(part => part.type === 'reasoning' && parseMoaProgress(part.text))
+  })
+
   if (!hasContent) {
     return null
+  }
+
+  if (moaOnly) {
+    return <>{children}</>
   }
 
   return (
@@ -328,6 +342,11 @@ const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; star
 const ReasoningTextPart: ReasoningMessagePartComponent = () => {
   const { status, text } = useMessagePartReasoning()
   const messageRunning = useAuiState(s => s.message.status?.type === 'running')
+  const moa = parseMoaProgress(text)
+
+  if (moa) {
+    return <MoaOrchestration state={moa} />
+  }
 
   return (
     <MarkdownTextContent

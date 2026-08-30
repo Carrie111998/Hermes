@@ -160,6 +160,10 @@ export type GatewayEventPayload = {
   index?: number
   aggregator?: string
   // moa.progress / moa.phase (Mixture of Agents fan-out progress relay)
+  advisors?: unknown[]
+  concurrency?: number
+  fanout?: string
+  guidance_reused?: boolean
   refs_done?: number
   refs_total?: number
   phase?: string

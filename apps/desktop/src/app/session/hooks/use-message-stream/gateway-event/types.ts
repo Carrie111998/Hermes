@@ -34,6 +34,12 @@ export interface GatewayEventDeps {
   scheduleSessionsRefresh: () => void
   sessionInterrupted: (sessionId: string) => boolean
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
+  updateMoaProgress: (
+    sessionId: string,
+    eventType: string,
+    payload: GatewayEventPayload | undefined,
+    occurredAt: number
+  ) => boolean
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
