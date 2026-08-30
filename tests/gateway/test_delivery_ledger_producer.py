@@ -15,7 +15,13 @@ import pytest
 
 from gateway import delivery_ledger as dl
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BackendUnavailableReply,
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
 from gateway.session import SessionSource
 
 
@@ -149,6 +155,18 @@ class TestProducerHook:
         runner._redeliver_failed_obligations_for_platform.assert_awaited_once_with(
             Platform.SLACK, profile="reviewer"
         )
+
+    @pytest.mark.asyncio
+    async def test_backend_notice_is_not_durably_replayed_as_plain_text(self):
+        adapter = _Adapter()
+        await _run(
+            adapter,
+            _event(),
+            BackendUnavailableReply("backend unavailable"),
+        )
+
+        assert adapter.sent == ["backend unavailable"]
+        assert _rows() == []
 
 
     @pytest.mark.asyncio

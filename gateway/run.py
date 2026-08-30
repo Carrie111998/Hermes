@@ -3010,6 +3010,8 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
+    BackendNoticeState,
+    BackendUnavailableReply,
     BasePlatformAdapter,
     EphemeralReply,
     MessageEvent,
@@ -3055,6 +3057,31 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_BACKEND_UNAVAILABLE_FAILURE_REASONS = frozenset({
+    "overloaded",
+    "server_error",
+    "timeout",
+})
+_BACKEND_UNAVAILABLE_NOTICE = (
+    "The AI backend is temporarily unavailable. "
+    "Please try sending your message again in a moment."
+)
+
+
+def _is_backend_unavailable_agent_result(agent_result: dict) -> bool:
+    """Whether a failed agent result represents a transient backend outage.
+
+    The agent retry loop emits this structured classification.  Do not infer
+    it from exceptions at the adapter layer, where a connection failure may
+    belong to Slack, Telegram, media delivery, storage, or another subsystem.
+    """
+    return bool(
+        agent_result.get("failed")
+        and agent_result.get("failure_reason")
+        in _BACKEND_UNAVAILABLE_FAILURE_REASONS
+    )
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -7372,6 +7399,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.__dict__["_sessions"] = sessions
         return sessions
 
+    def _backend_notice_state_for_adapters(self) -> BackendNoticeState:
+        """Return runner-owned notice state, tolerating partial test runners."""
+        state = self.__dict__.get("_backend_notice_state")
+        if state is None:
+            state = BackendNoticeState()
+            self.__dict__["_backend_notice_state"] = state
+        return state
+
+    def _share_backend_notice_state(
+        self,
+        adapter: Any,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Wire runner routing and profile-scoped state across reconnects."""
+        # All adapters participate in replacement routing, including direct
+        # built-ins created outside plugin factories.
+        adapter.gateway_runner = self
+        if not profile_name:
+            try:
+                profile_name = self._active_profile_name()
+            except Exception:
+                profile_name = None
+        setter = getattr(adapter, "set_backend_notice_state", None)
+        if callable(setter):
+            setter(
+                self._backend_notice_state_for_adapters(),
+                profile_name=profile_name,
+            )
+
     def _session_state(self, session_key: str) -> "SessionState":
         """Get-or-create the :class:`SessionState` for ``session_key``."""
         sessions = self._sessions_map()
@@ -7435,6 +7491,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # user knows persistence is broken instead of discovering it later
         # via a missing /resume or empty history (#88235).
         self._session_db_init_error: Optional[str] = None
+        self._backend_notice_state = BackendNoticeState()
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -13918,6 +13975,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
+            self._share_backend_notice_state(adapter)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -15735,6 +15793,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    self._share_backend_notice_state(adapter)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -16863,6 +16922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # and NAS health aggregation can see which secondary profile failed.
         adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        self._share_backend_notice_state(adapter, profile_name=profile_name)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -22791,6 +22851,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 response = ""
+
+            # The retry loop already classified provider failures.  Mark
+            # transient backend outages explicitly so the adapter can suppress
+            # only this safe notice and arm its cooldown after delivery.
+            if (
+                not _gateway_surface_passes_raw_text(source.platform)
+                and _is_backend_unavailable_agent_result(agent_result)
+            ):
+                return BackendUnavailableReply(_BACKEND_UNAVAILABLE_NOTICE)
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
