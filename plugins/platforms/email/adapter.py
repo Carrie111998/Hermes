@@ -1421,6 +1421,7 @@ class EmailAdapter(BasePlatformAdapter):
             # Outbound-only send (cron/standalone): verbatim subject, fresh
             # conversation — no Re: prefix, no thread-context threading headers.
             msg["Subject"] = explicit_subject
+            subject = explicit_subject  # keep the success log line bound
             original_msg_id = reply_to_msg_id
         else:
             if ctx:
