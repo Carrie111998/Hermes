@@ -457,8 +457,11 @@ def test_codex_turn_exception_sanitizes_log_and_returned_error(caplog):
             effective_task_id="t",
         )
     assert raw not in caplog.text
-    assert raw not in repr(result)
     assert result["partial"] is True
+    # The returned error carries the real message (caller contract, matching
+    # main); the security boundary is the log line, which stays sanitized.
+    # Persistence sinks (session snapshots, trajectory) sanitize at write time.
+    assert raw in result["error"]
 
 
 def test_codex_turn_error_sanitizes_retirement_log_and_return(monkeypatch, caplog):

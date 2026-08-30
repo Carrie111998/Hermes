@@ -835,7 +835,7 @@ def run_codex_app_server_turn(
             agent.clear_interrupt()
         return {
             "final_response": (
-                f"Codex app-server turn failed: {safe_error}. "
+                f"Codex app-server turn failed: {exc}. "
                 f"Fall back to default runtime with `/codex-runtime auto`."
             ),
             "messages": messages,
@@ -848,7 +848,7 @@ def run_codex_app_server_turn(
                 if _interrupt_message
                 else {}
             ),
-            "error": safe_error,
+            "error": str(exc),
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
