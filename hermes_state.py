@@ -1804,6 +1804,17 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_DB_MARKERS)
 
 
+def _has_structural_corruption_provenance(exc: BaseException) -> bool:
+    """Require a compatible SQLite result code before durable quarantine."""
+    if not is_malformed_db_error(exc):
+        return False
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if error_code is None:
+        return True
+    corrupt_vtab = getattr(sqlite3, "SQLITE_CORRUPT_VTAB", 267)
+    return error_code != corrupt_vtab and (error_code & 0xFF) == sqlite3.SQLITE_CORRUPT
+
+
 def is_malformed_schema_error(exc: BaseException) -> bool:
     """True only when SQLite explicitly reports malformed schema text.
 
@@ -2389,6 +2400,7 @@ def _rotate_db_generation_token(db_path: Path) -> bool:
 
 def _structural_quarantine_path(db_path: Path, fingerprint: str) -> Path:
     """Return the retained marker for one database generation."""
+    db_path = db_path.resolve(strict=False)
     generation_id = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
     return db_path.with_name(
         f"{db_path.name}.structural-quarantine-{generation_id}.json"
@@ -2396,7 +2408,23 @@ def _structural_quarantine_path(db_path: Path, fingerprint: str) -> Path:
 
 
 def _active_structural_quarantine_path(db_path: Path) -> Path:
+    db_path = db_path.resolve(strict=False)
     return db_path.with_name(f"{db_path.name}.structural-quarantine.json")
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    """Persist a directory entry update where the platform supports it."""
+    if os.name == "nt":
+        return
+    try:
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        # Network and exotic filesystems may reject directory fsync.
+        pass
 
 
 def _read_quarantine_payload(marker: Path) -> Optional[Dict[str, Any]]:
@@ -2442,17 +2470,7 @@ def _write_quarantine_payload(marker: Path, payload: Dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, marker)
-        if os.name != "nt":
-            try:
-                directory_fd = os.open(marker.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            except OSError:
-                # Some network/filesystem implementations do not permit
-                # directory fsync; the atomically replaced marker still wins.
-                pass
+        _fsync_parent_directory(marker)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -2482,17 +2500,23 @@ def _record_structural_quarantine(
     _write_quarantine_payload(_active_structural_quarantine_path(db_path), payload)
 
 
-def _retire_active_structural_quarantine(db_path: Path) -> None:
+def _retire_active_structural_quarantine(db_path: Path) -> bool:
     """Retire the path-wide gate after verified repair, retaining history."""
-    _active_structural_quarantine_path(db_path).unlink(missing_ok=True)
+    marker = _active_structural_quarantine_path(db_path)
+    try:
+        marker.unlink(missing_ok=True)
+        _fsync_parent_directory(marker)
+        return True
+    except OSError as exc:
+        logger.error("Could not retire state.db structural quarantine: %s", exc)
+        return False
 
 
 def _finalize_structural_repair(db_path: Path) -> bool:
     """Bind verified bytes to a new generation before lifting quarantine."""
     if not _rotate_db_generation_token(db_path):
         return False
-    _retire_active_structural_quarantine(db_path)
-    return True
+    return _retire_active_structural_quarantine(db_path)
 
 
 def _backup_content_identity(db_path: Path) -> "Optional[str]":
@@ -5503,7 +5527,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # still excludes sibling writers. This closes the window
                         # between rollback and the outer recovery classifier.
                         if (
-                            is_malformed_db_error(exc)
+                            _has_structural_corruption_provenance(exc)
                             and not self._has_fts_corruption_evidence(
                                 exc, lock_held=True
                             )
@@ -5583,7 +5607,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if self._enter_fts_fail_open(exc):
                     continue
                 if (
-                    is_malformed_db_error(exc)
+                    _has_structural_corruption_provenance(exc)
                     and self._structural_corruption_error is None
                 ):
                     self._quarantine_structural_corruption(exc)
@@ -5893,7 +5917,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not self._fts_enabled:
             return False
         if not self._has_fts_corruption_evidence(exc):
-            if is_malformed_db_error(exc):
+            if _has_structural_corruption_provenance(exc):
                 self._quarantine_structural_corruption(exc)
                 logger.critical(
                     "state.db reported unscoped or mixed structural corruption "
