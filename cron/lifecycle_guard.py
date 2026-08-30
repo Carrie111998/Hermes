@@ -91,22 +91,29 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # left the bypassable approval layer (tools/approval.py, skipped on
     # force=True) as the only cover, while this hard block — documented as
     # "force=True cannot help here" — let them through (#80260).
-    r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
+    # Span cap (#98869): the verb and the gateway identifier must sit within
+    # 200 chars on the same line. Real commands keep verb and target close
+    # (even flag-heavy invocations stay under ~100 chars of separation), but
+    # a single-line data file (compact JSON) let the old `[^\n]*` join three
+    # unrelated words across 650 KB — a "lifecycle command" thousands of
+    # times longer than any real one. Branches B/C/D share the cap.
+    r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]{0,200}\bhermes[.\-]?gateway)"
     # Branch C: systemctl ops on a hermes-gateway unit.
-    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
+    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]{0,200}\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
     # Leading \b ensures we match "pkill" or "kill" as whole words, not as
     # suffixes of other words (e.g. "skill" -> "kill").
-    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    r"|(?:\bp?kill\b[^\n]{0,200}\bhermes\b[^\n]{0,200}\bgateway)"
+    r"|(?:\bp?kill\b[^\n]{0,200}\bgateway\b[^\n]{0,200}\bhermes)"
 )
 
 
 # A backslash immediately followed by a newline is a POSIX shell line
 # continuation — the shell joins the two lines before parsing. Every branch
-# above uses `[^\n]*` between its verb and the gateway identifier so the
-# match can't span unrelated lines of a longer cron prompt/script, but that
+# above uses a same-line bounded gap (`[^\n]{0,200}`) between its verb and
+# the gateway identifier so the match can't span unrelated lines of a
+# longer cron prompt/script, but that
 # also means a real multi-line shell invocation split across continuation
 # lines (e.g. `launchctl submit \` / `  -l ai.hermes.gateway-... \` / `  -- ...`,
 # the exact reported shape in #62891) would otherwise slip past. Collapse
