@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -264,3 +265,53 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line == f'"{spaced}" desktop'
+
+
+def test_exec_uses_packaged_electron_when_present(tmp_path, xdg_home, monkeypatch):
+    """A built app must not route the launcher through blocking ``hermes desktop``."""
+    root = _make_project(tmp_path)
+    packaged = root / "apps" / "desktop" / "release" / "linux-unpacked" / "hermes"
+    packaged.parent.mkdir(parents=True)
+    packaged.write_text("", encoding="utf-8")
+    packaged.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == str(packaged.resolve())
+    assert exec_line.endswith("/hermes")
+    assert " desktop" not in exec_line
+    assert "--disable-gpu" not in exec_line
+    assert "--ozone-platform" not in exec_line
+
+
+def test_exec_prefers_newer_linux_unpacked_tree(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    older = root / "apps" / "desktop" / "release" / "linux-unpacked" / "hermes"
+    newer = root / "apps" / "desktop" / "release" / "linux-arm64-unpacked" / "hermes"
+    older.parent.mkdir(parents=True)
+    newer.parent.mkdir(parents=True)
+    older.write_text("", encoding="utf-8")
+    newer.write_text("", encoding="utf-8")
+    older.chmod(0o755)
+    newer.chmod(0o755)
+    older_stat = older.stat()
+    os.utime(older, (older_stat.st_atime, older_stat.st_mtime - 10))
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == str(newer.resolve())
+
+
+def test_exec_falls_back_to_cli_when_packaged_app_missing(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    assert _parse(entry.read_text(encoding="utf-8"))["Exec"] == "/usr/bin/hermes desktop"
