@@ -209,14 +209,16 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
         # Same-process holder (e.g. another thread's live lease): never
         # self-reclaim — the lease refresher and release path own it.
         return False
+    try:
+        from hermes_cli.process_safety import is_pid_alive
+        return not is_pid_alive(pid)
+    except Exception:
+        pass
     if psutil is not None:
         try:
-            # psutil is the canonical cross-platform liveness answer
-            # (CONTRIBUTING.md "Critical rules" #1). pid_exists() reports
-            # recycled PIDs as alive — conservative, the TTL still applies.
             return not psutil.pid_exists(pid)
         except Exception:
-            return False  # any doubt → keep the lease until TTL expiry
+            return False
     # Scaffold-phase fallback only (psutil missing), and POSIX-only: stdlib
     # os.kill(pid, 0) is NOT a no-op probe on Windows (bpo-14484 — sig=0 maps
     # to CTRL_C_EVENT and can kill the target's console group). Without psutil
