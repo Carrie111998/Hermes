@@ -98,10 +98,37 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # Native binary (uv tool shim, PyInstaller, distro package) — its own
         # loader is self-sufficient.
         return False
-    shebang = head.decode("utf-8", errors="replace").strip().lower()
-    if "python" not in shebang:
+    shebang = head.decode("utf-8", errors="replace").strip()
+    # Only the substring gate may lowercase: shebang paths are real
+    # filesystem paths, and Linux is case-sensitive — lowercasing
+    # "#!/.../CaseDir/python3" would resolve the wrong (or a nonexistent)
+    # file and wrongly force an interpreter prefix.
+    if "python" not in shebang.lower():
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
+        return False
+    # Compare the shebang's interpreter against the running one by REAL path.
+    # A textual comparison breaks for uv-created venvs: venv/bin/python3 is a
+    # symlink to the managed interpreter, so resolving sys.executable yields
+    # the managed python's directory, and a text lookup of that dir in the
+    # shebang fails even though the shebang resolves to the very same file
+    # (menu launch then dies with ModuleNotFoundError).
+    parts = shebang[2:].split()
+    if not parts:
+        return True
+    interp = parts[0]
+    if interp == "/usr/bin/env":
+        # env-based shebang: resolves via PATH in the DE session, which can
+        # differ from ours — treat as needing the explicit interpreter.
+        return True
+    if not interp.startswith("/"):
+        return True
+    try:
+        resolved_interp = Path(interp).resolve()
+    except OSError:
+        return True
+    if resolved_interp == Path(sys.executable).resolve():
+        # Same interpreter file (directly or via symlink) — shebang is fine.
         return False
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,

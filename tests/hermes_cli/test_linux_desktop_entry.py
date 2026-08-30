@@ -149,6 +149,66 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     assert exec_line == f"{hermes_bin} desktop"
 
 
+def test_exec_leaves_symlinked_venv_shebang_alone(tmp_path, xdg_home, monkeypatch):
+    import sys
+
+    # uv-created venvs: venv/bin/python3 is a SYMLINK to the managed
+    # interpreter, so the shebang text (`.../venv/bin/python3`) differs from
+    # the resolved sys.executable even though both name the same file. A
+    # textual containment check alone then wrongly decides the shebang
+    # escapes the venv and prefixes the Exec with the MANAGED interpreter,
+    # which lacks hermes_cli in site-packages → silent ModuleNotFoundError on
+    # menu launch.
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    symlink_interp = bin_dir / "python3"
+    try:
+        symlink_interp.symlink_to(Path(sys.executable).resolve())
+    except OSError:
+        pytest.skip("symlinks unavailable on this platform")
+
+    root = _make_project(tmp_path)
+    hermes_bin = bin_dir / "hermes"
+    hermes_bin.write_text(f"#!{symlink_interp}\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # Shebang resolves to the running interpreter (through the uv-style
+    # symlink) — correct as-is, no interpreter prefix.
+    assert exec_line == f"{hermes_bin} desktop"
+
+
+def test_exec_leaves_case_sensitive_shebang_path_alone(tmp_path, xdg_home, monkeypatch):
+    import sys
+
+    # Linux paths are case-sensitive: lowercasing the shebang before parsing
+    # the interpreter path would resolve the wrong (or a nonexistent) file
+    # and wrongly force a prefix. The uppercase directory must survive.
+    bin_dir = tmp_path / "CaseDir" / "bin"
+    bin_dir.mkdir(parents=True)
+    symlink_interp = bin_dir / "python3"
+    try:
+        symlink_interp.symlink_to(Path(sys.executable).resolve())
+    except OSError:
+        pytest.skip("symlinks unavailable on this platform")
+
+    root = _make_project(tmp_path)
+    hermes_bin = bin_dir / "hermes"
+    hermes_bin.write_text(f"#!{symlink_interp}\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{hermes_bin} desktop"
+
+
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
