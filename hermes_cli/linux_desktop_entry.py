@@ -76,13 +76,13 @@ def resolve_exec_command() -> str:
             # installer's bash wrapper). Launched from the .desktop entry that
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
-            # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # sys.executable, unresolved: resolving escapes the venv's symlinked
+            # python (uv venvs) and loses hermes_cli.
+            argv = [str(Path(sys.executable)), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [str(Path(sys.executable)), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
@@ -103,11 +103,10 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
-    # A python shebang pointing INSIDE the running interpreter's environment
-    # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    # Only `env python` resolves through PATH and can escape the venv; an
+    # absolute shebang already names the interpreter that owns the script.
+    interp = shebang[2:].strip().split()[0]
+    return interp == "env" or interp.endswith("/env")
 
 
 def _quote_exec_arg(arg: str) -> str:
