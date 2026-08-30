@@ -127,6 +127,14 @@ GLM52_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 GLM53_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: GLM-5.3-flash on the standard BigModel endpoint (open.bigmodel.cn) is
+#: narrower: it rejects ``medium`` with HTTP 400 "该模型始终思考，不支持关闭
+#: 思考；请使用 low、high 或 max" — only low/high/max are accepted (verified
+#: live 2026-08-30). ``medium`` maps to ``high`` (the positional middle and
+#: server default, same rationale as KIMI_K3_OVERRIDES); ``xhigh`` to ``max``.
+GLM53_FLASH_EFFORTS: tuple[str, ...] = ("low", "high", "max")
+GLM53_FLASH_OVERRIDES: dict[str, str] = {"medium": "high", "xhigh": "max"}
+
 #: DeepSeek V4 OpenAI-compat endpoint: low/medium/high/max; ``xhigh``
 #: requests the top tier (matches the shipped profile mapping).
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
