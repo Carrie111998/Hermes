@@ -783,12 +783,9 @@ def run_codex_app_server_turn(
     # Without a run budget Hermes therefore waits for protocol completion;
     # explicit interrupts, subprocess death, and the post-tool quiet watchdog
     # still terminate unhealthy turns.
-    turn_timeout = None
-    run_budget = getattr(agent, "run_budget_seconds", None)
-    run_started_at = getattr(agent, "_run_budget_started_at", None)
-    if run_budget is not None and run_started_at is not None:
-        elapsed = max(0.0, time.time() - run_started_at)
-        turn_timeout = max(0.0, float(run_budget) - elapsed)
+    from agent.run_budget import remaining_run_budget_seconds
+
+    turn_timeout = remaining_run_budget_seconds(agent)
 
     try:
         turn = agent._codex_session.run_turn(

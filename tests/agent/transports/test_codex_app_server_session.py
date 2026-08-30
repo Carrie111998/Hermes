@@ -186,6 +186,59 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_exhausted_turn_budget_does_not_start_client(self):
+        created = []
+
+        def client_factory(**kwargs):
+            created.append(kwargs)
+            return FakeClient(**kwargs)
+
+        result = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=client_factory,
+        ).run_turn("hi", turn_timeout=0.0)
+
+        assert created == []
+        assert result.interrupted is True
+        assert result.error and "timed out" in result.error
+        assert result.should_retire is False
+
+    def test_turn_budget_includes_startup_and_turn_start(self, monkeypatch):
+        client = FakeClient()
+        clock = {"now": 0.0}
+        request_timeouts = []
+        original_initialize = client.initialize
+        original_request = client.request
+
+        def initialize(**kwargs):
+            request_timeouts.append(("initialize", kwargs.get("timeout")))
+            clock["now"] += 3.0
+            return original_initialize(**kwargs)
+
+        def request(method, params=None, timeout=30.0):
+            request_timeouts.append((method, timeout))
+            clock["now"] += 3.0
+            return original_request(method, params, timeout)
+
+        monkeypatch.setattr(client, "initialize", initialize)
+        monkeypatch.setattr(client, "request", request)
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        result = make_session(client).run_turn(
+            "hi",
+            turn_timeout=7.0,
+            notification_poll_timeout=0.0,
+        )
+
+        assert request_timeouts[:3] == [
+            ("initialize", pytest.approx(7.0)),
+            ("thread/start", pytest.approx(4.0)),
+            ("turn/start", pytest.approx(1.0)),
+        ]
+        assert request_timeouts[3:] == [("turn/interrupt", 5)]
+        assert result.interrupted is True
+        assert result.error and "timed out" in result.error
+
     def test_explicit_interrupt_remains_terminal_without_a_deadline(self):
         client = FakeClient()
         session = make_session(client)
@@ -220,6 +273,31 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    @pytest.mark.parametrize(
+        "status, expected_interrupted, expected_error",
+        [
+            ("interrupted", True, None),
+            ("failed", False, "status=failed"),
+        ],
+    )
+    def test_non_success_completion_status_is_not_success(
+        self, status, expected_interrupted, expected_error
+    ):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": status, "error": None},
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is expected_interrupted
+        if expected_error is None:
+            assert result.error is None
+        else:
+            assert result.error and expected_error in result.error
 
 
 
@@ -777,6 +855,98 @@ class TestSessionRetirement:
         assert r.error is None
         assert r.should_retire is False
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_protocol_final_answer_without_completion_recovers_without_budget(
+        self, monkeypatch
+    ):
+        """No-budget turns still recover a protocol-marked final answer."""
+        client = FakeClient()
+        clock = {"now": 0.0, "final_sent": False}
+
+        def take_notification(timeout: float = 0.0):
+            clock["now"] += 1.0
+            if not clock["final_sent"]:
+                clock["final_sent"] = True
+                return {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "m1",
+                            "text": "done",
+                            "phase": "final_answer",
+                        },
+                        "threadId": "thread-fake-001",
+                        "turnId": "turn-fake-001",
+                    },
+                }
+            if clock["now"] > 30.0:
+                raise AssertionError("no-budget final answer waited forever")
+            return None
+
+        monkeypatch.setattr(client, "take_notification", take_notification)
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        r = make_session(client).run_turn(
+            "hi",
+            notification_poll_timeout=0.0,
+        )
+
+        assert r.final_text == "done"
+        assert r.interrupted is False
+        assert r.error is None
+        assert r.should_retire is False
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_protocol_final_answer_is_not_replaced_by_later_commentary(
+        self, monkeypatch
+    ):
+        client = FakeClient()
+        clock = {"now": 0.0}
+        notifications = [
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "final-1",
+                        "text": "actual final",
+                        "phase": "final_answer",
+                    },
+                    "threadId": "thread-fake-001",
+                    "turnId": "turn-fake-001",
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "commentary-1",
+                        "text": "late commentary",
+                        "phase": "commentary",
+                    },
+                    "threadId": "thread-fake-001",
+                    "turnId": "turn-fake-001",
+                },
+            },
+        ]
+
+        def take_notification(timeout: float = 0.0):
+            clock["now"] += 1.0
+            return notifications.pop(0) if notifications else None
+
+        monkeypatch.setattr(client, "take_notification", take_notification)
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock["now"])
+
+        result = make_session(client).run_turn(
+            "hi",
+            notification_poll_timeout=0.0,
+        )
+
+        assert result.final_text == "actual final"
+        assert result.interrupted is False
+        assert result.error is None
 
     def test_progress_messages_can_continue_past_ten_minutes_before_completion(
         self, monkeypatch

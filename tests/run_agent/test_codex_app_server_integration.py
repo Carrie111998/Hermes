@@ -165,7 +165,9 @@ class TestRunConversationCodexPath:
             "build_turn_context",
             build_turn_context_with_elapsed_budget,
         )
-        monkeypatch.setattr(codex_runtime.time, "time", lambda: 107.5)
+        monkeypatch.setattr(codex_runtime.time, "monotonic", lambda: 107.5)
+        # A wall-clock correction must not alter the run's remaining budget.
+        monkeypatch.setattr(codex_runtime.time, "time", lambda: 10_000.0)
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
         monkeypatch.setattr(
             CodexAppServerSession,

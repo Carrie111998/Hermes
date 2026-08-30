@@ -90,6 +90,19 @@ class TurnResult:
 # items when an interrupt or upstream error tears the turn down before the
 # normal completion path fires. Mirrors openclaw beta.8 fix.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
+_FINAL_ANSWER_COMPLETION_GRACE_SECONDS = 5.0
+
+
+def _bounded_request_timeout(
+    deadline: Optional[float], default_timeout: float
+) -> float:
+    """Cap one startup request by an optional whole-turn deadline."""
+    if deadline is None:
+        return default_timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("codex app-server turn deadline expired")
+    return min(default_timeout, remaining)
 
 
 def _is_completed_final_answer_item(note: dict) -> bool:
@@ -329,10 +342,11 @@ class CodexAppServerSession:
 
     # ---------- lifecycle ----------
 
-    def ensure_started(self) -> str:
+    def ensure_started(self, *, deadline: Optional[float] = None) -> str:
         """Spawn the subprocess, do the initialize handshake, and start a
         thread. Returns the codex thread id. Idempotent — repeated calls
-        return the same thread id."""
+        return the same thread id. When supplied, ``deadline`` bounds the
+        startup RPCs by the caller's absolute monotonic deadline."""
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
@@ -343,6 +357,7 @@ class CodexAppServerSession:
             client_name="hermes",
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
+            timeout=_bounded_request_timeout(deadline, 10.0),
         )
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
@@ -360,7 +375,11 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        result = self._client.request(
+            "thread/start",
+            params,
+            timeout=_bounded_request_timeout(deadline, 15.0),
+        )
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -497,9 +516,9 @@ class CodexAppServerSession:
         into Hermes' messages shape.
 
         turn_timeout: optional hard wall-clock cap for the whole native Codex
-        turn. ``None`` waits for protocol completion without an arbitrary cap;
-        explicit interrupts, subprocess failure, and the post-tool watchdog
-        remain active.
+        turn. ``None`` waits without an arbitrary whole-turn cap; explicit
+        interrupts, subprocess failure, the post-tool watchdog, and the short
+        completion grace after a protocol-marked final answer remain active.
 
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
@@ -513,8 +532,18 @@ class CodexAppServerSession:
         # the caller can render — instead of bubbling raw codex exceptions
         # up to AIAgent.run_conversation.
         result = TurnResult()
+        deadline = (
+            time.monotonic() + max(0.0, turn_timeout)
+            if turn_timeout is not None
+            else None
+        )
+        if deadline is not None and time.monotonic() >= deadline:
+            result.interrupted = True
+            result.error = f"turn timed out after {turn_timeout}s"
+            self._interrupt_event.clear()
+            return result
         try:
-            self.ensure_started()
+            self.ensure_started(deadline=deadline)
         except (CodexAppServerError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
@@ -534,6 +563,11 @@ class CodexAppServerSession:
             result.interrupted = True
             self._interrupt_event.clear()
             return result
+        if deadline is not None and time.monotonic() >= deadline:
+            result.interrupted = True
+            result.error = f"turn timed out after {turn_timeout}s"
+            self._interrupt_event.clear()
+            return result
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
@@ -547,7 +581,7 @@ class CodexAppServerSession:
                     "threadId": self._thread_id,
                     "input": [{"type": "text", "text": user_input_text}],
                 },
-                timeout=10,
+                timeout=_bounded_request_timeout(deadline, 10.0),
             )
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
@@ -581,13 +615,13 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = (
-            time.monotonic() + max(0.0, turn_timeout)
-            if turn_timeout is not None
-            else None
-        )
         turn_complete = False
-        saw_completed_final_answer = False
+        # A completed phase=final_answer item is protocol-grounded terminal
+        # output, but allow the normal turn/completed notification and trailing
+        # bookkeeping a short window to arrive before using the compatibility
+        # fallback. This also keeps that fallback reachable for no-budget turns.
+        final_answer_completion_deadline: Optional[float] = None
+        completed_final_answer_text: Optional[str] = None
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
         # within post_tool_quiet_timeout and the turn hasn't completed, we
@@ -596,6 +630,10 @@ class CodexAppServerSession:
 
         while (
             (deadline is None or time.monotonic() < deadline)
+            and (
+                final_answer_completion_deadline is None
+                or time.monotonic() < final_answer_completion_deadline
+            )
             and not turn_complete
         ):
             if self._interrupt_event.is_set():
@@ -679,16 +717,23 @@ class CodexAppServerSession:
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
-                    if _is_completed_final_answer_item(pending):
-                        saw_completed_final_answer = True
+                    is_protocol_final = _is_completed_final_answer_item(pending)
+                    if is_protocol_final and proj.final_text:
+                        final_answer_completion_deadline = (
+                            time.monotonic()
+                            + _FINAL_ANSWER_COMPLETION_GRACE_SECONDS
+                        )
+                        completed_final_answer_text = proj.final_text
                     if proj.messages:
                         result.projected_messages.extend(proj.messages)
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
                         last_tool_completion_at = time.monotonic()
                     if proj.final_text is not None:
-                        result.final_text = proj.final_text
+                        if is_protocol_final or completed_final_answer_text is None:
+                            result.final_text = proj.final_text
                         if _has_turn_aborted_marker(proj.final_text):
+                            result.final_text = proj.final_text
                             turn_complete = True
                             result.interrupted = True
                             result.error = (
@@ -735,8 +780,13 @@ class CodexAppServerSession:
 
             # Project into messages
             projection = projector.project(note)
-            if _is_completed_final_answer_item(note):
-                saw_completed_final_answer = True
+            is_protocol_final = _is_completed_final_answer_item(note)
+            if is_protocol_final and projection.final_text:
+                final_answer_completion_deadline = (
+                    time.monotonic()
+                    + _FINAL_ANSWER_COMPLETION_GRACE_SECONDS
+                )
+                completed_final_answer_text = projection.final_text
             if projection.messages:
                 result.projected_messages.extend(projection.messages)
             if projection.is_tool_iteration:
@@ -752,13 +802,16 @@ class CodexAppServerSession:
                     last_tool_completion_at = None
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
-                # (e.g. partial then final). Take the last one as canonical.
-                result.final_text = projection.final_text
+                # (e.g. commentary then final). Once the protocol identifies
+                # a final_answer, later commentary cannot replace its payload.
+                if is_protocol_final or completed_final_answer_text is None:
+                    result.final_text = projection.final_text
                 # Some codex builds tear a turn down by emitting a
                 # `<turn_aborted>` marker in the agent message text and
                 # never sending turn/completed. Treat the marker itself
                 # as terminal so we don't burn the full deadline.
                 if _has_turn_aborted_marker(projection.final_text):
+                    result.final_text = projection.final_text
                     turn_complete = True
                     result.interrupted = True
                     result.error = (
@@ -770,39 +823,56 @@ class CodexAppServerSession:
                 turn_status = (
                     (note.get("params") or {}).get("turn") or {}
                 ).get("status")
-                if turn_status and turn_status not in {"completed", "interrupted"}:
+                if turn_status == "interrupted":
+                    result.interrupted = True
+                elif turn_status and turn_status != "completed":
                     err_obj = (
                         (note.get("params") or {}).get("turn") or {}
                     ).get("error")
-                    if err_obj:
-                        err_msg = _format_responses_error(err_obj, str(turn_status))
-                        # If the turn failed for an auth/refresh reason,
-                        # rewrite the error into a re-auth hint AND mark
-                        # the session for retirement.
-                        stderr_blob = "\n".join(
-                            self._client.stderr_tail(40)
+                    err_msg = (
+                        _format_responses_error(err_obj, str(turn_status))
+                        if err_obj
+                        else f"turn ended status={turn_status}"
+                    )
+                    # If the turn failed for an auth/refresh reason,
+                    # rewrite the error into a re-auth hint AND mark
+                    # the session for retirement.
+                    stderr_blob = "\n".join(
+                        self._client.stderr_tail(40)
+                    )
+                    hint = _classify_oauth_failure(err_msg, stderr_blob)
+                    if hint is not None:
+                        result.error = hint
+                        result.should_retire = True
+                    elif err_obj:
+                        result.error = self._format_error_with_stderr(
+                            f"turn ended status={turn_status}", err_msg
                         )
-                        hint = _classify_oauth_failure(err_msg, stderr_blob)
-                        if hint is not None:
-                            result.error = hint
-                            result.should_retire = True
-                        else:
-                            result.error = self._format_error_with_stderr(
-                                f"turn ended status={turn_status}", err_msg
-                            )
+                    else:
+                        result.error = err_msg
+
+        if (
+            turn_complete
+            and not result.interrupted
+            and result.error is None
+            and completed_final_answer_text
+        ):
+            result.final_text = completed_final_answer_text
 
         if (
             not turn_complete
             and not result.interrupted
-            and saw_completed_final_answer
-            and result.final_text
+            and final_answer_completion_deadline is not None
+            and completed_final_answer_text
             and result.error is None
         ):
             logger.warning(
-                "codex app-server turn reached deadline after a completed "
-                "final_answer item but before turn/completed; accepting the "
-                "protocol-marked final text as the terminal response"
+                "codex app-server turn ended its completion wait after a "
+                "completed final_answer item but before turn/completed; "
+                "accepting the protocol-marked final text as the terminal "
+                "response"
             )
+            result.final_text = completed_final_answer_text
             turn_complete = True
 
         if not turn_complete and not result.interrupted:
