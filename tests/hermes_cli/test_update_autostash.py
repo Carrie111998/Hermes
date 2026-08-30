@@ -108,7 +108,7 @@ def test_reload_updated_runtime_modules_restores_new_hermes_constants_symbol(mon
 
 
 # ---------------------------------------------------------------------------
-# ff-only fallback to reset --hard on diverged history
+# ff-only recovery for diverged history
 # ---------------------------------------------------------------------------
 
 def _make_update_side_effect(
@@ -131,6 +131,10 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "merge-base" in joined and "--fork-point" in joined:
+            return SimpleNamespace(stdout="abc123\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "--verify" in joined and "HEAD" in joined:
+            return SimpleNamespace(stdout="abc123\n", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
@@ -163,7 +167,7 @@ def _make_update_side_effect(
 
 
 # ---------------------------------------------------------------------------
-# reset --hard failure — don't attempt stash restore
+# failed divergence recovery — don't attempt stash restore
 # ---------------------------------------------------------------------------
 
 def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, capsys):
@@ -262,6 +266,10 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
     # run into exit 1 (gateway_fleet_restart_incomplete).
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._restart_macos_launchd_gateways",
+        lambda restarted, failed, timeout: None,
     )
     return restore_calls, discard_calls, park_calls
 
