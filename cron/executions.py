@@ -54,8 +54,10 @@ def scheduled_fire_identity(job_id: str, scheduled_for: str) -> str:
 
 
 def _connect() -> sqlite3.Connection:
+    from cron.jobs import _ensure_cron_dir
+
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_cron_dir(path.parent)
     return sqlite3.connect(path, timeout=5)
 
 
