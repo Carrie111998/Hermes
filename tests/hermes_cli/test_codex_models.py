@@ -76,7 +76,7 @@ def _make_jwt(payload: dict) -> str:
 
 class TestExtractChatgptAccountId:
     def test_extracts_account_id_from_jwt(self):
-        token = _make_jwt({"https://api.openai.com/profile": {"chatgpt_account_id": "acct-abc123"}})
+        token = _make_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-abc123"}})
         result = _extract_chatgpt_account_id(token)
         assert result == "acct-abc123"
 
@@ -91,7 +91,7 @@ class TestExtractChatgptAccountId:
         assert _extract_chatgpt_account_id("") is None
 
     def test_returns_none_for_empty_account_id(self):
-        token = _make_jwt({"https://api.openai.com/profile": {"chatgpt_account_id": ""}})
+        token = _make_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": ""}})
         assert _extract_chatgpt_account_id(token) is None
 
 
