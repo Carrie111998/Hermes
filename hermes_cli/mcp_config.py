@@ -9,6 +9,7 @@ configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
 """
 
 import asyncio
+from collections.abc import Mapping
 import logging
 import math
 import os
@@ -332,16 +333,33 @@ def _parse_configured_health_check(
     return tool_name, arguments
 
 
-def _health_field(value: Any, snake: str, camel: str, default: Any = None) -> Any:
-    if isinstance(value, dict):
-        return value.get(snake, value.get(camel, default))
-    return getattr(value, snake, getattr(value, camel, default))
+_HEALTH_VALUE_MISSING = object()
+_HEALTH_VALUE_CONFLICT = object()
+
+
+def _health_value(value: Any, field: str, default: Any = _HEALTH_VALUE_MISSING) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(field, default)
+    return getattr(value, field, default)
+
+
+def _health_alias_value(value: Any, snake: str, camel: str) -> Any:
+    """Return an alias value, failing closed when both spellings disagree."""
+    snake_value = _health_value(value, snake)
+    camel_value = _health_value(value, camel)
+    if snake_value is not _HEALTH_VALUE_MISSING and camel_value is not _HEALTH_VALUE_MISSING:
+        if type(snake_value) is not type(camel_value) or snake_value != camel_value:
+            return _HEALTH_VALUE_CONFLICT
+        return snake_value
+    if snake_value is not _HEALTH_VALUE_MISSING:
+        return snake_value
+    return camel_value
 
 
 def _health_tool_is_read_only(tool: Any) -> bool:
     """Interpret the MCP read-only annotation without importing runtime internals."""
-    annotations = _health_field(tool, "annotations", "annotations")
-    return _health_field(annotations, "read_only_hint", "readOnlyHint", False) is True
+    annotations = _health_value(tool, "annotations")
+    return _health_alias_value(annotations, "read_only_hint", "readOnlyHint") is True
 
 
 async def _run_configured_health_check(
@@ -353,7 +371,7 @@ async def _run_configured_health_check(
         (
             tool
             for tool in getattr(server, "_tools", [])
-            if getattr(tool, "name", None) == tool_name
+            if _health_value(tool, "name", None) == tool_name
         ),
         None,
     )
@@ -376,7 +394,10 @@ async def _run_configured_health_check(
         logger.debug("MCP application health check failed for '%s'", tool_name)
         raise RuntimeError("configured health check RPC failed") from None
 
-    if _health_field(result, "is_error", "isError", False):
+    error_state = _health_alias_value(result, "is_error", "isError")
+    if error_state is _HEALTH_VALUE_CONFLICT:
+        raise RuntimeError("configured health check returned an ambiguous error state")
+    if error_state is not _HEALTH_VALUE_MISSING and error_state is not False:
         raise RuntimeError("configured health check returned an error")
     return tool_name
 
@@ -429,11 +450,14 @@ def _probe_single_server(
         )
         try:
             for t in server._tools:
-                desc = getattr(t, "description", "") or ""
+                tool_display_name = _health_value(t, "name", None)
+                if not isinstance(tool_display_name, str):
+                    continue
+                desc = _health_value(t, "description", "") or ""
                 # Truncate long descriptions for display
                 if len(desc) > 80:
                     desc = desc[:77] + "..."
-                tools_found.append((t.name, desc))
+                tools_found.append((tool_display_name, desc))
             if health_check is not None:
                 health_tool_name = await _run_configured_health_check(
                     server, health_check
