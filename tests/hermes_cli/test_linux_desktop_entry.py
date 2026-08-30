@@ -26,6 +26,13 @@ def _make_project(tmp_path: Path) -> Path:
     return root
 
 
+def _hermes_not_on_path(monkeypatch, tmp_path) -> None:
+    """Pin ``shutil.which`` and ``Path.home`` so neither the host's real
+    hermes wrapper nor ``~/.local/bin/hermes`` can leak into tests."""
+    monkeypatch.setattr(lde.shutil, "which", lambda name: None)
+    monkeypatch.setattr(lde.Path, "home", staticmethod(lambda: tmp_path))
+
+
 def _parse(entry_text: str) -> dict:
     values = {}
     for line in entry_text.splitlines():
@@ -40,6 +47,7 @@ def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, mo
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
     hermes_bin.write_text("", encoding="utf-8")
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
     )
@@ -68,6 +76,7 @@ def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, mo
 
 def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
@@ -78,6 +87,7 @@ def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
 
 def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
@@ -101,13 +111,17 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     hermes_bin.parent.mkdir()
     hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    # sys.executable must be prefixed UNRESOLVED: a venv interpreter is
+    # usually a symlink to its base Python, and resolving it bypasses
+    # pyvenv.cfg, losing the venv site-packages under desktop activation.
+    interpreter = str(sys.executable)
     assert exec_line.split(" ")[0].strip('"') == interpreter
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
@@ -119,6 +133,7 @@ def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypat
     hermes_bin.parent.mkdir()
     hermes_bin.write_text('#!/bin/bash\nexec /opt/hermes/venv/bin/python "$@"\n', encoding="utf-8")
     hermes_bin.chmod(0o755)
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
@@ -135,9 +150,13 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
+    # The venv writes the UNRESOLVED interpreter path into console-script
+    # shebangs; resolving it would follow the venv python symlink to its
+    # base and misclassify the script as needing an external interpreter.
+    interpreter = str(sys.executable)
     hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
@@ -151,6 +170,7 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
     calls: list[Path] = []
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda d: calls.append(d) or [])
@@ -257,6 +277,7 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     spaced = tmp_path / "my apps" / "hermes"
     spaced.parent.mkdir()
     spaced.write_text("", encoding="utf-8")
+    _hermes_not_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(spaced))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
@@ -264,3 +285,51 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line == f'"{spaced}" desktop'
+
+
+# ---------------------------------------------------------------------------
+# Exec resolution: PATH wrapper must win over argv[0]
+# ---------------------------------------------------------------------------
+
+
+def test_exec_prefers_path_wrapper_over_argv0(tmp_path, xdg_home, monkeypatch):
+    """Desktop activation runs outside a login shell: the PATH-installed
+    wrapper (which execs the repo venv and unsets PYTHONPATH) must be used
+    even when argv[0] resolves to the bare repo launcher."""
+    root = _make_project(tmp_path)
+    wrapper = tmp_path / "bin" / "hermes"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(lde.shutil, "which", lambda name: str(wrapper))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(root / "hermes")
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{wrapper} desktop"
+
+
+def test_exec_falls_back_to_home_local_bin_when_not_on_path(tmp_path, xdg_home, monkeypatch):
+    """When the wrapper is not on PATH (minimal activation env), the
+    canonical ``~/.local/bin/hermes`` is still preferred over argv[0]."""
+    root = _make_project(tmp_path)
+    fake_home = tmp_path / "home"
+    wrapper = fake_home / ".local" / "bin" / "hermes"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    _hermes_not_on_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(lde.Path, "home", staticmethod(lambda: fake_home))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(root / "hermes")
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{wrapper} desktop"
