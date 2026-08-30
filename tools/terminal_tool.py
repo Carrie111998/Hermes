@@ -4167,6 +4167,29 @@ def _handle_terminal(args, **kw):
             "command in 'command'. Use execute_code(code=...) for Python; "
             "for shell, retry as terminal(command=...)."
         )
+    if "command" not in args:
+        known_parameters = {
+            "background",
+            "timeout",
+            "workdir",
+            "pty",
+            "notify",
+            "notify_on_complete",
+            "watch_patterns",
+        }
+        unexpected = sorted(set(args) - known_parameters)
+        if unexpected:
+            parameter = unexpected[0]
+            return tool_error(
+                f"terminal received an unrecognized '{parameter}' parameter, "
+                "but it requires a shell command string in 'command'. Do not "
+                "pass a command category or token list; retry as "
+                'terminal(command="...").'
+            )
+        return tool_error(
+            "terminal requires a shell command string in 'command'. Retry as "
+            'terminal(command="...").'
+        )
     # `notify` is the advertised interface: true → notify_on_complete,
     # ['pat', ...] → watch_patterns. The legacy args remain accepted
     # (old transcripts, internal callers); explicit `notify` wins.
