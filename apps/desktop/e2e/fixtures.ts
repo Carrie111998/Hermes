@@ -27,7 +27,7 @@ import * as path from 'node:path'
 
 import { _electron, type ElectronApplication, type Page } from '@playwright/test'
 
-import { startMockServer, type MockServerOptions } from './mock-server'
+import { type MockServerOptions, startMockServer } from './mock-server'
 import { installErrorBannerGuard } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
@@ -280,33 +280,35 @@ function assertDistBuilt(): void {
 }
 
 /**
- * Find the Electron binary. Prefer the desktop workspace package binary;
- * fall back to PATH for development shells that provide Electron externally.
+ * Find the Electron binary. Prefer the platform-native executable installed in
+ * either the repository or desktop package, then use PATH on non-Windows hosts.
  */
 export function findElectron(): string {
   // In dev mode, we use the `electron` binary directly (not the packaged app).
   // The dev:electron script in package.json does exactly this: `electron .`
   // after building. We replicate that here.
-  const localElectron = path.join(
-    DESKTOP_ROOT,
-    'node_modules',
-    'electron',
-    'dist',
-    process.platform === 'win32' ? 'electron.exe' : 'electron',
-  )
+  const basename = process.platform === 'win32' ? 'electron.exe' : 'electron'
 
-  if (fs.existsSync(localElectron)) {
-    return localElectron
+  const localCandidates = [
+    path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', basename),
+    path.join(DESKTOP_ROOT, 'node_modules', 'electron', 'dist', basename),
+  ]
+
+  for (const candidate of localCandidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
   }
 
-  // Fall back to PATH, using a native Windows resolver so the returned path
-  // is spawnable by Playwright rather than an MSYS /c/... shim path.
-  const result = spawnSync(process.platform === 'win32' ? 'where.exe' : 'which', ['electron'], {
-    encoding: 'utf8',
-  })
+  if (process.platform !== 'win32') {
+    // Fall back to PATH
+    const result = spawnSync('which', ['electron'], {
+      encoding: 'utf8',
+    })
 
-  if (result.status === 0 && result.stdout.trim()) {
-    return result.stdout.split(/\r?\n/).find(line => line.trim())!.trim()
+    if (result.status === 0 && result.stdout.trim()) {
+      return result.stdout.trim()
+    }
   }
 
   throw new Error(
@@ -372,6 +374,7 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  mockServer?: MockServerOptions
 }
 
 /**
@@ -381,10 +384,6 @@ export interface MockBackendOptions {
  *   3. Launch the desktop app
  *   4. Return handles for test interaction
  */
-export interface MockBackendOptions {
-  mockServer?: MockServerOptions
-}
-
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
   // 1. Start mock server
   const mock = await startMockServer(options.mockServer)
@@ -639,6 +638,7 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
       // `position: fixed; inset: 0`. If the hit element or an ancestor
       // is a full-viewport fixed overlay, we're still covered.
       let node: Element | null = el
+
       while (node) {
         const cs = window.getComputedStyle(node)
 
