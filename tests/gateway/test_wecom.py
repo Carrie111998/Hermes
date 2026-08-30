@@ -1000,7 +1000,7 @@ class TestSendStreamFrame:
         payload = "hello world"
         ok = await adapter.send_stream_frame(payload, chat_id="chat-1")
 
-        assert ok is True
+        assert ok
         # seed + content = 2 frames
         assert len(adapter._sent_frames) == 2
         seed_frame = adapter._sent_frames[0]
@@ -1066,7 +1066,7 @@ class TestSendStreamFrame:
         # Send another — still coalesces (overwrites previous coalesced)
         ok = await adapter.send_stream_frame("alpha beta", chat_id="chat-1")
 
-        assert ok is True  # returns True (coalesced successfully)
+        assert ok  # returns True (coalesced successfully)
         # Still only 1 call to _send_json (the seed)
         assert adapter._send_json.await_count == 1
 
@@ -1098,7 +1098,7 @@ class TestSendStreamFrame:
 
         before = len(adapter._sent_frames)
         ok = await adapter.send_stream_frame("still-sends", chat_id="chat-1", turn_id=turn_id)
-        assert ok is True
+        assert ok
         # Frame was sent (not dropped).
         assert len(adapter._sent_frames) > before
 
@@ -1125,7 +1125,7 @@ class TestSendStreamFrame:
             "partial final", chat_id="chat-1", finalize=True, turn_id=turn_id,
         )
 
-        assert ok is True
+        assert ok
         # After finalize, turn should be cleaned up
         assert turn_key not in adapter._stream_turns
         # Finalize goes through _send_reply_queued (mocked).
@@ -1153,7 +1153,7 @@ class TestSendStreamFrameFailures:
 
         ok = await adapter.send_stream_frame("hi", chat_id="unknown-chat")
 
-        assert ok is False
+        assert not ok
         adapter._send_reply_request.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1165,7 +1165,7 @@ class TestSendStreamFrameFailures:
 
         ok = await adapter.send_stream_frame("hi", chat_id=None)
 
-        assert ok is False
+        assert not ok
         adapter._send_reply_request.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1205,7 +1205,7 @@ class TestSendStreamFrameFailures:
         # Now try to finalize — ack returns 846608.
         ok = await adapter.send_stream_frame("hello final", chat_id="chat-1", finalize=True, turn_id=turn_id)
 
-        assert ok is False
+        assert not ok
         assert "chat-1" in adapter._stream_expired_chats
         # This specific turn should be cleaned up
         turn_key = "chat-1:test-turn-2"
@@ -1224,12 +1224,12 @@ class TestSendStreamFrameFailures:
 
         # Without turn_id: short-circuits immediately
         ok = await adapter.send_stream_frame("hi", chat_id="chat-1")
-        assert ok is False
+        assert not ok
         adapter._send_reply_request.assert_not_awaited()
 
         # With a new turn_id: also short-circuits (can't create new turn)
         ok = await adapter.send_stream_frame("hi", chat_id="chat-1", turn_id="new-turn")
-        assert ok is False
+        assert not ok
         adapter._send_reply_request.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1272,7 +1272,7 @@ class TestSendStreamFrameFailures:
         turn_id = "test-turn-3"
         ok = await adapter.send_stream_frame("hi", chat_id="chat-1", turn_id=turn_id)
 
-        assert ok is True
+        assert ok
         # Intermediate failure keeps the turn alive and leaves the chat usable.
         turn_key = "chat-1:test-turn-3"
         assert turn_key in adapter._stream_turns
@@ -1469,7 +1469,7 @@ class TestSerialCoalesceFrameFlow:
         self._mock_send_json_with_immediate_ack(adapter)
 
         ok = await adapter.send_stream_frame("Hello.", chat_id="chat-1")
-        assert ok is True
+        assert ok
         # seed + content = 2 frames (the 6-char body is NOT buffered).
         assert len(adapter._sent_frames) == 2
         assert adapter._sent_frames[0]["body"]["stream"]["content"] == "<think></think>"
@@ -1496,7 +1496,7 @@ class TestSerialCoalesceFrameFlow:
         ok = await adapter.send_stream_frame(
             "Short.", chat_id="chat-1", finalize=True,
         )
-        assert ok is True
+        assert ok
         # seed + content + finalize = 3 frames.
         assert len(adapter._sent_frames) == 3
         final_frame = adapter._sent_frames[-1]
@@ -1518,7 +1518,7 @@ class TestSerialCoalesceFrameFlow:
 
         await adapter.send_stream_frame("same text", chat_id="chat-1")
         ok = await adapter.send_stream_frame("same text", chat_id="chat-1")
-        assert ok is True
+        assert ok
         # seed + first content only; the identical repeat was deduped.
         assert len(adapter._sent_frames) == 2
         assert adapter._sent_frames[-1]["body"]["stream"]["content"] == "same text"
