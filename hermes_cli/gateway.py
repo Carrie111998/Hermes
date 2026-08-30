@@ -36,6 +36,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
+    EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     is_gateway_supervisor_process,
@@ -7969,7 +7970,9 @@ def _gateway_command_inner(args):
     if subcmd is None or subcmd == "run":
         if _maybe_redirect_run_to_s6_supervision(args):
             return  # unreachable; execvp doesn't return
-        external_supervisor = getattr(args, "external_supervisor", False)
+        external_supervisor = getattr(args, "external_supervisor", False) or (
+            os.getenv(EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV) == str(os.getpid())
+        )
         if external_supervisor:
             os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
         verbose = getattr(args, "verbose", 0)

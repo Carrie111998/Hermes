@@ -12,35 +12,23 @@ DISPATCHER = REPO_ROOT / "docker" / "entrypoint-dispatch.sh"
 
 
 @pytest.mark.parametrize(
-    ("argv", "expected"),
+    "argv",
     [
-        (["gateway"], ["gateway", "run", "--external-supervisor"]),
-        (["gateway", "run"], ["gateway", "run", "--external-supervisor"]),
-        (
-            ["--profile", "work", "gateway", "run"],
-            ["--profile", "work", "gateway", "run", "--external-supervisor"],
-        ),
-        (
-            ["-p", "work", "gateway"],
-            ["-p", "work", "gateway", "run", "--external-supervisor"],
-        ),
-        (
-            ["--profile=work", "gateway", "run"],
-            ["--profile=work", "gateway", "run", "--external-supervisor"],
-        ),
-        (
-            ["hermes", "gateway", "run"],
-            ["hermes", "gateway", "run", "--external-supervisor"],
-        ),
-        (
-            ["hermes", "gateway"],
-            ["hermes", "gateway", "run", "--external-supervisor"],
-        ),
-        (["chat"], ["chat"]),
+        ["gateway"],
+        ["gateway", "run"],
+        ["--profile", "work", "gateway", "run"],
+        ["-p", "work", "gateway"],
+        ["--profile=work", "gateway", "run"],
+        ["hermes", "gateway", "run"],
+        ["--accept-hooks", "gateway", "run"],
+        ["gateway", "--accept-hooks", "run"],
+        ["gateway", "--accept-hooks"],
+        ["--profile", "work", "gateway", "--accept-hooks"],
+        ["chat"],
     ],
 )
-def test_non_pid_one_dispatch_marks_direct_gateway_run(tmp_path, argv, expected):
-    """Only direct gateway launches receive explicit supervisor authority."""
+def test_non_pid_one_dispatch_binds_direct_process_slot(tmp_path, argv):
+    """The wrapper keeps argv and receives authority bound to its exec PID."""
     stage2 = tmp_path / "stage2.sh"
     stage2.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     stage2.chmod(0o755)
@@ -49,13 +37,16 @@ def test_non_pid_one_dispatch_marks_direct_gateway_run(tmp_path, argv, expected)
     wrapper = tmp_path / "wrapper.sh"
     wrapper.write_text(
         "#!/bin/sh\n"
-        'printf "%s\\n" "$@" > "$RECORD"\n',
+        'printf "%s\\n" "$HERMES_GATEWAY_EXTERNAL_SUPERVISOR_PID" > "$RECORD"\n'
+        'printf "%s\\n" "$$" >> "$RECORD"\n'
+        'printf "%s\\n" "$@" >> "$RECORD"\n',
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
 
     env = os.environ.copy()
     env.pop("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", None)
+    env.pop("HERMES_GATEWAY_EXTERNAL_SUPERVISOR_PID", None)
     env.update(
         {
             "HERMES_ENTRYPOINT_STAGE2": str(stage2),
@@ -73,4 +64,6 @@ def test_non_pid_one_dispatch_marks_direct_gateway_run(tmp_path, argv, expected)
     )
 
     assert result.returncode == 0, result.stderr
-    assert record.read_text(encoding="utf-8").splitlines() == expected
+    lines = record.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == lines[1]
+    assert lines[2:] == argv
