@@ -2866,6 +2866,44 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     _backfill_owner_events(conn)
 
 
+def _owner_contract_payload(kind: str, payload: object) -> Optional[dict[str, str]]:
+    """Return the allowlisted payload for the narrow owner-read contract."""
+    if kind != "created" or not isinstance(payload, dict):
+        return None
+    safe: dict[str, str] = {}
+    for key in ("by", "from_decompose_of"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            safe[key] = value.strip()
+    return safe or None
+
+
+def _owner_contract_payload_from_json(
+    kind: str, raw_payload: object,
+) -> Optional[dict[str, str]]:
+    """Decode and allowlist one stored owner payload, failing closed."""
+    try:
+        decoded = json.loads(raw_payload) if raw_payload else None
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        decoded = None
+    return _owner_contract_payload(kind, decoded)
+
+
+def _scrub_owner_event_payloads(conn: sqlite3.Connection) -> None:
+    """Remove payload fields outside the owner contract from durable rows."""
+    rows = conn.execute(
+        "SELECT id, kind, payload FROM owner_events WHERE payload IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        safe = _owner_contract_payload_from_json(row["kind"], row["payload"])
+        serialized = json.dumps(safe, ensure_ascii=False) if safe is not None else None
+        if serialized != row["payload"]:
+            conn.execute(
+                "UPDATE owner_events SET payload = ? WHERE id = ?",
+                (serialized, row["id"]),
+            )
+
+
 def _backfill_owner_events(conn: sqlite3.Connection) -> None:
     """Seed one durable baseline receipt for every pre-contract task.
 
@@ -2889,34 +2927,44 @@ def _backfill_owner_events(conn: sqlite3.Connection) -> None:
         task_columns
     ):
         return
-    conn.execute(
+    rows = conn.execute(
         """
-        INSERT OR IGNORE INTO owner_events (
-            task_id, kind, title, created_by, task_created_at,
-            payload, archived, created_at
-        )
         SELECT
-            t.id,
-            'created',
-            t.title,
-            t.created_by,
-            t.created_at,
+            t.id, t.title, t.created_by, t.created_at, t.status,
             (
                 SELECT e.payload
                   FROM task_events e
                  WHERE e.task_id = t.id AND e.kind = 'created'
                  ORDER BY e.id ASC
                  LIMIT 1
-            ),
-            CASE WHEN t.status = 'archived' THEN 1 ELSE 0 END,
-            t.created_at
+            ) AS source_payload
           FROM tasks t
          WHERE NOT EXISTS (
             SELECT 1 FROM owner_events o
              WHERE o.task_id = t.id AND o.kind = 'created'
          )
         """
-    )
+    ).fetchall()
+    for row in rows:
+        safe = _owner_contract_payload_from_json("created", row["source_payload"])
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO owner_events (
+                task_id, kind, title, created_by, task_created_at,
+                payload, archived, created_at
+            ) VALUES (?, 'created', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                row["title"],
+                row["created_by"],
+                row["created_at"],
+                json.dumps(safe, ensure_ascii=False) if safe is not None else None,
+                1 if row["status"] == "archived" else 0,
+                row["created_at"],
+            ),
+        )
+    _scrub_owner_event_payloads(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -4395,6 +4443,7 @@ def _append_owner_event(
     if row is None:
         return
     event_time = int(time.time()) if created_at is None else int(created_at)
+    safe_payload = _owner_contract_payload(kind, payload)
     conn.execute(
         """
         INSERT INTO owner_events (
@@ -4408,7 +4457,7 @@ def _append_owner_event(
             row["title"],
             row["created_by"],
             row["created_at"],
-            json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+            json.dumps(safe_payload, ensure_ascii=False) if safe_payload is not None else None,
             1 if row["status"] == "archived" else 0,
             event_time,
         ),
@@ -4437,16 +4486,16 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
-    owner_kind = {
-        "created": "created",
-        "edited": "updated",
-        "specified": "updated",
-        "archived": "archived",
-    }.get(kind)
-    if owner_kind is not None:
-        _append_owner_event(
-            conn, task_id, owner_kind, payload, created_at=now
-        )
+    if kind == "created":
+        _append_owner_event(conn, task_id, "created", payload, created_at=now)
+    elif (
+        kind == "specified"
+        and isinstance(payload, dict)
+        and "title" in payload.get("changed_fields", ())
+    ):
+        _append_owner_event(conn, task_id, "updated", created_at=now)
+    elif kind == "archived":
+        _append_owner_event(conn, task_id, "archived", created_at=now)
 
 
 def _end_run(

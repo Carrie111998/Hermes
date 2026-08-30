@@ -266,13 +266,9 @@ def _owner_task(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _owner_event(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        payload = json.loads(row["payload"]) if row["payload"] else None
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="Kanban creation provenance payload is malformed",
-        ) from exc
+    payload = kanban_db._owner_contract_payload_from_json(
+        row["kind"], row["payload"],
+    )
     return {
         "id": int(row["event_id"]),
         "kind": row["kind"],
@@ -533,10 +529,7 @@ def owner_snapshot(
             receipts.append({
                 "task": task,
                 "created_event": created_event,
-                "provenance_complete": (
-                    task["created_by"] is not None
-                    and isinstance(created_event["payload"], dict)
-                ),
+                "provenance_complete": task["created_by"] is not None,
                 "archived": task_row["status"] == "archived",
             })
         return {
@@ -1267,6 +1260,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
+            title_changed = (
+                payload.title is not None
+                and payload.title.strip() != task.title
+            )
             with kanban_db.write_txn(conn):
                 sets, vals = [], []
                 if payload.title is not None:
@@ -1282,6 +1279,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
                 )
                 kanban_db._append_event(conn, task_id, "edited")
+                if title_changed:
+                    kanban_db._append_owner_event(conn, task_id, "updated")
             # Mutation-boundary observer (RFC #58548), post-commit. Field
             # names only — values never leave the DB via this payload.
             kanban_db.notify_task_updated(
@@ -1455,12 +1454,7 @@ def _set_status_direct(
             ),
         )
         if prev["status"] == "archived" and effective_status != "archived":
-            kanban_db._append_owner_event(
-                conn,
-                task_id,
-                "updated",
-                {"status": effective_status},
-            )
+            kanban_db._append_owner_event(conn, task_id, "updated")
         if reopening_satisfied_parent:
             _invalidate_descendants_for_parent_reopen(
                 conn,

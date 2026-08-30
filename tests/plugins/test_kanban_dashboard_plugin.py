@@ -278,6 +278,48 @@ def test_owner_snapshot_returns_bounded_creation_receipts_with_exact_provenance(
     assert child_receipt["archived"] is False
 
 
+def test_owner_contract_excludes_non_contract_creation_payload(client):
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(
+            conn, title="parent", created_by="agent:main",
+        )
+        task_id = kb.create_task(
+            conn,
+            title="child",
+            created_by="agent:main",
+            parents=[parent_id],
+            workspace_kind="dir",
+            workspace_path="/private/owner-contract-secret",
+            model_override="private-model",
+            provider_override="private-provider",
+        )
+    finally:
+        conn.close()
+
+    snapshot = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    ).json()
+    receipt = next(
+        row for row in snapshot["receipts"] if row["task"]["id"] == task_id
+    )
+    assert receipt["created_event"]["payload"] is None
+    assert receipt["provenance_complete"] is True
+
+    events = client.get(
+        "/api/plugins/kanban/owner-events?board=default&after=0&limit=20"
+    ).json()["events"]
+    created = next(
+        event for event in events
+        if event["kind"] == "created" and event["task"]["id"] == task_id
+    )
+    assert created["payload"] is None
+    exposed = json.dumps({"snapshot": snapshot, "events": events})
+    assert "/private/owner-contract-secret" not in exposed
+    assert "private-model" not in exposed
+    assert "private-provider" not in exposed
+
+
 def test_owner_contract_routes_opt_into_generic_bearer_auth():
     _load_plugin_router()
     assert is_token_route("/api/plugins/kanban/owner-snapshot")
@@ -399,7 +441,7 @@ def test_owner_events_advance_stable_cursor_and_emit_only_materialization_receip
     assert [(event["kind"], event["task"]["id"]) for event in payload["events"]] == [
         ("created", child_id), ("archived", created["id"]),
     ], payload["events"]
-    assert payload["events"][0]["payload"]["parents"] == []
+    assert payload["events"][0]["payload"] is None
 
 
 def test_owner_events_reject_a_cursor_ahead_of_the_authoritative_stream(client):
@@ -525,6 +567,158 @@ def test_owner_snapshot_collapses_duplicate_legacy_creation_events(kanban_home, 
     assert receipt["created_event"]["payload"] != {"by": "duplicate"}
 
 
+def test_owner_snapshot_scrubs_preexisting_raw_owner_payload(kanban_home, client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="legacy owner row", created_by="importer")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE owner_events SET payload = ? WHERE task_id = ? AND kind = 'created'",
+                (
+                    json.dumps({
+                        "by": "importer",
+                        "from_decompose_of": "t_source",
+                        "parents": ["t_secret_parent"],
+                        "workspace_path": "/private/legacy-path",
+                        "summary": "private result summary",
+                    }),
+                    task_id,
+                ),
+            )
+            kb._append_owner_event(conn, task_id, "updated")
+            conn.execute(
+                "UPDATE owner_events SET payload = ? "
+                "WHERE task_id = ? AND kind = 'updated'",
+                (json.dumps({"summary": "private historical summary"}), task_id),
+            )
+    finally:
+        conn.close()
+
+    response = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    )
+    assert response.status_code == 200, response.text
+    receipt = next(
+        row for row in response.json()["receipts"] if row["task"]["id"] == task_id
+    )
+    assert receipt["created_event"]["payload"] == {
+        "by": "importer",
+        "from_decompose_of": "t_source",
+    }
+    events = client.get(
+        "/api/plugins/kanban/owner-events?board=default&after=0&limit=20"
+    ).json()["events"]
+    updated = next(event for event in events if event["kind"] == "updated")
+    assert updated["payload"] is None
+
+
+def test_owner_backfill_never_commits_raw_payload_before_scrub(
+    kanban_home, monkeypatch,
+):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="legacy backfill", created_by="importer")
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM owner_events WHERE task_id = ?", (task_id,))
+            conn.execute(
+                "UPDATE task_events SET payload = ? "
+                "WHERE task_id = ? AND kind = 'created'",
+                (
+                    json.dumps({
+                        "by": "importer",
+                        "from_decompose_of": "t_source",
+                        "parents": ["t_secret_parent"],
+                        "workspace_path": "/private/transient-leak",
+                    }),
+                    task_id,
+                ),
+            )
+
+        def fail_scrub(_conn):
+            raise RuntimeError("simulated scrub interruption")
+
+        monkeypatch.setattr(kb, "_scrub_owner_event_payloads", fail_scrub)
+        with pytest.raises(RuntimeError, match="simulated scrub interruption"):
+            kb._backfill_owner_events(conn)
+
+        row = conn.execute(
+            "SELECT payload FROM owner_events WHERE task_id = ? AND kind = 'created'",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(row["payload"]) == {
+            "by": "importer",
+            "from_decompose_of": "t_source",
+        }
+    finally:
+        conn.close()
+
+
+def test_owner_response_reapplies_payload_allowlist(client, monkeypatch):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="unsafe stored row", created_by="importer")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE owner_events SET payload = ? "
+                "WHERE task_id = ? AND kind = 'created'",
+                (
+                    json.dumps({
+                        "by": "importer",
+                        "from_decompose_of": "t_source",
+                        "parents": ["t_secret_parent"],
+                        "summary": "private summary",
+                    }),
+                    task_id,
+                ),
+            )
+            kb._append_owner_event(conn, task_id, "updated")
+            conn.execute(
+                "UPDATE owner_events SET payload = ? "
+                "WHERE task_id = ? AND kind = 'updated'",
+                (json.dumps({"summary": "private summary"}), task_id),
+            )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(kb, "_scrub_owner_event_payloads", lambda _conn: None)
+    response = client.get(
+        "/api/plugins/kanban/owner-events?board=default&after=0&limit=20"
+    )
+    assert response.status_code == 200, response.text
+    events = response.json()["events"]
+    created = next(event for event in events if event["kind"] == "created")
+    updated = next(event for event in events if event["kind"] == "updated")
+    assert created["payload"] == {
+        "by": "importer",
+        "from_decompose_of": "t_source",
+    }
+    assert updated["payload"] is None
+
+
+def test_owner_response_handles_non_utf8_payload_fail_closed(client, monkeypatch):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="binary stored row", created_by="importer")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE owner_events SET payload = ? "
+                "WHERE task_id = ? AND kind = 'created'",
+                (b"\xff", task_id),
+            )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(kb, "_scrub_owner_event_payloads", lambda _conn: None)
+    response = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    )
+    assert response.status_code == 200, response.text
+    receipt = next(
+        row for row in response.json()["receipts"] if row["task"]["id"] == task_id
+    )
+    assert receipt["created_event"]["payload"] is None
+
+
 def test_owner_events_publish_current_title_updates_without_rewriting_creation(client):
     task = client.post(
         "/api/plugins/kanban/tasks", json={"title": "Original"},
@@ -544,6 +738,64 @@ def test_owner_events_publish_current_title_updates_without_rewriting_creation(c
     assert [(event["kind"], event["task"]["title"]) for event in payload["events"]] == [
         ("updated", "Renamed"),
     ]
+    assert payload["events"][0]["payload"] is None
+
+
+def test_owner_events_ignore_body_only_edits(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Body-only"},
+    ).json()["task"]
+    cursor = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    ).json()["event_cursor"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"body": "private task content"},
+    )
+    assert response.status_code == 200
+
+    payload = client.get(
+        f"/api/plugins/kanban/owner-events?board=default&after={cursor}&limit=20"
+    ).json()
+    assert payload["events"] == []
+
+
+def test_owner_events_ignore_completed_result_edits(client):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Completed", created_by="agent:main")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    finally:
+        conn.close()
+    cursor = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    ).json()["event_cursor"]
+
+    conn = kb.connect()
+    try:
+        assert kb.edit_completed_task_result(
+            conn,
+            task_id,
+            result="private result body",
+            summary="private result summary must not cross owner scope",
+            metadata={"private": "metadata"},
+        )
+    finally:
+        conn.close()
+
+    payload = client.get(
+        f"/api/plugins/kanban/owner-events?board=default&after={cursor}&limit=20"
+    ).json()
+    assert payload["events"] == []
+    snapshot = client.get(
+        "/api/plugins/kanban/owner-snapshot?board=default&limit=10"
+    ).json()
+    serialized = json.dumps(snapshot)
+    assert "private result summary" not in serialized
+    assert "private result body" not in serialized
+    assert '"private": "metadata"' not in serialized
 
 
 def test_owner_events_publish_title_changes_from_triage_specification(client):
