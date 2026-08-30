@@ -38,10 +38,12 @@ class FakeClient:
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
         self._request_handler = None  # Optional[Callable[[str, dict], dict]]
+        self.initialize_kwargs: dict[str, Any] = {}
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
         self._initialized = True
+        self.initialize_kwargs = kwargs
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
 
@@ -173,6 +175,49 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_initialize_identity_describes_hermes_not_backend(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.codex_version import get_codex_cli_version
+
+        binary = tmp_path / "codex"
+        binary.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.229.2'\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        client = FakeClient()
+        monkeypatch.setattr(
+            session_mod, "_get_hermes_client_version", lambda: "0.20.5"
+        )
+        session = make_session(client, codex_bin=str(binary))
+        session.ensure_started()
+
+        assert get_codex_cli_version(str(binary)) == "0.229.2"
+        assert client.initialize_kwargs == {
+            "client_name": "hermes",
+            "client_title": "Hermes Agent",
+            "client_version": "0.20.5",
+        }
+
+    def test_configured_executable_reaches_app_server_factory(self, monkeypatch):
+        client = FakeClient()
+        factory_kwargs = []
+        monkeypatch.setenv("HERMES_CODEX_BIN", "/opt/configured/codex")
+        monkeypatch.setattr(
+            session_mod, "_get_hermes_client_version", lambda: "0.20.5"
+        )
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **kwargs: factory_kwargs.append(kwargs) or client,
+        )
+        session.ensure_started()
+
+        assert factory_kwargs == [
+            {"codex_bin": "/opt/configured/codex", "codex_home": None}
+        ]
+        assert client.initialize_kwargs["client_version"] == "0.20.5"
 
     def test_close_idempotent(self):
         client = FakeClient()
