@@ -201,6 +201,9 @@ export async function refreshActiveProfile(): Promise<void> {
 
   try {
     const res = await hermesApi<ActiveProfileResponse>({
+      ...($activeGatewayProfile.get()
+        ? { profile: normalizeProfileKey($activeGatewayProfile.get()) }
+        : {}),
       path: '/api/profiles/active',
       timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
     })

@@ -238,6 +238,7 @@ function fakeDesktop() {
     revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
     onWindowStateChanged: vi.fn(() => () => undefined),
     touchBackend: vi.fn(async () => undefined),
+    reportBackendUsage: vi.fn(async () => ({ ok: true })),
     profile: { get: vi.fn(async () => ({ profile: 'default' })) }
   }
 }
@@ -1511,14 +1512,17 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     await advanceBackoff()
 
     const reconnectCalls = desktop.getConnection.mock.calls.slice(callsBeforeDrop)
+    // Must never retarget the primary socket at the named profile (#46651).
     expect(reconnectCalls.some(args => (args[0] ?? '').trim() === 'coder')).toBe(false)
-    expect(reconnectCalls.some(args => args.length === 0 || args[0] == null || args[0] === '')).toBe(true)
+    // #91050: while the UI is on a named profile, do not respawn the idle
+    // primary via getConnection(). Switching back to default reconnects it.
+    expect(reconnectCalls.some(args => args.length === 0 || args[0] == null || args[0] === '')).toBe(false)
 
     const primaryReconnectSockets = FakeWebSocket.instances
       .slice(socketsBeforeDrop)
       .filter(socket => socket.url === primaryConn.wsUrl)
 
-    expect(primaryReconnectSockets.length).toBeGreaterThan(0)
+    expect(primaryReconnectSockets).toHaveLength(0)
     expect($connection.get()?.profile).toBe('coder')
     expect($connection.get()?.baseUrl).toBe(coderConn.baseUrl)
   })

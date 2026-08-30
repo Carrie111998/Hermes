@@ -287,6 +287,7 @@ import {
   runPrimaryBackendStartup
 } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
+import { resolveApiRouteProfile, shouldIdleStopPrimary } from './primary-idle'
 import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
@@ -1391,6 +1392,11 @@ const backendDialClaims = new BackendDialClaims()
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
+let primaryIdleStopChild = null
+let primaryBackendReady = false
+let lastReportedActiveProfile = null
+let lastReportedKeepProfiles = []
+let primaryIdleStopTimer = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
 // (the desktop's launch profile) stays managed by backendConnectionState +
 // startHermes(); this pool only holds EXTRA profile
@@ -10838,6 +10844,7 @@ function stopBackendChild(child) {
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
 // switch / crash recovery), which still resets boot progress + reloads.
 function resetHermesConnection({ soft = false } = {}) {
+  primaryBackendReady = false
   backendStartFailure = null
   remoteReauthFailure = null
   remoteLiveness.clear()
@@ -10948,6 +10955,89 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   // Await the escalation as well; do not let shutdown or failed adoption race
   // a still-running backend.
   await wait(1000)
+}
+
+function primaryModeNow() {
+  const hermesProcess = backendConnectionState.getProcess()
+
+  if (hermesProcess && !hermesProcess.killed) {
+    return 'local-child'
+  }
+
+  // Promise set with no child = remote / still connecting
+  if (backendConnectionState.getPromise() && !hermesProcess) {
+    return 'remote'
+  }
+
+  return 'down'
+}
+
+function schedulePrimaryIdleStop() {
+  if (primaryIdleStopTimer) {
+    return
+  }
+
+  primaryIdleStopTimer = setTimeout(() => {
+    primaryIdleStopTimer = null
+    void idleStopPrimaryIfStillSafe()
+  }, 3_000)
+
+  if (typeof primaryIdleStopTimer.unref === 'function') {
+    primaryIdleStopTimer.unref()
+  }
+}
+
+function cancelPrimaryIdleStop() {
+  if (!primaryIdleStopTimer) {
+    return
+  }
+
+  clearTimeout(primaryIdleStopTimer)
+  primaryIdleStopTimer = null
+}
+
+function livePoolKeys() {
+  return [...backendPool.entries()]
+    .filter(([, entry]) => Boolean(entry && entry.process))
+    .map(([profile]) => profile)
+}
+
+function primaryIsReachable() {
+  return Boolean(backendConnectionState.getProcess()) || Boolean(backendConnectionState.getPromise())
+}
+
+async function idleStopPrimaryIfStillSafe() {
+  if (
+    !shouldIdleStopPrimary({
+      activeProfile: lastReportedActiveProfile,
+      primaryKey: primaryProfileKey(),
+      keepProfiles: lastReportedKeepProfiles || [],
+      primaryMode: primaryModeNow()
+    })
+  ) {
+    return
+  }
+
+  if (!primaryBackendReady) {
+    // Child is still booting — retry after another debounce. SIGTERM here
+    // would reject startHermes and latch backendStartFailure.
+    schedulePrimaryIdleStop()
+
+    return
+  }
+
+  const hermesProcess = backendConnectionState.getProcess()
+  const dying = hermesProcess && !hermesProcess.killed ? hermesProcess : null
+
+  if (!dying) {
+    return
+  }
+
+  primaryIdleStopChild = dying
+  rememberLog(
+    `Idle-stopping primary backend "${primaryProfileKey()}" (active profile "${lastReportedActiveProfile}")`
+  )
+  await teardownPrimaryBackendAndWait({ soft: true })
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
@@ -12523,9 +12613,15 @@ async function startHermes() {
       }
 
       rememberLog(`Hermes backend exited (${signal || code})`)
-      sendBackendExit({ code, signal })
+      const reason = primaryIdleStopChild === hermesProcess ? 'idle-stop' : undefined
 
-      if (!backendReady) {
+      if (primaryIdleStopChild === hermesProcess) {
+        primaryIdleStopChild = null
+      }
+
+      sendBackendExit({ code, signal, ...(reason ? { reason } : {}) })
+
+      if (!backendReady && reason !== 'idle-stop') {
         const message = `Hermes backend exited before it became ready (${signal || code}).${primaryOutputTail.describe()}`
         updateBootProgress(
           {
@@ -12563,6 +12659,7 @@ async function startHermes() {
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
     await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
     backendReady = true
+    primaryBackendReady = true
     backendStartFailure = null
 
     const authToken = await adoptServedDashboardToken(baseUrl, token, {
@@ -12610,6 +12707,7 @@ async function startHermes() {
       throw error
     }
 
+    primaryBackendReady = false
     const failedProcess = backendConnectionState.invalidate()
     stopBackendChild(failedProcess)
     await waitForBackendExit(failedProcess)
@@ -14344,6 +14442,33 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
 
   return { ok: true }
 })
+ipcMain.handle('hermes:backend:usage', async (_event, payload) => {
+  const activeProfile = payload && payload.activeProfile != null ? String(payload.activeProfile) : ''
+  const keepProfiles = Array.isArray(payload?.keepProfiles) ? payload.keepProfiles.map(String) : []
+  lastReportedActiveProfile = activeProfile
+  lastReportedKeepProfiles = keepProfiles
+
+  const ping = [activeProfile, ...keepProfiles]
+
+  for (const name of ping) {
+    touchPoolBackend(name)
+  }
+
+  const shouldStop = shouldIdleStopPrimary({
+    activeProfile,
+    primaryKey: primaryProfileKey(),
+    keepProfiles,
+    primaryMode: primaryModeNow()
+  })
+
+  if (shouldStop) {
+    schedulePrimaryIdleStop()
+  } else {
+    cancelPrimaryIdleStop()
+  }
+
+  return { ok: true, idleStopScheduled: shouldStop }
+})
 ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
   return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile))
 })
@@ -15746,7 +15871,18 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
   const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
 
-  const base = (await fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile)) as any
+  const aggregatorProfile = resolveApiRouteProfile({
+    requestProfile: null,
+    tornDownProfile: null,
+    primaryRunning: primaryIsReachable(),
+    livePoolKeys: livePoolKeys(),
+    lastActiveProfile: lastReportedActiveProfile,
+    method: 'GET',
+    pathname: '/api/profiles/sessions'
+  })
+  const base = (await fetchPrimaryProfileSessions(searchParams, (profile, path) =>
+    fetchJsonForProfile(profile ?? aggregatorProfile, path)
+  )) as any
 
   // Over-fetch each remote from offset 0 (limit+offset rows) so the merged window
   // is correct for this page — mirrors the primary's per-profile over-fetch.
@@ -15947,9 +16083,27 @@ async function handleHermesApiRequest(request) {
   // primary until the PATCH settles, so the request routes there.
   const apiRoute = resolveProfileApiRequest(profile, request.path, profileRouteOptions(profile, request))
 
-  const routeProfile = profileRename
+  let parsedPath = null
+
+  try {
+    parsedPath = new URL(request?.path || '/', 'http://x')
+  } catch {
+    parsedPath = null
+  }
+
+  const routed = profileRename
     ? profileRename.routeProfile
     : resolveRouteProfile(tornDownProfile, apiRoute.backendProfile)
+
+  const routeProfile = resolveApiRouteProfile({
+    requestProfile: routed,
+    tornDownProfile,
+    primaryRunning: primaryIsReachable(),
+    livePoolKeys: livePoolKeys(),
+    lastActiveProfile: lastReportedActiveProfile,
+    method: request?.method,
+    pathname: parsedPath ? parsedPath.pathname : ''
+  })
 
   let response
 
