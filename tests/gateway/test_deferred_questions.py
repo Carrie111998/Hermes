@@ -732,14 +732,37 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
     if release_path == "cleanup":
         adapter._cleanup_finished_session_task(session_key, guard)
     elif release_path == "stale_heal":
-        assert adapter._heal_stale_session_lock(session_key)
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        finish_turn = asyncio.Event()
+
+        async def handle_unrelated(_event):
+            await finish_turn.wait()
+            return "ordinary"
+
+        adapter._message_handler = handle_unrelated
+        await adapter.handle_message(
+            MessageEvent(
+                text="unrelated",
+                source=source,
+                message_id="unrelated-turn",
+                message_type=MessageType.TEXT,
+            )
+        )
     else:
         adapter._release_session_guard(session_key, guard=guard)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    assert service.get(question.id).state == "awaiting"
-    assert adapter.sent == [("home", "May I send invites?", None, {"notify": True})]
+    state_before_turn_finishes = service.get(question.id).state
+    sent_before_turn_finishes = list(adapter.sent)
+    if release_path == "stale_heal":
+        finish_turn.set()
+        await asyncio.gather(*tuple(adapter._background_tasks))
+    assert state_before_turn_finishes == "awaiting"
+    assert sent_before_turn_finishes == [
+        ("home", "May I send invites?", None, {"notify": True})
+    ]
 
 
 @pytest.mark.asyncio

@@ -6111,7 +6111,7 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         *,
         guard: Optional[asyncio.Event] = None,
-    ) -> None:
+    ) -> Optional[asyncio.Task[None]]:
         """Release the adapter-level guard for a session.
 
         When ``guard`` is provided, only release the entry if it still points
@@ -6121,15 +6121,17 @@ class BasePlatformAdapter(ABC):
         """
         current_guard = self._active_sessions.get(session_key)
         if current_guard is None:
-            return
+            return None
         if guard is not None and current_guard is not guard:
-            return
+            return None
         del self._active_sessions[session_key]
         callback = self._session_idle_callbacks.pop(session_key, None)
         if callable(callback):
             task = asyncio.create_task(self._run_session_idle_callback(callback))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            return task
+        return None
 
     def _session_task_is_stale(self, session_key: str) -> bool:
         """Return True if the owner task for ``session_key`` is done/cancelled.
@@ -6148,7 +6150,7 @@ class BasePlatformAdapter(ABC):
         done = getattr(task, "done", None)
         return bool(done and done())
 
-    def _heal_stale_session_lock(self, session_key: str) -> bool:
+    async def _heal_stale_session_lock(self, session_key: str) -> bool:
         """Clear a stale session lock if the owner task is already gone.
 
         Returns True if a stale lock was healed.  Returns False if there is
@@ -6169,10 +6171,12 @@ class BasePlatformAdapter(ABC):
             self.name,
             session_key,
         )
-        self._release_session_guard(session_key)
+        idle_callback_task = self._release_session_guard(session_key)
         self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
+        if idle_callback_task is not None:
+            await idle_callback_task
         return True
 
     def _start_session_processing(
@@ -6474,7 +6478,7 @@ class BasePlatformAdapter(ABC):
         # normal dispatch so the user isn't trapped behind a dead guard —
         # this is the split-brain tail described in issue #11016.
         if session_key in self._active_sessions:
-            self._heal_stale_session_lock(session_key)
+            await self._heal_stale_session_lock(session_key)
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
