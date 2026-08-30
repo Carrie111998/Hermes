@@ -1703,11 +1703,18 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     return False
 
 
-# One-shot guard for the config-fallback bridge below.  Purely an
-# optimization: after the first attempt either TERMINAL_ENV is set (bridge
-# succeeded — merged config always carries terminal.backend) or the import
-# failed and retrying every call would be wasted work.
-_terminal_config_bridge_attempted = False
+# Guard for the config-fallback bridge below, keyed by Hermes home.  The
+# bridge runs at most once per active home: within one home it is purely an
+# optimization (after the first attempt either TERMINAL_ENV is set or the
+# import failed and retrying every call would be wasted work), but a unified
+# dashboard/serve process serves several profiles through the context-local
+# HERMES_HOME override, and each profile must bridge its OWN terminal.* config
+# (#98581).  ``owned`` are the TERMINAL_* vars the previous home's bridge (or
+# the launch-time CLI bridge) wrote, so a profile switch can drop them before
+# re-bridging — a stale ``TERMINAL_ENV=local`` from the launch profile must
+# never leak into a profile whose config selects docker.
+_terminal_config_bridge_state: Optional[Dict[str, Any]] = None
+_terminal_config_bridge_lock = threading.Lock()
 
 
 def _ensure_terminal_env_bridged() -> None:
@@ -1723,38 +1730,66 @@ def _ensure_terminal_env_bridged() -> None:
     config.yaml selects ``terminal.backend: docker``, running commands on the
     host the user intended to sandbox (#63141, #54449, #61115, #65696).
 
+    The bridge is re-run whenever the active Hermes home changes (context-local
+    profile override → ``HERMES_HOME`` env → platform default), so one unified
+    dashboard backend serves each profile's terminal backend instead of latching
+    the launch profile's for the whole process (#98581) — the same re-bridge
+    ``web_server.py`` already performs per-request for the embedded chat PTY.
+
     Explicit terminal config keys win: when config.yaml has a ``terminal``
     section, each key present there overrides its matching env value (which may
     be stale from ``hermes setup``). Environment values for omitted terminal
     keys are preserved. When no terminal section exists, exported/.env values
     keep working unchanged.
     """
-    global _terminal_config_bridge_attempted
-    if _terminal_config_bridge_attempted:
-        return
-    _terminal_config_bridge_attempted = True
-    try:
-        from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
+    global _terminal_config_bridge_state
+    from hermes_constants import hermes_home_key
 
-        # If config.yaml has an explicit terminal section, bridge with
-        # override enabled. The helper only overrides env vars for keys present
-        # in that raw section; merged defaults remain backfill-only. Without a
-        # terminal section, preserve an existing TERMINAL_ENV selection or
-        # backfill defaults when no selection exists.
-        raw_config = read_raw_config()
-        has_terminal_section = isinstance(raw_config.get("terminal"), dict)
+    home = hermes_home_key()
+    with _terminal_config_bridge_lock:
+        state = _terminal_config_bridge_state
+        if state is not None and state["home"] == home:
+            return
+        owned: set = set()
+        try:
+            from hermes_cli.config import (
+                apply_terminal_config_to_env,
+                read_raw_config,
+                terminal_config_owned_env_vars,
+            )
 
-        if has_terminal_section:
-            # Explicit terminal keys in config.yaml win over matching env values.
-            apply_terminal_config_to_env(env=None, override=True)
-        elif "TERMINAL_ENV" not in os.environ:
-            # No terminal section in config.yaml, TERMINAL_ENV not set —
-            # backfill from config defaults
-            apply_terminal_config_to_env(env=None, override=False)
-    except Exception:
-        # Never let a config problem take the terminal tool down — the
-        # historical local default still applies.
-        logger.debug("terminal config → env fallback bridge failed", exc_info=True)
+            # Drop the TERMINAL_* vars the previous home's bridge explicitly
+            # owned before resolving the new home's selection, mirroring the
+            # dashboard PTY re-bridge in web_server.py. Operator-exported
+            # values for keys neither home configured are preserved.
+            if state is not None:
+                for env_var in state["owned"]:
+                    os.environ.pop(env_var, None)
+
+            # If config.yaml has an explicit terminal section, bridge with
+            # override enabled. The helper only overrides env vars for keys
+            # present in that raw section; merged defaults remain backfill-only.
+            # Without a terminal section, preserve an existing TERMINAL_ENV
+            # selection or backfill defaults when no selection exists.
+            raw_config = read_raw_config()
+            raw_terminal = raw_config.get("terminal")
+            has_terminal_section = isinstance(raw_terminal, dict)
+
+            if has_terminal_section:
+                # Explicit terminal keys in config.yaml win over matching env values.
+                apply_terminal_config_to_env(env=None, override=True)
+                owned = terminal_config_owned_env_vars(raw_terminal)
+            elif "TERMINAL_ENV" not in os.environ:
+                # No terminal section in config.yaml, TERMINAL_ENV not set —
+                # backfill from config defaults
+                apply_terminal_config_to_env(env=None, override=False)
+        except Exception:
+            # Never let a config problem take the terminal tool down — the
+            # historical local default still applies. Record the attempt for
+            # this home so a permanently broken import does not retry on every
+            # call (same waste-avoidance as the original one-shot flag).
+            logger.debug("terminal config → env fallback bridge failed", exc_info=True)
+        _terminal_config_bridge_state = {"home": home, "owned": owned}
 
 
 def _get_env_config() -> Dict[str, Any]:
