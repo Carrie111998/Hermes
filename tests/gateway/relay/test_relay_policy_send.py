@@ -26,6 +26,8 @@ def _clean_env(monkeypatch):
         "GATEWAY_RELAY_PLATFORMS",
         "GATEWAY_RELAY_BOT_IDS",
         "DISCORD_ALLOW_BOTS",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_THREADED_FREE_RESPONSE_CHANNELS",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {}, raising=False)
@@ -49,6 +51,81 @@ def test_projection_maps_require_mention_and_free_response(monkeypatch):
         "freeResponseScopes": ["c-support", "c-help"],
         "allowOtherBots": False,
     }
+
+
+def test_projection_unions_threaded_free_response_scopes(monkeypatch):
+    monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "discord": {
+                "require_mention": True,
+                "free_response_channels": ["c-chat", "c-shared"],
+                "threaded_free_response_channels": ["c-intake", "c-shared"],
+            }
+        },
+        raising=False,
+    )
+
+    pol = relay.relay_relevance_policy()
+
+    assert pol is not None
+    assert pol["freeResponseScopes"] == ["c-chat", "c-shared", "c-intake"]
+
+
+def test_threaded_scopes_keep_default_mention_gate(monkeypatch):
+    monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "discord": {
+                "threaded_free_response_channels": ["c-intake"],
+            }
+        },
+        raising=False,
+    )
+
+    pol = relay.relay_relevance_policy()
+
+    assert pol is not None
+    assert pol["requireAddress"] is True
+    assert pol["freeResponseScopes"] == ["c-intake"]
+
+
+def test_projection_uses_env_only_scopes_with_normalization(monkeypatch):
+    monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
+    monkeypatch.setenv(
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        " c-chat, c-shared, c-chat ",
+    )
+    monkeypatch.setenv(
+        "DISCORD_THREADED_FREE_RESPONSE_CHANNELS",
+        "c-intake,c-shared",
+    )
+
+    pol = relay.relay_relevance_policy()
+
+    assert pol is not None
+    assert pol["requireAddress"] is True
+    assert pol["freeResponseScopes"] == ["c-chat", "c-shared", "c-intake"]
+
+
+def test_projection_preserves_scalar_channel_id(monkeypatch):
+    monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "discord": {
+                "free_response_channels": 1491973769726791812,
+            }
+        },
+        raising=False,
+    )
+
+    pol = relay.relay_relevance_policy()
+
+    assert pol is not None
+    assert pol["freeResponseScopes"] == ["1491973769726791812"]
 
 
 def test_projection_declares_explicit_require_mention_false(monkeypatch):
@@ -86,7 +163,13 @@ def test_send_posts_projected_policy_with_token(monkeypatch):
     _arm(monkeypatch)
     monkeypatch.setattr(
         "gateway.run._load_gateway_config",
-        lambda: {"discord": {"require_mention": True, "free_response_channels": ["c-support"]}},
+        lambda: {
+            "discord": {
+                "require_mention": True,
+                "free_response_channels": ["c-support"],
+                "threaded_free_response_channels": ["c-intake"],
+            }
+        },
         raising=False,
     )
     captured = {}
@@ -102,7 +185,10 @@ def test_send_posts_projected_policy_with_token(monkeypatch):
     assert captured["policy_url"] == "https://connector.example/relay/policy"
     assert captured["token"]  # a real upgrade token was minted
     assert captured["policy"]["requireAddress"] is True
-    assert captured["policy"]["freeResponseScopes"] == ["c-support"]
+    assert captured["policy"]["freeResponseScopes"] == [
+        "c-support",
+        "c-intake",
+    ]
 
 
 def test_send_skips_when_no_secret(monkeypatch):
@@ -134,5 +220,3 @@ def test_send_fail_soft_on_transport_error(monkeypatch):
     monkeypatch.setattr(relay, "_post_policy", _boom)
     # Never raises; returns False so boot proceeds.
     assert relay.send_relay_policy() is False
-
-

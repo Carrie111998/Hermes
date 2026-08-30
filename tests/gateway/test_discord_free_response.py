@@ -1,5 +1,6 @@
 """Tests for Discord free-response defaults and mention gating."""
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -7,7 +8,8 @@ import sys
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 
 
 def _ensure_discord_mock():
@@ -109,6 +111,7 @@ def adapter(monkeypatch):
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
         "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_THREADED_FREE_RESPONSE_CHANNELS",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
@@ -305,6 +308,281 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "casual chat in free-response channel"
     assert event.source.chat_type == "group"
+
+
+def test_discord_threaded_free_response_channels_bare_int(adapter):
+    adapter.config.extra["threaded_free_response_channels"] = 1491973769726791812
+
+    assert adapter._discord_threaded_free_response_channels() == {
+        "1491973769726791812"
+    }
+
+
+@pytest.mark.asyncio
+async def test_discord_threaded_free_response_channel_from_config_extra(
+    adapter, monkeypatch
+):
+    """Config-driven mention-free intake lanes still create a thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    adapter.config.extra["threaded_free_response_channels"] = ["789"]
+
+    fake_thread = FakeThread(channel_id=1001, name="threaded-extra")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="config-driven thread creation",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "1001"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "1001"
+    assert event.source.parent_chat_id == "789"
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_setting_is_isolated_between_profile_adapters(
+    adapter, monkeypatch
+):
+    """Each profile's config must win over process-global bridge state."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setattr(
+        discord_platform,
+        "_profile_scoped_config_load",
+        lambda: True,
+    )
+
+    inline_extra = discord_platform._apply_yaml_config(
+        {}, {"auto_thread": False}
+    )
+    threaded_extra = discord_platform._apply_yaml_config(
+        {}, {"auto_thread": True}
+    )
+    assert inline_extra is not None
+    assert threaded_extra is not None
+
+    adapter.config.extra.update(inline_extra)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    adapter._snapshot_gate_env()
+    adapter._auto_create_thread = AsyncMock()
+
+    threaded_adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="second-profile-token",
+            extra=threaded_extra,
+        )
+    )
+    threaded_adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+    threaded_adapter._text_batch_delay_seconds = 0
+    threaded_adapter.handle_message = AsyncMock()
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    threaded_adapter._snapshot_gate_env()
+
+    threaded_parent = FakeTextChannel(channel_id=790)
+    threaded_target = FakeThread(
+        channel_id=1002,
+        name="second-profile-thread",
+        parent=threaded_parent,
+    )
+    threaded_adapter._auto_create_thread = AsyncMock(
+        return_value=threaded_target
+    )
+
+    bot_user = adapter._client.user
+    inline_message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content=f"<@{bot_user.id}> keep this profile inline",
+        mentions=[bot_user],
+    )
+    threaded_message = make_message(
+        channel=threaded_parent,
+        content=f"<@{bot_user.id}> thread this profile",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(inline_message)
+    await threaded_adapter._handle_message(threaded_message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    inline_event = adapter.handle_message.await_args.args[0]
+    assert inline_event.source.chat_id == "789"
+
+    threaded_adapter._auto_create_thread.assert_awaited_once_with(
+        threaded_message
+    )
+    threaded_event = threaded_adapter.handle_message.await_args.args[0]
+    assert threaded_event.source.chat_id == "1002"
+    assert threaded_event.source.parent_chat_id == "790"
+
+
+@pytest.mark.asyncio
+async def test_no_thread_channel_overrides_threaded_free_response(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    adapter.config.extra["threaded_free_response_channels"] = ["789"]
+    adapter._auto_create_thread = AsyncMock()
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="keep this exceptional lane inline",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "789"
+    assert event.source.chat_type == "group"
+
+
+def test_discord_threaded_free_response_yaml_bridge(monkeypatch):
+    monkeypatch.delenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS", raising=False)
+
+    seeded = discord_platform._apply_yaml_config(
+        {}, {"threaded_free_response_channels": ["789", "790"]}
+    )
+
+    assert seeded is not None
+    assert seeded["threaded_free_response_channels"] == "789,790"
+    assert discord_platform.os.getenv(
+        "DISCORD_THREADED_FREE_RESPONSE_CHANNELS"
+    ) == "789,790"
+    bridged_adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    assert bridged_adapter._discord_threaded_free_response_channels() == {
+        "789",
+        "790",
+    }
+
+
+def test_empty_recovery_channel_list_uses_all_scoped_defaults(adapter):
+    adapter.config.extra.update(
+        {
+            "allowed_channels": ["111"],
+            "free_response_channels": ["222"],
+            "threaded_free_response_channels": ["333"],
+            "missed_message_backfill": {"channels": []},
+        }
+    )
+
+    assert adapter._missed_message_backfill_channels() == {
+        "111",
+        "222",
+        "333",
+    }
+
+
+@pytest.mark.asyncio
+async def test_recovered_threaded_free_response_message_passes_mention_gate(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.extra["threaded_free_response_channels"] = ["789"]
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    adapter._handle_message = AsyncMock(return_value=True)
+
+    channel = FakeTextChannel(channel_id=789)
+    message = make_message(channel=channel, content="recovered intake request")
+    message.guild = channel.guild
+
+    assert await adapter._dispatch_recovered_message(message) is True
+    adapter._handle_message.assert_awaited_once_with(
+        message,
+        role_authorized=False,
+        recovered=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_threaded_free_response_ingress_binds_final_and_voice_to_thread(
+    adapter, monkeypatch
+):
+    """Parent intake state must not pull final text or voice out of the thread."""
+    from gateway.run import GatewayRunner
+
+    parent = FakeTextChannel(channel_id=789, name="intake")
+    parent.guild.id = 555
+    thread = FakeThread(channel_id=1001, name="threaded-intake", parent=parent)
+    adapter.config.typing_indicator = False
+    adapter.config.extra["threaded_free_response_channels"] = ["789"]
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setattr(
+        "gateway.delivery_ledger.ledger_enabled", lambda: False
+    )
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    adapter._ready_event.set()
+
+    # The fixture replaces handle_message for focused ingress tests. Restore
+    # the real BasePlatformAdapter pipeline for this ingress-to-egress proof.
+    del adapter.handle_message
+
+    sent = AsyncMock(
+        return_value=SendResult(success=True, message_id="final-thread-message")
+    )
+    adapter.send = sent
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._voice_mode = {"discord:789": "all"}
+
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+    captured_events = []
+    voice_decisions = []
+
+    async def _handle_threaded_turn(event):
+        captured_events.append(event)
+        voice_decisions.append(
+            runner._should_send_voice_reply(
+                event,
+                "final answer in the task thread",
+                [],
+            )
+        )
+        handler_started.set()
+        await release_handler.wait()
+        return "final answer in the task thread"
+
+    adapter.set_message_handler(_handle_threaded_turn)
+
+    other_user = SimpleNamespace(id=77, bot=False)
+    message = make_message(
+        channel=parent,
+        content="Please review this with <@77>",
+        mentions=[other_user],
+    )
+    message.guild = parent.guild
+
+    assert await adapter._dispatch_discord_message(message) is True
+    await asyncio.wait_for(handler_started.wait(), timeout=2)
+
+    event = captured_events[0]
+    assert event.source.chat_id == "1001"
+    assert event.source.thread_id == "1001"
+    assert event.source.parent_chat_id == "789"
+    assert voice_decisions == [False]
+
+    session_task = next(iter(adapter._session_tasks.values()))
+    release_handler.set()
+    await asyncio.wait_for(session_task, timeout=2)
+
+    sent.assert_awaited_once()
+    call = sent.await_args
+    assert call is not None
+    assert call.kwargs["chat_id"] == "1001"
+    assert call.kwargs["content"] == "final answer in the task thread"
+    assert call.kwargs["metadata"]["thread_id"] == "1001"
 
 
 @pytest.mark.asyncio
@@ -825,5 +1103,3 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     assert event.channel_context == (
         "[Context around the replied-to message]\n[Hermes [bot]] earlier answer"
     )
-
-

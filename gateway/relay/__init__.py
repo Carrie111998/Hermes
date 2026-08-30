@@ -349,6 +349,19 @@ def _policy_url(relay_dial_url: str) -> str:
     return f"{raw}/relay/policy"
 
 
+def _normalize_relay_scopes(raw: object) -> list[str]:
+    """Normalize one configured relay-scope value without losing scalars."""
+    if raw is None:
+        return []
+    values = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    normalized: list[str] = []
+    for value in values:
+        scope = str(value).strip()
+        if scope and scope not in normalized:
+            normalized.append(scope)
+    return normalized
+
+
 def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
     """Project a fronted platform's RELEVANCE config into the connector's generic vocabulary.
 
@@ -363,16 +376,18 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
     Mapping (the connector vocabulary ← the gateway's existing config):
       - ``requireAddress``     ← the platform's ``require_mention`` (the agent
         only engages a non-owner message that @mentions it / replies to it).
-      - ``freeResponseScopes`` ← the platform's ``free_response_channels`` (the
-        channel/scope ids where ``require_mention`` is waived — same scope
-        vocabulary the connector's δ scope grants + ε floor use).
+      - ``freeResponseScopes`` ← the union of the platform's
+        ``free_response_channels`` and ``threaded_free_response_channels``
+        (the channel/scope ids where ``require_mention`` is waived — same
+        scope vocabulary the connector's δ scope grants + ε floor use).
       - ``allowOtherBots``     ← ``{PLATFORM}_ALLOW_BOTS`` in {"mentions","all"}
         (whether bot-authored messages are admitted; default off).
 
     Read from the relay platform's config block (the platform the connector
     fronts, e.g. ``discord:``), falling back to the bridged top-level keys, then
-    the ``{PLATFORM}_*`` env. ``platform`` defaults to the PRIMARY fronted
-    platform (back-compat). Returns the generic dict, or None when relay isn't
+    the ``{PLATFORM}_*`` env when neither YAML location declares the key.
+    ``platform`` defaults to the PRIMARY fronted platform (back-compat).
+    Returns the generic dict, or None when relay isn't
     configured or the platform exposes no relevance knobs (⇒ the connector's
     default — mention-gated — applies unchallenged; an EXPLICIT
     ``require_mention: false`` IS a knob and is declared so the connector
@@ -406,13 +421,20 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
         elif cfg.get("require_mention") is not None:
             require_mention = cfg.get("require_mention")
 
-        frc = plat_cfg.get("free_response_channels")
-        if frc is None:
-            frc = cfg.get("free_response_channels")
-        if isinstance(frc, (list, tuple)):
-            free_response = [str(c).strip() for c in frc if str(c).strip()]
-        elif isinstance(frc, str) and frc.strip():
-            free_response = [c.strip() for c in frc.split(",") if c.strip()]
+        for config_key in (
+            "free_response_channels",
+            "threaded_free_response_channels",
+        ):
+            if config_key in plat_cfg:
+                configured_scopes = plat_cfg.get(config_key)
+            elif config_key in cfg:
+                configured_scopes = cfg.get(config_key)
+            else:
+                env_key = f"{platform.upper()}_{config_key.upper()}"
+                configured_scopes = os.environ.get(env_key)
+            for scope in _normalize_relay_scopes(configured_scopes):
+                if scope not in free_response:
+                    free_response.append(scope)
     except Exception:  # noqa: BLE001 - config absence/parse must never crash boot
         pass
 
@@ -431,7 +453,7 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
     if require_mention is None and not free_response and not allow_other_bots:
         return None
 
-    require_address = bool(require_mention) if require_mention is not None else False
+    require_address = bool(require_mention) if require_mention is not None else True
 
     return {
         "platform": platform,
