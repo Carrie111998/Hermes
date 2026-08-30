@@ -3897,12 +3897,14 @@ def _channel_override_lookup_keys(
 ) -> list[str]:
     """Ordered, de-duplicated keys for ``channel_overrides`` lookup.
 
-    Matches ``resolve_channel_prompt`` semantics: exact thread/channel id first,
-    then parent channel/forum id (Discord threads inherit parent overrides).
+    Telegram forum topics need a stable key scoped by both chat and topic,
+    e.g. ``-100123:188``. After that, preserve the existing lookup order:
+    chat/channel id, thread id, then parent id.
     """
     keys: list[str] = []
     seen: set[str] = set()
-    for key in (chat_id, thread_id, parent_id):
+    composite_key = f"{chat_id}:{thread_id}" if chat_id and thread_id else None
+    for key in (composite_key, chat_id, thread_id, parent_id):
         if not key:
             continue
         sk = str(key)
@@ -3923,8 +3925,8 @@ def _get_channel_override(
 ) -> Optional[ChannelOverride]:
     """Return per-channel override for this platform/chat_id, or None.
 
-    Looks up ``channel_overrides`` by ``chat_id``, then ``thread_id``, then
-    ``parent_id`` (forum threads / child channels inherit the parent entry).
+    Looks up ``channel_overrides`` by ``chat_id:thread_id`` first, then
+    ``chat_id``, ``thread_id``, and ``parent_id``.
     """
     platforms = getattr(config, "platforms", None)
     if not platforms:
@@ -3939,6 +3941,39 @@ def _get_channel_override(
         ov = overrides.get(key)
         if ov is not None:
             return ov
+    return None
+
+
+def _get_channel_override_field(
+    config: GatewayConfig,
+    platform: Platform,
+    chat_id: str,
+    field_name: str,
+    *,
+    thread_id: Optional[str] = None,
+    parent_id: Optional[str] = None,
+) -> Any:
+    """Resolve one field while allowing an exact entry to omit it.
+
+    ``None`` means absent and continues inheritance. Falsey values such as
+    ``False`` are explicit and stop lookup.
+    """
+    platforms = getattr(config, "platforms", None)
+    if not platforms:
+        return None
+    platform_config = platforms.get(platform)
+    if not platform_config or not platform_config.channel_overrides:
+        return None
+    overrides = platform_config.channel_overrides
+    for key in _channel_override_lookup_keys(
+        chat_id, thread_id=thread_id, parent_id=parent_id
+    ):
+        override = overrides.get(key)
+        if override is None:
+            continue
+        value = getattr(override, field_name, None)
+        if value is not None:
+            return value
     return None
 
 
@@ -5546,6 +5581,10 @@ class TurnRunner:
             session_key=ctx.session_key,
             model=model,
         )
+        reasoning_is_scoped = self._runner._has_scoped_reasoning_override(
+            source=ctx.source,
+            session_key=ctx.session_key,
+        )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -5676,6 +5715,7 @@ class TurnRunner:
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
+            reasoning_config=reasoning_config,
         )
         agent = None
         reused_cached_agent = False
@@ -5929,8 +5969,9 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
-        # Per-message state — callbacks and reasoning config change every
-        # turn and must not be baked into the cached agent constructor.
+        # Per-message state — callbacks and reasoning config are refreshed
+        # every turn. Reasoning also participates in the cache signature
+        # above so a changed lane/session value rebuilds safely.
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
         # rather than tool_progress alone: the progress_callback also relays
         # _thinking assistant scratch text, which is gated on
@@ -6003,6 +6044,7 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
+        agent._reasoning_config_fixed = reasoning_is_scoped
         agent.service_tier = self._runner._service_tier
         # Merge, never overwrite: init-time request overrides (e.g. a custom
         # provider's extra_body merged at agent construction) must survive
@@ -9801,9 +9843,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
-        Priority: session-scoped ``/reasoning --session`` override >
-        per-model override (``agent.reasoning_overrides``) > global
-        ``agent.reasoning_effort``. ``model`` should be the session's
+        Priority: session-scoped ``/reasoning --session`` override > channel
+        override > per-model override (``agent.reasoning_overrides``) >
+        global ``agent.reasoning_effort``. ``model`` should be the session's
         *effective* model (session ``/model`` override included) so
         per-model overrides track what the session actually runs — when
         empty, the config's ``model.default`` is used.
@@ -9819,7 +9861,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+
+        config = getattr(self, "config", None)
+        if config and source is not None:
+            try:
+                channel_effort = _get_channel_override_field(
+                    config,
+                    source.platform,
+                    str(source.chat_id) if source.chat_id else "",
+                    "reasoning_effort",
+                    thread_id=(
+                        str(source.thread_id)
+                        if getattr(source, "thread_id", None)
+                        else None
+                    ),
+                    parent_id=(
+                        str(source.parent_chat_id)
+                        if getattr(source, "parent_chat_id", None)
+                        else None
+                    ),
+                )
+                if channel_effort is not None:
+                    from hermes_constants import parse_reasoning_effort
+
+                    parsed = parse_reasoning_effort(channel_effort)
+                    if parsed is not None:
+                        return parsed
+                    if str(channel_effort).strip():
+                        logger.warning(
+                            "Unknown channel reasoning_effort '%s', using global default",
+                            channel_effort,
+                        )
+            except Exception:
+                logger.debug("Failed to resolve channel reasoning override", exc_info=True)
         return self._load_reasoning_config(model)
+
+    def _has_scoped_reasoning_override(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> bool:
+        """Return whether session/channel reasoning must stay fixed this turn."""
+        resolved_session_key = session_key
+        if not resolved_session_key and source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_session_key = None
+
+        if resolved_session_key:
+            _r_state = self._peek_session_state(resolved_session_key)
+            if _r_state is not None and _r_state.conversation.reasoning_override is not None:
+                return True
+        if source is None or getattr(self, "config", None) is None:
+            return False
+        lane_effort = _get_channel_override_field(
+            self.config,
+            source.platform,
+            str(source.chat_id) if source.chat_id else "",
+            "reasoning_effort",
+            thread_id=(
+                str(source.thread_id)
+                if getattr(source, "thread_id", None)
+                else None
+            ),
+            parent_id=(
+                str(source.parent_chat_id)
+                if getattr(source, "parent_chat_id", None)
+                else None
+            ),
+        )
+        if lane_effort is None:
+            return False
+        from hermes_constants import parse_reasoning_effort
+
+        return parse_reasoning_effort(lane_effort) is not None
 
     def _set_session_reasoning_override(
         self,
@@ -23667,6 +23784,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
+            reasoning_is_scoped = self._has_scoped_reasoning_override(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -23720,6 +23838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                agent._reasoning_config_fixed = reasoning_is_scoped
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -27381,6 +27500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id: str | None = None,
         user_id_alt: str | None = None,
         skip_context_files: bool = False,
+        reasoning_config: dict | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -27394,6 +27514,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the output of ``_extract_cache_busting_config(user_config)`` so
         edits to model.context_length / compression.* in config.yaml are
         picked up on the next gateway message without a manual restart.
+
+        ``reasoning_config`` is the effective per-turn value. Including it
+        prevents a cached agent from carrying stale reasoning across lane or
+        session-override changes; identical values still reuse the cache.
 
         ``user_id`` and ``user_id_alt`` are the runtime user identities
         carried by the current message's gateway source.  They participate
@@ -27429,8 +27553,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("requested_provider", ""),
                 runtime.get("api_mode", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
-                # reasoning_config excluded — it's set per-message on the
-                # cached agent and doesn't affect system prompt or tools.
+                reasoning_config,
                 ephemeral_prompt or "",
                 _cache_keys_sorted,
                 str(user_id or ""),
