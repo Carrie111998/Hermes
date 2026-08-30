@@ -19,10 +19,12 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setSelectedStoredSessionId,
   setTurnStartedAt
 } from '@/store/session'
 import {
   $sessionStates,
+  $sessionTiles,
   clearAllSessionStates,
   reconcileBusyStatesOnReconnect,
   type SessionTileDelegate,
@@ -44,6 +46,7 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     cleanup()
     setActiveSessionId(null)
     setActiveSessionStoredIdRotation(null)
+    setSelectedStoredSessionId(null)
   })
 
   it('emits the previous, next, and runtime ids and removes the stale reverse mapping', () => {
@@ -84,6 +87,48 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     expect($activeSessionStoredIdRotation.get()).toBeNull()
     expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-A-next')).toBe('runtime-A')
+  })
+
+  it('re-homes an open tile on a cache-path rotation even when the runtime is background (#98622)', () => {
+    let cache!: Cache
+
+    // Background runtime: the rotation atom stays null, but the tile keyed on
+    // the pre-rotation id must still re-home to the new tip.
+    setActiveSessionId('runtime-B')
+    render(
+      <Harness activeSessionId="runtime-B" onReady={value => (cache = value)} selectedStoredSessionId="stored-B" />
+    )
+
+    act(() => {
+      $sessionTiles.set([{ storedSessionId: 'stored-A' }])
+      cache.updateSessionState('runtime-A', state => state, 'stored-A')
+      cache.updateSessionState('runtime-A', state => state, 'stored-A-next')
+    })
+
+    const tiles = $sessionTiles.get()
+    expect(tiles.find(t => t.storedSessionId === 'stored-A')).toBeUndefined()
+    expect(tiles.find(t => t.storedSessionId === 'stored-A-next')).toBeDefined()
+  })
+
+  it('drops the stale tile on a cache-path rotation when the new tip is the main selection (#98622)', () => {
+    let cache!: Cache
+
+    setActiveSessionId('runtime-A')
+    render(
+      <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-A-next" />
+    )
+
+    act(() => {
+      // The drop decision reads the GLOBAL selection atom, not the harness prop.
+      setSelectedStoredSessionId('stored-A-next')
+      $sessionTiles.set([{ storedSessionId: 'stored-A' }])
+      cache.updateSessionState('runtime-A', state => state, 'stored-A')
+      cache.updateSessionState('runtime-A', state => state, 'stored-A-next')
+    })
+
+    // Main already shows the conversation on the new tip: the tile is dropped
+    // entirely (main OR tile — never both).
+    expect($sessionTiles.get()).toHaveLength(0)
   })
 })
 
