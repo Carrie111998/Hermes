@@ -65,6 +65,60 @@ def _same_endpoint(a: str, b: str) -> bool:
     )
 
 
+def _normalize_root_authorization_server_url(url: str) -> str:
+    """Remove a trailing slash only from a URL's root path.
+
+    Google publishes ``https://accounts.google.com/`` in protected-resource
+    metadata while its authorization-server metadata uses the issuer
+    ``https://accounts.google.com``. The MCP SDK compares those values exactly.
+    A slash on a non-root path remains significant and is preserved.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url
+    if (
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc
+        and parsed.path == "/"
+        and not parsed.query
+        and not parsed.fragment
+    ):
+        return url[:-1]
+    return url
+
+
+def _install_root_issuer_compatibility() -> None:
+    """Accept equivalent root issuers in the pinned MCP SDK.
+
+    The SDK compares the protected-resource authorization server and the OAuth
+    metadata issuer as raw strings. Google emits those same root URLs with and
+    without a trailing slash. Keep the SDK's normal check for every other
+    mismatch.
+    """
+    try:
+        import importlib
+
+        oauth2 = importlib.import_module("mcp.client.auth.oauth2")
+    except ImportError:
+        return
+    if getattr(oauth2, "_hermes_root_issuer_compat", False):
+        return
+    original_validate = getattr(oauth2, "validate_metadata_issuer")
+
+    def validate_metadata_issuer(metadata: Any, expected_issuer: str) -> None:
+        if _normalize_root_authorization_server_url(str(metadata.issuer)) == (
+            _normalize_root_authorization_server_url(expected_issuer)
+        ):
+            return
+        original_validate(metadata, expected_issuer)
+
+    setattr(oauth2, "validate_metadata_issuer", validate_metadata_issuer)
+    setattr(oauth2, "_hermes_root_issuer_compat", True)
+
+
 # ---------------------------------------------------------------------------
 # Per-server entry
 # ---------------------------------------------------------------------------
@@ -113,6 +167,7 @@ def _make_hermes_provider_class() -> Optional[type]:
         from mcp.client.auth.oauth2 import OAuthClientProvider
     except ImportError:  # pragma: no cover — SDK required in CI
         return None
+    _install_root_issuer_compatibility()
 
     class HermesMCPOAuthProvider(OAuthClientProvider):
         """OAuthClientProvider with pre-flow disk-mtime reload.
@@ -299,15 +354,13 @@ def _make_hermes_provider_class() -> Optional[type]:
                         meta.token_endpoint,
                     )
 
-            # Pre-flight OAuth AS discovery so ``_refresh_token`` has a
-            # correct ``token_endpoint`` before the first refresh attempt.
-            # Only runs when we have tokens on cold-load but no cached
-            # metadata — i.e. the exact scenario where the SDK's built-in
-            # 401-branch discovery hasn't had a chance to run yet.
-            if (
-                tokens is not None
-                and self.context.oauth_metadata is None
-            ):
+            # Pre-flight OAuth AS discovery gives both a cold token refresh
+            # and an initial browser authorization the correct metadata. Google
+            # publishes a protected-resource authorization-server URL with a
+            # root slash while its metadata issuer has no slash. Fetching first
+            # lets us normalize that equivalent root URL before the SDK's
+            # strict issuer check during its 401 branch.
+            if self.context.oauth_metadata is None:
                 try:
                     await self._prefetch_oauth_metadata()
                 except Exception as exc:  # pragma: no cover — defensive
@@ -363,8 +416,8 @@ def _make_hermes_provider_class() -> Optional[type]:
                     if prm:
                         self.context.protected_resource_metadata = prm
                         if prm.authorization_servers:
-                            self.context.auth_server_url = str(
-                                prm.authorization_servers[0]
+                            self.context.auth_server_url = _normalize_root_authorization_server_url(
+                                str(prm.authorization_servers[0])
                             )
                         break
 

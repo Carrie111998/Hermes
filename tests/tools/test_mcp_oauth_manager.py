@@ -74,6 +74,21 @@ def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
     monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
 
 
+def test_prefetch_normalizes_only_root_authorization_server_slash():
+    """Google PRM uses a root slash while its OAuth issuer omits it."""
+    from tools.mcp_oauth_manager import _normalize_root_authorization_server_url
+
+    assert _normalize_root_authorization_server_url("https://accounts.google.com/") == (
+        "https://accounts.google.com"
+    )
+    assert _normalize_root_authorization_server_url("https://idp.example.com/tenant/") == (
+        "https://idp.example.com/tenant/"
+    )
+    assert _normalize_root_authorization_server_url("https://idp.example.com/?tenant=x") == (
+        "https://idp.example.com/?tenant=x"
+    )
+
+
 def test_hermes_provider_subclass_exists():
     """HermesMCPOAuthProvider is defined and subclasses OAuthClientProvider."""
     from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS
