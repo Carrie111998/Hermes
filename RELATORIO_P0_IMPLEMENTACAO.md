@@ -91,18 +91,18 @@ A implementação deve continuar obedecendo aos seguintes invariantes:
 
 ## 7. Validação local reproduzível
 
-Os comandos abaixo foram executados antes da preparação do branch limpo:
+Os comandos abaixo foram executados no worktree limpo baseado em `origin/main`, após a implementação do P0:
 
 ### Whitelist e plugin hooks
 
 ```text
-scripts/run_tests.sh tests/hermes_cli/test_plugins.py -q
+HERMES_PYTHON='C:/Users/Nitro/hermes-agent/.venv/Scripts/python.exe' scripts/run_tests.sh tests/hermes_cli/test_plugins.py -q
 ```
 
 Resultado real:
 
 ```text
-1 file, 75 tests, 0 failed
+75 tests passed, 0 failed.
 ```
 
 O runner foi utilizado conforme o contrato do projeto, com ambiente hermético, timezone UTC e locale C.UTF-8.
@@ -120,7 +120,7 @@ Resultado real:
 1 passed | 5 skipped (6)
 ```
 
-O Vitest reportou apenas os avisos de configuração npm já existentes (`min-release-age` e `min-release-age-exclude`); não houve falha de teste.
+O teste novo usa um processo nativo multiplataforma que mantém o stdio aberto; os cinco testes POSIX-only existentes foram pulados pelo ambiente Windows. O Vitest reportou apenas os avisos de configuração npm já existentes (`min-release-age` e `min-release-age-exclude`); não houve falha de teste.
 
 ### Higiene do patch
 
@@ -130,7 +130,7 @@ git diff --check
 
 Resultado real: nenhuma inconsistência de whitespace foi reportada.
 
-A mesma validação será repetida no worktree limpo usado para o commit e o PR. O resultado final do CI remoto será registrado após a criação do PR; não será tratado como verde antes da leitura dos checks reais.
+A validação focada, o `git diff --check` e a verificação do PNG foram repetidos no worktree limpo usado para o commit e o PR. O resultado final do CI remoto é registrado somente após a leitura dos checks reais; não é tratado como verde por inferência.
 
 ## 8. Revisão de arquitetura, segurança e concorrência
 
@@ -159,14 +159,24 @@ Não foram adicionados suppressions de erro, `except` silencioso, aumento de tim
 
 ## 10. Rastreabilidade externa
 
-Após a criação e verificação dos artefatos GitHub, esta seção será preenchida com os links reais:
+Os artefatos GitHub foram criados e lidos de volta pela API:
 
-- Issue: `PREENCHER_COM_URL_DA_ISSUE`
-- Pull request: `PREENCHER_COM_URL_DO_PR`
+- Issue: `https://github.com/NousResearch/hermes-agent/issues/98479`
+- Pull request: `https://github.com/NousResearch/hermes-agent/pull/98485`
 - Branch de entrega: `fix/p0-tool-safety`
-- Commit de entrega: `PREENCHER_COM_SHA_DO_COMMIT`
+- Commit de implementação P0: `e8dc3a9a5bb852a6c957d1eb183491ef24792a05` (código e testes).
+- Commit de documentação e infográfico: documentação e infográfico serão registrados em um commit final deste branch.
 
 A issue e o PR devem manter explícita a relação com o P0, referenciar a evidência upstream do P0-A e declarar que o P1 está fora do escopo.
+
+### Infográfico
+
+- Arquivo versionado no branch: `assets/infografico-p0-tool-safety.png`.
+- Cópia de conveniência: `C:\Users\Nitro\Downloads\hermes-p0-pr-98485.png`.
+- Validação real: PNG RGB, 1024x1536, 3.165.150 bytes; a cópia e o arquivo versionado foram comparados por tamanho.
+- O gerador de temas executou 10.000 temas únicos com seed `98077`; o tema selecionado foi `tema-08486` (`steampunk-gotico`), com paleta `prata oxidada, azul petróleo e roxo escuro`.
+- A inspeção visual confirmou texto legível, sem clipping ou sobreposição aparente, e representação dos dois caminhos P0, do bloqueio de bypass silencioso e da exclusão de P1.
+- O infográfico é documentação visual e não substitui os testes automatizados nem a revisão do diff.
 
 ## 11. Checklist de encerramento
 
@@ -177,11 +187,11 @@ A issue e o PR devem manter explícita a relação com o P0, referenciar a evid�
 - [x] Regressão P0-B adicionada para worker com contexto propagado.
 - [x] Testes focados executados com resultado real.
 - [x] `git diff --check` executado.
-- [ ] Worktree limpo baseado em `origin/main` preparado e verificado.
-- [ ] Commit P0 criado.
-- [ ] Issue criada e lida de volta pela API.
-- [ ] PR criado e lido de volta pela API.
+- [x] Worktree limpo baseado em `origin/main` preparado e verificado.
+- [x] Commit P0 criado.
+- [x] Issue criada e lida de volta pela API.
+- [x] PR criado e lido de volta pela API.
 - [ ] CI remoto verificado.
 - [ ] Três passes de exhaustion review concluídos.
 - [ ] URLs e SHA finais incorporados neste documento.
-- [ ] Infográfico PNG validado no branch de entrega.
+- [x] Infográfico PNG validado no branch de entrega.
