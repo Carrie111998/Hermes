@@ -265,6 +265,16 @@ class TestInstallCuaDriverUpgrade:
              patch.object(tools_config, "_clear_stale_cua_install_lock"), \
              patch.object(
                  tools_config,
+                 "_cua_install_lock_held",
+                 return_value=False,
+             ), \
+             patch.object(
+                 tools_config,
+                 "_cua_release_endpoint_reachable",
+                 return_value=True,
+             ), \
+             patch.object(
+                 tools_config,
                  "_repair_cua_driver_autostart_windows",
                  return_value=True,
              ), \
@@ -828,7 +838,7 @@ class TestPosixStaleInstallLockClear:
         lock = home / "packages" / ".install.lock.d"
         lock.mkdir(parents=True)
         if pid is not None:
-            (lock / "info").write_text(f"pid={pid}\n")
+            (lock / "info").write_text(f"pid={pid}\n", encoding="utf-8")
         os.environ["CUA_DRIVER_RS_HOME"] = str(home)
         return lock
 
