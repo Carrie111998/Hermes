@@ -16,6 +16,7 @@ compatibility.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -1324,7 +1325,19 @@ def _consume_codex_event_stream(
                             ).strip()
                     if commentary_text:
                         try:
-                            on_commentary_message(commentary_text)
+                            try:
+                                sig = inspect.signature(on_commentary_message)
+                                accepts_item_id = "item_id" in sig.parameters or any(
+                                    p.kind == inspect.Parameter.VAR_KEYWORD
+                                    for p in sig.parameters.values()
+                                )
+                            except (ValueError, TypeError):
+                                accepts_item_id = True
+
+                            if accepts_item_id:
+                                on_commentary_message(commentary_text, item_id=done_id)
+                            else:
+                                on_commentary_message(commentary_text)
                         except Exception:
                             logger.debug(
                                 "Codex stream on_commentary_message raised",
@@ -1610,11 +1623,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_streamed_text_parts.append(text)
         agent._fire_stream_delta(text)
 
+    delivered_commentary_ids: set[str] = set()
+
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
 
-    def _on_commentary_message(text: str) -> None:
-        agent._fire_streamed_codex_commentary(text)
+    def _on_commentary_message(text: str, item_id: str | None = None) -> None:
+        if item_id and item_id in delivered_commentary_ids:
+            return
+        if agent._fire_streamed_codex_commentary(text, item_id=item_id):
+            if item_id:
+                delivered_commentary_ids.add(item_id)
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.

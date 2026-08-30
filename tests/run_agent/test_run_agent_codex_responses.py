@@ -2407,3 +2407,110 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     )
 
     assert "".join(reasoning_streamed) == "Need to inspect files."
+
+
+def test_codex_commentary_stream_retry_with_item_id_delivered_once(monkeypatch):
+    """Commentary with an authoritative item_id must only be delivered once across stream retries (#94526)."""
+    agent = _build_agent(monkeypatch)
+    delivered = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: delivered.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    # First attempt delivers commentary with item_id "comm_item_1"
+    agent._fire_streamed_codex_commentary("Inspecting codebase first...", item_id="comm_item_1")
+    assert len(delivered) == 1
+    assert delivered[0]["text"] == "Inspecting codebase first..."
+    assert delivered[0]["already_streamed"] is False
+
+    # Second attempt (transport retry) attempts to deliver the same item_id
+    agent._fire_streamed_codex_commentary("Inspecting codebase first...", item_id="comm_item_1")
+    # Must be suppressed (strict deduplication)
+    assert len(delivered) == 1
+
+    # A different commentary item in the same turn can still deliver
+    agent._fire_streamed_codex_commentary("Now running tests...", item_id="comm_item_2")
+    assert len(delivered) == 2
+    assert delivered[1]["text"] == "Now running tests..."
+
+
+def test_emit_interim_assistant_message_is_noop_when_item_id_already_delivered(monkeypatch):
+    """Post-persist emission must be a strict no-op if the item was already streamed (#94526)."""
+    agent = _build_agent(monkeypatch)
+    delivered = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: delivered.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    # 1. Live stream delivered commentary
+    agent._fire_streamed_codex_commentary("Reading file tree...", item_id="comm_001")
+    assert len(delivered) == 1
+
+    # 2. Assistant message created with matching codex_message_items
+    assistant_msg = {
+        "role": "assistant",
+        "content": "Done.",
+        "codex_message_items": [
+            {
+                "type": "message",
+                "phase": "commentary",
+                "id": "comm_001",
+                "content": [{"type": "output_text", "text": "Reading file tree..."}],
+            }
+        ],
+    }
+
+    # 3. Post-persist sweep should be a strict no-op
+    agent._emit_interim_assistant_message(assistant_msg)
+    assert len(delivered) == 1
+
+
+def test_interim_commentary_registers_delivery_without_polluting_stream_accumulator(monkeypatch):
+    """Live commentary must be recognized as delivered via dual-key registry without polluting the final stream accumulator (#94526)."""
+    agent = _build_agent(monkeypatch)
+    agent.interim_assistant_callback = lambda text, **kw: None
+
+    text = "Executing tool plan..."
+    agent._fire_streamed_codex_commentary(text, item_id="comm_plan_1")
+
+    assert agent._interim_text_was_delivered(text, item_id="comm_plan_1") is True
+    # The final stream accumulator must remain unpolluted by commentary
+    assert getattr(agent, "_current_streamed_assistant_text", "") == ""
+
+
+def test_fire_streamed_commentary_returns_status_and_does_not_record_on_error(monkeypatch):
+    """If callback fails, commentary must not be marked delivered so retry can re-attempt delivery (#94526)."""
+    agent = _build_agent(monkeypatch)
+
+    def failing_cb(text, **kw):
+        raise RuntimeError("Network socket disconnected during delivery")
+
+    agent.interim_assistant_callback = failing_cb
+    text = "Important progress update"
+    success = agent._fire_streamed_codex_commentary(text, item_id="comm_fail_1")
+
+    assert success is False
+    assert agent._interim_text_was_delivered(text, item_id="comm_fail_1") is False
+
+
+def test_commentary_and_streamed_assistant_text_interleaving(monkeypatch):
+    """Commentary delivery interleaved with final token streaming preserves prefix semantics (#94526)."""
+    agent = _build_agent(monkeypatch)
+    delivered_commentary = []
+    agent.interim_assistant_callback = lambda text, **kw: delivered_commentary.append(text)
+
+    # 1. Live commentary arrives and delivers via interim callback
+    agent._fire_streamed_codex_commentary("Step 1: Inspecting schema", item_id="comm_step_1")
+    assert len(delivered_commentary) == 1
+    assert agent._interim_text_was_delivered("Step 1: Inspecting schema", item_id="comm_step_1") is True
+
+    # 2. Final response text streams and accumulates visible assistant text
+    agent._record_streamed_assistant_text("Final ")
+    agent._record_streamed_assistant_text("answer summary.")
+
+    # 3. Streamed accumulator contains only the token stream, so final text is properly recognized as streamed
+    assert agent._interim_content_was_streamed("Final answer summary.") is True
+    # Non-streamed text should not match
+    assert agent._interim_content_was_streamed("Completely unrelated text") is False
+
+

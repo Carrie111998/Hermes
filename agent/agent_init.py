@@ -1116,6 +1116,7 @@ def init_agent(
     # Unlike token-stream tracking, this spans Codex continuation/tool calls so
     # repeated commentary is not re-sent before normalization can deduplicate it.
     agent._delivered_interim_texts: set[str] = set()
+    agent._delivered_interim_ids: set[str] = set()
 
     # Single-writer guard for the streaming delta sink (#65991). A stale/
     # superseded stream (e.g. one the stale-stream detector reconnected past,

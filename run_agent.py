@@ -6677,18 +6677,11 @@ class AIAgent:
         # on_commentary() (#65919 review).
         return bool(streamed) and visible_content.startswith(streamed)
 
-    def _extract_codex_interim_visible_parts(
+    def _extract_codex_interim_items(
         self,
         assistant_msg: Dict[str, Any],
-    ) -> List[str]:
-        """Extract visible Codex commentary as one string per message item.
-
-        Codex Responses can keep user-facing mid-turn narration as structured
-        ``phase=commentary`` message items while final answer text remains in
-        assistant ``content``.  Non-streaming gateway surfaces need that
-        commentary through the interim assistant callback before tool calls run.
-        ``phase=analysis`` remains hidden because it is provider scratchpad.
-        """
+    ) -> List[tuple[str, str]]:
+        """Extract visible Codex commentary pairs (item_id, text) per message item."""
         if not getattr(self, "show_commentary", True):
             # display.show_commentary=false — commentary stays on the
             # reasoning channel (pre-commentary-channel behavior).
@@ -6697,7 +6690,7 @@ class AIAgent:
         if not isinstance(items, list):
             return []
 
-        messages: List[str] = []
+        entries: List[tuple[str, str]] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -6706,6 +6699,7 @@ class AIAgent:
             phase = item.get("phase")
             if not isinstance(phase, str) or phase.strip().lower() != "commentary":
                 continue
+            item_id = str(item.get("id") or item.get("item_id") or "").strip()
             content_parts = item.get("content")
             if not isinstance(content_parts, list):
                 continue
@@ -6723,8 +6717,22 @@ class AIAgent:
                 visible = self._strip_think_blocks(visible).strip()
                 visible = redact_sensitive_text(visible)
             if visible:
-                messages.append(visible)
-        return messages
+                entries.append((item_id, visible))
+        return entries
+
+    def _extract_codex_interim_visible_parts(
+        self,
+        assistant_msg: Dict[str, Any],
+    ) -> List[str]:
+        """Extract visible Codex commentary as one string per message item.
+
+        Codex Responses can keep user-facing mid-turn narration as structured
+        ``phase=commentary`` message items while final answer text remains in
+        assistant ``content``.  Non-streaming gateway surfaces need that
+        commentary through the interim assistant callback before tool calls run.
+        ``phase=analysis`` remains hidden because it is provider scratchpad.
+        """
+        return [text for _item_id, text in self._extract_codex_interim_items(assistant_msg)]
 
     def _extract_codex_interim_visible_text(self, assistant_msg: Dict[str, Any]) -> str:
         """Extract all visible Codex commentary for comparison/fallback."""
@@ -6749,13 +6757,30 @@ class AIAgent:
         content = assistant_msg.get("content")
         return self._strip_think_blocks(flatten_message_text(content)).strip()
 
-    def _interim_text_was_delivered(self, text: str) -> bool:
+    def _interim_text_was_delivered(
+        self, text: str, item_id: str | None = None
+    ) -> bool:
+        if item_id:
+            delivered_ids = getattr(self, "_delivered_interim_ids", None)
+            if isinstance(delivered_ids, set) and item_id in delivered_ids:
+                return True
         normalized = self._normalize_interim_visible_text(text)
         if not normalized:
             return False
-        return normalized in getattr(self, "_delivered_interim_texts", set())
+        delivered_texts = getattr(self, "_delivered_interim_texts", None)
+        if isinstance(delivered_texts, set) and normalized in delivered_texts:
+            return True
+        return self._interim_content_was_streamed(text)
 
-    def _record_delivered_interim_text(self, text: str) -> None:
+    def _record_delivered_interim_text(
+        self, text: str, item_id: str | None = None
+    ) -> None:
+        if item_id:
+            delivered_ids = getattr(self, "_delivered_interim_ids", None)
+            if not isinstance(delivered_ids, set):
+                delivered_ids = set()
+                self._delivered_interim_ids = delivered_ids
+            delivered_ids.add(str(item_id))
         normalized = self._normalize_interim_visible_text(text)
         if normalized:
             delivered = getattr(self, "_delivered_interim_texts", None)
@@ -6764,21 +6789,25 @@ class AIAgent:
                 self._delivered_interim_texts = delivered
             delivered.add(normalized)
 
-    def _fire_streamed_codex_commentary(self, text: str) -> None:
+    def _fire_streamed_codex_commentary(
+        self, text: str, item_id: str | None = None
+    ) -> bool:
         """Deliver a completed live Codex commentary message immediately."""
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(text, str):
-            return
+            return False
         visible = self._strip_think_blocks(text).strip()
         if visible:
             visible = redact_sensitive_text(visible)
-        if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
-            return
+        if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible, item_id=item_id):
+            return False
         try:
             cb(visible, already_streamed=False)
-            self._record_delivered_interim_text(visible)
+            self._record_delivered_interim_text(visible, item_id=item_id)
+            return True
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+            return False
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6795,24 +6824,27 @@ class AIAgent:
         """
         if not isinstance(assistant_msg, dict):
             return
-        commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+        commentary_items = self._extract_codex_interim_items(assistant_msg)
         undelivered_parts: List[str] = []
+        undelivered_ids: List[str] = []
         pending_keys: set[str] = set()
-        for part in commentary_parts:
-            key = self._normalize_interim_visible_text(part)
-            if (
-                not key
-                or key in pending_keys
-                or self._interim_text_was_delivered(part)
-            ):
-                continue
-            pending_keys.add(key)
-            undelivered_parts.append(part)
-        visible = (
-            "\n\n".join(undelivered_parts).strip()
-            if commentary_parts
-            else self._interim_assistant_visible_text(assistant_msg)
-        )
+
+        if commentary_items:
+            for item_id, part in commentary_items:
+                key = self._normalize_interim_visible_text(part)
+                if (
+                    not key
+                    or key in pending_keys
+                    or self._interim_text_was_delivered(part, item_id=item_id)
+                ):
+                    continue
+                pending_keys.add(key)
+                undelivered_parts.append(part)
+                undelivered_ids.append(item_id)
+            visible = "\n\n".join(undelivered_parts).strip()
+        else:
+            visible = self._interim_assistant_visible_text(assistant_msg)
+
         if (
             not visible
             or visible == "(empty)"
@@ -6842,10 +6874,12 @@ class AIAgent:
         try:
             cb(visible, already_streamed=already_streamed)
             if undelivered_parts:
-                for part in undelivered_parts:
-                    self._record_delivered_interim_text(part)
+                for idx, part in enumerate(undelivered_parts):
+                    pid = undelivered_ids[idx] if idx < len(undelivered_ids) else None
+                    self._record_delivered_interim_text(part, item_id=pid)
             else:
                 self._record_delivered_interim_text(visible)
+            self._record_streamed_assistant_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
