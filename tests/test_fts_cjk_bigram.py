@@ -242,3 +242,45 @@ def test_integrity_after_lifecycle(db):
             "INSERT INTO messages_fts_cjk(messages_fts_cjk) "
             "VALUES('integrity-check')"
         )
+
+
+def test_pending_backfill_warns_on_open_and_stats(cjk_so, tmp_path, monkeypatch, caplog):
+    """An interrupted cjk backfill must not stay silent (#98743).
+
+    A DB left with the marker pair frozen mid-way (only optimize-storage's
+    loop ever advances it) warns on the next capable writable open, and the
+    read-only doctor probe reports the same stuck progress."""
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "absent.so"))
+    db_path = tmp_path / "state.db"
+    d1 = SessionDB(db_path=db_path)
+    d1.create_session(session_id="s1", source="cli", model="m")
+    for i in range(10):
+        d1.append_message("s1", role="user", content=f"중단된 백필 {i}")
+    d1.close()
+
+    # Reopen capable: table gets created on the populated DB with the
+    # backfill markers pending.
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
+    d2 = SessionDB(db_path=db_path)
+    assert d2._fts_cjk_loaded
+    assert not d2._fts_cjk_available
+    st = d2.fts_cjk_rebuild_status()
+    assert st is not None and st["pending"]
+    d2.close()
+
+    from hermes_state import collect_state_db_stats
+    stats = collect_state_db_stats(db_path)
+    cjk = stats["fts_cjk_backfill"]
+    assert cjk is not None and cjk["total"] > 0
+
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="hermes_state"):
+        d3 = SessionDB(db_path=db_path)
+        try:
+            assert not d3._fts_cjk_available  # still not served
+        finally:
+            d3.close()
+    assert any(
+        "CJK FTS index backfill is pending" in r.message
+        for r in caplog.records
+    ), caplog.text

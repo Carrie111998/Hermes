@@ -38,6 +38,68 @@ def populated_db(tmp_path):
 # ── collect_state_db_stats ──────────────────────────────────────────────
 
 
+def test_collect_stats_cjk_backfill_markers(populated_db):
+    # Simulate the interrupted CJK backfill directly: markers set, progress
+    # frozen mid-way. The probe must surface it without opening a SessionDB.
+    conn = sqlite3.connect(str(populated_db))
+    conn.execute(
+        "INSERT OR REPLACE INTO state_meta(key, value) "
+        "VALUES ('fts_cjk_rebuild_high_water', '290407')"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO state_meta(key, value) "
+        "VALUES ('fts_cjk_rebuild_progress', '148500')"
+    )
+    conn.commit()
+    conn.close()
+
+    stats = collect_state_db_stats(populated_db)
+    cjk = stats["fts_cjk_backfill"]
+    assert cjk is not None
+    assert cjk["total"] == 290407
+    assert cjk["indexed"] == 148500
+    assert cjk["percent"] == 51
+    assert stats["fts_cjk_stale"] is False
+
+    from hermes_cli.doctor import _render_state_db_stats
+
+    rendered = _render_state_db_stats(stats)
+    warnings = [
+        " ".join((text, detail))
+        for kind, text, detail in rendered
+        if kind == "warn"
+    ]
+    assert any(
+        "CJK FTS index backfill is interrupted" in w
+        and "148,500/290,407" in w
+        and "optimize-storage" in w
+        for w in warnings
+    )
+
+
+def test_collect_stats_cjk_stale_flag(populated_db):
+    conn = sqlite3.connect(str(populated_db))
+    conn.execute(
+        "INSERT OR REPLACE INTO state_meta(key, value) VALUES ('fts_cjk_stale', '1')"
+    )
+    conn.commit()
+    conn.close()
+
+    stats = collect_state_db_stats(populated_db)
+    assert stats["fts_cjk_stale"] is True
+    assert stats["fts_cjk_backfill"] is None
+
+    from hermes_cli.doctor import _render_state_db_stats
+
+    rendered = _render_state_db_stats(stats)
+    warnings = [
+        " ".join((text, detail))
+        for kind, text, detail in rendered
+        if kind == "warn"
+    ]
+    assert any("CJK FTS index is stale" in w for w in warnings)
+
+
 def test_collect_stats_sane_values(populated_db):
     stats = collect_state_db_stats(populated_db)
 
