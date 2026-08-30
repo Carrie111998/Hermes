@@ -98,16 +98,26 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # Native binary (uv tool shim, PyInstaller, distro package) — its own
         # loader is self-sufficient.
         return False
-    shebang = head.decode("utf-8", errors="replace").strip().lower()
-    if "python" not in shebang:
+    shebang_line = head.decode("utf-8", errors="replace").strip()
+    shebang_interp = shebang_line[2:].split()[0] if len(shebang_line) > 2 else ""
+    if "python" not in shebang_interp.lower():
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
+    # a system path) would escape the venv when spawned by the DE. Resolve
+    # both sides before comparing: uv-created venvs symlink ``bin/python3``
+    # to the base interpreter, so the raw shebang text and the resolved
+    # ``sys.executable`` point at the same binary but differ textually
+    # (#90292 follow-up) — a plain substring check false-positives on that
+    # and wrongly prefixes Exec with a foreign interpreter.
+    try:
+        shebang_dir = str(Path(shebang_interp).resolve().parent)
+    except OSError:
+        shebang_dir = ""
     exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    return shebang_dir != exe_dir
 
 
 def _quote_exec_arg(arg: str) -> str:
