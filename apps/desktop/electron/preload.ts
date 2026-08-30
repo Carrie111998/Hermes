@@ -266,6 +266,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   setTitleBarTheme: payload => ipcRenderer.send('hermes:titlebar-theme', payload),
   setNativeTheme: mode => ipcRenderer.send('hermes:native-theme', mode),
   setTranslucency: payload => ipcRenderer.send('hermes:translucency', payload),
+  // Synchronous read — does the current window have an active glass/vibrancy
+  // backing?  Used by applyTheme() to store 'transparent' as the pre-paint
+  // boot background instead of the opaque themed color, preventing the
+  // blinding-white first frame on macOS in dark mode (#98561).
+  glassEnabled: () => ipcRenderer.sendSync('hermes:glass-enabled'),
   setKeepAwake: on => ipcRenderer.send('hermes:keep-awake', on),
   setDisableF12: blocked => ipcRenderer.send('hermes:devtools:disable-f12', blocked),
   setPreviewShortcutActive: active => ipcRenderer.send('hermes:previewShortcutActive', Boolean(active)),

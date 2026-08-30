@@ -282,8 +282,20 @@ function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
   // Raw (non-JSON) keys read by the inline pre-paint script in index.html —
   // they let a brand-new window paint the themed background on its very first
   // frame, before this module has even loaded.
+  //
+  // When glass/vibrancy is active the window backing is transparent and the
+  // NSVisualEffectView provides the background.  Storing the opaque chromeBg
+  // here causes the pre-paint script to paint a solid opaque layer that sits
+  // on top of the vibrancy compositor, producing a blinding white first frame
+  // in dark mode on macOS (#98561).  Store 'transparent' instead so the
+  // vibrancy material shows through from the first painted pixel.
+  //
+  // hermesDesktop.glassEnabled is a cheap synchronous read set by the Electron
+  // preload from the current translucency state — no async import needed.
+  const glassEnabled = Boolean((window as any).hermesDesktop?.glassEnabled?.())
+  const bootBg = glassEnabled ? 'transparent' : chromeBg
   try {
-    window.localStorage.setItem('hermes-boot-background', chromeBg)
+    window.localStorage.setItem('hermes-boot-background', bootBg)
     window.localStorage.setItem('hermes-boot-color-scheme', rendered)
   } catch {
     // Storage may be unavailable (private mode / quota); the inline script
