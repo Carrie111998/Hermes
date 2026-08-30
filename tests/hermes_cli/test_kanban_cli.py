@@ -57,6 +57,27 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_list_json_handles_bytes_fields_in_db(kanban_home):
+    """Regression: tasks with BLOB/bytes fields (e.g. body stored as bytes)
+    must not crash `hermes kanban list --status archived --json` with TypeError."""
+    with kb.connect() as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, body, assignee, status, priority, workspace_kind, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, 'archived', 0, 'scratch', 1000, 'user')",
+            ("t_bytes1", "bytes task", b"## archived task body as bytes", "coder"),
+        )
+        conn.commit()
+
+    raw = kc.run_slash("list --status archived --json")
+    payload = json.loads(raw)
+    assert any(
+        row.get("id") == "t_bytes1"
+        and row.get("body") == "## archived task body as bytes"
+        for row in payload
+    )
+
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

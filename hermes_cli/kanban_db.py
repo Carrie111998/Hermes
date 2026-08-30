@@ -1145,35 +1145,46 @@ class Task:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
+
+        def _str_val(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            if isinstance(v, bytes):
+                return v.decode("utf-8", errors="replace")
+            return str(v)
+
         # Parse skills JSON blob if present
         skills_value: Optional[list] = None
         if "skills" in keys and row["skills"]:
             try:
-                parsed = json.loads(row["skills"])
+                raw_skills = row["skills"]
+                if isinstance(raw_skills, bytes):
+                    raw_skills = raw_skills.decode("utf-8", errors="replace")
+                parsed = json.loads(raw_skills)
                 if isinstance(parsed, list):
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
         return cls(
-            id=row["id"],
-            title=row["title"],
-            body=row["body"],
-            assignee=row["assignee"],
-            status=row["status"],
+            id=_str_val(row["id"]) or "",
+            title=_str_val(row["title"]) or "",
+            body=_str_val(row["body"]),
+            assignee=_str_val(row["assignee"]),
+            status=_str_val(row["status"]) or "",
             priority=row["priority"],
-            created_by=row["created_by"],
+            created_by=_str_val(row["created_by"]),
             created_at=row["created_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
-            workspace_kind=row["workspace_kind"],
-            workspace_path=row["workspace_path"],
-            branch_name=row["branch_name"] if "branch_name" in keys else None,
-            project_id=row["project_id"] if "project_id" in keys else None,
-            claim_lock=row["claim_lock"],
+            workspace_kind=(_str_val(row["workspace_kind"]) or "scratch") if "workspace_kind" in keys else "scratch",
+            workspace_path=_str_val(row["workspace_path"]) if "workspace_path" in keys else None,
+            branch_name=_str_val(row["branch_name"]) if "branch_name" in keys else None,
+            project_id=_str_val(row["project_id"]) if "project_id" in keys else None,
+            claim_lock=_str_val(row["claim_lock"]),
             claim_expires=row["claim_expires"],
-            tenant=row["tenant"] if "tenant" in keys else None,
-            result=row["result"] if "result" in keys else None,
-            idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+            tenant=_str_val(row["tenant"]) if "tenant" in keys else None,
+            result=_str_val(row["result"]) if "result" in keys else None,
+            idempotency_key=_str_val(row["idempotency_key"]) if "idempotency_key" in keys else None,
             consecutive_failures=(
                 row["consecutive_failures"] if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
@@ -1184,9 +1195,9 @@ class Task:
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
             last_failure_error=(
-                row["last_failure_error"] if "last_failure_error" in keys
+                _str_val(row["last_failure_error"]) if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
-                else (row["last_spawn_error"] if "last_spawn_error" in keys else None)
+                else (_str_val(row["last_spawn_error"]) if "last_spawn_error" in keys else None)
             ),
             max_runtime_seconds=(
                 row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
@@ -1198,20 +1209,20 @@ class Task:
                 row["current_run_id"] if "current_run_id" in keys else None
             ),
             workflow_template_id=(
-                row["workflow_template_id"] if "workflow_template_id" in keys else None
+                _str_val(row["workflow_template_id"]) if "workflow_template_id" in keys else None
             ),
             current_step_key=(
-                row["current_step_key"] if "current_step_key" in keys else None
+                _str_val(row["current_step_key"]) if "current_step_key" in keys else None
             ),
             skills=skills_value,
-            model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            model_override=_str_val(row["model_override"]) if "model_override" in keys and row["model_override"] else None,
             provider_override=(
-                row["provider_override"]
+                _str_val(row["provider_override"])
                 if "provider_override" in keys and row["provider_override"]
                 else None
             ),
             reasoning_effort=(
-                row["reasoning_effort"]
+                _str_val(row["reasoning_effort"])
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
@@ -1225,10 +1236,10 @@ class Task:
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
             ),
             session_id=(
-                row["session_id"] if "session_id" in keys else None
+                _str_val(row["session_id"]) if "session_id" in keys else None
             ),
             block_kind=(
-                row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
+                _str_val(row["block_kind"]) if "block_kind" in keys and row["block_kind"] else None
             ),
             block_recurrences=(
                 int(row["block_recurrences"])

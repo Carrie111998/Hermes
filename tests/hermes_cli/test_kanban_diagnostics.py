@@ -224,3 +224,75 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# role_assignee_mismatch rule
+# ---------------------------------------------------------------------------
+
+
+def test_role_assignee_mismatch_fires_on_common_prefixes():
+    cases = [
+        ("Coder: fix memory leak", "reviewer", "Coder", "coder"),
+        ("Reviewer: review PR #123", "coder", "Reviewer", "reviewer"),
+        ("DevOps: deploy production cluster", "architect", "DevOps", "devops"),
+        ("[DevOps] deploy gateway", "reviewer", "DevOps", "devops"),
+        ("Coder\uFF1Afix json crash", "reviewer", "Coder", "coder"),
+        ("[Coder]: handle bytes body", "devops", "Coder", "coder"),
+    ]
+    now = int(time.time())
+    for title, assignee, expected_prefix, expected_role in cases:
+        task = _task(title=title, assignee=assignee, status="ready")
+        diags = kd.compute_task_diagnostics(task, [], [], now=now)
+        mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+        assert len(mismatches) == 1, f"Failed for title={title!r}, assignee={assignee!r}"
+        d = mismatches[0]
+        assert d.severity == "warning"
+        assert d.data["role_prefix"] == expected_prefix
+        assert d.data["expected_assignee"] == expected_role
+        assert d.data["actual_assignee"] == assignee
+        assert any(a.kind == "reassign" for a in d.actions)
+        assert any(a.kind == "cli_hint" for a in d.actions)
+
+
+def test_role_assignee_mismatch_does_not_fire_when_matching():
+    cases = [
+        ("Coder: fix memory leak", "coder"),
+        ("Reviewer: review PR #123", "reviewer"),
+        ("DevOps: deploy production cluster", "devops"),
+        ("[DevOps] deploy gateway", "devops"),
+        ("Coder\uFF1Afix json crash", "coder"),
+    ]
+    now = int(time.time())
+    for title, assignee in cases:
+        task = _task(title=title, assignee=assignee, status="ready")
+        diags = kd.compute_task_diagnostics(task, [], [], now=now)
+        mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+        assert len(mismatches) == 0, f"Unexpected mismatch diagnostic for {title!r} with {assignee!r}"
+
+
+def test_role_assignee_mismatch_does_not_fire_on_unrelated_prefix_or_no_prefix():
+    cases = [
+        ("Fix bug in parser", "reviewer"),
+        ("Feature: add support for streaming", "coder"),
+        ("Bug: crash on empty list", "reviewer"),
+        ("http://example.com/issue/12", "coder"),
+        ("123: numeric title", "coder"),
+        ("Quick investigation", "devops"),
+    ]
+    now = int(time.time())
+    for title, assignee in cases:
+        task = _task(title=title, assignee=assignee, status="ready")
+        diags = kd.compute_task_diagnostics(task, [], [], now=now)
+        mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+        assert len(mismatches) == 0, f"Unexpected mismatch diagnostic for non-role title {title!r}"
+
+
+def test_role_assignee_mismatch_exempt_for_terminal_status():
+    now = int(time.time())
+    for status in ("done", "archived"):
+        task = _task(title="Coder: fix bug", assignee="reviewer", status=status)
+        diags = kd.compute_task_diagnostics(task, [], [], now=now)
+        mismatches = [d for d in diags if d.kind == "role_assignee_mismatch"]
+        assert len(mismatches) == 0, f"Terminal task ({status}) should not fire role_assignee_mismatch"
+
