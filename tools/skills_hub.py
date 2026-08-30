@@ -169,7 +169,12 @@ def _referenced_support_paths(skill_md: str) -> Optional[set[str]]:
         return None
     paths: set[str] = set()
     for match in _LOCAL_LINK_RE.finditer(normalized):
-        raw = unquote(urlsplit(match.group(1).rstrip(".,;:")).path)
+        raw_match = match.group(1).rstrip(".,;:")
+        if raw_match.endswith("/"):
+            continue
+        raw = unquote(urlsplit(raw_match).path)
+        if raw.endswith("/"):
+            continue
         try:
             safe = _validate_bundle_rel_path(raw)
         except ValueError:
@@ -679,6 +684,8 @@ class GitHubSource(SkillSource):
                 if item is None:
                     logger.warning("Referenced skill support file is missing: %s", item_path)
                     return None
+                if item.get("type") == "tree":
+                    continue
                 if item.get("type") != "blob" or item.get("mode") == "120000":
                     logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
                     return None
