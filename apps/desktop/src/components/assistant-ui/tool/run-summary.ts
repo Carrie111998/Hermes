@@ -37,7 +37,10 @@ const EXPLORE_TOOLS = new Set([
   'list_files',
   'read_file',
   'search_files',
+  'session_search',
   'session_search_recall',
+  'skill_view',
+  'skills_list',
   'vision_analyze',
   'web_extract',
   'web_search'
@@ -48,7 +51,7 @@ function toolCategory(toolName: string): RunCategory {
     return 'edit'
   }
 
-  if (toolName === 'terminal' || toolName === 'execute_code') {
+  if (toolName === 'terminal' || toolName === 'execute_code' || toolName === 'process') {
     return 'run'
   }
 
@@ -63,6 +66,25 @@ function toolCategory(toolName: string): RunCategory {
   return 'other'
 }
 
+// Hermes-specific tool verbs, for tools whose category verb ("Using",
+// "Exploring") is too vague to say what is actually happening. Tools the
+// category system already describes well are deliberately absent.
+const HERMES_TOOL_VERBS: Record<string, string> = {
+  browser_exec: 'Browsing',
+  computer_use: 'Using desktop',
+  cronjob: 'Scheduling',
+  image_generate: 'Generating image',
+  memory: 'Saving to memory',
+  session_search: 'Searching history',
+  skill_manage: 'Managing skill',
+  skill_view: 'Loading skill',
+  skills_list: 'Listing skills',
+  text_to_speech: 'Speaking',
+  todo: 'Planning',
+  tool_search: 'Searching tools',
+  vision_analyze: 'Analyzing image'
+}
+
 function isPending(tool: ToolCallLike): boolean {
   return tool.result === undefined
 }
@@ -73,7 +95,7 @@ function isPending(tool: ToolCallLike): boolean {
  * described in the same words from the moment the model drafts it.
  */
 export function toolPresentVerb(toolName: string): string {
-  return CATEGORY_COPY[toolCategory(toolName)].present
+  return HERMES_TOOL_VERBS[toolName] ?? CATEGORY_COPY[toolCategory(toolName)].present
 }
 
 /** The thing a tool acted on, as the header should name it. */

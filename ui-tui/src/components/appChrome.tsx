@@ -119,7 +119,17 @@ export const busyIndicatorWidth = (style: IndicatorStyle, hasDuration: boolean):
   return indicatorFrameWidth(style) + verb + duration
 }
 
-function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: null | number; style: IndicatorStyle }) {
+function FaceTicker({
+  activeToolVerb,
+  color,
+  startedAt,
+  style
+}: {
+  activeToolVerb?: string
+  color: string
+  startedAt?: null | number
+  style: IndicatorStyle
+}) {
   const [tick, setTick] = useState(() => Math.floor(Math.random() * 1000))
   const [verbTick, setVerbTick] = useState(() => Math.floor(Math.random() * VERBS.length))
   const [now, setNow] = useState(() => Date.now())
@@ -162,7 +172,7 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
   }, [intervalMs, isOccluded, showVerb])
 
   const { frame } = renderIndicator(style, tick)
-  const verb = VERBS[verbTick % VERBS.length] ?? ''
+  const verb = activeToolVerb ?? VERBS[verbTick % VERBS.length] ?? ''
   const verbSegment = showVerb ? ` ${padVerb(verb)}` : ''
   // Leading space keeps a gap between the frame and the duration when the
   // verb segment is hidden (e.g. `unicode` spinner style).  When the verb
@@ -472,6 +482,7 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
 export function StatusRule({
   battery,
   focusView,
+  activeToolVerb,
   cwdLabel,
   cols,
   busy,
@@ -666,7 +677,12 @@ export function StatusRule({
             </Text>
           ) : null}
           {busy ? (
-            <FaceTicker color={statusColor} startedAt={turnStartedAt} style={indicatorStyle} />
+            <FaceTicker
+              activeToolVerb={activeToolVerb}
+              color={statusColor}
+              startedAt={turnStartedAt}
+              style={indicatorStyle}
+            />
           ) : showNotice ? null : (
             <Text color={statusColor} wrap="truncate-end">
               {status}
@@ -914,6 +930,9 @@ interface StatusRuleProps {
   battery?: BatteryInfo | null
   // Focus view (/focus) badge — display-only reduced-output indicator.
   focusView?: boolean
+  // Verb for the tool currently running, e.g. 'loading skill'. Replaces the
+  // rotating filler word while a tool is in flight.
+  activeToolVerb?: string
   bgCount: number
   lastTurnEndedAt?: null | number
   liveSessionCount: number
