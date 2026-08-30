@@ -151,6 +151,83 @@ def _run_update_until_guard(args):
     return "returned"
 
 
+def test_current_checkout_handoff_wires_desktop_rebuild(monkeypatch, tmp_path):
+    """The real no-commit hand-off branch must reach the Desktop rebuild tail."""
+    from hermes_cli import update_cmd
+    from hermes_cli import update_inventory, update_receipt
+    from hermes_cli import gitlock, managed_uv
+
+    (tmp_path / ".git").mkdir()
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.touch()
+
+    def fake_git_run(command, **_kwargs):
+        if "--abbrev-ref" in command:
+            stdout = "main\n"
+        elif "rev-list" in command:
+            stdout = "0\n"
+        elif "--is-shallow-repository" in command:
+            stdout = "false\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    completions = []
+    rebuilds = []
+    monkeypatch.setenv("HERMES_UPDATE_REEXEC", "1")
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_git_run)
+    monkeypatch.setattr(update_cmd, "_read_project_version", lambda: None)
+    monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda _path: True)
+    monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
+    monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
+    monkeypatch.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(update_cmd, "_venv_core_imports_healthy", lambda: (True, ""))
+    monkeypatch.setattr(update_cmd, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(update_cmd, "venv_python_path", lambda *_args, **_kwargs: venv_python)
+    monkeypatch.setattr(update_cmd, "_check_and_apply_config_migration", lambda **_kwargs: None)
+    monkeypatch.setattr(update_cmd, "_print_update_completion", completions.append)
+    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", lambda: None)
+    monkeypatch.setattr(
+        update_cmd,
+        "_rebuild_desktop_after_update",
+        lambda path, **kwargs: rebuilds.append((path, kwargs)) or True,
+    )
+
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(cli_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(cli_main, "_capture_active_tool_dependencies", lambda: {})
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: False)
+    monkeypatch.setattr(cli_main, "_run_pre_update_backup", lambda _args: None)
+    monkeypatch.setattr(cli_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(cli_main, "_resume_windows_gateways_after_update", lambda _token: None)
+    monkeypatch.setattr(cli_main, "_get_origin_url", lambda *_args: "https://github.com/NousResearch/hermes-agent.git")
+    monkeypatch.setattr(cli_main, "_resolve_update_branch", lambda _args: "main")
+    monkeypatch.setattr(cli_main, "_stash_local_changes_if_needed", lambda *_args: None)
+    monkeypatch.setattr(cli_main, "_abort_dependency_sync_if_self_locked", lambda _token: None)
+    monkeypatch.setattr(cli_main, "_install_python_dependencies_with_optional_fallback", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_main, "_refresh_active_lazy_features", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_main, "_restore_active_tool_dependencies", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_main, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(update_receipt, "begin_update_receipt", lambda: None)
+    monkeypatch.setattr(update_inventory, "collect_runtime_inventory", lambda: SimpleNamespace(runtimes=[]))
+    monkeypatch.setattr(update_inventory, "record_plan_in_receipt", lambda _plan: None)
+    monkeypatch.setattr(gitlock, "clear_stale_git_locks", lambda _root: [])
+    monkeypatch.setattr(gitlock, "clear_stale_tmp_packs", lambda _root: [])
+    monkeypatch.setattr(managed_uv, "update_managed_uv", lambda **_kwargs: None)
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda **_kwargs: "uv")
+
+    update_cmd._cmd_update_impl(_update_args(force=True), gateway_mode=False)
+
+    assert rebuilds == [
+        (
+            tmp_path / "apps" / "desktop",
+            {"had_desktop_app_before_update": True},
+        )
+    ]
+    assert completions == ["✓ Update complete!"]
+
+
 @pytest.mark.parametrize(
     "force,force_venv,expected",
     [
