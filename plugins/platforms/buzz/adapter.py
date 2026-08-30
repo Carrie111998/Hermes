@@ -25,11 +25,12 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+          reply_to_mode: first          # first (default) or off (flat replies)
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_REPLY_TO_MODE  # first (default) or off (flat replies)
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -344,6 +345,32 @@ def _parse_json_list(stdout: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _configured_reply_to_mode(config: Any) -> str:
+    """Resolve the env-overridable reply mode shared by every send path."""
+    env_mode = os.getenv("BUZZ_REPLY_TO_MODE", "").strip()
+    if env_mode:
+        return env_mode.lower()
+    configured = getattr(config, "reply_to_mode", "first")
+    # YAML 1.1 parses bare `off`/`on` as booleans before PlatformConfig sees it.
+    if configured is False:
+        return "off"
+    if configured is True:
+        return "first"
+    return str(configured or "first").strip().lower()
+
+
+def _reply_target(
+    reply_to: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    reply_to_mode: str = "first",
+) -> Optional[str]:
+    """Return a reply anchor unless the configured mode requires flat delivery."""
+    if str(reply_to_mode).strip().lower() == "off":
+        return None
+    return reply_to or (metadata or {}).get("thread_id")
+
+
 # ---------------------------------------------------------------------------
 # Buzz Adapter
 # ---------------------------------------------------------------------------
@@ -374,6 +401,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self.channels: List[str] = [c.strip() for c in raw_channels if isinstance(c, str) and c.strip()]
 
         self.home_channel = (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
+        self.reply_to_mode = _configured_reply_to_mode(config)
 
         try:
             interval = float(os.getenv("BUZZ_POLL_INTERVAL") or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL))
@@ -611,7 +639,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        reply_target = _reply_target(reply_to, metadata, reply_to_mode=self.reply_to_mode)
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -683,8 +711,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            reply_target = _reply_target(reply_to, metadata, reply_to_mode=self.reply_to_mode)
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1388,8 +1417,9 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    if thread_id:
-        args += ["--reply-to", str(thread_id)]
+    reply_target = _reply_target(thread_id, reply_to_mode=_configured_reply_to_mode(pconfig))
+    if reply_target:
+        args += ["--reply-to", str(reply_target)]
     for path in media_files or []:
         args += ["--file", str(path)]
     try:

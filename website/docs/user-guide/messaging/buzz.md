@@ -25,6 +25,7 @@ gateway:
   platforms:
     buzz:
       enabled: true
+      reply_to_mode: first          # default; use reply_to_mode: "off" for flat replies
       extra:
         relay_url: https://mycommunity.communities.buzz.xyz
         channels:                  # channel UUIDs to watch (empty = all joined)
@@ -52,6 +53,7 @@ BUZZ_PRIVATE_KEY=nsec1...
 | `BUZZ_HOME_CHANNEL` | — | Channel UUID for cron / notification delivery (defaults to the first watched channel) |
 | `BUZZ_ALLOWED_USERS` | — | Comma-separated npubs or hex pubkeys allowed to talk to the agent |
 | `BUZZ_ALLOW_ALL_USERS` | — | Allow any community member to talk to the agent |
+| `BUZZ_REPLY_TO_MODE` | — | `first` (default) preserves reply anchors; `off` sends flat replies |
 | `BUZZ_POLL_INTERVAL` | — | Seconds between inbound poll sweeps (default: 4) |
 | `BUZZ_CLI_PATH` | — | Path to the `buzz` binary (default: `buzz` on PATH, then `~/bin/buzz`) |
 | `BUZZ_CREDENTIALS_FILE` | — | JSON credentials file holding the nsec, used when `BUZZ_PRIVATE_KEY` is unset |
@@ -70,6 +72,7 @@ gateway:
   platforms:
     buzz:
       enabled: true
+      reply_to_mode: first                 # first (default) preserves reply anchors; use off for flat replies
       extra:
         relay_url: https://mycommunity.communities.buzz.xyz
         channels:                         # channel UUIDs to watch (empty = all joined)

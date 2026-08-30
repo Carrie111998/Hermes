@@ -42,6 +42,7 @@ _ENV_VARS = (
     "BUZZ_HOME_CHANNEL",
     "BUZZ_ALLOWED_USERS",
     "BUZZ_ALLOW_ALL_USERS",
+    "BUZZ_REPLY_TO_MODE",
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
@@ -68,10 +69,14 @@ def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind
     }
 
 
-def _make_adapter(extra=None):
+def _make_adapter(extra=None, reply_to_mode="first"):
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})})
+    cfg = PlatformConfig(
+        enabled=True,
+        reply_to_mode=reply_to_mode,
+        extra={"relay_url": "https://test.relay", **(extra or {})},
+    )
     adapter = BuzzAdapter(cfg)
     adapter._self_pubkey = SELF_PUBKEY
     adapter._self_npub = SELF_NPUB
@@ -141,6 +146,32 @@ class TestBuzzAdapterInit:
         from gateway.config import PlatformConfig
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
+
+    def test_bare_yaml_off_boolean_selects_flat_reply_mode(self):
+        """YAML 1.1 parses unquoted `off` as False; preserve its semantic token."""
+        from gateway.config import PlatformConfig
+
+        config = PlatformConfig.from_dict({
+            "enabled": True,
+            "reply_to_mode": False,
+            "extra": {"relay_url": "https://cfg.relay"},
+        })
+        assert BuzzAdapter(config).reply_to_mode == "off"
+
+    def test_loader_normalizes_unquoted_yaml_off(self, monkeypatch, tmp_path):
+        """The full YAML loader preserves the advertised unquoted `off` setting."""
+        from gateway.config import Platform, load_gateway_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    buzz:\n      enabled: true\n      reply_to_mode: off\n      extra:\n        relay_url: https://cfg.relay\n",
+            encoding="utf-8",
+        )
+
+        config = load_gateway_config()
+        buzz_config = config.platforms[Platform("buzz")]
+        assert buzz_config.reply_to_mode is False
+        assert BuzzAdapter(buzz_config).reply_to_mode == "off"
 
 
 # ── CLI error contract ────────────────────────────────────────────────────
@@ -407,6 +438,79 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_send_omits_reply_reference_when_reply_mode_off(self, monkeypatch):
+        """Flat Buzz DMs must not be rendered as reply threads."""
+        monkeypatch.setenv("BUZZ_REPLY_TO_MODE", "off")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "flat reply", reply_to="source-event")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_send_omits_metadata_thread_reference_when_reply_mode_off(self, monkeypatch):
+        """Flat delivery also suppresses framework-provided thread metadata."""
+        monkeypatch.setenv("BUZZ_REPLY_TO_MODE", "off")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt125", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "flat metadata reply", metadata={"thread_id": "source-event"})
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_send_uses_canonical_reply_mode_config(self):
+        """YAML PlatformConfig reply_to_mode controls Buzz without an env override."""
+        adapter = _make_adapter(reply_to_mode="off")
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt126", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "configured flat reply", reply_to="source-event")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_environment_reply_mode_overrides_canonical_config(self, monkeypatch):
+        """An explicit environment setting wins over config.yaml, like other Buzz settings."""
+        monkeypatch.setenv("BUZZ_REPLY_TO_MODE", "first")
+        adapter = _make_adapter(reply_to_mode="off")
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "env threaded reply", reply_to="source-event")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "source-event"
+
+    @pytest.mark.asyncio
+    async def test_send_keeps_reply_reference_by_default(self):
+        """Existing threaded delivery remains the default for Buzz replies."""
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt125", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "threaded reply", reply_to="source-event")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "source-event"
+
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
@@ -420,6 +524,23 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+    @pytest.mark.asyncio
+    async def test_send_local_image_omits_reply_reference_when_reply_mode_off(self, monkeypatch, tmp_path):
+        """Local media sends honor flat reply mode as well as text sends."""
+        monkeypatch.setenv("BUZZ_REPLY_TO_MODE", "off")
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(CHANNEL, str(img), reply_to="source-event")
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -536,5 +657,32 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_omits_thread_when_reply_mode_off(self, monkeypatch, tmp_path):
+        """Cron/standalone sends share the same flat-delivery contract."""
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-flat-cron"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}, reply_to_mode="off"),
+            CHANNEL,
+            "cron says hi",
+            thread_id="source-event",
+        )
+
+        assert result == {"success": True, "message_id": "evt-flat-cron"}
+        assert "--reply-to" not in captured["args"]
 
 
