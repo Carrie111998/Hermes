@@ -89,7 +89,7 @@ _DEFAULT_FILE_TIMEOUT_SECONDS = 420.0
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
 # but is loudly reported as FLAKY so it gets fixed rather than hidden.
-# Deterministic failures fail every attempt — a real regression can never be
+# Deterministic failures fail both attempts — a real regression can never be
 # laundered into green by this (it would have to flake in our favor twice in
 # a row on the same runner, which is exactly the definition of a flake).
 # Set to 0 to disable (env: HERMES_TEST_FILE_RETRIES).
@@ -615,7 +615,7 @@ def _print_inline_failure(
         print(f"  ║ {line}", flush=True)
     print("  ║", flush=True)
     print(f"  ║  Repro: {repro}", flush=True)
-    print("  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
+    print("  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
     print(flush=True)
 
 
@@ -653,6 +653,7 @@ def _save_durations(
         data[key] = round(t, 3)
     path = repo_root / _DURATIONS_FILE
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
 
 def _compute_lpt_slices(
     files: List[Path],
