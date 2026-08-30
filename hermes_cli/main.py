@@ -524,6 +524,7 @@ def _apply_profile_override() -> None:
     profile_name = None
     consume = 0
     profile_index = None
+    subcommand = None
 
     def _inside_mcp_add_args(index: int) -> bool:
         """True once argv reaches `hermes mcp add ... --args <command argv>`.
@@ -583,10 +584,12 @@ def _apply_profile_override() -> None:
             break
         if arg == "--args" and _inside_mcp_add_args(i):
             break
+        if subcommand is None and not arg.startswith("-"):
+            subcommand = arg
         # `hermes doctor --profile NAME` is a read-only inspection target,
         # not the global profile override. The doctor subparser owns that
         # spelling; retain the historical global override everywhere else.
-        doctor_before = "doctor" in argv[:i]
+        doctor_before = subcommand == "doctor"
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
             if doctor_before:
                 i += 2
