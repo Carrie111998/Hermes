@@ -398,7 +398,9 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
 
     # Collect results from all (or filtered) sources in parallel.
     # Per-source limits are generous — parallelism + 30s timeout cap prevents hangs.
-    _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
+    _TRUST_RANK = {
+        "builtin": 4, "operator": 3, "trusted": 2, "community": 1,
+    }
     # NOTE: when the centralized index is available, parallel_search_sources
     # skips the external API sources and serves everything from "hermes-index".
     # That source MUST therefore carry a limit large enough to cover the whole
@@ -925,7 +927,9 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
     )
 
     page_size = max(1, min(page_size, 100))
-    _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
+    _TRUST_RANK = {
+        "builtin": 4, "operator": 3, "trusted": 2, "community": 1,
+    }
     # "hermes-index" must carry a high limit: when the index is available the
     # router skips external API sources and serves everything from it, so a
     # low cap here silently truncates the whole hub (see do_browse note).

@@ -759,7 +759,9 @@ class GitHubSource(SkillSource):
         # Deduplicate by identifier, preferring higher trust levels.
         # identifier is unique per skill; name is not (two configured taps can
         # publish skills with the same name but different identifiers).
-        _trust_rank = {"builtin": 2, "trusted": 1, "community": 0}
+        _trust_rank = {
+            "builtin": 3, "operator": 2, "trusted": 1, "community": 0,
+        }
         seen = {}
         for r in results:
             if r.identifier not in seen:
@@ -868,14 +870,11 @@ class GitHubSource(SkillSource):
                     )
             revision = self._tree_revisions.get(repo) or branch
         else:
-            for rel_path in referenced:
-                content = self._fetch_file_bytes(repo, f"{skill_path.rstrip('/')}/{rel_path}")
-                if content is None:
-                    logger.warning("Failed to fetch referenced skill support "
-                                   "file; continuing without it: %s", rel_path)
-                    continue
-                files[rel_path] = content
-            revision = ""
+            logger.warning(
+                "Cannot fetch a complete pinned skill bundle without the "
+                "repository tree: %s/%s", repo, skill_path,
+            )
+            return None
 
         skill_name = skill_path.rstrip("/").split("/")[-1]
         trust = self.trust_level_for(identifier)
@@ -1852,9 +1851,11 @@ class SkillsShSource(SkillSource):
     )
     _WEEKLY_INSTALLS_RE = re.compile(r'Weekly Installs.*?children\\":\\"(?P<count>[0-9.,Kk]+)\\"', re.DOTALL)
 
-    def __init__(self, auth: GitHubAuth):
+    def __init__(
+        self, auth: GitHubAuth, github: Optional[GitHubSource] = None
+    ):
         self.auth = auth
-        self.github = GitHubSource(auth=auth)
+        self.github = github or GitHubSource(auth=auth)
 
     def source_id(self) -> str:
         return "skills-sh"
@@ -4627,13 +4628,15 @@ class HermesIndexSource(SkillSource):
     downstream sources take over transparently.
     """
 
-    def __init__(self, auth: GitHubAuth):
+    def __init__(
+        self, auth: GitHubAuth, github: Optional[GitHubSource] = None
+    ):
         self._index: Optional[dict] = None
         self._loaded = False
         self.auth = auth
         # Lazily create GitHubSource for fetch — only used when actually
         # downloading files, which requires real GitHub API calls.
-        self._github: Optional[GitHubSource] = None
+        self._github: Optional[GitHubSource] = github
 
     def _ensure_loaded(self) -> dict:
         if not self._loaded:
@@ -4814,14 +4817,15 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
 
     taps_mgr = TapsManager()
     extra_taps = taps_mgr.list_taps()
+    github = GitHubSource(auth=auth, extra_taps=extra_taps)
 
     sources: List[SkillSource] = [
         OptionalSkillSource(auth=auth),  # Official optional skills (highest priority)
-        HermesIndexSource(auth=auth), # Centralized index (search + resolved install paths)
-        SkillsShSource(auth=auth),
+        HermesIndexSource(auth=auth, github=github), # Centralized index (search + resolved install paths)
+        SkillsShSource(auth=auth, github=github),
         WellKnownSkillSource(),
         UrlSource(),                  # Direct HTTP(S) URL to a SKILL.md file
-        GitHubSource(auth=auth, extra_taps=extra_taps),
+        github,
         ClawHubSource(),
         LobeHubSource(),
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills
@@ -4964,7 +4968,9 @@ def unified_search(query: str, sources: List[SkillSource],
     # identifier is always unique per skill (e.g. "browse-sh/airbnb.com/search-listings-ddgioa").
     # Using name would incorrectly collapse browse-sh skills from different sites that share
     # the same task name (e.g. "search-listings" from Airbnb and Booking.com).
-    _TRUST_RANK = {"builtin": 2, "trusted": 1, "community": 0}
+    _TRUST_RANK = {
+        "builtin": 3, "operator": 2, "trusted": 1, "community": 0,
+    }
     seen: Dict[str, SkillMeta] = {}
     for r in all_results:
         if r.identifier not in seen:
