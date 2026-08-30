@@ -1707,16 +1707,20 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
 # optimization: after the first attempt either TERMINAL_ENV is set (bridge
 # succeeded — merged config always carries terminal.backend) or the import
 # failed and retrying every call would be wasted work.  The one-shot is
-# keyed to the context-local Hermes home override: under profile
-# multiplexing (gateway.multiplex_profiles) each profile runs under its own
-# override, so the first profile's bridge must not pin TERMINAL_* for the
-# others (#94200).
+# keyed to the active Hermes home (context-local profile override →
+# ``HERMES_HOME`` env → platform default, via ``hermes_home_key()``):
+# under profile multiplexing (gateway.multiplex_profiles) each profile runs
+# under its own home, and a unified dashboard backend switches homes
+# per request, so the first home's bridge must not pin TERMINAL_* for the
+# others (#94200, #98581).
 _terminal_config_bridge_attempted = False
 _terminal_config_bridge_scope: "str | None" = None
-# TERMINAL_* keys the last bridge introduced (not present in os.environ
-# before it ran) — unset on the next scope change so the incoming profile
-# starts from its own config/.env instead of the previous profile's
-# backend selection.
+# TERMINAL_* env vars the last bridged home's ``terminal`` config section
+# explicitly owns — unset on the next home change so the incoming profile
+# starts from its own config/.env instead of the previous home's backend
+# selection. Ownership is computed from the config section, so keys a
+# launcher bridge (CLI ``env_mappings``) already wrote for the same section
+# are covered too; keys neither home configured are never touched.
 _terminal_config_bridge_keys: "set[str]" = set()
 # Serializes the check/purge/re-bridge sequence below: under profile
 # multiplexing, agents on different threads can race their first terminal
@@ -1744,35 +1748,41 @@ def _ensure_terminal_env_bridged() -> None:
     keys are preserved. When no terminal section exists, exported/.env values
     keep working unchanged.
 
-    The bridge runs once per context-local home override. Under multiplexed
+    The bridge runs once per active Hermes home (context-local profile
+    override → ``HERMES_HOME`` env → platform default). Under multiplexed
     profiles the override is the profile boundary (each profile's agents run
-    under its own ``set_hermes_home_override``), and the first terminal call
-    used to pin the first profile's TERMINAL_* into the shared process env —
-    a docker profile bridging first made every later local profile inherit
-    Docker ("sandbox flapping", #94200). When the override changes, the keys
-    the previous bridge introduced are unset before re-bridging, so each
-    profile resolves from its own config. Without an override (single-home
-    CLI/processes) the flag keeps its pure one-shot optimization semantics.
+    under its own ``set_hermes_home_override``), and a unified dashboard
+    backend serves several profiles through that same override — the first
+    terminal call used to pin the first home's TERMINAL_* into the shared
+    process env, so a docker home bridging first made every later local
+    profile inherit Docker ("sandbox flapping", #94200; docker-profile
+    commands on the host, #98581). When the home changes, the env vars the
+    previous home's terminal section explicitly owns are unset before
+    re-bridging, so each profile resolves from its own config — the same
+    re-bridge ``web_server.py`` performs per-request for the embedded chat
+    PTY. Within one home the flag keeps its pure one-shot optimization
+    semantics.
     """
     global _terminal_config_bridge_attempted
     global _terminal_config_bridge_scope, _terminal_config_bridge_keys
     with _terminal_config_bridge_lock:
         try:
-            from hermes_constants import get_hermes_home_override
+            from hermes_constants import hermes_home_key
 
-            current_scope = get_hermes_home_override()
+            current_scope = hermes_home_key()
         except Exception:
             current_scope = None
         if _terminal_config_bridge_attempted and _terminal_config_bridge_scope == current_scope:
             return
-        # Profile handoff: drop the TERMINAL_* keys the previous scope's
-        # bridge introduced (keys the user's shell/.env exported stay put)
-        # so the incoming profile resolves from its own config instead of
-        # the previous profile's backend selection (#94200). This runs
+        # Profile handoff: drop the TERMINAL_* env vars the previous home's
+        # terminal section explicitly owned (keys the user's shell/.env
+        # exported for sections neither home configured stay put) so the
+        # incoming profile resolves from its own config instead of the
+        # previous home's backend selection (#94200, #98581). This runs
         # BEFORE the attempt flags latch: if the config import or anything
         # below raises, the stale keys are already gone and the except
         # path degrades to the historical local default — it must not
-        # re-leak the previous profile's backend selection precisely when
+        # re-leak the previous home's backend selection precisely when
         # the config machinery is broken.
         for key in _terminal_config_bridge_keys:
             os.environ.pop(key, None)
@@ -1780,9 +1790,11 @@ def _ensure_terminal_env_bridged() -> None:
         _terminal_config_bridge_attempted = True
         _terminal_config_bridge_scope = current_scope
         try:
-            from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
-
-            before = {k for k in os.environ if k.startswith("TERMINAL_")}
+            from hermes_cli.config import (
+                apply_terminal_config_to_env,
+                read_raw_config,
+                terminal_config_owned_env_vars,
+            )
 
             # If config.yaml has an explicit terminal section, bridge with
             # override enabled. The helper only overrides env vars for keys present
@@ -1790,18 +1802,25 @@ def _ensure_terminal_env_bridged() -> None:
             # terminal section, preserve an existing TERMINAL_ENV selection or
             # backfill defaults when no selection exists.
             raw_config = read_raw_config()
-            has_terminal_section = isinstance(raw_config.get("terminal"), dict)
+            raw_terminal = raw_config.get("terminal")
+            has_terminal_section = isinstance(raw_terminal, dict)
 
             if has_terminal_section:
                 # Explicit terminal keys in config.yaml win over matching env values.
                 apply_terminal_config_to_env(env=None, override=True)
+                # Record what this home's section owns so the next handoff can
+                # drop exactly those vars — including ones a launcher bridge
+                # (CLI env_mappings) wrote for the same section before the
+                # first terminal call, which a before/after diff would miss.
+                _terminal_config_bridge_keys = terminal_config_owned_env_vars(
+                    raw_terminal
+                )
             elif "TERMINAL_ENV" not in os.environ:
                 # No terminal section in config.yaml, TERMINAL_ENV not set —
-                # backfill from config defaults
+                # backfill from config defaults. Backfilled vars are not
+                # section-owned (the section does not exist), so they are left
+                # for the next handoff like any operator-exported value.
                 apply_terminal_config_to_env(env=None, override=False)
-            _terminal_config_bridge_keys = (
-                {k for k in os.environ if k.startswith("TERMINAL_")} - before
-            )
         except Exception:
             # Never let a config problem take the terminal tool down — the
             # historical local default still applies.

@@ -12,7 +12,11 @@ import sys
 import pytest
 
 import tools.terminal_tool as terminal_tool
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -284,6 +288,104 @@ def test_handoff_never_unsets_shell_exported_terminal_vars(
         reset_hermes_home_override(token_b)
 
     assert os.environ["TERMINAL_DOCKER_IMAGE"] == "shell/image:9"
+
+
+# -- unified dashboard profile switcher (#98581) --------------------------------
+
+
+def test_profile_switch_serves_each_profiles_terminal_backend(tmp_path):
+    """A unified dashboard backend serves non-default profiles under a
+    context-local HERMES_HOME override; each profile must execute commands
+    with ITS configured terminal backend, not the launch profile's (#98581 —
+    profiles with ``terminal.backend: docker`` ran on the host instead)."""
+    launch_home = tmp_path / "root"
+    docker_home = tmp_path / "root" / "profiles" / "web"
+    docker_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text("terminal:\n  backend: local\n")
+    (docker_home / "config.yaml").write_text(
+        "terminal:\n  backend: docker\n  docker_image: sandbox/image:1\n"
+    )
+
+    launch_token = set_hermes_home_override(str(launch_home))
+    try:
+        assert terminal_tool._get_env_config()["env_type"] == "local"
+
+        profile_token = set_hermes_home_override(str(docker_home))
+        try:
+            config = terminal_tool._get_env_config()
+        finally:
+            reset_hermes_home_override(profile_token)
+
+        assert config["env_type"] == "docker"
+        assert config["docker_image"] == "sandbox/image:1"
+        assert os.environ["TERMINAL_ENV"] == "docker"
+
+        # Back on the launch profile: the profile's docker selection must
+        # not stick, and the launch backend applies again.
+        assert terminal_tool._get_env_config()["env_type"] == "local"
+        assert os.environ["TERMINAL_ENV"] == "local"
+    finally:
+        reset_hermes_home_override(launch_token)
+
+
+def test_profile_switch_drops_launch_terminal_selection(tmp_path):
+    """TERMINAL_* vars owned by the launch profile's terminal section must
+    not survive a switch to a profile without one — the unconfigured profile
+    falls back to the local default, not the launch profile's backend."""
+    launch_home = tmp_path / "root"
+    plain_home = tmp_path / "root" / "profiles" / "plain"
+    plain_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    (plain_home / "config.yaml").write_text("agent:\n  max_turns: 100\n")
+
+    launch_token = set_hermes_home_override(str(launch_home))
+    try:
+        assert terminal_tool._get_env_config()["env_type"] == "docker"
+        assert os.environ["TERMINAL_ENV"] == "docker"
+
+        profile_token = set_hermes_home_override(str(plain_home))
+        try:
+            config = terminal_tool._get_env_config()
+        finally:
+            reset_hermes_home_override(profile_token)
+
+        assert config["env_type"] == "local"
+        assert os.environ["TERMINAL_ENV"] == "local"
+    finally:
+        reset_hermes_home_override(launch_token)
+
+
+def test_handoff_drops_launcher_bridged_selection_before_first_call(
+    monkeypatch, tmp_path
+):
+    """A launcher bridge (CLI ``env_mappings``) can write the launch home's
+    selection BEFORE the first terminal-tool bridge call ever runs. Those
+    vars belong to the launch home's terminal section all the same and must
+    be dropped on handoff — ownership comes from the config section, not
+    from what this bridge happened to introduce (#98581)."""
+    launch_home = tmp_path / "root"
+    plain_home = tmp_path / "root" / "profiles" / "plain"
+    plain_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    (plain_home / "config.yaml").write_text("agent:\n  max_turns: 100\n")
+    # The CLI launcher bridged the launch home's selection into the env
+    # before any terminal-tool call ran in this process.
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    launch_token = set_hermes_home_override(str(launch_home))
+    try:
+        assert terminal_tool._get_env_config()["env_type"] == "docker"
+
+        profile_token = set_hermes_home_override(str(plain_home))
+        try:
+            config = terminal_tool._get_env_config()
+        finally:
+            reset_hermes_home_override(profile_token)
+
+        assert config["env_type"] == "local"
+        assert os.environ["TERMINAL_ENV"] == "local"
+    finally:
+        reset_hermes_home_override(launch_token)
 
 
 def test_defaults_backfill_when_neither_config_nor_env_selects_backend():
