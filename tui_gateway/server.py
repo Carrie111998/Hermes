@@ -2475,6 +2475,47 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _rescue_session_event(sid: str, obj: dict, params: dict) -> bool:
+    """Second-chance delivery when the session's bound transport is gone.
+
+    ``write_json`` routes session events to ``_sessions[sid]["transport"]``.
+    When that transport is the post-disconnect drop sentinel, or a socket
+    that went ``_closed`` before any rebind, its write returns False and the
+    frame used to be dropped silently — a blocking bridge (clarify/sudo/
+    secret/terminal.read) then parked its agent thread until timeout while
+    no client ever saw the request (#98503; the approval twin is #82976).
+    The disconnect path re-binds the session to the newest surviving
+    viewer, but emitters on agent worker threads race that rebind, so try
+    the session's other live viewers first, newest first. The frame is
+    already stamped and replay-recorded by the caller; this only re-routes
+    the live write.
+    """
+    with _sessions_lock:
+        viewers = dict((_sessions.get(sid) or {}).get("viewers") or {})
+    for transport, _ts in sorted(viewers.items(), key=lambda kv: kv[1], reverse=True):
+        if _transport_is_dead(transport):
+            continue
+        try:
+            if transport.write(obj):
+                return True
+        except Exception:
+            logger.debug(
+                "viewer fallback write failed for sid=%s", sid, exc_info=True
+            )
+    event_type = params.get("type") if isinstance(params, dict) else None
+    log = (
+        logger.warning
+        if isinstance(event_type, str) and event_type.endswith(".request")
+        else logger.debug
+    )
+    log(
+        "session event type=%s sid=%s dropped: bound transport is gone and no live viewer took it",
+        event_type,
+        sid,
+    )
+    return False
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -2500,7 +2541,9 @@ def write_json(obj: dict) -> bool:
             from tui_gateway.event_replay import _stamp_event
 
             _stamp_event(obj)
-            return t.write(obj)
+            if t.write(obj):
+                return True
+            return _rescue_session_event(sid, obj, params)
 
     from tui_gateway.event_replay import _stamp_event
 
