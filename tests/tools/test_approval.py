@@ -1178,6 +1178,8 @@ class TestApprovalTimeoutIsNotConsent:
         mod._session_approved.clear()
         mod._permanent_approved.clear()
         mod._pending.clear()
+        mod._denial_tally.clear()
+        mod._denied_intents.clear()
 
         self._saved_env = {
             k: os.environ.get(k)
