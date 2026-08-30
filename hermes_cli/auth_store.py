@@ -1032,11 +1032,21 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
                 return destination
             except FileExistsError:
                 if published:
+                    try:
+                        temp.unlink()
+                    except (FileNotFoundError, OSError):
+                        pass
                     return destination
                 # A deterministic incumbent or raced destination is evidence;
                 # only nonce candidates may be attempted after this point.
                 pass
             except (OSError, ValueError):
+                if published:
+                    try:
+                        temp.unlink()
+                    except (FileNotFoundError, OSError):
+                        pass
+                    return destination
                 pass
             finally:
                 if fd is not None:

@@ -94,6 +94,31 @@ def test_sidecar_cleanup_failure_keeps_single_verified_winner(tmp_path, monkeypa
     assert sidecars[0].read_bytes() == original
 
 
+def test_post_publication_verification_failure_stops_without_retry(
+    tmp_path, monkeypatch
+):
+    """A published sidecar remains the single truthful preservation result."""
+    primary = tmp_path / "auth.json"
+    original = _corrupt(primary, b"{verification-race")
+    real_is_reparse_or_link = owner._is_reparse_or_link
+
+    def fail_sidecar_verification(path):
+        if path.name.startswith("auth.json.corrupt"):
+            raise OSError("synthetic post-publication verification failure")
+        return real_is_reparse_or_link(path)
+
+    monkeypatch.setattr(owner, "_is_reparse_or_link", fail_sidecar_verification)
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(primary)
+
+    assert caught.value.preserved is True
+    assert caught.value.corrupt_path == primary.with_name("auth.json.corrupt")
+    sidecars = list(tmp_path.glob("auth.json.corrupt*"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_bytes() == original
+    assert not list(tmp_path.glob(".auth.json.corrupt*.tmp.*"))
+
+
 def test_recovery_rejects_changed_reviewed_source(tmp_path):
     primary = tmp_path / "auth.json"
     original = _corrupt(primary)
