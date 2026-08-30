@@ -33,6 +33,7 @@ from agent.auxiliary_client import (
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
+    extract_content_or_reasoning,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -4775,7 +4776,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     **attempt_summary_route_kwargs(),
                 )
                 body = (
-                    resp.choices[0].message.content
+                    extract_content_or_reasoning(resp)
                     if hasattr(resp, "choices") else str(resp)
                 ) or ""
                 from agent.agent_runtime_helpers import strip_think_blocks
