@@ -3825,14 +3825,14 @@ class BasePlatformAdapter(ABC):
 
     def notify_deferred_questions_connected(self) -> None:
         """Wake durable plugin work after the transport is usable."""
-        service = self._deferred_question_service
+        service = getattr(self, "_deferred_question_service", None)
         if service is None:
             return
         platform_name = getattr(self.platform, "value", str(self.platform))
         service.adapter_connected(platform_name, self)
 
     def notify_deferred_questions_disconnected(self) -> None:
-        service = self._deferred_question_service
+        service = getattr(self, "_deferred_question_service", None)
         if service is None:
             return
         platform_name = getattr(self.platform, "value", str(self.platform))
