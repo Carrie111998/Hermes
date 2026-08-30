@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent import conversation_compression as compression_module
 from agent.conversation_compression import (
     CompressionCommitFence,
     context_compression_timed_out,
@@ -50,6 +51,60 @@ class TestResolveContextCompressionTimeouts:
 
 
 class TestRunCompressContextWithProgressTimeout:
+    def test_timeout_state_first_use_is_atomic(self, monkeypatch):
+        agent = SimpleNamespace()
+        reset_constructor_entered = threading.Event()
+        marker_constructor_finished = threading.Event()
+        release_reset_constructor = threading.Event()
+        reset_finished = threading.Event()
+        marker_finished = threading.Event()
+        seen = {}
+        original_local = threading.local
+
+        class DelayedLocal(original_local):
+            def __new__(cls):
+                state = super().__new__(cls)
+                if threading.current_thread().name == "timeout-resetter":
+                    reset_constructor_entered.set()
+                    assert release_reset_constructor.wait(timeout=2)
+                else:
+                    marker_constructor_finished.set()
+                return state
+
+        monkeypatch.setattr(compression_module.threading, "local", DelayedLocal)
+
+        def resetter():
+            reset_context_compression_timeout_outcome(agent)
+            reset_finished.set()
+            assert marker_finished.wait(timeout=2)
+            seen["resetter"] = context_compression_timed_out(agent)
+
+        def marker():
+            mark_context_compression_timed_out(agent)
+            marker_finished.set()
+            assert reset_finished.wait(timeout=2)
+            seen["marker"] = context_compression_timed_out(agent)
+
+        reset_thread = threading.Thread(target=resetter, name="timeout-resetter")
+        mark_thread = threading.Thread(target=marker, name="timeout-marker")
+        reset_thread.start()
+        assert reset_constructor_entered.wait(timeout=2)
+        mark_thread.start()
+
+        # A fixed implementation publishes the initialization lock before
+        # constructing the state. The old implementation lets the marker
+        # publish a competing state while the resetter is paused here.
+        if "_context_compression_timeout_state_lock" not in vars(agent):
+            assert marker_constructor_finished.wait(timeout=2)
+        release_reset_constructor.set()
+
+        reset_thread.join(timeout=2)
+        mark_thread.join(timeout=2)
+
+        assert not reset_thread.is_alive()
+        assert not mark_thread.is_alive()
+        assert seen == {"resetter": False, "marker": True}
+
     def test_timeout_outcome_is_isolated_between_overlapping_entrypoints(self):
         agent = SimpleNamespace()
         worker_marked = threading.Event()

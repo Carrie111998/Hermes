@@ -1611,24 +1611,51 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     return _sig is True or isinstance(_sig, str)
 
 
+def _get_context_compression_timeout_state(
+    agent: Any,
+    *,
+    create: bool,
+) -> Optional[Tuple[Any, Optional[threading.local]]]:
+    """Return the stable lock and thread-local timeout state for an agent."""
+    try:
+        attributes = vars(agent)
+    except TypeError:
+        return None
+
+    lock = attributes.setdefault(
+        "_context_compression_timeout_state_lock",
+        threading.Lock(),
+    )
+    with lock:
+        state = attributes.get("_context_compression_timeout_state")
+        if create and not isinstance(state, threading.local):
+            state = threading.local()
+            attributes["_context_compression_timeout_state"] = state
+        return lock, state if isinstance(state, threading.local) else None
+
+
 def reset_context_compression_timeout_outcome(agent: Any) -> None:
     """Clear the current thread's owned-compression timeout outcome."""
-    state = vars(agent).get("_context_compression_timeout_state")
-    if not isinstance(state, threading.local):
-        state = threading.local()
-        vars(agent)["_context_compression_timeout_state"] = state
-    state.timed_out = False
-    agent._last_context_compression_timed_out = False
+    locked_state = _get_context_compression_timeout_state(agent, create=True)
+    if locked_state is None:
+        agent._last_context_compression_timed_out = False
+        return
+    lock, state = locked_state
+    with lock:
+        state.timed_out = False
+        agent._last_context_compression_timed_out = False
 
 
 def mark_context_compression_timed_out(agent: Any) -> None:
     """Mark the current owned compression as host-timed-out."""
-    state = vars(agent).get("_context_compression_timeout_state")
-    if not isinstance(state, threading.local):
-        state = threading.local()
-        vars(agent)["_context_compression_timeout_state"] = state
-    state.timed_out = True
-    agent._last_context_compression_timed_out = True
+    locked_state = _get_context_compression_timeout_state(agent, create=True)
+    if locked_state is None:
+        agent._last_context_compression_timed_out = True
+        return
+    lock, state = locked_state
+    with lock:
+        state.timed_out = True
+        agent._last_context_compression_timed_out = True
 
 
 def context_compression_timed_out(agent: Any) -> bool:
@@ -1639,12 +1666,12 @@ def context_compression_timed_out(agent: Any) -> bool:
     timeout. The attribute fallback supports older/minimal agent doubles.
     Every read is type-pinned to avoid MagicMock auto-attributes.
     """
-    try:
-        state = vars(agent).get("_context_compression_timeout_state")
-    except TypeError:
-        state = None
-    if isinstance(state, threading.local):
-        return getattr(state, "timed_out", None) is True
+    locked_state = _get_context_compression_timeout_state(agent, create=False)
+    if locked_state is not None:
+        lock, state = locked_state
+        with lock:
+            if isinstance(state, threading.local):
+                return getattr(state, "timed_out", None) is True
     return getattr(agent, "_last_context_compression_timed_out", None) is True
 
 
