@@ -7658,13 +7658,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         # making every 413 retry a no-op. Force a conservative boundary that
         # retains the newest 200 rows and summarizes the older rows.
         if len(messages) >= _MESSAGE_COUNT_PRESSURE_THRESHOLD:
+            telemetry["message_count_pressure"] = True
             pressure_cut = self._align_boundary_backward(
                 messages,
                 max(compress_start + 1, len(messages) - _MESSAGE_COUNT_PRESSURE_TAIL),
             )
             if pressure_cut > compress_end:
                 compress_end = pressure_cut
-                telemetry["message_count_pressure"] = True
 
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining
@@ -7883,7 +7883,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
         feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
+        if (
+            not force
+            and not telemetry.get("message_count_pressure")
+            and self._ineffective_compression_count >= 1
+        ):
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
