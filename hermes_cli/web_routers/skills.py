@@ -541,3 +541,38 @@ async def update_skill_content(body: SkillContentUpdate):
         raise HTTPException(status_code=status, detail=err)
     _clear_skills_prompt_cache()
     return result
+
+
+@router.delete("/api/skills")
+async def delete_skill(name: str, profile: Optional[str] = None):
+    """Permanently delete one user skill from the selected profile.
+
+    This is the authenticated dashboard equivalent of a foreground
+    ``skill_manage(action="delete")`` call.  It reuses the native deletion
+    guards, then reconciles the disabled-skills and usage sidecars so
+    recreating the same skill name does not inherit stale state.
+    """
+    from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+    from tools.skill_manager_tool import _delete_skill
+    from tools.skill_usage import forget
+
+    def _run():
+        with _profile_scope(profile):
+            result = _delete_skill(name)
+            if not result.get("success"):
+                error = str(result.get("error", "Failed to delete skill."))
+                status = 404 if "not found" in error.lower() else 409
+                raise HTTPException(status_code=status, detail=error)
+
+            with _CONFIG_MUTATION_LOCK:
+                config = load_config()
+                disabled = get_disabled_skills(config)
+                if name in disabled:
+                    disabled.discard(name)
+                    save_disabled_skills(config, disabled)
+            forget(name)
+            return {"success": True, "name": name, "deleted": True}
+
+    result = await asyncio.to_thread(_run)
+    _clear_skills_prompt_cache()
+    return result

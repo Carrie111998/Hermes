@@ -8,6 +8,7 @@ gap for headless/VPS users. These tests pin:
 - POST /api/skills creates a skill through the same validated write path
   as the agent's ``skill_manage`` tool (frontmatter validation enforced).
 - PUT /api/skills/content rewrites an existing SKILL.md (404 on unknown).
+- DELETE /api/skills removes one exact user skill and reconciles sidecars.
 - POST /api/cron/jobs accepts ``skills`` and persists it on the job;
   PUT /api/cron/jobs/{id} can update the list.
 """
@@ -144,6 +145,55 @@ class TestSkillUpdate:
         assert resp.status_code == 400
 
 
+class TestSkillDelete:
+    def test_delete_removes_exact_skill_and_reconciles_sidecars(
+        self, client, isolated_profiles
+    ):
+        from hermes_cli.config import load_config
+        from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+        from tools.skill_usage import load_usage, record_created
+
+        default_home = isolated_profiles["default"]
+        config = load_config()
+        save_disabled_skills(config, {"dashboard-skill"})
+        record_created("dashboard-skill", agent_created=False)
+
+        resp = client.delete("/api/skills", params={"name": "dashboard-skill"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "success": True,
+            "name": "dashboard-skill",
+            "deleted": True,
+        }
+        assert not (default_home / "skills" / "dashboard-skill").exists()
+        assert "dashboard-skill" not in get_disabled_skills(load_config())
+        assert "dashboard-skill" not in load_usage()
+        assert client.get(
+            "/api/skills/content", params={"name": "dashboard-skill"}
+        ).status_code == 404
+
+    def test_delete_is_profile_scoped(self, client, isolated_profiles):
+        resp = client.delete(
+            "/api/skills",
+            params={"name": "worker-skill", "profile": "worker_alpha"},
+        )
+
+        assert resp.status_code == 200
+        assert not (
+            isolated_profiles["worker_alpha"] / "skills" / "worker-skill"
+        ).exists()
+        assert (
+            isolated_profiles["default"] / "skills" / "dashboard-skill"
+        ).exists()
+
+    def test_delete_unknown_skill_is_404(self, client, isolated_profiles):
+        resp = client.delete("/api/skills", params={"name": "missing-skill"})
+
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"].lower()
+
+
 class TestEditorEndpointsAuth:
     @pytest.mark.parametrize(
         "method,path,kwargs",
@@ -151,6 +201,7 @@ class TestEditorEndpointsAuth:
             ("get", "/api/skills/content?name=dashboard-skill", {}),
             ("post", "/api/skills", {"json": {"name": "x", "content": "y"}}),
             ("put", "/api/skills/content", {"json": {"name": "x", "content": "y"}}),
+            ("delete", "/api/skills?name=dashboard-skill", {}),
         ],
     )
     def test_endpoints_401_without_token(
