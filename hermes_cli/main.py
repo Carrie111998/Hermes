@@ -5133,6 +5133,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_restart_phase_failure_is_incomplete",
         "_restore_active_tool_dependencies",
         "_restore_stashed_changes",
+        "_should_prompt_for_stash_restore",
         "_resume_windows_gateways_after_update",
         "_run_pending_fleet_restart",
         "_run_logged_subprocess",
