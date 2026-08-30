@@ -185,23 +185,70 @@ export function createSecretStorageConnections(deps: Record<string, any>): Recor
   function rewriteAllStoredSecrets(shouldRewrite: (secret: any) => boolean, reencode: (secret: any) => any): boolean {
     let touched = false
 
-    const rewriteBlock = (block: any) => {
+    // Older connection.json files stored tokens as bare strings, and global
+    // remote headers could likewise be bare strings. Normalize those legacy
+    // shapes before the caller's policy predicate sees them; otherwise both the
+    // migration pass and the encryption toggle mistake plaintext for an unknown
+    // encoding and leave it on disk.
+    const normalizeStoredSecret = (secret: any) => {
+      if (typeof secret !== 'string') {
+        return secret
+      }
+
+      const value = secret.trim()
+
+      return value ? { encoding: 'plain', value } : secret
+    }
+
+    const needsRewrite = (secret: any) => shouldRewrite(normalizeStoredSecret(secret))
+    const rewriteSecret = (secret: any) => reencode(normalizeStoredSecret(secret))
+
+    const normalizeStoredBlock = (block: any) => {
       if (!block || typeof block !== 'object') {
         return block
       }
 
-      const next = { ...block, ...(block.token ? { token: reencode(block.token) } : {}) }
+      const next = { ...block }
+
+      if (block.token) {
+        next.token = normalizeStoredSecret(block.token)
+      }
 
       if (block.headers && typeof block.headers === 'object') {
-        next.headers = Object.fromEntries(Object.entries(block.headers).map(([k, v]) => [k, reencode(v)]))
+        next.headers = normalizeRemoteHeaders(block.headers)
       }
 
       return next
     }
 
-    const blockNeedsRewrite = (o: any) =>
-      shouldRewrite(o?.token) ||
-      Object.values(o?.headers && typeof o.headers === 'object' ? o.headers : {}).some(shouldRewrite)
+    const rewriteBlock = (block: any) => {
+      const normalized = normalizeStoredBlock(block)
+
+      if (!normalized || typeof normalized !== 'object') {
+        return normalized
+      }
+
+      const next = { ...normalized, ...(normalized.token ? { token: rewriteSecret(normalized.token) } : {}) }
+
+      if (normalized.headers && typeof normalized.headers === 'object') {
+        next.headers = Object.fromEntries(
+          Object.entries(normalized.headers).map(([k, v]) => [k, rewriteSecret(v)])
+        )
+      }
+
+      return next
+    }
+
+    const blockNeedsRewrite = (o: any) => {
+      const normalized = normalizeStoredBlock(o)
+
+      return (
+        needsRewrite(normalized?.token) ||
+        Object.values(normalized?.headers && typeof normalized.headers === 'object' ? normalized.headers : {}).some(
+          needsRewrite
+        )
+      )
+    }
 
     // v1 connection.json.
     const config = readDesktopConnectionConfig({ failOnCorrupt: true })
@@ -226,7 +273,7 @@ export function createSecretStorageConnections(deps: Record<string, any>): Recor
     // Native OAuth token store: baseUrl → blob. The store module rejects a
     // corrupt primary before mutation and publishes the complete replacement via
     // the atomic owner-only writer supplied above.
-    if (rewriteNativeTokenStore(shouldRewrite, reencode, _nativeTokenStoreIo())) {
+    if (rewriteNativeTokenStore(needsRewrite, rewriteSecret, _nativeTokenStoreIo())) {
       touched = true
     }
 

@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
 
 import { test } from 'vitest'
 
+import { normalizeRemoteHeaders } from './connection-config'
 import { createDesktopSecretStorage } from './desktop-secret-storage'
+import { createSecretStorageConnections } from './secret-storage-connections'
+import { classifyStoredSecret, readSecretStoragePolicy, writeSecretStoragePolicy } from './secret-storage-policy'
 
 function storageFixture(available = true) {
   let encryptCalls = 0
@@ -111,4 +116,130 @@ test('plaintext header strings still use the explicit opt-out only when secure s
     { 'X-E2E-Access-Secret': { encoding: 'plain', value: 'header-bytes' } }
   )
   assert.equal(encryptCalls(), 0)
+})
+
+function connectionStorageFixture(initialPolicy: { on: boolean; migrated: boolean }) {
+  const root = fs.mkdtempSync('C:/TEMP/hermes-redteam-f751a8c5/r3-cand-005-secret-storage-')
+  const configPath = path.join(root, 'connection.json')
+  const registryPath = path.join(root, 'connections.json')
+  const policyPath = path.join(root, 'secret-storage-policy.json')
+  const config = {
+    mode: 'remote',
+    remote: {
+      url: 'https://gateway.example.test/hermes',
+      token: 'legacy-token-value',
+      headers: {
+        'CF-Access-Client-Id': 'legacy-header-value'
+      }
+    },
+    profiles: {}
+  }
+  const registry = { version: 2, primary: 'local', launchMode: 'primary', lastUsed: 'local', connections: [] }
+  let encryptCalls = 0
+
+  fs.writeFileSync(configPath, JSON.stringify(config))
+  fs.writeFileSync(registryPath, JSON.stringify(registry))
+  fs.writeFileSync(policyPath, JSON.stringify(initialPolicy))
+
+  const safeStorage = {
+    isEncryptionAvailable: () => true,
+    encryptString: (value: string) => {
+      encryptCalls += 1
+      return Buffer.from(value)
+    },
+    decryptString: (value: Buffer) => value.toString()
+  }
+  const writeSecretFileAtomic = (target: string, text: string) => {
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, text)
+  }
+  const connections = createSecretStorageConnections({
+    DESKTOP_CONNECTIONS_REGISTRY_PATH: registryPath,
+    DESKTOP_CONNECTION_CONFIG_PATH: configPath,
+    PROFILE_NAME_RE: /^[A-Za-z0-9_-]+$/,
+    SAFE_STORAGE_ENCODING: 'safeStorage',
+    SECRET_STORAGE_POLICY_FILE: 'secret-storage-policy.json',
+    _nativeTokenStoreIo: () => ({}),
+    app: { getPath: () => root },
+    classifyStoredSecret,
+    connectionConfigCache: null,
+    connectionConfigCacheMtime: null,
+    connectionRegistryCache: null,
+    connectionRegistryCacheMtime: null,
+    createDesktopSecretStorage,
+    encryptDesktopSecretStrict: (value: string, api: typeof safeStorage) => {
+      if (!api.isEncryptionAvailable()) {
+        throw new Error('secure storage unavailable')
+      }
+
+      return { encoding: 'safeStorage', value: api.encryptString(value).toString('base64') }
+    },
+    fs,
+    normalizeRegistry: (value: any) => value,
+    normalizeRemoteHeaders,
+    modeIsRemoteLike: (mode: string) => mode === 'remote' || mode === 'cloud',
+    path,
+    readSecretStoragePolicy,
+    reconcileRegistryDrift: (_registry: any) => ({ changed: false, registry }),
+    rememberLog: () => undefined,
+    rewriteNativeTokenStore: () => false,
+    safeStorage,
+    tightenSecretFileMode: () => undefined,
+    writeSecretFileAtomic,
+    writeSecretStoragePolicy
+  })
+
+  return {
+    connections,
+    configPath,
+    policyPath,
+    encryptCalls: () => encryptCalls,
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+test('legacy bare-string global headers and tokens are encrypted during migration', () => {
+  const fixture = connectionStorageFixture({ on: true, migrated: false })
+
+  try {
+    fixture.connections.migrateLegacyEncryptedSecretsOnce()
+
+    const saved = JSON.parse(fs.readFileSync(fixture.configPath, 'utf8'))
+    const serialized = JSON.stringify(saved)
+
+    assert.equal(saved.remote.url, 'https://gateway.example.test/hermes')
+    assert.deepEqual(fixture.connections.decryptRemoteHeaders(saved.remote.headers), {
+      'CF-Access-Client-Id': 'legacy-header-value'
+    })
+    assert.equal(fixture.connections.decryptDesktopSecret(saved.remote.token), 'legacy-token-value')
+    assert.equal(serialized.includes('legacy-token-value'), false)
+    assert.equal(serialized.includes('legacy-header-value'), false)
+    assert.deepEqual(JSON.parse(fs.readFileSync(fixture.policyPath, 'utf8')), { on: true, migrated: true })
+    assert.equal(fixture.encryptCalls(), 2)
+  } finally {
+    fixture.cleanup()
+  }
+})
+
+test('enabling encryption rewrites legacy bare-string headers and tokens before secure policy commit', () => {
+  const fixture = connectionStorageFixture({ on: false, migrated: true })
+
+  try {
+    assert.deepEqual(fixture.connections.applySecretStorageEncryption(true), { on: true })
+
+    const saved = JSON.parse(fs.readFileSync(fixture.configPath, 'utf8'))
+    const serialized = JSON.stringify(saved)
+
+    assert.equal(saved.remote.url, 'https://gateway.example.test/hermes')
+    assert.deepEqual(fixture.connections.decryptRemoteHeaders(saved.remote.headers), {
+      'CF-Access-Client-Id': 'legacy-header-value'
+    })
+    assert.equal(fixture.connections.decryptDesktopSecret(saved.remote.token), 'legacy-token-value')
+    assert.equal(serialized.includes('legacy-token-value'), false)
+    assert.equal(serialized.includes('legacy-header-value'), false)
+    assert.deepEqual(JSON.parse(fs.readFileSync(fixture.policyPath, 'utf8')), { on: true, migrated: true })
+    assert.equal(fixture.encryptCalls(), 2)
+  } finally {
+    fixture.cleanup()
+  }
 })
