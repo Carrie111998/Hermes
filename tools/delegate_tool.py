@@ -2475,7 +2475,6 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
-
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
@@ -2666,24 +2665,47 @@ def _run_single_child(
     _child_cleanup_done = False
 
     def _cleanup_child_lifetime() -> None:
-        """Release worker-owned resources exactly once after its lifetime ends."""
+        """Retire child ownership exactly once after its worker lifetime ends."""
         nonlocal _child_cleanup_done
         with _child_cleanup_lock:
             if _child_cleanup_done:
                 return
             _child_cleanup_done = True
 
+        # Keep the child visible to list/steer/stop and interrupt propagation
+        # until its worker has actually stopped. Each cleanup is isolated so a
+        # close failure cannot strand the credential lease or live registries.
+        if _subagent_id:
+            try:
+                _unregister_subagent(_subagent_id, agent=child)
+            except Exception:
+                logger.debug("Failed to unregister child after delegation", exc_info=True)
+
+        if hasattr(parent_agent, "_active_children"):
+            try:
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                if lock:
+                    with lock:
+                        parent_agent._active_children.remove(child)
+                else:
+                    parent_agent._active_children.remove(child)
+            except Exception:
+                logger.debug(
+                    "Failed to remove child from active_children", exc_info=True
+                )
+
         try:
-            if hasattr(child, "close"):
-                child.close()
+            close = getattr(child, "close", None)
+            if callable(close):
+                close()
         except Exception:
             logger.debug("Failed to close child agent after delegation", exc_info=True)
-        finally:
-            if child_pool is not None and leased_cred_id is not None:
-                try:
-                    child_pool.release_lease(leased_cred_id)
-                except Exception as exc:
-                    logger.debug("Failed to release credential lease: %s", exc)
+
+        if child_pool is not None and leased_cred_id is not None:
+            try:
+                child_pool.release_lease(leased_cred_id)
+            except Exception:
+                logger.debug("Failed to release credential lease", exc_info=True)
 
     def _attach_worktree(entry_dict: Dict[str, Any]) -> None:
         """Inspect + prune the child worktree, reporting into the entry."""
@@ -3375,11 +3397,6 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id, agent=child)
-
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -3388,22 +3405,9 @@ def _run_single_child(
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
 
-        # Remove child from active tracking
-
-        # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
-            try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
-                        parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
-
-        # Close tool resources and release the credential lease together. A
-        # timed-out worker still owns both until its Future reports completion.
+        # Retire every child-lifetime owner at one boundary. A timed-out worker
+        # retains its live registries, tool resources, and credential lease
+        # until its Future reports completion.
         if not _defer_child_cleanup_to_worker:
             _cleanup_child_lifetime()
 
