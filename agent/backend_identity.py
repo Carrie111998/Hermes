@@ -244,9 +244,10 @@ def same_endpoint(a: BackendIdentity, b: BackendIdentity) -> bool:
 def same_deployment(a: BackendIdentity, b: BackendIdentity) -> bool:
     """Are these the exact same model deployment (the thing a timeout kills)?
 
-    Provider+model must match; explicit base URLs distinguish deployments. A
-    missing URL is unknown at this layer and cannot prove that it matches an
-    explicit or another provider-default URL.
+    Provider+model must match; the base_url axis distinguishes only when BOTH
+    sides carry an explicit URL (#62984: same provider+model on two different
+    explicit URLs is two deployments — a pool).  A side with an unknown URL
+    inherits the provider default and cannot prove difference.
     """
     if not (a.provider and b.provider and a.provider == b.provider):
         # Same-host different-label shims: same URL + same model IS the same
@@ -262,8 +263,6 @@ def same_deployment(a: BackendIdentity, b: BackendIdentity) -> bool:
             return True
         return False
     if not (a.model and b.model and a.model == b.model):
-        return False
-    if bool(a.base_url) != bool(b.base_url):
         return False
     if a.base_url and b.base_url and a.base_url != b.base_url:
         return False  # distinct explicit endpoints — a pool, not a dup
