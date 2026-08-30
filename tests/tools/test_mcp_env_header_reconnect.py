@@ -59,6 +59,33 @@ class TestResolveHeadersWithEnv:
         assert result["X-Counts"] == 3
         assert result["X-List"] == ["${A}", 1]
 
+    def test_idempotent_with_unchanged_env(self):
+        """RAW storage contract: re-resolving the same config must not
+        entangle state across calls. Because headers are stored with `${ENV}`
+        intact (see _load_mcp_config), a second call with an unchanged env
+        yields the same header — the resolved token is never fed back into a
+        later expansion (no nested/second-order expansion of a value that was
+        already materialized)."""
+        from tools.mcp_tool import _resolve_headers_with_env
+
+        config = {"headers": {"Authorization": "Bearer ${MCP_TOKEN}"}}
+        with patch.dict("os.environ", {"MCP_TOKEN": "tok-A"}, clear=False):
+            first = _resolve_headers_with_env(config)
+        with patch.dict("os.environ", {"MCP_TOKEN": "tok-A"}, clear=False):
+            second = _resolve_headers_with_env(config)
+        assert first == second == {"Authorization": "Bearer tok-A"}
+
+    def test_no_second_order_expansion_of_a_materialized_value(self):
+        """A resolved value is not re-interpolated on a later call: if the env
+        var's own value contains a `${...}`-looking substring, it is emitted
+        verbatim (the RAW header only carries the outer ref)."""
+        from tools.mcp_tool import _resolve_headers_with_env
+
+        config = {"headers": {"Authorization": "Bearer ${MCP_TOKEN}"}}
+        with patch.dict("os.environ", {"MCP_TOKEN": "A${B}"}, clear=False):
+            out = _resolve_headers_with_env(config)
+        assert out["Authorization"] == "Bearer A${B}"
+
 
 def test_load_mcp_config_keeps_headers_raw():
     """``_load_mcp_config`` stores headers WITHOUT expanding ${ENV}, while
