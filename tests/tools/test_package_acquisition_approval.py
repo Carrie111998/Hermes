@@ -26,8 +26,12 @@ def _isolate_approval_state():
         "pipx run plausible-vendor-cli",
         "uv pip install plausible-vendor-sdk",
         "uv add plausible-vendor-sdk",
+        "uv run --with plausible-vendor-sdk python -c 'import plausible_vendor_sdk'",
         "uvx plausible-vendor-cli",
         "npm install plausible-vendor-sdk",
+        "npm add plausible-vendor-sdk",
+        "npm --prefix run install plausible-vendor-sdk",
+        "uv --directory run add plausible-vendor-sdk",
         "npm ci",
         "npm exec plausible-vendor-cli",
         "npx plausible-vendor-cli",
@@ -42,6 +46,7 @@ def _isolate_approval_state():
         "poetry add plausible-vendor-sdk",
         "composer require plausible-vendor/sdk",
         "bundle install",
+        "apk add openssh",
         "sudo apt-get install plausible-vendor-cli",
         "command pip install plausible-vendor-sdk",
         "builtin pip install plausible-vendor-sdk",
@@ -66,14 +71,18 @@ def _isolate_approval_state():
         "docker exec build-container pip install plausible-vendor-sdk",
         "podman run --rm node npm install plausible-vendor-sdk",
         "pip --disable-pip-version-check install plausible-vendor-sdk",
+        "pip --cache-dir list install plausible-vendor-sdk",
+        "python -m pip --cache-dir list install plausible-vendor-sdk",
+        "pip --trusted-host show install plausible-vendor-sdk",
+        "apt-get -o remove install plausible-vendor-sdk",
         "uv --quiet pip install plausible-vendor-sdk",
         "uv pip --system install plausible-vendor-sdk",
         "/usr/bin/env pip install plausible-vendor-sdk",
         r"C:\Python311\Scripts\pip.exe install plausible-vendor-sdk",
         r"cmd /c C:\Python311\Scripts\pip.exe install plausible-vendor-sdk",
         "wsl python3 -m pip install plausible-vendor-sdk",
-        "pip in\"stall\" plausible-vendor-sdk",
-        "pip i\"$EMPTY\"nstall plausible-vendor-sdk",
+        'pip in"stall" plausible-vendor-sdk',
+        'pip i"$EMPTY"nstall plausible-vendor-sdk',
     ],
 )
 def test_detects_package_acquisition_commands(command):
@@ -87,10 +96,39 @@ def test_detects_package_acquisition_commands(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "apk add openssh",
+        "npm add plausible-vendor-sdk",
+        "uv run --with plausible-vendor-sdk python -c 'import plausible_vendor_sdk'",
+    ],
+)
+def test_acquisition_aliases_reach_owner_gate_before_isolated_and_off_bypasses(
+    monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "package-alias-owner-gate-test")
+    monkeypatch.setattr(
+        approval_module, "_get_approval_config", lambda: {"mode": "off"}
+    )
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    monkeypatch.setattr("tools.tirith_security.check_command_security", _safe_tirith)
+
+    result = check_all_command_guards(command, "docker")
+
+    assert result["approved"] is False
+    assert result["approval_pending"] is True
+    assert result["pattern_key"] == "package acquisition"
+    assert result["single_operation"] is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "pip list",
         "pip show plausible-vendor-sdk",
         "npm test",
         "npm run build",
+        "npm --prefix install run build",
+        "uv --directory add run python script.py",
         "pnpm exec eslint .",
         "yarn run test",
         "cargo test",
@@ -115,13 +153,17 @@ def _safe_tirith(_command):
 def test_smart_mode_never_sends_package_acquisition_to_aux_llm(monkeypatch):
     monkeypatch.setenv("HERMES_EXEC_ASK", "1")
     monkeypatch.setenv("HERMES_SESSION_KEY", "package-smart-test")
-    monkeypatch.setattr(approval_module, "_get_approval_config", lambda: {"mode": "smart"})
+    monkeypatch.setattr(
+        approval_module, "_get_approval_config", lambda: {"mode": "smart"}
+    )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr("tools.tirith_security.check_command_security", _safe_tirith)
     monkeypatch.setattr(
         approval_module,
         "_smart_approve",
-        lambda *_args, **_kwargs: pytest.fail("package acquisition reached smart approval"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "package acquisition reached smart approval"
+        ),
     )
 
     result = check_all_command_guards("npx plausible-vendor-cli", "local")
@@ -137,7 +179,9 @@ def test_package_acquisition_ignores_session_and_permanent_allowlists(monkeypatc
     session_key = "package-allowlist-test"
     monkeypatch.setenv("HERMES_EXEC_ASK", "1")
     monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
-    monkeypatch.setattr(approval_module, "_get_approval_config", lambda: {"mode": "manual"})
+    monkeypatch.setattr(
+        approval_module, "_get_approval_config", lambda: {"mode": "manual"}
+    )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr("tools.tirith_security.check_command_security", _safe_tirith)
     approval_module.approve_session(session_key, "package acquisition")
@@ -175,7 +219,9 @@ def test_owner_approval_is_one_operation_even_if_client_returns_session(monkeypa
     session_key = "package-once-test"
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
-    monkeypatch.setattr(approval_module, "_get_approval_config", lambda: {"mode": "manual"})
+    monkeypatch.setattr(
+        approval_module, "_get_approval_config", lambda: {"mode": "manual"}
+    )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr("tools.tirith_security.check_command_security", _safe_tirith)
     approval_module.clear_session(session_key)
@@ -203,7 +249,9 @@ def test_owner_approval_is_one_operation_even_if_client_returns_session(monkeypa
 def test_interactive_yolo_still_requires_owner_approval(monkeypatch):
     monkeypatch.setenv("HERMES_EXEC_ASK", "1")
     monkeypatch.setenv("HERMES_SESSION_KEY", "package-yolo-test")
-    monkeypatch.setattr(approval_module, "_get_approval_config", lambda: {"mode": "off"})
+    monkeypatch.setattr(
+        approval_module, "_get_approval_config", lambda: {"mode": "off"}
+    )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
     monkeypatch.setattr("tools.tirith_security.check_command_security", _safe_tirith)
 
@@ -220,7 +268,9 @@ def test_selected_transport_cannot_persist_package_approval(monkeypatch):
     session_key = "package-transport-test"
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
-    monkeypatch.setattr(approval_module, "_get_approval_config", lambda: {"mode": "manual"})
+    monkeypatch.setattr(
+        approval_module, "_get_approval_config", lambda: {"mode": "manual"}
+    )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr("tools.tirith_security.check_command_security", _safe_tirith)
     approval_module.clear_session(session_key)
@@ -245,7 +295,9 @@ def test_selected_transport_cannot_persist_package_approval(monkeypatch):
 def test_isolated_container_still_owner_gates_package_acquisition(monkeypatch):
     monkeypatch.setenv("HERMES_EXEC_ASK", "1")
     monkeypatch.setenv("HERMES_SESSION_KEY", "package-container-test")
-    monkeypatch.setattr(approval_module, "_get_approval_config", lambda: {"mode": "manual"})
+    monkeypatch.setattr(
+        approval_module, "_get_approval_config", lambda: {"mode": "manual"}
+    )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr("tools.tirith_security.check_command_security", _safe_tirith)
 
@@ -264,9 +316,10 @@ def test_isolated_container_still_owner_gates_package_acquisition(monkeypatch):
 
 def test_stale_gateway_choice_is_narrowed_before_wakeup():
     session_key = "package-stale-choice-test"
-    entry = approval_module._ApprovalEntry(
-        {"request_id": "pkg-1", "single_operation": True}
-    )
+    entry = approval_module._ApprovalEntry({
+        "request_id": "pkg-1",
+        "single_operation": True,
+    })
     approval_module._gateway_queues[session_key] = [entry]
     try:
         resolved = approval_module.resolve_gateway_approval(
@@ -282,12 +335,14 @@ def test_stale_gateway_choice_is_narrowed_before_wakeup():
 
 def test_approve_all_does_not_resolve_single_operation_requests():
     session_key = "package-approve-all-test"
-    first = approval_module._ApprovalEntry(
-        {"request_id": "pkg-1", "single_operation": True}
-    )
-    second = approval_module._ApprovalEntry(
-        {"request_id": "pkg-2", "single_operation": True}
-    )
+    first = approval_module._ApprovalEntry({
+        "request_id": "pkg-1",
+        "single_operation": True,
+    })
+    second = approval_module._ApprovalEntry({
+        "request_id": "pkg-2",
+        "single_operation": True,
+    })
     approval_module._gateway_queues[session_key] = [first, second]
     try:
         resolved = approval_module.resolve_gateway_approval(
@@ -305,14 +360,12 @@ def test_approve_all_does_not_resolve_single_operation_requests():
 
 def test_identical_single_operation_requests_do_not_coalesce(monkeypatch):
     session_key = "package-no-coalesce-test"
-    existing = approval_module._ApprovalEntry(
-        {
-            "request_id": "pkg-existing",
-            "command": "pip install plausible-vendor-sdk",
-            "pattern_keys": ["package acquisition"],
-            "single_operation": True,
-        }
-    )
+    existing = approval_module._ApprovalEntry({
+        "request_id": "pkg-existing",
+        "command": "pip install plausible-vendor-sdk",
+        "pattern_keys": ["package acquisition"],
+        "single_operation": True,
+    })
     approval_module._gateway_queues[session_key] = [existing]
     monkeypatch.setattr(
         approval_module,

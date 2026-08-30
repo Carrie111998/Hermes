@@ -27,6 +27,13 @@ from typing import Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
+from tools.package_acquisition import (
+    PACKAGE_ACQUISITION_DESCRIPTION,
+    PACKAGE_ACQUISITION_PATTERN_KEY,
+    PACKAGE_EXEC_WRAPPERS,
+    is_package_argv_acquisition,
+    package_executable_basename,
+)
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -477,11 +484,6 @@ _CMDPOS = (
 # an abandoned, mistyped, or later-hijacked package name. Package classifiers
 # therefore feed a stricter owner-only, one-operation policy below rather than
 # the reusable dangerous-command approval path.
-PACKAGE_ACQUISITION_PATTERN_KEY = "package acquisition"
-PACKAGE_ACQUISITION_DESCRIPTION = (
-    "package acquisition executes code obtained from a package registry; "
-    "verify the exact package, version, registry, and publisher before approving"
-)
 
 # Destructive-path argument matcher for the rm hardline rules.
 #
@@ -2475,87 +2477,9 @@ def _canonical_package_word(word: str) -> str:
     return _deobfuscate_shell_word_for_detection(without_variables).lower()
 
 
-def _package_executable_basename(value: str) -> str:
-    return re.split(r"[\\/]", value)[-1].removesuffix(".exe")
-
-
 def _package_argv_is_acquisition(words: list[str]) -> bool:
-    if not words:
-        return False
-    argv = [_canonical_package_word(word) for word in words]
-    exe = _package_executable_basename(argv[0])
-    args = argv[1:]
-
-    # Help exits before acquisition for the package managers below.
-    if "--help" in args or "-h" in args:
-        return False
-
-    def has(action: str) -> bool:
-        return action in args
-
-    if re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py)", exe):
-        return any(
-            args[i] == "-m" and args[i + 1] == "pip" and "install" in args[i + 2:]
-            for i in range(len(args) - 1)
-        )
-    if re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", exe):
-        return has("install")
-    if exe == "pipx":
-        return any(action in args for action in {"install", "run", "runpip"})
-    if exe == "uv":
-        if "pip" in args:
-            pip_index = args.index("pip")
-            if "install" in args[pip_index + 1:]:
-                return True
-        if any(action in args for action in {"add", "sync"}):
-            return True
-        return any(
-            args[i] == "tool" and args[i + 1] in {"install", "run"}
-            for i in range(len(args) - 1)
-        )
-    if exe == "uvx":
-        return True
-    if exe == "npm":
-        return any(action in args for action in {"install", "i", "ci", "exec"})
-    if exe == "npx":
-        return True
-    if exe == "pnpm":
-        return any(action in args for action in {"add", "install", "i", "dlx"})
-    if exe == "yarn":
-        return any(action in args for action in {"add", "install", "dlx"})
-    if exe == "bun":
-        return any(action in args for action in {"add", "install", "i", "x"})
-    if exe == "deno":
-        return any(action in args for action in {"install", "add"}) or (
-            "run" in args and any(flag in args for flag in {"--allow-all", "-a"})
-        )
-    if exe in {"cargo", "gem", "go", "winget", "choco", "scoop", "brew"}:
-        return has("install")
-    if exe in {"apk", "apt", "apt-get", "dnf", "yum", "zypper"}:
-        return has("install")
-    if exe == "pacman":
-        return any(arg.startswith("-s") and arg != "-ss" for arg in args)
-    if exe in {"conda", "mamba", "micromamba"}:
-        return any(action in args for action in {"install", "create", "update"})
-    if exe == "dotnet":
-        return any(
-            args[i] == "tool" and args[i + 1] == "install"
-            for i in range(len(args) - 1)
-        )
-    if exe == "poetry":
-        return any(action in args for action in {"add", "install", "update"})
-    if exe == "composer":
-        return any(action in args for action in {"require", "install", "update"})
-    if exe == "bundle":
-        return any(action in args for action in {"install", "update"})
-    return False
-
-
-_PACKAGE_EXEC_WRAPPERS = frozenset({
-    "command", "builtin", "exec", "nohup", "setsid", "time", "nice",
-    "timeout", "stdbuf", "sudo", "env", "xargs", "docker", "podman",
-    "nerdctl", "cmd", "wsl",
-})
+    canonical_argv = [_canonical_package_word(word) for word in words]
+    return is_package_argv_acquisition(canonical_argv)
 
 
 def _read_package_command_words(command: str, start: int) -> list[str]:
@@ -2583,13 +2507,13 @@ def _package_words_are_acquisition(words: list[str]) -> bool:
             _package_argv_is_acquisition(words[index:])
             for index in range(1, len(words))
         )
-    exe = _package_executable_basename(exe_word)
+    exe = package_executable_basename(exe_word)
     if exe == "find":
         for index, word in enumerate(words[:-1]):
             if _canonical_package_word(word) in {"-exec", "-execdir"}:
                 return _package_argv_is_acquisition(words[index + 1:])
         return False
-    if exe in _PACKAGE_EXEC_WRAPPERS:
+    if exe in PACKAGE_EXEC_WRAPPERS:
         # Wrapper option grammars vary and many options consume operands.
         # Inspect each suffix; the classifier still requires an exact package
         # manager executable and acquisition action.
