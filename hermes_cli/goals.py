@@ -40,6 +40,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -597,6 +598,9 @@ class GoalState:
     # Persist them with the goal so a later status call can return the exact
     # authoritative readback rather than reconstructing evidence in prose.
     acceptance_evidence: List[Dict[str, str]] = field(default_factory=list)
+    # Opaque state identity returned by model-callable readbacks. It is
+    # generated only by canonical persistence and rotates on each mutation.
+    receipt_token: Optional[str] = None
     # Optional structured completion contract (outcome / verification /
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
@@ -641,6 +645,11 @@ class GoalState:
                 for item in (data.get("acceptance_evidence") or [])
                 if isinstance(item, dict)
             ],
+            receipt_token=(
+                str(data["receipt_token"])
+                if re.fullmatch(r"[0-9a-f]{32}", str(data.get("receipt_token") or ""))
+                else None
+            ),
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g)
@@ -680,6 +689,8 @@ _GOAL_GENERATION_LOCK = threading.Lock()
 _GOAL_GENERATIONS: Dict[Tuple[str, str], int] = {}
 _GOAL_STATE_LOCKS_GUARD = threading.Lock()
 _GOAL_STATE_LOCKS: Dict[Tuple[str, str], Any] = {}
+_GOAL_FILE_LOCK_LOCAL = threading.local()
+_GOAL_FILE_LOCK_TIMEOUT_S = 5.0
 
 
 def _goal_generation_key(session_id: str) -> Tuple[str, str]:
@@ -717,24 +728,115 @@ def _goal_state_lock(session_id: str):
         return lock
 
 
+def _goal_file_lock_path(session_id: str):
+    """Return a profile-scoped, filesystem-safe lock path for one session."""
+    from hermes_constants import get_hermes_home
+
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return get_hermes_home() / "locks" / "goals" / f"{digest}.lock"
+
+
+def _acquire_goal_file_lock(handle) -> None:
+    """Acquire one byte/file lock without blocking the event loop forever."""
+    deadline = time.monotonic() + _GOAL_FILE_LOCK_TIMEOUT_S
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timed out acquiring cross-process goal lock")
+            time.sleep(0.01)
+
+
+def _release_goal_file_lock(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _cross_process_goal_lock(session_id: str):
+    """Serialize one session across CLI, gateway, and model-tool processes."""
+    key = _goal_generation_key(session_id)
+    held = getattr(_GOAL_FILE_LOCK_LOCAL, "held", None)
+    if held is None:
+        held = {}
+        _GOAL_FILE_LOCK_LOCAL.held = held
+    if key in held:
+        held[key][0] += 1
+        try:
+            yield
+        finally:
+            held[key][0] -= 1
+        return
+
+    lock_path = _goal_file_lock_path(session_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        _acquire_goal_file_lock(handle)
+        held[key] = [1, handle]
+        try:
+            yield
+        finally:
+            held.pop(key, None)
+            _release_goal_file_lock(handle)
+    finally:
+        handle.close()
+
+
 @contextmanager
 def goal_state_transaction(session_id: str):
     """Serialize one session's goal read/transition/write sequences."""
     with _goal_state_lock(session_id):
-        yield
+        with _cross_process_goal_lock(session_id):
+            yield
 
 
 def _serialized_goal_mutation(method):
     """Keep one manager transition atomic with same-session controls."""
     @wraps(method)
     def locked(self, *args, **kwargs):
+        key = _goal_generation_key(self.session_id)
+        held = getattr(_GOAL_FILE_LOCK_LOCAL, "held", {})
+        outermost_transaction = key not in held
         with goal_state_transaction(self.session_id):
-            # The caller may have refreshed immediately before entering this
-            # method, but another manager can mutate the same session in that
-            # gap. Re-check the process-local generation while holding the
-            # session lock so stale state cannot reach a judge or overwrite a
-            # newer transition.
-            self.refresh_if_stale()
+            # Reload persisted state exactly once at the outer process-lock
+            # boundary. Nested decorated calls must keep the same state object
+            # because their caller may hold a reference to it.
+            if not outermost_transaction:
+                pass
+            elif method.__name__ == "set":
+                self.refresh_if_stale()
+            else:
+                authoritative = load_goal_authoritative(self.session_id)
+                if (
+                    authoritative is not None
+                    and (
+                        self._state is None
+                        or authoritative.receipt_token != self._state.receipt_token
+                    )
+                ):
+                    self._state = authoritative
+                self._seen_generation = _goal_generation(self.session_id)
             result = method(self, *args, **kwargs)
             # A successful mutation can bump this session's generation. Mark
             # the manager current before releasing the lock so its own
@@ -961,6 +1063,7 @@ def save_goal(session_id: str, state: GoalState) -> None:
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
     try:
+        state.receipt_token = uuid.uuid4().hex
         db.set_meta(_meta_key(session_id), state.to_json())
         _bump_goal_generation(session_id)
     except Exception as exc:

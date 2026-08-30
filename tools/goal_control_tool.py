@@ -207,7 +207,7 @@ def goal_control_tool(
             elif action == "clear":
                 if before is not None and before.status != "cleared":
                     manager.clear()
-                    intended.status = "cleared"
+                    intended = load_goal_authoritative(caller_session_id)
 
             persisted = load_goal_authoritative(caller_session_id)
             if action != "status":
@@ -229,7 +229,11 @@ def goal_control_tool(
         )
 
     state_payload = _state_payload(persisted)
-    receipt_token = uuid.uuid4().hex
+    receipt_token = (
+        persisted.receipt_token
+        if persisted is not None and persisted.receipt_token is not None
+        else uuid.uuid4().hex
+    )
     return json.dumps(
         {
             "success": True,
