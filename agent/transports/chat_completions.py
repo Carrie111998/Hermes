@@ -1032,6 +1032,12 @@ class ChatCompletionsTransport(ProviderTransport):
 
     def validate_response(self, response: Any) -> bool:
         """Check that response has valid choices and is not a router failure shim."""
+        choices = getattr(response, "choices", None)
+        if not isinstance(choices, (list, tuple)) or not choices:
+            # The shared classifier intentionally understands Responses payloads
+            # for auxiliary recovery.  This transport cannot normalize those
+            # shapes, so fail closed at its own consumption boundary.
+            return False
         return is_valid_chat_completion_response(response)
 
     def extract_cache_stats(self, response: Any) -> dict[str, int] | None:

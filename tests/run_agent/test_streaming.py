@@ -554,16 +554,23 @@ class TestStreamingCallbacks:
     def test_multiple_stream_choices_preserve_and_release_valid_output(
         self, mock_close, mock_create
     ):
-        """A sentinel alternative must not erase a second valid choice."""
+        """Alternatives remain evidence but never leak callbacks."""
         from run_agent import AIAgent
 
-        def choice(index, content, finish_reason="stop"):
+        def choice(
+            index,
+            content,
+            *,
+            reasoning=None,
+            tool_calls=None,
+            finish_reason="stop",
+        ):
             return SimpleNamespace(
                 index=index,
                 delta=SimpleNamespace(
                     content=content,
-                    tool_calls=None,
-                    reasoning_content=None,
+                    tool_calls=tool_calls,
+                    reasoning_content=reasoning,
                     reasoning=None,
                 ),
                 finish_reason=finish_reason,
@@ -576,13 +583,23 @@ class TestStreamingCallbacks:
                 usage=None,
             ),
             SimpleNamespace(
-                choices=[choice(1, "valid second choice")],
+                choices=[choice(
+                    1,
+                    "valid second choice",
+                    reasoning="alternative reasoning",
+                    tool_calls=[_make_tool_call_delta(
+                        tc_id="call_alt", name="alternative_tool", arguments="{}"
+                    )],
+                )],
                 model="test/model",
                 usage=None,
             ),
             _make_empty_chunk(usage=SimpleNamespace(completion_tokens=0)),
         ]
         deltas = []
+        reasoning = []
+        tools = []
+        first_deltas = []
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = iter(chunks)
         mock_create.return_value = mock_client
@@ -594,18 +611,27 @@ class TestStreamingCallbacks:
             skip_context_files=True,
             skip_memory=True,
             stream_delta_callback=deltas.append,
+            reasoning_callback=reasoning.append,
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
+        agent._fire_tool_gen_started = tools.append
 
-        response = agent._interruptible_streaming_api_call({})
+        response = agent._interruptible_streaming_api_call(
+            {}, on_first_delta=lambda: first_deltas.append("first")
+        )
 
         assert [choice.message.content for choice in response.choices] == [
             "Connect timeout, please try again later.",
             "valid second choice",
         ]
+        assert response.choices[1].message.reasoning_content == "alternative reasoning"
+        assert response.choices[1].message.tool_calls[0].function.name == "alternative_tool"
         assert agent._get_transport().validate_response(response) is True
-        assert "valid second choice" in "".join(deltas)
+        assert deltas == ["Connect timeout, please try again later."]
+        assert reasoning == []
+        assert tools == []
+        assert first_deltas == ["first"]
 
     @pytest.mark.parametrize("evidence", ["second_choice", "tool_call", "usage"])
     @patch("run_agent.AIAgent._create_request_openai_client")
@@ -645,7 +671,7 @@ class TestStreamingCallbacks:
                     model="test/model",
                     usage=None,
                 )
-                assert deltas == [sentinel, "second"]
+                assert deltas == [sentinel]
             elif evidence == "tool_call":
                 yield SimpleNamespace(
                     choices=[choice(
@@ -790,15 +816,26 @@ class TestStreamingFallback:
 
         final_response = SimpleNamespace(
             model="copilot-acp",
-            choices=[SimpleNamespace(
-                message=SimpleNamespace(
-                    content="Hello from ACP",
-                    tool_calls=None,
-                    reasoning_content=None,
-                    reasoning=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="Hello from ACP",
+                        tool_calls=None,
+                        reasoning_content="primary reasoning",
+                        reasoning=None,
+                    ),
+                    finish_reason="stop",
                 ),
-                finish_reason="stop",
-            )],
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="alternative content",
+                        tool_calls=None,
+                        reasoning_content="alternative reasoning",
+                        reasoning=None,
+                    ),
+                    finish_reason="stop",
+                ),
+            ],
             usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
         )
 
@@ -819,13 +856,20 @@ class TestStreamingFallback:
         agent._interrupt_requested = False
 
         deltas = []
+        reasoning = []
+        first_deltas = []
         agent._stream_callback = lambda text: deltas.append(text)
+        agent.reasoning_callback = reasoning.append
 
-        response = agent._interruptible_streaming_api_call({})
+        response = agent._interruptible_streaming_api_call(
+            {}, on_first_delta=lambda: first_deltas.append("first")
+        )
 
         assert response is final_response
         assert agent._disable_streaming is True
         assert deltas == ["Hello from ACP"]
+        assert reasoning == ["primary reasoning"]
+        assert first_deltas == ["first"]
 
 
     @patch("run_agent.AIAgent._abort_request_openai_client")

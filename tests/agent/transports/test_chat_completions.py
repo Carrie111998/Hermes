@@ -621,6 +621,34 @@ class TestChatCompletionsValidate:
         r = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))])
         assert transport.validate_response(r) is True
 
+    def test_responses_shape_is_rejected_before_chat_normalization(self, transport):
+        response = SimpleNamespace(
+            output=[],
+            output_text="generated response text",
+            usage=SimpleNamespace(output_tokens=3),
+        )
+
+        assert transport.validate_response(response) is False
+
+    def test_valid_chat_shape_can_be_validated_then_normalized(self, transport):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="generated response text"),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(
+                prompt_tokens=2,
+                completion_tokens=3,
+                total_tokens=5,
+            ),
+        )
+
+        assert transport.validate_response(response) is True
+        normalized = transport.normalize_response(response)
+        assert normalized.content == "generated response text"
+        assert normalized.usage is not None
+        assert normalized.usage.completion_tokens == 3
+
 
 class TestChatCompletionsNormalize:
 

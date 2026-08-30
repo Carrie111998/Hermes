@@ -4100,6 +4100,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pending_timeout_prefix.clear()
 
         def _accumulate_additional_choice(choice: Any, position: int) -> None:
+            # Alternatives are retained only as raw response evidence. Since
+            # downstream normalization consumes choices[0], they must not
+            # produce content, reasoning, tool, or first-delta callbacks.
             raw_index = getattr(choice, "index", None)
             index = raw_index if isinstance(raw_index, int) else position
             if index not in additional_choice_states:
@@ -4120,17 +4123,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             text = getattr(delta, "content", None)
             if isinstance(text, str) and text:
                 state["content"].append(text)
-                _fire_first_delta()
-                agent._fire_stream_delta(text)
-                deltas_were_sent["yes"] = True
             reasoning_text = (
                 getattr(delta, "reasoning_content", None)
                 or getattr(delta, "reasoning", None)
             )
             if isinstance(reasoning_text, str) and reasoning_text:
                 state["reasoning"].append(reasoning_text)
-                _fire_first_delta()
-                agent._fire_reasoning_delta(reasoning_text)
             for tc_delta in (getattr(delta, "tool_calls", None) or []):
                 tool_index = getattr(tc_delta, "index", 0) or 0
                 tool = state["tool_calls"].setdefault(
@@ -4145,8 +4143,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     name = getattr(function, "name", None)
                     if name:
                         tool["name"] = name
-                        _fire_first_delta()
-                        agent._fire_tool_gen_started(name)
                     arguments = getattr(function, "arguments", None)
                     if arguments:
                         tool["arguments"].append(arguments)
@@ -4441,7 +4437,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             if additional_choices_in_chunk:
                 # A second raw choice is conclusive cardinality evidence. Flush
-                # before processing its callbacks, while retaining choice order.
+                # the consumed choice while retaining alternative choice order.
                 _accept_timeout_candidate()
 
             # Multi-choice providers may emit alternatives in separate chunks;
@@ -4619,9 +4615,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent.model or "unknown",
             )
             agent._disable_streaming = True
-            choices = final_response.choices
+            choices = getattr(final_response, "choices", None)
             if is_valid_chat_completion_response(final_response):
-                for choice in choices if isinstance(choices, (list, tuple)) else []:
+                # normalize_response consumes choices[0], so only that choice
+                # may produce user-visible callbacks. Alternatives remain on
+                # the raw response as timeout-shim cardinality evidence.
+                for choice in choices[:1] if isinstance(choices, (list, tuple)) else []:
                     message = getattr(choice, "message", None)
                     if message is None:
                         continue
