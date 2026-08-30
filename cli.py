@@ -16302,6 +16302,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 prompt_deadline = min(prompt_deadline, deadline)
             response_queue = queue.Queue()
 
+            if cancel_event is not None:
+                add_waker = getattr(cancel_event, "add_waker", None)
+                if add_waker is not None:
+                    add_waker(lambda: response_queue.put_nowait("deny"))
+
             self._approval_state = {
                 "command": command,
                 "description": description,
@@ -16373,6 +16378,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "timeout"
         finally:
             self._approval_lock.release()
+
+    setattr(_approval_callback, "_codex_cooperative_cancel", True)
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
                           allow_session: bool = True,

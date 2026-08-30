@@ -313,6 +313,7 @@ class TestRunTurn:
     ):
         """Every scoped notification takes the same terminal-status path."""
         client = FakeClient()
+        approval_calls = []
         client.queue_server_request(
             "item/commandExecution/requestApproval",
             request_id="approval-1",
@@ -327,10 +328,13 @@ class TestRunTurn:
 
         result = make_session(
             client,
-            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+            approval_callback=lambda *args, **kwargs: (
+                approval_calls.append((args, kwargs)) or "once"
+            ),
         ).run_turn("hi", turn_timeout=0.05, notification_poll_timeout=0.0)
 
-        assert client.responses == [("approval-1", {"decision": "accept"})]
+        assert approval_calls == []
+        assert client.responses == [("approval-1", {"decision": "decline"})]
         assert result.interrupted is expected_interrupted
         assert result.should_retire is False
         if expected_error is None:
@@ -779,14 +783,20 @@ class TestServerRequestRouting:
 
 
 
-    def test_routing_auto_approve_bypass(self):
+    def test_routing_auto_approve_bypass(self, monkeypatch):
         client = FakeClient()
         client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",
                                     command="ls", cwd="/")
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
+        original_respond = client.respond
+
+        def respond(request_id, result):
+            original_respond(request_id, result)
+            client.queue_notification(
+                "turn/completed", threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
+
+        monkeypatch.setattr(client, "respond", respond)
         # No callback, but routing says auto-approve. Should approve.
         s = make_session(client, request_routing=_ServerRequestRouting(
             auto_approve_exec=True))
@@ -927,6 +937,55 @@ class TestServerRequestRouting:
         assert result.error and "exited unexpectedly" in result.error
         assert client.responses == [("approval-1", {"decision": "decline"})]
 
+    def test_process_death_joins_real_cli_approval_and_clears_modal(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from cli import HermesCLI
+
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="sleep 300",
+            cwd="/tmp",
+        )
+        cli = HermesCLI.__new__(HermesCLI)
+        cli._approval_state = None
+        cli._approval_deadline = 0
+        cli._approval_lock = threading.Lock()
+        cli._paint_now = MagicMock()
+        cli._persist_prompt_summary = MagicMock()
+        cli._app = SimpleNamespace(invalidate=MagicMock())
+
+        holder = {}
+        session = make_session(client, approval_callback=cli._approval_callback)
+        run_thread = threading.Thread(
+            target=lambda: holder.setdefault(
+                "result",
+                session.run_turn("hi", notification_poll_timeout=0.0),
+            )
+        )
+        run_thread.start()
+        deadline = time.monotonic() + 0.5
+        while cli._approval_state is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert cli._approval_state is not None
+
+        client._closed = True
+        run_thread.join(0.75)
+
+        assert not run_thread.is_alive()
+        assert cli._approval_state is None
+        assert not any(
+            thread.is_alive() and thread.name == "codex-approval-callback"
+            for thread in threading.enumerate()
+        )
+        result = holder["result"]
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert client.responses == [("approval-1", {"decision": "decline"})]
+
 
 
 # ---- enriched approval prompts ----
@@ -943,13 +1002,13 @@ class TestApprovalPromptEnrichment:
             "item/commandExecution/requestApproval", request_id="r1",
             command="ls",  # no cwd
         )
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
         captured = {}
         def cb(command, description, *, allow_permanent=True):
             captured["description"] = description
+            client.queue_notification(
+                "turn/completed", threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
             return "once"
         s = make_session(client, approval_callback=cb)
         s.run_turn("hi", turn_timeout=1.0)
@@ -977,14 +1036,14 @@ class TestApprovalPromptEnrichment:
             startedAtMs=1234567890,
             reason="add and update files",
         )
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
         captured = {}
         def cb(command, description, *, allow_permanent=True):
             captured["command"] = command
             captured["description"] = description
+            client.queue_notification(
+                "turn/completed", threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
             return "once"
         s = make_session(client, approval_callback=cb)
         s.run_turn("hi", turn_timeout=1.0)
@@ -1005,13 +1064,13 @@ class TestApprovalPromptEnrichment:
             startedAtMs=1234567890,
             reason="apply some changes",
         )
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
         captured = {}
         def cb(command, description, *, allow_permanent=True):
             captured["command"] = command
+            client.queue_notification(
+                "turn/completed", threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
             return "once"
         s = make_session(client, approval_callback=cb)
         s.run_turn("hi", turn_timeout=1.0)

@@ -95,6 +95,29 @@ _FINAL_ANSWER_COMPLETION_GRACE_SECONDS = 5.0
 _APPROVAL_CANCEL_JOIN_SECONDS = 0.25
 
 
+class _ApprovalCancelEvent(threading.Event):
+    """Cancellation event that can also wake a cooperative blocking prompt."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._waker_lock = threading.Lock()
+        self._wakers: list[Callable[[], None]] = []
+
+    def add_waker(self, waker: Callable[[], None]) -> None:
+        with self._waker_lock:
+            if not self.is_set():
+                self._wakers.append(waker)
+                return
+        waker()
+
+    def set(self) -> None:
+        super().set()
+        with self._waker_lock:
+            wakers, self._wakers = self._wakers, []
+        for waker in wakers:
+            waker()
+
+
 def _bounded_request_timeout(
     deadline: Optional[float], default_timeout: float
 ) -> float:
@@ -796,6 +819,9 @@ class CodexAppServerSession:
                     )
                     if state.turn_complete:
                         break
+                if state.turn_complete:
+                    self._decline_server_request(sreq)
+                    break
                 approval_deadline = deadline
                 if state.final_answer_completion_deadline is not None:
                     approval_deadline = (
@@ -1129,7 +1155,7 @@ class CodexAppServerSession:
         deadline: Optional[float],
     ) -> str:
         """Run a possibly blocking prompt while retaining turn cancellation."""
-        cancel_event = threading.Event()
+        cancel_event = _ApprovalCancelEvent()
         done = threading.Event()
         outcome: dict[str, str] = {}
 
@@ -1167,10 +1193,18 @@ class CodexAppServerSession:
 
         def decline_after_cancellation() -> str:
             cancel_event.set()
-            # Cooperative callbacks (including the CLI prompt) should be gone
-            # before the turn returns.  Keep the wait bounded for legacy
-            # callbacks that do not accept ``cancel_event``.
-            worker.join(timeout=_APPROVAL_CANCEL_JOIN_SECONDS)
+            callback = self._approval_callback
+            callback_fn = getattr(callback, "__func__", callback)
+            cooperative = bool(
+                getattr(callback_fn, "_codex_cooperative_cancel", False)
+            )
+            # The marked CLI callback is cancellation-wakeable, so its worker
+            # must be fully reaped before returning. Keep legacy/third-party
+            # callbacks bounded because accepting cancel_event does not prove
+            # that they actually cooperate with it.
+            worker.join(
+                timeout=None if cooperative else _APPROVAL_CANCEL_JOIN_SECONDS
+            )
             if worker.is_alive():
                 logger.warning(
                     "codex approval callback did not stop after cancellation"
@@ -1191,6 +1225,39 @@ class CodexAppServerSession:
         if cancellation_requested():
             return decline_after_cancellation()
         return outcome.get("decision", "decline")
+
+    def _decline_server_request(self, req: dict) -> None:
+        """Resolve a removed request without consulting authorization policy."""
+        client = self._client
+        if client is None:
+            return
+        request_id = req.get("id")
+        method = req.get("method", "")
+        try:
+            if method in {
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+                "item/permissions/requestApproval",
+            }:
+                client.respond(request_id, {"decision": "decline"})
+            elif method == "mcpServer/elicitation/request":
+                client.respond(
+                    request_id,
+                    {"action": "decline", "content": None, "_meta": None},
+                )
+            else:
+                client.respond_error(
+                    request_id,
+                    code=-32601,
+                    message=f"Unsupported method: {method}",
+                )
+        except Exception:
+            if client.is_alive():
+                raise
+            logger.debug(
+                "codex exited before terminal request could be declined",
+                exc_info=True,
+            )
 
     def _handle_server_request(
         self,
