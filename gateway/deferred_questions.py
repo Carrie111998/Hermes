@@ -292,7 +292,7 @@ class DeferredQuestionService:
                 ) = ?
             """
             params += (normalized_profile,)
-        sql += " ORDER BY created_at ASC LIMIT 1"
+        sql += " ORDER BY created_at ASC, id ASC LIMIT 1"
         with self._lock, self._transaction() as conn:
             row = conn.execute(sql, params).fetchone()
         return self._from_row(row)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -89,6 +89,23 @@ def test_enqueue_deduplicates_one_unresolved_question(tmp_path: Path) -> None:
 
     assert second.id == first.id
     assert service.pending_for_session(first.session_key) == first
+
+
+def test_pending_uses_queue_tiebreaker_for_equal_timestamps(tmp_path: Path) -> None:
+    service = _service(tmp_path / "questions.sqlite3")
+
+    with (
+        patch("gateway.deferred_questions.time.time", return_value=1.0),
+        patch("gateway.deferred_questions.uuid.uuid4") as uuid4,
+    ):
+        uuid4.side_effect = [
+            SimpleNamespace(hex="b-question"),
+            SimpleNamespace(hex="a-question"),
+        ]
+        _enqueue(service, dedupe_key="later-id")
+        lower_id = _enqueue(service, dedupe_key="lower-id")
+
+    assert service.pending_for_session(lower_id.session_key) == lower_id
 
 
 def test_each_transaction_closes_its_sqlite_connection(tmp_path: Path) -> None:
@@ -668,7 +685,7 @@ async def test_relay_deferred_delivery_uses_transport_and_restores_routing(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_path", ["cleanup", "direct"])
+@pytest.mark.parametrize("release_path", ["cleanup", "direct", "stale_heal"])
 async def test_busy_question_wakes_only_after_session_guard_is_released(
     tmp_path: Path,
     release_path: str,
@@ -714,6 +731,8 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
     assert session_key in adapter._session_idle_callbacks
     if release_path == "cleanup":
         adapter._cleanup_finished_session_task(session_key, guard)
+    elif release_path == "stale_heal":
+        assert adapter._heal_stale_session_lock(session_key)
     else:
         adapter._release_session_guard(session_key, guard=guard)
     await asyncio.sleep(0)

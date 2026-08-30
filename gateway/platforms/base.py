@@ -6169,7 +6169,7 @@ class BasePlatformAdapter(ABC):
             self.name,
             session_key,
         )
-        self._active_sessions.pop(session_key, None)
+        self._release_session_guard(session_key)
         self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
