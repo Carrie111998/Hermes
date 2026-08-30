@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -176,6 +176,71 @@ async def test_reconnect_wake_retries_after_active_handler_fails(
 
 
 @pytest.mark.asyncio
+async def test_reconnect_wake_runs_second_recovery_pass_for_skipped_platform(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from gateway.deferred_questions import DeferredQuestionResult
+
+    service = _service(tmp_path / "questions.sqlite3")
+
+    def enqueue(platform: str, key: str):
+        return service.enqueue(
+            plugin_id="plow-chat",
+            session_key=f"{platform}:home:owner",
+            delivery_source={
+                "platform": platform,
+                "chat_id": "home",
+                "user_id": "owner",
+            },
+            question="May I send invites?",
+            handler_name="invite-consent",
+            context={},
+            dedupe_key=key,
+        )
+
+    skipped = enqueue("platform_b", "b")
+    active = enqueue("platform_a", "a")
+    with service._lock, service._transaction() as conn:
+        conn.execute(
+            "UPDATE deferred_questions SET state = 'handling', response = 'yes'"
+        )
+
+    adapter_a = _DeliveryAdapter(service, active=False)
+    adapter_b = _DeliveryAdapter(service, active=False)
+    service.bind_adapter("platform_a", adapter_a)
+    service.bind_adapter("platform_b", adapter_b)
+    service.adapter_connected("platform_a", adapter_a)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    handled: list[str] = []
+
+    async def handle(record, _answer):
+        handled.append(record.id)
+        if record.id == active.id:
+            started.set()
+            await release.wait()
+        return DeferredQuestionResult.done("")
+
+    service.register_handler("plow-chat", "invite-consent", handle)
+    await asyncio.sleep(0)
+    recovery = service._recovery_task
+    assert recovery is not None
+    await started.wait()
+
+    service.adapter_connected("platform_b", adapter_b)
+    release.set()
+    await recovery
+
+    assert handled == [active.id, skipped.id]
+    with pytest.raises(KeyError):
+        service.get(active.id)
+    with pytest.raises(KeyError):
+        service.get(skipped.id)
+
+
+@pytest.mark.asyncio
 async def test_overlapping_recovery_does_not_retry_ambiguous_delivery(
     tmp_path: Path,
 ) -> None:
@@ -185,18 +250,15 @@ async def test_overlapping_recovery_does_not_retry_ambiguous_delivery(
 
     service = _service(tmp_path / "questions.sqlite3")
 
-    class AmbiguousAdapter(_DeliveryAdapter):
-        def __init__(self, service) -> None:
-            super().__init__(service, active=False)
-            self.attempts = 0
-
-        async def deliver_deferred_message(self, delivery_source, content):
-            self.attempts += 1
-            return SimpleNamespace(
+    adapter = _DeliveryAdapter(
+        service,
+        active=False,
+        outcomes=[
+            SimpleNamespace(
                 success=False, error="delivery timed out", retryable=False
             )
-
-    adapter = AmbiguousAdapter(service)
+        ],
+    )
     question, _adapter = _awaiting_question(service, adapter=adapter)
     started = asyncio.Event()
     release = asyncio.Event()
@@ -219,10 +281,47 @@ async def test_overlapping_recovery_does_not_retry_ambiguous_delivery(
         await handling
     assert await recovery == []
 
-    persisted = service.get(question.id)
-    assert persisted.state == "handling"
-    assert persisted.delivery_attempted is True
+    with pytest.raises(KeyError):
+        service.get(question.id)
     assert adapter.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_resolved_ambiguous_ack_does_not_block_next_question(
+    tmp_path: Path,
+) -> None:
+    from gateway.deferred_questions import DeferredQuestionResult
+
+    service = _service(tmp_path / "questions.sqlite3")
+    first = _enqueue(service, dedupe_key="first")
+    second = _enqueue(service, dedupe_key="second")
+
+    adapter = _DeliveryAdapter(
+        service,
+        active=False,
+        outcomes=[
+            SimpleNamespace(
+                success=False, error="delivery timed out", retryable=False
+            )
+        ],
+    )
+    service.bind_adapter("plow_chat", adapter)
+    service.adapter_connected("plow_chat", adapter)
+    service.claim_for_delivery(first.id)
+    service.mark_awaiting(first.id)
+
+    async def handle(_record, _answer):
+        return DeferredQuestionResult.done("Consent recorded.")
+
+    service.register_handler("plow-chat", "invite-consent", handle)
+
+    with pytest.raises(RuntimeError, match="delivery timed out"):
+        await service.handle_response(first.session_key, "yes")
+
+    with pytest.raises(KeyError):
+        service.get(first.id)
+    assert service.get(second.id).state == "awaiting"
+    assert adapter.sent[-1] == ("home", second.question)
 
 
 @pytest.mark.asyncio
@@ -298,7 +397,11 @@ async def test_reply_delivery_recovery_does_not_rerun_handler(tmp_path: Path) ->
     path = tmp_path / "questions.sqlite3"
     service = _service(path)
 
-    adapter = _RetryableOnceAdapter(service)
+    adapter = _DeliveryAdapter(
+        service,
+        active=False,
+        outcomes=[SimpleNamespace(success=False, error="offline", retryable=True)],
+    )
     question, _adapter = _awaiting_question(service, adapter=adapter)
     service.handling_retry_seconds = 0
     handler_calls = 0
@@ -395,9 +498,11 @@ async def test_resolved_dedupe_key_can_be_enqueued_again(tmp_path: Path) -> None
 
 
 class _DeliveryAdapter:
-    def __init__(self, service, *, active: bool) -> None:
+    def __init__(self, service, *, active: bool, outcomes=()) -> None:
         self.service = service
         self.active = active
+        self.outcomes = list(outcomes)
+        self.attempts = 0
         self.callbacks = {}
         self.sent = []
 
@@ -414,24 +519,14 @@ class _DeliveryAdapter:
         self.callbacks[session_key] = (generation, callback)
 
     async def deliver_deferred_message(self, delivery_source, content):
+        self.attempts += 1
+        if self.outcomes:
+            return self.outcomes.pop(0)
         pending = self.service.pending_for_session("plow_chat:home:owner")
         assert pending is not None
         assert pending.state in {"delivering", "handling"}
         self.sent.append((delivery_source["chat_id"], content))
         return SimpleNamespace(success=True, error=None, retryable=False)
-
-
-class _RetryableOnceAdapter(_DeliveryAdapter):
-    def __init__(self, service) -> None:
-        super().__init__(service, active=False)
-        self.attempts = 0
-
-    async def deliver_deferred_message(self, delivery_source, content):
-        self.attempts += 1
-        if self.attempts == 1:
-            return SimpleNamespace(success=False, error="offline", retryable=True)
-        return await super().deliver_deferred_message(delivery_source, content)
-
 
 class _GatewayAdapter(BasePlatformAdapter):
     def __init__(self, platform=Platform.TELEGRAM):
@@ -483,6 +578,45 @@ async def test_deferred_delivery_restores_slack_workspace_and_thread() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_deferred_delivery_uses_transport_and_restores_routing(
+    tmp_path: Path,
+) -> None:
+    from gateway.session import SessionSource
+
+    service = _service(tmp_path / "questions.sqlite3")
+    adapter = _GatewayAdapter(Platform.RELAY)
+    adapter.prime_routing_cache = MagicMock()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel",
+        chat_type="group",
+        user_id="owner",
+        scope_id="guild",
+        delivery_transport="relay",
+    )
+    question = service.enqueue(
+        plugin_id="plow-chat",
+        session_key="discord:channel",
+        delivery_source=source.to_dict(),
+        question="May I send invites?",
+        handler_name="invite-consent",
+        context={},
+        dedupe_key="invite-consent",
+    )
+
+    assert question.platform == "relay"
+    service.bind_adapter("relay", adapter)
+    service.adapter_connected("relay", adapter)
+    await service.deliver_ready("relay")
+
+    assert service.get(question.id).state == "awaiting"
+    adapter.prime_routing_cache.assert_called_once()
+    assert adapter.sent == [
+        ("channel", "May I send invites?", None, {"notify": True})
+    ]
+
+
+@pytest.mark.asyncio
 async def test_busy_session_delivers_only_from_completion_callback(
     tmp_path: Path,
 ) -> None:
@@ -509,13 +643,11 @@ async def test_busy_session_delivers_only_from_completion_callback(
 async def test_failed_delivery_returns_question_to_queue(tmp_path: Path) -> None:
     service = _service(tmp_path / "questions.sqlite3")
     question = _enqueue(service)
-
-    class FailingAdapter(_DeliveryAdapter):
-        async def deliver_deferred_message(self, delivery_source, content):
-            assert self.service.get(question.id).state == "delivering"
-            return SimpleNamespace(success=False, error="offline", retryable=True)
-
-    adapter = FailingAdapter(service, active=False)
+    adapter = _DeliveryAdapter(
+        service,
+        active=False,
+        outcomes=[SimpleNamespace(success=False, error="offline", retryable=True)],
+    )
     service.bind_adapter("plow_chat", adapter)
     service.adapter_connected("plow_chat", adapter)
 
@@ -557,7 +689,11 @@ async def test_disconnected_handling_recovery_waits_for_reconnect(
 
     service = _service(tmp_path / "questions.sqlite3")
 
-    adapter = _RetryableOnceAdapter(service)
+    adapter = _DeliveryAdapter(
+        service,
+        active=False,
+        outcomes=[SimpleNamespace(success=False, error="offline", retryable=True)],
+    )
     question, _adapter = _awaiting_question(service, adapter=adapter)
     service.handling_retry_seconds = 0
     handler_calls = 0
@@ -596,18 +732,12 @@ async def test_ambiguous_delivery_is_not_retried_after_restart(tmp_path: Path) -
     service = _service(path)
     question = _enqueue(service)
 
-    class AmbiguousAdapter(_DeliveryAdapter):
-        def __init__(self, service) -> None:
-            super().__init__(service, active=False)
-            self.attempts = 0
-
-        async def deliver_deferred_message(self, delivery_source, content):
-            self.attempts += 1
-            return SimpleNamespace(
-                success=False, error="delivery timed out", retryable=False
-            )
-
-    first_adapter = AmbiguousAdapter(service)
+    ambiguous = SimpleNamespace(
+        success=False, error="delivery timed out", retryable=False
+    )
+    first_adapter = _DeliveryAdapter(
+        service, active=False, outcomes=[ambiguous]
+    )
     service._adapters["plow_chat"] = (
         first_adapter,
         __import__("asyncio").get_running_loop(),
@@ -619,7 +749,9 @@ async def test_ambiguous_delivery_is_not_retried_after_restart(tmp_path: Path) -
     assert service.get(question.id).state == "delivering"
 
     restarted = _service(path)
-    restarted_adapter = AmbiguousAdapter(restarted)
+    restarted_adapter = _DeliveryAdapter(
+        restarted, active=False, outcomes=[ambiguous]
+    )
     restarted.bind_adapter("plow_chat", restarted_adapter)
     restarted.adapter_connected("plow_chat", restarted_adapter)
     await __import__("asyncio").sleep(0)
@@ -636,18 +768,11 @@ async def test_failed_delivery_waits_for_an_external_wake(
     service = _service(tmp_path / "questions.sqlite3")
     question = _enqueue(service)
 
-    class FlakyAdapter(_DeliveryAdapter):
-        def __init__(self, service) -> None:
-            super().__init__(service, active=False)
-            self.attempts = 0
-
-        async def deliver_deferred_message(self, delivery_source, content):
-            self.attempts += 1
-            if self.attempts == 1:
-                return SimpleNamespace(success=False, error="offline", retryable=True)
-            return await super().deliver_deferred_message(delivery_source, content)
-
-    adapter = FlakyAdapter(service)
+    adapter = _DeliveryAdapter(
+        service,
+        active=False,
+        outcomes=[SimpleNamespace(success=False, error="offline", retryable=True)],
+    )
     service.bind_adapter("plow_chat", adapter)
     service.adapter_connected("plow_chat", adapter)
     await __import__("asyncio").sleep(0)
@@ -694,11 +819,19 @@ async def test_wake_does_not_copy_the_enqueuers_context_into_delivery(
     assert adapter.context_values == [None]
 
 
-def test_plugin_client_namespaces_handler_and_dedupe_key(tmp_path: Path) -> None:
+def test_plugin_client_namespaces_handler_and_dedupe_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from gateway.deferred_questions import DeferredQuestionClient
+    from hermes_cli import plugin_capabilities
 
     service = _service(tmp_path / "questions.sqlite3")
     client = DeferredQuestionClient(service, "plow-chat")
+    monkeypatch.setattr(
+        plugin_capabilities,
+        "plugin_capability_granted",
+        lambda *_args, **_kwargs: True,
+    )
 
     async def handler(_record, _answer):
         raise AssertionError("not called")
@@ -716,6 +849,33 @@ def test_plugin_client_namespaces_handler_and_dedupe_key(tmp_path: Path) -> None
     assert question.plugin_id == "plow-chat"
     assert question.handler_name == "invite-consent"
     assert question.dedupe_key == "owner-consent"
+
+
+def test_plugin_client_denies_enqueue_without_platform_action_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gateway.deferred_questions import DeferredQuestionClient
+    from hermes_cli import plugin_capabilities
+
+    service = _service(tmp_path / "questions.sqlite3")
+    client = DeferredQuestionClient(service, "plow-chat")
+    monkeypatch.setattr(
+        plugin_capabilities,
+        "plugin_capability_granted",
+        lambda plugin_id, capability: False,
+    )
+
+    with pytest.raises(PermissionError, match="gateway.platform_actions"):
+        client.enqueue(
+            session_key="plow_chat:home:owner",
+            delivery_source={"platform": "plow_chat", "chat_id": "home"},
+            question="May I send invites?",
+            context={},
+            dedupe_key="owner-consent",
+            handler_name="invite-consent",
+        )
+
+    assert service.pending_for_session("plow_chat:home:owner") is None
 
 
 def test_stale_handler_cleanup_does_not_remove_replacement(tmp_path: Path) -> None:
@@ -804,7 +964,6 @@ def test_plugin_context_exposes_plugin_scoped_client(
     manager = PluginManager()
     context = PluginContext(PluginManifest(name="Plow Chat", key="plow-chat"), manager)
 
-    assert context.deferred_questions.plugin_id == "plow-chat"
     assert context.deferred_questions is context.deferred_questions
 
     async def handler(_record, _answer):
@@ -912,6 +1071,116 @@ async def test_adapter_intercepts_deferred_reply_before_busy_queue(
     adapter._busy_session_handler.assert_not_awaited()
     with pytest.raises(KeyError):
         service.get(question.id)
+
+
+@pytest.mark.asyncio
+async def test_adapter_leaves_question_pending_for_different_authorized_sender(
+    tmp_path: Path,
+) -> None:
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource, build_session_key
+
+    service = _service(tmp_path / "questions.sqlite3")
+    adapter = _GatewayAdapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+    adapter.set_deferred_question_service(service)
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._message_handler = AsyncMock(return_value="ordinary")
+    owner = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="shared",
+        chat_type="group",
+        user_id="owner",
+    )
+    session_key = build_session_key(owner, group_sessions_per_user=False)
+    question = service.enqueue(
+        plugin_id="plow-chat",
+        session_key=session_key,
+        delivery_source=owner.to_dict(),
+        question="May I send invites?",
+        handler_name="invite-consent",
+        context={},
+        dedupe_key="invite-consent",
+    )
+    service.claim_for_delivery(question.id)
+    service.mark_awaiting(question.id)
+    handler = AsyncMock()
+    service.register_handler("plow-chat", "invite-consent", handler)
+    other = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="shared",
+        chat_type="group",
+        user_id="other-member",
+    )
+
+    await adapter.handle_message(
+        MessageEvent(
+            text="yes",
+            source=other,
+            message_id="msg-other",
+            message_type=MessageType.TEXT,
+        )
+    )
+
+    assert service.get(question.id).state == "awaiting"
+    handler.assert_not_awaited()
+    adapter._message_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_adapter_selects_deferred_service_by_routed_profile(
+    tmp_path: Path,
+) -> None:
+    from gateway.deferred_questions import DeferredQuestionResult
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource, build_session_key
+
+    default_service = _service(tmp_path / "default.sqlite3")
+    work_service = _service(tmp_path / "work.sqlite3")
+    adapter = _GatewayAdapter()
+    adapter.set_deferred_question_service(default_service)
+    adapter.set_deferred_question_service(work_service, profile_name="work")
+    work_service.adapter_connected("telegram", adapter)
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._message_handler = AsyncMock(return_value="ordinary")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="home",
+        chat_type="dm",
+        user_id="owner",
+        profile="work",
+    )
+    session_key = build_session_key(source, profile="work")
+    question = work_service.enqueue(
+        plugin_id="plow-chat",
+        session_key=session_key,
+        delivery_source=source.to_dict(),
+        question="May I send invites?",
+        handler_name="invite-consent",
+        context={},
+        dedupe_key="invite-consent",
+    )
+    work_service.claim_for_delivery(question.id)
+    work_service.mark_awaiting(question.id)
+
+    async def handle(_record, _answer):
+        return DeferredQuestionResult.done("Consent recorded.")
+
+    work_service.register_handler("plow-chat", "invite-consent", handle)
+
+    await adapter.handle_message(
+        MessageEvent(
+            text="yes",
+            source=source,
+            message_id="msg-work",
+            message_type=MessageType.TEXT,
+        )
+    )
+
+    with pytest.raises(KeyError):
+        work_service.get(question.id)
+    assert default_service.pending_for_session(session_key) is None
+    adapter._message_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -3138,6 +3139,8 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._deferred_question_service = None
+        self._deferred_question_services: Dict[str, Any] = {}
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
@@ -3818,11 +3821,22 @@ class BasePlatformAdapter(ABC):
 
         self.set_deferred_question_service(get_deferred_question_service())
 
-    def set_deferred_question_service(self, service: Any) -> None:
+    def set_deferred_question_service(
+        self, service: Any, *, profile_name: Optional[str] = None
+    ) -> None:
         """Register this adapter without waking work before it connects."""
-        self._deferred_question_service = service
+        profile = (profile_name or "").strip()
+        services = getattr(self, "_deferred_question_services", None)
+        if not isinstance(services, dict):
+            services = {}
+            self._deferred_question_services = services
+        services[profile] = service
+        if not profile:
+            self._deferred_question_service = service
         platform_name = getattr(self.platform, "value", str(self.platform))
         service.bind_adapter(platform_name, self)
+        if self.is_connected:
+            service.adapter_connected(platform_name, self)
 
     def notify_deferred_questions_connected(self) -> None:
         """Wake durable plugin work after the transport is usable."""
@@ -3835,12 +3849,22 @@ class BasePlatformAdapter(ABC):
 
     def _set_deferred_transport_ready(self, ready: bool) -> None:
         """Publish every transport transition through one durable-work seam."""
-        service = self._deferred_question_service
-        if service is None:
+        services = getattr(self, "_deferred_question_services", None)
+        if not isinstance(services, dict):
+            service = getattr(self, "_deferred_question_service", None)
+            services = {"": service} if service is not None else {}
+        if not services:
             return
         platform_name = getattr(self.platform, "value", str(self.platform))
-        transition = service.adapter_connected if ready else service.adapter_disconnected
-        transition(platform_name, self)
+        seen: set[int] = set()
+        for service in services.values():
+            if id(service) in seen:
+                continue
+            seen.add(id(service))
+            transition = (
+                service.adapter_connected if ready else service.adapter_disconnected
+            )
+            transition(platform_name, self)
 
     def is_session_active(self, session_key: str) -> bool:
         """Return whether this adapter currently owns a run for ``session_key``."""
@@ -5839,6 +5863,10 @@ class BasePlatformAdapter(ABC):
 
         source = SessionSource.from_dict(delivery_source)
         delivery_adapter = self._final_delivery_adapter(source)
+        if getattr(source, "delivery_transport", None) == "relay":
+            prime = getattr(delivery_adapter, "prime_routing_cache", None)
+            if callable(prime):
+                prime(SimpleNamespace(source=source))
         reply_to = getattr(source, "message_id", None)
         if (
             _platform_name(source.platform) == "telegram"
@@ -6324,7 +6352,15 @@ class BasePlatformAdapter(ABC):
         # an out-of-band correction to unrelated work that started after the
         # question was delivered. Slash commands remain commands and leave the
         # question pending.
-        deferred_service = getattr(self, "_deferred_question_service", None)
+        deferred_services = getattr(self, "_deferred_question_services", None)
+        profile = str(getattr(event.source, "profile", None) or "").strip()
+        deferred_service = (
+            deferred_services.get(profile)
+            if isinstance(deferred_services, dict)
+            else None
+        )
+        if deferred_service is None:
+            deferred_service = getattr(self, "_deferred_question_service", None)
         pending_deferred = (
             deferred_service.pending_for_session(session_key)
             if deferred_service is not None and not event.get_command()
@@ -6337,6 +6373,18 @@ class BasePlatformAdapter(ABC):
                 event.source.chat_id,
             )
             if authorized is not True:
+                return
+            expected_sender = str(
+                pending_deferred.delivery_source.get("user_id_alt")
+                or pending_deferred.delivery_source.get("user_id")
+                or ""
+            ).strip()
+            actual_sender = str(
+                getattr(event.source, "user_id_alt", None)
+                or getattr(event.source, "user_id", None)
+                or ""
+            ).strip()
+            if expected_sender and actual_sender != expected_sender:
                 return
             try:
                 deferred_result = await deferred_service.handle_response(

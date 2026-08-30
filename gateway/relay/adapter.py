@@ -1023,6 +1023,8 @@ class RelayAdapter(BasePlatformAdapter):
 
     async def _on_inbound(self, event) -> None:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
+        if getattr(event, "source", None) is not None:
+            event.source.delivery_transport = "relay"
         # Inbound replay dedupe (live-canary finding #3, Alice staging): the
         # relay leg is at-least-once — on WS re-handshake the connector
         # replays its durable per-instance buffer, and a long multi-tool turn
@@ -1507,6 +1509,7 @@ class RelayAdapter(BasePlatformAdapter):
             if platform == "discord":
                 event = self._discord_interaction_to_event(forward)
                 if event is not None:
+                    event.source.delivery_transport = "relay"
                     self._capture_scope(event)
                     # Phase 3: a component press carrying a Hermes prompt token
                     # resolves its waiting primitive and is consumed (same

@@ -15187,6 +15187,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    self._bind_multiplex_deferred_services(adapter)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -16055,6 +16056,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     claimed[retry_claim] = active
 
         profile_homes = _multiplex_profile_homes(self.config)
+        for adapter in self.adapters.values():
+            self._bind_multiplex_deferred_services(adapter)
         for profile_name, profile_home in profile_homes:
             if profile_name == active:
                 continue  # handled by the primary startup loop
@@ -16102,6 +16105,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("could not record served_profiles", exc_info=True)
 
         return connected
+
+    def _bind_multiplex_deferred_services(
+        self, adapter: BasePlatformAdapter
+    ) -> None:
+        """Bind every routed profile's durable question store to an adapter."""
+        if not getattr(self.config, "multiplex_profiles", False):
+            return
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            from gateway.deferred_questions import get_deferred_question_service
+
+            active = get_active_profile_name() or "default"
+            for profile_name, profile_home in _multiplex_profile_homes(self.config):
+                if profile_name == active:
+                    continue
+                with _profile_runtime_scope(profile_home):
+                    service = get_deferred_question_service()
+                adapter.set_deferred_question_service(
+                    service, profile_name=profile_name
+                )
+        except Exception:
+            logger.error(
+                "Failed to bind multiplex deferred-question services",
+                exc_info=True,
+            )
 
     async def _start_one_profile_adapters(
         self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]

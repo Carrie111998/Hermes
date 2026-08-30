@@ -40,7 +40,10 @@ class DeferredQuestion:
 
     @property
     def platform(self) -> str:
-        return str(self.delivery_source["platform"])
+        return str(
+            self.delivery_source.get("delivery_transport")
+            or self.delivery_source["platform"]
+        )
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,7 @@ class DeferredQuestionService:
         self._handler_lock = asyncio.Lock()
         self._handling_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._recovery_task: asyncio.Task[None] | None = None
+        self._recovery_requested = False
         self.handling_retry_seconds = 5.0
         self._initialize()
 
@@ -191,7 +195,11 @@ class DeferredQuestionService:
             delivery_source, sort_keys=True, separators=(",", ":")
         )
         chat_id = str(delivery_source.get("chat_id") or "")
-        platform = str(delivery_source.get("platform") or "")
+        platform = str(
+            delivery_source.get("delivery_transport")
+            or delivery_source.get("platform")
+            or ""
+        )
         if not all(
             value.strip()
             for value in (
@@ -379,6 +387,7 @@ class DeferredQuestionService:
             return
 
         def recover_captured() -> None:
+            self._recovery_requested = True
             if self._recovery_task is None or self._recovery_task.done():
                 self._recovery_task = asyncio.create_task(self._recover_handling())
 
@@ -612,6 +621,28 @@ class DeferredQuestionService:
                         )
                     if schedule_retry:
                         self._schedule_handling_retry(record)
+                elif result.resolved:
+                    with self._lock, self._transaction() as conn:
+                        conn.execute(
+                            """
+                            DELETE FROM deferred_questions
+                            WHERE id = ? AND state = 'handling'
+                            """,
+                            (record.id,),
+                        )
+                    await self.deliver_ready(record.platform, record.session_key)
+                else:
+                    with self._lock, self._transaction() as conn:
+                        conn.execute(
+                            """
+                            UPDATE deferred_questions
+                            SET state = 'awaiting', question = ?, response = NULL,
+                                result_json = NULL, delivery_attempted = 0,
+                                updated_at = ?
+                            WHERE id = ? AND state = 'handling'
+                            """,
+                            (result.question, time.time(), record.id),
+                        )
                 raise RuntimeError(
                     getattr(delivered, "error", None)
                     or "deferred-question reply delivery failed"
@@ -641,7 +672,11 @@ class DeferredQuestionService:
         return result
 
     async def _recover_handling(self) -> None:
-        await self.retry_handling()
+        while True:
+            self._recovery_requested = False
+            await self.retry_handling()
+            if not self._recovery_requested:
+                return
 
     async def retry_handling(
         self,
@@ -691,10 +726,6 @@ class DeferredQuestionClient:
         self._plugin_id = plugin_id
         self._track_registration = track_registration
 
-    @property
-    def plugin_id(self) -> str:
-        return self._plugin_id
-
     def register_handler(
         self, handler_name: str, handler: DeferredQuestionHandler
     ) -> None:
@@ -717,6 +748,15 @@ class DeferredQuestionClient:
         dedupe_key: str,
         handler_name: str,
     ) -> DeferredQuestion:
+        from hermes_cli.plugin_capabilities import plugin_capability_granted
+
+        if not plugin_capability_granted(
+            self._plugin_id, "gateway.platform_actions"
+        ):
+            raise PermissionError(
+                "gateway.platform_actions capability is required for "
+                "deferred questions"
+            )
         return self._service.enqueue(
             plugin_id=self._plugin_id,
             session_key=session_key,
