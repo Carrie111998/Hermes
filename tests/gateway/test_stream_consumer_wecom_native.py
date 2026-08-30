@@ -555,6 +555,9 @@ class TestClarifyEagerReseed:
             await asyncio.sleep(0.01)
         return predicate()
 
+    def _empty_seed_count(self, adapter):
+        return len([f for f in adapter.frames if f["text"] == "" and not f["finalize"]])
+
     async def _to_reopen_pending(self, consumer, adapter):
         """Run to the point right after a clarify boundary: native still on,
         no stream open, awaiting a re-seed.  Returns nothing; leaves the run
@@ -620,22 +623,20 @@ class TestClarifyEagerReseed:
         consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
 
         task = await self._to_reopen_pending(consumer, adapter)
-        seeds_before = len(
-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
-        )
+        seeds_before = self._empty_seed_count(adapter)
 
         # User answered → request an eager re-seed.  NO on_delta yet.
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)  # let run() process _REOPEN_SEED
+        assert await self._wait_until(
+            lambda: consumer._native_stream_opened
+            and self._empty_seed_count(adapter) == seeds_before + 1
+        ), "run() must process _REOPEN_SEED before the assertion reads frames"
 
-        seeds_after = len(
-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
-        )
+        seeds_after = self._empty_seed_count(adapter)
         assert seeds_after == seeds_before + 1, (
             "eager re-seed must emit exactly one new empty seed frame before "
             f"any delta (before={seeds_before}, after={seeds_after})"
         )
-        assert await self._wait_until(lambda: consumer._native_stream_opened)
         assert consumer._awaiting_reopen_after_boundary is False
         assert consumer._reopen_seeded_eagerly is True
 
