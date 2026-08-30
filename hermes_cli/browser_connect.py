@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_real_home
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ def real_profile_data_dir(browser: str, system: str | None = None) -> str | None
         return None
     system = system or platform.system()
     mac_parts, win_parts, linux_name = _real_profile_relparts(browser)
-    home = os.path.expanduser("~")
+    home = get_real_home()
     if system == "Darwin":
         return posixpath.join(home, "Library", "Application Support", *mac_parts)
     if system == "Windows":
