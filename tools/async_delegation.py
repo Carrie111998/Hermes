@@ -1182,6 +1182,18 @@ def _push_batch_completion_event(
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
+    results = combined.get("results") or []
+    event_model = event_record.get("model")
+    if not event_model:
+        effective_models = {
+            str(result.get("model"))
+            for result in results
+            if isinstance(result, dict) and result.get("model")
+        }
+        if len(effective_models) == 1:
+            event_model = next(iter(effective_models))
+        elif len(effective_models) > 1:
+            event_model = "mixed"
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
@@ -1194,12 +1206,12 @@ def _push_batch_completion_event(
         "context": event_record.get("context"),
         "toolsets": event_record.get("toolsets"),
         "role": event_record.get("role"),
-        "model": event_record.get("model"),
+        "model": event_model,
         "status": status,
         "is_batch": True,
         # The full per-task results list — the formatter renders a
         # consolidated multi-task block from this.
-        "results": combined.get("results") or [],
+        "results": results,
         # Per-task live transcript log paths (cache/delegation/live/...).
         # They persist after completion and double as the full-fidelity
         # operational record of each child's run.

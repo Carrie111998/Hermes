@@ -263,6 +263,112 @@ class TestRunSingleChildSchemaValidation:
         assert len(child.calls) == 1
         assert entry.get("schema_valid") is False
 
+    def test_nonempty_api_failure_skips_schema_retry_and_keeps_terminal_cause(self):
+        """Transport error prose is not a candidate structured response.
+
+        A failed child can return a non-empty user-facing error.  Treating that
+        prose as invalid schema used to fire a second provider call, then label
+        the result ``completed`` / ``max_iterations`` instead of the real API
+        failure.
+        """
+        child = _StubChild(["unused"])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        child.calls = []
+
+        def failed_call(user_message, task_id=None, **_kwargs):
+            child.calls.append(user_message)
+            return {
+                "final_response": "API call failed after 3 retries: HTTP 429",
+                "completed": False,
+                "failed": True,
+                "error": "HTTP 429 rate limit",
+                "failure_reason": "rate_limited",
+                "api_calls": 3,
+                "messages": [],
+            }
+
+        child.run_conversation = failed_call
+        entry = _run(child)
+
+        assert entry["status"] == "failed"
+        assert entry["exit_reason"] == "rate_limited"
+        assert entry["truncated"] is False
+        assert entry["error"] == "HTTP 429 rate limit"
+        assert len(child.calls) == 1
+        assert entry["schema_valid"] is False
+        assert entry.get("schema_retries", 0) == 0
+
+    def test_schema_retry_api_failure_replaces_first_turn_terminal_state(self):
+        """A failed correction turn is terminal, not a successful first turn.
+
+        The first response can be a healthy-but-schema-invalid completion. If
+        the one bounded correction call then fails at the provider boundary,
+        its failure fields must replace the first turn's completed state.
+        """
+        child = _StubChild(["unused"])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        child.calls = []
+
+        responses = iter(
+            [
+                {
+                    "final_response": "not json",
+                    "completed": True,
+                    "api_calls": 1,
+                    "messages": [],
+                },
+                {
+                    "final_response": "API call failed after 3 retries: HTTP 429",
+                    "completed": False,
+                    "failed": True,
+                    "error": "HTTP 429 rate limit",
+                    "failure_reason": "rate_limited",
+                    "turn_exit_reason": "provider_error",
+                    "api_calls": 3,
+                    "messages": [],
+                },
+            ]
+        )
+
+        def sequenced_call(user_message, task_id=None, **_kwargs):
+            child.calls.append(user_message)
+            return next(responses)
+
+        child.run_conversation = sequenced_call
+        entry = _run(child)
+
+        assert entry["status"] == "failed"
+        assert entry["exit_reason"] == "rate_limited"
+        assert entry["error"] == "HTTP 429 rate limit"
+        assert entry["summary"] == "API call failed after 3 retries: HTTP 429"
+        assert entry["api_calls"] == 4
+        assert entry["schema_retries"] == 1
+        assert entry["schema_valid"] is False
+        assert len(child.calls) == 2
+
+    def test_real_iteration_exhaustion_keeps_truncated_completed_summary(self):
+        child = _StubChild(["unused"])
+        child.calls = []
+
+        def exhausted_call(user_message, task_id=None, **_kwargs):
+            child.calls.append(user_message)
+            return {
+                "final_response": "Partial but usable summary",
+                "completed": False,
+                "failed": False,
+                "turn_exit_reason": "max_iterations_reached(5/5)",
+                "api_calls": 5,
+                "messages": [],
+            }
+
+        child.run_conversation = exhausted_call
+        entry = _run(child)
+
+        assert entry["status"] == "completed"
+        assert entry["exit_reason"] == "max_iterations"
+        assert entry["truncated"] is True
+        assert len(child.calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # delegate_task dispatch-time schema handling

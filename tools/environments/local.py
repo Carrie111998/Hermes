@@ -1945,6 +1945,29 @@ class LocalEnvironment(BaseEnvironment):
         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
         return _quote_bash_path(path)
 
+    def _resolve_execution_cwd(self, cwd: str) -> str:
+        """Repair a stale local cwd before the shell wrapper embeds its ``cd``.
+
+        ``_run_bash`` also guards ``Popen(cwd=...)`` as a final safety net, but
+        that is too late for the command string: ``BaseEnvironment.execute``
+        has already wrapped the stale path by then.  Resolve it at the shared
+        pre-wrap hook and update the persistent cwd when the stale value was
+        this environment's own session directory.
+        """
+        safe_cwd = _resolve_safe_cwd(cwd)
+        if safe_cwd != cwd:
+            normalized = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
+            if safe_cwd != normalized:
+                logger.warning(
+                    "LocalEnvironment cwd %r is missing on disk; "
+                    "falling back to %r so terminal commands keep working.",
+                    cwd,
+                    safe_cwd,
+                )
+            if cwd == self.cwd:
+                self.cwd = safe_cwd
+        return safe_cwd
+
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:

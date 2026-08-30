@@ -908,6 +908,16 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
+    def _resolve_execution_cwd(self, cwd: str) -> str:
+        """Return the cwd embedded in the command wrapper.
+
+        Remote backends must resolve paths inside their own filesystem, so the
+        base implementation is deliberately a no-op.  LocalEnvironment
+        overrides this hook to repair a directory deleted by an earlier tool
+        call before both the wrapper's ``cd`` and ``Popen(cwd=...)`` are built.
+        """
+        return cwd
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -1498,7 +1508,10 @@ class BaseEnvironment(ABC):
             from tools.terminal_tool import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
         effective_timeout = timeout or self.timeout
-        effective_cwd = cwd or self.cwd
+        # Recovery applies only to stale session state.  An explicit caller
+        # cwd keeps its original shell semantics (including relative paths and
+        # ``~``) and must fail rather than silently run in a surviving parent.
+        effective_cwd = cwd or self._resolve_execution_cwd(self.cwd)
 
         # Merge sudo stdin with caller stdin
         if sudo_stdin is not None and stdin_data is not None:

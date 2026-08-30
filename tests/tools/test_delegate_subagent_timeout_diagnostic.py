@@ -201,6 +201,7 @@ class TestRunSingleChildTimeoutDump:
 
         assert result["status"] == "timeout"
         assert result["api_calls"] == 0
+        assert result["model"] == "test/model"
         assert result["diagnostic_path"] is not None
         dump_path = Path(result["diagnostic_path"])
         assert dump_path.is_file()
@@ -235,6 +236,7 @@ class TestRunSingleChildTimeoutDump:
         )
 
         assert result["status"] == "error"
+        assert result["model"] == "test/model"
         assert result["timeout_seconds"] is None
         assert result["timed_out_after_seconds"] is None
         assert result["timeout_phase"] is None

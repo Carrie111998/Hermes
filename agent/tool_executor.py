@@ -173,11 +173,27 @@ class _BatchAbandoned(BaseException):
     """
 
 
+class _DuplicateToolArgumentKey(ValueError):
+    """Raised when model-emitted JSON would silently discard an earlier key."""
+
+
+def _reject_duplicate_argument_keys(pairs: list[tuple[str, Any]]) -> dict:
+    parsed: dict = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise _DuplicateToolArgumentKey(key)
+        parsed[key] = value
+    return parsed
+
+
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+    """Parse model-emitted arguments without repairing or losing fields."""
     try:
-        arguments = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError):
+        arguments = json.loads(
+            raw_arguments,
+            object_pairs_hook=_reject_duplicate_argument_keys,
+        )
+    except (json.JSONDecodeError, TypeError, _DuplicateToolArgumentKey):
         arguments = None
     if isinstance(arguments, dict):
         return arguments, None

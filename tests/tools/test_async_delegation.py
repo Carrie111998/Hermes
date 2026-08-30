@@ -674,9 +674,81 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt.get("is_batch") is True
     assert len(evt["results"]) == 1
     assert evt["results"][0]["summary"] == "done: the real task"
+    assert evt["model"] == "m"
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_background_batch_reports_effective_inherited_model(monkeypatch):
+    """Blank dispatch overrides must not render as ``Model: ?``.
+
+    The child result already carries the effective inherited model; the batch
+    completion envelope should promote that value when every child agrees.
+    """
+    combined = {
+        "results": [
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "model": "effective-model",
+                "exit_reason": "completed",
+            }
+        ],
+        "total_duration_seconds": 1.0,
+    }
+    result = ad.dispatch_async_delegation_batch(
+        goals=["inherit model"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key="",
+        runner=lambda: combined,
+        max_async_children=1,
+    )
+    evt = _drain_for(result["delegation_id"], timeout=5.0)
+
+    assert evt is not None
+    assert evt["model"] == "effective-model"
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "Model: effective-model" in text
+
+
+def test_background_timeout_batch_reports_child_model(monkeypatch):
+    combined = {
+        "results": [
+            {
+                "task_index": 0,
+                "status": "timeout",
+                "summary": None,
+                "error": "timed out",
+                "model": "inherited-model",
+                "exit_reason": "timeout",
+            }
+        ],
+        "total_duration_seconds": 1.0,
+    }
+    result = ad.dispatch_async_delegation_batch(
+        goals=["timeout"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key="",
+        runner=lambda: combined,
+        max_async_children=1,
+    )
+    evt = _drain_for(result["delegation_id"], timeout=5.0)
+
+    assert evt is not None
+    assert evt["model"] == "inherited-model"
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "Model: inherited-model" in text
+    assert "Model: ?" not in text
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):

@@ -134,6 +134,68 @@ class TestRunBashCwdRecovery:
         assert env.cwd == str(tmp_path)
         assert not any("missing on disk" in rec.message for rec in caplog.records)
 
+    def test_recovered_cwd_is_used_by_wrapped_command(self, tmp_path):
+        """The shell wrapper must not re-cd into the deleted directory.
+
+        ``_run_bash`` historically repaired only ``Popen(cwd=...)`` after
+        ``_wrap_command`` had already embedded the stale path.  The process
+        started successfully, then the wrapper exited 126 before the user's
+        command ran — exactly what happens after a lander removes its own git
+        worktree.
+        """
+        wedged = tmp_path / "landed-worktree"
+        wedged.mkdir()
+        env = LocalEnvironment(cwd=str(wedged), timeout=10)
+        try:
+            shutil.rmtree(wedged)
+            result = env.execute("printf 'COMMAND_RAN\\n'; pwd")
+        finally:
+            env.cleanup()
+
+        assert result["returncode"] == 0
+        assert "COMMAND_RAN" in result["output"]
+        assert str(tmp_path) in result["output"]
+        assert env.cwd == str(tmp_path)
+
+    def test_missing_explicit_cwd_fails_instead_of_running_in_parent(self, tmp_path):
+        """Recovery is for stale session state, never caller input.
+
+        Silently running a destructive command in the nearest surviving parent
+        when its explicit workdir is absent is worse than the original failure.
+        """
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        try:
+            missing = tmp_path / "explicit-does-not-exist"
+            result = env.execute("printf 'MUST_NOT_RUN\\n'", cwd=str(missing))
+        finally:
+            env.cleanup()
+
+        assert result["returncode"] != 0
+        assert "MUST_NOT_RUN" not in result["output"]
+        assert env.cwd == str(tmp_path)
+
+    def test_explicit_tilde_keeps_existing_shell_semantics(self, tmp_path):
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        try:
+            result = env.execute("pwd", cwd="~")
+        finally:
+            env.cleanup()
+
+        assert result["returncode"] == 0
+        assert os.path.realpath(result["output"].strip()) == os.path.realpath(os.path.expanduser("~"))
+
+    def test_explicit_relative_cwd_resolves_below_session_cwd(self, tmp_path):
+        child = tmp_path / "child"
+        child.mkdir()
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        try:
+            result = env.execute("pwd", cwd="child")
+        finally:
+            env.cleanup()
+
+        assert result["returncode"] == 0
+        assert os.path.realpath(result["output"].strip()) == os.path.realpath(child)
+
 
 class TestUpdateCwdRejectsMissingPaths:
     """``_update_cwd`` must not propagate a deleted path back into ``self.cwd``."""
