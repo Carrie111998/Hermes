@@ -132,6 +132,23 @@ def test_search_memo_caches_when_at_least_one_usable_result():
     assert memo.lookup("firecrawl", "q", 5) is not None
 
 
+def test_search_memo_caches_mixed_noise_with_one_usable_result():
+    """Blank-url noise next to one usable url still caches — pins the
+    any() (not all()) semantics of the usable-result guard."""
+    memo = SearchMemo()
+    resp = {
+        "success": True,
+        "data": {
+            "web": [
+                {"url": ""},                    # blank url — noise
+                {"url": "https://e.com/1"},     # one usable result
+            ]
+        },
+    }
+    memo.store("firecrawl", "q", 5, resp)
+    assert memo.lookup("firecrawl", "q", 5) is not None
+
+
 def test_search_memo_disabled_by_config(monkeypatch):
     monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_enabled": False})
     memo = SearchMemo()
