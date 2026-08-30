@@ -904,6 +904,56 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
 
+    def test_newer_live_revision_wins_over_history(self, agent):
+        agent._todo_store.restore(
+            [{"id": "db", "content": "Current", "status": "in_progress"}],
+            revision=5,
+        )
+        history = [
+            self._assistant_todo_call(),
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": json.dumps(
+                    {
+                        "todos": [
+                            {"id": "old", "content": "Old", "status": "pending"}
+                        ],
+                        "revision": 4,
+                    }
+                ),
+            },
+        ]
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        assert agent._todo_store.snapshot()["revision"] == 5
+        assert agent._todo_store.read()[0]["id"] == "db"
+
+    def test_history_recovers_newer_snapshot(self, agent):
+        history = [
+            self._assistant_todo_call(),
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": json.dumps(
+                    {
+                        "todos": [
+                            {"id": "new", "content": "Recovered", "status": "pending"}
+                        ],
+                        "revision": 2,
+                    }
+                ),
+            },
+        ]
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        assert agent._todo_store.snapshot()["revision"] == 2
+        assert agent._todo_store.read()[0]["id"] == "new"
+
 
 
 
@@ -1038,11 +1088,6 @@ class TestBuildSystemPrompt:
             return next(ln for ln in p.splitlines()
                         if ln.startswith("Conversation started:"))
         assert _line(agent._build_system_prompt()) == _line(agent._build_system_prompt())
-
-    def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
-        monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
-        prompt = agent._build_system_prompt()
-        assert "NOUS SUBSCRIPTION BLOCK" in prompt
 
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
@@ -2451,7 +2496,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
-        ("read_preview", {}),
+        ("desktop_preview", {"action": "read"}),
         ("drive_preview", {"action": "elements"}),
         ("annotate_preview", {"action": "clear"}),
         ("read_window_below", {}),
@@ -2688,6 +2733,42 @@ class TestHandleMaxIterations:
             relay_calls[0]["metadata"]["api_request_id"],
             outcome="success",
         )
+
+    def test_suppress_status_output_keeps_iteration_warning_off_stdout(self, agent, capsys):
+        """Machine-readable mode (-Q/oneshot) must not contaminate stdout (#26155)."""
+        resp = _mock_response(content="Summary")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        agent.suppress_status_output = True
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}],
+            1,
+        )
+
+        captured = capsys.readouterr()
+        assert result == "Summary"
+        assert "Reached maximum iterations" not in captured.out
+
+    def test_plain_quiet_mode_still_prints_iteration_warning(self, agent, capsys):
+        """Interactive CLI runs quiet_mode=True by default — the warning must
+        still show there; only suppress_status_output gates it (#26155)."""
+        resp = _mock_response(content="Summary")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        agent.quiet_mode = True
+        agent.suppress_status_output = False
+        printed = []
+        agent._print_fn = lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}],
+            1,
+        )
+
+        assert result == "Summary"
+        combined = "\n".join(printed) + capsys.readouterr().out
+        assert "Reached maximum iterations" in combined
 
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
@@ -3544,6 +3625,49 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Here is the actual answer."
         assert result["api_calls"] == 2  # 1 original + 1 nudge retry
+
+    def test_openrouter_empty_retry_bypasses_response_cache(self, agent, monkeypatch):
+        """An OpenRouter empty retry must not replay the cached empty response."""
+        self._setup_agent(agent)
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        content_resp = _mock_response(
+            content="Fresh provider response.",
+            finish_reason="stop",
+        )
+        responses = iter([empty_resp, content_resp])
+        request_kwargs = []
+
+        def _create(**kwargs):
+            request_kwargs.append(kwargs)
+            return next(responses)
+
+        original_build_api_kwargs = agent._build_api_kwargs
+
+        def _build_api_kwargs(*args, **kwargs):
+            built = original_build_api_kwargs(*args, **kwargs)
+            built["extra_headers"] = {"X-Custom-Header": "preserved"}
+            return built
+
+        agent.client.chat.completions.create.side_effect = _create
+        monkeypatch.setattr(agent, "_build_api_kwargs", _build_api_kwargs)
+        monkeypatch.setattr(
+            "agent.conversation_loop.jittered_backoff",
+            lambda *args, **kwargs: 0.0,
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert result["final_response"] == "Fresh provider response."
+        assert "X-OpenRouter-Cache" not in request_kwargs[0].get(
+            "extra_headers", {}
+        )
+        assert request_kwargs[1]["extra_headers"]["X-Custom-Header"] == "preserved"
+        assert request_kwargs[1]["extra_headers"]["X-OpenRouter-Cache"] == "false"
 
     def test_empty_response_triggers_fallback_provider(self, agent):
         """After 3 empty retries, fallback provider is activated and produces content."""

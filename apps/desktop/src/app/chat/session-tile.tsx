@@ -53,7 +53,6 @@ import {
   $sessionTileDelegateRevision,
   $sessionTiles,
   closeSessionTile,
-  discardSessionTile,
   patchSessionTile,
   type SessionTile,
   sessionTileDelegate,
@@ -76,6 +75,26 @@ import { lastVisibleMessageIsUser } from './thread-loading'
 import { ChatView } from '.'
 
 const NO_MESSAGES: ChatMessage[] = []
+
+export function sessionTileResumeFailure(
+  message: string,
+  durableSessionFound: boolean | undefined,
+  tileStillUnbound: boolean
+): string | undefined {
+  if (!tileStillUnbound) {
+    return undefined
+  }
+
+  if (!/session not found|\b404\b/i.test(message)) {
+    return message
+  }
+
+  if (durableSessionFound) {
+    return 'Session is still available — retry resuming it.'
+  }
+
+  return 'Session unavailable — you can retry resuming it.'
+}
 
 /** The tile's SessionView: the same atom shape the primary chat renders
  *  from, computed from this session's slice of `$sessionStates`. */
@@ -213,13 +232,12 @@ function TileChat({
     () =>
       gatewayOpen ? (
         <ModelMenuPanel
-          gateway={gateway || undefined}
           onSelectModel={selectModel}
-          profile={ownerRoute?.profile || activeGatewayProfile}
+          profile={ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile}
           requestGateway={requestTileGateway}
         />
       ) : null,
-    [activeGatewayProfile, gateway, gatewayOpen, ownerRoute?.profile, requestTileGateway, selectModel]
+    [activeGatewayProfile, gatewayOpen, ownerRoute?.profile, ownerRoute?.targetProfile, requestTileGateway, selectModel]
   )
 
   return (
@@ -266,6 +284,11 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const resumingRef = useRef(false)
   const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
 
+  const storedSessionStillExists = useCallback(
+    () => $sessions.get().some(s => sessionMatchesStoredId(s, storedSessionId)),
+    [storedSessionId]
+  )
+
   // A tab-strip "+"/⌘T tab is created UNLISTED — its session stays out of
   // $sessions (no sidebar clutter) until it's actually used, so the tab shows
   // "New session". The moment this tile has a message, pull its row into
@@ -277,7 +300,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const hasMessages = useStore(view.$messagesEmpty) === false
 
   useEffect(() => {
-    const alreadyListed = () => $sessions.get().some(s => sessionMatchesStoredId(s, storedSessionId))
+    const alreadyListed = storedSessionStillExists
 
     if (!runtimeId || !hasMessages || alreadyListed()) {
       return
@@ -311,7 +334,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
         window.clearTimeout(timer)
       }
     }
-  }, [hasMessages, ownerRoute, runtimeId, storedSessionId])
+  }, [hasMessages, ownerRoute, runtimeId, storedSessionId, storedSessionStillExists])
 
   // Same gating as the primary's route resume (use-route-resume): never fire
   // session.resume before the gateway is OPEN. Persisted tiles mount at boot
@@ -334,22 +357,32 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     delegate
       .resumeTile(storedSessionId)
       .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
-      .catch((err: unknown) => {
+      .catch(async (err: unknown) => {
         const message = err instanceof Error ? err.message : String(err)
 
-        // A gone session (404 / "Session not found") is terminal — a stale or
-        // cross-profile persisted tile. Discard it instead of latching an error
-        // that re-retries on every reconnect (the "Session not found" spam).
-        if (/session not found|\b404\b/i.test(message)) {
-          discardSessionTile(storedSessionId)
-        } else {
+        if (!/session not found|\b404\b/i.test(message)) {
           patchSessionTile(storedSessionId, { error: message })
+
+          return
+        }
+
+        // A recents page is not authoritative, and resolveStoredSession()
+        // intentionally treats transient probe failures like a miss. Await it
+        // before releasing this resume attempt, then fail safe: a tile may be
+        // retried by the user, but must never be deleted on an inconclusive
+        // reconnect-time lookup.
+        const durableSession = await resolveStoredSession(storedSessionId, ownerRoute).catch(() => undefined)
+        const current = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+        const error = sessionTileResumeFailure(message, Boolean(durableSession), Boolean(current && !current.runtimeId))
+
+        if (error) {
+          patchSessionTile(storedSessionId, { error })
         }
       })
       .finally(() => {
         resumingRef.current = false
       })
-  }, [delegateRevision, gatewayOpen, runtimeId, storedSessionId, tile?.error])
+  }, [delegateRevision, gatewayOpen, ownerRoute, runtimeId, storedSessionId, tile?.error])
 
   // The gateway (re)opening invalidates any latched error — it likely came
   // from a not-yet-open gateway or the previous connection. Clearing it
@@ -613,8 +646,6 @@ export function WorkspaceTabMenu({ children }: { children: React.ReactElement })
  *  `$sessions`). Tiles dock against main on the chosen edge, flex width. */
 export const watchSessionTiles = paneMirror<SessionTile>({
   source: $sessionTiles,
-  workspaceMode: tile => tile.workspaceMode ?? 'sessions',
-  workspaceOwnerKey: tile => tile.workspaceOwnerKey,
   // $projectTree: a tile whose session is older than the recents page resolves
   // its title through the tree, which loads after the tiles register. (The tab's
   // status dot subscribes to color/state itself, so it needs no `also` entry.)
