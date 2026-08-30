@@ -173,9 +173,11 @@ class _StubChild:
 
     def run_conversation(self, user_message, task_id=None, **_kwargs):
         self.calls.append(user_message)
-        text = self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, dict):
+            return response
         return {
-            "final_response": text,
+            "final_response": response,
             "completed": True,
             "api_calls": 1,
             "messages": [],
@@ -262,6 +264,87 @@ class TestRunSingleChildSchemaValidation:
         assert entry["status"] == "failed"
         assert len(child.calls) == 1
         assert entry.get("schema_valid") is False
+
+    def test_provider_failure_with_output_skips_retry(self):
+        child = _StubChild(
+            [
+                {
+                    "final_response": "HTTP 400: model rejected",
+                    "completed": False,
+                    "failed": True,
+                    "error": "HTTP 400: model rejected",
+                    "failure_reason": "model_not_found",
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+            ]
+        )
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        entry = _run(child)
+
+        assert len(child.calls) == 1
+        assert entry["status"] == "failed"
+        assert entry["exit_reason"] == "model_not_found"
+        assert entry["truncated"] is False
+        assert entry["error"] == "HTTP 400: model rejected"
+        assert entry["schema_valid"] is False
+        assert "schema_retries" not in entry
+
+    def test_provider_failure_on_retry_preserves_terminal_outcome(self):
+        child = _StubChild(
+            [
+                "not json at all",
+                {
+                    "final_response": "HTTP 400: model rejected",
+                    "completed": False,
+                    "failed": True,
+                    "error": "HTTP 400: model rejected",
+                    "failure_reason": "model_not_found",
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                },
+            ]
+        )
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        entry = _run(child)
+
+        assert len(child.calls) == 2
+        assert entry["status"] == "failed"
+        assert entry["exit_reason"] == "model_not_found"
+        assert entry["truncated"] is False
+        assert entry["error"] == "HTTP 400: model rejected"
+        assert entry["summary"] == "HTTP 400: model rejected"
+        assert entry["schema_valid"] is False
+        assert entry["schema_retries"] == 1
+
+    def test_provider_failure_on_retry_clears_stale_summary(self):
+        child = _StubChild(
+            [
+                "not json at all",
+                {
+                    "completed": False,
+                    "failed": True,
+                    "error": "HTTP 400: model rejected",
+                    "failure_reason": "model_not_found",
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                },
+            ]
+        )
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        entry = _run(child)
+
+        assert entry["status"] == "failed"
+        assert entry["summary"] == ""
+        assert entry["exit_reason"] == "model_not_found"
+        assert entry["truncated"] is False
+        assert entry["error"] == "HTTP 400: model rejected"
 
 
 # ---------------------------------------------------------------------------
