@@ -145,7 +145,12 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
-from agent.redact import redact_sensitive_text
+from agent.redact import (
+    key_has_secret_keyword,
+    redact_sensitive_text,
+    reset_extra_literal_secrets,
+    set_extra_literal_secrets,
+)
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway.browser_control_artifacts import (
@@ -1214,6 +1219,66 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     if limit is not None:
         return redacted[:limit]
     return redacted
+
+
+# Env keys a per-run env is NOT allowed to set. Two hazards, per review:
+#  * exec hijacking of tool subprocesses -- PATH/PYTHONPATH/NODE_OPTIONS pick
+#    what runs; LD_*/DYLD_*/BASH_ENV inject code into spawned processes.
+#  * egress redirection -- *_PROXY points all tool-originated HTTP at a
+#    client-chosen host (an exfiltration channel that also bypasses redaction).
+#  * session-attribution spoofing -- the HERMES_ namespace is reserved for the
+#    gateway's own session/task wiring and must not be client-settable.
+# Matching is case-insensitive. Rejecting (HTTP 400) is safer than silently
+# dropping: the caller learns their env was not applied.
+_RESERVED_ENV_EXACT = frozenset({
+    "PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+    "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "IFS",
+    "NODE_OPTIONS", "NODE_PATH",
+})
+_RESERVED_ENV_PREFIXES = ("HERMES_", "LD_", "DYLD_")
+
+
+def _is_reserved_env_key(key: str) -> bool:
+    upper = key.upper()
+    if upper in _RESERVED_ENV_EXACT:
+        return True
+    if upper.endswith("_PROXY"):
+        return True
+    return any(upper.startswith(p) for p in _RESERVED_ENV_PREFIXES)
+
+
+def _validate_run_env(raw: object) -> Dict[str, str]:
+    """Validate an optional per-run env object from POST /v1/runs.
+
+    Accepts ONLY a JSON object of string->string. Rejects non-objects,
+    non-string values, and binding wrappers such as
+    {"type": "plain", "value": "true"} (a dict value, not a string).
+    Also rejects reserved/dangerous keys (see ``_is_reserved_env_key``) that
+    could hijack tool subprocess execution, redirect egress, or spoof session
+    attribution. Raises ValueError (caller returns HTTP 400).
+
+    Note on scrubbing: only values under secret-keyed names (see
+    ``key_has_secret_keyword``) are force-redacted from output. A secret
+    embedded inside an otherwise non-secret value -- e.g. a URL like
+    ``ENDPOINT=https://user:pass@host`` -- is not auto-scrubbed by this path;
+    callers should pass such credentials under a secret-keyed name.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("env must be a JSON object of string values")
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k:
+            raise ValueError("env keys must be non-empty strings")
+        if not isinstance(v, str):
+            raise ValueError(f"env['{k}'] must be a string, not {type(v).__name__}")
+        if _is_reserved_env_key(k):
+            raise ValueError(
+                f"env['{k}'] is a reserved or unsafe key and cannot be set per run"
+            )
+        out[k] = v
+    return out
 
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
@@ -7617,6 +7682,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        try:
+            run_env = _validate_run_env(body.get("env"))
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_env"), status=400)
+
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
@@ -7794,7 +7864,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         pass
 
                 def _run_sync():
-                    from gateway.session_context import clear_session_vars
+                    from gateway.session_context import (
+                        clear_session_vars,
+                        reset_run_env,
+                        set_run_env,
+                    )
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -7805,6 +7879,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    run_env_token = None
+                    secret_token = None
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -7829,6 +7905,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 browser_control_transport_family=(
                                     request_browser_control_transport_family
                                 ),
+                            )
+                            run_env_token = set_run_env(run_env)
+                            secret_token = set_extra_literal_secrets(
+                                v
+                                for k, v in run_env.items()
+                                if key_has_secret_keyword(k)
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
@@ -7859,6 +7941,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                 if session_tokens:
                                     try:
                                         clear_session_vars(session_tokens)
+                                    except Exception:
+                                        pass
+                                if run_env_token is not None:
+                                    try:
+                                        reset_run_env(run_env_token)
+                                    except Exception:
+                                        pass
+                                if secret_token is not None:
+                                    try:
+                                        reset_extra_literal_secrets(secret_token)
                                     except Exception:
                                         pass
                         u = {

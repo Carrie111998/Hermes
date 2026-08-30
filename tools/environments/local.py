@@ -582,6 +582,18 @@ def _inject_session_context_env(env: dict) -> None:
             # inherited global so a sibling session's value can't leak in.
             env.pop(var_name, None)
 
+    # Overlay per-run env (API POST /v1/runs). Task-local via ContextVar and
+    # applied after the session vars so run-scoped values win. Every tool
+    # subprocess inherits it because all spawns build env through this bridge.
+    try:
+        from gateway.session_context import get_run_env
+
+        for _rk, _rv in get_run_env().items():
+            if isinstance(_rk, str) and isinstance(_rv, str):
+                env[_rk] = _rv
+    except Exception:
+        pass
+
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""

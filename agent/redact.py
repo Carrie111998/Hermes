@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import threading
+from contextvars import ContextVar, Token
 from urllib.parse import unquote_plus
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
@@ -75,6 +76,50 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # warning is logged at gateway and CLI startup so operators see the
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+
+
+# Task-local literal secret values to scrub from ALL redacted text (SSE error
+# events, run summaries, X-Hermes-Error headers, cancel/timeout messages). The
+# API server registers per-run env secret values here so they never surface in
+# gateway output, without persisting them or mutating os.environ. Task-local via
+# ContextVar -> concurrent runs cannot see each other's registrations.
+# Minimum length for a value to be force-scrubbed: real secrets are long, and
+# scrubbing a short common value would corrupt legitimate output.
+_MIN_LITERAL_SECRET_LEN = 8
+_EXTRA_LITERAL_SECRETS: ContextVar = ContextVar(
+    "hermes_extra_literal_secrets", default=()
+)
+
+
+def set_extra_literal_secrets(values) -> Token:
+    """Register task-local literal secret values to redact everywhere.
+
+    Returns a token; pass it to ``reset_extra_literal_secrets`` in a finally.
+    Short common values (e.g. "true", "admin", "prod") are ignored: real
+    secrets are long and high-entropy, whereas a short value -- even under a
+    secret-looking key -- would strike identical substrings in legitimate
+    output and corrupt it. Values under 8 chars are skipped; registered
+    longest-first so overlapping secrets mask cleanly.
+    """
+    cleaned = tuple(
+        sorted(
+            {v for v in values if isinstance(v, str) and len(v) >= _MIN_LITERAL_SECRET_LEN},
+            key=len,
+            reverse=True,
+        )
+    )
+    return _EXTRA_LITERAL_SECRETS.set(cleaned)
+
+
+def reset_extra_literal_secrets(token: Token) -> None:
+    """Clear task-local literal secrets. Call on every terminal path (finally)."""
+    try:
+        _EXTRA_LITERAL_SECRETS.reset(token)
+    except Exception:
+        try:
+            _EXTRA_LITERAL_SECRETS.set(())
+        except Exception:
+            pass
 
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
@@ -314,6 +359,14 @@ def _key_has_secret_keyword(key: str) -> bool:
         if _is_word_start(key, m.start()) and _is_word_end(key, m.end()):
             return True
     return False
+
+
+# Public alias: other modules (e.g. the API server, to decide which per-run env
+# values to force-scrub) should not reach for the underscore-prefixed name.
+def key_has_secret_keyword(key: str) -> bool:
+    """Public wrapper for :func:`_key_has_secret_keyword`."""
+    return _key_has_secret_keyword(key)
+
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
@@ -822,6 +875,16 @@ def redact_sensitive_text(
         text = str(text)
     if not text:
         return text
+
+    # Task-local literal secrets (e.g. per-run env secret values registered by
+    # the API server) are ALWAYS scrubbed -- ahead of the global redaction
+    # toggle -- because they are explicitly sensitive and must never surface.
+    _extras = _EXTRA_LITERAL_SECRETS.get()
+    if _extras:
+        for _secret in _extras:
+            if _secret and _secret in text:
+                text = text.replace(_secret, "\u00abredacted\u00bb")
+
     if not (force or _REDACT_ENABLED):
         return text
 
