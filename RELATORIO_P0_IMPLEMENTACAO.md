@@ -165,7 +165,7 @@ Os artefatos GitHub foram criados e lidos de volta pela API:
 - Pull request: `https://github.com/NousResearch/hermes-agent/pull/98485`
 - Branch de entrega: `fix/p0-tool-safety`
 - Commit de implementação P0: `e8dc3a9a5bb852a6c957d1eb183491ef24792a05` (código e testes).
-- Commit de documentação e infográfico: documentação e infográfico serão registrados em um commit final deste branch.
+- Commit de documentação e infográfico: `ea439f8a01222008d4cac81d5860bafbf763eac2` (artefatos finais até esta etapa).
 
 A issue e o PR devem manter explícita a relação com o P0, referenciar a evidência upstream do P0-A e declarar que o P1 está fora do escopo.
 
@@ -193,5 +193,5 @@ A issue e o PR devem manter explícita a relação com o P0, referenciar a evid�
 - [x] PR criado e lido de volta pela API.
 - [ ] CI remoto verificado.
 - [ ] Três passes de exhaustion review concluídos.
-- [ ] URLs e SHA finais incorporados neste documento.
+- [x] URLs e SHA finais incorporados neste documento.
 - [x] Infográfico PNG validado no branch de entrega.
