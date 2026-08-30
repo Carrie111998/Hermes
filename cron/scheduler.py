@@ -7422,10 +7422,13 @@ def _run_one_job_body(
             with _side_effect_fence() as owns_output:
                 if not owns_output:
                     raise _FireClaimLostDuringSideEffect
-                # Publish the exact response and human-readable Markdown as one
-                # collision-resistant committed run. The sidecar is prepared first;
-                # the Markdown filename is the reader-visible commit marker.
-                output_file = save_job_output(job["id"], output, final_response)
+                # Publish the exact response (or the useful failure payload) and
+                # human-readable Markdown as one collision-resistant committed
+                # run. The sidecar is prepared first; the Markdown filename is
+                # the reader-visible commit marker. Persisting failures keeps
+                # chained jobs from seeing a misleading empty-response sentinel.
+                context_payload = final_response if success else (error or "")
+                output_file = save_job_output(job["id"], output, context_payload)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
