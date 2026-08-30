@@ -613,6 +613,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    cwd: Optional[str] = None,
 ):
     """
     Initialize the AI Agent.
@@ -655,6 +656,9 @@ def init_agent(
             output_config.format instead of a trailing-assistant prefill.
         platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
             Used to inject platform-specific formatting hints into the system prompt.
+        cwd (str): Logical working directory known by the constructing surface.
+            A non-empty value is passed to memory providers during initialization.
+            None or an empty value leaves the runtime cwd resolver unpinned.
         skip_context_files (bool): If True, skip auto-injection of project context files
             (SOUL.md, .hermes.md, AGENTS.md, CLAUDE.md, .cursorrules) from the cwd / HERMES_HOME
             into the system prompt. Use this for batch processing and data generation to avoid
@@ -676,6 +680,7 @@ def init_agent(
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
+    agent.session_cwd = cwd or None
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     agent._user_name = user_name
@@ -1935,6 +1940,14 @@ def init_agent(
                             _st = agent._session_db.get_session_title(agent.session_id)
                             if _st:
                                 _init_kwargs["session_title"] = _st
+                                try:
+                                    _sts = agent._session_db.get_session_title_source(
+                                        agent.session_id
+                                    )
+                                except Exception:
+                                    _sts = None
+                                if _sts:
+                                    _init_kwargs["session_title_source"] = _sts
                         except Exception:
                             pass
                     # Thread gateway user identity for per-user memory scoping
@@ -1955,6 +1968,8 @@ def init_agent(
                     # Thread gateway session key for stable per-chat Honcho session isolation
                     if agent._gateway_session_key:
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key
+                    if agent.session_cwd:
+                        _init_kwargs["cwd"] = agent.session_cwd
                     # Profile identity for per-profile provider scoping
                     try:
                         from hermes_cli.profiles import get_active_profile_name

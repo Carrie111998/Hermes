@@ -3185,7 +3185,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 with _sessions_lock:
                     if _sessions.get(sid) is not current:
                         return
-            tokens = _set_session_context(key)
+            logical_cwd = _session_cwd(current)
+            tokens = _set_session_context(key, cwd=logical_cwd)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
             # agent that profile's db so turns persist to the right state.db.
@@ -3220,7 +3221,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw: dict[str, Any] = {
+                    "session_db": session_db,
+                    "cwd_override": logical_cwd,
+                }
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -8790,6 +8794,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    cwd_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -8957,6 +8962,7 @@ def _make_agent(
         provider_data_collection=_pr.get("data_collection"),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
+        cwd=cwd_override,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),

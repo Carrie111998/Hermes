@@ -931,7 +931,7 @@ def _(rid, params: dict) -> dict:
             )
             history = sanitize_replay_history(raw_history)
             messages = [] if omit_messages else _history_to_messages(display_history)
-            tokens = _set_session_context(target)
+            tokens = _set_session_context(target, cwd=profile_resume_cwd)
             try:
                 # Pass the profile's db so the agent persists turns to the right
                 # state.db; home override is active here so config/skills/model
@@ -945,6 +945,7 @@ def _(rid, params: dict) -> dict:
                     session_id=target,
                     session_db=db,
                     platform_override=source,
+                    cwd_override=profile_resume_cwd or None,
                     **stored_runtime_overrides,
                 )
             finally:
@@ -3254,7 +3255,13 @@ def _(rid, params: dict) -> dict:
                 ],
                 chunk_rows=500,
             )
-            db.set_session_title(new_key, title)
+            if branch_name:
+                db.set_session_title(new_key, title)
+            else:
+                # The desktop omits ``name`` for its default branch flow. Keep
+                # that lineage-generated title automatic so Honcho's configured
+                # sessionStrategy can still route the branch by workspace.
+                db.set_auto_title(new_key, title, source="derived")
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -3294,6 +3301,7 @@ def _(rid, params: dict) -> dict:
             else None
         )
         try:
+            branch_cwd = _session_cwd(session)
             tokens = _set_session_context(new_key)
             try:
                 agent = _make_agent(
@@ -3302,6 +3310,7 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
+                    cwd_override=branch_cwd,
                 )
             finally:
                 _clear_session_context(tokens)
@@ -3311,7 +3320,7 @@ def _(rid, params: dict) -> dict:
                 agent,
                 list(history),
                 cols=session.get("cols", 80),
-                cwd=_session_cwd(session),
+                cwd=branch_cwd,
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,

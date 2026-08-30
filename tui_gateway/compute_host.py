@@ -573,6 +573,7 @@ class ComputeHost:
                 reasoning_config_override=frame.get("reasoning_config_override"),
                 service_tier_override=frame.get("service_tier_override"),
                 platform_override=frame.get("source"),
+                cwd_override=str(frame.get("cwd") or "") or None,
                 session_db=session_db,
             )
             if server._transfer_db_to_agent(agent, session_db):

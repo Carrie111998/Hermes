@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from agent.secret_scope import get_secret
 from hermes_constants import get_hermes_home
 from hermes_cli.profiles import _get_default_hermes_home
+from hermes_state_common import TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM
 from plugins.plugin_utils import SingletonSlot
 from typing import Any, TYPE_CHECKING
 
@@ -54,6 +55,9 @@ def _sanitize_url(url: str | None) -> str | None:
 
 
 HOST = "hermes"
+_AUTOMATIC_SESSION_TITLE_SOURCES = frozenset(
+    {TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM}
+)
 
 
 def profile_host_key(profile: str | None) -> str:
@@ -874,6 +878,7 @@ class HonchoClientConfig:
         session_title: str | None = None,
         session_id: str | None = None,
         gateway_session_key: str | None = None,
+        session_title_source: str | None = None,
     ) -> str | None:
         """Resolve Honcho session name.
 
@@ -882,7 +887,7 @@ class HonchoClientConfig:
           2. per-session strategy — Hermes session_id ({timestamp}_{hex}); authoritative,
              so a generated title never remaps a live conversation
           3. Manual directory override from sessions map
-          4. Hermes session title (from /title command; non-per-session)
+          4. Explicit Hermes session title (from /title; non-per-session)
           5. per-repo strategy — git repo root directory name
           6. per-directory strategy — directory basename
           7. global strategy — workspace name
@@ -912,8 +917,15 @@ class HonchoClientConfig:
         if manual:
             return manual
 
-        # /title mid-session remap (non-per-session).
-        if session_title:
+        # Explicit /title remaps non-per-session conversations. Automatically
+        # generated display titles are metadata and must not override the
+        # configured per-repo/per-directory/global identity strategy. Missing
+        # provenance keeps the legacy explicit-title behavior for callers that
+        # predate title_source threading.
+        if (
+            session_title
+            and session_title_source not in _AUTOMATIC_SESSION_TITLE_SOURCES
+        ):
             sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', session_title).strip('-')
             if sanitized:
                 if self.session_peer_prefix and self.peer_name:

@@ -27,6 +27,15 @@ from agent.context_compressor import (
 )
 
 
+# Canonical session-title provenance vocabulary. SessionDB writes these values,
+# while consumers such as memory plugins use them to distinguish display-only
+# automatic titles from explicit user identity. Keep the contract in this
+# cycle-safe shared module rather than duplicating string literals.
+TITLE_SOURCE_DERIVED = "derived"
+TITLE_SOURCE_LLM = "llm"
+TITLE_SOURCE_USER = "user"
+
+
 # Session preview = the head of the first user message, shown wherever a
 # session has no title (sidebar rows, pickers, exports, the desktop's
 # `sessionTitle` fallback).
