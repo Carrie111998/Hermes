@@ -195,6 +195,52 @@ class TestFastModeRouting(unittest.TestCase):
         assert route["runtime"]["provider"] == "openrouter"
         assert route.get("request_overrides") is None
 
+    def test_turn_route_middleware_receives_redacted_route_and_switches_provider(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="old-model",
+            api_key="secret-not-for-plugin",
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+            requested_provider="anthropic",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-1",
+        )
+        observed = {}
+
+        def fake_apply(route, **context):
+            observed["route"] = route
+            observed["context"] = context
+            return SimpleNamespace(
+                changed=True,
+                payload={**route, "model": "gpt-5.4", "provider": "openai"},
+                trace=[{"source": "test"}],
+            )
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "openai",
+                "api_key": "selected-key",
+                "base_url": "https://api.openai.com/v1",
+                "api_mode": "chat_completions",
+            },
+        ):
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        assert "api_key" not in observed["route"]
+        assert "api_key" not in observed["route"]["runtime"]
+        assert observed["context"]["session_id"] == "session-1"
+        assert route["model"] == "gpt-5.4"
+        assert route["runtime"]["provider"] == "openai"
+        assert route["runtime"]["api_key"] == "selected-key"
+        assert route["middleware_trace"] == [{"source": "test"}]
+
 
 class TestAnthropicFastMode(unittest.TestCase):
     """Verify Anthropic Fast Mode model support and override resolution."""

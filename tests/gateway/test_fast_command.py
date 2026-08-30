@@ -124,6 +124,45 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     assert route["request_overrides"] == {"service_tier": "priority"}
 
 
+def test_turn_route_middleware_receives_redacted_route_and_resolves_provider(monkeypatch):
+    runner = _make_runner()
+    observed = {}
+
+    def fake_apply(route, **context):
+        observed["route"] = route
+        observed["context"] = context
+        return SimpleNamespace(
+            changed=True,
+            payload={**route, "model": "gpt-5.4", "provider": "openai"},
+            trace=[{"source": "test"}],
+        )
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_turn_route_middleware", fake_apply)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {"provider": provider, "api_key": "selected-key", "base_url": "https://api.openai.com/v1"},
+    )
+    model, runtime, trace = runner._apply_turn_route_middleware(
+        message="route this",
+        model="old",
+        runtime_kwargs={
+            "provider": "anthropic",
+            "api_key": "secret-not-for-plugin",
+            "base_url": "https://api.anthropic.com",
+        },
+        session_id="session-1",
+        source=_make_source(),
+    )
+    assert "api_key" not in observed["route"]
+    assert "api_key" not in observed["route"]["runtime"]
+    assert observed["context"]["session_id"] == "session-1"
+    assert model == "gpt-5.4"
+    assert runtime["provider"] == "openai"
+    assert runtime["api_key"] == "selected-key"
+    assert trace == [{"source": "test"}]
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
@@ -168,5 +207,4 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key=session_key) is None
     # A different session still gets the config default.
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
-
 
