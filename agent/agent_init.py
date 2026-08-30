@@ -1411,7 +1411,15 @@ def init_agent(
                     elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
                         _fb_entries = [fallback_model]
                     _fb_resolved = False
-                    for _fb in _fb_entries:
+                    for _fb_index, _fb in enumerate(_fb_entries):
+                        from agent.fallback_safety import fallback_runtime_block_reason
+
+                        _runtime_block = fallback_runtime_block_reason(
+                            _fb, _fb.get("api_mode") or "chat_completions"
+                        )
+                        if _runtime_block is not None:
+                            logger.warning("Init-time fallback rejected: %s", _runtime_block)
+                            continue
                         try:
                             from hermes_cli.fallback_config import resolve_entry_api_key
                             _fb_explicit_key = resolve_entry_api_key(_fb)
@@ -1430,6 +1438,8 @@ def init_agent(
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
+                            agent._active_fallback_entry = dict(_fb)
+                            agent._fallback_index = _fb_index + 1
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
@@ -1575,8 +1585,13 @@ def init_agent(
         agent._fallback_chain = [fallback_model]
     else:
         agent._fallback_chain = []
-    agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    if not agent._fallback_activated:
+        agent._fallback_index = 0
+        agent._active_fallback_entry = None
+    else:
+        # Init-time activation happens before the chain is materialized.
+        agent._fallback_index = int(getattr(agent, "_fallback_index", 0) or 0)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:
