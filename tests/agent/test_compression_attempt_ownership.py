@@ -23,6 +23,9 @@ no timing, no threads.
 
 from types import SimpleNamespace
 
+import pytest
+
+from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.conversation_compression import (
     _claim_compressor_attempt,
     _clear_compression_cancelled_check_if_owner,
@@ -30,6 +33,11 @@ from agent.conversation_compression import (
     _install_compression_cancelled_check,
     _restore_compressor_attempt_state,
     _snapshot_compressor_attempt_state,
+    _supported_compression_kwargs,
+)
+from agent.context_compressor import (
+    ContextCompressor,
+    _compression_attempt_provider_budget,
 )
 
 
@@ -224,6 +232,97 @@ class TestDigestCallsFollowThePinnedRoute:
         from agent.context_compressor import attempt_summary_route_kwargs
 
         assert attempt_summary_route_kwargs() == {}
+
+
+class TestLeanAttemptProviderBudget:
+    """One lean attempt must bound and promptly cancel digest provider work."""
+
+    @staticmethod
+    def _compressor() -> ContextCompressor:
+        compressor = object.__new__(ContextCompressor)
+        compressor._lean_pristine_tools = None
+        return compressor
+
+    @staticmethod
+    def _response(content: str = "digest") -> SimpleNamespace:
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    def test_remaining_attempt_budget_coarsens_all_digest_input(
+        self, monkeypatch
+    ):
+        import agent.auxiliary_client as auxiliary_client
+        import agent.context_compressor as context_compressor
+
+        prompts = []
+
+        def call_llm(**kwargs):
+            prompts.append(kwargs["messages"][0]["content"])
+            return self._response()
+
+        monkeypatch.setattr(auxiliary_client, "call_llm", call_llm)
+        monkeypatch.setattr(context_compressor, "_LEAN_DIGEST_CHUNK_CHARS", 40)
+        turns = [{"role": "user", "content": "start " + "x" * 300 + " END-MARKER"}]
+
+        with _compression_attempt_provider_budget(max_calls=3) as budget:
+            assert budget.try_start_call()  # reserve the main-summary request
+            result = self._compressor()._build_chunk_digests(turns)
+
+        assert len(prompts) == 2
+        assert "END-MARKER" in prompts[-1]
+        assert "Segment 2/2" in result
+
+    def test_cancelled_attempt_stops_before_the_next_digest_call(
+        self, monkeypatch
+    ):
+        import agent.auxiliary_client as auxiliary_client
+        import agent.context_compressor as context_compressor
+
+        calls = 0
+        cancelled = False
+
+        def call_llm(**_kwargs):
+            nonlocal calls, cancelled
+            calls += 1
+            cancelled = True
+            return self._response()
+
+        monkeypatch.setattr(auxiliary_client, "call_llm", call_llm)
+        monkeypatch.setattr(context_compressor, "_LEAN_DIGEST_CHUNK_CHARS", 40)
+        turns = [{"role": "user", "content": "x" * 400}]
+
+        with pytest.raises(AuxiliaryExplicitCancellation):
+            with _compression_attempt_provider_budget(
+                cancel_check=lambda: cancelled,
+                max_calls=8,
+            ):
+                self._compressor()._build_chunk_digests(turns)
+
+        assert calls == 1
+
+    def test_host_cancel_check_only_flows_to_opted_in_builtin_signature(self):
+        cancel_check = lambda: True  # noqa: E731
+
+        def builtin(messages, current_tokens=None, _cancel_check=None):
+            return messages
+
+        def plugin(messages, current_tokens=None, **kwargs):
+            return messages
+
+        common = {
+            "current_tokens": 100,
+            "focus_topic": None,
+            "force": False,
+            "memory_context": "",
+            "cancel_check": cancel_check,
+        }
+
+        builtin_kwargs = _supported_compression_kwargs(builtin, **common)
+        plugin_kwargs = _supported_compression_kwargs(plugin, **common)
+
+        assert builtin_kwargs["_cancel_check"] is cancel_check
+        assert "_cancel_check" not in plugin_kwargs
 
 
 class TestMidRestoreClaimRace:

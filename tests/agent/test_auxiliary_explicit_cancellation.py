@@ -176,6 +176,51 @@ def test_protected_silent_provider_is_isolated_and_raises_frozen_explicit_cancel
     stream.close()  # release the bounded daemon provider worker
 
 
+def test_compression_fence_cancel_is_not_masked_by_unset_hard_cancel_event() -> None:
+    from agent.conversation_compression import (
+        CompressionCommitFence,
+        _compression_attempt_cancel_check,
+    )
+
+    started = threading.Event()
+    hard_cancel_event = threading.Event()
+    fence = CompressionCommitFence()
+    stream = _BlockingStream(started)
+    client = _GenericClient(stream)
+    dispatches = 0
+    outcome: dict[str, BaseException] = {}
+
+    def _worker() -> None:
+        nonlocal dispatches
+        try:
+            cancel_check = _compression_attempt_cancel_check(
+                fence, hard_cancel_event
+            )
+            with aux.aux_interrupt_protection(cancel_check=cancel_check):
+                dispatches += 1
+                _invoke_generic(client)
+                dispatches += 1
+                _invoke_generic(client)
+        except BaseException as exc:
+            outcome["exc"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    assert started.wait(timeout=1), "request never entered its silent transport"
+    cancelled_at = time.monotonic()
+    assert not hard_cancel_event.is_set()
+    assert fence.cancel_before_commit() is True
+    worker.join(timeout=1)
+    elapsed = time.monotonic() - cancelled_at
+
+    assert not worker.is_alive(), "fence cancellation did not wake the request"
+    assert isinstance(outcome["exc"], aux.AuxiliaryExplicitCancellation)
+    assert dispatches == 1
+    assert not client.closed.is_set()
+    assert elapsed < 0.75
+    stream.close()
+
+
 def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None:
     started = threading.Event()
     stream = _BlockingStream(started)
