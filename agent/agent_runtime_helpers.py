@@ -42,6 +42,7 @@ from agent.message_sanitization import (
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
+from agent.tool_result_persistence import sanitize_trajectory_tool_value
 from agent.credential_pool import (
     STATUS_EXHAUSTED,
     credential_pool_matches_provider,
@@ -227,8 +228,9 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                     # Format tool response with XML tags
                     tool_response = "<tool_response>\n"
                     
-                    # Try to parse tool content as JSON if it looks like JSON
-                    tool_content = tool_msg["content"]
+                    # Tool output crosses into a trajectory file below; apply
+                    # the sink sanitizer before embedding it in XML/JSON.
+                    tool_content = sanitize_trajectory_tool_value(tool_msg["content"])
                     try:
                         if tool_content.strip().startswith(("{", "[")):
                             tool_content = json.loads(tool_content)

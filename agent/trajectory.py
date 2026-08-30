@@ -41,8 +41,10 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
     if filename is None:
         filename = "trajectory_samples.jsonl" if completed else "failed_trajectories.jsonl"
 
+    from agent.tool_result_persistence import sanitize_trajectory_for_sink
+
     entry = {
-        "conversations": trajectory,
+        "conversations": sanitize_trajectory_for_sink(trajectory),
         "timestamp": datetime.now().isoformat(),
         "model": model,
         "completed": completed,
