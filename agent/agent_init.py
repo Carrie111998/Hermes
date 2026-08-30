@@ -2365,8 +2365,8 @@ def init_agent(
         0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
     )
     # Optional extra summarizer guidance. Empty / whitespace / non-string
-    # means unset (current Hermes "Be CONCRETE" sentence). Stored as-is;
-    # the compressor inserts a set string verbatim.
+    # means unset (current Hermes structured compact template). Stored as-is;
+    # the compressor inserts a set string verbatim as the full outcome instruction.
     compression_summary_instructions = _compression_cfg.get("summary_instructions", "")
 
     # Read optional explicit context_length override for the auxiliary

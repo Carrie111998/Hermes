@@ -4861,8 +4861,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         """Return configured summarizer guidance, or "" when unset.
 
         Empty string, whitespace-only, None, and non-string values all mean
-        unset so the default Be CONCRETE sentence stays in place. The value
-        is returned verbatim (no interpolation) when set.
+        unset so the default structured compact template stays in place. The
+        value is returned verbatim (no interpolation) when set and replaces
+        the entire batch template (and micro merge prose).
         """
         raw = getattr(self, "summary_instructions", "")
         if not isinstance(raw, str) or not raw.strip():
@@ -5158,22 +5159,24 @@ Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_secti
         # Concatenate guidance so a configured string is never interpolated
         # (.format / f-string would expand braces in the user value).
         _custom_instructions = self._effective_summary_instructions()
-        _concrete_sentence = (
-            _custom_instructions
-            if _custom_instructions
-            else (
+        if _custom_instructions:
+            _outcome_instructions = (
+                _custom_instructions
+                + _temporal_anchoring_rule
+            )
+        else:
+            _concrete_sentence = (
                 "Be CONCRETE — include file paths, command outputs, error messages, "
                 "line numbers, and specific values. Avoid vague descriptions like "
                 '"made some changes" — say exactly what changed.'
             )
-        )
-        _template_sections = (
-            _template_sections
-            + _concrete_sentence
-            + f"""
+            _outcome_instructions = (
+                _template_sections
+                + _concrete_sentence
+                + f"""
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
-        )
+            )
 
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress.
@@ -5186,7 +5189,25 @@ Write only the summary body. Do not include any preamble or prefix."""
             _bounded_previous_summary = self._bound_summary_input(
                 self._previous_summary
             )
-            prompt = f"""{_summarizer_preamble}
+            if _custom_instructions:
+                prompt = (
+                    f"""{_summarizer_preamble}
+
+You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
+
+PREVIOUS SUMMARY:
+{_bounded_previous_summary}
+
+NEW TURNS TO INCORPORATE:
+{content_to_summarize}{_memory_section}
+
+Update the previous summary using these rules:
+
+"""
+                    + _outcome_instructions
+                )
+            else:
+                prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
@@ -5198,10 +5219,23 @@ NEW TURNS TO INCORPORATE:
 
 Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
-{_template_sections}"""
+{_outcome_instructions}"""
         else:
             # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
+            if _custom_instructions:
+                prompt = (
+                    f"""{_summarizer_preamble}
+
+Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+
+TURNS TO SUMMARIZE:
+{content_to_summarize}{_memory_section}
+
+"""
+                    + _outcome_instructions
+                )
+            else:
+                prompt = f"""{_summarizer_preamble}
 
 Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
 
@@ -5210,7 +5244,7 @@ TURNS TO SUMMARIZE:
 
 Use this exact structure:
 
-{_template_sections}"""
+{_outcome_instructions}"""
 
         # Inject focus topic guidance when the user provides one via /compress <focus>.
         # This goes at the end of the prompt so it takes precedence.
@@ -6968,23 +7002,26 @@ This compaction should PRIORITISE preserving all information related to the focu
         else:
             summary_block = "(No previous summary yet.)"
 
+        _merge_prose = (
+            "Merge the exchange's key decisions, requirements, file paths, and "
+            "open questions into the summary.  Preserve the summary's structure.  "
+            "Drop resolved details that are no longer relevant.  Add new decisions, "
+            "file paths, and open questions."
+        )
+        _custom_instructions = self._effective_summary_instructions()
+        # Concatenate guidance so a configured string is never interpolated
+        # (.format / f-string would expand braces in the user value).
+        _guidance = _custom_instructions if _custom_instructions else _merge_prose
         user_prompt = (
             "You are a summarization agent creating a compact record of an "
             "ongoing conversation.  You are given a running summary and the "
-            "next exchange from the conversation.  Merge the exchange's key "
-            "decisions, requirements, file paths, and open questions into the "
-            "summary.  Preserve the summary's structure.  Drop resolved details "
-            "that are no longer relevant.  Add new decisions, file paths, and "
-            "open questions.\n\n"
+            "next exchange from the conversation.  "
+            + _guidance
+            + "\n\n"
             "NEVER include API keys, tokens, passwords, secrets, credentials, "
             "or connection strings in the summary \u2014 replace any that appear "
             "with [REDACTED].\n\n"
         )
-        # Append configured guidance after NEVER/[REDACTED]. Concatenate so
-        # braces in the user string are never interpolated.
-        _custom_instructions = self._effective_summary_instructions()
-        if _custom_instructions:
-            user_prompt = user_prompt + _custom_instructions + "\n\n"
         user_prompt = user_prompt + (
             f"## Current Running Summary\n{summary_block}\n\n"
             f"## Next Exchange to Merge\n{exchange_text}\n\n"
