@@ -24,6 +24,7 @@ _HARD_FAILURE_REASONS = frozenset(
         "github_state_unavailable",
     }
 )
+_SOFT_SCAN_DEGRADATION_REASONS = frozenset({"github_ci_state_unavailable"})
 
 
 def _has_reported_failure(section: object) -> bool:
@@ -41,6 +42,39 @@ def _has_reported_failure(section: object) -> bool:
         ):
             return True
     return False
+
+
+def _has_soft_scan_degradation(section: object) -> bool:
+    """Whether only the known read-only GitHub CI metadata gap was reported."""
+
+    if not isinstance(section, dict) or section.get("status") != "degraded":
+        return False
+    skipped = section.get("skipped")
+    if not isinstance(skipped, dict):
+        return False
+    return any(
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and count > 0
+        and reason in _SOFT_SCAN_DEGRADATION_REASONS
+        for reason, count in skipped.items()
+    )
+
+
+def _has_hard_failure_reason(section: object) -> bool:
+    if not isinstance(section, dict):
+        return False
+    skipped = section.get("skipped")
+    if not isinstance(skipped, dict):
+        return False
+    return any(
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and count > 0
+        and reason in _HARD_FAILURE_REASONS
+        and reason not in _SOFT_SCAN_DEGRADATION_REASONS
+        for reason, count in skipped.items()
+    )
 
 
 def _has_only_expected_merge_blockers(section: object) -> bool:
@@ -94,10 +128,18 @@ def _cron_exit_code(stdout: str, process_returncode: int, stderr: str = "") -> i
         return process_returncode
     merge = payload.get("merge")
     partial_merge_success = _has_successful_merge(merge)
-    if payload.get("status") == "degraded" and not partial_merge_success:
+    soft_scan_degradation = _has_soft_scan_degradation(payload)
+    if payload.get("status") == "degraded" and not (
+        partial_merge_success or soft_scan_degradation
+    ):
         return process_returncode
     repair = payload.get("repair")
-    if _has_reported_failure(payload) or _has_reported_failure(repair):
+    top_level_failure = (
+        _has_hard_failure_reason(payload)
+        if soft_scan_degradation
+        else _has_reported_failure(payload)
+    )
+    if top_level_failure or _has_reported_failure(repair):
         return process_returncode
     if isinstance(merge, dict) and merge.get("status") == "degraded":
         if not _has_only_expected_merge_blockers(merge):
