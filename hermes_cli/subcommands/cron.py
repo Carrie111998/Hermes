@@ -132,6 +132,30 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "monitors, incremental digests). First run is unchanged."
         ),
     )
+    cron_create.add_argument(
+        "--context-from",
+        dest="context_from",
+        action="append",
+        help=(
+            "Job ID whose most recent completed output is injected into "
+            "this job's prompt as context (chains jobs: A collects, B "
+            "processes). Repeatable for multiple sources. For the job's own "
+            "previous output use --continuity instead."
+        ),
+    )
+    cron_create.add_argument(
+        "--attach-to-session",
+        dest="attach_to_session",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Make this job's delivery CONTINUABLE — the user can reply and "
+            "the agent has the brief in context (threads on thread-capable "
+            "platforms). Use for conversational recurring jobs (briefings); "
+            "omit for fire-and-forget alerts. No effect when --deliver local."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -212,6 +236,36 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Turn off run-to-run continuity (other context_from job refs "
             "are preserved)."
         ),
+    )
+    cron_edit.add_argument(
+        "--context-from",
+        dest="context_from",
+        action="append",
+        help=(
+            "Job ID whose most recent completed output is injected into "
+            "this job's prompt as context. Repeatable for multiple sources; "
+            "REPLACES the job's existing context_from list (its own 'self' "
+            "continuity entry is dropped unless --continuity is passed in "
+            "the same edit). Pass an empty string to clear all refs."
+        ),
+    )
+    cron_edit.add_argument(
+        "--attach-to-session",
+        dest="attach_to_session",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Make this job's delivery CONTINUABLE — the user can reply and "
+            "the agent has the brief in context. No effect when deliver=local."
+        ),
+    )
+    cron_edit.add_argument(
+        "--no-attach-to-session",
+        dest="attach_to_session",
+        action="store_const",
+        const=False,
+        help="Turn off attach_to_session (delivery reverts to fire-and-forget).",
     )
     cron_edit.add_argument(
         "--monitor-script",
