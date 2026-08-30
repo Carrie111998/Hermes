@@ -646,6 +646,16 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
             lambda *_args, **_kwargs: None,
             raising=False,
         )
+        # The Keychain mirror of a committed refresh write (#98334) starts by
+        # reading the entry; neutralize it for the same reason as the reader
+        # above so an ordinary credential-file test on a macOS host cannot
+        # touch (let alone rotate) the developer's real Keychain entry.
+        monkeypatch.setattr(
+            _mod,
+            "_read_claude_code_keychain_entry",
+            lambda *_args, **_kwargs: None,
+            raising=False,
+        )
     return None
 
 

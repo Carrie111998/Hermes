@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -262,6 +263,9 @@ def is_rotation_consumed_uncommitted(
     return fingerprint in _read_spent_rotation_sidecar(source_path)
 
 
+_CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
 def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     """Read Claude Code OAuth credentials from the macOS Keychain.
 
@@ -281,7 +285,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         # Read the "Claude Code-credentials" generic password entry
         result = subprocess.run(
             ["security", "find-generic-password",
-             "-s", "Claude Code-credentials",
+             "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE,
              "-w"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
@@ -600,6 +604,174 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+def _read_claude_code_keychain_entry() -> Optional[tuple]:
+    """Read the raw Claude Code Keychain entry: ``(account, claudeAiOauth)``.
+
+    Unlike ``_read_claude_code_credentials_from_keychain`` this returns the
+    stored ``claudeAiOauth`` dict as-is — metadata fields (``scopes``,
+    ``subscriptionType``, ...) included, and a non-empty ``accessToken`` NOT
+    required — because the caller needs to *update* the entry, including the
+    post-``invalid_grant`` state where Claude Code has already emptied the
+    token triple but left the metadata behind.
+
+    The account name is read from the item metadata instead of assumed to be
+    the login user name: Claude Code owns the entry, and
+    ``add-generic-password -U`` matches on ``(service, account)`` — guessing
+    the account wrong would create a second entry next to the one Claude
+    Code actually reads.
+    """
+    if platform.system() != "Darwin":
+        return None
+
+    try:
+        meta = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Keychain: security command not available or timed out")
+        return None
+
+    if meta.returncode != 0:
+        logger.debug("Keychain: no entry found for %r", _CLAUDE_CODE_KEYCHAIN_SERVICE)
+        return None
+
+    match = re.search(r'"acct"<blob>="([^"]*)"', meta.stdout)
+    if match is None or not match.group(1):
+        logger.debug("Keychain: entry has no readable account attribute")
+        return None
+    account = match.group(1)
+
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", account,
+             "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE,
+             "-w"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Keychain: security command not available or timed out")
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.debug("Keychain: credentials payload is not valid JSON")
+        return None
+
+    oauth_data = data.get("claudeAiOauth")
+    if not (oauth_data and isinstance(oauth_data, dict)):
+        return None
+
+    return account, oauth_data
+
+
+def _security_i_escape(value: str) -> str:
+    """Escape *value* for a double-quoted argument of ``security -i``.
+
+    The interactive parser is not a shell: inside double quotes only
+    backslash and double-quote are special (a single quote is an ordinary
+    character — passing one through a shell-style ``'..'`` span silently
+    truncates the value at it), so this is the complete escape set.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _sync_claude_code_keychain_credentials(oauth_data: Dict[str, Any]) -> None:
+    """Mirror a committed credential write to the macOS Keychain (#98334).
+
+    On Darwin Claude Code treats the login Keychain entry as the
+    authoritative store, and Anthropic OAuth refresh tokens are single-use
+    and rotating. A refresh that only updates ~/.claude/.credentials.json
+    strands an already-invalidated refresh token in the Keychain; Claude
+    Code's own next refresh then fails with ``invalid_grant`` and wipes the
+    entry, logging the user out of Claude Code.
+
+    Updates an existing entry only — never creates one — and merges just
+    the rotated token fields into the stored payload so the metadata Claude
+    Code gates on (``scopes`` with ``user:inference``, ``subscriptionType``,
+    ...) survives the rotation.
+
+    Best-effort by design: the JSON file write made by the caller is the
+    commit step of the refresh transaction, and every caller of
+    ``_write_claude_code_credentials`` treats an exception as a failed
+    rotation. A Keychain the user has locked (or denied ``security`` access
+    to) must not un-commit a rotation that already landed.
+    """
+    if platform.system() != "Darwin":
+        return
+
+    entry = _read_claude_code_keychain_entry()
+    if entry is None:
+        logger.debug(
+            "Keychain: no %r entry to update — leaving the store untouched",
+            _CLAUDE_CODE_KEYCHAIN_SERVICE,
+        )
+        return
+    account, stored = entry
+
+    merged = dict(stored)
+    merged.update(
+        {key: value for key, value in oauth_data.items() if value is not None}
+    )
+
+    # ``security -i`` parses its command from stdin, which keeps the payload
+    # (a secret) off argv and out of the process table; ``-w <value>`` on the
+    # command line would expose it there for the lifetime of the child.
+    payload = json.dumps({"claudeAiOauth": merged})
+    command = 'add-generic-password -U -a "%s" -s "%s" -w "%s"\n' % (
+        _security_i_escape(account),
+        _security_i_escape(_CLAUDE_CODE_KEYCHAIN_SERVICE),
+        _security_i_escape(payload),
+    )
+
+    try:
+        result = subprocess.run(
+            ["security", "-i"],
+            input=command,
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error(
+            "Rotated Claude Code credentials were written to %s but not to "
+            "the macOS Keychain (%s). Claude Code reads the Keychain copy, "
+            "whose refresh token is now spent: re-run 'claude login' if "
+            "Claude Code reports an expired login.",
+            claude_code_credentials_path(), exc,
+        )
+        return
+
+    if result.returncode != 0:
+        logger.error(
+            "Rotated Claude Code credentials were written to %s but not to "
+            "the macOS Keychain (%s). Claude Code reads the Keychain copy, "
+            "whose refresh token is now spent: re-run 'claude login' if "
+            "Claude Code reports an expired login.",
+            claude_code_credentials_path(),
+            result.stderr.strip() or "security -i exited non-zero",
+        )
+        return
+
+    logger.debug("Keychain: mirrored rotated Claude Code credentials")
+
+
 def _write_claude_code_credentials(
     access_token: str,
     refresh_token: str,
@@ -676,6 +848,13 @@ def _write_claude_code_credentials(
         # pair never landed either.
         logger.error("Failed to write refreshed credentials to %s: %s", cred_path, e)
         raise CredentialPersistError(cred_path, e) from e
+
+    # The file write above committed the rotation. On Darwin the Keychain
+    # copy Claude Code reads must be brought in step with it or its refresh
+    # token is stranded spent (#98334). Deliberately after the commit and
+    # best-effort: a locked Keychain must not fail a rotation that already
+    # landed in the file.
+    _sync_claude_code_keychain_credentials(oauth_data)
 
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
