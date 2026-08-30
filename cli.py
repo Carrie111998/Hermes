@@ -11070,7 +11070,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # path binds and lazy `_init_agent` will snapshot.
                 self._credential_pool = resolved.get("credential_pool")
             except Exception as exc:
-                logger.debug(
+                # Fail-loud: a pool-less rotation is a support-visible symptom
+                # (auth/billing 401s won't rotate), so log at WARNING, not DEBUG.
+                logger.warning(
                     "Credential pool re-resolution for switched provider "
                     "%s failed; no rotation this session (%s)",
                     self.provider, exc,
