@@ -140,7 +140,10 @@ def _run(cmd: list[str], timeout: float = 3.0) -> tuple[int, str, str]:
 
 def _python_version_of(binary: str) -> Optional[str]:
     """Return a short version string like ``3.12.4`` for ``binary``, or None."""
-    if not shutil.which(binary):
+    if os.path.isabs(binary):
+        if not os.path.isfile(binary):
+            return None
+    elif not shutil.which(binary):
         return None
     rc, out, err = _run([binary, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"])
     if rc == 0 and out:
@@ -150,7 +153,10 @@ def _python_version_of(binary: str) -> Optional[str]:
 
 def _has_pip_module(binary: str) -> bool:
     """True if ``<binary> -m pip --version`` succeeds."""
-    if not shutil.which(binary):
+    if os.path.isabs(binary):
+        if not os.path.isfile(binary):
+            return False
+    elif not shutil.which(binary):
         return False
     rc, _out, _err = _run([binary, "-m", "pip", "--version"])
     return rc == 0
@@ -162,7 +168,10 @@ def _detect_pep668(binary: str) -> bool:
     Looks for ``EXTERNALLY-MANAGED`` next to the stdlib (the marker file
     Debian/Ubuntu drop in to gate naive ``pip install``).
     """
-    if not shutil.which(binary):
+    if os.path.isabs(binary):
+        if not os.path.isfile(binary):
+            return False
+    elif not shutil.which(binary):
         return False
     code = (
         "import sys, os;"
@@ -210,11 +219,15 @@ def _build_probe_line() -> str:
     if backend in _REMOTE_BACKENDS or _plugin_backend_is_remote(backend):
         return ""
 
-    py3_ver = _python_version_of("python3")
+    # When running under the Nix package (or any sealed environment where
+    # python3 isn't on PATH), HERMES_PYTHON provides the absolute path to the
+    # Python binary.  Fall back to the bare name when unset.
+    python3_path = os.environ.get("HERMES_PYTHON") or "python3"
+    py3_ver = _python_version_of(python3_path)
     py_ver = _python_version_of("python")  # for systems with a `python` alias
-    py3_has_pip = _has_pip_module("python3") if py3_ver else False
+    py3_has_pip = _has_pip_module(python3_path) if py3_ver else False
     pip_bound_to = _pip_python_version()
-    py3_pep668 = _detect_pep668("python3") if py3_ver else False
+    py3_pep668 = _detect_pep668(python3_path) if py3_ver else False
     # Bare which() is correct here, unlike Hermes's own uv call sites: this
     # reports the environment *the model will see* in the terminal tool, and
     # what the model can type is exactly what is on that subshell's PATH.
