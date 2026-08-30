@@ -151,8 +151,11 @@ def _run_update_until_guard(args):
     return "returned"
 
 
-def test_current_checkout_handoff_wires_desktop_rebuild(monkeypatch, tmp_path):
-    """The real no-commit hand-off branch must reach the Desktop rebuild tail."""
+@pytest.mark.parametrize("desktop_build_ok", [True, False])
+def test_current_checkout_handoff_reports_desktop_rebuild_result(
+    monkeypatch, tmp_path, capsys, desktop_build_ok
+):
+    """The real no-commit hand-off branch propagates its Desktop result."""
     from hermes_cli import update_cmd
     from hermes_cli import update_inventory, update_receipt
     from hermes_cli import gitlock, managed_uv
@@ -173,8 +176,14 @@ def test_current_checkout_handoff_wires_desktop_rebuild(monkeypatch, tmp_path):
             stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    completions = []
+    events = []
     rebuilds = []
+
+    def rebuild(path, **kwargs):
+        events.append("rebuild")
+        rebuilds.append((path, kwargs))
+        return desktop_build_ok
+
     monkeypatch.setenv("HERMES_UPDATE_REEXEC", "1")
     monkeypatch.setattr(update_cmd.subprocess, "run", fake_git_run)
     monkeypatch.setattr(update_cmd, "_read_project_version", lambda: None)
@@ -185,14 +194,23 @@ def test_current_checkout_handoff_wires_desktop_rebuild(monkeypatch, tmp_path):
     monkeypatch.setattr(update_cmd, "_venv_core_imports_healthy", lambda: (True, ""))
     monkeypatch.setattr(update_cmd, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(update_cmd, "venv_python_path", lambda *_args, **_kwargs: venv_python)
-    monkeypatch.setattr(update_cmd, "_check_and_apply_config_migration", lambda **_kwargs: None)
-    monkeypatch.setattr(update_cmd, "_print_update_completion", completions.append)
-    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", lambda: None)
     monkeypatch.setattr(
         update_cmd,
-        "_rebuild_desktop_after_update",
-        lambda path, **kwargs: rebuilds.append((path, kwargs)) or True,
+        "_check_and_apply_config_migration",
+        lambda **_kwargs: events.append("migration"),
     )
+    monkeypatch.setattr(
+        update_cmd,
+        "_print_update_completion",
+        lambda message: events.append(("completion", message)),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_gateway_update_exit_code",
+        lambda ok: events.append(("gateway_exit", ok)),
+    )
+    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", lambda: None)
+    monkeypatch.setattr(update_cmd, "_rebuild_desktop_after_update", rebuild)
 
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(cli_main, "_capture_active_lazy_features", lambda: [])
@@ -217,7 +235,7 @@ def test_current_checkout_handoff_wires_desktop_rebuild(monkeypatch, tmp_path):
     monkeypatch.setattr(managed_uv, "update_managed_uv", lambda **_kwargs: None)
     monkeypatch.setattr(managed_uv, "ensure_uv", lambda **_kwargs: "uv")
 
-    update_cmd._cmd_update_impl(_update_args(force=True), gateway_mode=False)
+    update_cmd._cmd_update_impl(_update_args(force=True), gateway_mode=True)
 
     assert rebuilds == [
         (
@@ -225,7 +243,18 @@ def test_current_checkout_handoff_wires_desktop_rebuild(monkeypatch, tmp_path):
             {"had_desktop_app_before_update": True},
         )
     ]
-    assert completions == ["✓ Update complete!"]
+    if desktop_build_ok:
+        assert events == [
+            "rebuild",
+            "migration",
+            ("completion", "✓ Update complete!"),
+            ("gateway_exit", True),
+        ]
+    else:
+        assert events == ["rebuild", "migration", ("gateway_exit", False)]
+        output = capsys.readouterr().out
+        assert "Update partially complete" in output
+        assert "Update complete!" not in output
 
 
 @pytest.mark.parametrize(
