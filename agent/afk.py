@@ -368,6 +368,51 @@ def _verify_owner_only(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _sync_parent_directory(path: Path) -> None:
+    """Durably synchronize the directory entry containing *path*.
+
+    Native Windows retains the atomic replacement and per-user-location
+    semantics above, but has no POSIX directory-entry fsync equivalent; this
+    helper therefore intentionally does nothing there and makes no POSIX
+    durability or mode-enforcement claim. On POSIX, open/fsync/close errors
+    propagate so callers can fail closed instead of reporting success before
+    the directory entry is durable.
+    """
+    if os.name == "nt":
+        return
+    dir_fd = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    sync_error = None
+    try:
+        try:
+            os.fsync(dir_fd)
+        except BaseException as exc:
+            sync_error = exc
+    finally:
+        try:
+            os.close(dir_fd)
+        except BaseException as close_error:
+            if sync_error is None:
+                raise
+            sync_error.add_note(
+                f"parent-directory close also failed: {close_error}"
+            )
+    if sync_error is not None:
+        raise sync_error
+
+
+def _unlink_afk_state(path: Path) -> bool:
+    """Remove an AFK state file and durably synchronize its parent entry."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    _sync_parent_directory(path)
+    return True
+
+
 def _read_state_unlocked() -> Optional[dict]:
     """Read and sanitize the state file. Caller decides about locking."""
     path = state_path()
@@ -456,6 +501,7 @@ def _atomic_replace_json(path: Path, payload: dict) -> None:
             os.fsync(fh.fileno())
         os.replace(temp_name, path)
         temp_name = None
+        _sync_parent_directory(path)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -496,9 +542,11 @@ def engage(reason: Optional[str] = None) -> dict:
             except AfkStateError:
                 # Never leave a record we could not make private.
                 try:
-                    path.unlink()
-                except OSError:
-                    pass
+                    _unlink_afk_state(path)
+                except OSError as exc:
+                    raise AfkStateError(
+                        f"could not clean up AFK state at {path}: {exc}"
+                    ) from exc
                 raise
             state = _read_state_unlocked()
             if state is None:
@@ -522,9 +570,9 @@ def clear() -> bool:
     """Mark the operator back. True when an AFK state was actually lifted.
 
     Taken under the same lock as :func:`engage` so a clear can never land
-    between a concurrent write and its readback. ``unlink`` returning is itself
-    the durable proof, so there is no confirming read: it could only be raced
-    by a later legitimate ``/afk on``.
+    between a concurrent write and its readback. The unlink and
+    parent-directory synchronization are the durable proof, so there is no
+    confirming read: it could only be raced by a later legitimate ``/afk on``.
 
     Raises:
         AfkStateError: a state exists but could not be removed — a caller must
@@ -535,10 +583,7 @@ def clear() -> bool:
         with status_transaction():
             _reject_symlink(path, label="state")
             try:
-                path.unlink()
-                return True
-            except FileNotFoundError:
-                return False
+                return _unlink_afk_state(path)
             except OSError as exc:
                 raise AfkStateError(
                     f"could not clear AFK state at {path}: {exc}"

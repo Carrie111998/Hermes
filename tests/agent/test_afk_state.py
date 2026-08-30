@@ -159,6 +159,316 @@ def test_engage_raises_when_the_write_lands_unreadable(hermes_root, monkeypatch)
         afk.engage()
 
 
+def _record_engage_io(monkeypatch):
+    events: list[str] = []
+    real_fsync = afk.os.fsync
+    real_replace = afk.os.replace
+
+    def recording_fsync(fd):
+        mode = afk.os.fstat(fd).st_mode
+        events.append(
+            "directory_fsync" if stat.S_ISDIR(mode) else "file_fsync"
+        )
+        return real_fsync(fd)
+
+    def recording_replace(source, target):
+        events.append("replace")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(afk.os, "fsync", recording_fsync)
+    monkeypatch.setattr(afk.os, "replace", recording_replace)
+    return events, real_fsync
+
+
+def _assert_engage_parent_directory_sync(monkeypatch):
+    events, real_fsync = _record_engage_io(monkeypatch)
+    state = afk.engage(reason="directory barrier")
+
+    assert state["reason"] == "directory barrier"
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+
+    events.clear()
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(afk.os.fstat(fd).st_mode):
+            raise OSError("simulated parent-directory sync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(afk.os, "fsync", fail_directory_fsync)
+    with pytest.raises(afk.AfkStateError, match="directory|write"):
+        afk.engage(reason="must fail closed")
+
+    reply = afk.handle_command("on must fail closed")
+    assert "AFK recorded" not in reply
+
+
+@pytest.mark.linux_only
+def test_engage_parent_directory_sync_on_linux(hermes_root, monkeypatch):
+    _assert_engage_parent_directory_sync(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_engage_parent_directory_sync_on_macos(hermes_root, monkeypatch):
+    _assert_engage_parent_directory_sync(monkeypatch)
+
+
+@pytest.mark.windows_only
+def test_engage_parent_directory_sync_skips_posix_directory_sync_on_windows(
+    hermes_root, monkeypatch
+):
+    events, _real_fsync = _record_engage_io(monkeypatch)
+    afk.engage(reason="windows semantics")
+    assert events == ["file_fsync", "replace"]
+
+
+def _record_unlink_and_sync(monkeypatch):
+    events: list[str] = []
+    real_unlink = afk.Path.unlink
+    real_fsync = afk.os.fsync
+
+    def recording_unlink(path, *args, **kwargs):
+        events.append("unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    def recording_fsync(fd):
+        mode = afk.os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            events.append("directory_fsync")
+        else:
+            events.append("file_fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(afk.Path, "unlink", recording_unlink)
+    monkeypatch.setattr(afk.os, "fsync", recording_fsync)
+    return events, real_fsync
+
+
+def _assert_clear_parent_directory_sync(monkeypatch):
+    afk.engage(reason="clear barrier")
+    events, real_fsync = _record_unlink_and_sync(monkeypatch)
+    assert afk.clear() is True
+    assert events == ["unlink", "directory_fsync"]
+
+    afk.state_path().write_text("{}", encoding="utf-8")
+    events.clear()
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(afk.os.fstat(fd).st_mode):
+            events.append("directory_fsync")
+            raise OSError("simulated clear directory-sync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(afk.os, "fsync", fail_directory_fsync)
+    with pytest.raises(afk.AfkStateError, match="clear|directory"):
+        afk.clear()
+    reply = afk.handle_command("off")
+    assert "Welcome back" not in reply
+
+
+def _assert_privacy_cleanup_parent_directory_sync(monkeypatch):
+    events, real_fsync = _record_unlink_and_sync(monkeypatch)
+    monkeypatch.setattr(afk, "enforces_owner_only_permissions", lambda: True)
+    monkeypatch.setattr(afk, "_file_mode", lambda _path: 0o644)
+    directory_syncs = 0
+
+    def fail_privacy_cleanup_sync(fd):
+        nonlocal directory_syncs
+        mode = afk.os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            directory_syncs += 1
+            events.append("directory_fsync")
+            if directory_syncs == 2:
+                raise OSError("simulated privacy cleanup sync failure")
+        else:
+            events.append("file_fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(afk.os, "fsync", fail_privacy_cleanup_sync)
+    with pytest.raises(afk.AfkStateError, match="could not clean up AFK state"):
+        afk.engage(reason="privacy cleanup")
+    assert events == [
+        "file_fsync",
+        "directory_fsync",
+        "unlink",
+        "directory_fsync",
+    ]
+    assert not afk.state_path().exists()
+    reply = afk.handle_command("on privacy cleanup")
+    assert "AFK recorded" not in reply
+
+
+@pytest.mark.linux_only
+def test_clear_parent_directory_sync_on_linux(hermes_root, monkeypatch):
+    _assert_clear_parent_directory_sync(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_clear_parent_directory_sync_on_macos(hermes_root, monkeypatch):
+    _assert_clear_parent_directory_sync(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_privacy_cleanup_parent_directory_sync_on_linux(hermes_root, monkeypatch):
+    _assert_privacy_cleanup_parent_directory_sync(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_privacy_cleanup_parent_directory_sync_on_macos(hermes_root, monkeypatch):
+    _assert_privacy_cleanup_parent_directory_sync(monkeypatch)
+
+
+def _assert_clear_parent_directory_sync_enoent_after_unlink(monkeypatch):
+    afk.state_path().write_text("{}", encoding="utf-8")
+    real_open = afk.os.open
+
+    def fail_parent_open(path, flags, *args):
+        if path == afk.state_path().parent:
+            raise FileNotFoundError("simulated parent-directory disappearance")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(afk.os, "open", fail_parent_open)
+    with pytest.raises(afk.AfkStateError, match="could not clear AFK state"):
+        afk.clear()
+
+
+@pytest.mark.linux_only
+def test_clear_parent_directory_sync_enoent_after_unlink_on_linux(
+    hermes_root, monkeypatch
+):
+    _assert_clear_parent_directory_sync_enoent_after_unlink(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_clear_parent_directory_sync_enoent_after_unlink_on_macos(
+    hermes_root, monkeypatch
+):
+    _assert_clear_parent_directory_sync_enoent_after_unlink(monkeypatch)
+
+
+def _assert_clear_command_reports_parent_directory_sync_enoent(monkeypatch):
+    afk.state_path().write_text("{}", encoding="utf-8")
+    real_open = afk.os.open
+
+    def fail_parent_open(path, flags, *args):
+        if path == afk.state_path().parent:
+            raise FileNotFoundError("simulated parent-directory disappearance")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(afk.os, "open", fail_parent_open)
+    reply = afk.handle_command("off")
+    assert "Couldn't clear AFK" in reply
+    assert "Welcome back" not in reply
+
+
+@pytest.mark.linux_only
+def test_clear_command_reports_parent_directory_sync_enoent_on_linux(
+    hermes_root, monkeypatch
+):
+    _assert_clear_command_reports_parent_directory_sync_enoent(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_clear_command_reports_parent_directory_sync_enoent_on_macos(
+    hermes_root, monkeypatch
+):
+    _assert_clear_command_reports_parent_directory_sync_enoent(monkeypatch)
+
+
+def _assert_privacy_cleanup_parent_directory_sync_enoent_is_fail_closed(
+    monkeypatch,
+):
+    monkeypatch.setattr(afk, "enforces_owner_only_permissions", lambda: True)
+    monkeypatch.setattr(afk, "_file_mode", lambda _path: 0o644)
+    real_open = afk.os.open
+    parent_opens = 0
+
+    def fail_privacy_cleanup_parent_open(path, flags, *args):
+        nonlocal parent_opens
+        if path == afk.state_path().parent:
+            parent_opens += 1
+            if parent_opens == 2:
+                raise FileNotFoundError("simulated privacy cleanup disappearance")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(afk.os, "open", fail_privacy_cleanup_parent_open)
+    with pytest.raises(afk.AfkStateError, match="could not clean up AFK state"):
+        afk.engage(reason="privacy cleanup")
+
+
+@pytest.mark.linux_only
+def test_privacy_cleanup_parent_directory_sync_enoent_is_fail_closed_on_linux(
+    hermes_root, monkeypatch
+):
+    _assert_privacy_cleanup_parent_directory_sync_enoent_is_fail_closed(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_privacy_cleanup_parent_directory_sync_enoent_is_fail_closed_on_macos(
+    hermes_root, monkeypatch
+):
+    _assert_privacy_cleanup_parent_directory_sync_enoent_is_fail_closed(monkeypatch)
+
+
+def _assert_parent_directory_close_only_failure(monkeypatch):
+    real_close = afk.os.close
+
+    def fail_directory_close(fd):
+        if stat.S_ISDIR(afk.os.fstat(fd).st_mode):
+            raise OSError("simulated parent-directory close failure")
+        return real_close(fd)
+
+    monkeypatch.setattr(afk.os, "close", fail_directory_close)
+    with pytest.raises(afk.AfkStateError, match="close"):
+        afk.engage(reason="close failure")
+
+
+def _assert_parent_directory_primary_fsync_failure(monkeypatch):
+    real_fsync = afk.os.fsync
+    real_close = afk.os.close
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(afk.os.fstat(fd).st_mode):
+            raise OSError("primary parent-directory fsync failure")
+        return real_fsync(fd)
+
+    def fail_directory_close(fd):
+        if stat.S_ISDIR(afk.os.fstat(fd).st_mode):
+            raise OSError("secondary parent-directory close failure")
+        return real_close(fd)
+
+    monkeypatch.setattr(afk.os, "fsync", fail_directory_fsync)
+    monkeypatch.setattr(afk.os, "close", fail_directory_close)
+    with pytest.raises(
+        afk.AfkStateError, match="primary parent-directory fsync"
+    ) as exc_info:
+        afk.engage(reason="primary sync failure")
+    assert "primary parent-directory fsync" in str(exc_info.value.__cause__)
+
+
+@pytest.mark.linux_only
+def test_parent_directory_sync_close_failure_on_linux(hermes_root, monkeypatch):
+    _assert_parent_directory_close_only_failure(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_parent_directory_sync_close_failure_on_macos(hermes_root, monkeypatch):
+    _assert_parent_directory_close_only_failure(monkeypatch)
+
+
+@pytest.mark.linux_only
+def test_parent_directory_sync_primary_fsync_failure_on_linux(
+    hermes_root, monkeypatch
+):
+    _assert_parent_directory_primary_fsync_failure(monkeypatch)
+
+
+@pytest.mark.macos_only
+def test_parent_directory_sync_primary_fsync_failure_on_macos(
+    hermes_root, monkeypatch
+):
+    _assert_parent_directory_primary_fsync_failure(monkeypatch)
+
+
 def test_re_engaging_replaces_the_previous_reason(hermes_root):
     first = afk.engage(reason="lunch")
     second = afk.engage(reason="dentist")

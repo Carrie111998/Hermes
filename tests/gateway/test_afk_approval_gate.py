@@ -236,6 +236,177 @@ def test_afk_engaged_by_pre_approval_hook_still_prevents_notification(
     assert outcome["result"]["afk_denied"] is True
 
 
+def test_blocked_pre_approval_hook_does_not_block_afk_commit_and_late_response_cannot_authorize(
+    hermes_root, session_key, monkeypatch
+):
+    hook_entered = threading.Event()
+    release_hook = threading.Event()
+    notified: list[dict] = []
+    session = session_key
+    pattern = "test_key"
+    approval.clear_session(session)
+    with approval._lock:
+        approval._permanent_approved.discard(pattern)
+
+    def _hook(name, **_kwargs):
+        if name == "pre_approval_request":
+            hook_entered.set()
+            assert release_hook.wait(timeout=30), "test hook was not released"
+
+    monkeypatch.setattr(approval, "_fire_approval_hook", _hook)
+    outcome, done, thread = _blocking_approval(
+        session, lambda data: notified.append(dict(data))
+    )
+    try:
+        assert hook_entered.wait(timeout=5), "pre-approval hook never blocked"
+        with approval._lock:
+            queue = approval._gateway_queues.get(session, [])
+            assert len(queue) == 1
+            old_request_id = queue[0].data["request_id"]
+
+        afk_outcome, afk_done, afk_thread = _run_in_thread(
+            lambda: afk.engage(reason="blocked pre-approval hook")
+        )
+        assert afk_done.wait(timeout=5), "AFK commit stayed blocked by hook"
+        afk_thread.join(timeout=1)
+        assert "error" not in afk_outcome, afk_outcome.get("error")
+        assert not release_hook.is_set()
+        assert not done.is_set(), "approval waiter finished before hook release"
+        assert approval.list_gateway_approvals(session) == []
+        assert (
+            approval.resolve_gateway_approval(
+                session, "always", request_id=old_request_id
+            )
+            == 0
+        )
+    finally:
+        release_hook.set()
+
+    assert done.wait(timeout=5), "approval waiter stayed blocked after hook release"
+    thread.join(timeout=1)
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome["result"]["choice"] == "deny"
+    assert outcome["result"]["afk_denied"] is True
+    assert notified == []
+    assert approval.list_gateway_approvals(session) == []
+    assert approval.is_approved(session, pattern) is False
+    with approval._lock:
+        assert pattern not in approval._permanent_approved
+
+
+def test_blocked_notifier_does_not_block_afk_commit_and_late_response_cannot_authorize(
+    hermes_root, session_key, monkeypatch
+):
+    notify_entered = threading.Event()
+    release_notify = threading.Event()
+    notified: list[dict] = []
+    session = session_key
+    pattern = "test_key"
+    approval.clear_session(session)
+    with approval._lock:
+        approval._permanent_approved.discard(pattern)
+
+    monkeypatch.setattr(approval, "_fire_approval_hook", lambda *_a, **_k: None)
+
+    def _notify(data):
+        notified.append(dict(data))
+        notify_entered.set()
+        assert release_notify.wait(timeout=30), "test notifier was not released"
+
+    outcome, done, thread = _blocking_approval(session, _notify)
+    try:
+        assert notify_entered.wait(timeout=5), "notifier never blocked"
+        with approval._lock:
+            queue = approval._gateway_queues.get(session, [])
+            assert len(queue) == 1
+            old_request_id = queue[0].data["request_id"]
+
+        afk_outcome, afk_done, afk_thread = _run_in_thread(
+            lambda: afk.engage(reason="blocked notifier")
+        )
+        assert afk_done.wait(timeout=5), "AFK commit stayed blocked by notifier"
+        afk_thread.join(timeout=1)
+        assert "error" not in afk_outcome, afk_outcome.get("error")
+        assert not release_notify.is_set()
+        assert not done.is_set(), "approval waiter finished before notifier release"
+        assert approval.list_gateway_approvals(session) == []
+        assert (
+            approval.resolve_gateway_approval(
+                session, "always", request_id=old_request_id
+            )
+            == 0
+        )
+    finally:
+        release_notify.set()
+
+    assert done.wait(timeout=5), "approval waiter stayed blocked after notifier release"
+    thread.join(timeout=1)
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome["result"]["choice"] == "deny"
+    assert outcome["result"]["afk_denied"] is True
+    assert notified and notified[0]["request_id"] == old_request_id
+    assert approval.list_gateway_approvals(session) == []
+    assert approval.is_approved(session, pattern) is False
+    with approval._lock:
+        assert pattern not in approval._permanent_approved
+
+
+def test_notifier_failure_after_explicit_resolution_keeps_normal_result(
+    hermes_root, session_key, monkeypatch
+):
+    notify_entered = threading.Event()
+    release_notify = threading.Event()
+    follower_hook_entered = threading.Event()
+    follower_notified: list[dict] = []
+    session = session_key
+    approval.clear_session(session)
+
+    def _hook(name, **kwargs):
+        if name == "pre_approval_request" and kwargs.get("coalesced"):
+            follower_hook_entered.set()
+
+    monkeypatch.setattr(approval, "_fire_approval_hook", _hook)
+
+    def _notify(_data):
+        notify_entered.set()
+        assert release_notify.wait(timeout=30), "test notifier was not released"
+        raise RuntimeError("late notifier failure")
+
+    leader, leader_done, leader_thread = _blocking_approval(session, _notify)
+    follower = follower_done = follower_thread = None
+    try:
+        assert notify_entered.wait(timeout=5), "notifier never blocked"
+        follower, follower_done, follower_thread = _blocking_approval(
+            session, lambda data: follower_notified.append(dict(data))
+        )
+        assert follower_hook_entered.wait(timeout=5), "follower did not coalesce"
+        with approval._lock:
+            queue = approval._gateway_queues.get(session, [])
+            assert len(queue) == 1
+            request_id = queue[0].data["request_id"]
+
+        assert (
+            approval.resolve_gateway_approval(
+                session, "always", request_id=request_id
+            )
+            == 1
+        )
+    finally:
+        release_notify.set()
+
+    assert follower_done is not None
+    assert leader_done.wait(timeout=5), "leader did not finish after notifier release"
+    assert follower_done.wait(timeout=5), "follower did not finish after resolution"
+    leader_thread.join(timeout=1)
+    follower_thread.join(timeout=1)
+    assert "error" not in leader, leader.get("error")
+    assert "error" not in follower, follower.get("error")
+    assert leader["result"]["choice"] == "always"
+    assert follower["result"]["choice"] == "always"
+    assert leader["result"].get("notify_failed") is not True
+    assert follower_notified == []
+
+
 @pytest.mark.parametrize("attempted_choice", ["once", "session", "always"])
 def test_resolution_while_afk_can_only_deny(
     hermes_root, session_key, attempted_choice

@@ -4908,11 +4908,33 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     #     execution, so the follower falls through to a fresh prompt.
     leader = None
     entry = None
+
+    def _entry_result(approval_entry):
+        result = {
+            "resolved": approval_entry.event.is_set(),
+            "choice": approval_entry.result,
+            "reason": approval_entry.reason,
+        }
+        if approval_entry.resolution_source == "afk":
+            result["afk_denied"] = True
+        elif approval_entry.resolution_source == "availability":
+            result["availability_denied"] = True
+        return result
+
+    def _entry_is_pending(approval_entry):
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            return any(
+                candidate is approval_entry
+                and candidate.data.get("request_id")
+                == approval_entry.data.get("request_id")
+                for candidate in queue
+            )
+
     try:
-        # This lock is shared with engage() and resolver grants. Holding it
-        # through enqueue + notify gives those operations a total ordering:
-        # notification completed before AFK engaged, or AFK is observed and no
-        # callback/hook is invoked. There is no check-then-notify window.
+        # Admission and enqueue share the AFK transaction with engage() and
+        # resolver grants. Keep the lock order status_transaction -> _lock,
+        # then leave both before invoking arbitrary callbacks.
         from agent import afk
 
         with afk.status_transaction():
@@ -4933,50 +4955,96 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                     entry = _ApprovalEntry(approval_data)
                     _gateway_queues.setdefault(session_key, []).append(entry)
 
-            if leader is None:
-                # Hooks can have external effects, so they are behind the same
-                # AFK check as the user-facing callback.
-                _fire_approval_hook(
-                    "pre_approval_request",
-                    command=command,
-                    description=description,
-                    pattern_key=primary_key,
-                    pattern_keys=list(all_keys),
-                    session_key=session_key,
-                    surface=surface,
-                )
-                # A synchronous hook may itself engage AFK. Re-read inside
-                # the same re-entrant transaction before crossing the actual
-                # notification boundary; engage() has already denied and
-                # signalled this entry in that case.
+        if leader is None:
+            # Hooks can have external effects, so invoke them only after the
+            # admission transaction has released both the AFK and queue locks.
+            _fire_approval_hook(
+                "pre_approval_request",
+                command=command,
+                description=description,
+                pattern_key=primary_key,
+                pattern_keys=list(all_keys),
+                session_key=session_key,
+                surface=surface,
+            )
+            # A synchronous hook may itself engage AFK. Re-enter the status
+            # transaction and require that the same entry/request ID is still
+            # pending before crossing the notification boundary.
+            skip_notify = False
+            with afk.status_transaction():
                 presentation_denial = approval_presentation_denial()
                 if presentation_denial is not None:
                     return presentation_denial
+                skip_notify = not _entry_is_pending(entry)
+
+            if not skip_notify:
                 try:
                     notify_cb(dict(entry.data))
                 except Exception as exc:
                     logger.warning("Gateway approval notify failed: %s", exc)
-                    with _lock:
-                        queue = _gateway_queues.get(session_key, [])
-                        if entry in queue:
-                            queue.remove(entry)
-                        if not queue:
-                            _gateway_queues.pop(session_key, None)
-                    _fire_approval_hook(
-                        "post_approval_response",
-                        command=command,
-                        description=description,
-                        pattern_key=primary_key,
-                        pattern_keys=list(all_keys),
-                        session_key=session_key,
-                        surface=surface,
-                        choice="notify_failed",
-                    )
-                    return {
-                        "resolved": False,
-                        "choice": None,
-                        "notify_failed": True,
-                    }
+                    notify_failed = False
+                    resolution_owned = False
+                    with afk.status_transaction():
+                        # AFK may have drained this entry while the arbitrary
+                        # notifier was blocked. Let that revocation win over
+                        # the callback failure and never requeue the entry.
+                        presentation_denial = approval_presentation_denial()
+                        if presentation_denial is not None:
+                            return presentation_denial
+                        with _lock:
+                            queue = _gateway_queues.get(session_key, [])
+                            if entry in queue:
+                                queue.remove(entry)
+                                if not queue:
+                                    _gateway_queues.pop(session_key, None)
+                                notify_failed = True
+                            elif entry.resolution_source in {
+                                "afk",
+                                "availability",
+                            }:
+                                return _entry_result(entry)
+                            else:
+                                # A concurrent explicit resolver already won;
+                                # do not resurrect or replace its entry. Wait
+                                # for its final revalidation outside both
+                                # locks, then use normal result handling.
+                                resolution_owned = entry.resolution_source in {
+                                    "resolving",
+                                    "user",
+                                }
+                                notify_failed = not resolution_owned
+                    if resolution_owned:
+                        entry.resolution_committed.wait()
+                    if notify_failed:
+                        _fire_approval_hook(
+                            "post_approval_response",
+                            command=command,
+                            description=description,
+                            pattern_key=primary_key,
+                            pattern_keys=list(all_keys),
+                            session_key=session_key,
+                            surface=surface,
+                            choice="notify_failed",
+                        )
+                        return {
+                            "resolved": False,
+                            "choice": None,
+                            "notify_failed": True,
+                        }
+
+                # Revalidate after the notifier returns. If AFK won while it
+                # was blocked, return its automatic denial; otherwise leave
+                # the exact entry in place for the existing wait/resolution
+                # choreography below.
+                with afk.status_transaction():
+                    presentation_denial = approval_presentation_denial()
+                    if presentation_denial is not None:
+                        return presentation_denial
+                    if not _entry_is_pending(entry) and entry.resolution_source in {
+                        "afk",
+                        "availability",
+                    }:
+                        return _entry_result(entry)
     except Exception:
         logger.warning(
             "Approval denied because machine-global AFK status could not be "
