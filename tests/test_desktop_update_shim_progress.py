@@ -130,11 +130,11 @@ exit "$(cat "$HERMES_TEST_EXITS.$n" 2>/dev/null || echo 0)"
 """
 
 
-def _run_handoff(tmp_path, exits: dict[int, int]) -> list[dict]:
+def _run_handoff(tmp_path, exits: dict[int, int], venv_dir: str = "venv") -> list[dict]:
     """Run the real hand-off end to end; return the stage seen at each call."""
     install_root = tmp_path / "hermes-agent"
-    (install_root / "venv" / "bin").mkdir(parents=True)
-    hermes = install_root / "venv" / "bin" / "hermes"
+    (install_root / venv_dir / "bin").mkdir(parents=True)
+    hermes = install_root / venv_dir / "bin" / "hermes"
     hermes.write_text(FAKE_HERMES)
     hermes.chmod(0o755)
 
@@ -197,3 +197,46 @@ def test_retry_gate_publishes_a_distinct_stage(tmp_path):
         "Updating code and dependencies",
         "Retrying update",
     ]
+
+
+@requires_posix_handoff
+def test_update_gate_accepts_dot_venv_layout(tmp_path):
+    """Shared-venv installs keep only a `.venv` symlink in the checkout (the
+    layout `hermes doctor` reports as healthy); the entry-point gate must
+    probe it as a fallback instead of aborting with "needs repair" (#98384)."""
+    stages = _run_handoff(tmp_path, {1: 0}, venv_dir=".venv")
+
+    assert len(stages) == 1
+    assert stages[0]["status"] == "running"
+    assert stages[0]["message"] == "Updating code and dependencies"
+
+
+@requires_posix_handoff
+def test_missing_entry_point_still_fails_closed(tmp_path):
+    """Neither venv/ nor .venv/: the gate must keep failing closed with the
+    repair exit code instead of running an update with no entry point."""
+    install_root = tmp_path / "hermes-agent"
+    install_root.mkdir()
+
+    subprocess.run(
+        [
+            "/bin/bash",
+            str(SHIM_DIR / "posix.sh"),
+            "--install-root",
+            str(install_root),
+            "--no-ui",
+        ],
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+        timeout=60,
+        check=True,
+    )
+
+    result = tmp_path / ".hermes-update-result.json"
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline and not result.exists():
+        time.sleep(0.1)
+    assert result.exists(), "hand-off never wrote its result file"
+
+    payload = json.loads(result.read_text())
+    assert payload["ok"] is False
+    assert payload["exit_code"] == 3

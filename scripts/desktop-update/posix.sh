@@ -235,6 +235,7 @@ start_ui() {
   [ "$NO_UI" -eq 1 ] && return
   local html="$SCRIPT_DIR/ui.html" py browser port="" i
   py="${INSTALL_ROOT:+$INSTALL_ROOT/venv/bin/python3}"
+  [ -x "${py:-/nonexistent}" ] || py="${INSTALL_ROOT:+$INSTALL_ROOT/.venv/bin/python3}"
   [ -x "${py:-/nonexistent}" ] || py="$(command -v python3 2>/dev/null)"
   browser="$(find_browser)"
   if [ -n "$browser" ] && [ -n "$py" ] && ! default_browser_is_chromium "$py"; then
@@ -561,8 +562,13 @@ fi
 sleep 1
 start_ui
 
+# Managed installs hold <root>/venv; uv-default/git layouts hold only a
+# <root>/.venv symlink into ~/.hermes/venvs — a layout `hermes doctor`
+# reports as healthy. Probe both before declaring the install broken,
+# mirroring _default_live_venv() (hermes_cli/managed_uv.py).
 HERMES_BIN="$INSTALL_ROOT/venv/bin/hermes"
-[ -x "$HERMES_BIN" ] || { FINAL_CODE=3 FINAL_MSG="Update aborted: $HERMES_BIN is missing. The install needs repair (run the Hermes installer or hermes doctor)."; log "$FINAL_MSG"; exit 3; }
+[ -x "$HERMES_BIN" ] || HERMES_BIN="$INSTALL_ROOT/.venv/bin/hermes"
+[ -x "$HERMES_BIN" ] || { FINAL_CODE=3 FINAL_MSG="Update aborted: neither $INSTALL_ROOT/venv/bin/hermes nor $INSTALL_ROOT/.venv/bin/hermes is present. The install needs repair (run the Hermes installer or hermes doctor)."; log "$FINAL_MSG"; exit 3; }
 
 # Run FROM the install root: `hermes update` resolves the tree it mutates
 # from the working directory, and we inherit the Desktop's cwd (which can be
