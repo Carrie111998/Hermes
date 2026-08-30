@@ -360,6 +360,12 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
       })
     }
 
+    // Re-home any open tile keyed on the pre-rotation id to the new tip so the
+    // conversation keeps ONE pane (#98622). Not gated on the active runtime:
+    // a background tile's conversation rotates too, and its pane would
+    // otherwise keep the stale id forever (duplicate/differently-titled tabs).
+    rekeySessionTile(previous.storedSessionId, next.storedSessionId)
+
     clearSettled(previous.storedSessionId)
     setSessionStalled(previous.storedSessionId, false)
   }
@@ -917,6 +923,50 @@ if (!isSecondaryWindow() && !isBrowserWindow()) {
 
 export function patchSessionTile(storedSessionId: string, patch: Partial<SessionTile>) {
   saveTiles($sessionTiles.get().map(t => (t.storedSessionId === storedSessionId ? { ...t, ...patch } : t)))
+}
+
+/**
+ * Re-home an open tile after auto-compression rotates the conversation's stored
+ * id (#98622). Without this, the tile stays keyed on the pre-rotation id while
+ * the rest of the app (selection, route, composer) moves to the new tip — the
+ * same conversation then renders as two tabs (identical or differently-titled,
+ * since each tip is titled independently).
+ *
+ * Placement fields (`dir`/`anchor`/`before`) are preserved so the pane mirror
+ * re-docks the re-keyed tile in the same slot; pane-mirror's wanted-set diff
+ * disposes the old pane and adopts the new one from this single change.
+ *
+ * Two degenerate cases, both resolving to ONE visible surface:
+ * - A tile already exists on the new tip → drop the stale one (the surviving
+ *   tile represents the conversation; the mirror removes the old pane).
+ * - The new tip is already the MAIN selection → drop the stale tile entirely
+ *   (a session is either main OR a tile — never both; openSessionTile enforces
+ *   the same invariant at open time).
+ */
+export function rekeySessionTile(previousStoredSessionId: string, nextStoredSessionId: string) {
+  if (!previousStoredSessionId || previousStoredSessionId === nextStoredSessionId) {
+    return
+  }
+
+  const tiles = $sessionTiles.get()
+  const stale = tiles.find(t => t.storedSessionId === previousStoredSessionId)
+
+  if (!stale) {
+    return
+  }
+
+  const nextIsSelected = nextStoredSessionId === $selectedStoredSessionId.get()
+  const nextHasTile = tiles.some(t => t.storedSessionId === nextStoredSessionId)
+
+  if (nextIsSelected || nextHasTile) {
+    saveTiles(tiles.filter(t => t.storedSessionId !== previousStoredSessionId))
+
+    return
+  }
+
+  saveTiles(
+    tiles.map(t => (t.storedSessionId === previousStoredSessionId ? { ...t, storedSessionId: nextStoredSessionId } : t))
+  )
 }
 
 export function sessionTileOwnerRoute(storedSessionId: string): SessionOwnerRoute | undefined {

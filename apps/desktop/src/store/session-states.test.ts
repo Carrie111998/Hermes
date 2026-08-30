@@ -34,6 +34,7 @@ import {
   orderTilesByTree,
   patchSessionTile,
   recordSessionEventScope,
+  rekeySessionTile,
   releaseSessionTranscript,
   requestForOwnedSession,
   resetTileRuntimeBindings,
@@ -1227,5 +1228,68 @@ describe('isSessionRemote (#94640)', () => {
     setSessions([{ id: 'stored-2', profile: 'loki' } as never])
 
     expect(isSessionRemote('stored-2')).toBe(true)
+  })
+})
+
+describe('rekeySessionTile (#98622 — pane identity across compression tip rotation)', () => {
+  beforeEach(() => {
+    $sessionTiles.set([])
+    $selectedStoredSessionId.set(null)
+  })
+
+  afterEach(() => {
+    $sessionTiles.set([])
+    $selectedStoredSessionId.set(null)
+  })
+
+  it('re-keys the open tile to the new tip, preserving placement', () => {
+    $sessionTiles.set([
+      { anchor: 'workspace', before: null, dir: 'right', storedSessionId: 'tip-old' },
+      { storedSessionId: 'unrelated' }
+    ])
+
+    rekeySessionTile('tip-old', 'tip-new')
+
+    const tiles = $sessionTiles.get()
+    expect(tiles.find(t => t.storedSessionId === 'tip-old')).toBeUndefined()
+    const rekeyed = tiles.find(t => t.storedSessionId === 'tip-new')
+    expect(rekeyed).toMatchObject({ anchor: 'workspace', before: null, dir: 'right' })
+    expect(tiles.find(t => t.storedSessionId === 'unrelated')).toBeDefined()
+  })
+
+  it('drops the stale tile when the new tip already has a tile (one pane per conversation)', () => {
+    $sessionTiles.set([{ storedSessionId: 'tip-old' }, { storedSessionId: 'tip-new' }])
+
+    rekeySessionTile('tip-old', 'tip-new')
+
+    const tiles = $sessionTiles.get()
+    expect(tiles).toHaveLength(1)
+    expect(tiles[0].storedSessionId).toBe('tip-new')
+  })
+
+  it('drops the stale tile when the new tip is already the main selection (main OR tile, never both)', () => {
+    $selectedStoredSessionId.set('tip-new')
+    $sessionTiles.set([{ storedSessionId: 'tip-old' }])
+
+    rekeySessionTile('tip-old', 'tip-new')
+
+    expect($sessionTiles.get()).toHaveLength(0)
+  })
+
+  it('is a no-op when no tile carries the previous id', () => {
+    $sessionTiles.set([{ storedSessionId: 'other' }])
+
+    rekeySessionTile('tip-old', 'tip-new')
+
+    expect($sessionTiles.get()).toEqual([{ storedSessionId: 'other' }])
+  })
+
+  it('ignores degenerate inputs (empty id, same id)', () => {
+    $sessionTiles.set([{ storedSessionId: 'tip-old' }])
+
+    rekeySessionTile('', 'tip-new')
+    rekeySessionTile('tip-old', 'tip-old')
+
+    expect($sessionTiles.get()).toEqual([{ storedSessionId: 'tip-old' }])
   })
 })
