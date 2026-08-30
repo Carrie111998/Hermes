@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import copy
 import dataclasses
 import inspect
 import json
@@ -19,7 +20,7 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, cast
 
 logger = logging.getLogger(__name__)
 
@@ -7816,6 +7817,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if not isinstance(result, dict) or not result.get("receipt"):
             state = str(result.get("state") if isinstance(result, dict) else "current")
             label = "already current" if state == "current" else "not ready"
+            if state == "current" and await self._mark_wisdom_action_complete(
+                query,
+                callback_data=data,
+                completed_label=(
+                    "✓ Installed" if action == "install" else "✓ Updated"
+                ),
+            ):
+                return
             try:
                 await query.edit_message_text(
                     text=f"<b>Collective Wisdom skill is {label}</b>",
@@ -7883,6 +7892,14 @@ class TelegramAdapter(BasePlatformAdapter):
         applied_version = applied.get("version") if isinstance(applied, dict) else None
         applied_suffix = f" v{applied_version}" if isinstance(applied_version, int) else ""
         verb = "installed" if action == "install" else "updated"
+        if await self._mark_wisdom_action_complete(
+            query,
+            callback_data=data,
+            completed_label=(
+                "✓ Installed" if action == "install" else "✓ Updated"
+            ),
+        ):
+            return
         try:
             await query.edit_message_text(
                 text=f"✅ <b>{name}{applied_suffix} {verb}</b>",
@@ -7891,6 +7908,136 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception:
             pass
+
+    @staticmethod
+    def _wisdom_api_mapping(value: object) -> Optional[Dict[str, Any]]:
+        """Return a JSON-compatible Telegram API object when one is available."""
+        if isinstance(value, dict):
+            return cast(Dict[str, Any], value)
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            mapped = to_dict()
+            if isinstance(mapped, dict):
+                return mapped
+        return None
+
+    @classmethod
+    def _replace_wisdom_action_button(
+        cls,
+        value: object,
+        *,
+        callback_data: str,
+        completed_label: str,
+    ) -> bool:
+        """Replace one exact Wisdom action with Telegram's disabled button type.
+
+        Rich-message controls can be inline ``RichTextButton`` values or members
+        of a ``RichBlockButtons`` row. The legacy fallback is an inline keyboard.
+        All three serialize the actionable button as a mapping containing
+        ``callback_data``, so one recursive replacement preserves the rest of
+        the notification, including unrelated skills and Portal links.
+        """
+        changed = False
+
+        def visit(node: object) -> None:
+            nonlocal changed
+            if isinstance(node, list):
+                for child in node:
+                    visit(child)
+                return
+            if not isinstance(node, dict):
+                return
+            mapped_node = cast(Dict[str, Any], node)
+            if mapped_node.get("callback_data") == callback_data:
+                mapped_node.pop("callback_data", None)
+                mapped_node["disabled"] = {}
+                mapped_node["style"] = "success"
+                mapped_node["text"] = completed_label
+                changed = True
+                return
+            for child in mapped_node.values():
+                visit(child)
+
+        visit(value)
+        return changed
+
+    async def _mark_wisdom_action_complete(
+        self,
+        query,
+        *,
+        callback_data: str,
+        completed_label: str,
+    ) -> bool:
+        """Keep a Wisdom notification and disable only its completed action."""
+        message = getattr(query, "message", None)
+        bot = getattr(self, "_bot", None)
+        raw_request = getattr(bot, "do_api_request", None)
+        if message is None or not callable(raw_request):
+            return False
+
+        message_id = getattr(message, "message_id", None)
+        chat_id = getattr(message, "chat_id", None)
+        if message_id is None or chat_id is None:
+            return False
+
+        rich_message = getattr(message, "rich_message", None)
+        if rich_message is None:
+            api_kwargs = getattr(message, "api_kwargs", None)
+            getter = getattr(api_kwargs, "get", None)
+            if callable(getter):
+                rich_message = getter("rich_message")
+        rich_mapping = self._wisdom_api_mapping(rich_message)
+        if rich_mapping is not None:
+            updated_rich = copy.deepcopy(rich_mapping)
+            if self._replace_wisdom_action_button(
+                updated_rich,
+                callback_data=callback_data,
+                completed_label=completed_label,
+            ):
+                try:
+                    await raw_request(
+                        "editMessageText",
+                        api_kwargs={
+                            "chat_id": normalize_telegram_chat_id(chat_id),
+                            "message_id": int(message_id),
+                            "rich_message": updated_rich,
+                            "link_preview_options": {"is_disabled": True},
+                        },
+                    )
+                    return True
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Could not preserve completed Wisdom rich notification: %s",
+                        self.name,
+                        _redact_telegram_error_text(exc),
+                    )
+
+        reply_markup = getattr(message, "reply_markup", None)
+        markup_mapping = self._wisdom_api_mapping(reply_markup)
+        if markup_mapping is not None:
+            updated_markup = copy.deepcopy(markup_mapping)
+            if self._replace_wisdom_action_button(
+                updated_markup,
+                callback_data=callback_data,
+                completed_label=completed_label,
+            ):
+                try:
+                    await raw_request(
+                        "editMessageReplyMarkup",
+                        api_kwargs={
+                            "chat_id": normalize_telegram_chat_id(chat_id),
+                            "message_id": int(message_id),
+                            "reply_markup": updated_markup,
+                        },
+                    )
+                    return True
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Could not preserve completed Wisdom fallback notification: %s",
+                        self.name,
+                        _redact_telegram_error_text(exc),
+                    )
+        return False
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback

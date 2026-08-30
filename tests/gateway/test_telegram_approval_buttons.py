@@ -378,6 +378,180 @@ class TestTelegramApprovalCallback:
         )
 
     @pytest.mark.asyncio
+    async def test_wisdom_install_preserves_rich_notification_and_disables_action(
+        self,
+    ):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:plan:install:skill-4"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 77
+        query.message.rich_message = None
+        query.message.reply_markup = None
+        query.message.api_kwargs = {
+            "rich_message": {
+                "blocks": [
+                    {
+                        "type": "paragraph",
+                        "text": [
+                            "New skill from your team\nrelease-checklist · v2\n",
+                            {
+                                "type": "button",
+                                "button": {
+                                    "text": "Install",
+                                    "style": "primary",
+                                    "callback_data": "wi:plan:install:skill-4",
+                                },
+                            },
+                            " ",
+                            {
+                                "type": "button",
+                                "button": {
+                                    "text": "View ↗",
+                                    "url": "https://portal.test/release-checklist",
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        "type": "paragraph",
+                        "text": [
+                            "Update available\nteam-runbook · v3\n",
+                            {
+                                "type": "button",
+                                "button": {
+                                    "text": "Update",
+                                    "style": "primary",
+                                    "callback_data": "wi:plan:update:skill-3",
+                                },
+                            },
+                        ],
+                    },
+                ]
+            }
+        }
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+        service = MagicMock()
+        service.install_plan.return_value = {
+            "receipt": "wip_deadbeef",
+            "skill_id": "skill-4",
+            "slug": "release-checklist",
+            "version": 2,
+            "compatibility": {"outcome": "compatible"},
+            "allowed": True,
+        }
+        service.install_apply.return_value = {
+            "skill_id": "skill-4",
+            "slug": "release-checklist",
+            "version": 2,
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._bot.do_api_request.assert_awaited_once()
+        raw_call = adapter._bot.do_api_request.await_args
+        assert raw_call.args == ("editMessageText",)
+        payload = raw_call.kwargs["api_kwargs"]
+        assert payload["chat_id"] == 12345
+        assert payload["message_id"] == 77
+        rich_message = payload["rich_message"]
+        install_button = rich_message["blocks"][0]["text"][1]["button"]
+        assert install_button == {
+            "text": "✓ Installed",
+            "style": "success",
+            "disabled": {},
+        }
+        assert rich_message["blocks"][0]["text"][3]["button"] == {
+            "text": "View ↗",
+            "url": "https://portal.test/release-checklist",
+        }
+        assert rich_message["blocks"][1]["text"][1]["button"] == {
+            "text": "Update",
+            "style": "primary",
+            "callback_data": "wi:plan:update:skill-3",
+        }
+        query.edit_message_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_wisdom_update_preserves_fallback_keyboard_and_disables_action(
+        self,
+    ):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:plan:update:skill-3"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 78
+        query.message.rich_message = None
+        query.message.api_kwargs = {}
+        query.message.reply_markup.to_dict.return_value = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Update",
+                        "callback_data": "wi:plan:update:skill-3",
+                        "style": "primary",
+                    },
+                    {"text": "View ↗", "url": "https://portal.test/team-runbook"},
+                ],
+                [
+                    {
+                        "text": "Install",
+                        "callback_data": "wi:plan:install:skill-4",
+                    }
+                ],
+            ]
+        }
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+        service = MagicMock()
+        service.update_plan.return_value = {
+            "receipt": "wup_deadbeef",
+            "skill_id": "skill-3",
+            "slug": "team-runbook",
+            "version": 3,
+            "compatibility": {"outcome": "compatible"},
+            "modified": False,
+            "sensitive_expansion": [],
+        }
+        service.update_apply.return_value = {
+            "skill_id": "skill-3",
+            "slug": "team-runbook",
+            "version": 3,
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._bot.do_api_request.assert_awaited_once()
+        raw_call = adapter._bot.do_api_request.await_args
+        assert raw_call.args == ("editMessageReplyMarkup",)
+        keyboard = raw_call.kwargs["api_kwargs"]["reply_markup"]["inline_keyboard"]
+        assert keyboard[0][0] == {
+            "text": "✓ Updated",
+            "style": "success",
+            "disabled": {},
+        }
+        assert keyboard[0][1] == {
+            "text": "View ↗",
+            "url": "https://portal.test/team-runbook",
+        }
+        assert keyboard[1][0] == {
+            "text": "Install",
+            "callback_data": "wi:plan:install:skill-4",
+        }
+        query.edit_message_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_wisdom_callback_does_not_apply_when_full_review_is_required(self):
         adapter = _make_adapter()
         query = AsyncMock()
