@@ -10,6 +10,10 @@ Run multiple independent Hermes agents on the same machine — each with its own
 
 A profile is a separate Hermes home directory. Each profile gets its own directory containing its own `config.yaml`, `.env`, `SOUL.md`, memories, sessions, skills, cron jobs, and state database. Profiles let you run separate agents for different purposes — a coding assistant, a personal bot, a research agent — without mixing up Hermes state.
 
+:::caution Give every agent its own profile
+Never point two agent processes at the same profile (the same Hermes home). Both write memory automatically, and each loads the other's writes into its system prompt at session start — so two writers on one home compound each other's state until it stops being anything you configured. Profiles exist exactly to prevent this; agents that need shared memory should use an [external memory provider](/user-guide/features/memory-providers) instead.
+:::
+
 When you create a profile, it automatically becomes its own command. Create a profile called `coder` and you immediately have `coder chat`, `coder setup`, `coder gateway start`, etc.
 
 ## Quick start
@@ -237,9 +241,29 @@ User-modified skills are never overwritten.
 hermes profile list           # show all profiles with status
 hermes profile show coder     # detailed info for one profile
 hermes profile rename coder dev-bot   # rename (updates alias + service)
-hermes profile export coder   # export to coder.tar.gz
-hermes profile import coder.tar.gz   # import from archive
+hermes profile export coder   # pack into coder.tar.gz (shareable; keys stripped)
+hermes profile import coder.tar.gz   # install an archive as a new profile
 ```
+
+In chat, the same two live as `/export` and `/import` — and in the desktop app as **⌘K → Export/Import profile…**. See [Sharing a profile](#sharing-a-profile).
+
+### Naming the default profile
+
+The default profile's internal ID is always `default` — it can't be truly
+renamed because `~/.hermes` is the installation root. Renaming it instead
+sets a **display name**, which UI surfaces show in place of the bare ID:
+
+```bash
+hermes profile rename default Harumesu   # Unicode fine: 小助手
+```
+
+The display name appears in `hermes profile list`/`show`, the `/profile`
+chat command, the dashboard, and the desktop app (including the Bot Mode
+roster). It is presentation-only: `-p default`, service names, cron jobs,
+and every other reference keep using the canonical `default` ID. It is
+stored as `display_name` in `~/.hermes/profile.yaml`; remove that line to
+revert. Named profiles can carry a `display_name` too (it survives a real
+rename), but `rename` for them still renames the profile itself.
 
 ## Deleting a profile
 
@@ -273,11 +297,47 @@ Profiles use the `HERMES_HOME` environment variable. When you run `coder chat`, 
 
 This is separate from terminal working directory. Tool execution starts from `terminal.cwd` (or the launch directory when `cwd: "."` on the local backend), not automatically from `HERMES_HOME`.
 
+On host installs, tool subprocesses keep your real OS-user `HOME` by default so
+existing CLI credentials under `~` keep working across profiles. Profile data is
+isolated by `HERMES_HOME`, not by changing `HOME`. Container backends still use
+`{HERMES_HOME}/home` for persistent tool state, and host users who need strict
+per-profile tool config can opt in with `terminal.home_mode: profile`.
+
+This means two things that are easy to mix up:
+
+- `HERMES_HOME` is the profile boundary. It controls Hermes config, `.env`,
+  memory, sessions, skills, logs, cron jobs, gateway state, and other Hermes
+  data.
+- `HOME` is the operating-system/user home that external CLIs expect. On host
+  installs, Hermes keeps it as the real user home by default so tools like
+  `git`, `ssh`, `gh`, `az`, `npm`, Claude Code, and Codex find the same
+  credentials they use in your normal shell.
+
+The tradeoff is that host profiles share normal user-level CLI state by default.
+If you need separate CLI identities per profile, set `terminal.home_mode:
+profile` in that profile's `config.yaml`. In that mode Hermes launches tool
+subprocesses with `HOME={HERMES_HOME}/home`; you then need to initialize or link
+the profile-specific `~/.ssh`, `~/.gitconfig`, `~/.config/gh`, cloud CLI auth,
+Claude/Codex auth, npm state, and similar files inside that profile home.
+
+Hermes also exposes `HERMES_REAL_HOME` to subprocesses so scripts can still find
+the actual account home when `home_mode: profile` is active.
+
 The default profile is simply `~/.hermes` itself. No migration needed — existing installs work identically.
 
-## Sharing profiles as distributions
+## Sharing a profile
 
-A profile you built on one machine can be packaged as a **git repository** and installed with one command on another machine — your own workstation, a teammate's laptop, or a community user's environment. The shared package includes the SOUL, config, skills, cron jobs, and MCP connections. Credentials, memories, and sessions stay per-machine.
+A profile you built on one machine can go to another — your own workstation, a teammate's laptop, or the community. Two paths:
+
+**Send a file.** `/export` packs the profile into one `.tar.gz` — skills, memory, persona, crons, plugins, settings, and (from the desktop) your theme and layout. API keys are stripped. The recipient runs `/import`.
+
+```bash
+# In chat, run /export, hand over the file, and they run /import on it
+hermes profile export coder
+hermes profile import ./coder.tar.gz --name coder
+```
+
+**Publish a distribution.** Package the profile as a **git repository** so recipients install it with one command and pull versioned updates later. Carries the SOUL, config, skills, cron jobs, and MCP connections; credentials, memories, and sessions stay per-machine.
 
 ```bash
 # Install a whole agent from a git repo
@@ -287,4 +347,4 @@ hermes profile install github.com/you/research-bot --alias
 hermes profile update research-bot
 ```
 
-See **[Profile Distributions: Share a Whole Agent](./profile-distributions.md)** for the full guide — authoring, publishing, update semantics, security model, and use cases.
+Use an export file for a one-time handoff or a move; use a distribution for an agent you'll keep shipping. See **[Profile Distributions: Share a Whole Agent](./profile-distributions.md)** for both — the comparison table, authoring, publishing, update semantics, and the security model.
