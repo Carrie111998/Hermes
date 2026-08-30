@@ -4792,14 +4792,22 @@ class HermesIndexSource(SkillSource):
 
         return None
 
-    @staticmethod
-    def _to_meta(entry: dict) -> SkillMeta:
+    def _to_meta(self, entry: dict) -> SkillMeta:
+        trust_level = entry.get("trust_level", "community")
+        github_id = entry.get("resolved_github_id")
+        if not github_id:
+            repo = entry.get("repo", "")
+            path = entry.get("path", "")
+            if repo and path:
+                github_id = f"{repo}/{path}"
+        if github_id:
+            trust_level = self._get_github().trust_level_for(github_id)
         return SkillMeta(
             name=entry.get("name", ""),
             description=entry.get("description", ""),
             source=entry.get("source", "hermes-index"),
             identifier=entry.get("identifier", ""),
-            trust_level=entry.get("trust_level", "community"),
+            trust_level=trust_level,
             repo=entry.get("repo"),
             path=entry.get("path"),
             tags=entry.get("tags", []),

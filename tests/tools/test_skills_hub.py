@@ -752,6 +752,25 @@ class TestCreateSourceRouter:
         assert bundle is not None
         assert bundle.trust_level == "operator"
 
+    def test_index_metadata_uses_current_operator_tap_trust(self):
+        github = GitHubSource(
+            auth=MagicMock(spec=GitHubAuth),
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+        index = HermesIndexSource(
+            auth=MagicMock(spec=GitHubAuth),
+            github=github,
+        )
+
+        meta = index._to_meta({
+            "name": "hermes",
+            "identifier": "GoBeromsu/bstack/skills/hermes",
+            "resolved_github_id": "GoBeromsu/bstack/skills/hermes",
+            "trust_level": "community",
+        })
+
+        assert meta.trust_level == "operator"
+
 
 # ---------------------------------------------------------------------------
 # HubLockFile
