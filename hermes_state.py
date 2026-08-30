@@ -9753,6 +9753,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if self._title_rank(current["title_source"]) >= new_rank:
                     return 0
 
+            changed_at = time.time()
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
@@ -9777,8 +9778,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         conn, ancestor_id=conflict_id, descendant_id=session_id
                     ):
                         conn.execute(
-                            "UPDATE sessions SET title = NULL WHERE id = ?",
-                            (conflict_id,),
+                            "UPDATE sessions SET title = NULL, title_changed_at = ? "
+                            "WHERE id = ?",
+                            (changed_at, conflict_id),
                         )
                     else:
                         raise ValueError(
@@ -9788,11 +9790,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # NULL-safe in SQLite), so a concurrent write between the SELECT
             # and here loses instead of being silently overwritten.
             cursor = conn.execute(
-                "UPDATE sessions SET title = ?, title_source = ? "
+                "UPDATE sessions SET title = ?, title_source = ?, "
+                "title_changed_at = ? "
                 "WHERE id = ? AND title IS ? AND title_source IS ?",
                 (
                     title,
                     source if title else None,
+                    changed_at,
                     session_id,
                     current["title"],
                     current["title_source"],
@@ -10747,7 +10751,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 merged = dict(s)
                 for key in (
                     "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "preview",
+                    "tool_call_count", "title", "title_changed_at", "last_active", "preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
                 ):
                     if key in tip_row:
