@@ -844,6 +844,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    force_standalone=False,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -864,7 +865,7 @@ async def _send_via_adapter(
     except Exception:
         runner = None
 
-    if runner is not None:
+    if runner is not None and not force_standalone:
         try:
             adapter = runner.adapters.get(platform)
         except Exception:
@@ -971,7 +972,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    force_standalone=False,
+    args=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1302,6 +1313,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
+                force_standalone=force_standalone,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1389,6 +1401,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                force_standalone=force_standalone,
             )
 
         if isinstance(result, dict) and result.get("error"):
