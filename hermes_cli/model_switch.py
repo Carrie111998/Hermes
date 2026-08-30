@@ -744,15 +744,16 @@ def resolve_persist_behavior(
     1. ``--once`` explicitly opts out → ``False`` (next turn only).
     2. ``--session`` explicitly opts out → ``False`` (this session only).
     3. ``--global`` explicitly opts in → ``True``.
-    4. ``--provider`` given without an explicit persist flag → ``False``
-       (session only).  Provider switches are typically exploratory — the
-       user is trying a different backend for this conversation, not
-       reconfiguring the default.  ``--global`` can still force persist.
-    5. Otherwise defer to ``model.persist_switch_by_default`` in
+    4. Otherwise defer to ``model.persist_switch_by_default`` in
        ``config.yaml`` (defaults to ``False``: a plain ``/model <name>``
-       affects only the current session).  Users who want the old
-       persist-by-default behavior can set the key to ``true``; a one-off
-       ``--global`` always persists.
+       affects only the current session).  Users who want picker/menu choices
+       to behave like a persistent preference can set the key to ``true``;
+       a one-off ``--global`` always persists.
+
+    ``--provider`` is intentionally *not* an automatic session-only opt-out
+    when the config default is true.  Gateway/model-picker choices for named
+    custom providers necessarily carry a provider slug; those menu choices
+    should still persist for users who enabled ``persist_switch_by_default``.
 
     The config read is defensive: on a fresh install ``model`` may be a
     flat string rather than a dict, in which case the built-in default
@@ -764,8 +765,6 @@ def resolve_persist_behavior(
         return False
     if is_global:
         return True
-    if explicit_provider:
-        return False
     try:
         from hermes_cli.config import load_config
 
