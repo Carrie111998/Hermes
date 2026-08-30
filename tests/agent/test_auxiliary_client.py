@@ -1847,7 +1847,7 @@ class TestAuxiliaryFallbackLayering:
         return patches
 
     def test_sync_configured_chain_continues_after_fallback_402(self):
-        """Primary 402 -> fallback[0] 402 -> fallback[1] success."""
+        """Later calls skip the primary and fallback that already returned 402."""
         entries = self._fallback_entries()
         primary = MagicMock()
         primary.chat.completions.create.side_effect = self._make_payment_err()
@@ -1868,14 +1868,20 @@ class TestAuxiliaryFallbackLayering:
                 task="compression",
                 messages=[{"role": "user", "content": "summarize"}],
             )
+            repeated = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize another chunk"}],
+            )
 
         assert result.choices[0].message.content == "chain-success"
+        assert repeated.choices[0].message.content == "chain-success"
+        assert primary.chat.completions.create.call_count == 1
         assert fallback_zero.chat.completions.create.call_count == 1
-        assert fallback_one.chat.completions.create.call_count == 1
+        assert fallback_one.chat.completions.create.call_count == 2
 
     @pytest.mark.asyncio
     async def test_async_configured_chain_continues_after_fallback_402(self):
-        """Async primary 402 -> fallback[0] 402 -> fallback[1] success."""
+        """Async later calls skip routes that already returned 402."""
         entries = self._fallback_entries()
         primary = MagicMock()
         primary.chat.completions.create = AsyncMock(side_effect=self._make_payment_err())
@@ -1905,10 +1911,16 @@ class TestAuxiliaryFallbackLayering:
                 task="compression",
                 messages=[{"role": "user", "content": "summarize"}],
             )
+            repeated = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize another chunk"}],
+            )
 
         assert result.choices[0].message.content == "async-chain-success"
+        assert repeated.choices[0].message.content == "async-chain-success"
+        assert primary.chat.completions.create.await_count == 1
         assert async_zero.chat.completions.create.await_count == 1
-        assert async_one.chat.completions.create.await_count == 1
+        assert async_one.chat.completions.create.await_count == 2
 
     def test_configured_chain_exhaustion_preserves_original_error_and_warning(
         self, caplog,

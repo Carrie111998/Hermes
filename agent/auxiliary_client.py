@@ -5965,6 +5965,10 @@ def _try_configured_fallback_chain(
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
+        if _is_provider_unhealthy(_normalize_chain_label(fb_provider)):
+            _log_skip_unhealthy(_normalize_chain_label(fb_provider), task)
+            tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
+            continue
         fb_model_raw = str(entry.get("model", "")).strip()
         if should_skip_candidate(
             BackendIdentity.build(
@@ -9926,6 +9930,14 @@ def _call_llm_impl(
             main_runtime=main_runtime,
             task=task,
         )
+        explicit_provider = (resolved_provider or "").strip().lower()
+        if (
+            task
+            and explicit_provider not in {"", "auto"}
+            and _is_provider_unhealthy(_normalize_chain_label(explicit_provider))
+        ):
+            _log_skip_unhealthy(_normalize_chain_label(explicit_provider), task)
+            client = None
         effective_provider = _effective_provider_for_client(
             client, resolved_provider,
         )
@@ -10816,6 +10828,14 @@ async def _async_call_llm_impl(
             main_runtime=main_runtime,
             task=task,
         )
+        explicit_provider = (resolved_provider or "").strip().lower()
+        if (
+            task
+            and explicit_provider not in {"", "auto"}
+            and _is_provider_unhealthy(_normalize_chain_label(explicit_provider))
+        ):
+            _log_skip_unhealthy(_normalize_chain_label(explicit_provider), task)
+            client = None
         effective_provider = _effective_provider_for_client(
             client, resolved_provider,
         )
