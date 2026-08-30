@@ -3356,8 +3356,10 @@ def _current_checkout_sha() -> str | None:
 
 def _receipt_looks_unfinished(receipt: dict) -> bool:
     """True when *receipt* is from an update that did not finish cleanly."""
+    from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON
+
     stop_reason = receipt.get("stop_reason")
-    if stop_reason and stop_reason != "completed at command boundary":
+    if stop_reason and stop_reason != COMMAND_BOUNDARY_STOP_REASON:
         return True
     exit_code = receipt.get("exit_code")
     outcome = receipt.get("outcome")

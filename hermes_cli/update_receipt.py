@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _RECEIPT_DIR_NAME = "update_receipts"
 _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
+COMMAND_BOUNDARY_STOP_REASON = "completed at command boundary"
 
 # Module-level current receipt. ``hermes update`` is a single-threaded CLI
 # command; a module singleton lets the 7k-line updater record steps from
