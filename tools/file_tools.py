@@ -689,15 +689,6 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
 
-    try:
-        from agent.file_safety import get_write_denied_error
-        for probe in (resolved, normalized, filepath):
-            denial_err = get_write_denied_error(probe)
-            if denial_err:
-                return denial_err
-    except Exception:
-        pass
-
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
@@ -723,6 +714,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         or normalized in _SENSITIVE_EXACT_PATHS
     ):
         return _err
+
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -734,6 +726,16 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+
+    try:
+        from agent.file_safety import get_write_denied_error
+        for probe in (resolved, normalized, filepath):
+            denial_err = get_write_denied_error(probe)
+            if denial_err:
+                return denial_err
+    except Exception:
+        pass
+
     return None
 
 
