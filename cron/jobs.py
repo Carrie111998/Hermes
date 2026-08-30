@@ -3595,7 +3595,7 @@ def _claim_job_for_fire_locked(
             job["fire_claim"] = {"at": now.isoformat(), "by": owner}
             kind = job.get("schedule", {}).get("kind")
             if advance_schedule and kind in {"cron", "interval"}:
-                nxt = compute_next_run(job["schedule"], now.isoformat())
+                nxt = _advance_recurring_run(job, now)
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
