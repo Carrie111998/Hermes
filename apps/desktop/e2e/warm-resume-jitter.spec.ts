@@ -396,7 +396,7 @@ test('tab reactivation preserves the mounted transcript without repainting', asy
 test('warm-route resume after background inference completes (no jitter)', async ({}, testInfo) => {
   test.fixme(
     true,
-    'Warm resume repaints after inference: expected one additive burst, got two ([18,1]).',
+    'Blocked on #93140: warm resume repaints after inference: expected one additive burst, got two ([18,1]).',
   )
 
   const page = fixture!.page

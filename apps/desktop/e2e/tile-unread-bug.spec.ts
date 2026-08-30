@@ -173,7 +173,7 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
 // Test 2: SPLIT (visible) — unread dot is WRONG (FAILS until fix)
 // ────────────────────────────────────────────────────────────────────────
 
-test.describe.skip('sidebar states — split (visible) unread bug (RED)', () => {
+test.describe.skip('Blocked on #93141: sidebar states — split (visible) unread bug (RED)', () => {
   test.describe.configure({ mode: 'serial' })
 
   let fixture: MockBackendFixture
