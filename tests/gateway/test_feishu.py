@@ -2264,14 +2264,14 @@ class TestFeishuReplyAnchors(unittest.TestCase):
 
 class TestFeishuProcessInboundMessage(unittest.TestCase):
     def _build_adapter(self):
-        from plugins.platforms.feishu.adapter import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter, FeishuQuotedMessageContext
 
         adapter = FeishuAdapter.__new__(FeishuAdapter)
         adapter._bot_open_id = "ou_bot"
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
-        adapter._fetch_message_text = AsyncMock(return_value=None)
+        adapter._fetch_message_context = AsyncMock(return_value=FeishuQuotedMessageContext())
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
@@ -2310,6 +2310,67 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertEqual(event.message_id, "om_current")
         self.assertEqual(event.reply_to_message_id, "om_quoted")
         self.assertIsNone(adapter.build_source.call_args.kwargs["thread_id"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_reply_to_image_injects_quoted_image_context(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = Mock()
+        adapter._build_get_message_request = Mock(return_value=object())
+        adapter._download_feishu_image = AsyncMock(
+            return_value=("/tmp/quoted-image.jpg", "image/jpeg")
+        )
+        parent = SimpleNamespace(
+            body=SimpleNamespace(content=json.dumps({"image_key": "img_quoted"})),
+            msg_type="image",
+            mentions=[],
+        )
+        response = Mock()
+        response.success = Mock(return_value=True)
+        response.data = SimpleNamespace(items=[parent])
+        adapter._client.im.v1.message.get = Mock(return_value=response)
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
+        )
+        adapter._resolve_source_chat_type = Mock(return_value="group")
+        adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
+        adapter._dispatch_inbound_event = AsyncMock()
+
+        message = SimpleNamespace(
+            content=json.dumps({"text": "What is in this?"}),
+            message_type="text",
+            message_id="om_current",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id="om_quoted_image",
+            upper_message_id=None,
+            root_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_current",
+            )
+        )
+
+        await_args = adapter._dispatch_inbound_event.await_args
+        if await_args is None:
+            self.fail("quoted reply was not dispatched")
+        event = await_args.args[0]
+        self.assertEqual(event.reply_to_text, "[Image]")
+        self.assertEqual(event.media_urls, ["/tmp/quoted-image.jpg"])
+        self.assertEqual(event.media_types, ["image/jpeg"])
+        adapter._download_feishu_image.assert_awaited_once_with(
+            message_id="om_quoted_image",
+            image_key="img_quoted",
+        )
 
     def test_topic_reply_keeps_the_current_message_as_reply_anchor(self):
         """A true topic stays threaded and anchors to the newest user message."""
@@ -2464,14 +2525,14 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
     """High-level scenarios from the design spec — verify the full pipeline."""
 
     def _build_adapter(self):
-        from plugins.platforms.feishu.adapter import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter, FeishuQuotedMessageContext
 
         adapter = FeishuAdapter.__new__(FeishuAdapter)
         adapter._bot_open_id = "ou_bot"
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
-        adapter._fetch_message_text = AsyncMock(return_value=None)
+        adapter._fetch_message_context = AsyncMock(return_value=FeishuQuotedMessageContext())
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
