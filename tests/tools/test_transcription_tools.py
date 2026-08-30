@@ -9,6 +9,7 @@ import os
 import sys
 import struct
 import subprocess
+import time
 import types
 import wave
 from pathlib import Path
@@ -1173,7 +1174,7 @@ class TestTranscribeCredentialReadGuard:
         from agent.file_safety import get_read_block_error
 
         env_file = tmp_path / ".env"
-        env_file.write_text("OPENAI_API_KEY=sk-secret\n")
+        env_file.write_text("OPENAI_API_KEY=sk-secret\n", encoding="utf-8")
 
         expected = get_read_block_error(str(env_file))
         assert expected, "test setup: a .env file should be read-blocked"
@@ -1207,7 +1208,7 @@ class TestRunCommandSttIdleTimeout:
                 "import sys, time",
                 "for idx in range(4):",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
-                "    time.sleep(0.04)",
+                "    time.sleep(0.15)",
                 "print('done', flush=True)",
             ]),
             encoding="utf-8",
@@ -1215,12 +1216,47 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.1,
+            timeout=0.5,
         )
 
         assert result.returncode == 0
         assert "tick 3" in result.stderr
         assert "done" in result.stdout
+
+    def test_completed_process_does_not_timeout_waiting_for_reader_eof(self):
+        """A finished command is not idle just because pipe readers lag."""
+        from tools.transcription_tools import _run_command_stt
+
+        class SlowEofStream:
+            encoding = "utf-8"
+
+            def __init__(self, chunks):
+                self.chunks = list(chunks)
+
+            def read(self, size):
+                if self.chunks:
+                    return self.chunks.pop(0)
+                time.sleep(0.15)
+                return ""
+
+        class FakeProcess:
+            pid = 12345
+            returncode = 0
+            stdout = SlowEofStream(["done"])
+            stderr = SlowEofStream(["tick"])
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with patch("tools.transcription_tools.subprocess.Popen", return_value=FakeProcess()):
+            result = _run_command_stt("fake stt", timeout=0.05)
+
+        assert result.returncode == 0
+        assert result.stdout == "done"
+        assert result.stderr == "tick"
 
     def test_silent_stall_still_times_out(self, tmp_path):
         """A silently stalled command is killed once the idle window elapses,
@@ -1240,7 +1276,7 @@ class TestRunCommandSttIdleTimeout:
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
             _run_command_stt(
                 self._shell_command(sys.executable, "-u", str(script)),
-                timeout=0.1,
+                timeout=0.5,
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")

@@ -1773,6 +1773,11 @@ def init_agent(
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
+    agent._awaiting_session_persistence = False
+    agent._awaiting_session_persistence_stage = None
+    agent._session_persistence_wait_attempts = 0
+    agent._session_persistence_wait_cancelled = False
+    agent._tool_execution_interrupted = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

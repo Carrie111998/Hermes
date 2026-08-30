@@ -101,6 +101,10 @@ COMPACTION_STATUS_MARKER = "Compacting context"
 COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
+# Exact start-edge marker used by gateway topic-local progress notices. Keep
+# this distinct from COMPACTION_STATUS so post-facto bookkeeping cannot
+# impersonate a real compressor start.
+COMPACTION_START_STATUS = f"{COMPACTION_STATUS} [start]"
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
@@ -5269,6 +5273,7 @@ def try_shrink_image_parts_in_messages(
 
 
 __all__ = [
+    "COMPACTION_START_STATUS",
     "COMPACTION_STATUS",
     "COMPACTION_DONE_STATUS",
     "COMPACTION_STATUS_MARKER",

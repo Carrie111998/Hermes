@@ -526,7 +526,7 @@ class TestRuntimeFtsRebuild:
         monkeypatch.setattr(
             SessionDB,
             "_recover_stale_fts",
-            lambda self, cursor, legacy: False,
+            lambda self, cursor, legacy, include_trigram_policy=True: False,
         )
         reopened = SessionDB(db_path=db_path)
         try:

@@ -81,14 +81,18 @@ class TestSnapshotRealProfile:
         (root / "Default" / "Cache" / "Cache_Data").mkdir(parents=True)
         (root / "Code Cache" / "js").mkdir(parents=True)
         (root / "Crashpad").mkdir()
-        (root / "Local State").write_text('{"os_crypt": {}}')
-        (root / "Default" / "Cookies").write_text("sqlite-cookies")
-        (root / "Default" / "Network" / "Cookies").write_text("sqlite-net-cookies")
-        (root / "Default" / "Login Data").write_text("sqlite-logins")
-        (root / "Default" / "Preferences").write_text("{}")
-        (root / "Default" / "Cache" / "Cache_Data" / "big").write_text("x" * 1000)
-        (root / "Code Cache" / "js" / "blob").write_text("y" * 1000)
-        (root / "Crashpad" / "dump").write_text("z")
+        (root / "Local State").write_text('{"os_crypt": {}}', encoding="utf-8")
+        (root / "Default" / "Cookies").write_text("sqlite-cookies", encoding="utf-8")
+        (root / "Default" / "Network" / "Cookies").write_text(
+            "sqlite-net-cookies", encoding="utf-8"
+        )
+        (root / "Default" / "Login Data").write_text("sqlite-logins", encoding="utf-8")
+        (root / "Default" / "Preferences").write_text("{}", encoding="utf-8")
+        (root / "Default" / "Cache" / "Cache_Data" / "big").write_text(
+            "x" * 1000, encoding="utf-8"
+        )
+        (root / "Code Cache" / "js" / "blob").write_text("y" * 1000, encoding="utf-8")
+        (root / "Crashpad" / "dump").write_text("z", encoding="utf-8")
         # Live-instance leftovers that must never reach the copy
         os.symlink("dead-target-1", root / "SingletonLock")
         return root
@@ -103,7 +107,12 @@ class TestSnapshotRealProfile:
         assert err is None
         assert dst == str(home / "browser-profile" / "chrome")
         # Auth files present
-        assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "sqlite-cookies"
+        assert (
+            (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text(
+                encoding="utf-8"
+            )
+            == "sqlite-cookies"
+        )
         assert (home / "browser-profile" / "chrome" / "Default" / "Network" / "Cookies").exists()
         assert (home / "browser-profile" / "chrome" / "Default" / "Login Data").exists()
         assert (home / "browser-profile" / "chrome" / "Local State").exists()
@@ -123,14 +132,19 @@ class TestSnapshotRealProfile:
         assert err is None
         # Simulate: user logs into a new site in their own browser, and the
         # copy has drifted state that must survive (History not in refresh set).
-        (src / "Default" / "Cookies").write_text("sqlite-cookies-v2")
+        (src / "Default" / "Cookies").write_text("sqlite-cookies-v2", encoding="utf-8")
         copy_history = home / "browser-profile" / "chrome" / "Default" / "History"
-        copy_history.write_text("agent-session-history")
+        copy_history.write_text("agent-session-history", encoding="utf-8")
 
         dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
         assert err2 is None and dst2 == dst
-        assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "sqlite-cookies-v2"
-        assert copy_history.read_text() == "agent-session-history"
+        assert (
+            (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text(
+                encoding="utf-8"
+            )
+            == "sqlite-cookies-v2"
+        )
+        assert copy_history.read_text(encoding="utf-8") == "agent-session-history"
 
     def test_missing_source_fails_closed(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
@@ -230,7 +244,9 @@ class TestRealProfileCdpLaunch:
                 return None
 
         def fake_popen(argv, **kw):
-            (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
+            (tmp_path / "DevToolsActivePort").write_text(
+                "41000\n/devtools/browser/x\n", encoding="utf-8"
+            )
             return FakeChrome()
 
         with patch.object(bt, "_use_real_profile", return_value=True), \
@@ -280,7 +296,9 @@ class TestRealProfileCdpLaunch:
 
         def fake_popen(argv, **kw):
             captured["chrome_argv"] = argv
-            (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
+            (tmp_path / "DevToolsActivePort").write_text(
+                "41000\n/devtools/browser/x\n", encoding="utf-8"
+            )
             return FakeChrome()
 
         with patch.object(bt, "_use_real_profile", return_value=True), \
@@ -314,7 +332,9 @@ class TestRealProfileCdpLaunch:
                 return None
 
         def fake_popen(argv, **kw):
-            (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
+            (tmp_path / "DevToolsActivePort").write_text(
+                "41000\n/devtools/browser/x\n", encoding="utf-8"
+            )
             return FakeChrome()
 
         with patch.object(bt, "_use_real_profile", return_value=True), \
@@ -338,7 +358,9 @@ class TestRealProfileCdpLaunch:
 
     def test_cdp_on_data_dir_matches_devtoolsactiveport(self, tmp_path):
         import tools.browser_tool as bt
-        (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
+        (tmp_path / "DevToolsActivePort").write_text(
+            "41000\n/devtools/browser/x\n", encoding="utf-8"
+        )
         assert bt._cdp_on_data_dir("http://127.0.0.1:41000", str(tmp_path))
         assert not bt._cdp_on_data_dir("http://127.0.0.1:9999", str(tmp_path))
 
@@ -349,7 +371,7 @@ class TestConsentConfigRead:
     def test_consent_read_from_config(self, tmp_path, monkeypatch):
         import tools.browser_tool as bt
         cfg = tmp_path / "config.yaml"
-        cfg.write_text("browser:\n  use_real_profile: true\n")
+        cfg.write_text("browser:\n  use_real_profile: true\n", encoding="utf-8")
         with patch("hermes_cli.config.read_raw_config",
                    return_value={"browser": {"use_real_profile": True}}):
             assert bt._use_real_profile() is True
@@ -601,7 +623,7 @@ class TestSnapshotIsCredentialStore:
         home = tmp_path / ".hermes"
         (home / "browser-profile" / "chrome" / "Default").mkdir(parents=True)
         cookies = home / "browser-profile" / "chrome" / "Default" / "Cookies"
-        cookies.write_text("secret-cookie-db")
+        cookies.write_text("secret-cookie-db", encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(home))
         err = fs.get_read_block_error(str(cookies))
         assert err and "snapshot" in err.lower()
@@ -612,7 +634,7 @@ class TestSnapshotIsCredentialStore:
         home.mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(home))
         normal = tmp_path / "notes.txt"
-        normal.write_text("hello")
+        normal.write_text("hello", encoding="utf-8")
         assert fs.get_read_block_error(str(normal)) is None
 
     def test_snapshot_dir_secured(self, tmp_path, monkeypatch):
@@ -620,8 +642,8 @@ class TestSnapshotIsCredentialStore:
         import hermes_cli.browser_connect as bc
         src = tmp_path / "real" / "Default"
         src.mkdir(parents=True)
-        (tmp_path / "real" / "Local State").write_text("{}")
-        (src / "Cookies").write_text("db")
+        (tmp_path / "real" / "Local State").write_text("{}", encoding="utf-8")
+        (src / "Cookies").write_text("db", encoding="utf-8")
         monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
         called = {"paths": []}
         with patch("hermes_cli.config._secure_dir",
@@ -642,13 +664,19 @@ class TestReviewBugFixes:
         for prof in ("Default", "Profile 6"):
             (root / prof / "Network").mkdir(parents=True)
         (root / "Local State").write_text(
-            '{"profile": {"last_used": "Profile 6"}}'
+            '{"profile": {"last_used": "Profile 6"}}', encoding="utf-8"
         )
         # Default is signed OUT (tracking cookies only); Profile 6 has the session.
-        (root / "Default" / "Cookies").write_text("default-tracking-only")
-        (root / "Profile 6" / "Cookies").write_text("PROFILE6-SESSION-AUTH")
-        (root / "Profile 6" / "Login Data").write_text("profile6-logins")
-        (root / "Profile 6" / "Preferences").write_text("{}")
+        (root / "Default" / "Cookies").write_text(
+            "default-tracking-only", encoding="utf-8"
+        )
+        (root / "Profile 6" / "Cookies").write_text(
+            "PROFILE6-SESSION-AUTH", encoding="utf-8"
+        )
+        (root / "Profile 6" / "Login Data").write_text(
+            "profile6-logins", encoding="utf-8"
+        )
+        (root / "Profile 6" / "Preferences").write_text("{}", encoding="utf-8")
         return root
 
     def test_last_used_profile_lands_in_copy_default(self, tmp_path, monkeypatch):
@@ -659,22 +687,33 @@ class TestReviewBugFixes:
         dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None
         # The copy's Default must carry PROFILE 6's session, not Default's.
-        got = (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text()
+        got = (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text(
+            encoding="utf-8"
+        )
         assert got == "PROFILE6-SESSION-AUTH"
-        assert (home / "browser-profile" / "chrome" / "Default" / "Login Data").read_text() == "profile6-logins"
+        assert (
+            (home / "browser-profile" / "chrome" / "Default" / "Login Data").read_text(
+                encoding="utf-8"
+            )
+            == "profile6-logins"
+        )
 
     def test_last_used_falls_back_to_default(self, tmp_path):
         import hermes_cli.browser_connect as bc
         root = tmp_path / "d"
         (root / "Default").mkdir(parents=True)
-        (root / "Local State").write_text('{"profile": {"last_used": "Profile 9"}}')  # not present
+        (root / "Local State").write_text(
+            '{"profile": {"last_used": "Profile 9"}}', encoding="utf-8"
+        )  # not present
         assert bc._last_used_profile(str(root)) == "Default"
 
     def test_last_used_reads_local_state(self, tmp_path):
         import hermes_cli.browser_connect as bc
         root = tmp_path / "d"
         (root / "Profile 6").mkdir(parents=True)
-        (root / "Local State").write_text('{"profile": {"last_used": "Profile 6"}}')
+        (root / "Local State").write_text(
+            '{"profile": {"last_used": "Profile 6"}}', encoding="utf-8"
+        )
         assert bc._last_used_profile(str(root)) == "Profile 6"
 
     def test_refresh_remirrors_last_used(self, tmp_path, monkeypatch):
@@ -683,10 +722,17 @@ class TestReviewBugFixes:
         home = tmp_path / "hh"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
         bc.snapshot_real_profile("chrome", src=str(src))          # fresh
-        (src / "Profile 6" / "Cookies").write_text("PROFILE6-REFRESHED")
+        (src / "Profile 6" / "Cookies").write_text(
+            "PROFILE6-REFRESHED", encoding="utf-8"
+        )
         dst, err = bc.snapshot_real_profile("chrome", src=str(src))  # refresh
         assert err is None
-        assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "PROFILE6-REFRESHED"
+        assert (
+            (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text(
+                encoding="utf-8"
+            )
+            == "PROFILE6-REFRESHED"
+        )
 
     # ── Bug 3: private-URL sidecar must NOT carry the real profile ──
     def test_sidecar_never_uses_real_profile(self):
@@ -768,10 +814,16 @@ class TestReviewRound3:
     def _multi(self, root):
         for prof in ("Default", "Profile 6"):
             (root / prof / "Network").mkdir(parents=True)
-        (root / "Local State").write_text('{"profile": {"last_used": "Profile 6"}}')
-        (root / "Default" / "Cookies").write_text("default-signed-out")
-        (root / "Profile 6" / "Cookies").write_text("PROFILE6-SESSION")
-        (root / "Profile 6" / "Preferences").write_text("{}")
+        (root / "Local State").write_text(
+            '{"profile": {"last_used": "Profile 6"}}', encoding="utf-8"
+        )
+        (root / "Default" / "Cookies").write_text(
+            "default-signed-out", encoding="utf-8"
+        )
+        (root / "Profile 6" / "Cookies").write_text(
+            "PROFILE6-SESSION", encoding="utf-8"
+        )
+        (root / "Profile 6" / "Preferences").write_text("{}", encoding="utf-8")
         return root
 
     # ── ② torn first copy must not poison freshness ──
@@ -792,11 +844,17 @@ class TestReviewRound3:
         dst = bc.real_profile_copy_dir("chrome")
         # Simulate a torn first copy: Default exists but NO done marker.
         os.makedirs(os.path.join(dst, "Default"))
-        open(os.path.join(dst, "Default", "Cookies"), "w").write("HALF-COPY-GARBAGE")
+        with open(os.path.join(dst, "Default", "Cookies"), "w", encoding="utf-8") as fh:
+            fh.write("HALF-COPY-GARBAGE")
         d, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None
         # Rebuilt from the active profile, not treated as populated.
-        assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "PROFILE6-SESSION"
+        assert (
+            (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text(
+                encoding="utf-8"
+            )
+            == "PROFILE6-SESSION"
+        )
         assert os.path.isfile(os.path.join(dst, bc._SNAPSHOT_DONE_MARKER))
 
     # ── ④ only the active profile is copied, never the others ──
@@ -805,14 +863,16 @@ class TestReviewRound3:
         src = self._multi(tmp_path / "real")
         # Add a non-active profile with its own cookies — must NOT be copied.
         (src / "Profile 3").mkdir()
-        (src / "Profile 3" / "Cookies").write_text("PROFILE3-SHOULD-NOT-COPY")
+        (src / "Profile 3" / "Cookies").write_text(
+            "PROFILE3-SHOULD-NOT-COPY", encoding="utf-8"
+        )
         home = tmp_path / "hh"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
         dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None
         copy = home / "browser-profile" / "chrome"
         # Active profile (Profile 6) landed in Default; other profiles absent.
-        assert (copy / "Default" / "Cookies").read_text() == "PROFILE6-SESSION"
+        assert (copy / "Default" / "Cookies").read_text(encoding="utf-8") == "PROFILE6-SESSION"
         assert not (copy / "Profile 3").exists()
         assert not (copy / "Profile 6").exists()
 
@@ -823,7 +883,7 @@ class TestReviewRound3:
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
         store = home / "browser-profile" / "chrome" / "Default"
         store.mkdir(parents=True)
-        (store / "Cookies").write_text("secret")
+        (store / "Cookies").write_text("secret", encoding="utf-8")
         bc.cleanup_real_profile_snapshots()
         assert not (home / "browser-profile").exists()
 
@@ -964,12 +1024,25 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
+
+        class FakeChrome:
+            def poll(self):
+                return None
+
+        def fake_popen(argv, **kw):
+            (tmp_path / "DevToolsActivePort").write_text(
+                "9251\n/devtools/browser/x\n", encoding="utf-8"
+            )
+            return FakeChrome()
+
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
              patch("hermes_cli.browser_connect.snapshot_real_profile",
                    return_value=(str(tmp_path), None)) as snap, \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
@@ -989,8 +1062,10 @@ class TestWindowsLockedProfileCopy:
     def _locked_src(self, root):
         import sqlite3, json
         (root / "Default" / "Network").mkdir(parents=True)
-        (root / "Local State").write_text(json.dumps({"profile": {"last_used": "Default"}}))
-        (root / "Default" / "Preferences").write_text("{}")
+        (root / "Local State").write_text(
+            json.dumps({"profile": {"last_used": "Default"}}), encoding="utf-8"
+        )
+        (root / "Default" / "Preferences").write_text("{}", encoding="utf-8")
         ck = str(root / "Default" / "Cookies")
         con = sqlite3.connect(ck)
         con.execute("create table cookies(host_key, name)")
@@ -1029,10 +1104,13 @@ class TestWindowsLockedProfileCopy:
 
     def test_copy_auth_file_plain_for_non_db(self, tmp_path):
         import hermes_cli.browser_connect as bc
-        src = str(tmp_path / "Preferences"); open(src, "w").write('{"k":1}')
+        src = str(tmp_path / "Preferences")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write('{"k":1}')
         dst = str(tmp_path / "out" / "Preferences")
         assert bc._copy_auth_file(src, dst) is True
-        assert open(dst).read() == '{"k":1}'
+        with open(dst, encoding="utf-8") as fh:
+            assert fh.read() == '{"k":1}'
 
     def test_fail_closed_when_db_unreadable(self, tmp_path, monkeypatch):
         """If even the online-backup can't read the DB, snapshot fails closed
@@ -1041,9 +1119,11 @@ class TestWindowsLockedProfileCopy:
         import json
         root = tmp_path / "real"
         (root / "Default").mkdir(parents=True)
-        (root / "Local State").write_text(json.dumps({"profile": {"last_used": "Default"}}))
-        (root / "Default" / "Cookies").write_text("not-a-db")
-        (root / "Default" / "Preferences").write_text("{}")
+        (root / "Local State").write_text(
+            json.dumps({"profile": {"last_used": "Default"}}), encoding="utf-8"
+        )
+        (root / "Default" / "Cookies").write_text("not-a-db", encoding="utf-8")
+        (root / "Default" / "Preferences").write_text("{}", encoding="utf-8")
         home = tmp_path / "hh"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
         # Force both sqlite-backup and raw copy to fail for the DB.

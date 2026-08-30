@@ -21,6 +21,7 @@ the real cause instead of reading like disk damage.
 import sqlite3
 import threading
 import time
+import logging
 
 import pytest
 
@@ -83,7 +84,7 @@ class TestTranscriptWritePatience:
 
     def test_exhausted_patience_names_the_real_cause(self, db, monkeypatch):
         """When patience genuinely runs out, the error must say the lock was
-        held by another process — not read like disk/permission damage."""
+        held by another connection — not read like disk/permission damage."""
         monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
 
         started = threading.Event()
@@ -99,8 +100,110 @@ class TestTranscriptWritePatience:
             holder.join(timeout=10.0)
         assert not holder.is_alive()
         text = str(excinfo.value)
-        assert "another Hermes process" in text
+        assert "another database connection" in text
         assert "healthy" in text
+
+    def test_same_process_lock_error_includes_operation_metadata(self, db):
+        """A same-process competing connection must not be blamed on a process."""
+        db._conn.execute("PRAGMA busy_timeout=1")
+        started = threading.Event()
+        holder = threading.Thread(
+            target=_hold_write_lock, args=(db.db_path, 1.0, started)
+        )
+        holder.start()
+        try:
+            assert started.wait(5.0)
+
+            def _do(conn):
+                conn.execute(
+                    "UPDATE state_meta SET value = value WHERE key = 'schema_version'"
+                )
+
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                db._execute_write(
+                    _do,
+                    patience_s=0.05,
+                    operation="test_same_process_lock",
+                    session_id="s-lock-probe",
+                )
+        finally:
+            holder.join(timeout=10.0)
+
+        text = str(excinfo.value)
+        assert "another database connection" in text
+        assert "another Hermes process" not in text
+        assert f"db_path={db.db_path}" in text
+        assert "operation=test_same_process_lock" in text
+        assert "session=s-lock-probe" in text
+        assert "pid=" in text
+        assert "thread=" in text
+
+    def test_recovered_lock_logs_one_wait_and_one_recovery(self, db, monkeypatch, caplog):
+        """Recovered contention emits deduped wait and recovery telemetry."""
+        monkeypatch.setattr(SessionDB, "_WRITE_LOCK_WARNING_AFTER_S", 0.0)
+        monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MIN_S", 0.01)
+        monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MAX_S", 0.01)
+        db._conn.execute("PRAGMA busy_timeout=1")
+        db.create_session("s-recovered", "cli")
+
+        started = threading.Event()
+        holder = threading.Thread(
+            target=_hold_write_lock, args=(db.db_path, 0.25, started)
+        )
+        holder.start()
+        try:
+            assert started.wait(5.0)
+            with caplog.at_level(logging.INFO, logger="hermes_state"):
+                db.append_message(
+                    session_id="s-recovered",
+                    role="user",
+                    content="saved after recovery",
+                )
+        finally:
+            holder.join(timeout=10.0)
+
+        wait_events = [
+            rec for rec in caplog.records
+            if "SessionDB write lock wait:" in rec.message
+        ]
+        recovery_events = [
+            rec for rec in caplog.records
+            if "SessionDB write lock recovered:" in rec.message
+        ]
+        assert len(wait_events) == 1
+        assert len(recovery_events) == 1
+        assert "operation=append_message" in wait_events[0].message
+        assert "session=s-recovered" in wait_events[0].message
+        assert "db_path=" in recovery_events[0].message
+        assert "recovery=success" in recovery_events[0].message
+
+    def test_append_messages_batch_honors_short_patience_override(self, db):
+        """The outer persistence wait can keep DB attempts short and cancellable."""
+        db.create_session("s-short-override", "cli")
+        db._conn.execute("PRAGMA busy_timeout=1")
+
+        started = threading.Event()
+        holder = threading.Thread(
+            target=_hold_write_lock, args=(db.db_path, 0.5, started)
+        )
+        holder.start()
+        try:
+            assert started.wait(5.0)
+            t0 = time.monotonic()
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                db.append_messages_batch(
+                    "s-short-override",
+                    [{"role": "user", "content": "short patience"}],
+                    write_patience_s=0.05,
+                )
+            elapsed = time.monotonic() - t0
+        finally:
+            holder.join(timeout=10.0)
+
+        assert not holder.is_alive()
+        assert elapsed < 0.5
+        assert "another database connection" in str(excinfo.value)
+        assert db.get_messages("s-short-override") == []
 
     def test_write_succeeds_immediately_when_uncontended(self, db):
         """Patience must cost nothing when there is no contention."""

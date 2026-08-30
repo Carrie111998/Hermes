@@ -573,6 +573,27 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_fusion_command(self, event: MessageEvent) -> str:
+        """Handle /fusion through the shared Fusion command adapter."""
+        import asyncio
+        import os
+
+        from hermes_cli.fusion_command import run_fusion_command
+
+        command = (event.text or "").strip() or "/fusion"
+        default_repo_path = os.environ.get("TERMINAL_CWD") or os.getcwd()
+        try:
+            output = await asyncio.to_thread(
+                run_fusion_command,
+                command,
+                default_repo_path=default_repo_path,
+            )
+        except Exception as exc:  # pragma: no cover - defensive gateway envelope
+            return f"Fusion failed: {exc}"
+        if len(output) > 3800:
+            output = output[:3800] + "\n... output truncated; see artifacts for full details."
+        return output
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

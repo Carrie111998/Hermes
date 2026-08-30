@@ -298,6 +298,9 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     Returns ``None`` only when there is genuinely no reliable anchor, in which
     case callers fall back to the process cwd.
     """
+    fusion_root = _get_fusion_scope_root(task_id)
+    if fusion_root is not None:
+        return str(fusion_root)
     try:
         from tools.terminal_tool import get_session_cwd
 
@@ -1122,6 +1125,82 @@ def _is_expected_write_exception(exc: Exception) -> bool:
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
 
+# Fusion v2 participant scopes. Keyed by task_id so ordinary sessions keep
+# normal file-tool behavior. Read-only roots deny write/patch; write roots are
+# used only for isolated spike worktrees and still confine all paths there.
+_fusion_scope_lock = threading.Lock()
+_fusion_readonly_roots: dict[str, Path] = {}
+_fusion_write_roots: dict[str, Path] = {}
+
+
+def register_fusion_readonly_root(task_id: str, repo_root: str) -> None:
+    """Confine read/search file tools for *task_id* to *repo_root*."""
+    if not task_id or not repo_root:
+        return
+    with _fusion_scope_lock:
+        _fusion_readonly_roots[str(task_id)] = Path(repo_root).expanduser().resolve()
+        _fusion_write_roots.pop(str(task_id), None)
+
+
+def unregister_fusion_readonly_root(task_id: str) -> None:
+    """Remove a previously-registered Fusion read-only file scope."""
+    if not task_id:
+        return
+    with _fusion_scope_lock:
+        _fusion_readonly_roots.pop(str(task_id), None)
+
+
+def register_fusion_write_root(task_id: str, worktree_root: str) -> None:
+    """Confine read/search/write/patch file tools to an isolated spike root."""
+    if not task_id or not worktree_root:
+        return
+    with _fusion_scope_lock:
+        _fusion_write_roots[str(task_id)] = Path(worktree_root).expanduser().resolve()
+        _fusion_readonly_roots.pop(str(task_id), None)
+
+
+def unregister_fusion_write_root(task_id: str) -> None:
+    """Remove a previously-registered Fusion spike write scope."""
+    if not task_id:
+        return
+    with _fusion_scope_lock:
+        _fusion_write_roots.pop(str(task_id), None)
+
+
+def _get_fusion_readonly_root(task_id: str = "default") -> Path | None:
+    with _fusion_scope_lock:
+        return _fusion_readonly_roots.get(str(task_id))
+
+
+def _get_fusion_write_root(task_id: str = "default") -> Path | None:
+    with _fusion_scope_lock:
+        return _fusion_write_roots.get(str(task_id))
+
+
+def _get_fusion_scope_root(task_id: str = "default") -> Path | None:
+    return _get_fusion_write_root(task_id) or _get_fusion_readonly_root(task_id)
+
+
+def _fusion_scope_label(task_id: str) -> str:
+    return "Fusion spike" if _get_fusion_write_root(task_id) else "Fusion read-only"
+
+
+def _check_fusion_scoped_path(filepath: str, task_id: str, operation: str) -> str | None:
+    root = _get_fusion_scope_root(task_id)
+    if root is None:
+        return None
+    label = _fusion_scope_label(task_id)
+    try:
+        resolved = _resolve_path_for_task(filepath, task_id)
+    except (OSError, ValueError) as exc:
+        return f"{label} {operation} denied for {filepath!r}: {exc}"
+    if resolved == root or resolved.is_relative_to(root):
+        return None
+    return (
+        f"{label} {operation} denied for {filepath!r}: "
+        f"resolved path {resolved} escapes repository root {root}."
+    )
+
 # Track files read per task to detect re-read loops and deduplicate reads.
 # Per task_id we store:
 #   "last_key":     the key of the most recent read/search call (or None)
@@ -1635,7 +1714,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 "block or produce infinite output."
             )
 
+        fusion_error = _check_fusion_scoped_path(path, task_id, "read")
+        if fusion_error:
+            return tool_error(fusion_error)
+
         _resolved = _resolve_path_for_task(path, task_id)
+        path_for_ops = str(_resolved) if _get_fusion_scope_root(task_id) else path
 
         # ── Special-file type guard (stat-based) ──────────────────────
         # The name blocklist above catches /dev/* and /proc/* aliases; this
@@ -1845,7 +1929,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        result = file_ops.read_file(path_for_ops, offset, limit)
         result_dict = result.to_dict()
 
         # ── Populate negative-result cache on not-found ───────────────
@@ -2246,6 +2330,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     the schema — the mirror rejection error teaches it. The cross-PROFILE
     guard this flag was named for is removed (profiles are not isolated).
     """
+    fusion_write_root = _get_fusion_write_root(task_id)
+    if _get_fusion_readonly_root(task_id) and not fusion_write_root:
+        return tool_error(
+            "Fusion read-only write denied: participants cannot modify files."
+        )
+    if fusion_write_root:
+        fusion_error = _check_fusion_scoped_path(path, task_id, "write")
+        if fusion_error:
+            return tool_error(fusion_error)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2336,6 +2429,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    fusion_write_root = _get_fusion_write_root(task_id)
+    if _get_fusion_readonly_root(task_id) and not fusion_write_root:
+        return tool_error(
+            "Fusion read-only patch denied: participants cannot modify files."
+        )
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     # Paths whose CONTENT will be text-written (Update/Add + explicit path).
@@ -2389,6 +2487,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return _err
                 _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        if fusion_write_root:
+            fusion_error = _check_fusion_scoped_path(_p, task_id, "patch")
+            if fusion_error:
+                return tool_error(fusion_error)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -2587,6 +2689,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 already_searched=count,
             )
 
+        fusion_error = _check_fusion_scoped_path(path, task_id, "search")
+        if fusion_error:
+            return tool_error(fusion_error)
+
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
@@ -2609,8 +2715,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             return cached_search_nf
 
         file_ops = _get_file_ops(task_id)
+        path_for_ops = (
+            resolved_search_path if _get_fusion_scope_root(task_id) else path
+        )
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=path_for_ops, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)

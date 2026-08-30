@@ -14341,6 +14341,12 @@ def main():
         help="Skip the final VACUUM (index is rebuilt but freed pages aren't returned to the OS until a later VACUUM)",
     )
     sessions_optimize_storage.add_argument(
+        "--reclaim-disabled-trigram",
+        action="store_true",
+        default=False,
+        help="Physically drop the trigram FTS index after sessions.trigram_fts=false has disabled it",
+    )
+    sessions_optimize_storage.add_argument(
         "--yes", "-y",
         action="store_true",
         default=False,

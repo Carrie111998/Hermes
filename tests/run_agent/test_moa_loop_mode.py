@@ -536,10 +536,11 @@ def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
 def test_references_run_in_parallel(monkeypatch):
     """References fan out concurrently (delegate-batch semantics), not serially.
 
-    Each reference sleeps; wall-time must approximate the slowest single call,
-    not the sum. Order is preserved and a failing reference is isolated.
+    Two references rendezvous at a barrier, proving they overlapped without
+    relying on a tight wall-clock threshold. Order is preserved and a failing
+    reference is isolated.
     """
-    import time
+    import threading
 
     from agent import moa_loop
 
@@ -547,13 +548,17 @@ def test_references_run_in_parallel(monkeypatch):
     monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
 
     barrier_hits = []
+    concurrent_refs = threading.Barrier(2)
 
     def slow_call_llm(**kwargs):
-        barrier_hits.append(time.monotonic())
+        barrier_hits.append(kwargs["provider"])
         model = kwargs["model"]
         if model == "boom":
             raise RuntimeError("kaboom")
-        time.sleep(0.5)
+        try:
+            concurrent_refs.wait(timeout=2.0)
+        except threading.BrokenBarrierError as exc:
+            raise RuntimeError("reference calls did not overlap") from exc
         return _response(f"resp-{kwargs['provider']}")
 
     monkeypatch.setattr(moa_loop, "call_llm", slow_call_llm)
@@ -565,17 +570,11 @@ def test_references_run_in_parallel(monkeypatch):
         {"provider": "p3", "model": "ok"},
     ]
 
-    start = time.monotonic()
     out = moa_loop._run_references_parallel(
         refs, [{"role": "user", "content": "hi"}], temperature=0.6, max_tokens=64
     )
-    elapsed = time.monotonic() - start
 
-    # Two 0.5s sleeps run concurrently → well under the 1.0s serial floor.
-    # Threshold sits at 0.95s (not tight against 0.5s) to tolerate CI
-    # thread-pool startup jitter while still failing hard if the two calls
-    # ran serially (which would be ≥1.0s).
-    assert elapsed < 0.95, f"references did not run in parallel (took {elapsed:.2f}s)"
+    assert set(barrier_hits) == {"p1", "p2", "p3"}
     # Output order matches input order (stable Reference N labelling).
     assert [label for label, _, _ in out] == ["p1:ok", "moa:preset", "p2:boom", "p3:ok"]
     assert "recursively reference MoA" in out[1][1]

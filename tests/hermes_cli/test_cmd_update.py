@@ -72,7 +72,7 @@ def _patch_managed_uv(request):
 
 
 @pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
+def _patch_gateway_discovery(monkeypatch):
     """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
 
     The restart phase used to swallow every exception at debug level, so these
@@ -83,6 +83,10 @@ def _patch_gateway_discovery():
     Discovery returning nothing makes the phase a clean no-op for every test
     in this module (none of them assert on gateway restarts).
     """
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(hm, "_reload_updated_runtime_modules", lambda: None)
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
          patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
@@ -101,12 +105,12 @@ class TestCmdUpdateNpmLockfileCache:
         from hermes_cli import main as hm
 
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
-        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}', encoding="utf-8")
 
         hm._record_npm_lockfile_hash(tmp_path)
 
         assert (
-            self._cache_file(tmp_path, tmp_path).read_text()
+            self._cache_file(tmp_path, tmp_path).read_text(encoding="utf-8")
             == hm._npm_manifests_digest()
         )
 
@@ -117,14 +121,15 @@ class TestCmdUpdateNpmLockfileCache:
         from hermes_cli import main as hm
 
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
-        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
-        (tmp_path / "package.json").write_text('{"dependencies": {}}')
+        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}', encoding="utf-8")
+        (tmp_path / "package.json").write_text('{"dependencies": {}}', encoding="utf-8")
         (tmp_path / "node_modules").mkdir()
         hm._record_npm_lockfile_hash(tmp_path)
         assert hm._npm_lockfile_changed(tmp_path) is False
 
         (tmp_path / "package.json").write_text(
-            '{"dependencies": {"left-pad": "^1.0.0"}}'
+            '{"dependencies": {"left-pad": "^1.0.0"}}',
+            encoding="utf-8",
         )
         assert hm._npm_lockfile_changed(tmp_path) is True
 
@@ -143,7 +148,7 @@ class TestCmdUpdateNpmLockfileCache:
 
         checkout = tmp_path / "checkout"
         checkout.mkdir()
-        (checkout / "package.json").write_text("{}")
+        (checkout / "package.json").write_text("{}", encoding="utf-8")
         shared_root = tmp_path / ".hermes"
         named_profile = shared_root / "profiles" / "work"
         named_profile.mkdir(parents=True)
@@ -962,7 +967,7 @@ class TestNodeRuntimeNpmResolution:
     ):
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
         monkeypatch.setattr(
@@ -1219,8 +1224,8 @@ class TestUpdateNodeDependencies:
         """
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         popen_calls = []
@@ -1256,8 +1261,8 @@ class TestUpdateNodeDependencies:
         review)."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         popen_calls = []
@@ -1277,8 +1282,8 @@ class TestUpdateNodeDependencies:
         """--no-fund, --no-audit, --progress=false must survive."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         popen_calls = []
@@ -1298,8 +1303,8 @@ class TestUpdateNodeDependencies:
         """When _npm_lockfile_changed reports no change, npm must not be called."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: False)
 
@@ -1315,8 +1320,8 @@ class TestUpdateNodeDependencies:
         """When _npm_lockfile_changed reports a change, npm must run."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         popen_calls = []
@@ -1334,8 +1339,8 @@ class TestUpdateNodeDependencies:
         run retries instead of wrongly believing deps are up to date)."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         recorded = []
@@ -1355,8 +1360,8 @@ class TestUpdateNodeDependencies:
         it's independent of ui-tui/web dependency state (#43564)."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
@@ -1374,7 +1379,7 @@ class TestUpdateNodeDependencies:
         """No npm on PATH → return without calling subprocess."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
         hm._update_node_dependencies()
@@ -1399,8 +1404,8 @@ class TestUpdateNodeDependencies:
         """npm install must execute from PROJECT_ROOT, not a workspace subdir."""
         from hermes_cli import main as hm
 
-        (tmp_path / "package.json").write_text("{}")
-        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
         popen_calls = []

@@ -82,6 +82,21 @@ def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
         pass
 
 
+class _CronStandaloneSessionStore:
+    def __repr__(self) -> str:
+        return "CRON_STANDALONE_SESSION_STORE"
+
+
+class _CronOwnerStoreUnavailable:
+    def __repr__(self) -> str:
+        return "CRON_OWNER_STORE_UNAVAILABLE"
+
+
+CRON_STANDALONE_SESSION_STORE = _CronStandaloneSessionStore()
+CRON_OWNER_STORE_UNAVAILABLE = _CronOwnerStoreUnavailable()
+_OWNER_STORE_UNAVAILABLE_WARNED: set[str] = set()
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -1564,6 +1579,97 @@ def _get_hermes_home() -> Path:
     anchor it at the shared default root — either re-breaks profile isolation.
     """
     return _hermes_home or get_hermes_home()
+
+
+def _warn_owner_store_unavailable_once(job_id: str) -> None:
+    key = str(_get_hermes_home())
+    if key in _OWNER_STORE_UNAVAILABLE_WARNED:
+        return
+    _OWNER_STORE_UNAVAILABLE_WARNED.add(key)
+    logger.error(
+        "Cron owner SessionDB is unavailable for HERMES_HOME=%s; cron job '%s' "
+        "will run without a session store instead of opening per-job writable "
+        "schema state.",
+        key,
+        job_id,
+    )
+
+
+def _cron_session_db_timeout_seconds() -> float:
+    """Resolve the bounded standalone SessionDB init timeout."""
+    _session_db_timeout: float | None = None
+    _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+    if _raw_env_timeout:
+        try:
+            _session_db_timeout = float(_raw_env_timeout)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
+                _raw_env_timeout,
+            )
+    if _session_db_timeout is None:
+        try:
+            from hermes_cli.config import load_config
+
+            _cfg = load_config() or {}
+            _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
+            _configured = _cron_cfg.get("session_db_timeout_seconds")
+            if _configured is not None:
+                _session_db_timeout = float(_configured)
+        except Exception as exc:
+            logger.debug(
+                "Failed to load cron.session_db_timeout_seconds from config: %s",
+                exc,
+            )
+    if _session_db_timeout is None:
+        _session_db_timeout = 10.0
+    return _session_db_timeout
+
+
+def _open_standalone_cron_session_db(job_id: str):
+    """Open a standalone cron SessionDB with the historical timeout bound."""
+    from hermes_state import SessionDB
+
+    timeout_s = _cron_session_db_timeout_seconds()
+    if timeout_s > 0:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(SessionDB)
+        try:
+            return future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            future.add_done_callback(_close_late_session_db_result)
+            raise
+        finally:
+            # Don't wait for a wedged connect() to unwind — abandon the worker
+            # thread rather than blocking shutdown on it too.
+            pool.shutdown(wait=False)
+    # 0 = unlimited (legacy behavior, opt-in for debugging)
+    return SessionDB()
+
+
+def _resolve_cron_session_db(job_id: str, owner_session_db=CRON_STANDALONE_SESSION_STORE):
+    """Return ``(db, borrowed)`` for a cron job's session store."""
+    if owner_session_db is CRON_STANDALONE_SESSION_STORE:
+        try:
+            return _open_standalone_cron_session_db(job_id), False
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+                "without a session store for this run instead of blocking it "
+                "forever",
+                job_id,
+                _cron_session_db_timeout_seconds(),
+            )
+            return None, False
+        except Exception as exc:
+            logger.debug("Job '%s': SQLite session store not available: %s", job_id, exc)
+            return None, False
+
+    if owner_session_db is CRON_OWNER_STORE_UNAVAILABLE or owner_session_db is None:
+        _warn_owner_store_unavailable_once(job_id)
+        return None, False
+
+    return owner_session_db, True
 
 
 def _get_lock_paths() -> tuple[Path, Path]:
@@ -5424,6 +5530,7 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    owner_session_db=CRON_STANDALONE_SESSION_STORE,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5660,7 +5767,9 @@ def run_job(
     # (``wakeAgent: false``, blocked prompt) opened state.db and returned
     # without reaching the finally that closes it, relying on GC to release
     # the handle. Init now happens inside the main try, right before the
-    # agent is constructed — after every early-return path (#96290).
+    # agent is constructed — after every early-return path (#96290). Gateway
+    # cron borrows its process-owned store at that late point instead of
+    # opening another writable schema connection.
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -5833,6 +5942,7 @@ def run_job(
     _cron_session_token = None
     _non_dispatcher_token = None
     _session_db = None
+    _session_db_borrowed = False
     try:
         if not _cwd_lock_acquired:
             # Fail closed (#79768): running without the lock would let a
@@ -6348,56 +6458,14 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
-        # Initialize the SQLite session store so cron job messages are
-        # persisted and discoverable via session_search (same pattern as
-        # gateway/run.py) — only now, after every early-return path
-        # (wake-gate, prompt validation, drift skip) has passed, so a gated
-        # run never opens state.db just to abandon the handle (#96290).
-        #
-        # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT,
-        # which only watches the agent's run_conversation below):
-        # SessionDB.__init__ opens/migrates state.db synchronously and has no
-        # timeout of its own against a wedged sqlite3.connect (e.g. a stale
-        # flock left by a crashed sibling process). An unbounded hang here
-        # would wedge the job's worker thread, so the init is bounded and a
-        # timeout proceeds without a session store instead of blocking the
-        # run forever.
-        _session_db_timeout = _get_session_db_timeout()
-        try:
-            from hermes_state import SessionDB
-
-            if _session_db_timeout > 0:
-                _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                _session_db_future = _session_db_pool.submit(SessionDB)
-                try:
-                    _session_db = _session_db_future.result(timeout=_session_db_timeout)
-                except concurrent.futures.TimeoutError:
-                    # The worker is abandoned (shutdown below doesn't wait for
-                    # it). If SessionDB() later completes inside it, the
-                    # future's result would be orphaned and its SQLite FDs
-                    # (.db, WAL, SHM) leak until process exit.  Register a
-                    # done-callback that retrieves and closes any eventual
-                    # late result (#72782).
-                    _session_db_future.add_done_callback(_close_late_session_db_result)
-                    raise
-                finally:
-                    # Don't wait for a wedged connect() to unwind — abandon the
-                    # worker thread (same pattern as the agent inactivity
-                    # timeout further down) rather than blocking shutdown on
-                    # it too.
-                    _session_db_pool.shutdown(wait=False)
-            else:
-                # 0 = unlimited (legacy behavior, opt-in for debugging)
-                _session_db = SessionDB()
-        except concurrent.futures.TimeoutError:
-            logger.error(
-                "Job '%s': SessionDB init did not return within %.0fs — proceeding "
-                "without a session store for this run instead of blocking it "
-                "forever",
-                job.get("id", "?"), _session_db_timeout,
-            )
-        except Exception as e:
-            logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+        # Initialize the SQLite session store only now, after every early-return
+        # path has passed. Standalone cron opens a bounded private store;
+        # long-lived gateway/Desktop tickers borrow the process-owned store so
+        # each job avoids writable schema init under load.
+        _session_db, _session_db_borrowed = _resolve_cron_session_db(
+            job_id,
+            owner_session_db,
+        )
 
         agent = AIAgent(
             model=model,
@@ -6881,10 +6949,11 @@ def run_job(
                 )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
-            try:
-                _session_db.close()
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+            if not _session_db_borrowed:
+                try:
+                    _session_db.close()
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -7044,6 +7113,7 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    owner_session_db=CRON_STANDALONE_SESSION_STORE,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -7091,6 +7161,7 @@ def run_one_job(
                 loop=loop,
                 verbose=verbose,
                 extra_prompt=extra_prompt,
+                owner_session_db=owner_session_db,
                 fire_claim_lost=(
                     _CombinedCancelEvent(lost_ownership, cancel_event)
                     if cancel_event is not None
@@ -7115,6 +7186,7 @@ def _run_one_job_body(
     loop=None,
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
+    owner_session_db=CRON_STANDALONE_SESSION_STORE,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
@@ -7207,19 +7279,13 @@ def _run_one_job_body(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            if fire_claim_lost is None:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                )
-            else:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                    cancel_event=fire_claim_lost,
-                )
+            success, output, final_response, error = run_job(
+                job,
+                defer_agent_teardown=_deferred_agents,
+                extra_prompt=extra_prompt,
+                cancel_event=fire_claim_lost,
+                owner_session_db=owner_session_db,
+            )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -7698,6 +7764,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    owner_session_db=CRON_STANDALONE_SESSION_STORE,
 ):
     """
     Check and run all due jobs.
@@ -7917,6 +7984,7 @@ def tick(
                 adapters=adapters,
                 loop=loop,
                 verbose=verbose,
+                owner_session_db=owner_session_db,
             )
 
         # Partition due jobs: those with a per-job workdir mutate

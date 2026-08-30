@@ -12646,6 +12646,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_curator_command(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
+        elif canonical == "fusion":
+            from hermes_cli.fusion_command import handle_fusion_command
+            with self._busy_command(self._slow_command_status(cmd_original)):
+                handle_fusion_command(cmd_original, cli=self)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)

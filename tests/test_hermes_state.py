@@ -824,6 +824,7 @@ class TestFTS5Search:
         traced_connections = [db._conn]
         if read_conn is not db._conn:
             traced_connections.append(read_conn)
+            db._read_pool.put_nowait(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
 
@@ -1409,8 +1410,8 @@ class TestBulkDeleteSessions:
         bulk-delete CLI / web flows don't leak files."""
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="cli")
-        (tmp_path / "s1.jsonl").write_text("")
-        (tmp_path / "s2.json").write_text("{}")
+        (tmp_path / "s1.jsonl").write_text("", encoding="utf-8")
+        (tmp_path / "s2.json").write_text("{}", encoding="utf-8")
 
         deleted = db.delete_sessions(["s1", "s2"], sessions_dir=tmp_path)
         assert deleted == 2
@@ -1473,9 +1474,9 @@ class TestDeleteEmptySessions:
         db.end_session("empty_with_dump", end_reason="done")
 
         dump = tmp_path / "request_dump_empty_with_dump_0.json"
-        dump.write_text("{}")
+        dump.write_text("{}", encoding="utf-8")
         transcript = tmp_path / "empty_with_dump.jsonl"
-        transcript.write_text("")
+        transcript.write_text("", encoding="utf-8")
 
         deleted = db.delete_empty_sessions(sessions_dir=tmp_path)
         assert deleted == 1
@@ -3148,11 +3149,11 @@ class TestAutoMaintenance:
         db.create_session(session_id="new", source="cli")  # active
 
         # Transcript files mimicking real gateway/CLI layout
-        (sessions_dir / "old1.json").write_text("{}")
-        (sessions_dir / "old1.jsonl").write_text("{}\n")
-        (sessions_dir / "old2.jsonl").write_text("{}\n")
-        (sessions_dir / "request_dump_old1_001.json").write_text("{}")
-        (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
+        (sessions_dir / "old1.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "old1.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "old2.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "request_dump_old1_001.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "new.jsonl").write_text("{}\n", encoding="utf-8")  # active, must survive
 
         result = db.maybe_auto_prune_and_vacuum(
             retention_days=90, sessions_dir=sessions_dir
@@ -3415,10 +3416,173 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_optimize_demote_preserves_similarly_named_non_fts_tables(self, tmp_path):
+        db_path = tmp_path / "v22-preserve-neighbor.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db._conn.execute(
+                "CREATE TABLE messages_fts_trigram_backup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messages_fts_trigram_backup (id) VALUES (7)"
+            )
+            db._conn.execute(
+                "CREATE TABLE messagesXftsXtrigramXbackup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messagesXftsXtrigramXbackup (id) VALUES (8)"
+            )
+            db._conn.commit()
+
+            result = db.optimize_fts_storage(vacuum=False)
+
+            assert result["ok"] is True
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messages_fts_trigram_backup"
+                ).fetchall()
+            ] == [7]
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messagesXftsXtrigramXbackup"
+                ).fetchall()
+            ] == [8]
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE name = 'fts_v22_trash_messages_fts_trigram_backup'"
+            ).fetchone() is None
+        finally:
+            db.close()
 
 
 
 
+
+
+    def test_mixed_trigram_policy_openers_converge_without_teardown(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session("s1", source="cli")
+            db.append_message("s1", role="user", content="needle 大别山")
+            assert db.get_meta("trigram_fts_policy") == "enabled"
+            assert db._fts_table_exists("messages_fts_trigram") is True
+            assert len(db.search_messages("大别山")) == 1
+        finally:
+            db.close()
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("DELETE FROM state_meta WHERE key = 'trigram_fts_policy'")
+
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": False}},
+        )
+        monkeypatch.setenv("HERMES_DISABLE_FTS_TRIGRAM", "1")
+        disabled = SessionDB(db_path=db_path)
+        try:
+            assert disabled.get_meta("trigram_fts_policy") == "disabled"
+            assert disabled._fts_table_exists("messages_fts_trigram") is True
+            assert disabled._trigram_available is False
+            assert disabled._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = 'messages_fts_trigram_insert'"
+            ).fetchone() is None
+            disabled.append_message("s1", role="user", content="disabled 大别山")
+        finally:
+            disabled.close()
+
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": True}},
+        )
+        monkeypatch.delenv("HERMES_DISABLE_FTS_TRIGRAM", raising=False)
+        enabled = SessionDB(db_path=db_path)
+        try:
+            assert enabled.get_meta("trigram_fts_policy") == "disabled"
+            assert enabled._fts_table_exists("messages_fts_trigram") is True
+            assert enabled._trigram_available is False
+            assert len(enabled.search_messages("needle")) >= 1
+            assert len(enabled.search_messages("disabled")) >= 1
+            result = enabled.reclaim_disabled_trigram_fts(vacuum=False)
+            assert result["ok"] is True
+            assert enabled._fts_table_exists("messages_fts_trigram") is False
+            assert len(enabled.search_messages("disabled")) >= 1
+        finally:
+            enabled.close()
+
+    def test_reclaim_disabled_trigram_preserves_similarly_named_tables(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": False}},
+        )
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db._conn.execute(
+                "CREATE TABLE messagesXftsXtrigramXbackup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messagesXftsXtrigramXbackup (id) VALUES (1)"
+            )
+            db._conn.execute(
+                "CREATE TABLE messages_fts_trigram_backup (id INTEGER PRIMARY KEY)"
+            )
+            db._conn.execute(
+                "INSERT INTO messages_fts_trigram_backup (id) VALUES (2)"
+            )
+            db._conn.commit()
+
+            result = db.reclaim_disabled_trigram_fts(vacuum=False)
+
+            assert result["ok"] is True
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messagesXftsXtrigramXbackup"
+                ).fetchall()
+            ] == [1]
+            assert [
+                row[0] for row in db._conn.execute(
+                    "SELECT id FROM messages_fts_trigram_backup"
+                ).fetchall()
+            ] == [2]
+        finally:
+            db.close()
+
+    def test_invalid_trigram_policy_config_fails_before_trigram_ddl(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as hermes_config
+
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config_readonly",
+            lambda: {"sessions": {"trigram_fts": "sometimes"}},
+        )
+
+        with pytest.raises(ValueError, match="sessions.trigram_fts"):
+            SessionDB(db_path=db_path)
+
+        with sqlite3.connect(str(db_path)) as conn:
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name = 'messages_fts_trigram'"
+            ).fetchone() is None
 
     def _simulate_pre_fix_demote_crash_window(self, db):
         """Replay the pre-fix demote crash window: trash + empty v23 schema,
@@ -5211,7 +5375,7 @@ class TestPerformancePragmasEndToEnd:
         home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(home))
         if config_text is not None:
-            (home / "config.yaml").write_text(config_text)
+            (home / "config.yaml").write_text(config_text, encoding="utf-8")
         return home
 
     def test_configured_pragmas_reach_all_connection_types(

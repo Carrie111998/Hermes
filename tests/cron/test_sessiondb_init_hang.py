@@ -25,7 +25,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
-from cron.scheduler import run_job
+from cron.scheduler import CRON_OWNER_STORE_UNAVAILABLE, run_job
 
 # Hold the real class: patching cron.scheduler.concurrent.futures.ThreadPoolExecutor
 # also replaces concurrent.futures.ThreadPoolExecutor (same module object).
@@ -183,6 +183,76 @@ class TestSessionDbInitTimeout:
         assert timeouts == [0.2]
         assert success is True
         assert mock_agent_cls.call_args.kwargs["session_db"] is None
+
+    def test_borrowed_owner_store_skips_constructor_and_job_close(
+        self, tmp_path, monkeypatch
+    ):
+        """Long-lived owners pass an existing SessionDB; jobs must not open/close it."""
+        monkeypatch.delenv("HERMES_CRON_SESSION_DB_TIMEOUT", raising=False)
+        fake_db = MagicMock()
+        fake_db.get_compression_tip.return_value = None
+        job = {"id": "borrowed-store", "name": "test", "prompt": "hello"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB") as session_db_ctor, \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value=_RUNTIME,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(
+                job,
+                owner_session_db=fake_db,
+            )
+
+        session_db_ctor.assert_not_called()
+        assert success is True
+        assert final_response == "ok"
+        assert mock_agent_cls.call_args.kwargs["session_db"] is fake_db
+        assert fake_db.end_session.call_count == 1
+        fake_db.close.assert_not_called()
+
+    def test_owner_unavailable_sentinel_does_not_fallback_to_per_job_constructor(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A long-lived owner init failure is fail-soft, not N per-job schema opens."""
+        import cron.scheduler as sched
+
+        sched._OWNER_STORE_UNAVAILABLE_WARNED.clear()
+        job = {"id": "owner-unavailable", "name": "test", "prompt": "hello"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB") as session_db_ctor, \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value=_RUNTIME,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            with caplog.at_level("ERROR"):
+                success, output, final_response, error = run_job(
+                    job,
+                    owner_session_db=CRON_OWNER_STORE_UNAVAILABLE,
+                )
+
+        session_db_ctor.assert_not_called()
+        assert success is True
+        assert final_response == "ok"
+        assert mock_agent_cls.call_args.kwargs["session_db"] is None
+        assert any("Cron owner SessionDB is unavailable" in r.message for r in caplog.records)
 
 
 class TestDispatchGuardReleasedAfterHang:
@@ -380,3 +450,111 @@ class TestSessionDbInitAfterEarlyReturns:
         assert success is True
         mock_db_cls.assert_not_called()
         mock_agent_cls.assert_not_called()
+
+
+class TestBorrowedCronOwner:
+    def test_tick_parallel_jobs_share_owner_store_without_constructors(
+        self, tmp_path, monkeypatch
+    ):
+        """Three in-process jobs borrow one owner SessionDB instead of opening three."""
+        import threading
+        import cron.scheduler as sched
+
+        monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "3")
+        monkeypatch.delenv("HERMES_CRON_SESSION_DB_TIMEOUT", raising=False)
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+
+        fake_db = MagicMock()
+        fake_db.get_compression_tip.return_value = None
+        jobs = [
+            {
+                "id": f"borrowed-parallel-{i}",
+                "name": f"borrowed parallel {i}",
+                "prompt": "hello",
+                "schedule": {"kind": "interval", "minutes": 5},
+                "enabled": True,
+                "next_run_at": "2020-01-01T00:00:00",
+                "deliver": "local",
+            }
+            for i in range(3)
+        ]
+        started = 0
+        started_lock = threading.Lock()
+        all_started = threading.Event()
+        release = threading.Event()
+        session_dbs = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                session_dbs.append(kwargs.get("session_db"))
+
+            def run_conversation(self, _prompt):
+                nonlocal started
+                with started_lock:
+                    started += 1
+                    if started == len(jobs):
+                        all_started.set()
+                assert release.wait(5), "parallel cron jobs did not overlap"
+                return {"final_response": "ok"}
+
+            def close(self):
+                return None
+
+        try:
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state.SessionDB") as session_db_ctor, \
+                 patch(
+                     "hermes_cli.runtime_provider.resolve_runtime_provider",
+                     return_value=_RUNTIME,
+                 ), \
+                 patch("run_agent.AIAgent", FakeAgent), \
+                 patch.object(sched, "get_due_jobs", return_value=jobs), \
+                 patch.object(sched, "advance_next_runs"), \
+                 patch.object(sched, "claim_dispatch", return_value=True), \
+                 patch.object(
+                     sched,
+                     "claim_job_for_fire",
+                     side_effect=lambda job_id, return_job=False: next(
+                         job for job in jobs if job["id"] == job_id
+                     ),
+                 ), \
+                 patch.object(
+                     sched,
+                     "create_execution",
+                     side_effect=lambda job_id, source: {"id": f"exec-{job_id}"},
+                 ), \
+                 patch.object(sched, "mark_execution_running"), \
+                 patch.object(sched, "finish_execution"), \
+                 patch.object(sched, "save_job_output", return_value="/tmp/out"), \
+                 patch.object(sched, "mark_job_run"), \
+                 patch.object(sched, "_deliver_result", return_value=None):
+                tick_done = []
+
+                def run_tick():
+                    tick_done.append(
+                        sched.tick(
+                            verbose=False,
+                            owner_session_db=fake_db,
+                        )
+                    )
+
+                t = threading.Thread(target=run_tick)
+                t.start()
+                assert all_started.wait(5), "not all cron jobs reached run_conversation"
+                release.set()
+                t.join(timeout=5)
+
+            assert tick_done == [3]
+            session_db_ctor.assert_not_called()
+            assert session_dbs == [fake_db, fake_db, fake_db]
+            assert fake_db.end_session.call_count == 3
+            fake_db.close.assert_not_called()
+        finally:
+            for job in jobs:
+                sched._running_job_ids.discard(job["id"])
+            sched._shutdown_parallel_pool()

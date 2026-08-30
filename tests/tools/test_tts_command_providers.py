@@ -17,6 +17,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -347,6 +348,9 @@ class TestRunCommandTts:
             def wait(self, timeout=None):
                 return self.returncode
 
+            def poll(self):
+                return None
+
         with patch("tools.tts_tool.subprocess.Popen", return_value=FakeProcess()):
             result = _run_command_tts("fake tts", timeout=0.25)
 
@@ -356,6 +360,37 @@ class TestRunCommandTts:
         assert read_sizes["stdout"][0] == 65536
         assert read_sizes["stderr"][0] == 65536
 
+    def test_completed_process_does_not_timeout_waiting_for_reader_eof(self):
+        class SlowEofStream:
+            encoding = "utf-8"
+
+            def __init__(self, chunks: list[str]):
+                self.chunks = list(chunks)
+
+            def read(self, size: int) -> str:
+                if self.chunks:
+                    return self.chunks.pop(0)
+                time.sleep(0.15)
+                return ""
+
+        class FakeProcess:
+            pid = 12345
+            returncode = 0
+            stdout = SlowEofStream(["done"])
+            stderr = SlowEofStream(["tick"])
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with patch("tools.tts_tool.subprocess.Popen", return_value=FakeProcess()):
+            result = _run_command_tts("fake tts", timeout=0.05)
+
+        assert result.returncode == 0
+        assert result.stdout == "done"
+        assert result.stderr == "tick"
 
     def test_silent_after_progress_still_times_out_with_stderr(self, tmp_path):
         script = tmp_path / "progress_then_hang.py"

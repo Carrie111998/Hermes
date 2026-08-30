@@ -469,6 +469,11 @@ class TestS3IdleChargedFromLastProgress:
             assert release.wait(timeout=10)
             return ([], "late")
 
+        timeouts = []
+
+        def on_timeout(_idle, waited, since_progress):
+            timeouts.append((waited, since_progress))
+
         t0 = time.monotonic()
         try:
             msgs, prompt = run_compress_context_with_progress_timeout(
@@ -477,6 +482,7 @@ class TestS3IdleChargedFromLastProgress:
                 system_prompt_fallback="fb",
                 idle_timeout_seconds=idle,
                 total_ceiling_seconds=5.0,
+                on_timeout=on_timeout,
             )
         finally:
             elapsed = time.monotonic() - t0
@@ -484,10 +490,15 @@ class TestS3IdleChargedFromLastProgress:
         assert prompt == "fb"
         # Old behavior waited a full interval from the CHECK (~2x idle ≈
         # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
-        assert elapsed < idle * 1.8, (
-            f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
+        # (~0.45s). Assert the function's timeout accounting, not cold-start
+        # overhead from spinning up the shared executor thread.
+        assert timeouts, "expected the idle timeout callback to fire"
+        waited, since_progress = timeouts[-1]
+        assert waited < idle * 1.8, (
+            f"silence exceeded ~2x idle budget shape: {waited:.2f}s"
         )
+        assert since_progress >= idle
+        assert elapsed < 2.0
         _drain_admission_slots()
 
 

@@ -107,6 +107,24 @@ TOOLSETS = {
         "tools": ["web_search", "web_extract"],
         "includes": []  # No other toolsets included
     },
+
+    "fusion_readonly": {
+        "description": "Read-only repo/context access for Fusion participants",
+        "tools": [
+            "read_file", "search_files", "web_search", "web_extract",
+            "skills_list", "skill_view", "session_search", "todo",
+        ],
+        "includes": [],
+    },
+
+    "fusion_spike": {
+        "description": "Write-enabled file tools scoped to an isolated Fusion spike worktree",
+        "tools": [
+            "read_file", "search_files", "write_file", "patch",
+            "web_search", "web_extract", "skills_list", "skill_view", "session_search", "todo",
+        ],
+        "includes": [],
+    },
     
     "search": {
         "description": "Web search only (no content extraction/scraping)",
@@ -170,6 +188,12 @@ TOOLSETS = {
     "terminal": {
         "description": "Terminal/command execution and process management tools",
         "tools": ["terminal", "process"],
+        "includes": []
+    },
+
+    "moa": {
+        "description": "Advanced reasoning and problem-solving tools",
+        "tools": ["mixture_of_agents"],
         "includes": []
     },
     

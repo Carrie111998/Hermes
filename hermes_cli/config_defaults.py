@@ -2064,6 +2064,45 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    "fusion": {
+        # Built-in /fusion command for read-only heterogeneous multi-LLM
+        # planning/review. Secrets still live in .env/auth stores only.
+        "default_roster": "planning",
+        "rosters": {},
+        "model_pool": [
+            {
+                "slug": "glm-max",
+                "provider": "zai",
+                "model": "glm-5.2",
+                "reasoning_effort": "xhigh",
+            },
+            {
+                "slug": "deepseek-pro-max",
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "reasoning_effort": "xhigh",
+            },
+            {
+                "slug": "codex-default",
+                "provider": "openai-codex",
+                "model": "gpt-5.5",
+                "api_mode": "codex_responses",
+                "reasoning_effort": "xhigh",
+            },
+        ],
+        "timeout_seconds": 300,
+        "min_successful_participants": 2,
+        "participants": 3,
+        "allow_single_participant": False,
+        "min_distinct_models": 2,
+        "require_heterogeneous_models": True,
+        "allow_homogeneous_models": False,
+        "debate_rounds": 5,
+        "convergence_rounds": 5,
+        "reasoning_effort": "xhigh",
+        "spike_worktrees": True,
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
@@ -3414,6 +3453,13 @@ DEFAULT_CONFIG = {
         #     enforcement is a copy/gating change, not new migration code.
         #   "off": suppress the notice entirely.
         "fts_optimize_notice": "advise",
+        # Database-global trigram FTS policy for state.db. True keeps the
+        # CJK/substring trigram index online; false stops trigram sync on the
+        # next open without dropping the large FTS table. For legacy env-flag
+        # installs, stop all Hermes owners, run
+        # `hermes config set sessions.trigram_fts false`, remove
+        # HERMES_DISABLE_FTS_TRIGRAM, then restart.
+        "trigram_fts": True,
         # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
         # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
         # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)
@@ -3925,7 +3971,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 39,
+    "_config_version": 40,
 }
 
 # Optional environment variables that enhance functionality

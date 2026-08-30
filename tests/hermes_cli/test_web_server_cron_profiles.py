@@ -1,9 +1,11 @@
 """Regression tests for dashboard cron job profile routing."""
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 from queue import Empty, SimpleQueue
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -34,6 +36,51 @@ def _drain_queue(q):
             values.append(q.get_nowait())
         except Empty:
             return values
+
+
+@pytest.mark.asyncio
+async def test_desktop_lifespan_passes_and_closes_cron_owner_store(monkeypatch):
+    """Desktop cron uses one lifespan-owned SessionDB and closes it after stop."""
+    from hermes_cli import web_server
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setattr(web_server, "_warm_gateway_module", lambda: None)
+
+    async def _idle_loop():
+        try:
+            while True:
+                await asyncio.sleep(60)
+        except BaseException:
+            return None
+
+    monkeypatch.setattr(web_server, "run_reaper", lambda _registry: _idle_loop())
+    monkeypatch.setattr(web_server, "_dashboard_selftest_loop", _idle_loop)
+    monkeypatch.setattr(web_server, "_auto_archive_ticker_loop", _idle_loop)
+
+    class FakePtyRegistry:
+        async def close_all(self):
+            return None
+
+    monkeypatch.setattr(web_server, "PTY_REGISTRY", FakePtyRegistry())
+
+    fake_db = MagicMock()
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: fake_db)
+
+    captured = {}
+    started = threading.Event()
+
+    def fake_cron_ticker(stop_event, interval=60, owner_session_db=None):
+        captured["owner_session_db"] = owner_session_db
+        started.set()
+        assert stop_event.wait(5), "lifespan did not stop desktop cron"
+
+    monkeypatch.setattr(web_server, "_start_desktop_cron_ticker", fake_cron_ticker)
+
+    async with web_server._lifespan(web_server.app):
+        assert started.wait(5), "desktop cron thread did not start"
+
+    assert captured["owner_session_db"] is fake_db
+    fake_db.close.assert_called_once()
 
 
 
@@ -966,8 +1013,6 @@ async def test_dashboard_cron_rejects_missing_context_from(isolated_profiles):
 
     assert update_exc.value.status_code == 400
     assert "missing-job-id" in update_exc.value.detail
-
-
 
 
 

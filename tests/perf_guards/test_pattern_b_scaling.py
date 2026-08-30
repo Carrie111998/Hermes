@@ -29,6 +29,7 @@ PR that merges its fix (or immediately after).
 
 from __future__ import annotations
 
+import gc
 import time
 from pathlib import Path
 
@@ -43,6 +44,29 @@ def _min_time(fn, *, repeat: int = 5) -> float:
         fn()
         best = min(best, time.perf_counter() - t0)
     return best
+
+
+def _best_ratio(small_fn, large_fn, *, repeat: int = 5) -> float:
+    """Best paired 4N/N ratio for timing guards under noisy CI load."""
+    small_fn()
+    large_fn()
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        best = float("inf")
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            small_fn()
+            t_small = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            large_fn()
+            t_large = time.perf_counter() - t0
+            best = min(best, t_large / max(t_small, 1e-9))
+        return best
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +227,11 @@ class TestToolCallFragmentAssemblyLinear:
         return len("".join(entry["function"]["arguments_parts"]))
 
     def test_4x_fragments_cost_about_4x_time(self):
-        t_small = _min_time(lambda: self._assemble_dict_field(self.N_SMALL, self.FRAG), repeat=3)
-        t_large = _min_time(lambda: self._assemble_dict_field(self.N_LARGE, self.FRAG), repeat=3)
-        ratio = t_large / max(t_small, 1e-9)
+        ratio = _best_ratio(
+            lambda: self._assemble_dict_field(self.N_SMALL, self.FRAG),
+            lambda: self._assemble_dict_field(self.N_LARGE, self.FRAG),
+            repeat=5,
+        )
         assert ratio < self.MAX_RATIO, (
             f"tool-call fragment assembly is superlinear: 4x fragments cost "
             f"{ratio:.1f}x time. Fragments must be buffered in a list and "

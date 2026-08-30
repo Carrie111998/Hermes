@@ -42,6 +42,10 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.persistence_wait import (
+    session_persistence_wait_was_cancelled,
+    wait_for_session_persistence,
+)
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -213,6 +217,7 @@ def _flush_session_db_after_tool_progress(
     messages: list,
     *,
     stage: str,
+    allow_interrupted_start: bool = False,
 ) -> bool:
     """Flush tool-call progress before projecting it to any UI surface.
 
@@ -221,22 +226,22 @@ def _flush_session_db_after_tool_progress(
     Flush the already-appended assistant/tool messages immediately so the
     transcript survives destructive-but-valid tool calls.
     """
-    try:
-        persisted = agent._flush_messages_to_session_db(messages) is not False
-        if not persisted:
-            agent._incremental_persistence_failed = True
-            # The flush caught its own exception and returned False; the
-            # classified cause (if any) was captured at the catch site. Only
-            # fall back to 'unknown' when nothing more specific is recorded.
-            if getattr(agent, "_last_persistence_error_cause", None) is None:
-                agent._last_persistence_error_cause = "unknown"
-        return persisted
-    except Exception as exc:
+    persisted = wait_for_session_persistence(
+        agent,
+        lambda: agent._flush_messages_to_session_db(messages),
+        stage=f"tool progress after {stage}",
+        allow_interrupted_start=allow_interrupted_start,
+    )
+    if not persisted:
+        if session_persistence_wait_was_cancelled(agent):
+            return False
         agent._incremental_persistence_failed = True
-        from hermes_state import classify_persistence_error
-        agent._last_persistence_error_cause = classify_persistence_error(exc)
-        logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
-        return False
+        # The flush caught its own exception and returned False; the classified
+        # cause (if any) was captured at the catch site. Only fall back to
+        # 'unknown' when nothing more specific is recorded.
+        if getattr(agent, "_last_persistence_error_cause", None) is None:
+            agent._last_persistence_error_cause = "unknown"
+    return persisted
 
 
 def _image_generate_parallel_limit() -> int:
@@ -1138,11 +1143,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 error_type="user_interrupt",
                 error_message="Tool execution skipped due to user interrupt",
             )
-            _flush_session_db_after_tool_progress(
-                agent,
-                messages,
-                stage=f"cancelled tool result {tc.function.name}",
-            )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage="cancelled tool results",
+            allow_interrupted_start=True,
+        ):
+            if session_persistence_wait_was_cancelled(agent):
+                agent._tool_execution_interrupted = True
+                return
+            agent._incremental_persistence_failed = True
+            return
+        agent._tool_execution_interrupted = True
         return
 
     # ── Parse args + pre-execution bookkeeping ───────────────────────
@@ -1998,12 +2010,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     error_type="user_interrupt",
                     error_message="Tool execution skipped due to user interrupt",
                 )
-                if not _flush_session_db_after_tool_progress(
-                    agent,
-                    messages,
-                    stage=f"cancelled tool result {skipped_name}",
-                ):
+            if not _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage="cancelled tool results",
+                allow_interrupted_start=True,
+            ):
+                if session_persistence_wait_was_cancelled(agent):
+                    agent._tool_execution_interrupted = True
                     return
+                agent._incremental_persistence_failed = True
+                return
+            agent._tool_execution_interrupted = True
             break
 
         function_name = tool_call.function.name
@@ -2579,6 +2597,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     assistant_message.tool_calls[i - 1:],
                     reason="keyboard interrupt",
                 )
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage="cancelled tool results",
+                    allow_interrupted_start=True,
+                )
                 raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -2657,6 +2681,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     messages,
                     assistant_message.tool_calls[i - 1:],
                     reason="keyboard interrupt",
+                )
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage="cancelled tool results",
+                    allow_interrupted_start=True,
                 )
                 raise
             except Exception as tool_error:
@@ -2843,8 +2873,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent,
                     messages,
                     stage=f"skipped tool result {skipped_name}",
+                    allow_interrupted_start=True,
                 ):
+                    if session_persistence_wait_was_cancelled(agent):
+                        agent._tool_execution_interrupted = True
+                    else:
+                        agent._incremental_persistence_failed = True
                     return
+            agent._tool_execution_interrupted = True
             break
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────

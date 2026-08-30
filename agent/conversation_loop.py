@@ -64,6 +64,10 @@ from agent.message_sanitization import (
     _strip_non_ascii,
     serialized_messages_bytes,
 )
+from agent.persistence_wait import (
+    session_persistence_wait_was_cancelled,
+    wait_for_session_persistence,
+)
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
@@ -1956,6 +1960,8 @@ def run_conversation(
     # Per-turn diagnostic: a failed compression-tip adoption in a previous
     # turn's flush must not be reported against this turn.
     agent._compression_adoption_failed = False
+    agent._session_persistence_wait_cancelled = False
+    agent._tool_execution_interrupted = False
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -7447,6 +7453,7 @@ def run_conversation(
                     and previous_msg.get("finish_reason") == "incomplete"
                     and previous_interim_visible == current_interim_visible
                 )
+                _tool_turn_start_idx = len(messages)
                 append_message(messages, assistant_msg)
 
                 # Mixed batch: error-result the invalid calls and strip them
@@ -7469,29 +7476,26 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
-                _tool_turn_persisted = None
-                try:
-                    # Persist the assistant tool-call turn before any tool
-                    # side effects run. If a destructive tool restarts or
-                    # terminates Hermes mid-turn, resume logic still sees the
-                    # exact tool-call block that already executed.
-                    _tool_turn_persisted = agent._flush_messages_to_session_db(
-                        messages, conversation_history
-                    )
-                except Exception as exc:
-                    _tool_turn_persisted = False
-                    from hermes_state import classify_persistence_error
-                    agent._last_persistence_error_cause = (
-                        classify_persistence_error(exc)
-                    )
-                    logger.warning(
-                        "Incremental tool-call persistence failed before execution "
-                        "(session=%s): %s",
-                        agent.session_id or "none",
-                        exc,
-                    )
+                # Persist the assistant tool-call turn before any tool side
+                # effects run. Lock/busy contention waits here and retries this
+                # exact in-memory batch, never regenerating the model response.
+                _tool_turn_persisted = wait_for_session_persistence(
+                    agent,
+                    lambda: agent._flush_messages_to_session_db(
+                        messages,
+                        conversation_history,
+                    ),
+                    stage="assistant tool-call turn",
+                )
 
                 if _tool_turn_persisted is False:
+                    if session_persistence_wait_was_cancelled(agent):
+                        del messages[_tool_turn_start_idx:]
+                        interrupted = True
+                        _turn_exit_reason = "interrupted_by_user"
+                        final_response = ""
+                        failed = False
+                        break
                     # The canonical append failed. Do not project the row or
                     # run side-effecting tools from state that exists only in
                     # this process. Breaking also avoids retrying the same
@@ -7532,6 +7536,13 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                if getattr(agent, "_tool_execution_interrupted", False):
+                    interrupted = True
+                    _turn_exit_reason = "interrupted_by_user"
+                    final_response = ""
+                    failed = False
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:
@@ -8475,14 +8486,18 @@ def run_conversation(
                 # Unlike the tool-call exit, failure must NOT abort the turn:
                 # no side effect follows and _persist_session retries the write.
                 # Full incident narrative: tests/run_agent/test_81641_*.py.
-                try:
-                    agent._flush_messages_to_session_db(messages, conversation_history)
-                except Exception:
+                if not wait_for_session_persistence(
+                    agent,
+                    lambda: agent._flush_messages_to_session_db(
+                        messages,
+                        conversation_history,
+                    ),
+                    stage="final text turn",
+                ):
                     logger.warning(
                         "final text-turn flush failed (session=%s) — reply is "
                         "not yet durable; relying on finalize_turn retry",
                         getattr(agent, "session_id", None) or "none",
-                        exc_info=True,
                     )
 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"

@@ -12,6 +12,8 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
 
 
@@ -45,6 +47,19 @@ def _make_run_side_effect(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return side_effect
+
+
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery(monkeypatch):
+    """Keep cmd_update's gateway restart phase away from live local gateways."""
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(hermes_main, "_reload_updated_runtime_modules", lambda: None)
+    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), patch(
+        "hermes_cli.gateway.supports_systemd_services", return_value=False
+    ), patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+        yield
 
 
 class TestUpdateYesConfigMigration:

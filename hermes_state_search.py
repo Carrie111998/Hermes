@@ -19,6 +19,8 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,
+    FTS_TRIGRAM_POLICY_DISABLED,
+    FTS_TRIGRAM_POLICY_KEY,
     FTS_SQL,
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
@@ -26,6 +28,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _FTS_TRIGRAM_TRIGGERS,
     escape_like as _escape_like,
     fts_rebuild_admission,
 )
@@ -45,6 +48,15 @@ logger = logging.getLogger("hermes_state")
 # stripping it here widened those queries onto unrelated rows.
 _FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
 _FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
+_FTS5_SHADOW_SUFFIXES = ("_config", "_content", "_data", "_docsize", "_idx")
+
+
+def _fts5_shadow_table_names(*base_tables: str) -> tuple[str, ...]:
+    return tuple(
+        f"{base}{suffix}"
+        for base in base_tables
+        for suffix in _FTS5_SHADOW_SUFFIXES
+    )
 
 
 class SessionSearchMixin:
@@ -706,15 +718,23 @@ class SessionSearchMixin:
                     "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
                 )
                 conn.execute("PRAGMA writable_schema=RESET")
+                shadow_names = _fts5_shadow_table_names(
+                    "messages_fts",
+                    "messages_fts_trigram",
+                )
+                shadow_placeholders = ",".join("?" for _ in shadow_names)
                 shadows = [
                     r[0] for r in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table' "
-                        "AND (name LIKE 'messages_fts_%' ESCAPE '\\' "
-                        "OR name LIKE 'messages_fts_trigram_%' ESCAPE '\\')"
+                        f"AND name IN ({shadow_placeholders})",
+                        shadow_names,
                     ).fetchall()
                 ]
                 for sh in shadows:
-                    conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
+                    safe = str(sh).replace('"', '""')
+                    conn.execute(
+                        f'ALTER TABLE "{safe}" RENAME TO "fts_v22_trash_{safe}"'
+                    )
             # Claim the backfill *before* empty v23 tables exist. A crash
             # between this commit and schema ensure still leaves markers, so
             # optimize-storage resumes instead of tearing down trash and
@@ -972,6 +992,50 @@ class SessionSearchMixin:
             "FTS storage optimization complete (layout v%d).", FTS_STORAGE_VERSION
         )
         return {"ok": True, "vacuumed": vacuum_ok}
+
+    def reclaim_disabled_trigram_fts(self, *, vacuum: bool = True) -> Dict[str, Any]:
+        if self.read_only:
+            return {"ok": False, "reason": "read_only", "vacuumed": None}
+        if self.get_meta(FTS_TRIGRAM_POLICY_KEY) != FTS_TRIGRAM_POLICY_DISABLED:
+            return {"ok": False, "reason": "trigram_enabled", "vacuumed": None}
+
+        def _drop(conn):
+            dropped = 0
+            for trigger in _FTS_TRIGRAM_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for ddl in (
+                "DROP VIEW IF EXISTS messages_fts_trigram_src",
+                "DROP TABLE IF EXISTS messages_fts_trigram",
+            ):
+                conn.execute(ddl)
+                dropped += 1
+            shadow_names = _fts5_shadow_table_names("messages_fts_trigram")
+            shadow_placeholders = ",".join("?" for _ in shadow_names)
+            shadows = [
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    f"AND name IN ({shadow_placeholders})",
+                    shadow_names,
+                ).fetchall()
+            ]
+            for table in shadows:
+                safe = str(table).replace('"', '""')
+                conn.execute(f'DROP TABLE IF EXISTS "{safe}"')
+                dropped += 1
+            return dropped
+
+        dropped = self._execute_write(_drop)
+        self._trigram_available = False
+        vacuum_ok = None
+        if vacuum:
+            try:
+                with self._lock:
+                    self._conn.execute("VACUUM")
+                vacuum_ok = True
+            except sqlite3.OperationalError as exc:
+                logger.warning("VACUUM after disabled trigram reclaim failed: %s", exc)
+                vacuum_ok = False
+        return {"ok": True, "dropped": dropped, "vacuumed": vacuum_ok}
 
     def get_anchored_view(
         self,

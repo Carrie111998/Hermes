@@ -81,6 +81,9 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_SQL,
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
+    FTS_TRIGRAM_POLICY_DISABLED,
+    FTS_TRIGRAM_POLICY_ENABLED,
+    FTS_TRIGRAM_POLICY_KEY,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
@@ -1936,6 +1939,8 @@ def classify_persistence_error(exc_or_str) -> str:
         or "busy" in text
     ):
         return "locked"
+    if is_malformed_db_error(exc_or_str):
+        return "unknown"
     if (
         is_disk_full_error(exc_or_str)
         or "disk" in text
@@ -4440,6 +4445,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
+    _WRITE_LOCK_WARNING_AFTER_S = 10.0
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -5253,6 +5259,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        *,
+        operation: str = "write",
+        session_id: Optional[str] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -5281,6 +5290,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        wait_started: Optional[float] = None
+        wait_warned = False
+        wait_attempts = 0
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
@@ -5295,20 +5307,82 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _is_sqlite_null_system_error(exc: BaseException) -> bool:
+            return (
+                type(exc) is SystemError
+                and "returned null without setting an exception" in str(exc).lower()
+            )
+
+        null_wait_started: Optional[float] = None
+        null_wait_attempts = 0
+        null_last_stage = "unknown"
+        null_last_rollback_safety = "not_attempted"
+
         while True:
+            null_error_stage = "begin"
+            null_rollback_safety = "not_needed"
+            null_retry_safe = True
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        self._conn.execute("BEGIN IMMEDIATE")
+                    except BaseException:
+                        if self._conn.in_transaction:
+                            try:
+                                self._conn.rollback()
+                                null_rollback_safety = "begin_rolled_back"
+                            except Exception:
+                                null_rollback_safety = "begin_rollback_failed"
+                                null_retry_safe = False
+                            if null_retry_safe and self._conn.in_transaction:
+                                null_rollback_safety = (
+                                    "begin_rollback_left_transaction_active"
+                                )
+                                null_retry_safe = False
+                        else:
+                            null_rollback_safety = "begin_no_transaction"
+                        raise
+                    null_error_stage = "callback"
                     try:
                         result = fn(self._conn)
+                        null_error_stage = "commit"
                         self._conn.commit()
                     except BaseException:
+                        rollback_failed = False
                         try:
-                            self._conn.rollback()
+                            if self._conn.in_transaction:
+                                self._conn.rollback()
+                                null_rollback_safety = "rolled_back"
+                            else:
+                                null_rollback_safety = "no_active_transaction"
                         except Exception:
-                            pass
+                            rollback_failed = True
+                            null_rollback_safety = "rollback_failed"
+                        if not rollback_failed and self._conn.in_transaction:
+                            rollback_failed = True
+                            null_rollback_safety = "rollback_left_transaction_active"
+                        if null_error_stage == "commit" or rollback_failed:
+                            null_retry_safe = False
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
+                if wait_started is not None:
+                    self._log_write_lock_recovered(
+                        operation=operation,
+                        session_id=session_id,
+                        waited_s=time.monotonic() - wait_started,
+                        attempts=wait_attempts,
+                    )
+                if null_wait_started is not None:
+                    self._log_sqlite_null_system_error(
+                        event="recovered",
+                        outcome="success",
+                        operation=operation,
+                        session_id=session_id,
+                        waited_s=time.monotonic() - null_wait_started,
+                        attempts=null_wait_attempts,
+                        stage=null_last_stage,
+                        rollback_safety=null_last_rollback_safety,
+                    )
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -5336,16 +5410,83 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ):
                     continue
                 raise
+            except SystemError as exc:
+                if not _is_sqlite_null_system_error(exc):
+                    raise
+                now = time.monotonic()
+                if null_wait_started is None:
+                    null_wait_started = now
+                null_wait_attempts += 1
+                null_last_stage = null_error_stage
+                null_last_rollback_safety = null_rollback_safety
+                waited_s = now - null_wait_started
+                if not null_retry_safe:
+                    reason = (
+                        "commit_stage"
+                        if null_error_stage == "commit"
+                        else "rollback_unsafe"
+                    )
+                    self._log_sqlite_null_system_error(
+                        event="fail_closed",
+                        outcome=reason,
+                        operation=operation,
+                        session_id=session_id,
+                        waited_s=waited_s,
+                        attempts=null_wait_attempts,
+                        stage=null_error_stage,
+                        rollback_safety=null_rollback_safety,
+                    )
+                    raise
+                if self._sleep_before_write_retry(deadline, patience_s):
+                    continue
+                self._log_sqlite_null_system_error(
+                    event="exhausted",
+                    outcome="exhausted",
+                    operation=operation,
+                    session_id=session_id,
+                    waited_s=time.monotonic() - null_wait_started,
+                    patience_s=patience_s,
+                    attempts=null_wait_attempts,
+                    stage=null_error_stage,
+                    rollback_safety=null_rollback_safety,
+                )
+                raise
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    now = time.monotonic()
+                    if wait_started is None:
+                        wait_started = now
+                    wait_attempts += 1
+                    waited_s = now - wait_started
+                    if (
+                        not wait_warned
+                        and waited_s >= self._WRITE_LOCK_WARNING_AFTER_S
+                    ):
+                        wait_warned = True
+                        self._log_write_lock_wait(
+                            operation=operation,
+                            session_id=session_id,
+                            waited_s=waited_s,
+                            patience_s=patience_s,
+                            attempts=wait_attempts,
+                        )
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
+                    exhausted_s = (
+                        time.monotonic() - wait_started
+                        if wait_started is not None
+                        else patience_s
+                    )
                     raise sqlite3.OperationalError(
-                        f"database is locked (another Hermes process held the "
-                        f"state.db write lock for over {patience_s:.0f}s — "
+                        f"database is locked (another database connection held "
+                        f"the state.db write lock for over {patience_s:.3g}s; "
+                        f"db_path={self.db_path}; operation={operation}; "
+                        f"waited={exhausted_s:.3f}s; pid={os.getpid()}; "
+                        f"thread={threading.get_ident()}; "
+                        f"session={session_id or 'unknown'}; "
                         "likely a long maintenance operation such as VACUUM, "
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
@@ -5378,6 +5519,137 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+
+    def _log_sqlite_null_system_error(
+        self,
+        *,
+        event: str,
+        outcome: str,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        attempts: int,
+        stage: str,
+        rollback_safety: str,
+        patience_s: Optional[float] = None,
+    ) -> None:
+        level = logging.INFO if event == "recovered" else logging.ERROR
+        if patience_s is None:
+            logger.log(
+                level,
+                "SessionDB sqlite_null_system_error %s: db_path=%s "
+                "operation=%s waited=%.3fs pid=%s thread=%s session=%s "
+                "attempts=%s stage=%s rollback_safety=%s outcome=%s",
+                event,
+                str(self.db_path),
+                operation,
+                round(float(waited_s), 3),
+                os.getpid(),
+                threading.get_ident(),
+                session_id or "unknown",
+                int(attempts),
+                stage,
+                rollback_safety,
+                outcome,
+            )
+            return
+        logger.log(
+            level,
+            "SessionDB sqlite_null_system_error exhausted: db_path=%s "
+            "operation=%s waited=%.3fs patience=%.3fs pid=%s thread=%s "
+            "session=%s attempts=%s stage=%s rollback_safety=%s "
+            "outcome=%s",
+            str(self.db_path),
+            operation,
+            round(float(waited_s), 3),
+            patience_s,
+            os.getpid(),
+            threading.get_ident(),
+            session_id or "unknown",
+            int(attempts),
+            stage,
+            rollback_safety,
+            outcome,
+        )
+
+    def _write_lock_log_context(
+        self,
+        *,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        attempts: int,
+    ) -> dict:
+        return {
+            "db_path": str(self.db_path),
+            "operation": operation,
+            "waited_s": round(float(waited_s), 3),
+            "pid": os.getpid(),
+            "thread": threading.get_ident(),
+            "session": session_id or "unknown",
+            "attempts": int(attempts),
+            "db_holders": count_db_holders(self.db_path),
+            "holder": "another database connection",
+        }
+
+    def _log_write_lock_wait(
+        self,
+        *,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        patience_s: float,
+        attempts: int,
+    ) -> None:
+        context = self._write_lock_log_context(
+            operation=operation,
+            session_id=session_id,
+            waited_s=waited_s,
+            attempts=attempts,
+        )
+        logger.warning(
+            "SessionDB write lock wait: db_path=%s operation=%s waited=%.3fs "
+            "patience=%.3fs pid=%s thread=%s session=%s attempts=%s "
+            "db_holders=%s holder=%s",
+            context["db_path"],
+            context["operation"],
+            context["waited_s"],
+            patience_s,
+            context["pid"],
+            context["thread"],
+            context["session"],
+            context["attempts"],
+            context["db_holders"],
+            context["holder"],
+        )
+
+    def _log_write_lock_recovered(
+        self,
+        *,
+        operation: str,
+        session_id: Optional[str],
+        waited_s: float,
+        attempts: int,
+    ) -> None:
+        context = self._write_lock_log_context(
+            operation=operation,
+            session_id=session_id,
+            waited_s=waited_s,
+            attempts=attempts,
+        )
+        logger.info(
+            "SessionDB write lock recovered: db_path=%s operation=%s "
+            "waited=%.3fs pid=%s thread=%s session=%s attempts=%s "
+            "db_holders=%s recovery=success",
+            context["db_path"],
+            context["operation"],
+            context["waited_s"],
+            context["pid"],
+            context["thread"],
+            context["session"],
+            context["attempts"],
+            context["db_holders"],
+        )
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
@@ -5933,6 +6205,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        write_patience_s: Optional[float] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -6105,7 +6378,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
-        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        self._execute_write(
+            _do,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if write_patience_s is None
+                else write_patience_s
+            ),
+            operation="create_session",
+            session_id=session_id,
+        )
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -11082,6 +11364,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        write_patience_s: Optional[float] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -11199,7 +11482,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
         # process's FTS optimize) can't destroy a healthy turn (#74478).
         return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            _do,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if write_patience_s is None
+                else write_patience_s
+            ),
+            operation="append_message",
+            session_id=session_id,
         )
 
     def append_messages_batch(
@@ -11210,6 +11500,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        write_patience_s: Optional[float] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -11250,6 +11541,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     compression_lock_holder=compression_lock_holder,
                     turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    write_patience_s=write_patience_s,
                 )
             return inserted_total
 
@@ -11293,7 +11585,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            _do,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if write_patience_s is None
+                else write_patience_s
+            ),
+            operation="append_messages_batch",
+            session_id=session_id,
         )
 
     def set_latest_matching_message_display_kind(

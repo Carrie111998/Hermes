@@ -1255,9 +1255,26 @@ def _run_command_tts(
     for reader in readers:
         reader.start()
 
+    def process_finished() -> bool:
+        poll = getattr(proc, "poll", None)
+        return callable(poll) and poll() is not None
+
+    def drain_output_queue() -> None:
+        while True:
+            try:
+                name, chunk = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            if chunk is None:
+                open_streams.discard(name)
+                continue
+            chunks[name].append(chunk)
+
     deadline = time.monotonic() + timeout
     timed_out = False
     while open_streams:
+        if process_finished():
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
@@ -1268,27 +1285,31 @@ def _run_command_tts(
             continue
         if chunk is None:
             open_streams.discard(name)
+            deadline = time.monotonic() + timeout
             continue
         chunks[name].append(chunk)
         deadline = time.monotonic() + timeout
 
     if not timed_out:
-        try:
-            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        if process_finished():
+            for reader in readers:
+                reader.join(timeout=1.0)
+            drain_output_queue()
+        else:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            else:
+                for reader in readers:
+                    reader.join(timeout=1.0)
+                drain_output_queue()
 
     if timed_out:
         _terminate_command_tts_process_tree(proc)
         for reader in readers:
             reader.join(timeout=0.5)
-        while True:
-            try:
-                name, chunk = output_queue.get_nowait()
-            except queue.Empty:
-                break
-            if chunk:
-                chunks[name].append(chunk)
+        drain_output_queue()
         stdout = "".join(chunks["stdout"])
         stderr = "".join(chunks["stderr"])
         try:

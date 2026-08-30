@@ -558,9 +558,14 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        owner_session_db=None,
     ):
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import (
+            CRON_STANDALONE_SESSION_STORE,
+            _shutdown_parallel_pool,
+            tick as cron_tick,
+        )
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -577,75 +582,77 @@ class InProcessCronScheduler(CronScheduler):
         # only the process-global HERMES_HOME (the default profile) is ticked.
         # Heartbeats and recovery are also scoped per profile so `hermes cron
         # status` reflects liveness for every profile independently.
-        if profile_homes:
-            self._start_multiplex(
-                stop_event,
-                profile_homes=profile_homes,
-                adapters=adapters,
-                loop=loop,
-                interval=interval,
-                can_dispatch=can_dispatch,
-            )
-            return
+        if owner_session_db is None:
+            owner_session_db = CRON_STANDALONE_SESSION_STORE
 
-        # ── Single-profile (legacy) path ──────────────────────────────────
-        recovered = self.recover_interrupted()
-        if recovered:
-            logger.warning(
-                "Marked %d interrupted cron execution(s) unknown after restart",
-                recovered,
-            )
-        # Heartbeat once before the first sleep so `hermes cron status` sees a
-        # live ticker immediately after startup, not only after the first tick.
-        record_ticker_heartbeat()
-        # Exponential backoff for consecutive tick failures — most importantly
-        # fd exhaustion (EMFILE/ENFILE, #87644).  While FDs stay exhausted the
-        # ticker must NOT hammer the store every 60s; once they free (leak
-        # fixed, reclamation ran) the next tick succeeds and the backoff
-        # resets, so the scheduler self-heals without a gateway restart.
-        consecutive_failures = 0
-        while not stop_event.is_set():
-            ok = False
-            try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    cron_tick(
-                        verbose=False,
-                        adapters=adapters,
-                        loop=loop,
-                        sync=False,
-                        can_dispatch=can_dispatch,
-                    )
-                ok = True
-            except BaseException as e:
-                # Catch BaseException (not just Exception) so a SystemExit from
-                # a misbehaving provider SDK / agent retry path does not kill
-                # the ticker thread silently (#32612). KeyboardInterrupt is
-                # intentionally caught here too — gateway shutdown is driven by
-                # stop_event (set by the main thread's signal handler), not by
-                # an exception in this daemon thread, so swallowing it and
-                # re-checking stop_event keeps shutdown clean.
-                logger.error("Cron tick error: %s", e, exc_info=True)
-                # Persist the failure reason next to the heartbeat markers so
-                # `hermes cron status`/`list` (separate processes) can show
-                # WHY ticks fail, not just that the success marker is stale —
-                # e.g. a root-rewritten jobs.json locking out the ticker's
-                # uid went unnoticed for ~14h with the reason buried in the
-                # gateway log (#68483).
-                record_ticker_error(f"{type(e).__name__}: {e}")
-                # EMFILE: reclaim fds + back off exponentially so the
-                # exhausted process stops hammering the store while it has no
-                # chance of making progress (#87644).
-                consecutive_failures = _note_tick_failure(e, consecutive_failures)
-            # Record liveness every iteration; bump the success marker only on a
-            # clean tick, so status can tell "alive but failing every tick" from
-            # "actually firing jobs" (#32612, #32895).
-            record_ticker_heartbeat(success=ok)
-            if ok:
-                clear_ticker_error()
-                consecutive_failures = 0
-            stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+        try:
+            if profile_homes:
+                self._start_multiplex(
+                    stop_event,
+                    profile_homes=profile_homes,
+                    adapters=adapters,
+                    loop=loop,
+                    interval=interval,
+                    can_dispatch=can_dispatch,
+                    owner_session_db=owner_session_db,
+                )
+                return
+
+            # ── Single-profile (legacy) path ──────────────────────────────────
+            recovered = self.recover_interrupted()
+            if recovered:
+                logger.warning(
+                    "Marked %d interrupted cron execution(s) unknown after restart",
+                    recovered,
+                )
+            # Heartbeat once before the first sleep so `hermes cron status` sees a
+            # live ticker immediately after startup, not only after the first tick.
+            record_ticker_heartbeat()
+            # Exponential backoff for consecutive tick failures — most importantly
+            # fd exhaustion (EMFILE/ENFILE, #87644).
+            consecutive_failures = 0
+            while not stop_event.is_set():
+                ok = False
+                try:
+                    if can_dispatch is not None and not can_dispatch():
+                        logger.debug("Cron dispatch paused while gateway drains existing work")
+                    else:
+                        cron_tick(
+                            verbose=False,
+                            adapters=adapters,
+                            loop=loop,
+                            sync=False,
+                            can_dispatch=can_dispatch,
+                            owner_session_db=owner_session_db,
+                        )
+                    ok = True
+                except BaseException as e:
+                    # Catch BaseException (not just Exception) so a SystemExit from
+                    # a misbehaving provider SDK / agent retry path does not kill
+                    # the ticker thread silently (#32612). KeyboardInterrupt is
+                    # intentionally caught here too — gateway shutdown is driven by
+                    # stop_event (set by the main thread's signal handler), not by
+                    # an exception in this daemon thread, so swallowing it and
+                    # re-checking stop_event keeps shutdown clean.
+                    logger.error("Cron tick error: %s", e, exc_info=True)
+                    # Persist the failure reason next to the heartbeat markers so
+                    # `hermes cron status`/`list` (separate processes) can show
+                    # WHY ticks fail, not just that the success marker is stale —
+                    # e.g. a root-rewritten jobs.json locking out the ticker's
+                    # uid went unnoticed for ~14h with the reason buried in the
+                    # gateway log (#68483).
+                    record_ticker_error(f"{type(e).__name__}: {e}")
+                    consecutive_failures = _note_tick_failure(e, consecutive_failures)
+                # Record liveness every iteration; bump the success marker only on a
+                # clean tick, so status can tell "alive but failing every tick" from
+                # "actually firing jobs" (#32612, #32895).
+                record_ticker_heartbeat(success=ok)
+                if ok:
+                    clear_ticker_error()
+                    consecutive_failures = 0
+                stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+        finally:
+            _shutdown_parallel_pool()
 
     def _start_multiplex(
         self,
@@ -656,6 +663,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        owner_session_db=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -666,7 +674,11 @@ class InProcessCronScheduler(CronScheduler):
         ``web_server.py`` scopes per-profile cron API calls.
         """
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import (
+            CRON_OWNER_STORE_UNAVAILABLE,
+            CRON_STANDALONE_SESSION_STORE,
+            tick as cron_tick,
+        )
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -681,6 +693,20 @@ class InProcessCronScheduler(CronScheduler):
             len(profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
+        if owner_session_db is None:
+            owner_session_db = CRON_STANDALONE_SESSION_STORE
+
+        def _owner_for_profile(entry):
+            if not isinstance(owner_session_db, dict):
+                return owner_session_db
+            name = str(entry[0]) if isinstance(entry, tuple) else ""
+            home = entry[1] if isinstance(entry, tuple) else entry
+            return (
+                owner_session_db.get(name)
+                or owner_session_db.get(str(home))
+                or owner_session_db.get(home)
+                or CRON_OWNER_STORE_UNAVAILABLE
+            )
 
         # Recovery + initial heartbeat for every profile.
         # A profile may have been deleted since this snapshot was taken;
@@ -721,6 +747,7 @@ class InProcessCronScheduler(CronScheduler):
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
+                                    owner_session_db=_owner_for_profile(entry),
                                 )
                         finally:
                             reset_hermes_home_override(home_token)

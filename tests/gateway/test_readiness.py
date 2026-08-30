@@ -5,6 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
+import gateway.readiness as readiness
 from gateway.readiness import collect_runtime_readiness
 
 
@@ -18,6 +19,11 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
     with sqlite3.connect(home / "state.db") as conn:
         conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        readiness,
+        "_probe_disk",
+        lambda _home: {"status": "ok", "used_percent": 1.0, "free_bytes": 1_000_000},
+    )
 
     result = collect_runtime_readiness(
         configured_model="test/model",
@@ -91,5 +97,3 @@ def test_readiness_uses_running_session_store_state_over_independent_probe(
         },
     )
     assert recovered["checks"]["session_store"] == {"status": "ok"}
-
-

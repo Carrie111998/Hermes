@@ -3486,8 +3486,12 @@ def _blank_slate_minimal_toolsets(config: dict):
     config.setdefault("platform_toolsets", {})["cli"] = sorted(keep)
 
     try:
-        from toolsets import TOOLSETS
+        from toolsets import TOOLSETS, resolve_toolset
         from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_plugin_toolset_keys
+
+        kept_tools = set()
+        for ts_key in keep:
+            kept_tools.update(resolve_toolset(ts_key, include_registry=False))
 
         all_keys = set()
         all_keys.update(k for k, _, _ in CONFIGURABLE_TOOLSETS)
@@ -3505,9 +3509,14 @@ def _blank_slate_minimal_toolsets(config: dict):
                 # user-facing disables. Adding them here causes model_tools
                 # to subtract their tools (terminal, read_file, …) from the
                 # minimal Blank Slate surface (#57315).
+            if set(resolve_toolset(k, include_registry=False)) & kept_tools:
+                continue  # shared/toolset-scoping aliases do not own these tools
             all_keys.add(k)
 
-        disabled = sorted(all_keys - keep)
+        disabled = sorted(
+            k for k in all_keys - keep
+            if not (set(resolve_toolset(k, include_registry=False)) & kept_tools)
+        )
         if disabled:
             config.setdefault("agent", {})["disabled_toolsets"] = disabled
     except Exception as exc:

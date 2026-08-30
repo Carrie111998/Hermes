@@ -365,6 +365,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc"),
                busy_policy="dispatch", desktop="advanced"),
+    CommandDef(
+        "fusion",
+        "Heterogeneous multi-LLM planning/review with debate and hard consensus gate",
+        "Tools & Skills",
+        args_hint="[plan|review|findings|recommend] <task> [--models provider:model,...] [--participants N] [--timeout S]",
+        subcommands=("plan", "review", "findings", "recommend"),
+    ),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True, desktop="terminal"),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -1478,7 +1485,11 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+#   - usage: one-off usage/quota lookup; reached via /hermes usage on Slack.
+#     Demoted when /fusion claimed a native slot (Fusion is an interactive
+#     workflow entrypoint); without this entry /fusion silently clamps /usage
+#     off the native list and breaks Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "usage"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

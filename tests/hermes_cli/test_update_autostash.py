@@ -67,6 +67,8 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(hermes_main, "_reload_updated_runtime_modules", lambda: None)
 
 
 
@@ -350,19 +352,25 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
 
     def git(*args):
         return subprocess.run(
-            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
         )
 
     git("init", "-q")
     git("config", "user.email", "t@example.com")
     git("config", "user.name", "t")
-    (tmp_path / ".gitignore").write_text(repo_gitignore.read_text())
-    (tmp_path / "tracked.txt").write_text("x\n")
+    (tmp_path / ".gitignore").write_text(repo_gitignore.read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "tracked.txt").write_text("x\n", encoding="utf-8")
     git("add", "-A")
     git("commit", "-qm", "init")
 
     marker = tmp_path / ".hermes-bootstrap-complete"
-    marker.write_text("")
+    marker.write_text("", encoding="utf-8")
 
     # Exact flags used by hermes update (hermes_cli/main.py).
     git("stash", "push", "--include-untracked", "-m", "hermes-update-autostash")
@@ -373,7 +381,12 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
     )
     # It must not even register as a dirty/untracked change.
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
+        ["git", "status", "--porcelain"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     ).stdout
     assert ".hermes-bootstrap-complete" not in status
 
@@ -400,38 +413,44 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         pytest.skip("git not available")
     if os.name == "nt":
         pytest.skip("POSIX permission semantics")
-    if os.geteuid() == 0:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("root ignores directory write bits")
 
     def git(*args, check=True):
         return subprocess.run(
-            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=check,
         )
 
     git("init", "-q", "-b", "main")
     git("config", "user.email", "t@example.com")
     git("config", "user.name", "t")
-    (tmp_path / "tracked.txt").write_text("v1\n")
+    (tmp_path / "tracked.txt").write_text("v1\n", encoding="utf-8")
     git("add", "-A")
     git("commit", "-qm", "init")
 
-    (tmp_path / "tracked.txt").write_text("v2 local change\n")
+    (tmp_path / "tracked.txt").write_text("v2 local change\n", encoding="utf-8")
     pkg = tmp_path / "packaging" / "homebrew"
     pkg.mkdir(parents=True)
-    (pkg / "hermes-agent.rb").write_text("formula\n")
+    (pkg / "hermes-agent.rb").write_text("formula\n", encoding="utf-8")
     os.chmod(pkg, 0o555)  # undeletable contents, like a root-owned dir
     try:
         stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
         assert stash_ref
 
         # The tracked change is stashed; simulate the updater's checkout window.
-        assert (tmp_path / "tracked.txt").read_text() == "v1\n"
+        assert (tmp_path / "tracked.txt").read_text(encoding="utf-8") == "v1\n"
 
         restored = hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
         assert restored is True
-        assert (tmp_path / "tracked.txt").read_text() == "v2 local change\n"
-        assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
+        assert (tmp_path / "tracked.txt").read_text(encoding="utf-8") == "v2 local change\n"
+        assert (pkg / "hermes-agent.rb").read_text(encoding="utf-8") == "formula\n"
     finally:
         os.chmod(pkg, 0o755)

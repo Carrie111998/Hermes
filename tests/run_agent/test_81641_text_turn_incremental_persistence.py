@@ -29,6 +29,7 @@ These tests pin the fix:
 
 from __future__ import annotations
 
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -84,7 +85,11 @@ def _run_text_turn(agent, answer: str, *, flush_side_effect=None):
                 if isinstance(m, dict)
             ],
         ))
-        if flush_side_effect is not None:
+        if callable(flush_side_effect):
+            exc = flush_side_effect()
+            if exc is not None:
+                raise exc
+        elif flush_side_effect is not None:
             raise flush_side_effect
         return True
 
@@ -163,7 +168,7 @@ class TestCompletedTextTurnIncrementalPersistence:
         """
         answer = "Still answered."
         result, events = _run_text_turn(
-            loop_agent, answer, flush_side_effect=RuntimeError("database is locked")
+            loop_agent, answer, flush_side_effect=RuntimeError("simulated flush failure")
         )
 
         assert result["final_response"] == answer, (
@@ -173,3 +178,35 @@ class TestCompletedTextTurnIncrementalPersistence:
             "finalize_turn's _persist_session must still run so the failed "
             "flush gets retried."
         )
+
+    def test_locked_completed_text_flush_waits_before_finalization(self, loop_agent):
+        """Transient locked text-turn flushes retry before post-loop cleanup."""
+        loop_agent._session_persistence_lock_wait_initial_s = 0.0
+        loop_agent._session_persistence_lock_wait_max_sleep_s = 0.0
+        answer = "Saved after the lock clears."
+
+        attempts = {"count": 0}
+
+        def _flush_side_effect():
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                return sqlite3.OperationalError("database is locked")
+            return None
+
+        result, events = _run_text_turn(
+            loop_agent,
+            answer,
+            flush_side_effect=_flush_side_effect,
+        )
+
+        assert result["final_response"] == answer
+        answer_flushes = [
+            i
+            for i, (kind, snapshot) in enumerate(events)
+            if kind == "flush" and snapshot and snapshot[-1] == ("assistant", answer)
+        ]
+        assert len(answer_flushes) == 3
+        final_persist = max(
+            i for i, (kind, _) in enumerate(events) if kind == "persist_session"
+        )
+        assert answer_flushes[-1] < final_persist
