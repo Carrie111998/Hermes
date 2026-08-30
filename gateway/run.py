@@ -16176,10 +16176,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # and owns no resources that should be disconnected.
                     continue
 
-            self._configure_profile_adapter(adapter, profile_name, platform)
-
             try:
                 with _profile_runtime_scope(profile_home):
+                    self._configure_profile_adapter(adapter, profile_name, platform)
                     success = await self._connect_initial_adapter_with_timeout(
                         adapter, platform
                     )

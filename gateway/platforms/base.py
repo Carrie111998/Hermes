@@ -3825,6 +3825,12 @@ class BasePlatformAdapter(ABC):
         """Return whether this adapter currently owns a run for ``session_key``."""
         return session_key in self._active_sessions
 
+    def active_session_generation(self, session_key: str) -> int | None:
+        """Return the run generation owning ``session_key``, when available."""
+        guard = self._active_sessions.get(session_key)
+        generation = getattr(guard, "_hermes_run_generation", None)
+        return int(generation) if generation is not None else None
+
     def set_platform_event_handler(
         self,
         handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
@@ -6274,6 +6280,13 @@ class BasePlatformAdapter(ABC):
         # question pending.
         deferred_service = getattr(self, "_deferred_question_service", None)
         if deferred_service is not None and not event.get_command():
+            authorized = self._is_sender_authorized(
+                event.source.user_id,
+                event.source.chat_type,
+                event.source.chat_id,
+            )
+            if authorized is False:
+                return
             try:
                 deferred_result = await deferred_service.handle_response(
                     session_key, event.text or ""
@@ -6287,22 +6300,6 @@ class BasePlatformAdapter(ABC):
                 )
                 return
             if deferred_result is not None:
-                deferred_reply = (
-                    deferred_result.reply
-                    if deferred_result.resolved
-                    else deferred_result.question
-                )
-                if deferred_reply:
-                    await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=deferred_reply,
-                        reply_to=_reply_anchor_for_event(event),
-                        metadata=_mark_notify_metadata(
-                            _thread_metadata_for_source(
-                                event.source, _reply_anchor_for_event(event)
-                            )
-                        ),
-                    )
                 return
 
         # On-entry self-heal: if the adapter still has an _active_sessions

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import asyncio
 import contextvars
+import logging
 import sqlite3
 import threading
 import time
@@ -14,7 +15,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
 
-QuestionState = Literal["queued", "awaiting", "handling", "resolved"]
+QuestionState = Literal["queued", "delivering", "awaiting", "handling"]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,7 @@ class DeferredQuestionService:
         self._adapters: dict[str, tuple[Any, asyncio.AbstractEventLoop]] = {}
         self._busy_callbacks: set[str] = set()
         self._retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._recovery_task: asyncio.Task[None] | None = None
         self.delivery_retry_seconds = 5.0
         self._initialize()
 
@@ -88,16 +91,15 @@ class DeferredQuestionService:
                     context_json TEXT NOT NULL,
                     dedupe_key TEXT NOT NULL,
                     state TEXT NOT NULL CHECK (
-                        state IN ('queued', 'awaiting', 'handling', 'resolved')
+                        state IN ('queued', 'delivering', 'awaiting', 'handling')
                     ),
                     response TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS
-                    uq_deferred_questions_unresolved_dedupe
-                ON deferred_questions(plugin_id, dedupe_key)
-                WHERE state != 'resolved';
+                    uq_deferred_questions_dedupe
+                ON deferred_questions(plugin_id, dedupe_key);
                 CREATE INDEX IF NOT EXISTS
                     ix_deferred_questions_session_state
                 ON deferred_questions(session_key, state, created_at);
@@ -194,7 +196,7 @@ class DeferredQuestionService:
                 row = conn.execute(
                     """
                     SELECT * FROM deferred_questions
-                    WHERE plugin_id = ? AND dedupe_key = ? AND state != 'resolved'
+                    WHERE plugin_id = ? AND dedupe_key = ?
                     """,
                     (plugin_id, dedupe_key),
                 ).fetchone()
@@ -219,7 +221,7 @@ class DeferredQuestionService:
             row = conn.execute(
                 """
                 SELECT * FROM deferred_questions
-                WHERE session_key = ? AND state != 'resolved'
+                WHERE session_key = ?
                 ORDER BY created_at ASC LIMIT 1
                 """,
                 (session_key,),
@@ -232,12 +234,22 @@ class DeferredQuestionService:
             changed = conn.execute(
                 """
                 UPDATE deferred_questions
-                SET state = 'awaiting', updated_at = ?
+                SET state = 'delivering', updated_at = ?
                 WHERE id = ? AND state = 'queued'
                 """,
                 (now, question_id),
             ).rowcount
         return self.get(question_id) if changed else None
+
+    def mark_awaiting(self, question_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE deferred_questions SET state = 'awaiting', updated_at = ?
+                WHERE id = ? AND state = 'delivering'
+                """,
+                (time.time(), question_id),
+            )
 
     def requeue(self, question_id: str) -> None:
         with self._lock, self._connect() as conn:
@@ -245,7 +257,7 @@ class DeferredQuestionService:
                 """
                 UPDATE deferred_questions
                 SET state = 'queued', response = NULL, updated_at = ?
-                WHERE id = ? AND state = 'awaiting'
+                WHERE id = ? AND state = 'delivering'
                 """,
                 (time.time(), question_id),
             )
@@ -259,6 +271,17 @@ class DeferredQuestionService:
         if not callable(handler):
             raise TypeError("deferred question handler must be callable")
         self._handlers[(plugin_id, handler_name)] = handler
+        self._schedule_recovery()
+
+    def unregister_handler(
+        self,
+        plugin_id: str,
+        handler_name: str,
+        handler: DeferredQuestionHandler,
+    ) -> None:
+        key = (plugin_id, handler_name)
+        if self._handlers.get(key) is handler:
+            self._handlers.pop(key, None)
 
     def bind_adapter(self, platform: str, adapter: Any) -> None:
         try:
@@ -266,15 +289,32 @@ class DeferredQuestionService:
         except RuntimeError:
             loop = asyncio.get_event_loop()
         self._adapters[platform] = (adapter, loop)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE deferred_questions SET state = 'queued', updated_at = ?
+                WHERE platform = ? AND state = 'delivering'
+                """,
+                (time.time(), platform),
+            )
         self._wake_platform(platform)
 
-        def retry_captured() -> None:
-            asyncio.create_task(self.retry_handling())
+        self._schedule_recovery(loop)
 
-        if loop.is_running():
-            loop.call_soon_threadsafe(
-                retry_captured, context=contextvars.Context()
+    def _schedule_recovery(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
+        if loop is None:
+            loop = next(
+                (bound_loop for _adapter, bound_loop in self._adapters.values()),
+                None,
             )
+        if loop is None or not loop.is_running():
+            return
+
+        def recover_captured() -> None:
+            if self._recovery_task is None or self._recovery_task.done():
+                self._recovery_task = asyncio.create_task(self._recover_handling())
+
+        loop.call_soon_threadsafe(recover_captured, context=contextvars.Context())
 
     def _wake_platform(self, platform: str) -> None:
         binding = self._adapters.get(platform)
@@ -315,14 +355,25 @@ class DeferredQuestionService:
         self, platform: str, session_key: str | None = None
     ) -> list[DeferredQuestion]:
         sql = """
-            SELECT * FROM deferred_questions
-            WHERE platform = ? AND state = 'queued'
+            SELECT candidate.* FROM deferred_questions AS candidate
+            WHERE candidate.platform = ? AND candidate.state = 'queued'
+              AND NOT EXISTS (
+                  SELECT 1 FROM deferred_questions AS older
+                  WHERE older.session_key = candidate.session_key
+                    AND (
+                        older.created_at < candidate.created_at
+                        OR (
+                            older.created_at = candidate.created_at
+                            AND older.id < candidate.id
+                        )
+                    )
+              )
         """
         params: tuple[object, ...] = (platform,)
         if session_key is not None:
-            sql += " AND session_key = ?"
+            sql += " AND candidate.session_key = ?"
             params += (session_key,)
-        sql += " ORDER BY created_at ASC"
+        sql += " ORDER BY candidate.created_at ASC"
         with self._lock, self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [record for row in rows if (record := self._from_row(row)) is not None]
@@ -349,7 +400,9 @@ class DeferredQuestionService:
                     await self.deliver_ready(platform, key)
 
                 adapter.register_post_delivery_callback(
-                    record.session_key, after_delivery
+                    record.session_key,
+                    after_delivery,
+                    generation=adapter.active_session_generation(record.session_key),
                 )
                 continue
             claimed = self.claim_for_delivery(record.id)
@@ -359,6 +412,8 @@ class DeferredQuestionService:
             if not getattr(result, "success", False):
                 self.requeue(claimed.id)
                 self._schedule_delivery_retry(claimed)
+            else:
+                self.mark_awaiting(claimed.id)
 
     async def handle_response(
         self, session_key: str, response: str
@@ -399,20 +454,31 @@ class DeferredQuestionService:
         result = await handler(record, record.response)
         if not isinstance(result, DeferredQuestionResult):
             raise TypeError("deferred question handler returned an invalid result")
+        reply = result.reply if result.resolved else result.question
+        if not result.resolved and (not reply or not reply.strip()):
+            raise ValueError("clarification result requires a question")
+        binding = self._adapters.get(record.platform)
+        if binding is None:
+            raise RuntimeError(f"no adapter bound for {record.platform}")
+        adapter, _loop = binding
+        if reply:
+            delivered = await adapter.send(record.chat_id, reply)
+            if not getattr(delivered, "success", False):
+                raise RuntimeError(
+                    getattr(delivered, "error", None)
+                    or "deferred-question reply delivery failed"
+                )
         now = time.time()
         with self._lock, self._connect() as conn:
             if result.resolved:
                 conn.execute(
                     """
-                    UPDATE deferred_questions
-                    SET state = 'resolved', updated_at = ?
+                    DELETE FROM deferred_questions
                     WHERE id = ? AND state = 'handling'
                     """,
-                    (now, record.id),
+                    (record.id,),
                 )
             else:
-                if not result.question or not result.question.strip():
-                    raise ValueError("clarification result requires a question")
                 conn.execute(
                     """
                     UPDATE deferred_questions
@@ -422,7 +488,12 @@ class DeferredQuestionService:
                     """,
                     (result.question, now, record.id),
                 )
+        if result.resolved:
+            await self.deliver_ready(record.platform, record.session_key)
         return result
+
+    async def _recover_handling(self) -> None:
+        await self.retry_handling()
 
     async def retry_handling(
         self,
@@ -441,27 +512,31 @@ class DeferredQuestionService:
                 continue
             if (record.plugin_id, record.handler_name) not in self._handlers:
                 continue
-            results.append((record.id, await self._run_handler(record)))
+            try:
+                result = await self._run_handler(record)
+            except Exception:
+                logger.error(
+                    "Deferred-question recovery failed for %s",
+                    record.id,
+                    exc_info=True,
+                )
+                continue
+            results.append((record.id, result))
         return results
-
-    def resolve_without_handler(self, question_id: str, response: str) -> None:
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE deferred_questions
-                SET state = 'resolved', response = ?, updated_at = ?
-                WHERE id = ? AND state != 'resolved'
-                """,
-                (response, time.time(), question_id),
-            )
 
 
 class DeferredQuestionClient:
     """Plugin-scoped facade over the host deferred-question service."""
 
-    def __init__(self, service: DeferredQuestionService, plugin_id: str) -> None:
+    def __init__(
+        self,
+        service: DeferredQuestionService,
+        plugin_id: str,
+        track_registration: Callable[[str, Callable[[], None]], object] | None = None,
+    ) -> None:
         self._service = service
         self._plugin_id = plugin_id
+        self._track_registration = track_registration
 
     @property
     def plugin_id(self) -> str:
@@ -471,6 +546,13 @@ class DeferredQuestionClient:
         self, handler_name: str, handler: DeferredQuestionHandler
     ) -> None:
         self._service.register_handler(self._plugin_id, handler_name, handler)
+        if self._track_registration is not None:
+            self._track_registration(
+                handler_name,
+                lambda: self._service.unregister_handler(
+                    self._plugin_id, handler_name, handler
+                ),
+            )
 
     def enqueue(
         self,
@@ -507,8 +589,6 @@ def get_deferred_question_service() -> DeferredQuestionService:
     with _singleton_lock:
         service = _singletons.get(home)
         if service is None:
-            service = DeferredQuestionService(
-                home / "deferred_questions.sqlite3"
-            )
+            service = DeferredQuestionService(home / "deferred_questions.db")
             _singletons[home] = service
         return service

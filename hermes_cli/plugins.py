@@ -1686,7 +1686,11 @@ class PluginContext:
 
             plugin_id = self.manifest.key or self.manifest.name
             self._deferred_questions = DeferredQuestionClient(
-                get_deferred_question_service(), plugin_id
+                get_deferred_question_service(),
+                plugin_id,
+                track_registration=lambda key, release: self._track(
+                    "deferred_question_handler", key, release
+                ),
             )
         return self._deferred_questions
 
