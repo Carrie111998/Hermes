@@ -1018,7 +1018,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         provider=getattr(agent, "provider", None),
         model=getattr(agent, "model", None),
     )
-    _efc(_budget, pre_cap=_pre_cap, ceiling=_ceiling,
+    _efc(_budget, pre_cap=_pre_cap, ceiling=_ceiling, api_kwargs=api_kwargs,
          reason="main non-streaming dispatch (final payload)")
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")

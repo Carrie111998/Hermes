@@ -820,12 +820,46 @@ def build_final_context_budget(
     )
 
 
+def _set_final_request_output_cap(api_kwargs: dict, cap: int) -> None:
+    """Write ``cap`` into whichever provider-specific output field the FINAL
+    request already carries (mirrors :func:`_final_request_output_cap`, but
+    for the write path).
+
+    Only the field that already holds the authoritative cap is rewritten — a
+    Bedrock request carrying ``inferenceConfig.maxTokens`` is clamped there,
+    an OpenAI-compatible request on ``max_tokens``, etc.  If the request
+    carried no explicit cap (the cap came from the provider implicit /
+    default reservation), the clamp is applied to the most common transport
+    field (``max_tokens``) so the outgoing request carries a concrete value
+    instead of relying on the provider to accept an oversized implicit cap.
+    """
+    existing = _final_request_output_cap(api_kwargs)
+    if existing is not None:
+        if "max_tokens" in api_kwargs:
+            api_kwargs["max_tokens"] = cap
+        elif "max_completion_tokens" in api_kwargs:
+            api_kwargs["max_completion_tokens"] = cap
+        elif "max_output_tokens" in api_kwargs:
+            api_kwargs["max_output_tokens"] = cap
+        elif isinstance(api_kwargs.get("inferenceConfig"), dict) and "maxTokens" in api_kwargs["inferenceConfig"]:
+            api_kwargs["inferenceConfig"]["maxTokens"] = cap
+        elif "maxOutputTokens" in api_kwargs:
+            api_kwargs["maxOutputTokens"] = cap
+    # If no explicit cap was carried, leave the request as-is: the reservation
+    # that triggered the clamp is already bounded by the resolver (explicit →
+    # provider → DEFAULT), and there is no field to clamp.  The budget check
+    # below (budget.total after clamp) is the authoritative invariant; if the
+    # reservation still exceeds the remaining budget, the unshrinkable-input
+    # path will refuse.
+
+
 def enforce_final_context_budget(
     budget: FinalContextBudget,
     *,
     pre_cap: int | None = None,
     ceiling: int | None = None,
     reason: str = "",
+    api_kwargs: dict | None = None,
 ) -> None:
     """Raise :class:`ContextCeilingExceeded` if ``budget.total`` exceeds the
     effective limit = ``min(invocation pre-cap, profile ceiling)``.
@@ -833,6 +867,25 @@ def enforce_final_context_budget(
     Shared terminal enforcement primitive — the ONE place every physical
     dispatch owner (main + auxiliary) calls immediately before provider I/O.
     No-op when neither ``pre_cap`` nor ``ceiling`` is configured.
+
+    When ``api_kwargs`` is supplied, overflow is classified:
+
+    * **Unshrinkable** — ``budget.input_tokens_estimate`` alone is at or over
+      the effective limit.  The input payload cannot be reduced by touching
+      the output cap; :class:`ContextCeilingExceeded` is raised (the provider
+      is never called, and the caller's provider-400 recovery path is
+      preserved because the provider never returns a 400 for a request it
+      never received).
+
+    * **Shrinkable** — the input fits, but ``input + output_reservation``
+      exceeds the limit.  The requested output cap is clamped in-place to
+      ``max(0, limit - input_tokens_estimate)`` (the maximum legal output
+      allowance from the remaining budget) and the check is re-run against
+      the clamped reservation.  This avoids sending a known-invalid cap to
+      the provider while preserving the existing provider-400 recovery
+      path as a fallback for cases where the clamp is insufficient (e.g.
+      the provider's own tokenizer counts the input larger than Hermes's
+      rough estimate).
     """
     # effective limit = min(invocation pre-cap, profile ceiling); no-op if
     # neither is a valid positive int.
@@ -843,6 +896,34 @@ def enforce_final_context_budget(
     if limit is None:
         return
     if budget.total > limit:
+        if (
+            api_kwargs is not None
+            and (budget.total - budget.output_reservation) < limit
+        ):
+            # Shrinkable overflow: the non-output portion (input + system +
+            # tools) fits under the limit, but the output reservation pushes
+            # the total over.  Clamp the outgoing cap to the maximum legal
+            # allowance — the budget's total minus everything except the
+            # output reservation — so that input + system + tools + clamped
+            # cap == limit exactly.
+            allowed = limit - (budget.total - budget.output_reservation)
+            # The clamp must NEVER raise an explicit cap (explicit output caps
+            # are authoritative and may legitimately exceed the rough
+            # remaining budget — the provider's own tokenizer is the final
+            # arbiter, and the provider-400 recovery path remains the
+            # fallback).
+            if _final_request_output_cap(api_kwargs) is not None:
+                _set_final_request_output_cap(api_kwargs, allowed)
+                # After the clamp the resolver's Level-1 (final request cap)
+                # returns exactly `allowed`, so the post-clamp reservation is
+                # `allowed` and the post-clamp total is
+                # input + allowed == limit — the budget now fits exactly and
+                # the provider call proceeds with the reduced cap.
+                return
+            # No explicit cap field to clamp (the reservation came from the
+            # provider implicit / DEFAULT floor).  The input fits but the
+            # resolved reservation does not — the overflow is unshrinkable
+            # (nothing on the wire to lower), so fall through to the raise.
         raise ContextCeilingExceeded(budget.total, limit, reason=reason)
 
 

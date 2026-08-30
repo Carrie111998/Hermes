@@ -396,15 +396,39 @@ class TestToolMutationInvalidateCache:
                 tool["function"]["parameters"]["required"].append(f"extra_{i}")
 
         # A fresh estimate of the FINAL tools pushes the total over the 64K
-        # ceiling; a stale (pre-mutation) estimate would not. The gate must
-        # see the FINAL tools and refuse.
-        with pytest.raises(ContextCeilingExceeded):
-            _dispatch_nonstreaming_api_request(
-                agent, dict(kwargs), make_client=lambda *_a, **_k: agent.client
-            )
-
-        assert len(agent.client.create_calls) == 0, (
-            "Gate must see the in-place-mutated tools, not a stale cached estimate"
+        # ceiling; a stale (pre-mutation) estimate would not.  The gate must
+        # see the FINAL (expanded) tools.  Because the non-output portion
+        # (input + tools) still fits under the ceiling, the gate clamps the
+        # outgoing output cap to the maximum legal allowance derived from the
+        # FINAL tools rather than refusing: the clamped cap is the observable
+        # that distinguishes the expanded tools (cap = 64000 - 61964 = 2036)
+        # from a stale unexpanded estimate (cap would be 64000 - 58294 = 5706).
+        _dispatch_nonstreaming_api_request(
+            agent, dict(kwargs), make_client=lambda *_a, **_k: agent.client
+        )
+        # The cap was clamped downward (from 4096) to a value reflecting the
+        # FINAL tools — proof the gate saw the expanded schema, not the
+        # pre-warmed (stale) unexpanded estimate.  A stale estimate would have
+        # clamped the cap to a LARGER value (5706), so asserting the exact
+        # FINAL-tools-derived cap (2036) is the cache-invalidation invariant.
+        assert len(agent.client.create_calls) == 1, (
+            "Shrinkable overflow (non-output fits) must clamp and dispatch"
+        )
+        dispatched = agent.client.create_calls[0]
+        clamped = dispatched["max_tokens"]
+        assert clamped < 4096, "Gate must clamp the cap downward for over-ceiling total"
+        # The clamp cap reflects the FINAL (expanded) tools: ceiling -
+        # (input + expanded_tools).  A stale unexpanded estimate would give a
+        # different (larger) cap, so this exact value is the cache-invalidation
+        # proof.
+        from agent.model_metadata import (
+            _estimate_tools_tokens_rough as _est_tools,
+            estimate_messages_tokens_rough as _est_msgs,
+        )
+        expected_cap = 64_000 - (_est_msgs(base_messages) + _est_tools(tools))
+        assert clamped == expected_cap, (
+            f"Gate clamped to {clamped} but the FINAL-tools-derived cap is "
+            f"{expected_cap} — the gate used a stale tool estimate"
         )
 
 
