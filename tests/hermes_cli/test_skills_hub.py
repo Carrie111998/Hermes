@@ -5,7 +5,14 @@ import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import (
+    _apply_current_bundle_trust,
+    do_check,
+    do_install,
+    do_list,
+    do_update,
+    handle_skills_slash,
+)
 
 
 class _DummyLockFile:
@@ -14,6 +21,31 @@ class _DummyLockFile:
 
     def list_installed(self):
         return self._installed
+
+
+@pytest.mark.parametrize("cached_trust", ["community", "operator"])
+@pytest.mark.parametrize("current_trust", ["community", "operator"])
+def test_current_bundle_trust_overrides_fresh_or_cached_scan(
+    cached_trust, current_trust
+):
+    from tools.skills_guard import ScanResult
+
+    provenance = {"trust_level": cached_trust, "fresh": False}
+    result = ScanResult(
+        skill_name="demo",
+        source="owner/repo/skills/demo",
+        trust_level=cached_trust,
+        verdict="dangerous",
+        findings=[],
+        scan_provenance=dict(provenance),
+    )
+
+    _apply_current_bundle_trust(result, provenance, current_trust)
+
+    assert result.trust_level == current_trust
+    assert result.scan_provenance["trust_level"] == current_trust
+    assert provenance["trust_level"] == current_trust
+    assert result.verdict == "dangerous"
 
 
 @pytest.fixture()

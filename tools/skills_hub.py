@@ -134,7 +134,7 @@ class SkillMeta:
     description: str
     source: str           # "official", "github", "clawhub", "lobehub"
     identifier: str       # source-specific ID (e.g. "openai/skills/skill-creator")
-    trust_level: str      # "builtin" | "trusted" | "community"
+    trust_level: str      # "builtin" | "operator" | "trusted" | "community"
     repo: Optional[str] = None
     path: Optional[str] = None
     tags: List[str] = field(default_factory=list)
@@ -690,14 +690,18 @@ class GitHubSource(SkillSource):
 
     def __init__(self, auth: GitHubAuth, extra_taps: Optional[List[Dict]] = None):
         self.auth = auth
-        self._operator_tap_repos = {
-            normalized
-            for tap in (extra_taps or [])
-            if (normalized := self._normalize_repo(tap.get("repo", ""))) is not None
-        }
         self.taps = list(self.DEFAULT_TAPS)
-        if extra_taps:
-            self.taps.extend(extra_taps)
+        self._operator_tap_repos: set[str] = set()
+        for tap in extra_taps or []:
+            if not isinstance(tap, dict):
+                logger.warning("Ignoring malformed custom tap record: %r", tap)
+                continue
+            normalized = self._normalize_repo(tap.get("repo", ""))
+            if normalized is None:
+                logger.warning("Ignoring custom tap with invalid repo: %r", tap)
+                continue
+            self._operator_tap_repos.add(normalized)
+            self.taps.append(tap)
         # Per-instance cache: repo -> (default_branch, tree_entries)
         # Survives within a single search/install flow, avoiding redundant API calls.
         self._tree_cache: Dict[str, Tuple[str, List[dict]]] = {}

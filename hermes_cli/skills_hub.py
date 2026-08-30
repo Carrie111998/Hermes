@@ -28,6 +28,15 @@ from hermes_constants import display_hermes_home
 _console = Console()
 
 
+def _apply_current_bundle_trust(
+    result, scan_provenance: dict, trust_level: str
+) -> None:
+    """Bind policy to the active source router, never stale scan-cache trust."""
+    result.trust_level = trust_level
+    result.scan_provenance["trust_level"] = trust_level
+    scan_provenance["trust_level"] = trust_level
+
+
 def _display_source(r) -> str:
     """Human-facing source label for a result row.
 
@@ -720,9 +729,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Source identifiers drive scanner provenance, while the active source
     # router owns trust classification. Reapply current bundle trust on every
     # install/update so cached scans cannot retain stale tap membership.
-    result.trust_level = bundle.trust_level
-    result.scan_provenance["trust_level"] = bundle.trust_level
-    scan_provenance["trust_level"] = bundle.trust_level
+    _apply_current_bundle_trust(result, scan_provenance, bundle.trust_level)
     c.print(format_scan_report(result))
     freshness = "fresh" if scan_provenance["fresh"] else "cached"
     c.print(

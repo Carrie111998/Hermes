@@ -143,10 +143,37 @@ class TestTrustLevelFor:
         assert src.trust_level_for("GoBeromsu/other/skills/hermes") == "community"
         assert src.trust_level_for("malformed") == "community"
 
+    def test_operator_trust_is_profile_local_and_revoked_with_tap(self):
+        auth = MagicMock(spec=GitHubAuth)
+        default = GitHubSource(
+            auth=auth,
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+        other_profile = GitHubSource(auth=auth, extra_taps=[])
+        after_removal = GitHubSource(auth=auth, extra_taps=[])
+        identifier = "GoBeromsu/bstack/skills/hermes"
+
+        assert default.trust_level_for(identifier) == "operator"
+        assert other_profile.trust_level_for(identifier) == "community"
+        assert after_removal.trust_level_for(identifier) == "community"
+
     def test_default_tap_is_not_operator_trusted(self):
         src = self._source()
 
         assert src.trust_level_for("garrytan/gstack/skills/example") == "community"
+
+    @pytest.mark.parametrize("bad_tap", [None, "owner/repo", [], {}, {"repo": "bad"}])
+    def test_malformed_extra_tap_never_crashes_or_confers_trust(
+        self, bad_tap, caplog
+    ):
+        src = GitHubSource(
+            auth=MagicMock(spec=GitHubAuth),
+            extra_taps=[bad_tap],
+        )
+
+        assert src.trust_level_for("owner/repo/skills/example") == "community"
+        assert bad_tap not in src.taps
+        assert "Ignoring" in caplog.text
 
     def test_trusted_repo(self):
         src = self._source()
