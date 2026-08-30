@@ -1617,10 +1617,9 @@ def _create_quick_snapshot_locked(
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
     failed_dbs: list[str] = []  # present *.db that could not be snapshotted
-    # #68805: track protected DB files skipped for size — they are snapshot
-    # incompleteness just like a failed copy, so pruning must be suppressed
-    # to preserve the older complete snapshot that may contain the only
-    # recoverable database.
+    # #68805: track protected DB files skipped for size. They are snapshot
+    # incompleteness just like a failed copy, so pruning must preserve the
+    # newest older snapshot containing each omitted database.
     oversized_skipped: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
@@ -1748,16 +1747,16 @@ def _create_quick_snapshot_locked(
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
     # with known high-churn safety snapshots (for example pre-update) can pass a
     # smaller keep value so large state.db copies do not accumulate indefinitely.
-    # #68805 review: when a present DB failed to capture OR was skipped for
-    # size, preserve the latest complete recovery source in addition to the
-    # normal retention window.  Still prune stale incomplete snapshots: they
-    # contain config/auth copies too, and repeated failures must stay bounded.
+    # #68805: when a present DB failed to capture or was skipped for size,
+    # preserve the newest recovery copy of each omitted DB in addition to the
+    # normal retention window. Still prune stale partial snapshots that add no
+    # recovery coverage: they contain config/auth copies and must stay bounded.
     incomplete = failed_dbs or oversized_skipped
     retention = _QUICK_DEFAULT_KEEP if keep is None else keep
     if incomplete:
         if oversized_skipped:
             print(
-                "  ⚠ Preserving latest complete snapshot: DB file(s) skipped for size: "
+                "  ⚠ Preserving latest recovery copy: DB file(s) skipped for size: "
                 + ", ".join(oversized_skipped)
             )
             logger.warning(
@@ -1766,13 +1765,13 @@ def _create_quick_snapshot_locked(
             )
         logger.warning(
             "Snapshot incomplete because %d DB(s) failed to capture and/or %d "
-            "were oversized — preserving latest complete recovery source",
+            "were oversized — preserving latest recovery copy of each omitted DB",
             len(failed_dbs), len(oversized_skipped),
         )
     _prune_quick_snapshots(
         root,
         keep=retention,
-        preserve_latest_complete=bool(incomplete),
+        preserve_recovery_for=set(failed_dbs) | set(oversized_skipped),
     )
 
     logger.info(
@@ -2100,9 +2099,9 @@ def _prune_quick_snapshots(
     root: Path,
     keep: int = _QUICK_DEFAULT_KEEP,
     *,
-    preserve_latest_complete: bool = False,
+    preserve_recovery_for: Optional[set[str]] = None,
 ) -> int:
-    """Remove old snapshots, optionally retaining one complete recovery source."""
+    """Remove old snapshots while retaining recovery copies for omitted DBs."""
     if not root.exists():
         return 0
 
@@ -2117,20 +2116,28 @@ def _prune_quick_snapshots(
     )
 
     retained = set(dirs[:keep])
-    if preserve_latest_complete:
+    missing = set(preserve_recovery_for or ())
+    if missing:
         for d in dirs:
             try:
                 with open(d / "manifest.json", encoding="utf-8") as f:
                     meta = json.load(f)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "Could not inspect snapshot %s while preserving recovery copies: %s",
+                    d.name,
+                    exc,
+                )
                 continue
-            if (
-                isinstance(meta, dict)
-                and not meta.get("failed_dbs")
-                and not meta.get("oversized_skipped")
-            ):
+            files = meta.get("files") if isinstance(meta, dict) else None
+            if not isinstance(files, dict):
+                continue
+            covered = missing.intersection(files)
+            if covered:
                 retained.add(d)
-                break
+                missing.difference_update(covered)
+                if not missing:
+                    break
 
     deleted = 0
     for d in dirs:
