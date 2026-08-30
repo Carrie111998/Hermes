@@ -3481,14 +3481,19 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 # damaged file may fail, in which case the canonical
                 # database.journal_mode setting is the restore target.
                 before_mode = _probe_journal_mode_for_repair(db_path)
+                # Snapshot ownership before surgery. A quarantine published only
+                # after this repair began belongs to the post-repair generation
+                # and must never be retired by this pass.
+                had_active_quarantine = _active_structural_quarantine_path(
+                    db_path
+                ).exists()
                 result = _repair_state_db_schema_locked(
                     db_path, backup=backup, report=report
                 )
                 if result.get("repaired"):
                     result["journal_mode_before"] = before_mode
                     _restore_journal_mode_after_repair(db_path, before_mode)
-                    active_quarantine = _active_structural_quarantine_path(db_path)
-                    if active_quarantine.exists() and not _finalize_structural_repair(
+                    if had_active_quarantine and not _finalize_structural_repair(
                         db_path
                     ):
                         result["repaired"] = False
