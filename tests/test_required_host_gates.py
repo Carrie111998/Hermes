@@ -14,6 +14,7 @@ def _manager(callbacks):
 def test_required_gate_names_are_registered() -> None:
     assert {
         "provider_request_gate",
+        "assistant_final_candidate_gate",
         "assistant_persist_gate",
         "assistant_persist_receipt",
     } <= VALID_HOOKS

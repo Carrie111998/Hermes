@@ -1349,6 +1349,23 @@ def build_turn_context(
                 else None
             )
             raise RuntimeError(reason or "provider request aborted by Host gate")
+        if (
+            "allow_streaming" in _provider_gate
+            and not isinstance(_provider_gate.get("allow_streaming"), bool)
+        ):
+            raise RuntimeError("provider request Host gate returned an invalid streaming policy")
+    from hermes_cli.lifecycle import has_hook as _has_hook
+    if _has_hook("assistant_final_candidate_gate") and not (
+        isinstance(_provider_gate, dict)
+        and _provider_gate.get("allow_streaming") is False
+    ):
+        raise RuntimeError(
+            "assistant final-candidate gate requires allow_streaming=false"
+        )
+    agent._host_streaming_allowed = not (
+        isinstance(_provider_gate, dict)
+        and _provider_gate.get("allow_streaming") is False
+    )
     _provider_gate_context = (
         str(_provider_gate.get("context"))
         if isinstance(_provider_gate, dict) and _provider_gate.get("context")
@@ -1439,6 +1456,7 @@ def build_turn_context(
     agent._turn_file_mutation_paths = set()
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
+    agent._final_candidate_continue_signatures = set()
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.
