@@ -6748,6 +6748,12 @@ class TurnRunner:
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
+        _reasoning_config = getattr(_agent, "reasoning_config", None) if _agent else None
+        _fallback_activated = bool(getattr(_agent, "_fallback_activated", False)) if _agent else False
+        from gateway.runtime_footer import count_turn_tool_calls as _count_turn_tool_calls
+        _turn_tool_calls = _count_turn_tool_calls(
+            result.get("messages", []), history_offset=len(agent_history)
+        )
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -6884,6 +6890,9 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "reasoning_config": _reasoning_config,
+                "tool_calls": _turn_tool_calls,
+                "fallback_activated": _fallback_activated,
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6965,6 +6974,9 @@ class TurnRunner:
             "output_tokens": _output_toks,
             "model": _resolved_model,
             "context_length": _context_length,
+            "reasoning_config": _reasoning_config,
+            "tool_calls": _turn_tool_calls,
+            "fallback_activated": _fallback_activated,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
@@ -21568,12 +21580,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+                from hermes_cli.profiles import get_active_profile_name as _active_profile
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
+                    bot=_active_profile(),
                     model=agent_result.get("model"),
+                    reasoning_config=agent_result.get("reasoning_config"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
+                    tool_calls=agent_result.get("tool_calls"),
+                    fallback_activated=bool(agent_result.get("fallback_activated")),
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
                 )
