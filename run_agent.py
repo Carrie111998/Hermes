@@ -5967,81 +5967,56 @@ class AIAgent:
         session's current base_url is still the registry default or the
         previously-seen env value.
 
-        Covers api-key registry providers and named custom providers with a
-        ``key_env`` (#67935) — the latter resolve to ``provider="custom"``
-        with no registry entry, so they are matched through the runtime
-        provider's config lookup instead.
+        Covers every env-sourced api-key credential, regardless of provider:
+        registry api-key providers, OpenRouter (an aggregator with no registry
+        entry), and named custom providers with a ``key_env`` — all resolved
+        through the single ``resolve_env_key_binding`` helper shared with the
+        pool seeder, so a new provider is covered by construction rather than
+        by adding a branch here.
         """
         if self.api_mode != "chat_completions":
             return False
         if getattr(self, "_fallback_activated", False):
             return False
         try:
-            from agent.credential_pool import get_env_prefer_dotenv
-            from hermes_cli.auth import PROVIDER_REGISTRY
+            from agent.credential_pool import (
+                get_env_prefer_dotenv,
+                resolve_env_key_binding,
+            )
         except ImportError:
             return False
 
-        pconfig = PROVIDER_REGISTRY.get(self.provider)
-        if (
-            pconfig
-            and getattr(pconfig, "auth_type", "") == "api_key"
-            and getattr(pconfig, "api_key_env_vars", ())
-        ):
-            api_key = ""
-            for env_var in pconfig.api_key_env_vars:
-                api_key = get_env_prefer_dotenv(env_var).strip()
-                if api_key:
-                    break
-            if not api_key:
-                return False
-
-            env_url = ""
-            if pconfig.base_url_env_var:
-                env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip().rstrip("/")
-            default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
-            base_url = env_url or default_base
-            if self.provider == "kimi-coding":
-                from hermes_cli.auth import _resolve_kimi_base_url
-
-                base_url = _resolve_kimi_base_url(
-                    api_key, pconfig.inference_base_url, env_url
-                ).rstrip("/")
-            elif self.provider == "zai":
-                from hermes_cli.auth import _resolve_zai_base_url
-
-                base_url = _resolve_zai_base_url(
-                    api_key, pconfig.inference_base_url, env_url
-                ).rstrip("/")
-        elif self.provider == "custom":
-            # Named custom provider (#67935): identity lives in config
-            # (``providers.<name>`` / ``custom_providers``), the credential in
-            # the env var it names via ``key_env``. Re-resolve through the
-            # same config lookup the runtime resolver uses; entries without
-            # ``key_env`` (inline ``api_key``, pool-backed) have no
-            # env-sourced credential to watch.
-            try:
-                from hermes_cli.runtime_provider import _get_named_custom_provider
-            except ImportError:
-                return False
-            custom_provider = _get_named_custom_provider(
-                getattr(self, "requested_provider", "") or ""
-            )
-            if not custom_provider:
-                return False
-            key_env = str(custom_provider.get("key_env") or "").strip()
-            if not key_env:
-                return False
-            api_key = get_env_prefer_dotenv(key_env).strip()
-            if not api_key:
-                return False
-            # Custom providers pin their endpoint in config, not env — the
-            # config base_url is both the resolved and the "default" base, so
-            # only key edits are ever adopted here.
-            default_base = str(custom_provider.get("base_url") or "").strip().rstrip("/")
-            base_url = default_base
-        else:
+        binding = resolve_env_key_binding(
+            self.provider, getattr(self, "requested_provider", "") or ""
+        )
+        if not binding:
             return False
+
+        api_key = ""
+        for env_var in binding["key_env_vars"]:
+            api_key = get_env_prefer_dotenv(env_var).strip()
+            if api_key:
+                break
+        if not api_key:
+            return False
+
+        env_url = ""
+        if binding["base_url_env_var"]:
+            env_url = get_env_prefer_dotenv(binding["base_url_env_var"]).strip().rstrip("/")
+        default_base = (binding["default_base_url"] or "").strip().rstrip("/")
+        base_url = env_url or default_base
+        if self.provider == "kimi-coding":
+            from hermes_cli.auth import _resolve_kimi_base_url
+
+            base_url = _resolve_kimi_base_url(
+                api_key, binding["default_base_url"], env_url
+            ).rstrip("/")
+        elif self.provider == "zai":
+            from hermes_cli.auth import _resolve_zai_base_url
+
+            base_url = _resolve_zai_base_url(
+                api_key, binding["default_base_url"], env_url
+            ).rstrip("/")
 
         if not base_url:
             return False
