@@ -3032,6 +3032,7 @@ class BasePlatformAdapter(ABC):
     # first code line).  Plain-text platforms fall back to the short truncated
     # preview (see gateway/run.py progress_callback).
     supports_code_blocks: bool = False
+    _deferred_question_service = None
 
     # Whether this adapter's typing indicator renders TEXT (a status line
     # next to the bot name) rather than a native textless bubble. When True,
@@ -3207,7 +3208,6 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
-        self._deferred_question_service = None
         # Owning profile for a multiplexed secondary adapter, installed by
         # ``GatewayRunner._configure_profile_adapter``. Adapter-level session
         # keys must carry the profile namespace, but ``source.profile`` is only
@@ -3825,14 +3825,14 @@ class BasePlatformAdapter(ABC):
 
     def notify_deferred_questions_connected(self) -> None:
         """Wake durable plugin work after the transport is usable."""
-        service = getattr(self, "_deferred_question_service", None)
+        service = self._deferred_question_service
         if service is None:
             return
         platform_name = getattr(self.platform, "value", str(self.platform))
         service.adapter_connected(platform_name, self)
 
     def notify_deferred_questions_disconnected(self) -> None:
-        service = getattr(self, "_deferred_question_service", None)
+        service = self._deferred_question_service
         if service is None:
             return
         platform_name = getattr(self.platform, "value", str(self.platform))

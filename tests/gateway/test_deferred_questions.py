@@ -56,6 +56,17 @@ def test_enqueue_deduplicates_one_unresolved_question(tmp_path: Path) -> None:
     assert service.pending_for_session(first.session_key) == first
 
 
+def test_each_transaction_closes_its_sqlite_connection(tmp_path: Path) -> None:
+    import sqlite3
+
+    service = _service(tmp_path / "questions.sqlite3")
+    with service._transaction() as connection:
+        connection.execute("SELECT 1")
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")
+
+
 @pytest.mark.asyncio
 async def test_response_is_persisted_before_handler_and_resolves(
     tmp_path: Path,
@@ -133,6 +144,7 @@ async def test_handling_response_retries_after_restart(tmp_path: Path) -> None:
         restarted_adapter,
         __import__("asyncio").get_running_loop(),
     )
+    restarted._ready_platforms.add("plow_chat")
     answers = []
 
     async def recover(_record, answer):
@@ -348,6 +360,7 @@ async def test_busy_session_delivers_only_from_completion_callback(
     question = _enqueue(service)
     adapter = _DeliveryAdapter(service, active=True)
     service.bind_adapter("plow_chat", adapter)
+    service.adapter_connected("plow_chat", adapter)
 
     await service.deliver_ready("plow_chat")
 
@@ -374,10 +387,88 @@ async def test_failed_delivery_returns_question_to_queue(tmp_path: Path) -> None
 
     adapter = FailingAdapter(service, active=False)
     service.bind_adapter("plow_chat", adapter)
+    service.adapter_connected("plow_chat", adapter)
 
     await service.deliver_ready("plow_chat")
 
     assert service.get(question.id).state == "queued"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_before_prompt_delivery_leaves_question_retryable(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path / "questions.sqlite3")
+    question = _enqueue(service)
+
+    class DisconnectingAdapter(_DeliveryAdapter):
+        def is_session_active(self, session_key: str) -> bool:
+            service.adapter_disconnected("plow_chat", self)
+            return False
+
+    adapter = DisconnectingAdapter(service, active=False)
+    service._adapters["plow_chat"] = (
+        adapter,
+        __import__("asyncio").get_running_loop(),
+    )
+    service._ready_platforms.add("plow_chat")
+
+    await service.deliver_ready("plow_chat")
+
+    assert adapter.sent == []
+    assert service.get(question.id).state == "queued"
+
+
+@pytest.mark.asyncio
+async def test_disconnected_handling_recovery_waits_for_reconnect(
+    tmp_path: Path,
+) -> None:
+    from gateway.deferred_questions import DeferredQuestionResult
+
+    service = _service(tmp_path / "questions.sqlite3")
+
+    class ReconnectingAdapter(_DeliveryAdapter):
+        def __init__(self, service) -> None:
+            super().__init__(service, active=False)
+            self.attempts = 0
+
+        async def deliver_deferred_message(self, delivery_source, content):
+            self.attempts += 1
+            if self.attempts == 1:
+                return SimpleNamespace(success=False, error="offline", retryable=True)
+            return await super().deliver_deferred_message(delivery_source, content)
+
+    adapter = ReconnectingAdapter(service)
+    question, _adapter = _awaiting_question(service, adapter=adapter)
+    service.handling_retry_seconds = 0
+    handler_calls = 0
+
+    async def handle(_record, _answer):
+        nonlocal handler_calls
+        handler_calls += 1
+        return DeferredQuestionResult.done("Consent recorded.")
+
+    service.register_handler("plow-chat", "invite-consent", handle)
+    with pytest.raises(RuntimeError, match="offline"):
+        await service.handle_response(question.session_key, "Sure!")
+
+    service.adapter_disconnected("plow_chat", adapter)
+    await __import__("asyncio").sleep(0)
+    retry_tasks = tuple(service._handling_retry_tasks.values())
+    await __import__("asyncio").gather(*retry_tasks)
+
+    assert handler_calls == 1
+    assert adapter.attempts == 1
+    assert service.get(question.id).state == "handling"
+
+    service.adapter_connected("plow_chat", adapter)
+    await __import__("asyncio").sleep(0)
+    await __import__("asyncio").sleep(0)
+
+    assert handler_calls == 1
+    assert adapter.attempts == 2
+    with pytest.raises(KeyError):
+        service.get(question.id)
 
 
 @pytest.mark.asyncio
@@ -402,6 +493,7 @@ async def test_ambiguous_delivery_is_not_retried_after_restart(tmp_path: Path) -
         first_adapter,
         __import__("asyncio").get_running_loop(),
     )
+    service._ready_platforms.add("plow_chat")
     await service.deliver_ready("plow_chat")
 
     assert first_adapter.attempts == 1
@@ -559,6 +651,7 @@ async def test_only_oldest_question_in_a_session_is_delivered(tmp_path: Path) ->
     second = _enqueue(service, dedupe_key="second")
     adapter = _DeliveryAdapter(service, active=False)
     service.bind_adapter("plow_chat", adapter)
+    service.adapter_connected("plow_chat", adapter)
     await service.deliver_ready("plow_chat")
 
     assert adapter.sent == [("home", first.question)]
@@ -655,6 +748,7 @@ async def test_adapter_intercepts_deferred_reply_before_busy_queue(
     service = _service(tmp_path / "questions.sqlite3")
     adapter = _GatewayAdapter()
     adapter.set_deferred_question_service(service)
+    service.adapter_connected("telegram", adapter)
     adapter.set_authorization_check(lambda *_args: True)
     adapter._message_handler = AsyncMock(return_value="ordinary")
     adapter._busy_session_handler = AsyncMock(return_value=True)

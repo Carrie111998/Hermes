@@ -10,6 +10,8 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
@@ -76,13 +78,19 @@ class DeferredQuestionService:
         self.handling_retry_seconds = 5.0
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """Commit or roll back each operation and always close its connection."""
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _initialize(self) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS deferred_questions (
@@ -154,7 +162,7 @@ class DeferredQuestionService:
         )
 
     def get(self, question_id: str) -> DeferredQuestion:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             record = self._from_row(
                 conn.execute(
                     "SELECT * FROM deferred_questions WHERE id = ?", (question_id,)
@@ -196,7 +204,7 @@ class DeferredQuestionService:
             raise ValueError("deferred question fields must not be blank")
         now = time.time()
         question_id = uuid.uuid4().hex
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             try:
                 conn.execute(
                     """
@@ -246,7 +254,7 @@ class DeferredQuestionService:
         return record
 
     def pending_for_session(self, session_key: str) -> DeferredQuestion | None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM deferred_questions
@@ -259,7 +267,7 @@ class DeferredQuestionService:
 
     def claim_for_delivery(self, question_id: str) -> DeferredQuestion | None:
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             changed = conn.execute(
                 """
                 UPDATE deferred_questions
@@ -271,7 +279,7 @@ class DeferredQuestionService:
         return self.get(question_id) if changed else None
 
     def mark_awaiting(self, question_id: str) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 """
                 UPDATE deferred_questions
@@ -282,7 +290,7 @@ class DeferredQuestionService:
             )
 
     def requeue(self, question_id: str) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 """
                 UPDATE deferred_questions
@@ -329,7 +337,7 @@ class DeferredQuestionService:
             return
         _adapter, loop = binding
         self._ready_platforms.add(platform)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 """
                 UPDATE deferred_questions SET state = 'queued', updated_at = ?
@@ -345,6 +353,12 @@ class DeferredQuestionService:
         binding = self._adapters.get(platform)
         if binding is not None and binding[0] is adapter:
             self._ready_platforms.discard(platform)
+
+    def _ready_adapter(self, platform: str) -> Any | None:
+        binding = self._adapters.get(platform)
+        if binding is None or platform not in self._ready_platforms:
+            return None
+        return binding[0]
 
     def _schedule_recovery(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         if loop is None:
@@ -378,7 +392,7 @@ class DeferredQuestionService:
             loop.call_soon_threadsafe(schedule, context=contextvars.Context())
 
     def _mark_delivery_attempted(self, question_id: str) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 """
                 UPDATE deferred_questions SET delivery_attempted = 1, updated_at = ?
@@ -410,18 +424,20 @@ class DeferredQuestionService:
             sql += " AND candidate.session_key = ?"
             params += (session_key,)
         sql += " ORDER BY candidate.created_at ASC"
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [record for row in rows if (record := self._from_row(row)) is not None]
 
     async def deliver_ready(
         self, platform: str, session_key: str | None = None
     ) -> None:
-        binding = self._adapters.get(platform)
-        if binding is None:
+        adapter = self._ready_adapter(platform)
+        if adapter is None:
             return
-        adapter, _loop = binding
         for record in self._queued(platform, session_key):
+            adapter = self._ready_adapter(platform)
+            if adapter is None:
+                return
             if adapter.is_session_active(record.session_key):
                 if record.id in self._busy_callbacks:
                     continue
@@ -444,6 +460,10 @@ class DeferredQuestionService:
             claimed = self.claim_for_delivery(record.id)
             if claimed is None:
                 continue
+            adapter = self._ready_adapter(platform)
+            if adapter is None:
+                self.requeue(claimed.id)
+                return
             self._mark_delivery_attempted(claimed.id)
             result = await adapter.deliver_deferred_message(
                 claimed.delivery_source, claimed.question
@@ -457,7 +477,7 @@ class DeferredQuestionService:
     async def handle_response(
         self, session_key: str, response: str
     ) -> DeferredQuestionResult | None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM deferred_questions
@@ -485,14 +505,14 @@ class DeferredQuestionService:
         if record.id in self._handling_retry_tasks:
             return
         binding = self._adapters.get(record.platform)
-        if binding is None or record.platform not in self._ready_platforms:
+        if binding is None or self._ready_adapter(record.platform) is not binding[0]:
             return
         _adapter, loop = binding
 
         async def retry_once() -> None:
             try:
                 await asyncio.sleep(self.handling_retry_seconds)
-                if record.platform not in self._ready_platforms:
+                if self._ready_adapter(record.platform) is not _adapter:
                     return
                 pending = self.get(record.id)
                 await self._run_handler(pending, schedule_retry=False)
@@ -540,7 +560,7 @@ class DeferredQuestionService:
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            with self._lock, self._connect() as conn:
+            with self._lock, self._transaction() as conn:
                 conn.execute(
                     """
                     UPDATE deferred_questions
@@ -552,18 +572,17 @@ class DeferredQuestionService:
         reply = result.reply if result.resolved else result.question
         if not result.resolved and (not reply or not reply.strip()):
             raise ValueError("clarification result requires a question")
-        binding = self._adapters.get(record.platform)
-        if binding is None:
-            raise RuntimeError(f"no adapter bound for {record.platform}")
-        adapter, _loop = binding
         if reply:
+            adapter = self._ready_adapter(record.platform)
+            if adapter is None:
+                raise RuntimeError(f"adapter for {record.platform} is not connected")
             self._mark_delivery_attempted(record.id)
             delivered = await adapter.deliver_deferred_message(
                 record.delivery_source, reply
             )
             if not getattr(delivered, "success", False):
                 if getattr(delivered, "retryable", False):
-                    with self._lock, self._connect() as conn:
+                    with self._lock, self._transaction() as conn:
                         conn.execute(
                             """
                             UPDATE deferred_questions
@@ -579,7 +598,7 @@ class DeferredQuestionService:
                     or "deferred-question reply delivery failed"
                 )
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             if result.resolved:
                 conn.execute(
                     """
@@ -608,7 +627,7 @@ class DeferredQuestionService:
     async def retry_handling(
         self,
     ) -> list[tuple[str, DeferredQuestionResult]]:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM deferred_questions
@@ -621,6 +640,8 @@ class DeferredQuestionService:
         for row in rows:
             record = self._from_row(row)
             if record is None:
+                continue
+            if self._ready_adapter(record.platform) is None:
                 continue
             if (record.plugin_id, record.handler_name) not in self._handlers:
                 continue
