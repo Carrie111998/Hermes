@@ -2403,6 +2403,15 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        from agent.message_observability import log_message_shape
+
+        log_message_shape(
+            request_logger,
+            "api_messages_assembled",
+            api_messages,
+            conversation_history_count=len(conversation_history or []),
+        )
+
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -2484,12 +2493,14 @@ def run_conversation(
             _sel_incoming,
             logger=request_logger,
         )
+        log_message_shape(request_logger, "context_engine_output", api_messages)
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
         # gated on context_compressor — so orphans from session loading or
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
+        log_message_shape(request_logger, "sanitizer_output", api_messages)
 
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
@@ -3206,6 +3217,14 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    _payload_messages = next_api_kwargs.get("messages")
+                    if not isinstance(_payload_messages, list):
+                        _payload_messages = next_api_kwargs.get("input")
+                    log_message_shape(
+                        request_logger,
+                        "provider_call_input",
+                        _payload_messages if isinstance(_payload_messages, list) else [],
+                    )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
