@@ -446,8 +446,8 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; first valid `block` or `approve` directive wins, and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
 | `transform_memory_context` | Transform/control | While the built-in MEMORY.md / USER.md snapshot is loaded; the first valid string-list result replaces that target's prompt-only entries. Explicit `{"action": "allow"}` keeps the native entries. Missing or malformed decisions fail closed. The result is bounded, threat-scanned, and frozen with the native snapshot. | `target`, `entries` (tuple), `char_limit` | Exposes persistent user/profile data. Returned entries enter the system prompt. |
-| `pre_memory_write` | Directive/control + transform | Before every built-in add, replace, remove, or atomic batch and before acquiring the file lock. Results use deterministic priority: block, invalid/failure, skip, first transform, explicit allow. Transformed content is threat-scanned. | `action`, `target`, `content`, `old_text`, `operations`, `entries` (advisory tuple), `char_limit` | Exposes existing persistent entries and proposed writes, which may contain personal data. |
-| `post_memory_write` | Observer | Exactly once after a successful durable built-in memory mutation and after the file lock is released; return ignored. | `action`, `target`, `content`, `old_text`, `operations`, `entries` (persisted tuple), `char_count` | Exposes the resulting persistent entries and proposed write. |
+| `pre_memory_write` | Directive/control + transform | Before every built-in add, replace, remove, or atomic batch and before acquiring the file lock. Results use deterministic priority: block, invalid/failure, skip, first transform, explicit allow. Transformed content is threat-scanned. | `action`, `target`, `content`, `old_text`, `operations`, `provenance`, `entries` (advisory tuple), `char_limit` | Exposes existing persistent entries, proposed writes, and session provenance, which may contain personal data. |
+| `post_memory_write` | Observer | Exactly once after a successful durable built-in memory mutation and after the file lock is released; return ignored. | `action`, `target`, `content`, `old_text`, `operations`, `provenance`, `entries` (persisted tuple), `char_count` | Exposes the resulting persistent entries, proposed write, and session provenance. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
@@ -660,6 +660,45 @@ threat-scans all add/replace content after transformation. Batch operations
 must be objects; malformed items reject the entire batch before governance or
 disk access. The `entries` input is an advisory pre-lock snapshot; use
 `post_memory_write` when an observer needs the committed state.
+
+Both write hooks receive the same `provenance` dict. Its fields are metadata;
+hook return values cannot transform them. Hermes assigns one stable
+`operation_id` to the write attempt and preserves it through an approval
+replay. Agent-originated calls also include the fields available for
+that surface: `write_origin`, `execution_context`, `session_id`,
+`parent_session_id`, `ui_session_id`, `platform`, `source`, `profile_name`,
+`task_id`, `tool_call_id`, and `tool_name`. Optional fields are omitted when
+the caller has no corresponding session context. Direct `MemoryStore` callers
+still receive an `operation_id`, but should not be assumed to have a platform,
+window, or session identity.
+
+A standalone plugin can use this metadata to route several windows or
+processes that share one Hermes home. Persist externally before returning
+`skip`; Hermes then reports the operation as plugin-handled, does not mutate
+the native file, does not emit `post_memory_write`, and does not mirror the
+write a second time to a configured memory provider:
+
+```python
+def route_shared_memory(action, target, content=None, provenance=None, **kwargs):
+    provenance = provenance or {}
+    route = provenance.get("ui_session_id") or provenance.get("session_id")
+    operation_id = provenance.get("operation_id")
+    if not route or not operation_id:
+        return {"action": "block", "message": "write provenance required"}
+
+    canonical_store.write_idempotent(
+        route=route,
+        operation_id=operation_id,
+        action=action,
+        target=target,
+        content=content,
+    )
+    return {"action": "skip", "message": "routed to canonical memory"}
+```
+
+The external commit and Hermes' returned `skip` are not a distributed
+transaction. Routers should therefore make `operation_id` idempotent and
+return `skip` only after the external store confirms durability.
 
 `post_memory_write` runs after a successful durable mutation and after lock
 release. It receives the final `entries` tuple and `char_count`; return values

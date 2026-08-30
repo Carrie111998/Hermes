@@ -27,6 +27,7 @@ import copy
 import json
 import logging
 import time
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -76,6 +77,16 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+def _normalize_write_provenance(
+    provenance: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return an isolated write context with a stable attempt identifier."""
+    normalized = dict(provenance or {})
+    operation_id = str(normalized.get("operation_id") or "").strip()
+    normalized["operation_id"] = operation_id or uuid.uuid4().hex
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +518,7 @@ class MemoryStore:
         content: Optional[str] = None,
         old_text: Optional[str] = None,
         operations: Optional[List[Dict[str, Any]]] = None,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         """Apply a pre-write directive and validate the resulting payload.
 
@@ -532,6 +544,7 @@ class MemoryStore:
             "operations": [dict(operation) for operation in operations]
             if operations is not None and not invalid_batch_input
             else ([] if operations is not None else None),
+            "provenance": _normalize_write_provenance(provenance),
         }
         if invalid_batch_input:
             return payload, {
@@ -543,10 +556,12 @@ class MemoryStore:
 
             governor_registered = has_hook("pre_memory_write")
             if governor_registered:
+                hook_payload = dict(payload)
+                hook_payload["provenance"] = dict(payload["provenance"])
                 results = invoke_hook(
                     "pre_memory_write",
                     _propagate_callback_errors=True,
-                    **payload,
+                    **hook_payload,
                     entries=tuple(self._entries_for(target)),
                     char_limit=self._char_limit(target),
                 )
@@ -632,11 +647,15 @@ class MemoryStore:
         if first_skip is not None:
             response = first_skip.get("response")
             if isinstance(response, dict):
-                return payload, response
-            return payload, self._success_response(
-                target,
-                str(first_skip.get("message") or "Memory write handled by plugin."),
-            )
+                handled = dict(response)
+            else:
+                handled = self._success_response(
+                    target,
+                    str(first_skip.get("message") or "Memory write handled by plugin."),
+                )
+            handled["native_write"] = False
+            handled["handled_by_plugin"] = True
+            return payload, handled
         if first_transform is not None:
             for field in ("content", "old_text"):
                 if field in first_transform:
@@ -697,9 +716,17 @@ class MemoryStore:
         except Exception:
             pass
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(
+        self,
+        target: str,
+        content: str,
+        *,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
-        payload, early = self._prepare_write("add", target, content=content)
+        payload, early = self._prepare_write(
+            "add", target, content=content, provenance=provenance
+        )
         if early is not None:
             return early
         content = payload["content"]
@@ -752,10 +779,21 @@ class MemoryStore:
         self._emit_post_write(payload)
         return self._success_response(target, "Entry added.")
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(
+        self,
+        target: str,
+        old_text: str,
+        new_content: str,
+        *,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         payload, early = self._prepare_write(
-            "replace", target, content=new_content, old_text=old_text
+            "replace",
+            target,
+            content=new_content,
+            old_text=old_text,
+            provenance=provenance,
         )
         if early is not None:
             return early
@@ -820,9 +858,17 @@ class MemoryStore:
         self._emit_post_write(payload)
         return self._success_response(target, "Entry replaced.")
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    def remove(
+        self,
+        target: str,
+        old_text: str,
+        *,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
-        payload, early = self._prepare_write("remove", target, old_text=old_text)
+        payload, early = self._prepare_write(
+            "remove", target, old_text=old_text, provenance=provenance
+        )
         if early is not None:
             return early
         old_text = payload["old_text"]
@@ -864,7 +910,13 @@ class MemoryStore:
         self._emit_post_write(payload)
         return self._success_response(target, "Entry removed.")
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(
+        self,
+        target: str,
+        operations: List[Dict[str, Any]],
+        *,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Apply a sequence of add/replace/remove ops to one target atomically.
 
         All operations are validated and applied against the FINAL budget --
@@ -877,7 +929,9 @@ class MemoryStore:
         the net result would exceed the char limit, NOTHING is written and an
         error is returned describing the first failure plus the live state.
         """
-        payload, early = self._prepare_write("batch", target, operations=operations)
+        payload, early = self._prepare_write(
+            "batch", target, operations=operations, provenance=provenance
+        )
         if early is not None:
             return early
         operations = payload["operations"]
@@ -1221,7 +1275,8 @@ def load_on_disk_store() -> "MemoryStore":
 
 
 def _apply_write_gate(action: str, target: str, content: Optional[str],
-                      old_text: Optional[str]) -> Optional[str]:
+                      old_text: Optional[str],
+                      provenance: Dict[str, Any]) -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
     the write should NOT proceed normally (blocked or staged), or None when the
     caller should perform the real write.
@@ -1264,6 +1319,7 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         "target": target,
         "content": content,
         "old_text": old_text,
+        "provenance": provenance,
     }
     record = wa.stage_write(
         wa.MEMORY, payload,
@@ -1277,7 +1333,11 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     )
 
 
-def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
+def _apply_batch_write_gate(
+    target: str,
+    operations: List[Dict[str, Any]],
+    provenance: Dict[str, Any],
+) -> Optional[str]:
     """Evaluate the write gate for a batch of memory operations.
 
     Returns a JSON tool-result string when the batch should NOT proceed
@@ -1312,7 +1372,12 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     if decision.blocked:
         return tool_error(decision.message, success=False)
 
-    payload = {"action": "batch", "target": target, "operations": operations}
+    payload = {
+        "action": "batch",
+        "target": target,
+        "operations": operations,
+        "provenance": provenance,
+    }
     record = wa.stage_write(
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
@@ -1365,6 +1430,7 @@ def memory_tool(
     new_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
+    provenance: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -1390,6 +1456,8 @@ def memory_tool(
     if content is None and new_text is not None:
         content = new_text
 
+    provenance = _normalize_write_provenance(provenance)
+
     # Some strict providers fill optional schema fields with JSON null rather
     # than omitting them.  Treat ``target: null`` as omitted so memory writes
     # still use the documented default store instead of failing validation.
@@ -1404,10 +1472,10 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
+        gate_result = _apply_batch_write_gate(target, operations, provenance)
         if gate_result is not None:
             return gate_result
-        result = store.apply_batch(target, operations)
+        result = store.apply_batch(target, operations, provenance=provenance)
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1429,18 +1497,22 @@ def memory_tool(
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
+    gate_result = _apply_write_gate(
+        action, target, content, old_text, provenance
+    )
     if gate_result is not None:
         return gate_result
 
     if action == "add":
-        result = store.add(target, content)
+        result = store.add(target, content, provenance=provenance)
 
     elif action == "replace":
-        result = store.replace(target, old_text, content)
+        result = store.replace(
+            target, old_text, content, provenance=provenance
+        )
 
     elif action == "remove":
-        result = store.remove(target, old_text)
+        result = store.remove(target, old_text, provenance=provenance)
 
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
@@ -1521,14 +1593,21 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
         return target_error
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
+    provenance = _normalize_write_provenance(payload.get("provenance"))
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
+        return store.apply_batch(
+            target,
+            payload.get("operations") or [],
+            provenance=provenance,
+        )
     if action == "add":
-        return store.add(target, content)
+        return store.add(target, content, provenance=provenance)
     if action == "replace":
-        return store.replace(target, old_text, content)
+        return store.replace(
+            target, old_text, content, provenance=provenance
+        )
     if action == "remove":
-        return store.remove(target, old_text)
+        return store.remove(target, old_text, provenance=provenance)
     return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema
 # =============================================================================
@@ -1657,7 +1736,8 @@ registry.register(
         old_text=args.get("old_text"),
         new_text=args.get("new_text"),
         operations=args.get("operations"),
-        store=kw.get("store")),
+        store=kw.get("store"),
+        provenance=kw.get("provenance")),
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,

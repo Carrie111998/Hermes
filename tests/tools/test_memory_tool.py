@@ -247,6 +247,8 @@ class TestMemoryStoreAdd:
 
         assert result["success"] is True
         assert result["message"] == "canonical store handled the write"
+        assert result["native_write"] is False
+        assert result["handled_by_plugin"] is True
         assert store.memory_entries == []
 
     def test_pre_memory_write_hook_can_skip_duplicate_like_add(self, store, monkeypatch):
@@ -254,7 +256,10 @@ class TestMemoryStoreAdd:
             return name == "pre_memory_write"
 
         def fake_invoke_hook(name, **kwargs):
-            return [{"action": "skip", "message": "normalized duplicate"}]
+            return [{
+                "action": "skip",
+                "response": {"success": True, "message": "normalized duplicate"},
+            }]
 
         monkeypatch.setattr("hermes_cli.plugins.has_hook", fake_has_hook)
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
@@ -263,6 +268,8 @@ class TestMemoryStoreAdd:
 
         assert result["success"] is True
         assert "normalized duplicate" in result["message"]
+        assert result["native_write"] is False
+        assert result["handled_by_plugin"] is True
         assert store.memory_entries == []
 
     def test_pre_memory_write_hook_transform_is_rescanned(self, store, monkeypatch):
