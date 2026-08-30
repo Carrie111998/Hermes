@@ -1038,9 +1038,7 @@ class TestClarifyEagerReseed:
         consumer.on_delta("根据你的选择，这是后续的完整回答内容，足够长以触发一次流式刷新的补充。")
         await self._drain(consumer, 0.05)
 
-        seeds_before_second_boundary = len(
-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
-        )
+        seeds_before_second_boundary = self._empty_seed_count(adapter)
 
         # 第二轮 clarify boundary（reopen=True）。
         boundary = consumer.close_for_approval_prompt(
@@ -1061,16 +1059,16 @@ class TestClarifyEagerReseed:
 
         # 第二轮 eager seed：即便标志有残留，仍能正确再次开流。
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)
-
-        seeds_after = len(
-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+        assert await self._wait_until(
+            lambda: self._empty_seed_count(adapter) == seeds_before_second_boundary + 1
+            and consumer._native_stream_opened
         )
+
+        seeds_after = self._empty_seed_count(adapter)
         assert seeds_after == seeds_before_second_boundary + 1, (
             "第二轮 eager seed 必须再发一个新的空 seed 帧 "
             f"(before={seeds_before_second_boundary}, after={seeds_after})"
         )
-        assert await self._wait_until(lambda: consumer._native_stream_opened)
         assert consumer._reopen_seeded_eagerly is True
         assert consumer._awaiting_reopen_after_boundary is False
 
