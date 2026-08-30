@@ -2798,8 +2798,6 @@ from gateway.restart import (
     parse_restart_drain_timeout,
     resolve_cron_drain_budget,
 )
-
-
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -2808,6 +2806,10 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S = 1.0
+_LOOP_HEARTBEAT_RESTART_MAX_DELAY_S = 60.0
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -7107,6 +7109,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # defaults so partial construction in tests doesn't blow up on access; the
     # real values are set in __init__ / start() / stop().
     _loop_heartbeat_task: Optional["asyncio.Task"] = None
+    _loop_heartbeat_restart_handle: Optional[Any] = None
+    _loop_heartbeat_restart_delay_s: float = _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S
     _loop_floor_timer_handle: Optional[Any] = None
     _loop_liveness_watchdog: Optional[Any] = None
     _gateway_started_at: float = 0.0
@@ -7524,6 +7528,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # updated_at to distinguish "process alive" from "loop frozen".
         self._gateway_started_at: float = time.time()
         self._loop_heartbeat_task: Optional[asyncio.Task] = None
+        self._loop_heartbeat_restart_handle = None
+        self._loop_heartbeat_restart_delay_s = _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S
         self._loop_floor_timer_handle = None
         self._loop_liveness_watchdog = None
 
@@ -12839,6 +12845,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop."""
+        restart_handle = getattr(self, "_loop_heartbeat_restart_handle", None)
+        self._loop_heartbeat_restart_handle = None
+        if restart_handle is not None:
+            restart_handle.cancel()
+
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         self._loop_liveness_watchdog = None
         if watchdog is not None:
@@ -12905,10 +12916,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         An asyncio task so a frozen loop stops refreshing
         ``state/gateway.heartbeat``. Cancelled with the other background
-        tasks during stop(). Best-effort — a liveness probe must never be
-        able to abort startup.
+        tasks during stop(). Unexpected task exits are restarted after a short
+        delay so monitoring cannot silently disappear for the process lifetime.
         """
         try:
+            _pending_restart = getattr(self, "_loop_heartbeat_restart_handle", None)
+            if _pending_restart is not None and not _pending_restart.cancelled():
+                return
             _existing_hb = getattr(self, "_loop_heartbeat_task", None)
             if _existing_hb is not None and not _existing_hb.done():
                 return
@@ -12917,6 +12931,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
                     start_time=getattr(self, "_gateway_started_at", 0.0),
                 )
+            )
+            self._loop_heartbeat_task._hermes_heartbeat_started_at = (  # type: ignore[attr-defined]
+                self._loop_heartbeat_task.get_loop().time()
             )
             # PERMANENT for the process lifetime, same as a
             # _spawn_supervised watcher — tag it so
@@ -12927,8 +12944,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _bg is not None:
                 _bg.add(self._loop_heartbeat_task)
                 self._loop_heartbeat_task.add_done_callback(_bg.discard)
+            self._loop_heartbeat_task.add_done_callback(
+                self._restart_loop_heartbeat_after_failure
+            )
         except Exception:
-            logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
+            logger.warning("Failed to start gateway loop heartbeat", exc_info=True)
+
+    def _restart_loop_heartbeat_after_failure(self, task: "asyncio.Task") -> None:
+        """Log and replace an unexpectedly dead loop-heartbeat task."""
+        if task.cancelled() or getattr(self, "_loop_heartbeat_task", None) is not task:
+            return
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if getattr(self, "_draining", False) or (
+            shutdown_event is not None and shutdown_event.is_set()
+        ):
+            return
+
+        loop = task.get_loop()
+        started_at = getattr(task, "_hermes_heartbeat_started_at", loop.time())
+        if loop.time() - started_at >= DEFAULT_HEARTBEAT_INTERVAL_S:
+            self._loop_heartbeat_restart_delay_s = (
+                _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S
+            )
+        restart_delay = min(
+            max(
+                float(
+                    getattr(
+                        self,
+                        "_loop_heartbeat_restart_delay_s",
+                        _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S,
+                    )
+                ),
+                _LOOP_HEARTBEAT_RESTART_INITIAL_DELAY_S,
+            ),
+            _LOOP_HEARTBEAT_RESTART_MAX_DELAY_S,
+        )
+        self._loop_heartbeat_restart_delay_s = min(
+            restart_delay * 2,
+            _LOOP_HEARTBEAT_RESTART_MAX_DELAY_S,
+        )
+
+        exc = task.exception()
+        if exc is None:
+            logger.warning(
+                "Gateway loop heartbeat stopped unexpectedly; restarting in %.0fs",
+                restart_delay,
+            )
+        else:
+            logger.warning(
+                "Gateway loop heartbeat failed; restarting in %.0fs",
+                restart_delay,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        self._loop_heartbeat_task = None
+
+        def _restart() -> None:
+            self._loop_heartbeat_restart_handle = None
+            current_shutdown_event = getattr(self, "_shutdown_event", None)
+            if getattr(self, "_draining", False) or (
+                current_shutdown_event is not None and current_shutdown_event.is_set()
+            ):
+                return
+            self._start_loop_heartbeat_task()
+
+        self._loop_heartbeat_restart_handle = loop.call_later(restart_delay, _restart)
 
     async def start(self) -> bool:
         """
@@ -12937,6 +13016,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        try:
+            self._gateway_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._gateway_loop = None
+        if self._gateway_loop is not None:
+            self._start_loop_liveness_guards(self._gateway_loop)
+        self._start_loop_heartbeat_task()
+
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -12980,12 +13067,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("Could not set up faulthandler file logging", exc_info=True)
 
-        try:
-            self._gateway_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._gateway_loop = None
-        if self._gateway_loop is not None:
-            self._start_loop_liveness_guards(self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -13705,8 +13786,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
-
-        self._start_loop_heartbeat_task()
 
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
