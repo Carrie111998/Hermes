@@ -532,6 +532,13 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         key = str(frame.get("session_key") or sid)
         session = server._sessions.get(sid)
+        profile_home = str(
+            frame.get("profile_home")
+            or ((session or {}).get("profile_home"))
+            or ""
+        )
+        if profile_home:
+            server._require_existing_profile_home(profile_home)
         if session is not None:
             session["transport"] = self._transport
             if frame.get("cols") is not None:
@@ -545,7 +552,6 @@ class ComputeHost:
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
-        profile_home = str(frame.get("profile_home") or "")
         session_db = None
         owns_db = False
         home_token = None
@@ -554,7 +560,6 @@ class ComputeHost:
             if profile_home:
                 from hermes_constants import set_hermes_home_override
                 from agent.secret_scope import build_profile_secret_scope, set_secret_scope
-                from hermes_state import SessionDB
 
                 home_token = set_hermes_home_override(profile_home)
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
@@ -563,7 +568,7 @@ class ComputeHost:
                 # server._sessions[sid] (via _init_session, or the fallback dict
                 # in the except below), so the agent is the right owner; a
                 # _make_agent that RAISES is the one path where nothing takes it.
-                session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                session_db = server._open_profile_session_db(profile_home)
                 owns_db = True
             agent = server._make_agent(
                 sid,

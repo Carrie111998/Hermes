@@ -2287,6 +2287,20 @@ def _transfer_db_to_agent(agent, db) -> bool:
         return False
 
 
+def _require_existing_profile_home(profile_home: str | Path) -> Path:
+    """Resolve a live profile home without recreating a deleted profile."""
+    from hermes_constants import assert_named_profile_home_live
+
+    path = Path(profile_home)
+    try:
+        assert_named_profile_home_live(path)
+    except FileNotFoundError:
+        raise RuntimeError(f"profile home no longer exists: {path}") from None
+    if not path.is_dir():
+        raise RuntimeError(f"profile home no longer exists: {path}")
+    return path
+
+
 def _open_profile_session_db(profile_home):
     """Open a DEDICATED handle on ``profile_home``'s ``state.db`` — FAIL CLOSED.
 
@@ -2301,7 +2315,7 @@ def _open_profile_session_db(profile_home):
     """
     from hermes_state import SessionDB
 
-    db_path = Path(profile_home) / "state.db"
+    db_path = _require_existing_profile_home(profile_home) / "state.db"
     try:
         return SessionDB(db_path=db_path)
     except Exception as exc:
