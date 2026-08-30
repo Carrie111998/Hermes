@@ -15,13 +15,26 @@ the raw byte would.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 
+from prompt_toolkit.application import Application
+from prompt_toolkit.application.current import set_app
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.input import DummyInput
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import BufferControl, Layout, Window
+from prompt_toolkit.output import DummyOutput
 
-from hermes_cli.pt_input_extras import install_modify_other_keys_aliases
+from hermes_cli.pt_input_extras import (
+    install_canonical_space_binding,
+    install_modify_other_keys_aliases,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -41,15 +54,34 @@ def _ensure_alias_installed():
     _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
 
 
-def _parse(byte_seq: str):
-    """Feed bytes through prompt_toolkit's VT100 parser and return the
-    list of KeyPress objects."""
+def _parse_presses(byte_seq: str):
+    """Feed bytes through the parser without discarding raw key data."""
     out = []
     parser = Vt100Parser(out.append)
     for ch in byte_seq:
         parser.feed(ch)
     parser.flush()
-    return [kp.key for kp in out]
+    return out
+
+
+def _parse(byte_seq: str):
+    """Return the logical keys parsed from a terminal byte sequence."""
+    return [kp.key for kp in _parse_presses(byte_seq)]
+
+
+def _dispatch(key_bindings, key_press, buffer):
+    """Dispatch one parsed key through prompt_toolkit's real key processor."""
+    app = Application(
+        layout=Layout(Window(BufferControl(buffer=buffer))),
+        key_bindings=key_bindings,
+        input=DummyInput(),
+        output=DummyOutput(),
+    )
+    cast(Any, app).timeoutlen = None
+    processor = app.key_processor
+    with set_app(app):
+        processor.feed(key_press)
+        processor.process_keys()
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +396,37 @@ def test_shift_space_inserts_space():
     """Shift+Space must insert a space, not leak escape text (#86866)."""
     assert _parse("\x1b[32;2u") == [" "]
     assert _parse("\x1b[27;2;32~") == [" "]
+
+
+@pytest.mark.parametrize("byte_seq", [" ", "\x1b[32;2u", "\x1b[27;2;32~"])
+def test_space_binding_inserts_canonical_space(byte_seq):
+    """Space insertion must ignore the parser's preserved source bytes."""
+    key_bindings = KeyBindings()
+    install_canonical_space_binding(key_bindings)
+    presses = _parse_presses(byte_seq)
+    assert len(presses) == 1
+    assert presses[0].data == byte_seq
+
+    buffer = Buffer()
+    _dispatch(key_bindings, presses[0], buffer)
+    assert buffer.text == " "
+
+
+def test_specialized_space_binding_takes_precedence():
+    """A mode-specific Space handler must override canonical insertion."""
+    key_bindings = KeyBindings()
+    install_canonical_space_binding(key_bindings)
+    toggled = []
+
+    @key_bindings.add("space", filter=Condition(lambda: True))
+    def clarify_toggle(_event):
+        toggled.append(True)
+
+    buffer = Buffer()
+    _dispatch(key_bindings, _parse_presses(" ")[0], buffer)
+
+    assert toggled == [True]
+    assert buffer.text == ""
 
 
 # ---------------------------------------------------------------------------
