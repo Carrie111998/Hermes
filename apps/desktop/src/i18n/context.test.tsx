@@ -49,7 +49,10 @@ describe('I18nProvider', () => {
     )
 
     expect(screen.getByTestId('locale').textContent).toBe('zh')
-    expect(screen.getByTestId('label').textContent).toBe('语言')
+    // The locale applies immediately; its message tree is a separate chunk
+    // (catalog.ts) and lands a tick later, so assert on the rendered text
+    // rather than on the same tick as the locale switch.
+    await waitFor(() => expect(screen.getByTestId('label').textContent).toBe('语言'))
 
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
@@ -72,7 +75,7 @@ describe('I18nProvider', () => {
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
     expect(screen.getByTestId('locale').textContent).toBe('zh')
-    expect(screen.getByTestId('label').textContent).toBe('语言')
+    await waitFor(() => expect(screen.getByTestId('label').textContent).toBe('语言'))
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
@@ -110,7 +113,7 @@ describe('I18nProvider', () => {
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
     expect(screen.getByTestId('locale').textContent).toBe('zh-hant')
-    expect(screen.getByTestId('save').textContent).toBe('儲存')
+    await waitFor(() => expect(screen.getByTestId('save').textContent).toBe('儲存'))
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
@@ -129,7 +132,7 @@ describe('I18nProvider', () => {
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
     expect(screen.getByTestId('locale').textContent).toBe('ja')
-    expect(screen.getByTestId('save').textContent).toBe('保存')
+    await waitFor(() => expect(screen.getByTestId('save').textContent).toBe('保存'))
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 

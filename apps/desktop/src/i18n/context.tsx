@@ -2,7 +2,7 @@ import { createContext, type ReactNode, useCallback, useContext, useEffect, useM
 
 import { getHermesConfigRecord, type HermesConfigRecord, saveHermesConfig } from '@/hermes'
 
-import { TRANSLATIONS } from './catalog'
+import { DEFAULT_TRANSLATIONS, loadTranslations, translationsFor } from './catalog'
 import { DEFAULT_LOCALE, localeConfigValue, normalizeLocale } from './languages'
 import { setRuntimeI18nLocale } from './runtime'
 import type { Locale, Translations } from './types'
@@ -83,7 +83,7 @@ const I18nContext = createContext<I18nContextValue>({
   locale: DEFAULT_LOCALE,
   saveError: null,
   setLocale: async () => {},
-  t: TRANSLATIONS[DEFAULT_LOCALE]
+  t: DEFAULT_TRANSLATIONS
 })
 
 export interface I18nProviderProps {
@@ -99,6 +99,37 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
   const [configLoadError, setConfigLoadError] = useState<Error | null>(null)
   const [saveError, setSaveError] = useState<Error | null>(null)
   const localeRef = useRef(locale)
+
+  // Non-English message trees are separate chunks (see catalog.ts). Track the
+  // loaded one in state so the tree that arrives after an async import
+  // actually re-renders the subtree — `translationsFor` alone is a plain map
+  // read and would leave the UI on English until some unrelated render.
+  const [messages, setMessages] = useState<Translations>(() => translationsFor(locale) ?? DEFAULT_TRANSLATIONS)
+
+  useEffect(() => {
+    const alreadyLoaded = translationsFor(locale)
+
+    if (alreadyLoaded) {
+      setMessages(alreadyLoaded)
+
+      return
+    }
+
+    let cancelled = false
+
+    // Hold the previous tree while the chunk is in flight rather than
+    // flipping to English and back — a locale switch should read as one
+    // transition, not two.
+    void loadTranslations(locale).then(loadedMessages => {
+      if (!cancelled && loadedMessages) {
+        setMessages(loadedMessages)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [locale])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -183,9 +214,9 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
       locale,
       saveError,
       setLocale,
-      t: TRANSLATIONS[locale]
+      t: messages
     }),
-    [configLoadError, isLoadingConfig, isSavingLocale, locale, saveError, setLocale]
+    [configLoadError, isLoadingConfig, isSavingLocale, locale, messages, saveError, setLocale]
   )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>

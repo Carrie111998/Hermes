@@ -1,9 +1,17 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
-import { I18nProvider } from '@/i18n'
+import { I18nProvider, loadTranslations } from '@/i18n'
 
 import { ComposerTriggerPopover } from './trigger-popover'
+
+// Non-English message trees are separate chunks (i18n/catalog.ts). These
+// assertions are about the rendered copy, not about load timing, so warm the
+// locale once up front and keep them synchronous.
+beforeAll(async () => {
+  await loadTranslations('zh')
+})
+
 
 function renderPopover(kind: '@' | '/', loading = false) {
   const onHover = vi.fn()

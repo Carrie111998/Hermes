@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { setRuntimeI18nLocale } from '@/i18n'
+import { loadTranslations, setRuntimeI18nLocale } from '@/i18n'
 
 import {
   buildToolView,
@@ -400,7 +400,11 @@ describe('buildToolView title actions', () => {
     expect(view.detail).toBe('')
   })
 
-  it('uses the runtime locale for title text and action placement', () => {
+  it('uses the runtime locale for title text and action placement', async () => {
+    // Non-English message trees are separate chunks (i18n/catalog.ts); without
+    // this await the translator correctly falls back to English and the
+    // assertions below would be testing the fallback, not the Japanese copy.
+    await loadTranslations('ja')
     setRuntimeI18nLocale('ja')
 
     const read = buildToolView(part({ args: { path: '/tmp/demo.txt' }, result: undefined, toolName: 'read_file' }), '')

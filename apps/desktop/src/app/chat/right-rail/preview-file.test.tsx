@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { MarkdownPreview } from './preview-file'
@@ -13,7 +13,7 @@ describe('MarkdownPreview', () => {
     cleanup()
   })
 
-  it('renders block and inline math through KaTeX', () => {
+  it('renders block and inline math through KaTeX', async () => {
     // KaTeX marks its output; raw "$" delimiters must be gone.
     const { container } = render(
       <MarkdownPreview
@@ -21,7 +21,10 @@ describe('MarkdownPreview', () => {
       />
     )
 
-    expect(container.querySelector('.katex')).not.toBeNull()
+    // katex is off the cold boot graph (lib/use-math-plugin.ts), so the plugin
+    // lands a tick after mount. Waiting still guards the original regression:
+    // with no math plugin wired up at all, this never resolves.
+    await waitFor(() => expect(container.querySelector('.katex')).not.toBeNull())
     expect(screen.queryByText(/\$\$/)).toBeNull()
   })
 

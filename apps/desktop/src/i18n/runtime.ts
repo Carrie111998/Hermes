@@ -1,4 +1,4 @@
-import { TRANSLATIONS } from './catalog'
+import { translationsFor } from './catalog'
 import { DEFAULT_LOCALE } from './languages'
 import type { Locale } from './types'
 
@@ -62,5 +62,9 @@ export function getRuntimeI18nLocale(): Locale {
 }
 
 export function translateNow(key: string, ...args: unknown[]): string {
-  return translateFrom(locale => TRANSLATIONS[locale], runtimeLocale, key, args)
+  // `translationsFor` returns undefined until a non-English locale's chunk
+  // lands (see catalog.ts). `translateFrom`'s active → DEFAULT arm turns that
+  // into an English string rather than a missing one, so a translate that
+  // races the locale load degrades to English instead of rendering the key.
+  return translateFrom(translationsFor, runtimeLocale, key, args)
 }
