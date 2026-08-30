@@ -4,6 +4,9 @@ const focusOpenSession = vi.fn()
 const openSessionTile = vi.fn()
 const reuseBlankDraftTile = vi.fn()
 const setSessionTileWorkspaceScope = vi.fn()
+const focusedSessionWorkspaceScope = vi.fn<
+  () => { workspaceMode: 'bots' | 'sessions'; workspaceOwnerKey?: string }
+>(() => ({ workspaceMode: 'sessions' }))
 const openSessionInNewWindow = vi.fn()
 const canOpenSessionWindow = vi.fn(() => true)
 const workspaceIsPageGet = vi.fn(() => false)
@@ -11,6 +14,7 @@ const workspaceIsPageGet = vi.fn(() => false)
 vi.mock('@/store/session-states', () => ({
   focusedSessionNeedsRoute: (focused: 'main' | 'tile' | null, workspaceIsPage: boolean) =>
     !focused || (focused === 'main' && workspaceIsPage),
+  focusedSessionWorkspaceScope: () => focusedSessionWorkspaceScope(),
   focusOpenSession: (...args: unknown[]) => focusOpenSession(...args),
   openSessionTile: (...args: unknown[]) => openSessionTile(...args),
   reuseBlankDraftTile: (...args: unknown[]) => reuseBlankDraftTile(...args),
@@ -29,7 +33,7 @@ vi.mock('./routes', () => ({
 
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 
-import { mainChatOccupied, openSession, openSessionIntentFromModifiers } from './open-session'
+import { mainChatOccupied, openSession, openSessionFromPicker, openSessionIntentFromModifiers } from './open-session'
 
 /**
  * The question behind both the sidebar "+" and a palette open: is there a
@@ -92,6 +96,8 @@ describe('openSession', () => {
     workspaceIsPageGet.mockReturnValue(false)
     reuseBlankDraftTile.mockReset()
     setSessionTileWorkspaceScope.mockReset()
+    focusedSessionWorkspaceScope.mockReset()
+    focusedSessionWorkspaceScope.mockReturnValue({ workspaceMode: 'sessions' })
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
   })
@@ -204,6 +210,42 @@ describe('openSession', () => {
     openSession('s1', navigate, 'stack')
     expect(navigate).toHaveBeenCalledWith('/c/s1')
     expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
+  it('stack spends the focused Bot-scoped blank draft even when main is empty', () => {
+    const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
+
+    focusOpenSession.mockReturnValue(null)
+    reuseBlankDraftTile.mockReturnValue(true)
+    openSession('s1', navigate, 'stack', scope)
+
+    expect(reuseBlankDraftTile).toHaveBeenCalledWith('s1', scope)
+    expect(openSessionTile).not.toHaveBeenCalled()
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('picker resumes into the focused Bot workspace instead of the Sessions main', () => {
+    const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
+
+    focusedSessionWorkspaceScope.mockReturnValue(scope)
+    focusOpenSession.mockReturnValue(null)
+    reuseBlankDraftTile.mockReturnValue(true)
+    openSessionFromPicker('s1', navigate)
+
+    expect(focusedSessionWorkspaceScope).toHaveBeenCalledOnce()
+    expect(reuseBlankDraftTile).toHaveBeenCalledWith('s1', scope)
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('picker keeps its existing in-place behavior in the Sessions workspace', () => {
+    $activeSessionId.set('runtime-current')
+    focusedSessionWorkspaceScope.mockReturnValue({ workspaceMode: 'sessions' })
+    focusOpenSession.mockReturnValue(null)
+
+    openSessionFromPicker('s1', navigate)
+
+    expect(openSessionTile).not.toHaveBeenCalled()
+    expect(navigate).toHaveBeenCalledWith('/c/s1')
   })
 
   it('window pops out when the bridge supports it', () => {

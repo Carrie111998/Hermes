@@ -23,6 +23,7 @@ import {
   clearAllSessionStates,
   closeAllOpenSessionTiles,
   focusedSessionNeedsRoute,
+  focusedSessionWorkspaceScope,
   focusOpenSession,
   focusWorkspaceOwnerSessionTile,
   foregroundSessionScopes,
@@ -282,6 +283,20 @@ describe('SessionTile workspace scope', () => {
       })
     ])
     expect(focusOpenSession('bot-chat', scope)).toBe('tile')
+  })
+
+  it('reports the workspace scope of the focused Bot session tab', () => {
+    const scope = {
+      ownerRoute: { connectionId: 'connection-a', profile: 'default' },
+      workspaceMode: 'bots' as const,
+      workspaceOwnerKey: 'connection-a::default',
+      workspaceTabTitle: 'Bot Chat'
+    }
+
+    openSessionTile('bot-chat', 'center', undefined, undefined, scope)
+    $layoutTree.set(group(['workspace', tilePane('bot-chat')], { active: tilePane('bot-chat'), id: 'main' }))
+
+    expect(focusedSessionWorkspaceScope()).toEqual(scope)
   })
 
   it('keeps Bot tabs while a profile publication swaps the Sessions bucket', () => {

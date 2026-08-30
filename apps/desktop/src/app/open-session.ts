@@ -19,6 +19,7 @@ import { $activeSessionId, $selectedStoredSessionId, markSessionRead } from '@/s
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import {
   focusedSessionNeedsRoute,
+  focusedSessionWorkspaceScope,
   focusOpenSession,
   openSessionTile,
   reuseBlankDraftTile,
@@ -75,6 +76,15 @@ export function openSessionIntentFromModifiers(
   return base
 }
 
+/** Picker selection preserves the workspace of the tab that opened it without
+ * changing the established Sessions behavior. */
+export function openSessionFromPicker(storedSessionId: string, navigate: OpenSessionNavigate): void {
+  const workspaceScope = focusedSessionWorkspaceScope()
+  const intent = workspaceScope.workspaceMode === 'bots' ? 'stack' : 'in-place'
+
+  openSession(storedSessionId, navigate, intent, workspaceScope)
+}
+
 /**
  * @param navigate Required for `in-place` (route into main when not on screen).
  *   `tab` / `window` ignore it — pass a no-op when you don't have a router handle.
@@ -126,7 +136,13 @@ export function openSession(
   let spendBlankDraft = false
 
   if (resolved === 'stack') {
-    spendBlankDraft = mainChatOccupied($activeSessionId.get(), $selectedStoredSessionId.get())
+    // A Bot-scoped picker is already inside a session tab, so its blank draft
+    // is the surface the user expects `/resume` to replace. Main may be empty
+    // or hidden behind the Bots workspace; treating that as an in-place open
+    // routes the saved chat elsewhere while leaving the visible blank tab
+    // active. Force the tab path so it first focuses an existing target, then
+    // spends the scoped blank draft before stacking a new tab.
+    spendBlankDraft = Boolean(botWorkspaceScope) || mainChatOccupied($activeSessionId.get(), $selectedStoredSessionId.get())
     resolved = spendBlankDraft ? 'tab' : 'in-place'
   }
 
