@@ -6363,8 +6363,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_short = model_name.split("/")[-1] if "/" in model_name else model_name
             # Strip Palantir RID prefixes via the shared display formatter so
             # this site and ``ModelSwitchResult`` confirmation can't drift.
-            from hermes_cli.model_switch import format_model_for_display
+            from hermes_cli.model_switch import (
+                format_model_for_display,
+                strip_bedrock_profile_prefix_for_display,
+            )
             model_short = format_model_for_display(model_short)
+            # A Bedrock inference-profile prefix ("us.", "eu.", "global.")
+            # names the routing profile, not the model, and it spends 3-7 of
+            # the 23 characters that survive the truncation below.
+            model_short = strip_bedrock_profile_prefix_for_display(model_short)
         if model_short.endswith(".gguf"):
             model_short = model_short[:-5]
         if len(model_short) > 26:
