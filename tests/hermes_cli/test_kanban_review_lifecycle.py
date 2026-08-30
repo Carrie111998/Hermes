@@ -414,6 +414,91 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         assert tid in [s[0] for s in res_on.spawned]
 
 
+def test_non_dispatchable_assignee_exempt_from_ready_and_review(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``kanban.non_dispatchable_assignees`` must stop the dispatcher from
+    spawning a real-but-human lane in BOTH columns.
+
+    A human-owner lane is a real profile (``profile_exists`` is True), so the
+    nonexistent-profile guard cannot catch it: without the exemption the
+    worker spawns, exits on the missing model, and the block-recurrence
+    breaker files a waiting-on-a-person card as ``blocked``. Flipping the
+    list off proves the exemption — not something else — suppressed the
+    spawn."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    # Every assignee is a real profile: only the exemption list can stop
+    # a spawn.
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"non_dispatchable_assignees": ["product-owner"]}},
+    )
+
+    with kb.connect() as conn:
+        human_ready = kb.create_task(conn, title="human lane", assignee="product-owner")
+        bot_ready = kb.create_task(conn, title="bot lane", assignee="worker")
+        human_review = kb.create_task(conn, title="human review", assignee="product-owner")
+        claimed = kb.claim_task(conn, human_review)
+        assert claimed is not None
+        kb.request_review(
+            conn, human_review, summary="done",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, human_review).status == "review"
+
+        res = kb.dispatch_once(conn, dry_run=True)
+        spawned_ids = [s[0] for s in res.spawned]
+
+        # The human lane is skipped in both columns, bucketed as
+        # non-spawnable (steady-state, not operator-actionable).
+        assert human_ready not in spawned_ids
+        assert human_review not in spawned_ids
+        assert human_ready in res.skipped_nonspawnable
+        assert human_review in res.skipped_nonspawnable
+        # Real autonomous workers are unaffected.
+        assert bot_ready in spawned_ids
+
+        # Telemetry: a queue holding ONLY exempt lanes is correctly idle,
+        # not stuck.
+        assert kb.has_spawnable_ready(conn) is True  # bot lane present
+        conn.execute("DELETE FROM tasks WHERE assignee = 'worker'")
+        assert kb.has_spawnable_ready(conn) is False
+        assert kb.has_spawnable_review(conn) is False
+
+        # Exemption off -> the human lane is spawned again (proves the gate).
+        monkeypatch.setattr(
+            cfgmod, "load_config",
+            lambda *a, **k: {"kanban": {"non_dispatchable_assignees": []}},
+        )
+        res_on = kb.dispatch_once(conn, dry_run=True)
+        assert human_ready in [s[0] for s in res_on.spawned]
+
+
+def test_non_dispatchable_assignee_matches_case_insensitively(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dashboard tools may pass title-cased display labels; the exemption
+    must match them against the lowercase lane the same way profile
+    validation does."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"non_dispatchable_assignees": ["Product-Owner"]}},
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="human lane", assignee="product-owner")
+        res = kb.dispatch_once(conn, dry_run=True)
+        assert tid not in [s[0] for s in res.spawned]
+        assert tid in res.skipped_nonspawnable
+
+
 def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

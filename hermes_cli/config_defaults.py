@@ -2811,6 +2811,12 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Assignees the dispatcher must never spawn workers for, even though
+        # they are real Hermes profiles — e.g. a human-owner lane created for
+        # identity/shared memory with no model configured. Listed lanes are
+        # treated like control-plane lanes: their cards are skipped as
+        # non-spawnable in both the ready and review columns.
+        "non_dispatchable_assignees": [],
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
