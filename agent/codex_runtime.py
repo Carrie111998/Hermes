@@ -585,7 +585,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         start_cb = getattr(agent, "tool_start_callback", None)
         if start_cb is not None:
             try:
-                start_cb(_stable_call_id(item, name), name, args)
+                start_cb(_stable_call_id(safe_item, safe_name), safe_name, args)
             except Exception:
                 logger.debug(
                     "tool_start_callback raised for %s: %s",
@@ -596,6 +596,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def _fire_tool_completed(item: dict) -> None:
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
+        safe_item = sanitize_tool_result_projection_for_sink(item)
+        safe_name = sanitize_tool_result_for_sink(name)
         prior = started.pop(item_id, None)
         # Prefer codex's own durationMs when present so the bubble shows
         # exact tool wall-time; fall back to our started timestamp; fall
@@ -611,8 +613,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
-                cb("tool.completed", name, None, None,
-                   duration=duration, is_error=is_error, result=result)
+                cb("tool.completed", safe_name, None, None,
+                   duration=duration, is_error=is_error,
+                   result=sanitize_tool_result_for_sink(result))
             except Exception:
                 logger.debug(
                     "tool_progress_callback raised on tool.completed for %s: %s",
@@ -621,9 +624,14 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 )
         complete_cb = getattr(agent, "tool_complete_callback", None)
         if complete_cb is not None:
-            args = prior[1] if prior is not None else _codex_item_to_args(item)
+            args = prior[1] if prior is not None else _codex_item_to_args(safe_item)
             try:
-                complete_cb(_stable_call_id(item, name), name, args, result)
+                complete_cb(
+                    _stable_call_id(safe_item, safe_name),
+                    safe_name,
+                    args,
+                    sanitize_tool_result_for_sink(result),
+                )
             except Exception:
                 logger.debug(
                     "tool_complete_callback raised for %s: %s",
