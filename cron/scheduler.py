@@ -3066,6 +3066,37 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+class _GatewayLoopFallbackDispatch:
+    """Coordinate a scheduler timeout with gateway-loop fallback dispatch.
+
+    The loop must authorize under this lock before creating the send coroutine.
+    The scheduler aborts under the same lock, so an abort that wins guarantees a
+    queued callback observes it and makes no network/send call.  A timeout after
+    authorization is intentionally indeterminate: it must not be retried.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._aborted = False
+        self._authorized = False
+
+    def abort_pending(self) -> bool:
+        """Atomically abort only a fallback that the gateway loop has not authorized."""
+        with self._lock:
+            if self._authorized:
+                return False
+            self._aborted = True
+            return True
+
+    async def run(self, send_factory):
+        """Authorize on the gateway loop before constructing/awaiting the send."""
+        with self._lock:
+            if self._aborted:
+                return {"aborted": True}
+            self._authorized = True
+        return await send_factory()
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -3831,60 +3862,112 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
-            # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
-            try:
-                result = asyncio.run(coro)
-            except RuntimeError as run_err:
-                # asyncio.run() checks for a running loop before awaiting the coroutine;
-                # when it raises, the original coro was never started — close it to
-                # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
-                # fresh thread that has no running loop.
-                coro.close()
-                # If the RuntimeError is the interpreter-finalization signal,
-                # the fresh-thread fallback would fail identically — skip
-                # gracefully instead of logging a shutdown-race traceback.
-                if _interpreter_shutting_down(run_err):
-                    msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
-                    logger.warning("Job '%s': %s", job["id"], msg)
-                    target_errors.append(msg)
-                    delivery_errors.extend(target_errors)
+            # Matrix's persistent aiohttp/E2EE session is bound to the gateway
+            # loop, so its fallback must not re-await it in this scheduler
+            # thread's fresh asyncio.run() loop. Other live adapters retain the
+            # established standalone retry when this scheduling race loses.
+            if live_adapter_ready and platform == Platform.MATRIX:
+                # Keep gateway-bound adapters on their owning loop.  The
+                # dispatch handshake, not Future.cancel(), determines whether a
+                # timeout was safely aborted before any send could begin.
+                from agent.async_utils import safe_schedule_threadsafe
+
+                dispatch = _GatewayLoopFallbackDispatch()
+                future = safe_schedule_threadsafe(
+                    dispatch.run(
+                        lambda: _send_to_platform(
+                            platform, pconfig, chat_id, cleaned_delivery_content,
+                            thread_id=thread_id, media_files=media_files,
+                        )
+                    ),
+                    loop,
+                )
+                if future is None:
+                    msg = f"delivery to {platform_name}:{chat_id} failed: live adapter event loop scheduling failed"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    target_errors.append(msg); delivery_errors.extend(target_errors)
                     continue
-                # The thread-pool fallback can itself raise (SMTP ConnectionError,
-                # future.result timeout, etc.). An exception raised inside this
-                # `except RuntimeError` block is NOT caught by the sibling
-                # `except Exception` below — it would escape _deliver_result()
-                # and crash the whole delivery loop, silently skipping every
-                # remaining target (#47163). Wrap the fallback in its own
-                # try/except so a per-target failure is logged and the loop
-                # continues to the next target.
                 try:
-                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
-                        result = future.result(timeout=30)
-                    finally:
-                        pool.shutdown(wait=False)
+                    result = future.result(timeout=30)
+                except TimeoutError:
+                    if dispatch.abort_pending():
+                        # The synchronized abort is the proof a queued callback
+                        # cannot send; let it run and observe the abort cleanly.
+                        msg = (
+                            f"delivery to {platform_name}:{chat_id} failed: live adapter "
+                            "fallback timed out before dispatch authorization"
+                        )
+                        logger.warning("Job '%s': %s", job["id"], msg)
+                        target_errors.append(msg); delivery_errors.extend(target_errors)
+                        continue
+                    logger.warning(
+                        "Job '%s': live adapter fallback to %s:%s timed out after "
+                        "30s after dispatch authorization; outcome indeterminate, "
+                        "not retrying to avoid a duplicate",
+                        job["id"], platform_name, chat_id,
+                    )
+                    delivered = True
+                    continue
                 except Exception as e:
-                    # A shutdown-race here is expected during teardown; downgrade
-                    # to a warning so it doesn't read as a genuine failure.
-                    if _interpreter_shutting_down(e):
+                    msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                    logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
+                    target_errors.append(msg); delivery_errors.extend(target_errors)
+                    continue
+            else:
+                # Standalone path: run the async send in a fresh event loop (safe from any thread)
+                coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+                try:
+                    result = asyncio.run(coro)
+                except RuntimeError as run_err:
+                    # asyncio.run() checks for a running loop before awaiting the coroutine;
+                    # when it raises, the original coro was never started — close it to
+                    # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
+                    # fresh thread that has no running loop.
+                    coro.close()
+                    # If the RuntimeError is the interpreter-finalization signal,
+                    # the fresh-thread fallback would fail identically — skip
+                    # gracefully instead of logging a shutdown-race traceback.
+                    if _interpreter_shutting_down(run_err):
                         msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                         logger.warning("Job '%s': %s", job["id"], msg)
                         target_errors.append(msg)
                         delivery_errors.extend(target_errors)
                         continue
+                    # The thread-pool fallback can itself raise (SMTP ConnectionError,
+                    # future.result timeout, etc.). An exception raised inside this
+                    # `except RuntimeError` block is NOT caught by the sibling
+                    # `except Exception` below — it would escape _deliver_result()
+                    # and crash the whole delivery loop, silently skipping every
+                    # remaining target (#47163). Wrap the fallback in its own
+                    # try/except so a per-target failure is logged and the loop
+                    # continues to the next target.
+                    try:
+                        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                        try:
+                            future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                            result = future.result(timeout=30)
+                        finally:
+                            pool.shutdown(wait=False)
+                    except Exception as e:
+                        # A shutdown-race here is expected during teardown; downgrade
+                        # to a warning so it doesn't read as a genuine failure.
+                        if _interpreter_shutting_down(e):
+                            msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
+                            logger.warning("Job '%s': %s", job["id"], msg)
+                            target_errors.append(msg)
+                            delivery_errors.extend(target_errors)
+                            continue
+                        msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                        logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
+                        target_errors.extend([msg])
+                        delivery_errors.extend(target_errors)
+                        continue
+                except Exception as e:
                     msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                     logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                     target_errors.extend([msg])
                     delivery_errors.extend(target_errors)
                     continue
-            except Exception as e:
-                msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
-                logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
-                target_errors.extend([msg])
-                delivery_errors.extend(target_errors)
-                continue
 
             if result and result.get("error"):
                 # Include target context (platform/chat) so a bare error string
