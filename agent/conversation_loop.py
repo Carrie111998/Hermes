@@ -603,6 +603,27 @@ def _ra():
     return run_agent
 
 
+def _provider_wait_notice_text(
+    model: Any,
+    retry_count: int,
+    max_retries: int,
+    wait_time: float,
+) -> str:
+    """Live wait-state line for provider queueing/rate-limit backoff.
+
+    Surfaced through ``_emit_wait_notice`` → ``thinking.delta`` on
+    CLI/TUI/Desktop. The desktop provider-wait row only renders text whose
+    prefix matches ``⏳ waiting on`` (see apps/desktop/src/store/provider-wait.ts
+    ``providerWaitText``), so keep that phrasing — a 429 from a queueing
+    provider (e.g. coding-plan Token Plan) otherwise reads as a frozen turn
+    while Hermes silently backs off.
+    """
+    return (
+        f"⏳ waiting on {model} — provider queueing/rate-limited, "
+        f"retrying in {wait_time:.0f}s (attempt {retry_count}/{max_retries})"
+    )
+
+
 def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
@@ -3559,12 +3580,18 @@ def run_conversation(
                             }
                         time.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
-                        # monitor knows we're alive during backoff waits.
+                        # monitor knows we're alive during backoff waits.  Also
+                        # surface the wait on the live spinner/status line
+                        # (CLI/TUI/Desktop thinking.delta) — a provider that is
+                        # queueing or rate-limiting (429) otherwise reads as a
+                        # frozen turn with no explanation.
                         _backoff_touch_counter += 1
                         if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                            agent._touch_activity(
-                                f"retry backoff ({retry_count}/{max_retries}), "
-                                f"{int(sleep_end - time.time())}s remaining"
+                            _remaining_s = int(sleep_end - time.time())
+                            agent._emit_wait_notice(
+                                _provider_wait_notice_text(
+                                    agent.model, retry_count, max_retries, _remaining_s
+                                )
                             )
                     if _retry.restart_with_redirected_messages:
                         break  # rebuild this iteration from the correction
@@ -6669,6 +6696,22 @@ def run_conversation(
                         agent._emit_status(_rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)
+                    # Immediate live wait notice (CLI/TUI/Desktop thinking.delta):
+                    # a 429 from a queueing provider (e.g. coding-plan Token Plan)
+                    # otherwise reads as a frozen turn while Hermes silently backs
+                    # off. The desktop provider-wait row matches the "⏳ waiting on"
+                    # prefix, so keep that phrasing.
+                    try:
+                        agent._emit_wait_notice(
+                            _provider_wait_notice_text(
+                                agent.model,
+                                retry_count + 1,
+                                max_retries,
+                                wait_time,
+                            )
+                        )
+                    except Exception:
+                        logger.debug("rate-limit wait notice failed", exc_info=True)
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
@@ -6706,12 +6749,18 @@ def run_conversation(
                         }
                     time.sleep(0.2)  # Check interrupt every 200ms
                     # Touch activity every ~30s so the gateway's inactivity
-                    # monitor knows we're alive during backoff waits.
+                    # monitor knows we're alive during backoff waits.  Also
+                    # surface the wait on the live spinner/status line
+                    # (CLI/TUI/Desktop thinking.delta) — a rate-limited or
+                    # overloaded provider (429) otherwise reads as a frozen
+                    # turn while Hermes silently retries.
                     _backoff_touch_counter += 1
                     if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                        agent._touch_activity(
-                            f"error retry backoff ({retry_count}/{max_retries}), "
-                            f"{int(sleep_end - time.time())}s remaining"
+                        _remaining_s = int(sleep_end - time.time())
+                        agent._emit_wait_notice(
+                            _provider_wait_notice_text(
+                                agent.model, retry_count, max_retries, _remaining_s
+                            )
                         )
                 if _retry.restart_with_redirected_messages:
                     # Leave the retry loop — the check right below rebuilds this

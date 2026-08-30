@@ -10,6 +10,7 @@ gateway's "⏳ Working — N min" heartbeat includes).
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 import types
@@ -63,6 +64,44 @@ def test_emit_wait_notice_without_callback_still_touches_activity(tmp_path, monk
     assert "waiting on test-model" in agent.get_activity_summary()["last_activity_desc"]
 
 
+
+
+def test_backoff_wait_notice_matches_desktop_provider_wait_contract(tmp_path, monkeypatch):
+    """The 429/queueing backoff notice must survive the desktop's
+    ``providerWaitText`` filter — that row only renders text whose prefix
+    matches ``⏳ waiting on`` / ``⚠ no output`` / ``↻ model returned``.
+    Regression guard: if someone rewrites the phrasing and breaks the
+    cross-surface contract, the queueing hint silently vanishes from the UI
+    and the user is back to an unexplained frozen spinner.
+    """
+    from agent.conversation_loop import _provider_wait_notice_text
+
+    # Mirror of apps/desktop/src/store/provider-wait.ts providerWaitText().
+    provider_wait_re = re.compile(
+        r"^(?:⏳|⚠|↻)\s*(?:waiting on|no (?:output|response)|model returned)",
+        re.I,
+    )
+
+    notice = _provider_wait_notice_text("qwen3.8-flash", 2, 4, 45.0)
+    assert provider_wait_re.match(notice), f"desktop would drop this notice: {notice!r}"
+    assert "qwen3.8-flash" in notice
+    assert "45s" in notice
+    assert "(attempt 2/4)" in notice
+
+
+def test_backoff_wait_notice_roundtrip_to_thinking_callback(tmp_path, monkeypatch):
+    """The helper's output flows through _emit_wait_notice into the live
+    thinking_callback (the thinking.delta bridge) unchanged."""
+    from agent.conversation_loop import _provider_wait_notice_text
+
+    seen: list = []
+    agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
+    notice = _provider_wait_notice_text("qwen3.8-flash", 3, 4, 12.0)
+
+    agent._emit_wait_notice(notice)
+
+    assert seen == [notice]
+    assert "waiting on qwen3.8-flash" in agent.get_activity_summary()["last_activity_desc"]
 
 
 def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
