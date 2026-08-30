@@ -3937,6 +3937,17 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     inherited.pop("inherit", None)
                     if inherited:
                         config = _deep_merge(config, inherited)
+                    elif _resolve_root_config_path(config_path) is None:
+                        # `inherit: true` was asked for and could not be
+                        # honoured — the profile is not where inheritance can
+                        # find a root. Silence here reproduces the bug this
+                        # feature exists to fix: a config that reads as empty
+                        # for a reason nothing on screen explains.
+                        print(
+                            f"⚠ {config_path}: `inherit: true` has no effect here — "
+                            "inheritance expects a profile at <root>/profiles/<name>/.",
+                            file=sys.stderr,
+                        )
                 else:
                     _warn_nested_inherit(user_config, config_path)
 
