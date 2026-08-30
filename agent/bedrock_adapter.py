@@ -1738,6 +1738,30 @@ def _extract_provider_from_arn(arn: str) -> str:
     """
     match = re.search(r"foundation-model/([^.]+)", arn)
     return match.group(1) if match else ""
+
+
+def vision_capable_bedrock_model_ids(models: List[Dict[str, Any]]) -> List[str]:
+    """Return the IDs of discovered Bedrock models that accept image input.
+
+    A model qualifies when ``"IMAGE"`` appears in its ``input_modalities``.
+    This is the production consumer of the inference-profile modality
+    inheritance above: ``ListFoundationModels`` reports modalities, but
+    ``ListInferenceProfiles`` does not, so without that inheritance every
+    profile — which is what the ``/model`` picker actually offers, since bare
+    foundation IDs are deduplicated away in favour of profiles — would arrive
+    stamped ``TEXT``-only and every Claude profile would be misreported here as
+    text-only.
+
+    Order follows *models*, so callers keep whatever sort they applied.
+    """
+    ids: List[str] = []
+    for m in models:
+        modalities = [str(x).upper() for x in (m.get("input_modalities") or [])]
+        if "IMAGE" in modalities:
+            ids.append(m["id"])
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Error classification — Bedrock-specific exceptions
 # ---------------------------------------------------------------------------
