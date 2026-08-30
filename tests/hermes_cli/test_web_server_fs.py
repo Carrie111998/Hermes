@@ -93,6 +93,10 @@ def test_fs_read_previews_reject_sensitive_files(
     response = client.get(f"/api/fs/{route}", params={"path": str(target)})
 
     assert response.status_code == 403
+    # Pin that the 403 comes from the sensitive-path guard itself, so a
+    # future refactor raising a different 403 (e.g. from _fs_path) can't
+    # silently pass this test.
+    assert "sensitive" in response.json()["detail"]
 
 
 def test_fs_read_previews_reject_credential_directory(client, tmp_path):
