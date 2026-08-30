@@ -241,6 +241,14 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
+def _safe_json_dumps(data: Any) -> str:
+    """Serialize payload to JSON string safely with default=str fallback."""
+    try:
+        return json.dumps(data, default=str)
+    except Exception:
+        return "{}"
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -259,26 +267,35 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         )
         if key in record
     }
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
-               (delegation_id, origin_session, origin_ui_session_id,
-                parent_session_id, state, dispatched_at, updated_at,
-                delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (record["delegation_id"], record.get("session_key", ""),
-             record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id,
+                    parent_session_id, state, dispatched_at, updated_at,
+                    delivery_state, delivery_attempts, owner_pid,
+                    owner_started_at, task_json, origin_session_id)
+                   VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                (record["delegation_id"], record.get("session_key", ""),
+                 record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
+                 record["dispatched_at"], now, __import__("os").getpid(),
+                 owner_started_at, _safe_json_dumps(task_payload),
+                 record.get("origin_session_id", "")),
+            )
+        _prune_durable_records()
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: failed to persist dispatch to state.db: %s",
+            record.get("delegation_id"), exc,
         )
-    _prune_durable_records()
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    except Exception as exc:
+        logger.error("Failed to delete durable delegation %s: %s", delegation_id, exc)
 
 
 def _prune_durable_records() -> None:
@@ -322,13 +339,19 @@ def _prune_durable_records() -> None:
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute(
+                """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                   event_json=?, result_json=?, delivery_state='pending'
+                   WHERE delegation_id=?""",
+                (event.get("status", "completed"), event.get("completed_at", now), now,
+                 _safe_json_dumps(event), _safe_json_dumps(result), event["delegation_id"]),
+            )
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: failed to persist completion to state.db: %s",
+            event.get("delegation_id"), exc,
         )
 
 
@@ -391,7 +414,7 @@ def recover_abandoned_delegations() -> int:
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
                    WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                (now, now, _safe_json_dumps(event), _safe_json_dumps(result), delegation_id),
             )
             recovered += 1
     return recovered
@@ -912,8 +935,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -1162,8 +1187,10 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(

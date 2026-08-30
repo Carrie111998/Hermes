@@ -881,3 +881,89 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
 
+
+def test_non_json_serializable_result_finalizes_and_delivers():
+    """Non-JSON serializable objects in runner results (Path, datetime, custom objects)
+    must not crash finalization or leak delegation capacity."""
+    from datetime import datetime
+    from pathlib import Path
+
+    class CustomData:
+        def __init__(self, val):
+            self.val = val
+
+    custom_result = {
+        "status": "completed",
+        "summary": "Generated report",
+        "output_path": Path("/tmp/report.txt"),
+        "timestamp": datetime.now(),
+        "custom": CustomData(42),
+        "api_calls": 3,
+    }
+
+    res = ad.dispatch_async_delegation(
+        goal="Generate report",
+        context=None,
+        toolsets=None,
+        role="worker",
+        model=None,
+        session_key="test_session",
+        runner=lambda: custom_result,
+    )
+    assert res["status"] == "dispatched"
+    delegation_id = res["delegation_id"]
+
+    evt = _drain_for(delegation_id, timeout=5.0)
+    assert evt is not None
+    assert evt["delegation_id"] == delegation_id
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "Generated report"
+
+    # Active count should return to 0 (no slot leak).
+    deadline = time.monotonic() + 2.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ad.active_count() == 0
+
+
+def test_batch_non_json_serializable_result_finalizes_and_delivers():
+    """Batch delegation containing non-JSON serializable objects must also finalize safely."""
+    from pathlib import Path
+
+    def batch_runner():
+        return {
+            "results": [
+                {
+                    "status": "completed",
+                    "summary": "Processed file",
+                    "path": Path("/data/file.csv"),
+                    "api_calls": 2,
+                }
+            ],
+            "total_duration_seconds": 1.5,
+        }
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["Process item 1"],
+        context=None,
+        toolsets=None,
+        role="worker",
+        model=None,
+        session_key="test_session",
+        runner=batch_runner,
+    )
+    assert res["status"] == "dispatched"
+    delegation_id = res["delegation_id"]
+
+    evt = _drain_for(delegation_id, timeout=5.0)
+    assert evt is not None
+    assert evt["delegation_id"] == delegation_id
+    assert evt["is_batch"] is True
+
+    # Active count must return to 0
+    deadline = time.monotonic() + 2.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ad.active_count() == 0
+
+
