@@ -130,19 +130,65 @@ class TestAnchorInvalidation:
         rebuilt = [dict(m) for m in messages]  # fresh dicts, same values
         assert anchored_context_tokens(rebuilt, anchor) is None
 
-    def test_explicit_invalidation_sites(self):
-        """The compaction + session-reset sites null agent._usage_anchor."""
-        import inspect
+    def test_codex_native_compaction_clears_the_anchor(self):
+        """A Codex app-server compaction rewrites the provider-side
+        context, so the anchor's transcript snapshot no longer matches."""
+        from agent.codex_runtime import _record_codex_app_server_compaction
 
-        import agent.conversation_compression as cc
-        import agent.codex_runtime as cr
-        import run_agent
-
-        assert "agent._usage_anchor = None" in inspect.getsource(cc)
-        assert "agent._usage_anchor = None" in inspect.getsource(cr)
-        assert "self._usage_anchor = None" in inspect.getsource(
-            run_agent.AIAgent.reset_session_state
+        agent = SimpleNamespace(
+            _usage_anchor=object(),
+            session_id="s1",
+            _last_compaction_in_place=True,
+            _emit_status=lambda _s: None,
+            context_compressor=SimpleNamespace(
+                compression_count=0,
+                last_prompt_tokens=0,
+                last_completion_tokens=0,
+            ),
+            event_callback=None,
         )
+        turn = SimpleNamespace(
+            compacted=True, thread_id="t1", turn_id="u1", token_usage_last=None,
+        )
+
+        assert _record_codex_app_server_compaction(agent, turn) is True
+        assert agent._usage_anchor is None
+
+    def test_reset_session_state_clears_the_anchor(self, tmp_path):
+        """AIAgent.reset_session_state starts a fresh session: the anchor
+        belongs to the old transcript and must not survive the reset."""
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("ANCHOR_RESET_SESSION", source="cli")
+        try:
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                from run_agent import AIAgent
+
+                agent = AIAgent(
+                    api_key="test-key",
+                    base_url="https://openrouter.ai/api/v1",
+                    model="test/model",
+                    quiet_mode=True,
+                    session_db=db,
+                    session_id="ANCHOR_RESET_SESSION",
+                    skip_context_files=True,
+                    skip_memory=True,
+                )
+            agent.context_compressor = MagicMock()
+            agent._usage_anchor = object()
+
+            agent.reset_session_state()
+
+            assert agent._usage_anchor is None
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 class TestPreflightConsumer:

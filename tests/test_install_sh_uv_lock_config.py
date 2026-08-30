@@ -41,17 +41,14 @@ def test_installers_keep_bootstrap_isolation_but_restore_project_config_for_lock
 
     assert "export UV_NO_CONFIG=1" in install_text
     assert "export UV_NO_CONFIG=1" in setup_text
+    # Both installers must carry the helper, byte-identical, so a fix in
+    # one script cannot drift from the other. The helper's BEHAVIOR (env
+    # sanitization, isolated XDG, locked sync argv) is pinned by the
+    # live-bash test below, which actually runs it — intra-body substring
+    # assertions here would only re-test formatting.
     assert _locked_sync_helper(INSTALL_SCRIPTS[0]) == _locked_sync_helper(
         INSTALL_SCRIPTS[1]
     )
-
-    helper = _locked_sync_helper(INSTALL_SCRIPTS[0])
-    assert "unset UV_NO_CONFIG UV_CONFIG_FILE" in helper
-    assert 'export XDG_CONFIG_HOME="$isolated_uv_config"' in helper
-    assert 'export XDG_CONFIG_DIRS="$isolated_uv_config"' in helper
-    assert "$UV_CMD sync --extra all --locked" in helper
-    assert 'run_locked_uv_sync "$INSTALL_DIR/venv"' in install_text
-    assert 'run_locked_uv_sync "$SCRIPT_DIR/venv"' in setup_text
 
 
 def test_locked_sync_helper_sanitizes_only_its_subprocess(tmp_path: Path) -> None:

@@ -62,6 +62,7 @@ from agent.message_sanitization import (
     _looks_like_image_content_rejection,
     _strip_images_from_messages,
     _strip_non_ascii,
+    compression_recovery_progress,
     serialized_messages_bytes,
 )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
@@ -5758,9 +5759,8 @@ def run_conversation(
                     approx_tokens = new_tokens  # update for downstream logging
                     new_bytes = serialized_messages_bytes(messages)
 
-                    made_progress = (
-                        len(messages) < original_len
-                        or (new_bytes > 0 and new_bytes < original_bytes * 0.95)
+                    made_progress = compression_recovery_progress(
+                        original_len, len(messages), original_bytes, new_bytes
                     )
                     if made_progress:
                         if len(messages) < original_len:
