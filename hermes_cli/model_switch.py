@@ -4008,7 +4008,12 @@ def list_picker_providers(
         for_picker=True,
         excluded_providers=excluded_providers,
     )
-    if include_moa:
+    excluded = {
+        str(provider).strip().lower()
+        for provider in (excluded_providers or [])
+        if str(provider).strip()
+    }
+    if include_moa and "moa" not in excluded:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
 
     filtered: List[dict] = []

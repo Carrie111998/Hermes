@@ -19,6 +19,7 @@ from hermes_cli.model_switch import (
     _fetch_picker_live_models,
     _save_discovered_models_to_config,
     list_authenticated_providers,
+    list_picker_providers,
     switch_model,
 )
 from hermes_cli.providers import resolve_provider_full
@@ -1683,6 +1684,20 @@ def test_excluded_providers_hides_builtin_row(monkeypatch):
     assert not any(p["slug"] == "openrouter" for p in filtered), (
         "excluded_providers=['openrouter'] must hide the openrouter row"
     )
+
+
+def test_excluded_providers_hides_virtual_moa_row(monkeypatch):
+    """The virtual MoA picker row must honor the same exclusion setting."""
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers", lambda **kwargs: []
+    )
+
+    filtered = list_picker_providers(
+        include_moa=True,
+        excluded_providers=["moa"],
+    )
+
+    assert not any(p["slug"] == "moa" for p in filtered)
 
 
 def test_custom_provider_context_length_models_dict_still_probes(monkeypatch):
