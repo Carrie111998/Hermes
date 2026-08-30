@@ -444,6 +444,24 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 
 Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
 
+Persistent goals use the same slash-command contract as the CLI and messaging
+gateway. Send `/goal <objective>` as `input` with a stable `session_id`:
+
+```json
+{
+  "session_id": "release-check",
+  "input": "/goal Wait for CI to pass, investigate failures, and report the result"
+}
+```
+
+Hermes runs the native goal judge after each turn and performs canonical
+continuations within the run. A `wait` verdict parks the goal without another
+model call, judge call, or turn charge. Re-enter the same API session after a
+process/watch completes (or a timed wait expires) to continue the persisted
+goal. The core control commands (`/goal`, `/goal status`, `/goal pause`,
+`/goal resume`, `/goal clear`, `/goal wait <pid> [reason]`, and `/goal unwait`)
+are handled as control-plane operations and do not call the model.
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.
@@ -465,6 +483,11 @@ Statuses are retained briefly after terminal states (`completed`, `failed`, or `
 ### GET /v1/runs/\{run_id\}/events
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
+
+Persistent goal runs additionally emit `goal.started` and `goal.status`.
+`goal.status` includes the native judge verdict/reason plus turn-budget state,
+allowing clients to distinguish continuation, completion, pause, and parked
+waits without parsing assistant prose.
 
 When the agent delegates work to background subagents, the stream also carries
 `subagent.start` and `subagent.complete` lifecycle events, so clients can
