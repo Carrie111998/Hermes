@@ -669,7 +669,8 @@ _DB_BOOTSTRAP_LOCK = threading.Lock()
 _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
 _GOAL_GENERATION_LOCK = threading.Lock()
 _GOAL_GENERATIONS: Dict[Tuple[str, str], int] = {}
-_GOAL_STATE_LOCK = threading.RLock()
+_GOAL_STATE_LOCKS_GUARD = threading.Lock()
+_GOAL_STATE_LOCKS: Dict[Tuple[str, str], Any] = {}
 
 
 def _goal_generation_key(session_id: str) -> Tuple[str, str]:
@@ -696,19 +697,30 @@ def _bump_goal_generation(session_id: str) -> int:
         return generation
 
 
+def _goal_state_lock(session_id: str):
+    """Return the profile- and session-scoped re-entrant goal lock."""
+    key = _goal_generation_key(session_id)
+    with _GOAL_STATE_LOCKS_GUARD:
+        lock = _GOAL_STATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _GOAL_STATE_LOCKS[key] = lock
+        return lock
+
+
 @contextmanager
-def goal_state_transaction():
-    """Serialize in-process goal read/transition/write sequences."""
-    with _GOAL_STATE_LOCK:
+def goal_state_transaction(session_id: str):
+    """Serialize one session's goal read/transition/write sequences."""
+    with _goal_state_lock(session_id):
         yield
 
 
 def _serialized_goal_mutation(method):
-    """Keep one manager transition atomic with model/human controls."""
+    """Keep one manager transition atomic with same-session controls."""
     @wraps(method)
-    def locked(*args, **kwargs):
-        with _GOAL_STATE_LOCK:
-            return method(*args, **kwargs)
+    def locked(self, *args, **kwargs):
+        with _goal_state_lock(self.session_id):
+            return method(self, *args, **kwargs)
 
     return locked
 

@@ -30,6 +30,7 @@ def _home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
     goals._DB_BOOTSTRAP_INFLIGHT.clear()
     goals._GOAL_GENERATIONS.clear()
+    goals._GOAL_STATE_LOCKS.clear()
     return home
 
 
@@ -327,3 +328,44 @@ def test_slow_initialization_fails_closed_instead_of_claiming_success(
     assert result["error"]["code"] == "persistence_unavailable"
     assert initialized.wait(2), "background SessionDB initialization did not finish"
     assert goals.load_goal("session-current") is None
+
+
+def test_goal_mutation_lock_is_scoped_to_one_session(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    judge_started = threading.Event()
+    release_judge = threading.Event()
+    other_session_done = threading.Event()
+
+    def _blocked_judge(*_args, **_kwargs):
+        judge_started.set()
+        assert release_judge.wait(2), "test did not release the blocked judge"
+        return "continue", "still working", False, None, False
+
+    first = goals.GoalManager("session-first", default_max_turns=4)
+    first.set("First goal")
+    second = goals.GoalManager("session-second", default_max_turns=4)
+
+    monkeypatch.setattr(goals, "judge_goal", _blocked_judge)
+    evaluating = threading.Thread(
+        target=first.evaluate_after_turn,
+        args=("first response",),
+        daemon=True,
+    )
+    mutating = threading.Thread(
+        target=lambda: (second.set("Second goal"), other_session_done.set()),
+        daemon=True,
+    )
+
+    evaluating.start()
+    assert judge_started.wait(1), "first-session judge did not start"
+    mutating.start()
+    try:
+        assert other_session_done.wait(0.25), (
+            "an independent session was blocked by the first session's goal lock"
+        )
+    finally:
+        release_judge.set()
+        evaluating.join(2)
+        mutating.join(2)
+
+    assert goals.load_goal("session-second").goal == "Second goal"

@@ -110,7 +110,7 @@ def goal_control_tool(
             load_goal_authoritative,
         )
 
-        with goal_state_transaction():
+        with goal_state_transaction(caller_session_id):
             # This pre-read distinguishes "no goal" from unavailable/corrupt
             # persistence before any mutation is attempted.
             before = load_goal_authoritative(caller_session_id)
