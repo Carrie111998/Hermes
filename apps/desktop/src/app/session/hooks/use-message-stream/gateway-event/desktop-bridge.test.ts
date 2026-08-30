@@ -64,7 +64,12 @@ describe('handleDesktopBridgeEvent preview.act visibility', () => {
     handleDesktopBridgeEvent(actCtx('runtime-tile', false))
     await vi.waitFor(() => expect(request).toHaveBeenCalled())
 
-    const [, params] = request.mock.calls[0] as [string, { text: string }]
-    expect(params.text).not.toContain('only takes actions in the session the user is looking at')
+    expect(request).toHaveBeenCalledWith(
+      'preview.act.respond',
+      expect.objectContaining({
+        request_id: 'req-97848',
+        text: expect.not.stringContaining('only takes actions in the session the user is looking at')
+      })
+    )
   })
 })
