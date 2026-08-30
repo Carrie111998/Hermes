@@ -308,6 +308,11 @@ def _stat_fingerprint(directory: Path) -> Optional[Tuple[int, int]]:
     run on every sync as a fast-path guard. Returns ``None`` when the tree
     cannot be scanned — callers treat that as "fingerprints disagree" and
     fall back to the full content hash.
+
+    Known trade-off: two trees with the same file count and total size but
+    different contents compare equal, so same-size destination drift stays
+    masked until the bundled source changes (the #97791 class is structural
+    drift — missing/moved files — which this pair detects).
     """
     count = 0
     total = 0
