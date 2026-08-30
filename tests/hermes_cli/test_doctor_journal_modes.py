@@ -142,7 +142,10 @@ class TestReadJournalMode:
             holder.close()
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="root ignores file permissions",
+    )
     def test_read_only_directory_is_still_readable(self, tmp_path):
         db = tmp_path / "state.db"
         _make_db(db, journal_mode="WAL")
@@ -278,9 +281,19 @@ class TestLiveConnectionSafety:
 
 class TestUnreadableReason:
     def test_missing_file_keeps_the_os_error_text(self, tmp_path):
-        reason = doctor._unreadable_reason(tmp_path / "gone.db")
+        missing = tmp_path / "gone.db"
+        reason = doctor._unreadable_reason(missing)
 
-        assert "No such file or directory" in reason
+        # The original OSError text must be preserved verbatim (doctor's whole
+        # job is to say *which* problem it hit). The exact wording and path
+        # rendering are platform-specific (POSIX "No such file or directory"
+        # with forward slashes; Windows "The system cannot find the file
+        # specified" with escaped backslashes), so assert on the invariant that
+        # survives both: the file basename is in the message (the path reached
+        # the error) and it is the real OS error, not the generic
+        # "could not be read" fallback.
+        assert missing.name in reason
+        assert reason and "could not be read" not in reason
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
     @pytest.mark.skipif(
@@ -387,7 +400,10 @@ class TestReportDatabaseJournalModes:
         assert "state.db: rollback journal mode" in out
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="root ignores file permissions",
+    )
     def test_unreadable_database_does_not_crash(self, tmp_path, capsys):
         db = tmp_path / "state.db"
         _make_db(db)
