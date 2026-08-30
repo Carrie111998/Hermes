@@ -404,6 +404,11 @@ def test_main_ledgered_manual_serve_is_exempt(monkeypatch, capsys):
     assert data["blocked"] is False
     assert data["processes"] == []
     assert data["ledgered_manual_serves"] == 1
+    # Sanitized decision evidence: structured ledger identity only — the
+    # exemption must explain itself without echoing the command line.
+    assert data["exempted_manual_serves"] == [
+        {"pid": 78, "purpose": "serve", "port": 9119}
+    ]
 
 
 def test_main_ledgered_serve_alongside_unledgered_holder_still_blocks(monkeypatch, capsys):
@@ -427,6 +432,10 @@ def test_main_ledgered_serve_alongside_unledgered_holder_still_blocks(monkeypatc
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [79]
     assert data["ledgered_manual_serves"] == 1
+    # Only the ledger-vouched holder shows up in the sanitized evidence.
+    assert data["exempted_manual_serves"] == [
+        {"pid": 78, "purpose": "serve", "port": 9119}
+    ]
 
 
 def test_main_ledger_matcher_failure_keeps_serve_blocking(monkeypatch, capsys):
@@ -451,3 +460,4 @@ def test_main_ledger_matcher_failure_keeps_serve_blocking(monkeypatch, capsys):
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [78]
     assert data["ledgered_manual_serves"] == 0
+    assert data["exempted_manual_serves"] == []

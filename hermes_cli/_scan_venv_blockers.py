@@ -234,8 +234,8 @@ def _is_pausable_gateway(cmdline: str) -> bool:
     return looks_like_gateway_command_line(cmdline)
 
 
-def _ledgered_manual_serve_pids(matches: list[tuple[int, str, str]]) -> set[int]:
-    """Return the PIDs of venv holders the updater's serve rung owns.
+def _ledgered_manual_serve_entries(matches: list[tuple[int, str, str]]) -> list[dict]:
+    """Ledger entries for venv holders the updater's serve rung owns.
 
     Same dead-end shape as the gateway exemption above, for MANUAL
     ``serve``/``dashboard`` backends: the CLI updater's venv guard stops a
@@ -256,9 +256,28 @@ def _ledgered_manual_serve_pids(matches: list[tuple[int, str, str]]) -> set[int]
     try:
         from hermes_cli.update_cmd import _ledger_manual_serve_holders  # noqa: PLC0415
 
-        return {int(entry["pid"]) for entry in _ledger_manual_serve_holders(matches)}
+        return list(_ledger_manual_serve_holders(matches))
     except Exception:
-        return set()
+        return []
+
+
+def _manual_serve_evidence(entries: list[dict]) -> list[dict]:
+    """Sanitized decision evidence for exempted manual serves.
+
+    Structured ledger fields only — pid, purpose, recorded port — never the
+    command line, which can carry tokens or private endpoints.  Lets the
+    scan result explain *why* a holder disappeared from ``processes``
+    without echoing argv.
+    """
+    evidence = []
+    for entry in entries:
+        pid = entry.get("pid")
+        if not isinstance(pid, int):
+            continue
+        evidence.append(
+            {"pid": pid, "purpose": entry.get("purpose"), "port": entry.get("port")}
+        )
+    return evidence
 
 
 def main() -> None:
@@ -275,7 +294,12 @@ def main() -> None:
     except Exception as exc:
         _emit_probe_fail(f"scan aborted: {exc}")
 
-    manual_serve_pids = _ledgered_manual_serve_pids(matches)
+    manual_serve_entries = _ledgered_manual_serve_entries(matches)
+    manual_serve_pids = {
+        entry["pid"]
+        for entry in manual_serve_entries
+        if isinstance(entry.get("pid"), int)
+    }
     processes = []
     for pid, name, cmdline in matches:
         if _is_pausable_gateway(cmdline):
@@ -304,6 +328,9 @@ def main() -> None:
         # Diagnostic only: manual serve/dashboard backends the downstream
         # updater stops and relaunches on their recorded endpoints.
         "ledgered_manual_serves": len(manual_serve_pids),
+        # Diagnostic only: sanitized evidence (structured ledger identity,
+        # never argv) explaining which holders the exemption consumed.
+        "exempted_manual_serves": _manual_serve_evidence(manual_serve_entries),
     }
     print(json.dumps(data))
     sys.exit(0)
