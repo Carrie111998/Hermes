@@ -108,13 +108,18 @@ class SessionPortabilityMixin:
         # ``backup_weekly``) sorts its runs INSIDE the parent's range. A run's
         # remainder after the prefix is a bounded token — either a
         # ``%Y%m%d_%H%M%S`` timestamp (``cron/scheduler.run_job``) or a
-        # ``%08d`` run index (the test/device seeding path). Both start with at
-        # least 8 digits. An extended job's runs carry a textual label there
-        # (``weekly_<ts>``), which fails this predicate. GLOB treats '_' as a
-        # literal (unlike LIKE), so requiring 8 leading digits exactly matches
-        # every legitimate run suffix and nothing else. This is a post-filter on
-        # the already-bounded range scan, not a new full scan.
-        ts_glob = "[0-9]" * 8 + "*"
+        # ``%08d`` run index (the test/device seeding path). GLOB is a
+        # full-string match and treats '_' as a literal (unlike LIKE), so we
+        # require exactly one of two shapes: ``[0-9]{8}_<digits>*`` (timestamp:
+        # 8 leading digits, then '_', then digits) or the bare ``[0-9]{8}`` run
+        # index. An extended job's runs whose remainder is a textual label
+        # (``weekly_<ts>``) — or a digit-led label like ``20260101_replay`` —
+        # fail both predicates and are excluded, whereas a plain ``[0-9]{8}*``
+        # prefix predicate would let those digit-led labels slip through as the
+        # parent's run. This is a post-filter on the already-bounded range scan,
+        # not a new full scan.
+        ts_glob = "[0-9]" * 8 + "_" + "[0-9]" * 2 + "*"
+        run_index_glob = "[0-9]" * 8
 
         query = f"""
             SELECT s.*,
@@ -131,14 +136,15 @@ class SessionPortabilityMixin:
             FROM sessions s
             LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
             WHERE s.source = 'cron' AND s.id >= ? AND s.id < ?
-              AND substr(s.id, ? + 1) GLOB ?
+              AND (substr(s.id, ? + 1) GLOB ? OR substr(s.id, ? + 1) GLOB ?)
             ORDER BY s.started_at DESC, s.id DESC
             LIMIT ? OFFSET ?
         """
         with self._lock:
             cursor = self._conn.execute(
                 query,
-                (prefix, prefix_hi, len(prefix), ts_glob, limit, offset),
+                (prefix, prefix_hi, len(prefix), ts_glob, len(prefix),
+                 run_index_glob, limit, offset),
             )
             rows = cursor.fetchall()
 

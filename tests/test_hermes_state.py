@@ -5086,3 +5086,35 @@ class TestCronJobRunsFiltering:
         # Parent backup runs and unrelated jobs stay out.
         assert "cron_backup_20260822_120000_a" not in ids
         assert "cron_report_20260822_160000_e" not in ids
+
+    def test_digit_led_extended_job_does_not_leak_into_parent(self, db):
+        """A job whose extension is digit-led (``run1_20260101_replay``) must
+        not leak its runs into the parent's (``run1``) history.
+
+        Before the tighter glob, the parent predicate was ``[0-9]{8}*``; the
+        extended job's remainder ``20260101_replay_<ts>`` starts with 8 digits
+        and slipped through as a parent run. Both globs now require the
+        remainder after the 8 leading digits to be '_' then digits (timestamp)
+        or to be the bare 8-digit run index — a digit-led <label> fails both.
+        """
+        rows = [
+            ("cron_run1_20260822_120000", "cron", 1.0),
+            # Extended job's run: shares cron_run1_ prefix, remainder is
+            # digit-led label '20260101_replay_...'.
+            ("cron_run1_20260101_replay_20260822_130000", "cron", 2.0),
+            ("cron_run1_20260101_replay_20260822_140000", "cron", 3.0),
+        ]
+        db._conn.executemany(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            rows,
+        )
+        db._conn.commit()
+
+        runs = db.list_cron_job_runs("run1", limit=10)
+        ids = [r["id"] for r in runs]
+        # Parent's own timestamp-shaped run is present.
+        assert "cron_run1_20260822_120000" in ids
+        # The digit-led extended job's runs must NOT leak in.
+        for leak in ("cron_run1_20260101_replay_20260822_130000",
+                     "cron_run1_20260101_replay_20260822_140000"):
+            assert leak not in ids
