@@ -951,6 +951,12 @@ class RelayAdapter(BasePlatformAdapter):
             logger.warning("relay handshake failed: %s", exc)
             return False
         self._apply_descriptor(descriptor)
+        set_connection_state = getattr(
+            self._transport, "set_connection_state_handler", None
+        )
+        if callable(set_connection_state):
+            set_connection_state(self._on_transport_connection_state)
+        self._mark_connected()
         # Inbound (messages + interrupts) is delivered over the outbound WS via
         # the connector's relay bus — there is NO inbound HTTP endpoint (hosted
         # gateways have no public IP). The transport's reader already dispatches
@@ -961,6 +967,13 @@ class RelayAdapter(BasePlatformAdapter):
         if hasattr(self._transport, "auth_revoked"):
             self._start_revocation_monitor()
         return True
+
+    def _on_transport_connection_state(self, connected: bool) -> None:
+        """Mirror Relay socket recovery through the adapter lifecycle seam."""
+        if connected:
+            self._mark_connected()
+        else:
+            self._mark_disconnected()
 
     def _start_revocation_monitor(self) -> None:
         """Spawn (once) the task that turns a transport auth-revocation into a
@@ -1771,6 +1784,8 @@ class RelayAdapter(BasePlatformAdapter):
                         "relay transport disconnect failed during drain",
                         exc_info=True,
                     )
+        if getattr(self, "_running", False):
+            self._mark_disconnected()
 
     async def go_dormant(self) -> bool:
         """Quiesce the relay for a scale-to-zero suspend (D12 / Phase 0).
@@ -1874,6 +1889,7 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
+            retryable=bool(result.get("retryable")),
             raw_response=result,
         )
 
@@ -2083,6 +2099,7 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
+            retryable=bool(result.get("retryable")),
         )
 
     def auto_thread_info_for_chat(

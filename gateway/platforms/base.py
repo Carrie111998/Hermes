@@ -3848,11 +3848,7 @@ class BasePlatformAdapter(ABC):
             adapter_profile=adapter_profile,
         )
         if self.is_connected:
-            service.adapter_connected(
-                platform_name,
-                self,
-                adapter_profile=adapter_profile,
-            )
+            self.notify_deferred_questions_connected()
 
     def notify_deferred_questions_connected(self) -> None:
         """Wake durable plugin work after the transport is usable."""

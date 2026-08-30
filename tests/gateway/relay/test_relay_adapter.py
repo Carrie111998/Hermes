@@ -108,6 +108,55 @@ class _CaptureTransport:
         return {"success": True, "message_id": "m1"}
 
 
+@pytest.mark.asyncio
+async def test_send_preserves_transport_retryability():
+    t = _CaptureTransport()
+
+    async def unavailable(_action, *, platform=None):
+        return {
+            "success": False,
+            "error": "relay transport not connected",
+            "retryable": True,
+        }
+
+    t.send_outbound = unavailable
+    result = await RelayAdapter(
+        PlatformConfig(), make_desc(), transport=t
+    ).send("chat", "prompt")
+
+    assert not result.success
+    assert result.retryable
+
+
+class _LifecycleTransport(_CaptureTransport):
+    async def connect(self):
+        return True
+
+    async def handshake(self):
+        return make_desc()
+
+    def set_connection_state_handler(self, handler):
+        self.connection_state_handler = handler
+
+
+@pytest.mark.asyncio
+async def test_transport_reconnect_updates_adapter_readiness():
+    transport = _LifecycleTransport()
+    adapter = RelayAdapter(PlatformConfig(), make_desc(), transport=transport)
+    states = []
+    adapter._set_deferred_transport_ready = lambda ready: states.append(ready)
+
+    assert await adapter.connect()
+    assert adapter.is_connected
+    assert states == [True]
+
+    transport.connection_state_handler(False)
+    transport.connection_state_handler(True)
+
+    assert adapter.is_connected
+    assert states == [True, False, True]
+
+
 def _make_event(chat_id="chan-1", scope_id="scope-9"):
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource

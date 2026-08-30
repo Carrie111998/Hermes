@@ -91,7 +91,7 @@ async def test_health_reconnect_publishes_deferred_readiness() -> None:
     adapter = WhatsAppAdapter(PlatformConfig(enabled=True))
     adapter._running = True
     adapter._bridge_health_connected = False
-    adapter.notify_deferred_questions_connected = MagicMock()
+    adapter._set_deferred_transport_ready = MagicMock()
     adapter.notify_deferred_questions_disconnected = MagicMock()
     response = MagicMock(status=200)
     response.json = AsyncMock(
@@ -103,29 +103,27 @@ async def test_health_reconnect_publishes_deferred_readiness() -> None:
 
     assert adapter.is_connected
     assert not await adapter._refresh_bridge_health()
-    adapter.notify_deferred_questions_connected.assert_not_called()
+    adapter._set_deferred_transport_ready.assert_not_called()
 
     assert await adapter._refresh_bridge_health()
     assert adapter.is_connected
 
-    adapter.notify_deferred_questions_connected.assert_called_once_with()
+    adapter._set_deferred_transport_ready.assert_called_once_with(True)
     adapter.notify_deferred_questions_disconnected.assert_not_called()
 
 
-def test_deferred_readiness_requires_connected_bridge_health() -> None:
+def test_late_bound_service_respects_bridge_health() -> None:
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     adapter = WhatsAppAdapter(PlatformConfig(enabled=True))
     adapter._running = True
-    adapter._set_deferred_transport_ready = MagicMock()
-
     adapter._bridge_health_connected = False
-    adapter.notify_deferred_questions_connected()
-    adapter._set_deferred_transport_ready.assert_not_called()
+    service = MagicMock()
 
-    adapter._bridge_health_connected = True
-    adapter.notify_deferred_questions_connected()
-    adapter._set_deferred_transport_ready.assert_called_once_with(True)
+    adapter.set_deferred_question_service(service, profile_name="work")
+
+    service.bind_adapter.assert_called_once()
+    service.adapter_connected.assert_not_called()
 
 
 @pytest.mark.asyncio
