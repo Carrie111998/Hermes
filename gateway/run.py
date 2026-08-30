@@ -32298,23 +32298,25 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                # Per-profile adapters so each profile's cron output is
+                # delivered via its own bot/adapter instead of the default
+                # profile's.
+                cron_start_kwargs["profile_adapters"] = getattr(
+                    runner, "_profile_adapters", None
+                )
+                # runner.adapters belongs to the default profile, which
+                # profiles_to_serve() names "default" in its multiplex list.
+                # Thread that identity so the ticker reserves the shared
+                # adapters for the default profile alone and never routes a
+                # secondary's cron through the default bot (even before its
+                # adapter connects, when profile_adapters[name] is still
+                # absent/empty).
+                cron_start_kwargs["default_profile"] = "default"
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
                     [p[0] if isinstance(p, tuple) else p for p in profile_homes],
                 )
-                # Give each served profile its own live adapter map so cron
-                # deliveries from a secondary profile's store ride that
-                # profile's bot identity (e.g. agent-fund reports arrive as
-                # DMs from the agent-fund bot, not the default/PA bot).
-                profile_adapters = getattr(runner, "_profile_adapters", None) or {}
-                if profile_adapters:
-                    cron_start_kwargs["profile_adapters"] = profile_adapters
-                    logger.info(
-                        "Cron scheduler will route deliveries per profile for %d secondary profile(s): %s",
-                        len(profile_adapters),
-                        list(profile_adapters.keys()),
-                    )
         except Exception as exc:
             logger.warning(
                 "Could not resolve profile homes for multiplex cron: %s",

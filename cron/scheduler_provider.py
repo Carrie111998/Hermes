@@ -559,6 +559,7 @@ class InProcessCronScheduler(CronScheduler):
         can_dispatch=None,
         profile_homes=None,
         profile_adapters=None,
+        default_profile=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -584,6 +585,7 @@ class InProcessCronScheduler(CronScheduler):
                 profile_homes=profile_homes,
                 adapters=adapters,
                 profile_adapters=profile_adapters,
+                default_profile=default_profile,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -656,6 +658,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes,
         adapters=None,
         profile_adapters=None,
+        default_profile=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -669,12 +672,14 @@ class InProcessCronScheduler(CronScheduler):
         ``web_server.py`` scopes per-profile cron API calls.
 
         ``profile_adapters`` maps profile name → that profile's live adapter
-        map (``{Platform: adapter}``). When provided, each profile ticks with
-        ITS OWN adapters so cron deliveries issued from a secondary profile's
-        store ride that profile's bot identity instead of the default
-        profile's. Fall back to the shared ``adapters`` map for profiles not
-        present in the map (default profile, or a gateway that never started
-        secondary adapters).
+        map (``{Platform: adapter}``), populated once that profile's bot
+        connects. The shared ``adapters`` set belongs to the DEFAULT profile
+        only. A secondary profile is delivered via ITS OWN map only — it must
+        NEVER fall back to the default profile's ``adapters`` (that ships its
+        cron output through the wrong bot), so before its adapter connects —
+        map absent or empty — it simply does not deliver this tick.
+        ``default_profile`` names the profile that owns the shared ``adapters``
+        (the multiplex list always serves ``"default"`` first).
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -723,21 +728,27 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in _existing_profile_homes(profile_homes):
+                        _pname = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
-                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
-                                # A secondary profile's own adapters carry its
-                                # bot identity; without this, every profile's
-                                # cron delivery rides the DEFAULT profile's
-                                # adapters (wrong bot for DM deliveries).
-                                tick_adapters = adapters
-                                if profile_name and profile_name in profile_adapters:
-                                    tick_adapters = profile_adapters.get(profile_name)
+                                # Deliver each profile's cron via ITS OWN adapters.
+                                # The shared `adapters` set belongs to the default
+                                # profile only. A secondary profile uses its own map
+                                # in profile_adapters[name], which is populated only
+                                # once that profile's bot connects. A secondary must
+                                # NEVER fall back to the default profile's `adapters`
+                                # (that ships its cron output through the wrong bot),
+                                # so before its adapter connects — map absent or empty
+                                # — it simply does not deliver this tick.
+                                if _pname is None or _pname == default_profile:
+                                    _tick_adapters = adapters
+                                else:
+                                    _tick_adapters = (profile_adapters or {}).get(_pname) or {}
                                 cron_tick(
                                     verbose=False,
-                                    adapters=tick_adapters,
+                                    adapters=_tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
