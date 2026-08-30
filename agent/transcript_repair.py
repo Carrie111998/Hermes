@@ -22,35 +22,42 @@ def is_content_blank(content: Any) -> bool:
     if isinstance(content, str):
         return not content.strip()
     if isinstance(content, dict):
+        if not content:
+            return True
         if content.get("type") == "text":
             return not str(content.get("text", "")).strip()
-        return False
+        if content.get("type") in {"image", "image_url", "input_image", "audio", "input_audio", "document"}:
+            return False
+        if any(k in content for k in ("image_url", "image", "source", "data", "audio", "document")):
+            return False
+        if "text" in content:
+            return not str(content.get("text", "")).strip()
+        return True
     if isinstance(content, list):
         if not content:
             return True
         for part in content:
+            if part is None:
+                continue
             if isinstance(part, str):
                 if part.strip():
                     return False
             elif isinstance(part, dict):
+                if not part:
+                    continue
                 part_type = part.get("type")
                 if part_type == "text":
                     if str(part.get("text", "")).strip():
                         return False
-                elif part_type is not None:
-                    # Non-text typed part (e.g. image, image_url, input_audio, document) is non-blank
+                elif part_type in {"image", "image_url", "input_image", "audio", "input_audio", "document"}:
                     return False
-                else:
-                    # Dict without a "type" field: check if text-only or multimodal payload
-                    if any(k in part for k in ("image_url", "image", "source", "data", "audio", "document")):
-                        return False
-                    if "text" in part:
-                        if str(part.get("text", "")).strip():
-                            return False
-                    else:
+                elif any(k in part for k in ("image_url", "image", "source", "data", "audio", "document")):
+                    return False
+                elif "text" in part:
+                    if str(part.get("text", "")).strip():
                         return False
             else:
-                return False
+                continue
         return True
     return False
 

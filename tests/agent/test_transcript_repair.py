@@ -76,9 +76,19 @@ class TestIsContentBlank:
         assert is_content_blank([{"data": "raw_bytes"}]) is False
 
     def test_dict_content(self):
+        assert is_content_blank({}) is True
         assert is_content_blank({"type": "text", "text": "  "}) is True
         assert is_content_blank({"type": "text", "text": "hello"}) is False
         assert is_content_blank({"type": "image_url", "url": "data:..."}) is False
+
+    def test_empty_and_malformed_dicts_fail_closed_as_blank(self):
+        """Empty dictionaries and malformed metadata without durable text/media must be blank."""
+        assert is_content_blank([{}]) is True
+        assert is_content_blank([{}, None, "   "]) is True
+        assert is_content_blank([{"meta": "unknown"}]) is True
+        assert is_content_blank([{"type": "unknown_type"}]) is True
+        assert is_content_blank([{"text": ""}]) is True
+
 
 
 @pytest.fixture
