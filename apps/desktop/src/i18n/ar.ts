@@ -2544,6 +2544,7 @@ export const ar = defineLocale({
       readAloud: 'قراءة بصوت عال',
       editMessage: 'تحرير الرسالة',
       scrollToBottom: 'التمرير إلى الأسفل',
+      jumpToAnswerStart: 'الانتقال إلى بداية الإجابة',
       stop: 'إيقاف',
       restorePrevious: 'استعادة السابق',
       restoreCheckpoint: 'استعادة النقطة',

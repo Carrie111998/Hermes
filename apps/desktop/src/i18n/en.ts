@@ -3231,6 +3231,7 @@ export const en: Translations = {
       editMessage: 'Edit message',
       expandMessage: 'Expand message',
       scrollToBottom: 'Scroll to bottom',
+      jumpToAnswerStart: 'Jump to answer start',
       stop: 'Stop',
       restorePrevious: 'Restore previous checkpoint',
       restoreCheckpoint: 'Restore checkpoint',

@@ -11,7 +11,7 @@
 import { expect, test } from './test'
 
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
-import { BLOCKING_CLARIFY_QUESTION, BLOCKING_CLARIFY_TRIGGER } from './mock-server'
+import { BLOCKING_CLARIFY_QUESTION, BLOCKING_CLARIFY_TRIGGER, MOCK_REPLY } from './mock-server'
 import { expectVisualSnapshot } from './visual-snapshot'
 
 let fixture: MockBackendFixture | null = null
@@ -80,6 +80,54 @@ test.describe('chat interaction with mock backend', () => {
       undefined,
       { timeout: 60_000 }
     )
+  })
+
+  test('jumps from a sticky user prompt to the start of its answer', async ({}, testInfo) => {
+    const page = fixture!.page
+    const composer = page.locator('[contenteditable="true"]').first()
+
+    await composer.click()
+    await composer.type('E2E jump to answer start')
+    await page.keyboard.press('Enter')
+    await expect(page.getByText(MOCK_REPLY).last()).toBeVisible({ timeout: 60_000 })
+
+    const turn = page.locator('[data-slot="aui_turn-pair"]').last()
+    const prompt = turn.locator('[data-slot="aui_user-message-root"]')
+    const answer = turn.locator('[data-slot="aui_assistant-message-root"]')
+    const viewport = page.locator('[data-slot="aui_thread-viewport"]')
+
+    // The mock reply is intentionally short. Give this real rendered answer a
+    // long body for the navigation check without adding a special inference
+    // protocol or changing production data.
+    await answer.evaluate(element => {
+      element.style.minHeight = '2400px'
+    })
+    await viewport.evaluate(element => {
+      element.scrollTop = element.scrollHeight
+      element.dispatchEvent(new Event('scroll'))
+    })
+
+    await prompt.hover()
+    const jump = turn.getByRole('button', { name: 'Jump to answer start' })
+
+    await expect(jump).toBeVisible()
+    await expect(jump.locator('svg.tabler-icon-arrow-bar-up')).toBeVisible()
+    await expect(jump.locator('..')).toHaveCSS('opacity', '1')
+    await page.screenshot({ path: testInfo.outputPath('answer-start-jump-hover.png') })
+    await jump.click()
+
+    await expect
+      .poll(async () => {
+        const promptBox = await prompt.boundingBox()
+        const answerBox = await answer.boundingBox()
+
+        if (!promptBox || !answerBox) {
+          return Number.POSITIVE_INFINITY
+        }
+
+        return Math.abs(answerBox.y - (promptBox.y + promptBox.height))
+      })
+      .toBeLessThan(3)
   })
 
   test('screenshot of chat with messages', async () => {

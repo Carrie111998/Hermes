@@ -8,6 +8,7 @@ import {
   LIVE_TAIL_PARTS,
   liveTailStart,
   type MessageGroup,
+  resolveAnswerStartScrollTop,
   resolveThreadScrollTarget,
   shouldClampTranscriptBudget,
   subscribeToThreadForeground,
@@ -202,6 +203,23 @@ describe('resolveThreadScrollTarget', () => {
 
     expect(resolveThreadScrollTarget(899, context(scrollElement))).toBe(898.875)
     expect(resolveThreadScrollTarget(999, context(scrollElement))).toBe(999)
+  })
+})
+
+describe('resolveAnswerStartScrollTop', () => {
+  const scrollElement = {
+    clientHeight: 600,
+    scrollHeight: 2_000,
+    scrollTop: 800
+  }
+
+  it('places the answer immediately below its sticky user prompt', () => {
+    expect(resolveAnswerStartScrollTop(scrollElement, { bottom: 100 }, { top: -400 })).toBe(300)
+  })
+
+  it('clamps the target to the scrollable range', () => {
+    expect(resolveAnswerStartScrollTop(scrollElement, { bottom: 100 }, { top: -2_000 })).toBe(0)
+    expect(resolveAnswerStartScrollTop(scrollElement, { bottom: 100 }, { top: 2_000 })).toBe(1_400)
   })
 })
 

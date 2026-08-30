@@ -2855,6 +2855,7 @@ export const ja = defineLocale({
       stopReading: '読み上げを停止',
       readAloud: '読み上げ',
       editMessage: 'メッセージを編集',
+      jumpToAnswerStart: '回答の先頭へ移動',
       stop: '停止',
       restorePrevious: '前のチェックポイントに戻す',
       restoreCheckpoint: 'チェックポイントを復元',
