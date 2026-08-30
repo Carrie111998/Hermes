@@ -294,6 +294,7 @@ def test_board_pin_allows_explicit_custom_connection_without_board_label(
             platform="discord",
             chat_id="777",
             thread_id="888",
+            replace_existing=False,
         )
     finally:
         conn.close()
@@ -320,3 +321,43 @@ def test_create_source_allows_boardless_explicit_custom_connection(
         conn.close()
 
     assert subscribed is True
+
+
+def test_create_source_allows_boardless_custom_connection_on_active_scoped_board(
+    isolated_kanban_home,
+    monkeypatch,
+):
+    kb.write_board_metadata(
+        "scoped",
+        project_id="project-1",
+        project_slug="scoped",
+        project_name="Scoped",
+        project_primary_path=str(isolated_kanban_home),
+        default_workdir=str(isolated_kanban_home),
+        legacy_unscoped=False,
+    )
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "scoped")
+    custom_db = isolated_kanban_home / "explicit-scoped" / "kanban.db"
+    conn = kb.connect(db_path=custom_db)
+    try:
+        task_id = kb.create_task(
+            conn, title="scoped boardless custom", assignee="worker"
+        )
+        subscribed = kb.subscribe_notify_source_on_create(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="123",
+            thread_id="456",
+            chat_type="thread",
+        )
+        pin = kb.get_board_notify(conn)
+    finally:
+        conn.close()
+
+    assert subscribed is True
+    assert pin == {
+        "platform": "discord",
+        "chat_id": "123",
+        "thread_id": "456",
+    }

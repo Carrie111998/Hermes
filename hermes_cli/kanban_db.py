@@ -4873,7 +4873,7 @@ def set_board_notify(
     board_id = _board_notify_board_id(board)
     with _board_notify_destination_lock():
         if not replace_existing:
-            existing = get_board_notify(conn, board=board_id)
+            existing = get_board_notify(conn, board=board)
             if existing is not None:
                 return existing
         conflict = _board_notify_conflict(
