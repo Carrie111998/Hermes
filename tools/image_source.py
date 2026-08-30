@@ -91,6 +91,15 @@ class ResolvedImage:
 # ("C:\x.png") don't match because they lack the "//".
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
+# Some local models (reproducibly gpt-oss via Ollama, issue #98428) hand back a
+# filesystem path they were given as `image_url: /abs/path` with a bare
+# "path:"/"local:" pseudo-scheme prefixed ("path:/home/.../img.jpg"). That is
+# not a real URI (no "//"), so _SCHEME_RE doesn't match and the whole string
+# falls through to the path branch, failing as "media file not found". Strip
+# the pseudo-scheme only when a path character follows; real schemes
+# ("paths://x") and bare relative names ("path:foo.png") keep their old shape.
+_PSEUDO_SCHEME_RE = re.compile(r"^(?:path|local)\s*[:=]\s*(?=[/~.])", re.IGNORECASE)
+
 
 async def resolve_image_source(
     src: str,
@@ -101,6 +110,7 @@ async def resolve_image_source(
     if not isinstance(src, str) or not src.strip():
         raise SourceNotFound("image_url is required", src=str(src))
     s = src.strip()
+    s = _PSEUDO_SCHEME_RE.sub("", s, count=1)
     if s.startswith("data:"):
         data, mime = _resolve_data_url(s)
         return _finalize(data, mime, "data", s, permitted)

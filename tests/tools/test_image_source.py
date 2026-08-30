@@ -115,6 +115,48 @@ class TestLocalBackend:
         assert res.data == svg_bytes
 
 
+class TestPseudoSchemePrefixStripping:
+    """Issue #98428: text-routed local models (gpt-oss via Ollama) re-call
+    vision_analyze with a bare "path:"/"local:" pseudo-scheme prefixed onto the
+    injected cache path. The resolver must strip it instead of failing with
+    "media file not found" on the whole string as a relative path."""
+
+    @pytest.mark.asyncio
+    async def test_path_prefix_resolves_underlying_file(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = tmp_path / "img.png"
+        img.write_bytes(PNG)
+        res = await isrc.resolve_image_source(f"path:{img}", isrc.ResolveContext())
+        assert res.data == PNG
+        assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_local_prefix_and_separator_variants_resolve(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = tmp_path / "img.png"
+        img.write_bytes(PNG)
+        for src in (f"local:{img}", f"path= {img}"):
+            res = await isrc.resolve_image_source(src, isrc.ResolveContext())
+            assert res.data == PNG
+            assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_real_scheme_still_rejected_and_bare_name_untouched(
+            self, tmp_path, monkeypatch):
+        """The strip must not broaden scheme handling: a genuine scheme keeps
+        raising UnsupportedScheme, and a relative name carrying a literal colon
+        keeps the old not-found behaviour instead of being rewritten."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(isrc.UnsupportedScheme):
+            await isrc.resolve_image_source("paths://x.png", isrc.ResolveContext())
+        with pytest.raises(isrc.SourceNotFound):
+            await isrc.resolve_image_source("path:pic.png", isrc.ResolveContext())
+
+
 class TestNonLocalBackendConfinement:
     """The security model: under a sandbox backend, host reads are confined to
     the media caches; every other path is read inside the sandbox."""
