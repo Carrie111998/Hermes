@@ -3183,6 +3183,9 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        # Concurrent webhook tasks share stale-session recovery so none can
+        # reacquire the guard before deferred idle delivery finishes.
+        self._session_ingress_handoffs: Dict[str, asyncio.Task[bool]] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -6179,6 +6182,22 @@ class BasePlatformAdapter(ABC):
             await idle_callback_task
         return True
 
+    async def _await_stale_session_handoff(self, session_key: str) -> bool:
+        """Join the one stale-session recovery transition for this session."""
+        handoff = self._session_ingress_handoffs.get(session_key)
+        if handoff is None:
+            if session_key not in self._active_sessions:
+                return False
+            if not self._session_task_is_stale(session_key):
+                return False
+            handoff = asyncio.create_task(self._heal_stale_session_lock(session_key))
+            self._session_ingress_handoffs[session_key] = handoff
+        try:
+            return await asyncio.shield(handoff)
+        finally:
+            if handoff.done() and self._session_ingress_handoffs.get(session_key) is handoff:
+                self._session_ingress_handoffs.pop(session_key, None)
+
     def _start_session_processing(
         self,
         event: MessageEvent,
@@ -6477,8 +6496,7 @@ class BasePlatformAdapter(ABC):
         # cancelled), the lock is stale.  Clear it and fall through to
         # normal dispatch so the user isn't trapped behind a dead guard —
         # this is the split-brain tail described in issue #11016.
-        if session_key in self._active_sessions:
-            await self._heal_stale_session_lock(session_key)
+        await self._await_stale_session_handoff(session_key)
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:

@@ -735,20 +735,50 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
         from gateway.platforms.base import MessageEvent, MessageType
 
         finish_turn = asyncio.Event()
+        delivery_started = asyncio.Event()
+        finish_delivery = asyncio.Event()
+        handler_started = asyncio.Event()
 
         async def handle_unrelated(_event):
+            handler_started.set()
             await finish_turn.wait()
             return "ordinary"
 
+        original_send = adapter.send
+
+        async def block_deferred_send(*args, **kwargs):
+            delivery_started.set()
+            await finish_delivery.wait()
+            return await original_send(*args, **kwargs)
+
         adapter._message_handler = handle_unrelated
-        await adapter.handle_message(
-            MessageEvent(
-                text="unrelated",
-                source=source,
-                message_id="unrelated-turn",
-                message_type=MessageType.TEXT,
+        adapter.send = block_deferred_send
+        first_ingress = asyncio.create_task(
+            adapter.handle_message(
+                MessageEvent(
+                    text="first unrelated",
+                    source=source,
+                    message_id="first-unrelated-turn",
+                    message_type=MessageType.TEXT,
+                )
             )
         )
+        await delivery_started.wait()
+        second_ingress = asyncio.create_task(
+            adapter.handle_message(
+                MessageEvent(
+                    text="second unrelated",
+                    source=source,
+                    message_id="second-unrelated-turn",
+                    message_type=MessageType.TEXT,
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        handler_started_before_delivery = handler_started.is_set()
+        finish_delivery.set()
+        await asyncio.gather(first_ingress, second_ingress)
     else:
         adapter._release_session_guard(session_key, guard=guard)
     await asyncio.sleep(0)
@@ -759,6 +789,7 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
     if release_path == "stale_heal":
         finish_turn.set()
         await asyncio.gather(*tuple(adapter._background_tasks))
+        assert not handler_started_before_delivery
     assert state_before_turn_finishes == "awaiting"
     assert sent_before_turn_finishes == [
         ("home", "May I send invites?", None, {"notify": True})
