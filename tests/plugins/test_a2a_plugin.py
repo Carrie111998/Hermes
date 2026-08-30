@@ -10,8 +10,7 @@ with a mocked agent handler.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
+
 import json
 import os
 import socket
@@ -1248,6 +1247,8 @@ class TestPushNotificationEndToEnd:
                 length = int(self.headers.get("Content-Length", 0))
                 received["body"] = json.loads(self.rfile.read(length).decode())
                 received["signature"] = self.headers.get("X-A2A-Signature", "")
+                received["timestamp"] = self.headers.get("X-A2A-Timestamp", "")
+                received["delivery_id"] = self.headers.get("X-A2A-Delivery", "")
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -1281,13 +1282,15 @@ class TestPushNotificationEndToEnd:
             assert su["taskId"] == task["id"]
             assert su["status"]["state"] == "TASK_STATE_COMPLETED"
             assert "ECHO:" in protocol.extract_text(su["status"]["message"])
-            # HMAC signature verifies against the shared secret.
-            expected = hmac.new(
-                b"push-secret-1",
-                json.dumps(payload, sort_keys=True, ensure_ascii=False).encode(),
-                hashlib.sha256,
-            ).hexdigest()
-            assert received["signature"] == expected
+            # HMAC covers body + timestamp + unique delivery id so receivers
+            # can enforce a bounded replay window.
+            assert security.verify_push_payload(
+                payload,
+                received["signature"],
+                timestamp=received["timestamp"],
+                delivery_id=received["delivery_id"],
+                now=int(received["timestamp"]),
+            )
 
             await adapter.disconnect()
 

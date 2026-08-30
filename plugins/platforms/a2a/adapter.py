@@ -40,6 +40,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -1201,10 +1202,16 @@ class A2AAdapter(BasePlatformAdapter):
         # Push payload uses the StreamResponse format (same as streaming).
         payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
 
-        signature = security.sign_push_payload(payload)
+        timestamp = str(int(time.time()))
+        delivery_id = uuid.uuid4().hex
+        signature = security.sign_push_payload(
+            payload, timestamp=timestamp, delivery_id=delivery_id
+        )
         headers = {"Content-Type": "application/json"}
         if signature:
             headers["X-A2A-Signature"] = signature
+            headers["X-A2A-Timestamp"] = timestamp
+            headers["X-A2A-Delivery"] = delivery_id
 
         try:
             data = json.dumps(payload).encode("utf-8")

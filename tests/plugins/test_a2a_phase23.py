@@ -280,6 +280,93 @@ class TestPushSigning:
         monkeypatch.setenv("A2A_BEARER_TOKEN", "bearer-as-push-secret")
         assert security.sign_push_payload({"x": 1})
 
+    def test_timestamped_signature_rejects_replay(self, monkeypatch):
+        monkeypatch.setenv("A2A_PUSH_SECRET", "test-secret-123")
+        payload = {"statusUpdate": {"taskId": "task-1"}}
+        timestamp = "1767225600"
+        delivery_id = "delivery-1"
+        signature = security.sign_push_payload(
+            payload, timestamp=timestamp, delivery_id=delivery_id
+        )
+        seen = set()
+
+        assert security.verify_push_payload(
+            payload,
+            signature,
+            timestamp=timestamp,
+            delivery_id=delivery_id,
+            now=1767225600,
+            seen_delivery_ids=seen,
+        )
+        assert not security.verify_push_payload(
+            payload,
+            signature,
+            timestamp=timestamp,
+            delivery_id=delivery_id,
+            now=1767225600,
+            seen_delivery_ids=seen,
+        )
+
+    def test_timestamped_signature_rejects_expired_delivery(self, monkeypatch):
+        monkeypatch.setenv("A2A_PUSH_SECRET", "test-secret-123")
+        payload = {"statusUpdate": {"taskId": "task-1"}}
+        timestamp = "1767225000"
+        delivery_id = "delivery-expired"
+        signature = security.sign_push_payload(
+            payload, timestamp=timestamp, delivery_id=delivery_id
+        )
+
+        assert not security.verify_push_payload(
+            payload,
+            signature,
+            timestamp=timestamp,
+            delivery_id=delivery_id,
+            now=1767225600,
+            max_age_seconds=300,
+        )
+
+    def test_push_sender_emits_replay_protection_headers(self, monkeypatch):
+        monkeypatch.setenv("A2A_PUSH_SECRET", "test-secret-123")
+        adapter, _base = _make_live_adapter(monkeypatch)
+        adapter.tasks.pop_push_url = lambda _task_id: "https://example.com/callback"
+        monkeypatch.setattr(security, "is_safe_callback_url", lambda _url: True)
+        captured = {}
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def _urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return _Response()
+
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+        adapter._send_push_notification(
+            "task-1", "ctx-1", "done", protocol.STATE_COMPLETED
+        )
+
+        request = captured["request"]
+        timestamp = request.get_header("X-a2a-timestamp")
+        delivery_id = request.get_header("X-a2a-delivery")
+        signature = request.get_header("X-a2a-signature")
+        payload = json.loads(request.data)
+        assert timestamp
+        assert delivery_id
+        assert signature
+        assert security.verify_push_payload(
+            payload,
+            signature,
+            timestamp=timestamp,
+            delivery_id=delivery_id,
+            now=int(timestamp),
+        )
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Anti-loop ping-pong protection
