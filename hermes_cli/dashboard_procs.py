@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from hermes_constants import get_default_hermes_root
+
 
 def _m():
     """Lazy ``hermes_cli.main`` reference (call-time; keeps patches working)."""
@@ -795,10 +797,14 @@ _HEX16 = _HEX32
 
 
 def _hermes_home_dir() -> Path:
-    """Resolved Hermes home (HERMES_HOME override or ~/.hermes)."""
-    override = os.environ.get("HERMES_HOME", "").strip()
-    if override:
-        return Path(override).expanduser()
+    """Native Hermes root containing Desktop SSH ownership locks.
+
+    Remote Desktop backends may run with ``HERMES_HOME`` set to a named profile
+    or a custom deployment root. Electron does not use that environment value
+    for ownership records: ``remote-lifecycle.ts`` writes them to the literal
+    remote path ``~/.hermes/desktop-ssh``. Resolve the same native root here so
+    orphan cleanup sees every ownership lock the Desktop writer creates.
+    """
     return Path.home() / ".hermes"
 
 
@@ -850,55 +856,61 @@ def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
 def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """PIDs claimed as owners by valid ``backend.lock.json`` records on this host.
 
-    Scans ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` (the
-    same directory the Desktop SSH runtime writes to). Any PID a valid lock
-    names is a legitimately-owned backend — including backends another client
-    or machine started over SSH — and must be spared by the orphan reap.
+    Scans both ``~/.hermes/desktop-ssh`` (the path Electron writes today) and
+    ``{configured_hermes_root}/desktop-ssh`` for custom-root compatibility.
+    Any PID a valid lock names is a legitimately-owned backend — including
+    backends another client or machine started over SSH — and must be spared by
+    the orphan reap.
 
     Best-effort: any read/parse/IO error for a single record is swallowed and
     that record contributes no PID. Never raises.
     """
     import json
 
-    root = base_dir if base_dir is not None else (
-        _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
-    )
+    if base_dir is not None:
+        roots = (base_dir,)
+    else:
+        native_root = _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
+        configured_root = get_default_hermes_root() / _REMOTE_LOCK_SUBDIR
+        roots = tuple(dict.fromkeys((native_root, configured_root)))
+
     owned: set[int] = set()
-    if not root.is_dir():
-        return owned
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return owned
-    for entry in entries:
+    for root in roots:
+        if not root.is_dir():
+            continue
         try:
-            if not entry.is_dir():
-                continue
+            entries = list(root.iterdir())
         except OSError:
             continue
-        ownership_id = entry.name
-        # Mirror validateOwnershipId(): exactly 32 lowercase hex chars.
-        if len(ownership_id) != 32 or set(ownership_id) - _HEX32:
-            continue
-        lock_path = entry / "backend.lock.json"
-        try:
-            if not lock_path.is_file():
-                continue
-            with open(lock_path, "rb") as handle:
-                data = handle.read()
-        except OSError:
-            continue
-        if len(data) > 65536:
-            continue
-        try:
-            parsed = json.loads(data)
-        except (UnicodeDecodeError, ValueError):
-            continue
-        if _valid_lockfile_payload(parsed, ownership_id):
+        for entry in entries:
             try:
-                owned.add(int(parsed["pid"]))
-            except (TypeError, ValueError):
+                if not entry.is_dir():
+                    continue
+            except OSError:
                 continue
+            ownership_id = entry.name
+            # Mirror validateOwnershipId(): exactly 32 lowercase hex chars.
+            if len(ownership_id) != 32 or set(ownership_id) - _HEX32:
+                continue
+            lock_path = entry / "backend.lock.json"
+            try:
+                if not lock_path.is_file():
+                    continue
+                with open(lock_path, "rb") as handle:
+                    data = handle.read()
+            except OSError:
+                continue
+            if len(data) > 65536:
+                continue
+            try:
+                parsed = json.loads(data)
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if _valid_lockfile_payload(parsed, ownership_id):
+                try:
+                    owned.add(int(parsed["pid"]))
+                except (TypeError, ValueError):
+                    continue
     return owned
 
 
