@@ -5575,7 +5575,10 @@ class PluginManager:
         ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker
         is abandoned (not joined) so we do not reintroduce the #6622 hang.
         Timed-out or still-running ``pre_tool_call`` callbacks fail closed
-        with a block directive; other bounded hooks fail open (skip).
+        with a block directive. Other bounded hooks fail open: a confirmed
+        timeout is still skipped (bounding duplicate workers of a hung
+        callback), but a healthy invocation still in flight from an earlier
+        call runs concurrently on its own worker rather than being dropped.
 
         ``subagent_stop`` (and any hook in ``_HOOK_CALLER_THREAD_HOOKS``)
         always runs on the caller thread to preserve the documented parent-
@@ -5618,10 +5621,16 @@ class PluginManager:
                         suppressed_until = self._hook_timeout_suppressed_until.get(
                             callback_key
                         )
-                        running = callback_key in self._hook_running_callbacks
-                        if (
+                        timed_out = (
                             suppressed_until is not None and suppressed_until > now
-                        ) or running:
+                        )
+                        # A confirmed timeout must not spawn unbounded duplicates
+                        # of a hung worker, and pre_tool_call must fail closed on
+                        # any overlap. But "running" alone just means a healthy
+                        # invocation of a fail-open observer hook hasn't returned
+                        # yet — dropping it here silently loses telemetry (#98382).
+                        running = callback_key in self._hook_running_callbacks
+                        if timed_out or (running and fail_closed):
                             logger.warning(
                                 "Hook '%s' callback %s skipped after previous "
                                 "timeout or while still running",

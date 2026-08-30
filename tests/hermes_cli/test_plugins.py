@@ -1135,6 +1135,49 @@ class TestForceReloadSymmetry:
         assert elapsed < 1.0
         hold.set()
 
+    def test_concurrent_healthy_invocations_both_processed(self, monkeypatch):
+        """Two healthy overlapping calls to a fail-open hook must both run.
+
+        Regression for #98382: ``running`` was treated the same as a
+        confirmed timeout, so a second concurrent invocation of an observer
+        hook was silently dropped even though the first callback was well
+        within its timeout budget.
+        """
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        calls = []
+        lock = threading.Lock()
+
+        def slow(**kwargs):
+            time.sleep(0.3)
+            with lock:
+                calls.append(kwargs.get("marker"))
+            return kwargs.get("marker")
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [slow]
+
+        results = {}
+
+        def _invoke(marker):
+            results[marker] = mgr.invoke_hook("post_tool_call", marker=marker)
+
+        t1 = threading.Thread(target=_invoke, args=("first",))
+        t1.start()
+        time.sleep(0.15)
+        t2 = threading.Thread(target=_invoke, args=("second",))
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert sorted(calls) == ["first", "second"]
+        assert results["first"] == ["first"]
+        assert results["second"] == ["second"]
+
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
         """Timed-out pre_tool_call must return a block directive, not allow."""
         import time
