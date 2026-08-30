@@ -209,8 +209,19 @@ def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
 
         rendered = tuple(render_system_prompt_sections(_plugin_session_info(agent)))
     except Exception as exc:
-        logger.warning("Plugin system prompt sections could not be rendered: %s", exc)
-        rendered = ()
+        # Fail-open: a plugin whose render raises at a rebuild boundary
+        # keeps its last good bytes (stashed by invalidate_system_prompt)
+        # instead of silently vanishing from the prompt.
+        previous = getattr(agent, "_plugin_system_prompt_sections_previous", None)
+        if previous:
+            logger.warning(
+                "Plugin system prompt sections failed to re-render (%s); "
+                "keeping the previous frozen sections", exc,
+            )
+            rendered = previous
+        else:
+            logger.warning("Plugin system prompt sections could not be rendered: %s", exc)
+            rendered = ()
     setattr(agent, attr, rendered)
     return rendered
 
@@ -1028,10 +1039,21 @@ def invalidate_system_prompt(agent: Any) -> None:
     """Invalidate the cached system prompt, forcing a rebuild on the next turn.
 
     Called after context compression events. Also reloads memory from disk
-    so the rebuilt prompt captures any writes from this session.
+    so the rebuilt prompt captures any writes from this session, and clears
+    the frozen plugin-section snapshot so plugins re-render at the same
+    boundary (maintainer-directed, #95681 arc): a plugin section is just
+    another prompt block carrying state — freezing it while memory, skills,
+    and guidance refresh would recreate the stale-block disease inside
+    plugin-land. The previous bytes are stashed so a plugin whose render
+    RAISES falls back to its last good section instead of vanishing
+    (fail-open guard, not a freeze).
     """
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
+    _snapshot_attr = "_plugin_system_prompt_sections_snapshot"
+    if hasattr(agent, _snapshot_attr):
+        agent._plugin_system_prompt_sections_previous = getattr(agent, _snapshot_attr)
+        delattr(agent, _snapshot_attr)
     if agent._memory_store:
         agent._memory_store.load_from_disk()
 
