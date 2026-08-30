@@ -1778,7 +1778,7 @@ class AIAgent:
         if last in '.!?:)"\']}。！？：）】」』》^':
             return True
         # Emoji ranges (Misc Symbols, Dingbats, Emoticons, Supplemental, etc.)
-        if ord(last) >= 0x1F300:
+        if ord(last) >= 0x2600:
             return True
         return False
 
