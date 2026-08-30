@@ -324,3 +324,84 @@ def test_unresolvable_entry_point_still_loaded(monkeypatch):
         assert providers.get_provider_profile("ep-unresolvable") is not None
     finally:
         _clear_provider_caches()
+
+
+def test_platform_import_marker_entry_point_not_loaded(monkeypatch, tmp_path):
+    """A hand-written ``plugins.enabled`` entry whose name lacks the
+    ``-platform`` suffix is still skipped when its source carries the
+    documented platform-adapter import (#98438).
+
+    The name convention only covers PluginManager-generated ids; the
+    ``from gateway.config import Platform`` base import is the remaining
+    import-free platform signal (model-provider plugins never touch
+    gateway.config).
+    """
+    loads = []
+    (tmp_path / "stub_platform_plugin.py").write_text(
+        "from gateway.config import Platform, PlatformConfig\n"
+        "class StubAdapter:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    def _adapter_side_effect():
+        loads.append("stub-adapter")  # the import itself would already fail
+        return object()
+
+    fake_eps = _FakeEntryPoints(
+        [
+            _FakeEP(
+                "stub-adapter",
+                _adapter_side_effect,
+                value="stub_platform_plugin",
+            )
+        ]
+    )
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "entry_points", lambda: fake_eps)
+    _enable(monkeypatch, "stub-adapter")
+    _clear_provider_caches()
+    try:
+        providers._discover_providers()
+        assert loads == []  # never imported
+    finally:
+        sys.modules.pop("stub_platform_plugin", None)
+        _clear_provider_caches()
+
+
+def test_plain_plugin_without_markers_still_loaded(monkeypatch, tmp_path):
+    """A source-bearing entry point with NO platform/memory markers keeps
+    the historical load path — the marker scan must not over-skip."""
+    from providers.base import ProviderProfile
+
+    (tmp_path / "stub_plain_plugin.py").write_text(
+        "# a plain plugin: no gateway import, no memory markers\n"
+        "def register():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    def _plain_side_effect():
+        def register():
+            providers.register_provider(
+                ProviderProfile(name="ep-plain", base_url="https://d.test/v1")
+            )
+
+        return register
+
+    fake_eps = _FakeEntryPoints(
+        [_FakeEP("ep-plain", _plain_side_effect, value="stub_plain_plugin")]
+    )
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "entry_points", lambda: fake_eps)
+    _enable(monkeypatch, "ep-plain")
+    _clear_provider_caches()
+    try:
+        assert providers.get_provider_profile("ep-plain") is not None
+    finally:
+        sys.modules.pop("stub_plain_plugin", None)
+        _clear_provider_caches()

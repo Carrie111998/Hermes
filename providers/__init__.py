@@ -47,6 +47,11 @@ _ALIASES: dict[str, str] = {}
 _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _discovered = False
 
+# Import-free platform-adapter signal: every documented adapter does this
+# import at module top (see gateway/platforms/*), while model-provider
+# plugins never touch gateway.config. Scanned, never executed.
+_PLATFORM_IMPORT_MARKER = "from gateway.config import Platform"
+
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
@@ -224,17 +229,31 @@ def _discover_entry_point_providers() -> None:
         # hermes_cli/config.py) ``gateway.config`` is still half-initialized,
         # so the import fails and the platform silently disappears. Skip
         # entry points that are provably NOT model providers: a
-        # ``<name>-platform`` name (the manager's platform-id convention) or
-        # a memory-provider source signature. Anything else falls through to
-        # the load below — a real provider must never be dropped just
-        # because its source could not be classified.
+        # ``<name>-platform`` name (the manager's platform-id convention), a
+        # memory-provider source signature, or the documented adapter import
+        # in the source (hand-written ``plugins.enabled`` entries may carry
+        # any name, so the suffix alone can miss them). Anything else falls
+        # through to the load below — a real provider must never be dropped
+        # just because its source could not be classified.
         try:
-            from hermes_cli.plugins import _classify_entrypoint_value_kind
+            from hermes_cli.plugins import (
+                _classify_entrypoint_value_kind,
+                _resolve_module_source,
+            )
 
             value = getattr(ep, "value", "")
-            if ep.name.endswith("-platform") or (
+            skip = ep.name.endswith("-platform") or (
                 value and _classify_entrypoint_value_kind(value) == "exclusive"
-            ):
+            )
+            if not skip and value:
+                try:
+                    module_name = str(value).split(":", 1)[0].strip()
+                    skip = bool(module_name) and _PLATFORM_IMPORT_MARKER in (
+                        _resolve_module_source(module_name)
+                    )
+                except Exception:
+                    skip = False  # unresolvable source — fail open
+            if skip:
                 logger.debug(
                     "entry-point %r skipped by provider scan: platform or "
                     "memory-provider plugin owned by the PluginManager",
