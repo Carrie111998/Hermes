@@ -369,6 +369,7 @@ import {
   parseCompareBehindCount,
   resolveBehindCount,
   resolveCommitLogSelection,
+  resolveAncestry,
   resolveSshBehindCount,
   shouldCountCommits
 } from './update-count'
@@ -2956,11 +2957,12 @@ async function checkUpdates() {
     // `ls-remote` gives a tip, not a direction. Ask git whether that tip is
     // already reachable from HEAD before trusting the compare API, which
     // cannot see a commit that exists only on this machine.
-    const targetIsAncestorOfHead =
-      !tipsEqual &&
-      Boolean(currentSha) &&
-      Boolean(targetSha) &&
-      (await runGit(['merge-base', '--is-ancestor', targetSha, 'HEAD'], { cwd: updateRoot })).code === 0
+    const targetIsAncestorOfHead = await resolveAncestry({
+      currentSha,
+      runGit: (args: string[]) => runGit(args, { cwd: updateRoot }),
+      targetSha,
+      tipsEqual
+    })
 
     const compareBehind =
       tipsEqual || targetIsAncestorOfHead

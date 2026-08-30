@@ -10,6 +10,7 @@ import {
   compareApiUrl,
   parseCompareBehindCount,
   resolveBehindCount,
+  resolveAncestry,
   resolveSshBehindCount,
   resolveCommitLogSelection,
   shouldCountCommits
@@ -351,6 +352,70 @@ test('ssh check keeps the unknown-count signal when the API cannot answer', () =
       currentSha: 'aaa',
       targetIsAncestorOfHead: false,
       targetSha: 'bbb'
+    }),
+    null
+  )
+})
+
+
+// FAIL-BEFORE: the ancestry probe was `(await runGit(...)).code === 0` with no
+// catch. `runGit` rejects on spawn failure (`child.once('error', reject)`), so
+// a machine with a broken or missing git threw out of `checkUpdates()` instead
+// of reporting anything. The review on #98167 asked that a git execution
+// failure stay distinct from a valid "not an ancestor" result, in both the
+// Python and the Electron path.
+test('a git that cannot run yields unknown ancestry, not a verdict', async () => {
+  const runGit = async () => {
+    throw new Error('spawn git ENOENT')
+  }
+
+  assert.equal(
+    await resolveAncestry({
+      currentSha: 'a'.repeat(40),
+      runGit,
+      targetSha: 'b'.repeat(40),
+      tipsEqual: false
+    }),
+    null
+  )
+})
+
+test('a carried local commit is proven ahead', async () => {
+  const runGit = async () => ({ code: 0 })
+
+  assert.equal(
+    await resolveAncestry({
+      currentSha: 'a'.repeat(40),
+      runGit,
+      targetSha: 'b'.repeat(40),
+      tipsEqual: false
+    }),
+    true
+  )
+})
+
+test('a genuinely behind checkout is proven not an ancestor', async () => {
+  const runGit = async () => ({ code: 1 })
+
+  assert.equal(
+    await resolveAncestry({
+      currentSha: 'a'.repeat(40),
+      runGit,
+      targetSha: 'b'.repeat(40),
+      tipsEqual: false
+    }),
+    false
+  )
+})
+
+// Unknown ancestry must not be laundered into a count by the next step either.
+test('unknown ancestry does not resolve to up to date', () => {
+  assert.equal(
+    resolveSshBehindCount({
+      compareBehind: null,
+      currentSha: 'a'.repeat(40),
+      targetIsAncestorOfHead: null,
+      targetSha: 'b'.repeat(40)
     }),
     null
   )
