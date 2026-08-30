@@ -106,11 +106,14 @@ selector, so this command cannot accidentally switch the Hermes home before
 the diagnostic runs. The command loads `config.yaml`, uses the same
 `parse_profile_routes` and `match_profile_route` resolver as the gateway, and
 does not construct or contact a gateway. It reports the normalized platform,
-deterministically redacted identifiers, selected profile, winning route,
+stable digest displays of identifiers, selected profile, winning route,
 specificity precedence, and whether a fallback was used. User IDs are shown
 only as a redacted diagnostic dimension; they are not routing discriminators.
+The digest is not strong anonymization: low-entropy IDs remain guessable by
+hashing candidate values, although the raw identifiers are not printed.
 
-JSON output is stable (`sort_keys`, compact separators) and includes an
+JSON output is stable (`sort_keys`, compact separators) and is emitted only when
+`--json` is supplied; otherwise the routing diagnosis is human-readable. It includes an
 explicit `side_effects` object whose network, gateway, and writes values are
 always `false`. Malformed route configuration returns exit code 2 with
 `invalid_route_config`; two equally specific matching routes return exit code 2

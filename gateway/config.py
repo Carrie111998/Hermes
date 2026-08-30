@@ -1305,9 +1305,14 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
-        # Parse profile routes (validated by gateway.profile_routing)
+        # Parse profile routes (validated by gateway.profile_routing).  An
+        # explicitly empty top-level value is the same as an omitted value, so
+        # preserve the nested gateway form as the fallback.
         from gateway.profile_routing import parse_profile_routes
-        profile_routes = parse_profile_routes(data.get("profile_routes") or [])
+        raw_profile_routes = data.get("profile_routes")
+        if not raw_profile_routes:
+            raw_profile_routes = nested_gateway.get("profile_routes")
+        profile_routes = parse_profile_routes(raw_profile_routes or [])
 
         return cls(
             platforms=platforms,

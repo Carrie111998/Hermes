@@ -1235,12 +1235,39 @@ def check_macos_full_disk_access() -> None:
     )
 
 def _routing_redact(value: object) -> str | None:
-    """Return a deterministic, non-reversible display value for an ID."""
+    """Return a deterministic digest display value for an ID.
+
+    This is display redaction, not strong anonymization: low-entropy IDs can
+    be guessed by hashing candidate values. The raw identifier is never
+    emitted by this diagnostic.
+    """
     if value is None or not str(value).strip():
         return None
     normalized = str(value).strip()
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
     return f"<redacted:{digest}>"
+
+
+def _print_routing_result(result: dict, args) -> None:
+    """Render routing diagnostics as JSON only when explicitly requested."""
+    if getattr(args, "json", False):
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return
+    print("Routing diagnosis")
+    dimensions = result["dimensions"]
+    print(f"  Platform: {dimensions['platform'] or '(unspecified)'}")
+    for key in ("guild_id", "chat_id", "thread_id", "user_id"):
+        if dimensions[key] is not None:
+            print(f"  {key}: {dimensions[key]}")
+    error = result.get("error")
+    if error:
+        print(f"  Error: {error['code']}")
+        if "routes" in error:
+            print(f"  Conflicting routes: {', '.join(error['routes'])}")
+    match = result["match"]
+    print(f"  Match: {match['route'] or '(none)'} ({match['reason']})")
+    print(f"  Precedence: {match['precedence']}")
+    print(f"  Selected profile: {result['selected_profile'] or '(none)'}")
 
 
 def _run_routing_doctor(args) -> int:
@@ -1271,20 +1298,20 @@ def _run_routing_doctor(args) -> int:
     except Exception:
         result["error"] = {"code": "invalid_config", "message": "unable to read or parse config.yaml"}
         result["selected_profile"] = getattr(args, "routing_profile", None) or "default"
-        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        _print_routing_result(result, args)
         return 2
 
     nested = config.get("gateway") if isinstance(config.get("gateway"), dict) else {}
-    raw_routes = config.get("profile_routes", nested.get("profile_routes", []))
+    raw_routes = config.get("profile_routes") or nested.get("profile_routes", [])
     if raw_routes is not None and not isinstance(raw_routes, list):
         result["error"] = {"code": "invalid_route_config", "message": "profile_routes must be a list"}
-        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        _print_routing_result(result, args)
         return 2
     parse_errors: list[str] = []
     routes = parse_profile_routes(raw_routes, errors=parse_errors)
     if parse_errors:
         result["error"] = {"code": "invalid_route_config", "messages": sorted(parse_errors)}
-        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        _print_routing_result(result, args)
         return 2
 
     platform = dimensions["platform"]
@@ -1301,14 +1328,14 @@ def _run_routing_doctor(args) -> int:
         if len(best) > 1:
             result["error"] = {"code": "ambiguous_route", "routes": sorted(route.name for route in best)}
             result["match"] = {"route": None, "reason": "ambiguous", "precedence": f"specificity {best_specificity}"}
-            print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+            _print_routing_result(result, args)
             return 2
         selected = match_profile_route(routes, platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id)
         result["selected_profile"] = selected.profile if selected else None
         result["match"] = {"route": selected.name if selected else None, "reason": "specificity", "precedence": f"specificity {selected.specificity}" if selected else "default"}
     else:
         result["selected_profile"] = getattr(args, "routing_profile", None) or "default"
-    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    _print_routing_result(result, args)
     return 0
 
 

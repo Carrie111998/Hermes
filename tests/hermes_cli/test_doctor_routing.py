@@ -43,6 +43,65 @@ def test_routing_doctor_json_explains_selected_route_without_secrets(monkeypatch
     assert payload["side_effects"] == {"network": False, "gateway": False, "writes": False}
 
 
+def test_routing_doctor_uses_nested_routes_when_top_level_routes_are_empty(
+    monkeypatch, tmp_path, capsys
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """profile_routes: []
+gateway:
+  profile_routes:
+    - name: nested
+      platform: telegram
+      chat_id: '42'
+      profile: support
+"""
+    )
+    monkeypatch.setattr(doctor, "HERMES_HOME", home)
+
+    rc = doctor.run_doctor(
+        Namespace(
+            routing=True, routing_profile="default", routing_platform="telegram",
+            routing_chat_id="42", routing_thread_id=None, routing_user_id=None,
+            json=True, fix=False, ack=None,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_profile"] == "support"
+    assert payload["match"]["route"] == "nested"
+
+
+def test_routing_doctor_human_output_is_not_json(monkeypatch, tmp_path, capsys):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """profile_routes:
+  - name: support
+    platform: telegram
+    chat_id: '42'
+    profile: support
+"""
+    )
+    monkeypatch.setattr(doctor, "HERMES_HOME", home)
+
+    rc = doctor.run_doctor(
+        Namespace(
+            routing=True, routing_profile="default", routing_platform="telegram",
+            routing_chat_id="42", routing_thread_id=None, routing_user_id=None,
+            json=False, fix=False, ack=None,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Routing diagnosis" in output
+    assert "Selected profile: support" in output
+    assert not output.lstrip().startswith("{")
+
+
 def test_routing_doctor_reports_ambiguous_routes_deterministically(monkeypatch, tmp_path, capsys):
     home = tmp_path / ".hermes"
     home.mkdir()
