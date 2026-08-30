@@ -31,15 +31,23 @@ export const resetThreadScroll = () => setThreadAtBottom(true)
 // Cross-component bridge: the jump button lives by the composer, the viewport's
 // `scrollToBottom` lives inside the thread. The bridge registers a handler; the
 // button fires it. Mirrors the composer focus/insert emitter pattern.
-const handlers = new Set<() => void>()
+const handlers = new Map<string | null, Set<() => void>>()
 
-export const onScrollToBottomRequest = (handler: () => void) => {
-  handlers.add(handler)
+export const onScrollToBottomRequest = (handler: () => void, sessionId: string | null = null) => {
+  const scopedHandlers = handlers.get(sessionId) ?? new Set<() => void>()
+  scopedHandlers.add(handler)
+  handlers.set(sessionId, scopedHandlers)
 
-  return () => void handlers.delete(handler)
+  return () => {
+    scopedHandlers.delete(handler)
+
+    if (scopedHandlers.size === 0) {
+      handlers.delete(sessionId)
+    }
+  }
 }
 
-export const requestScrollToBottom = () => handlers.forEach(handler => handler())
+export const requestScrollToBottom = (sessionId: string | null = null) => handlers.get(sessionId)?.forEach(handler => handler())
 
 // Inline edit grows a sticky human bubble. Fire on pointerdown so the viewport
 // escapes stick-to-bottom before focus/layout; close clears the edit flag when

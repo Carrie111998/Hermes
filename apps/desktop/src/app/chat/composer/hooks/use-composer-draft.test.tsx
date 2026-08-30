@@ -2,6 +2,7 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useLayoutEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { clearSessionDraft, type ComposerAttachment, mainComposerScope, stashSessionDraft } from '@/store/composer'
 import { $connection } from '@/store/session'
 
@@ -49,6 +50,38 @@ function ProbeHarness({ activeQueueSessionKey, onLayoutSnapshot, sessionId }: Pr
 
   return null
 }
+
+describe('useComposerDraft — hidden pane focus', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('does not focus a composer mounted in a hidden pane', () => {
+    const focus = vi.spyOn(HTMLDivElement.prototype, 'focus')
+
+    function HiddenComposer() {
+      const draft = useComposerDraft({
+        activeQueueSessionKey: 'session-background',
+        focusKey: 'session-background',
+        inputDisabled: false,
+        queueEditRef: { current: null as QueueEditState | null },
+        sessionId: 'session-background'
+      })
+
+      return <div ref={draft.editorRef} />
+    }
+
+    render(
+      <PaneVisibleContext.Provider value={false}>
+        <HiddenComposer />
+      </PaneVisibleContext.Provider>
+    )
+
+    expect(focus).not.toHaveBeenCalled()
+  })
+})
+
 
 describe('useComposerDraft — attachment scope stays coherent with the committed session on switch (#59305)', () => {
   afterEach(() => {
