@@ -48,6 +48,47 @@ def _clear_vt100_prefix_cache() -> None:
         pass
 
 
+def _install_printable_extended_key_payload_patch() -> bool:
+    """Make recognized extended printable keys self-insert their character.
+
+    ``Vt100Parser`` normally preserves the complete matched escape sequence in
+    ``KeyPress.data``. That is correct for control keys, but prompt_toolkit's
+    generic self-insert binding inserts ``data`` for printable keys. Therefore
+    an alias such as ``ESC[27;2;83~ -> "S"`` otherwise inserts the literal
+    escape payload instead of ``S``.
+
+    Normalize only a one-character string key whose payload is a CSI sequence.
+    ``Keys`` enum values keep prompt_toolkit's native data behavior. Hermes'
+    current multi-key tuples begin with a ``Keys`` control value, so their
+    payload handling is unchanged. The class patch is process-global and
+    deliberately idempotent.
+    """
+    try:
+        from importlib import import_module
+
+        Vt100Parser = import_module("prompt_toolkit.input.vt100_parser").Vt100Parser
+    except Exception:
+        return False
+
+    original = Vt100Parser._call_handler
+    if getattr(original, "_hermes_printable_payload_patch", False):
+        return False
+
+    def _call_handler(self, key, insert_text):  # noqa: ANN001
+        if (
+            type(key) is str
+            and len(key) == 1
+            and isinstance(insert_text, str)
+            and insert_text.startswith("\x1b[")
+        ):
+            insert_text = key
+        return original(self, key, insert_text)
+
+    setattr(_call_handler, "_hermes_printable_payload_patch", True)
+    Vt100Parser._call_handler = _call_handler
+    return True
+
+
 def install_shift_enter_alias() -> int:
     """Map Shift+Enter byte sequences to the (Escape, ControlM) key tuple
     that Alt+Enter produces, so the existing Alt+Enter newline handler
@@ -238,6 +279,8 @@ def install_modify_other_keys_aliases() -> int:
         from prompt_toolkit.keys import Keys
     except Exception:
         return 0
+
+    _install_printable_extended_key_payload_patch()
 
     # -- Ctrl+letter / Ctrl+digit / Ctrl+symbol → Keys.Control* ----
     # codepoint -> Keys value.  The raw control byte for Ctrl+<ch> is
