@@ -3,10 +3,14 @@ that only manifest at runtime (not in mocked unit tests)."""
 
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 
@@ -708,6 +712,60 @@ class TestRootLevelProviderOverride:
 
 
 class TestStartupCwdRecovery:
+    def test_cli_import_and_banner_survive_deleted_launch_cwd(self, tmp_path):
+        """The real CLI must recover before import-time/late cwd users run.
+
+        The child removes its own launch directory before importing ``cli``.
+        It then constructs the CLI and renders the full (non-compact) banner,
+        exercising both startup configuration and a later banner read.
+        """
+        import subprocess
+
+        launch = tmp_path / "launch"
+        launch.mkdir()
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        child = """
+import os
+import pathlib
+import shutil
+
+launch = pathlib.Path(os.environ["HERMES_TEST_LAUNCH"])
+os.chdir(launch)
+shutil.rmtree(launch)
+import cli
+
+cli_obj = cli.HermesCLI(compact=False)
+recovered = pathlib.Path(os.getcwd())
+late_deleted = recovered / "banner-launch"
+late_deleted.mkdir()
+os.chdir(late_deleted)
+shutil.rmtree(late_deleted)
+os.environ["TERMINAL_CWD"] = str(recovered)
+cli_obj.show_banner()
+print("CLI_CWD_RECOVERY_OK")
+"""
+        env = {
+            **os.environ,
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_TEST_LAUNCH": str(launch),
+            "PYTHONPATH": str(REPO_ROOT),
+            "COLUMNS": "120",
+            "LINES": "40",
+            "TERM": "dumb",
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", child],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "CLI_CWD_RECOVERY_OK" in result.stdout
+
     def test_recover_startup_cwd_climbs_to_nearest_existing_pwd_ancestor(self, monkeypatch, tmp_path):
         import cli as cli_mod
 

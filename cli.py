@@ -8898,7 +8898,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 snapshot = None
 
             # Get terminal working directory (where commands will execute)
-            cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+            cwd = os.getenv("TERMINAL_CWD") or os.getcwd()
 
             if snapshot is not None:
                 self._defer_tool_warnings = True
