@@ -1795,6 +1795,19 @@ class AIAgent:
         (LiteLLM/sglang/vLLM/LM Studio proxies, Tailscale boxes), which
         report finish_reason correctly and were the source of #13971's
         false-positive truncation continuations.
+
+        Identity resolution notes:
+        - The ``glm`` substring check runs on the resolved model id, so
+          aliases that carry a GLM token (``glm-5.3-flash:cloud``,
+          ``zai/glm-5`` …) match, while a bare alias that hides the
+          model family entirely does not.
+        - The port/URL check runs on the resolved base URL: a custom
+          base URL still matches when it contains ``ollama`` or ``:11434``,
+          and a reverse proxy serving Ollama on another port matches
+          only if the provider is explicitly named ``ollama``.
+        - ``provider=="zai"`` routes are included regardless of URL
+          because Z.AI's GLM endpoints were the other half of the
+          original misreport family.
         """
         model_lower = (self.model or "").lower()
         provider_lower = (self.provider or "").lower()

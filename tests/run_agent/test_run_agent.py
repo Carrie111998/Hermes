@@ -4614,7 +4614,7 @@ class TestRunConversation:
 
         with (
             patch("run_agent.handle_function_call", return_value="search result"),
-            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_persist_session") as persist_session,
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
@@ -4627,6 +4627,74 @@ class TestRunConversation:
         assert result.get("partial") is not True
         # The stitched response is delivered.
         assert "restart" in (result["final_response"] or "")
+
+        # Provider-spy: the second suspicious stop is provably the LAST
+        # provider interaction — no fourth API call is ever issued
+        # (review request on this PR).
+        assert agent.client.chat.completions.create.call_count == 3
+
+        # Persisted state is clean: the last message is the stitched
+        # assistant answer and no continuation nudge survives as a
+        # pending user turn for the next request.
+        persisted = persist_session.call_args[0][0]
+        assert persisted[-1]["role"] == "assistant"
+        assert "restart" in (persisted[-1].get("content") or "")
+        assert not any(
+            isinstance(m, dict) and m.get("_length_continuation_nudge")
+            for m in persisted
+        )
+
+    def test_suspicious_continuation_followed_by_empty_response(self, agent):
+        """Partial stitch + empty continuation response must not converge on empty (#98406).
+
+        The reviewer's second scenario: first suspicious stop yields a partial,
+        the salvage continuation comes back EMPTY.  The convergent path must
+        refuse to mark an empty stitch complete and hand the turn to the
+        normal empty-response recovery instead.
+        """
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.3-flash:cloud"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        suspicious_partial = _mock_response(
+            content="Based on the search results, the best next",
+            finish_reason="stop",
+        )
+        empty_continuation = _mock_response(content="", finish_reason="stop")
+        recovered_answer = _mock_response(
+            content=" step is to update the config. Done.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn, suspicious_partial, empty_continuation, recovered_answer,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session") as persist_session,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # The empty continuation never got stitched into a "complete" turn:
+        # the loop recovered through the normal path and delivered the
+        # recovered answer joined after the partial.
+        assert result.get("error") is None
+        assert result["completed"] is True
+        assert "update the config" in (result["final_response"] or "")
+        # No leftover nudge in the persisted transcript.
+        persisted = persist_session.call_args[0][0]
+        assert not any(
+            isinstance(m, dict) and m.get("_length_continuation_nudge")
+            for m in persisted
+        )
 
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
