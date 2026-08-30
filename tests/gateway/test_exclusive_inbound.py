@@ -47,6 +47,14 @@ def _claim():
     return {"chat_id": "codex@g.us", "handler": "codex_bridge"}
 
 
+def _sender_claim():
+    return {
+        "chat_id": "codex@g.us",
+        "handler": "codex_bridge",
+        "allowed_senders": ["15551234567"],
+    }
+
+
 @pytest.mark.asyncio
 async def test_unrelated_chat_falls_through_without_auth_or_plugin(monkeypatch):
     runner = _runner()
@@ -82,6 +90,38 @@ async def test_exact_chat_awaits_one_registered_durable_admission(monkeypatch):
     assert admitted == ["m1"]
     assert event.source._authorization_profile_home is not None
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claim_sender_allowlist_authorizes_without_broad_gateway_grant(monkeypatch):
+    runner = _runner(authorized=False)
+    adapter = _Adapter(_sender_claim())
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="bridge"), manager)
+    admitted = []
+
+    async def accept(event):
+        admitted.append(event.message_id)
+        return True
+
+    context.register_exclusive_inbound_handler("codex_bridge", accept)
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    runner._configure_exclusive_inbound(adapter)
+
+    assert await adapter.exclusive_handler(_event()) is True
+    assert admitted == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_claim_sender_allowlist_still_drops_other_sender(monkeypatch):
+    runner = _runner(authorized=False)
+    adapter = _Adapter(_sender_claim())
+    get_manager = MagicMock()
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
+    runner._configure_exclusive_inbound(adapter)
+
+    assert await adapter.exclusive_handler(_event(user_id="19990000000")) is True
+    get_manager.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -157,7 +197,14 @@ async def test_unauthorized_claim_is_consumed_without_invoking_plugin(monkeypatc
 
 @pytest.mark.parametrize(
     "claim",
-    [None, [], {}, {"chat_id": "codex@g.us"}, {"handler": "bridge"}],
+    [
+        None,
+        [],
+        {},
+        {"chat_id": "codex@g.us"},
+        {"handler": "bridge"},
+        {"chat_id": "codex@g.us", "handler": "bridge", "allowed_senders": []},
+    ],
 )
 def test_malformed_claim_is_rejected_at_adapter_configuration(claim):
     runner = _runner()

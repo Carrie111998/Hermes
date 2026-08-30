@@ -16721,6 +16721,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("exclusive_inbound.chat_id must be a non-empty string")
         if not isinstance(handler, str) or not handler.strip():
             raise ValueError("exclusive_inbound.handler must be a non-empty string")
+        allowed_senders = raw.get("allowed_senders")
+        if allowed_senders is not None and (
+            not isinstance(allowed_senders, list)
+            or not allowed_senders
+            or any(not isinstance(item, str) or not item.strip() for item in allowed_senders)
+        ):
+            raise ValueError(
+                "exclusive_inbound.allowed_senders must be a non-empty list of strings"
+            )
         failure_message = raw.get("failure_message")
         if failure_message is not None and (
             not isinstance(failure_message, str) or not failure_message.strip()
@@ -16731,6 +16740,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return {
             "chat_id": chat_id.strip(),
             "handler": handler.strip(),
+            "allowed_senders": (
+                {item.strip().lower() for item in allowed_senders}
+                if isinstance(allowed_senders, list)
+                else None
+            ),
             "failure_message": (
                 failure_message.strip()
                 if isinstance(failure_message, str)
@@ -16812,7 +16826,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.profile = profile_name
 
             with _profile_runtime_scope(transport_home):
-                if not self._is_user_authorized_for_source(source):
+                claim_sender_allowed = (
+                    claim["allowed_senders"] is not None
+                    and str(getattr(source, "user_id", "")).strip().lower()
+                    in claim["allowed_senders"]
+                )
+                if not claim_sender_allowed and not self._is_user_authorized_for_source(source):
                     logger.warning(
                         "Unauthorized sender dropped from exclusive inbound claim "
                         "on %s/%s",

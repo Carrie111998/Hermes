@@ -1358,10 +1358,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # them on the stock WhatsApp path even when the
                                 # containing chat has an exclusive text/media
                                 # claim.
-                                is_poll_update = (
-                                    (event.metadata or {}).get("whatsapp_native_type")
-                                    == "pollUpdateMessage"
-                                )
+                                native_type = str(
+                                    (event.metadata or {}).get("whatsapp_native_type") or ""
+                                ).lower()
+                                is_poll_update = native_type.startswith("poll")
                                 claimed = (
                                     False
                                     if is_poll_update
@@ -1636,7 +1636,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
-            metadata: Dict[str, Any] = {}
+            metadata: Dict[str, Any] = {
+                "whatsapp_original_body": str(data.get("body") or ""),
+            }
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:

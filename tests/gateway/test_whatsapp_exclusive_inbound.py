@@ -78,7 +78,11 @@ async def test_each_native_quote_is_claimed_before_whatsapp_text_batching():
 
 
 @pytest.mark.asyncio
-async def test_native_poll_update_bypasses_exclusive_claim():
+@pytest.mark.parametrize(
+    "native_type",
+    ["pollUpdateMessage", "pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3"],
+)
+async def test_native_polls_bypass_exclusive_claim(native_type):
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
     adapter._bridge_port = 3000
@@ -103,7 +107,7 @@ async def test_native_poll_update_bypasses_exclusive_claim():
                 user_id="15551234567",
             ),
             message_id="poll-update",
-            metadata={"whatsapp_native_type": "pollUpdateMessage"},
+            metadata={"whatsapp_native_type": native_type},
         )
 
     adapter._build_message_event = build
