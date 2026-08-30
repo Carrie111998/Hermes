@@ -4498,7 +4498,13 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
-                _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                _inherit_notify_subs(
+                    conn,
+                    task_id,
+                    parents,
+                    created_at=now,
+                    board=board_slug,
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -4527,6 +4533,7 @@ def _inherit_notify_subs(
     parents: Iterable[str],
     *,
     created_at: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> None:
     """Copy gateway notification subscriptions from parent tasks to a child.
 
@@ -4541,6 +4548,11 @@ def _inherit_notify_subs(
     decomposition. Omitting columns here silently degrades routing: a
     DM-originated child completion falls back to chat_type='group' and wakes
     a fresh group-scoped session instead of the originating DM (issue #73030).
+
+    A valid board-wide Discord pin supersedes Discord card subscriptions. The
+    pin lookup is deliberately delegated to the board-notify module so
+    malformed persisted state is treated as absent instead of suppressing a
+    valid card route.
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
@@ -4551,6 +4563,8 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
+    board_pin = get_board_notify(conn, board=board)
+    platform_filter = "AND LOWER(platform) != 'discord'" if board_pin else ""
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
@@ -4561,7 +4575,7 @@ def _inherit_notify_subs(
                COALESCE(chat_type, 'dm'), notifier_profile,
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
+         WHERE task_id IN ({placeholders}) {platform_filter}
         """,
         (
             child_id,
@@ -4570,6 +4584,420 @@ def _inherit_notify_subs(
             *parent_ids,
         ),
     )
+
+
+_BOARD_NOTIFY_THREAD_LOCK = threading.RLock()
+_BOARD_NOTIFY_LOCK_TIMEOUT_SECONDS = 10.0
+
+
+def _board_notify_board_id(board: Optional[str] = None) -> str:
+    """Resolve the board identity used by the board-notify storage seam."""
+    return _normalize_board_slug(board) or get_current_board()
+
+
+def get_board_notify(
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+    *,
+    platform: str = "discord",
+) -> Optional[dict[str, str]]:
+    """Return the validated pin for ``board``.
+
+    ``board`` is the board identity used by
+    :mod:`hermes_cli.kanban_board_notify`. The positional ``"discord"`` form
+    remains accepted for callers written against the earlier platform-keyed
+    adapter; it resolves the active board while the storage module continues
+    to own validation and malformed-row handling.
+    """
+    normalized_platform = str(platform or "").strip().lower()
+    if board == "discord" and normalized_platform == "discord":
+        board = None
+    if normalized_platform != "discord":
+        return None
+    from hermes_cli import kanban_board_notify as board_notify
+
+    return board_notify.get_board_notify(conn, _board_notify_board_id(board))
+
+
+def list_board_notify(
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+) -> list[dict[str, str]]:
+    """Return the active board's valid pin, if one exists."""
+    pin = get_board_notify(conn, board=board)
+    return [pin] if pin is not None else []
+
+
+def remove_board_notify(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    platform: str = "discord",
+) -> bool:
+    """Remove the active board's pin without touching card subscriptions."""
+    if str(platform or "").strip().lower() != "discord":
+        return False
+    from hermes_cli import kanban_board_notify as board_notify
+
+    board_notify.clear_board_notify(conn, _board_notify_board_id(board))
+    return True
+
+
+def _board_notify_db_path(board: str) -> Path:
+    """Return a board database path for cross-board conflict scans.
+
+    The normal ``HERMES_KANBAN_DB`` override is intentionally not used here:
+    uniqueness checks must inspect each on-disk board rather than opening the
+    same explicitly pinned database repeatedly.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
+def _iter_board_notify_db_paths() -> Iterable[tuple[str, Path]]:
+    """Yield existing ``(board_slug, database_path)`` pairs."""
+    default_path = _board_notify_db_path(DEFAULT_BOARD)
+    if default_path.exists():
+        yield DEFAULT_BOARD, default_path
+    root = boards_root()
+    if not root.is_dir():
+        return
+    for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+        if not child.is_dir():
+            continue
+        try:
+            slug = _normalize_board_slug(child.name)
+        except ValueError:
+            continue
+        if slug and slug != DEFAULT_BOARD:
+            path = _board_notify_db_path(slug)
+            if path.exists():
+                yield slug, path
+
+
+def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the main file path for a live SQLite connection, when known."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or len(row) < 3 or not row[2]:
+        return None
+    try:
+        return Path(str(row[2])).resolve()
+    except OSError:
+        return Path(str(row[2]))
+
+
+@contextlib.contextmanager
+def _board_notify_destination_lock():
+    """Serialize destination scans and reservations within this process."""
+    with _BOARD_NOTIFY_THREAD_LOCK:
+        lock_path = kanban_home() / "kanban" / "board-notify.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        acquired = False
+        try:
+            deadline = time.monotonic() + _BOARD_NOTIFY_LOCK_TIMEOUT_SECONDS
+            if _IS_WINDOWS:
+                import msvcrt
+
+                while time.monotonic() < deadline:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except OSError:
+                        time.sleep(0.01)
+            else:
+                import fcntl
+
+                while time.monotonic() < deadline:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except (BlockingIOError, OSError):
+                        time.sleep(0.01)
+            if not acquired:
+                raise TimeoutError(
+                    "timed out waiting for the board notification destination lock"
+                )
+            yield
+        finally:
+            try:
+                if acquired:
+                    if _IS_WINDOWS:
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def _board_notify_conflict(
+    conn: sqlite3.Connection,
+    *,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    destination: Optional[Mapping[str, object]] = None,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Return the other board that owns ``destination``, if any.
+
+    Every persisted candidate crosses the board-notify module's validated read
+    seam and is parsed again before comparison. Invalid JSON or malformed
+    destinations therefore cannot reserve a valid Discord thread.
+    """
+    from hermes_cli import kanban_board_notify as board_notify
+
+    if destination is None:
+        destination = {
+            "platform": str(platform or "").strip().lower(),
+            "chat_id": str(chat_id or "").strip(),
+            "thread_id": str(thread_id or "").strip(),
+        }
+    canonical = board_notify.parse_discord_board_pin(destination)
+    if canonical is None:
+        raise ValueError(
+            "board notification destination must be a Discord thread"
+        )
+    current_path = _connection_db_path(conn)
+    if current_path is not None:
+        current_path = current_path.resolve()
+    current_board = _board_notify_board_id(board)
+    for slug, path in _iter_board_notify_db_paths():
+        if slug == current_board:
+            continue
+        try:
+            candidate_path = path.resolve()
+        except OSError:
+            candidate_path = path
+        if current_path is not None and candidate_path == current_path:
+            continue
+        other = None
+        try:
+            other = _sqlite_connect(path)
+            has_table = other.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'kanban_board_notify'"
+            ).fetchone()
+            if has_table is None:
+                continue
+            candidate = board_notify.get_board_notify(other, slug)
+            if board_notify.parse_discord_board_pin(candidate) == canonical:
+                return slug
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                continue
+            raise
+        finally:
+            if other is not None:
+                other.close()
+    return None
+
+
+def set_board_notify(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+    board: Optional[str] = None,
+    replace_existing: bool = True,
+) -> dict[str, str]:
+    """Validate, reserve, and persist one board-wide Discord destination."""
+    del user_id, user_id_alt, chat_type, notifier_profile
+    del delivery_mode, delivery_metadata
+    from hermes_cli import kanban_board_notify as board_notify
+
+    canonical = board_notify.parse_discord_board_pin(
+        {
+            "platform": str(platform or "").strip().lower(),
+            "chat_id": str(chat_id or "").strip(),
+            "thread_id": str(thread_id or "").strip(),
+        }
+    )
+    if canonical is None:
+        raise ValueError(
+            "board notification destination must be a Discord thread"
+        )
+    board_id = _board_notify_board_id(board)
+    with _board_notify_destination_lock():
+        if not replace_existing:
+            existing = get_board_notify(conn, board=board_id)
+            if existing is not None:
+                return existing
+        conflict = _board_notify_conflict(
+            conn,
+            destination=canonical,
+            board=board_id,
+        )
+        if conflict is not None:
+            raise ValueError(
+                f"notification destination already belongs to board {conflict!r}"
+            )
+        return board_notify.set_board_notify(conn, board_id, canonical)
+
+
+def _remove_notify_subs_for_task_platform(
+    conn: sqlite3.Connection,
+    task_id: str,
+    platform: str,
+) -> int:
+    normalized = str(platform or "").strip().lower()
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
+            "AND LOWER(platform) = ?",
+            (task_id, normalized),
+        )
+    return int(cur.rowcount or 0)
+
+
+def remove_notify_subs_for_task_platform(
+    conn: sqlite3.Connection,
+    task_id: str,
+    platform: str,
+) -> int:
+    """Delete one task's subscriptions for a platform."""
+    return _remove_notify_subs_for_task_platform(conn, task_id, platform)
+
+
+def purge_discord_task_subs(conn: sqlite3.Connection) -> int:
+    """Remove card-level Discord rows while preserving other platforms."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE LOWER(platform) = 'discord'"
+        )
+    return int(cur.rowcount or 0)
+
+
+def _auto_subscribe_on_create_enabled() -> bool:
+    """Resolve the create-notification policy from config.yaml."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        return bool(
+            cfg_get(
+                load_config(),
+                "kanban",
+                "auto_subscribe_on_create",
+                default=True,
+            )
+        )
+    except Exception:
+        return True
+
+
+def subscribe_notify_source_on_create(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+    board: Optional[str] = None,
+) -> bool:
+    """Route a create source through board pins or card subscriptions.
+
+    A valid board pin is authoritative and removes any stale Discord card row.
+    A malformed persisted pin is returned as ``None`` by the storage module and
+    therefore cannot suppress the normal card route or reserve a destination.
+    Scoped project boards may claim their first dedicated Discord thread;
+    unscoped/default boards retain ordinary card subscriptions.
+    """
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_chat_id = str(chat_id or "").strip()
+    normalized_thread_id = str(thread_id or "").strip()
+    if not normalized_platform or not normalized_chat_id:
+        return False
+
+    if not _auto_subscribe_on_create_enabled():
+        if normalized_platform == "discord" and get_board_notify(
+            conn, board=board
+        ) is not None:
+            _remove_notify_subs_for_task_platform(conn, task_id, "discord")
+            return True
+        return False
+
+    def subscribe_card() -> bool:
+        add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=normalized_platform,
+            chat_id=normalized_chat_id,
+            thread_id=normalized_thread_id or None,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            chat_type=chat_type,
+            notifier_profile=notifier_profile,
+            delivery_mode=delivery_mode,
+            delivery_metadata=delivery_metadata,
+        )
+        return True
+
+    if normalized_platform != "discord":
+        return subscribe_card()
+
+    board_id = _board_notify_board_id(board)
+    if get_board_notify(conn, board=board_id) is not None:
+        _remove_notify_subs_for_task_platform(conn, task_id, "discord")
+        return True
+
+    board_meta = read_board_metadata(board_id)
+    eligible_for_auto_pin = (
+        board_id != DEFAULT_BOARD
+        and not board_meta.get("legacy_unscoped")
+        and bool(board_meta.get("project_id"))
+        and bool(normalized_thread_id)
+        and str(chat_type or "").strip().lower() == "thread"
+    )
+    if not eligible_for_auto_pin:
+        return subscribe_card()
+
+    _remove_notify_subs_for_task_platform(conn, task_id, "discord")
+    try:
+        set_board_notify(
+            conn,
+            platform="discord",
+            chat_id=normalized_chat_id,
+            thread_id=normalized_thread_id,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            chat_type=chat_type,
+            notifier_profile=notifier_profile,
+            delivery_mode="notify",
+            delivery_metadata=delivery_metadata,
+            board=board_id,
+            replace_existing=False,
+        )
+    except ValueError as exc:
+        _log.warning("Discord auto-pin refused on board %r: %s", board_id, exc)
+        return False
+    purge_discord_task_subs(conn)
+    return True
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -4770,7 +5198,13 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    board: Optional[str] = None,
+) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -4798,7 +5232,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             conn, child_id, "linked",
             {"parent": parent_id, "child": child_id},
         )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
+        _inherit_notify_subs(conn, child_id, (parent_id,), board=board)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:

@@ -2971,6 +2971,16 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
+        if (
+            args.platform.strip().lower() == "discord"
+            and kb.get_board_notify(conn) is not None
+        ):
+            print(
+                "Discord card subscriptions are disabled while this board is "
+                "pinned; use `hermes kanban boards notify-pin` to retarget it.",
+                file=sys.stderr,
+            )
+            return 1
         kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,

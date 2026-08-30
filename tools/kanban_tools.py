@@ -1487,7 +1487,7 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(conn, new_tid, board=board)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1505,14 +1505,19 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
-    Returns True if a subscription row was written, False otherwise (no
-    session context, config gate disabled, or best-effort failure). The
-    caller surfaces this in the ``subscribed`` field of the kanban_create
-    response so an orchestrator can decide whether to fall back to an
-    explicit ``kanban_notify-subscribe`` or to polling.
+    Returns True when the source is covered by a board pin or subscription
+    row, False otherwise (no session context, config gate disabled, or
+    best-effort failure). The caller surfaces this in the ``subscribed`` field
+    of the kanban_create response so an orchestrator can decide whether to
+    fall back to an explicit ``kanban_notify-subscribe`` or to polling.
 
     Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
     True). Disable to mirror pre-feature behaviour, e.g. when the
@@ -1543,15 +1548,6 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     We never want a notification bookkeeping failure to fail the
     kanban_create that the agent is mid-conversation about.
     """
-    try:
-        cfg = load_config()
-        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
-            return False
-    except Exception:
-        # If config can't load we still default to True — this is the
-        # user-friendly behaviour that mirrors the pre-gate implementation.
-        pass
-
     platform = ""
     chat_id = ""
     try:
@@ -1615,16 +1611,20 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
-        _kb.add_notify_sub(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id, user_id_alt=user_id_alt,
+        return _kb.subscribe_notify_source_on_create(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
             chat_type=chat_type,
             notifier_profile=notifier_profile,
             delivery_mode=delivery_mode,
             delivery_metadata=delivery_metadata or None,
+            board=board,
         )
-        return True
     except Exception as _exc:
         logger.warning(
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
