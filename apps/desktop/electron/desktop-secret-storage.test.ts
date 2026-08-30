@@ -44,6 +44,21 @@ function storageFixture(available = true) {
   return { codec, safeStorage, encryptCalls: () => encryptCalls }
 }
 
+test('original namespace aliases resolve to the extracted codec function objects', () => {
+  const { codec } = storageFixture()
+  const originalNamespace = {
+    encryptDesktopSecret: codec.encryptDesktopSecret,
+    decryptDesktopSecret: codec.decryptDesktopSecret,
+    decryptRemoteHeaders: codec.decryptRemoteHeaders,
+    encryptIncomingRemoteHeaders: codec.encryptIncomingRemoteHeaders
+  }
+
+  for (const name of Object.keys(originalNamespace) as Array<keyof typeof originalNamespace>) {
+    assert.strictEqual(originalNamespace[name], codec[name])
+    assert.equal(typeof originalNamespace[name], 'function')
+  }
+})
+
 test('secret codec persists token and headers as opaque safeStorage envelopes', () => {
   const { codec } = storageFixture()
 
