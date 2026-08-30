@@ -9,6 +9,12 @@ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
+  $removedSessionIds,
+  captureSessionTombstoneGenerations,
+  type SessionTombstoneGenerationSnapshot,
+  sessionTombstoneLifecycleChanged
+} from '@/store/projects'
+import {
   $cronSessions,
   $currentCwd,
   $messagingSessions,
@@ -1372,7 +1378,30 @@ export function restoreListedSession(session: SessionInfo, slice?: ListedSession
   setSessions(prepend)
 }
 
-function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
+function upsertResolvedSession(
+  session: SessionInfo,
+  storedSessionId: string,
+  tombstoneGenerationsAtRequestStart: SessionTombstoneGenerationSnapshot
+) {
+  const removed = $removedSessionIds.get()
+  const identities = [storedSessionId, session.id, session._lineage_root_id]
+
+  // A direct by-id request may have started just before an archive/delete. Its
+  // stale response must not undo the optimistic eviction while that mutation's
+  // tombstone is active, after the tombstone was already present at request
+  // start, or after an add -> remove ABA cycle made membership look unchanged.
+  // Check every identity used by lineage-aware lookups. This suppresses only
+  // the sidebar-cache upsert: the resolved row is still returned so an explicit
+  // resume-by-id can open archived history, and a later request after a settled
+  // rollback can publish normally.
+  if (
+    session.archived ||
+    identities.some(id => (id ? removed.has(id) : false)) ||
+    sessionTombstoneLifecycleChanged(tombstoneGenerationsAtRequestStart, identities)
+  ) {
+    return
+  }
+
   const lineage = session._lineage_root_id ?? session.id
 
   setSessions(prev => [
@@ -1391,6 +1420,8 @@ export async function resolveStoredSession(
   storedSessionId: string,
   ownerRoute?: SessionProfileRoute
 ): Promise<SessionInfo | undefined> {
+  const tombstoneGenerationsAtRequestStart = captureSessionTombstoneGenerations()
+
   const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
     sessionMatchesStoredId(session, storedSessionId)
   )
@@ -1414,7 +1445,7 @@ export async function resolveStoredSession(
       const session = await getSession(storedSessionId, scope)
       session.profile = normalizeProfileKey(ownerRoute.profile)
       session.connection_id = ownerRoute.connectionId
-      upsertResolvedSession(session, storedSessionId)
+      upsertResolvedSession(session, storedSessionId, tombstoneGenerationsAtRequestStart)
 
       return session
     } catch {
@@ -1448,7 +1479,7 @@ export async function resolveStoredSession(
     // stamp is preserved for backend compatibility.
     session.profile ||= activeKey
 
-    upsertResolvedSession(session, storedSessionId)
+    upsertResolvedSession(session, storedSessionId, tombstoneGenerationsAtRequestStart)
 
     return session
   } catch {
@@ -1474,7 +1505,7 @@ export async function resolveStoredSession(
       // forwarding, so that backend answers as its own "default").
       session.profile = profile
 
-      upsertResolvedSession(session, storedSessionId)
+      upsertResolvedSession(session, storedSessionId, tombstoneGenerationsAtRequestStart)
 
       return session
     } catch {
