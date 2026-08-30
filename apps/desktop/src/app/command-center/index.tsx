@@ -1,4 +1,3 @@
-import { useStore } from '@nanostores/react'
 import { type MouseEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { LogTail } from '@/components/chat/log-tail'
@@ -30,7 +29,7 @@ import { fmtDateTime } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
-import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
+import { $pinnedSessionIds, pinSession, SIDEBAR_SESSIONS_PAGE_SIZE, unpinSession } from '@/store/layout'
 import { $sessionProfilesTruncated, $sessions, sessionPinId } from '@/store/session'
 
 import { SidebarLoadMoreRow } from '../chat/sidebar/load-more-row'
@@ -56,6 +55,7 @@ type UsagePeriod = (typeof USAGE_PERIODS)[number]
 // component never re-renders from $sessions ticks while on System/Usage/etc.
 const EMPTY_SESSIONS: readonly never[] = []
 const EMPTY_PINNED: readonly string[] = []
+const EMPTY_TRUNCATED: Record<string, boolean> = {}
 
 interface CommandCenterViewProps {
   initialSection?: CommandCenterSection
@@ -154,9 +154,16 @@ export function CommandCenterView({
   const [section, setSection] = useRouteEnumParam('section', SECTIONS, initialSection ?? 'sessions')
   const sessions = useStoreSelector($sessions, s => (section === 'sessions' ? s : EMPTY_SESSIONS))
   const pinnedSessionIds = useStoreSelector($pinnedSessionIds, s => (section === 'sessions' ? s : EMPTY_PINNED))
+
   // Mirrors the sidebar: any profile whose backend page was capped means there
   // is more to load, so the Sessions list gets a "load more" affordance.
-  const sessionProfilesTruncated = useStore($sessionProfilesTruncated)
+  // Gate like the other selectors: only subscribe on the Sessions tab so
+  // System/Usage/Maintenance don't re-render when $sessionProfilesTruncated
+  // ticks on every session fetch.
+  const sessionProfilesTruncated = useStoreSelector(
+    $sessionProfilesTruncated,
+    s => (section === 'sessions' ? s : EMPTY_TRUNCATED)
+  )
 
   const [query, setQuery] = useState('')
   const [pendingDelete, setPendingDelete] = useState<SessionInfo | null>(null)
@@ -445,12 +452,12 @@ export function CommandCenterView({
                 </ul>
                 )}
               </div>
-              {hasMoreSessions && !debouncedQuery && (
+              {hasMoreSessions && !!onLoadMoreSessions && !debouncedQuery && (
                 <div className="flex shrink-0 items-end justify-end">
                   <SidebarLoadMoreRow
                     loading={loadMorePending}
                     onClick={() => void onLoadMore()}
-                    step={0}
+                    step={SIDEBAR_SESSIONS_PAGE_SIZE}
                   />
                 </div>
               )}
