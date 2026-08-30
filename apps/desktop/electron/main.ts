@@ -5052,7 +5052,13 @@ function fetchJson(url, token, options: any = {}) {
               const text = Buffer.concat(chunks).toString('utf8')
 
               if ((res.statusCode || 500) >= 400) {
-                reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+                // Downstream classification (isGatewayAuthRejection /
+                // isServerSideHttpError) reads err.statusCode, never the
+                // "401: ..." message prefix — same contract as
+                // fetchJsonViaOauthSession below.
+                const err = new Error(`${res.statusCode}: ${text || res.statusMessage}`) as any
+                err.statusCode = res.statusCode || 500
+                reject(err)
 
                 return
               }

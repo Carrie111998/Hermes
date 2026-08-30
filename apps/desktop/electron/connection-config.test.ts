@@ -1342,3 +1342,25 @@ test('OAuth ticket-mint 401 stays on the reauth path (never Cloud-down)', () => 
   assert.equal((wrapped as any).needsOauthLogin, true)
   assert.equal((wrapped as any).statusCode, 401)
 })
+
+// Regression (#98647): fetchJson (electron/main.ts) attaches err.statusCode on
+// 4xx/5xx responses. Before that, a dead-session 401 from the WS-ticket mint
+// carried the code only in the message text; isGatewayAuthRejection read
+// Number(undefined) === NaN and every expired/revoked session was reported as
+// "Could not reach the remote Hermes gateway" (and retried by
+// withTransientRetries, hammering a session that cannot recover). This pins
+// the exact error shape fetchJson produces — message prefix AND structured
+// statusCode — so the fetch-layer → classifier contract cannot silently
+// regress again.
+test('ticket-mint 401 from fetchJson routes to reauth via structured statusCode (#98647)', () => {
+  const ticketErr = new Error(
+    '401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}'
+  ) as any
+  ticketErr.statusCode = 401
+
+  const wrapped = gatewayTicketFailure(ticketErr, 'auth message', 'transport message') as any
+
+  assert.equal(wrapped.message, 'auth message')
+  assert.equal(wrapped.needsOauthLogin, true)
+  assert.equal(wrapped.statusCode, 401)
+})
