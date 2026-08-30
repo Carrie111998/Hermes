@@ -3925,7 +3925,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 39,
+    "_config_version": 40,
 }
 
 # Optional environment variables that enhance functionality
@@ -4431,6 +4431,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Tavily API key",
         "url": "https://app.tavily.com/home",
         "tools": ["web_search", "web_extract"],
+        "password": True,
+        "category": "tool",
+    },
+    "MCP_YOUDOTCOM_API_KEY": {
+        "description": "You.com API key for the You.com MCP server",
+        "prompt": "You.com API key",
+        "url": "https://you.com/platform",
+        "tools": ["mcp_youdotcom"],
         "password": True,
         "category": "tool",
     },
