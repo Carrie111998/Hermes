@@ -2188,7 +2188,7 @@ class PluginContext:
 
         The handler signature is ``fn(raw_args: str) -> str | None``. New
         handlers may also accept keyword context (for example,
-        ``session_id`` and ``platform``); legacy one-argument handlers remain
+        ``session_id``, durable ``session_key``, and ``platform``); legacy one-argument handlers remain
         supported unchanged.
         It may also be an async callable — the gateway dispatch handles both.
 
@@ -7056,7 +7056,7 @@ def invoke_plugin_command(handler: Callable, raw_args: str, **context: Any) -> A
 
     Existing plugins keep the original ``handler(raw_args)`` contract. New
     plugins may declare a ``context`` keyword or ``**kwargs`` to receive host
-    metadata such as ``session_id`` and ``platform``. Signature inspection is
+    metadata such as ``session_id``, durable ``session_key``, and ``platform``. Signature inspection is
     used instead of catching ``TypeError`` so errors raised inside a handler
     are never accidentally retried and duplicated.
     """

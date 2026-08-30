@@ -150,13 +150,21 @@ def test_turn_route_middleware_receives_redacted_route_and_resolves_provider(mon
             "provider": "anthropic",
             "api_key": "secret-not-for-plugin",
             "base_url": "https://api.anthropic.com",
+            "api_mode": "acp",
+            "command": "copilot",
+            "args": ["--token=do-not-leak", "/private/operator/path"],
         },
+        session_key="chat-1",
         session_id="session-1",
         source=_make_source(),
     )
     assert "api_key" not in observed["route"]
     assert "api_key" not in observed["route"]["runtime"]
+    assert "command" not in observed["route"]["runtime"]
+    assert "args" not in observed["route"]["runtime"]
+    assert "do-not-leak" not in repr(observed["route"])
     assert observed["context"]["session_id"] == "session-1"
+    assert observed["context"]["session_key"] == "chat-1"
     assert model == "gpt-5.4"
     assert runtime["provider"] == "openai"
     assert runtime["api_key"] == "selected-key"
@@ -207,4 +215,3 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key=session_key) is None
     # A different session still gets the config default.
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
-

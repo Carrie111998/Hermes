@@ -12985,6 +12985,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 plugin_handler,
                                 user_args,
                                 session_id=getattr(self, "session_id", None),
+                                session_key=getattr(self, "session_id", None),
                                 platform="cli",
                             )
                         )

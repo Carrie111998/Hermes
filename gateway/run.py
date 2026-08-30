@@ -5849,6 +5849,7 @@ class TurnRunner:
             model=model,
             runtime_kwargs=runtime_kwargs,
             session_id=ctx.session_id,
+            session_key=ctx.session_key,
             source=ctx.source,
             internal=bool(ctx.persist_user_display_kind),
         )
@@ -8758,6 +8759,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         runtime_kwargs: dict,
         session_id: Optional[str],
         source: Optional[SessionSource],
+        session_key: Optional[str] = None,
         internal: bool = False,
     ) -> tuple[str, dict, list[dict]]:
         """Apply pre-agent routing and resolve host-owned credentials once.
@@ -8770,22 +8772,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if internal:
             return model, runtime_kwargs, []
         try:
-            from hermes_cli.middleware import apply_turn_route_middleware
+            from hermes_cli.middleware import (
+                apply_turn_route_middleware,
+                public_turn_route,
+            )
 
-            public_route = {
-                "model": model,
-                "provider": runtime_kwargs.get("provider"),
-                "requested_provider": runtime_kwargs.get("requested_provider"),
-                "runtime": {
-                    key: runtime_kwargs.get(key)
-                    for key in ("provider", "requested_provider", "api_mode", "command", "args")
-                    if runtime_kwargs.get(key) not in (None, "")
-                },
-            }
+            public_route = public_turn_route(model, runtime_kwargs)
             result = apply_turn_route_middleware(
                 public_route,
                 user_message=message,
                 session_id=session_id,
+                session_key=session_key,
                 source=source.platform.value if source and source.platform else "gateway",
                 is_user_turn=True,
                 is_first_turn=False,
@@ -19138,6 +19135,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         plugin_handler,
                         user_args,
                         session_id=_quick_key,
+                        session_key=_quick_key,
                         platform=source.platform.value if source.platform else None,
                     )
                     if asyncio.iscoroutine(result):

@@ -26,6 +26,25 @@ LLM_EXECUTION_MIDDLEWARE = "llm_execution"
 # rewrites an already selected provider request.
 TURN_ROUTE_MIDDLEWARE = "turn_route"
 
+# Stable, explicitly public route metadata.  Provider command/argv values can
+# carry operator-supplied secrets (for example ACP tokens), so they are never
+# part of the plugin-visible route ABI.
+PUBLIC_TURN_RUNTIME_KEYS = ("provider", "requested_provider", "api_mode")
+
+
+def public_turn_route(model: str, runtime: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the redacted route DTO exposed to turn-route middleware."""
+    return {
+        "model": model,
+        "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
+        "runtime": {
+            key: runtime.get(key)
+            for key in PUBLIC_TURN_RUNTIME_KEYS
+            if runtime.get(key) not in (None, "")
+        },
+    }
+
 # Back-compat aliases for older PoC branches that used API terminology.
 API_REQUEST_MIDDLEWARE = LLM_REQUEST_MIDDLEWARE
 API_EXECUTION_MIDDLEWARE = LLM_EXECUTION_MIDDLEWARE

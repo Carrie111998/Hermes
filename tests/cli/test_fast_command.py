@@ -162,8 +162,8 @@ class TestFastModeRouting(unittest.TestCase):
             base_url="https://openrouter.ai/api/v1",
             provider="openrouter",
             api_mode="chat_completions",
-            acp_command=None,
-            acp_args=[],
+            acp_command="copilot",
+            acp_args=["--token=do-not-leak", "/private/operator/path"],
             _credential_pool=None,
             service_tier="priority",
         )
@@ -235,11 +235,66 @@ class TestFastModeRouting(unittest.TestCase):
 
         assert "api_key" not in observed["route"]
         assert "api_key" not in observed["route"]["runtime"]
+        assert "command" not in observed["route"]["runtime"]
+        assert "args" not in observed["route"]["runtime"]
+        assert "do-not-leak" not in repr(observed["route"])
         assert observed["context"]["session_id"] == "session-1"
+        assert observed["context"]["session_key"] == "session-1"
         assert route["model"] == "gpt-5.4"
         assert route["runtime"]["provider"] == "openai"
         assert route["runtime"]["api_key"] == "selected-key"
         assert route["middleware_trace"] == [{"source": "test"}]
+        assert stub.model == "old-model"
+        assert stub.provider == "anthropic"
+        assert stub.api_key == "secret-not-for-plugin"
+
+    def test_turn_route_selection_is_ephemeral_across_two_turns(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary-a",
+            api_key="primary-key",
+            base_url="https://primary.example/v1",
+            provider="primary",
+            requested_provider="primary",
+            api_mode="chat_completions",
+            acp_command="primary-client",
+            acp_args=["--profile", "primary"],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-1",
+        )
+        calls = []
+
+        def fake_apply(route, **context):
+            calls.append(route)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    changed=True,
+                    payload={**route, "model": "dynamic-b", "provider": "secondary"},
+                    trace=[{"source": "test"}],
+                )
+            return SimpleNamespace(changed=False, payload=route, trace=[])
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "secondary",
+                "api_key": "secondary-key",
+                "base_url": "https://secondary.example/v1",
+                "api_mode": "chat_completions",
+            },
+        ):
+            first = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "turn one")
+            second = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "turn two")
+
+        assert first["model"] == "dynamic-b"
+        assert first["runtime"]["api_key"] == "secondary-key"
+        assert second["model"] == "primary-a"
+        assert second["runtime"]["provider"] == "primary"
+        assert second["runtime"]["api_key"] == "primary-key"
+        assert calls[1]["model"] == "primary-a"
+        assert calls[1]["provider"] == "primary"
 
 
 class TestAnthropicFastMode(unittest.TestCase):

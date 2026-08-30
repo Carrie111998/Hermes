@@ -330,22 +330,17 @@ class CLIAgentSetupMixin:
         # helpers and internal continuations opt out via ``_skip_turn_routing``.
         if not getattr(self, "_skip_turn_routing", False):
             try:
-                from hermes_cli.middleware import apply_turn_route_middleware
+                from hermes_cli.middleware import (
+                    apply_turn_route_middleware,
+                    public_turn_route,
+                )
 
-                public_route = {
-                    "model": route["model"],
-                    "provider": runtime.get("provider"),
-                    "requested_provider": runtime.get("requested_provider"),
-                    "runtime": {
-                        key: runtime.get(key)
-                        for key in ("provider", "requested_provider", "api_mode", "command", "args")
-                        if runtime.get(key) not in (None, "")
-                    },
-                }
+                public_route = public_turn_route(route["model"], runtime)
                 result = apply_turn_route_middleware(
                     public_route,
                     user_message=user_message,
                     session_id=getattr(self, "session_id", None),
+                    session_key=getattr(self, "session_id", None),
                     source="cli",
                     is_user_turn=True,
                     is_first_turn=self.agent is None,
@@ -383,15 +378,9 @@ class CLIAgentSetupMixin:
                         route["model"] = selected_model
                         route["runtime"] = runtime
                         route["middleware_trace"] = result.trace
-                        self.model = selected_model
-                        self.requested_provider = selected_provider
-                        self.provider = runtime.get("provider", selected_provider)
-                        self.api_key = runtime.get("api_key")
-                        self.base_url = runtime.get("base_url")
-                        self.api_mode = runtime.get("api_mode", self.api_mode)
-                        self.acp_command = runtime.get("command")
-                        self.acp_args = list(runtime.get("args") or [])
-                        self._credential_pool = runtime.get("credential_pool")
+                        # Keep the selection ephemeral to this turn.  The
+                        # configured CLI route remains the fallback for the
+                        # next turn if middleware is disabled or fails.
             except Exception as exc:
                 # Routing is advisory and must never strand the user's turn;
                 # Hermes continues with its configured route on plugin errors.
