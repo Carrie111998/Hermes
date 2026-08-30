@@ -213,7 +213,8 @@ browser:
   real_profile_headed: false
 ```
 
-When you turn the toggle back off, Hermes deletes the snapshot store
+Turning `real_profile_headed` back on or off does not touch the copied
+profile — only turning `use_real_profile` back off deletes the snapshot store
 (`~/.hermes/browser-profile/`) on the next browser use, so the copied
 credentials don't linger after you revoke consent.
 

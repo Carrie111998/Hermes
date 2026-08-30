@@ -361,6 +361,20 @@ class TestRealProfileCdpLaunch:
         assert "--headless=new" not in captured["argv"]
         self._reset()
 
+    def test_headed_string_false_is_hidden(self):
+        """A string "false" (e.g. from a generated/migrated config) must not
+        be treated as Python's truthy non-empty string."""
+        import tools.browser_tool as bt
+        with patch("hermes_cli.config.read_raw_config",
+                   return_value={"browser": {"real_profile_headed": "false"}}):
+            assert bt._real_profile_headed() is False
+
+    def test_headed_string_true_stays_headed(self):
+        import tools.browser_tool as bt
+        with patch("hermes_cli.config.read_raw_config",
+                   return_value={"browser": {"real_profile_headed": "true"}}):
+            assert bt._real_profile_headed() is True
+
     def test_reuses_only_session_on_our_copy_dir(self, tmp_path):
         """A live session on a DIFFERENT dir (stale/throwaway) is closed, not reused."""
         import tools.browser_tool as bt

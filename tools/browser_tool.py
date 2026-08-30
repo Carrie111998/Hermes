@@ -1456,14 +1456,17 @@ def _real_profile_headed() -> bool:
 
     Reads ``browser.real_profile_headed`` (default True, preserving today's
     visible-by-design behavior) on EVERY call, mirroring ``_use_real_profile``
-    so flipping it takes effect on the next launch without a restart.
+    so flipping it takes effect on the next launch without a restart. Uses
+    ``is_truthy_value`` so a string ``"false"`` (e.g. from a generated or
+    migrated config) is treated as off rather than as Python's truthy
+    non-empty string.
     """
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return bool(browser_cfg.get("real_profile_headed", True))
+            return is_truthy_value(browser_cfg.get("real_profile_headed", True), default=True)
     except Exception as e:
         logger.debug("Could not read browser.real_profile_headed from config: %s", e)
     return True
