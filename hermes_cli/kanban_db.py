@@ -4614,6 +4614,7 @@ def get_board_notify(
         board = None
     if normalized_platform != "discord":
         return None
+    _validate_board_notify_connection(conn, board)
     from hermes_cli import kanban_board_notify as board_notify
 
     return board_notify.get_board_notify(conn, _board_notify_board_id(board))
@@ -4637,6 +4638,7 @@ def remove_board_notify(
     """Remove the active board's pin without touching card subscriptions."""
     if str(platform or "").strip().lower() != "discord":
         return False
+    _validate_board_notify_connection(conn, board)
     from hermes_cli import kanban_board_notify as board_notify
 
     board_notify.clear_board_notify(conn, _board_notify_board_id(board))
@@ -4689,6 +4691,35 @@ def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
         return Path(str(row[2])).resolve()
     except OSError:
         return Path(str(row[2]))
+
+
+def _validate_board_notify_connection(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+) -> None:
+    """Reject an explicitly labelled board that differs from ``conn``.
+
+    ``kanban_db_path`` is the single path-resolution seam for Kanban, including
+    the ``HERMES_KANBAN_DB`` override. The board-notify conflict scan has a
+    separate path resolver because it must inspect sibling boards, but this
+    validation concerns the live connection itself and must use the normal
+    resolver.
+    """
+    if board is None:
+        return
+    current_path = _connection_db_path(conn)
+    if current_path is None:
+        return
+    expected_path = kanban_db_path(board=board)
+    try:
+        current_path = current_path.resolve()
+        expected_path = expected_path.resolve()
+    except OSError:
+        pass
+    if current_path != expected_path:
+        raise ValueError(
+            f"board {board!r} database does not match the live connection"
+        )
 
 
 @contextlib.contextmanager
@@ -4774,6 +4805,7 @@ def _board_notify_conflict(
     current_path = _connection_db_path(conn)
     if current_path is not None:
         current_path = current_path.resolve()
+    _validate_board_notify_connection(conn, board)
     current_board = _board_notify_board_id(board)
     for slug, path in _iter_board_notify_db_paths():
         if slug == current_board:
@@ -4837,6 +4869,7 @@ def set_board_notify(
         raise ValueError(
             "board notification destination must be a Discord thread"
         )
+    _validate_board_notify_connection(conn, board)
     board_id = _board_notify_board_id(board)
     with _board_notify_destination_lock():
         if not replace_existing:
@@ -4846,7 +4879,7 @@ def set_board_notify(
         conflict = _board_notify_conflict(
             conn,
             destination=canonical,
-            board=board_id,
+            board=board,
         )
         if conflict is not None:
             raise ValueError(
@@ -4962,7 +4995,7 @@ def subscribe_notify_source_on_create(
         return subscribe_card()
 
     board_id = _board_notify_board_id(board)
-    if get_board_notify(conn, board=board_id) is not None:
+    if get_board_notify(conn, board=board) is not None:
         _remove_notify_subs_for_task_platform(conn, task_id, "discord")
         return True
 
@@ -4990,7 +5023,7 @@ def subscribe_notify_source_on_create(
             notifier_profile=notifier_profile,
             delivery_mode="notify",
             delivery_metadata=delivery_metadata,
-            board=board_id,
+            board=board,
             replace_existing=False,
         )
     except ValueError as exc:
