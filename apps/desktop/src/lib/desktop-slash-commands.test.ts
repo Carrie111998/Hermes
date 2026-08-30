@@ -124,9 +124,16 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/redraw')).toBe(false)
     expect(isDesktopSlashSuggestion('/approve')).toBe(false)
     expect(isDesktopSlashSuggestion('/model')).toBe(false)
-    expect(isDesktopSlashSuggestion('/skills')).toBe(false)
     expect(isDesktopSlashSuggestion('/voice')).toBe(false)
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
+  })
+
+  it('executes /skills pending so staged skill writes are reviewable from desktop', () => {
+    expect(resolveDesktopCommand('/skills pending')?.surface).toEqual({ kind: 'exec' })
+    expect(desktopSlashCommandArgumentMode('/skills')).toBe('options')
+    expect(isDesktopSlashSuggestion('/skills')).toBe(true)
+    expect(isDesktopSlashCommand('/skills pending')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/skills pending')).toBeNull()
   })
 
   it('/voice points at the composer voice button instead of the generic advanced message', () => {
@@ -365,7 +372,7 @@ describe('desktop slash command curation', () => {
 
   it('explains known commands that desktop owns elsewhere', () => {
     expect(desktopSlashUnavailableMessage('/model sonnet')).toContain('model picker')
-    expect(desktopSlashUnavailableMessage('/skills')).toContain('desktop sidebar')
+    expect(desktopSlashUnavailableMessage('/pets')).toContain('desktop sidebar')
     expect(desktopSlashUnavailableMessage('/clear')).toContain('terminal interface')
   })
 
