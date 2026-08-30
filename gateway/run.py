@@ -12154,6 +12154,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _initialize_startup_restore_state(self) -> None:
+        """Keep cold-start recovery session-local instead of gating all inbound."""
+        self._startup_restore_in_progress = False
+        self._startup_restore_queue = []
+        self._startup_restore_tasks = []
+
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
         drained = 0
@@ -13308,14 +13314,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.debug("Stuck-loop detection failed: %s", e)
 
-        # Serialize startup restore against inbound dispatch.  Platform
-        # adapters can begin receiving messages as soon as they connect, but
-        # restart-interrupted sessions are not auto-resumed until all startup
-        # wiring below completes.  Queue inbound messages until the resume
-        # pass runs and every synthetic resume turn has finished.
-        self._startup_restore_in_progress = True
-        self._startup_restore_queue = []
-        self._startup_restore_tasks = []
+        # Cold boot availability outranks session recovery. Do NOT globally
+        # gate inbound while restart-interrupted sessions auto-resume: each
+        # resume session is synchronously pre-claimed, so same-session inbound
+        # still queues safely behind its own slot while every other Slack
+        # conversation remains serviceable even if a huge transcript,
+        # compression failure, or model stall makes recovery pathological.
+        # Auto-resume remains a post-connect background task.
+        self._initialize_startup_restore_state()
 
         connected_count = 0
         enabled_platform_count = 0

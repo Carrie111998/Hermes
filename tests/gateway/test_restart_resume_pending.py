@@ -705,6 +705,55 @@ async def test_reconnect_reschedule_is_platform_scoped():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MemoryError("giant-session-load-failed"),
+        RuntimeError("context-compression-failed"),
+        RuntimeError("auto-resume-failed"),
+    ],
+    ids=["giant-session", "compression-failure", "auto-resume-failure"],
+)
+async def test_startup_recovery_failure_never_enables_global_inbound_gate(failure):
+    """Broken recovery work is background-only after platform availability.
+
+    A huge transcript, compressor failure, or resume-agent failure may leave
+    that one session pending, but must not switch the gateway back into the
+    global startup queue that blocks Slack inbound for every session.
+    """
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    runner._initialize_startup_restore_state()
+    assert runner._startup_restore_in_progress is False
+    assert runner._startup_restore_queue == []
+    assert runner._startup_restore_tasks == []
+    source = make_restart_source(chat_id="broken-restore-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:broken-restore-chat",
+        session_id="sid-broken",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock(side_effect=failure)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert runner._startup_restore_in_progress is False
+    assert pending_entry.session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
 async def test_startup_restore_waits_for_resume_before_draining_inbound():
     """Queued inbound turns replay only after startup resume tasks finish."""
     runner, adapter = make_restart_runner()
