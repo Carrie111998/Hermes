@@ -9476,10 +9476,32 @@ def _friendly_missing_binary_error(exc: OSError) -> None:
     cmd_update wrapper as a bare traceback. This turns that into a one-line
     remediation naming the missing binary (#86529).
     """
-    name = getattr(exc, "filename", None) or (exc.args[0] if exc.args else "git")
+    filename = getattr(exc, "filename", None)
+    if isinstance(filename, str) and filename:
+        name = filename
+    elif exc.args and isinstance(exc.args[-1], str) and exc.args[-1]:
+        name = exc.args[-1]
+    else:
+        name = "git"
+    # Guard against errno int fallback (FileNotFoundError args[0] is errno 2)
+    if not isinstance(name, str) or name.isdigit():
+        name = "git"
     print(f"✗ `{name}` is required to update Hermes but was not found on PATH.")
     print("  Install it and try again, or run the update from a different shell.")
     sys.exit(1)
+
+
+def _is_missing_git_error(exc: FileNotFoundError) -> bool:
+    """Return True only for a missing git binary, not unrelated FileNotFoundErrors."""
+    import os
+    filename = getattr(exc, "filename", None)
+    if isinstance(filename, str) and filename:
+        return os.path.basename(filename) == "git"
+    if exc.args and isinstance(exc.args[-1], str):
+        return os.path.basename(exc.args[-1]) == "git"
+    # If we cannot determine, treat errno-2 with git-like context as git missing
+    # but be conservative: only if args contains 'git' string
+    return any(isinstance(a, str) and os.path.basename(a) == "git" for a in exc.args) if exc.args else False
 
 
 def cmd_update(args):
@@ -9528,7 +9550,12 @@ def cmd_update(args):
         except FileNotFoundError as exc:
             # Missing git binary escapes subprocess.run as FileNotFoundError,
             # not CalledProcessError — surface a friendly message (#86529).
-            _friendly_missing_binary_error(exc)
+            # Narrow: only report friendly message for missing git binary,
+            # re-raise unrelated FileNotFoundErrors (e.g. missing cache files).
+            if _is_missing_git_error(exc):
+                _friendly_missing_binary_error(exc)
+            else:
+                raise
         return
 
     gateway_mode = getattr(args, "gateway", False)
@@ -9561,7 +9588,11 @@ def cmd_update(args):
         # Missing git binary escapes subprocess.run as FileNotFoundError,
         # not CalledProcessError — surface a friendly message instead of a
         # bare traceback (finally still releases the lock + restores stdio).
-        _friendly_missing_binary_error(exc)
+        # Narrow: only handle missing git binary, re-raise others.
+        if _is_missing_git_error(exc):
+            _friendly_missing_binary_error(exc)
+        else:
+            raise
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
