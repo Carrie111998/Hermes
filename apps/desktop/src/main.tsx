@@ -27,6 +27,7 @@ import { installClipboardShim } from './lib/clipboard'
 import { queryClient } from './lib/query-client'
 import { installRendererAnimationPauseState } from './lib/renderer-loop-pause'
 import { installSelectionCopyColorGuard } from './lib/selection-copy-colors'
+import { applySpectatorDocumentMode } from './platform/browser-spectator'
 import { registerSpectatorServiceWorker } from './platform/spectator-service-worker'
 import { ThemeProvider } from './themes/context'
 
@@ -35,6 +36,7 @@ installClipboardShim()
 // theme's computed colors inlined; without this guard a dark-theme selection
 // pastes as near-white text into light-background targets.
 installSelectionCopyColorGuard()
+applySpectatorDocumentMode()
 void registerSpectatorServiceWorker()
 
 // The perf probe ships in dev, and in a production build ONLY when explicitly

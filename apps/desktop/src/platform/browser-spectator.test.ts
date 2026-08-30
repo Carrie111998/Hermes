@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  applySpectatorDocumentMode,
   assertSpectatorReadRequest,
   browserSpectatorApi,
-  browserSpectatorConnection
+  browserSpectatorConnection,
+  SPECTATOR_ROOT_ATTRIBUTE
 } from './browser-spectator'
 
 const jsonResponse = (body: unknown, status = 200) =>
@@ -23,7 +25,21 @@ describe('browser spectator transport', () => {
   })
 
   afterEach(() => {
+    document.documentElement.removeAttribute(SPECTATOR_ROOT_ATTRIBUTE)
     vi.unstubAllGlobals()
+  })
+
+  it('marks only the explicit browser spectator document', () => {
+    const desktop = window.hermesDesktop
+
+    delete (window as { hermesDesktop?: typeof window.hermesDesktop }).hermesDesktop
+    expect(applySpectatorDocumentMode()).toBe(true)
+    expect(document.documentElement.hasAttribute(SPECTATOR_ROOT_ATTRIBUTE)).toBe(true)
+
+    window.hermesDesktop = desktop ?? ({} as typeof window.hermesDesktop)
+    expect(applySpectatorDocumentMode()).toBe(false)
+    expect(document.documentElement.hasAttribute(SPECTATOR_ROOT_ATTRIBUTE)).toBe(false)
+    window.hermesDesktop = desktop
   })
 
   it('permits audited GET endpoints and scopes the profile', async () => {

@@ -1,6 +1,9 @@
 import type { HermesApiRequest, HermesConnection } from '@/global'
 
 const SPECTATOR_HEADER = 'X-Hermes-Spectator-Token'
+
+export const SPECTATOR_ROOT_ATTRIBUTE = 'data-hermes-spectator'
+
 const READ_ONLY_PREFIXES = [
   '/api/config',
   '/api/hermes/version',
@@ -24,7 +27,9 @@ declare global {
 function basePath(): string {
   const raw = window.__HERMES_BASE_PATH__?.trim() ?? ''
 
-  if (!raw) return ''
+  if (!raw) {
+    return ''
+  }
 
   return `/${raw.replace(/^\/+|\/+$/g, '')}`
 }
@@ -52,6 +57,16 @@ export function isBrowserSpectator(): boolean {
   return typeof window !== 'undefined' && window.__HERMES_SPECTATOR__ === true && !window.hermesDesktop
 }
 
+/** Mark the document before React mounts so iPad-only layout/touch rules never
+ * leak into native Desktop windows. Idempotent for StrictMode and hot reload. */
+export function applySpectatorDocumentMode(): boolean {
+  const enabled = isBrowserSpectator()
+
+  document.documentElement.toggleAttribute(SPECTATOR_ROOT_ATTRIBUTE, enabled)
+
+  return enabled
+}
+
 export function assertSpectatorReadRequest(request: HermesApiRequest): void {
   const method = (request.method ?? 'GET').toUpperCase()
 
@@ -66,7 +81,10 @@ export async function browserSpectatorApi<T>(request: HermesApiRequest): Promise
   assertSpectatorReadRequest(request)
 
   const token = window.__HERMES_SPECTATOR_TOKEN__
-  if (!token) throw new Error('Spectator credential is unavailable')
+
+  if (!token) {
+    throw new Error('Spectator credential is unavailable')
+  }
 
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), request.timeoutMs ?? 30_000)
@@ -86,6 +104,7 @@ export async function browserSpectatorApi<T>(request: HermesApiRequest): Promise
 
       if (body?.login_url) {
         window.location.assign(body.login_url)
+
         return new Promise<T>(() => undefined)
       }
     }
@@ -103,7 +122,11 @@ export async function browserSpectatorApi<T>(request: HermesApiRequest): Promise
 
 async function websocketAuth(): Promise<readonly [string, string]> {
   const token = window.__HERMES_SPECTATOR_TOKEN__ ?? ''
-  if (!token) throw new Error('Spectator credential is unavailable')
+
+  if (!token) {
+    throw new Error('Spectator credential is unavailable')
+  }
+
   return ['spectator', token]
 }
 

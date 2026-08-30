@@ -11989,6 +11989,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   }
 
   const token = crypto.randomBytes(32).toString('base64url')
+  const spectatorRelayToken = crypto.randomBytes(32).toString('base64url')
 
   // Same update mutual exclusion as the primary window's waitForLocalStart
   // (#73822): pool backends spawn from the same venv, so an ungated respawn
@@ -12052,6 +12053,9 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
         // can still point at the install dir even when spawn cwd is home.
         TERMINAL_CWD: hermesCwd,
         HERMES_DASHBOARD_SESSION_TOKEN: token,
+        HERMES_DESKTOP_PROFILE: profile,
+        HERMES_SPECTATOR_RELAY_TOKEN: spectatorRelayToken,
+        HERMES_SPECTATOR_DESCRIPTOR_DIR: path.join(HERMES_HOME, 'runtime', 'desktop-spectator'),
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
@@ -12360,6 +12364,7 @@ async function startHermes() {
     }
 
     const token = crypto.randomBytes(32).toString('base64url')
+    const spectatorRelayToken = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is
@@ -12441,6 +12446,9 @@ async function startHermes() {
           ...backend.env,
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
+          HERMES_DESKTOP_PROFILE: profile,
+          HERMES_SPECTATOR_RELAY_TOKEN: spectatorRelayToken,
+          HERMES_SPECTATOR_DESCRIPTOR_DIR: path.join(HERMES_HOME, 'runtime', 'desktop-spectator'),
           // Marks this dashboard backend as desktop-spawned so it runs the cron
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',

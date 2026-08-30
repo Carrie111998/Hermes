@@ -59,6 +59,40 @@
    (this variant) flatten everything into one shared scroll. See ChatSidebar. */
 @custom-variant compact (@media (max-height: 768px));
 
+/* iPad spectator ergonomics. The root attribute is set only by the explicit
+   read-only browser bootstrap, so native Desktop geometry remains byte-for-byte
+   governed by its existing rules. */
+html[data-hermes-spectator] {
+  min-height: 100%;
+  font-size: clamp(15px, 1.15vw, 17px);
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+
+html[data-hermes-spectator] body {
+  min-height: 100dvh;
+  overscroll-behavior: none;
+}
+
+html[data-hermes-spectator] #root {
+  box-sizing: border-box;
+  min-height: 100dvh;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+}
+
+@media (pointer: coarse) {
+  html[data-hermes-spectator] :is(button, [role='button'], [role='tab']) {
+    min-height: 2.5rem;
+  }
+
+  html[data-hermes-spectator] :is(button, [role='button'], [role='tab']):has(.codicon) {
+    min-width: 2.5rem;
+  }
+}
+
 @font-face {
   font-family: 'Collapse';
   font-style: normal;

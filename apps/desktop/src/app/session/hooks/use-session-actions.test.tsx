@@ -1014,7 +1014,8 @@ describe('resumeSession failure recovery', () => {
 
       expect(requestGateway).toHaveBeenCalledOnce()
       expect(requestGateway).toHaveBeenCalledWith('session.subscribe', {
-        session_id: 'stored-1'
+        session_id: 'stored-1',
+        profile: 'default'
       })
       expect(order).toEqual(['durable-hydration', 'session.subscribe'])
       expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-1', 'default')

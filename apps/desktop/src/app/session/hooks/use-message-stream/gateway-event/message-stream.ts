@@ -2,10 +2,13 @@ import type { BillingBlock } from '@hermes/shared'
 
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
+import { finalizeInterruptedMessages } from '@/app/session/hooks/use-prompt-actions/rewind'
+import { textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
 import { parseErrorSurface } from '@/lib/error-surface'
 import { triggerHaptic } from '@/lib/haptics'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
 import { clearClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
@@ -79,6 +82,29 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     sessionStateByRuntimeIdRef,
     updateSessionState
   } = deps
+
+  if (event.type === 'message.user') {
+    if (isBrowserSpectator() && sessionId && payload?.display_kind !== 'hidden') {
+      const text = coerceGatewayText(payload?.text)
+      const observerId = coerceGatewayText(payload?.observer_id)
+
+      if (text && observerId) {
+        updateSessionState(sessionId, state =>
+          state.messages.some(message => message.id === observerId)
+            ? state
+            : {
+                ...state,
+                messages: [
+                  ...finalizeInterruptedMessages(state.messages, state.streamId),
+                  { id: observerId, role: 'user', parts: [textPart(text)], timestamp: occurredAt }
+                ]
+              }
+        )
+      }
+    }
+
+    return true
+  }
 
   if (event.type === 'message.start') {
     if (!sessionId) {

@@ -40,7 +40,15 @@ import { useState } from 'react'
 
 import { avatarColor, botAppearance, BotFace } from './avatar'
 import { $focusedBotOwner, $selectedBot, focusedRosterOwner } from './bot-state'
-import { $botMeta, $lastRoster, botHandle, botRosterKey, botSelectionKey, isActiveRosterBot } from './data'
+import {
+  $botMeta,
+  $lastRoster,
+  botHandle,
+  botRosterKey,
+  botSelectionKey,
+  isActiveRosterBot,
+  isSpectatorMode
+} from './data'
 import { labeled } from './dialog-parts'
 import { botsText, useBots } from './i18n'
 import { displayName } from './labels'
@@ -451,6 +459,7 @@ export function RoutineRow({ job, onOpen, owner }: RoutineRowProps) {
   const { t } = useI18n()
   const c = t.cron
   const profile = typeof owner === 'string' ? owner : owner?.name
+  const spectator = isSpectatorMode()
   const [busy, setBusy] = useState(false)
   // Optimistic overlay: null = trust server state. Set immediately on
   // toggle so the switch responds even before the refetch lands.
@@ -520,23 +529,27 @@ export function RoutineRow({ job, onOpen, owner }: RoutineRowProps) {
             {routineTitle(job)}
           </span>
         </RowButton>
-        <Switch
-          checked={active}
-          disabled={busy || legacyUnsafe}
-          onCheckedChange={value => act(value ? 'resume' : 'pause')}
-        />
-        <Tip label={t.common.delete}>
-          <Button
-            aria-label={t.common.delete}
-            className="opacity-0 transition-opacity group-hover:opacity-100"
-            disabled={busy}
-            onClick={() => act('remove')}
-            size="icon-xs"
-            variant="ghost"
-          >
-            <Codicon name="trash" />
-          </Button>
-        </Tip>
+        {spectator ? null : (
+          <Switch
+            checked={active}
+            disabled={busy || legacyUnsafe}
+            onCheckedChange={value => act(value ? 'resume' : 'pause')}
+          />
+        )}
+        {spectator ? null : (
+          <Tip label={t.common.delete}>
+            <Button
+              aria-label={t.common.delete}
+              className="opacity-0 transition-opacity group-hover:opacity-100"
+              disabled={busy}
+              onClick={() => act('remove')}
+              size="icon-xs"
+              variant="ghost"
+            >
+              <Codicon name="trash" />
+            </Button>
+          </Tip>
+        )}
       </div>
       <div className="flex items-center justify-between gap-2 pl-3.5">
         <span className="inline-flex items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[0.65rem] text-(--ui-text-tertiary)">
@@ -1175,6 +1188,7 @@ export function RoutinesPane() {
   const { t } = useI18n()
   const c = t.cron
   const [createOpen, setCreateOpen] = useState(false)
+  const spectator = isSpectatorMode()
   const [createOwner, setCreateOwner] = useState<RosterRow | null>(null)
   // Hold the id, not the record: the 20s poll replaces every job object, and
   // an open inspector must follow the live row (next run, pause, last error)
@@ -1228,11 +1242,13 @@ export function RoutinesPane() {
           </div>
           <div className="text-[0.65rem] uppercase tracking-wider text-(--ui-text-quaternary)">{c.title}</div>
         </div>
-        <Tip label={c.newCron}>
-          <Button aria-label={c.newCron} onClick={openCreate} size="icon-xs" variant="ghost">
-            <Codicon name="add" />
-          </Button>
-        </Tip>
+        {spectator ? null : (
+          <Tip label={c.newCron}>
+            <Button aria-label={c.newCron} onClick={openCreate} size="icon-xs" variant="ghost">
+              <Codicon name="add" />
+            </Button>
+          </Tip>
+        )}
       </div>
       <div className="mx-3 border-t border-(--ui-stroke-secondary)" />
       {staleNotice ? (
@@ -1260,9 +1276,11 @@ export function RoutinesPane() {
         // none are tagged for this bot), so it wins the description slot.
         <PanelEmpty
           action={
-            <Button onClick={openCreate} size="sm">
-              {c.newCron}
-            </Button>
+            spectator ? undefined : (
+              <Button onClick={openCreate} size="sm">
+                {c.newCron}
+              </Button>
+            )
           }
           description={filterHint || c.emptyDescNew}
           icon="watch"
@@ -1278,20 +1296,22 @@ export function RoutinesPane() {
         </div>
       )}
       <RoutineDetailDialog job={detailJob} onClose={() => setDetailJobId(null)} open={Boolean(detailJob)} />
-      <CreateRoutineDialog
-        // Non-null past the `!owner` early return above: `routineCreateTarget`
-        // falls back to the active profile name.
-        bot={createTarget!}
-        // TODO(bot-mode-types): `createTarget` is a roster row whenever a create
-        // owner is set, so this key stringifies to "[object Object]" instead of
-        // identifying the target bot. Cast to keep the as-written behavior.
-        key={createTarget as string}
-        onClose={() => {
-          setCreateOpen(false)
-          setCreateOwner(null)
-        }}
-        open={createOpen}
-      />
+      {spectator ? null : (
+        <CreateRoutineDialog
+          // Non-null past the `!owner` early return above: `routineCreateTarget`
+          // falls back to the active profile name.
+          bot={createTarget!}
+          // TODO(bot-mode-types): `createTarget` is a roster row whenever a create
+          // owner is set, so this key stringifies to "[object Object]" instead of
+          // identifying the target bot. Cast to keep the as-written behavior.
+          key={createTarget as string}
+          onClose={() => {
+            setCreateOpen(false)
+            setCreateOwner(null)
+          }}
+          open={createOpen}
+        />
+      )}
     </div>
   )
 }

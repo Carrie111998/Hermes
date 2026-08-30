@@ -951,7 +951,10 @@ export function useSessionActions({
           const subscription = await requestGateway<{
             session_id?: string
             subscribed?: boolean
-          }>('session.subscribe', { session_id: storedSessionId }).catch(() => null)
+          }>('session.subscribe', {
+            session_id: storedSessionId,
+            profile: sessionProfile || 'default'
+          }).catch(() => null)
 
           if (!isCurrentResume()) {
             return

@@ -291,6 +291,12 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    raw_display_text = params.get("display_text")
+    observer_text = (
+        sanitize_user_prompt_text(raw_display_text)
+        if isinstance(raw_display_text, str)
+        else text
+    )
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
@@ -912,7 +918,21 @@ def _(rid, params: dict) -> dict:
             session["_hosted_room_task"] = dict(hosted_task)
         _start_inflight_turn(session, text)
 
+    observer_payload = {
+        "text": observer_text if isinstance(observer_text, str) else "",
+        "display_kind": display_kind,
+        "observer_id": f"{sid}:{time.time_ns()}",
+        "timestamp": time.time(),
+    }
+    observer_emitted = False
+
     if turn_isolation:
+        # Compute hosts may begin streaming synchronously from submit_turn().
+        # Publish the accepted user boundary first so observers never see the
+        # answer above its prompt. If dispatch fails open to the inline path,
+        # retain this one event rather than duplicating the bubble.
+        _emit("message.user", sid, observer_payload)
+        observer_emitted = True
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind
         )
@@ -970,6 +990,8 @@ def _(rid, params: dict) -> dict:
             5071,
             f"session storage could not be written: {exc}",
         )
+    if not observer_emitted:
+        _emit("message.user", sid, observer_payload)
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:

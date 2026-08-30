@@ -49,6 +49,9 @@ export type GatewayEventPayload = {
    * its local receipt clock when older gateways omit it. */
   timestamp?: number
   text?: string
+  /** Observer-only accepted user turn. Writer surfaces insert it optimistically. */
+  observer_id?: string
+  display_kind?: string | null
   rendered?: string
   status?: string
   message?: string

@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -659,7 +660,15 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
         finally:
             server._sessions.pop("sid", None)
 
-    assert run_flag_on() == run_flag_off()
+    def stable(events):
+        normalized = copy.deepcopy(events)
+        for event, _sid, payload in normalized:
+            if event == "message.user" and payload:
+                payload.pop("observer_id", None)
+                payload.pop("timestamp", None)
+        return normalized
+
+    assert stable(run_flag_on()) == stable(run_flag_off())
 
 
 def test_session_context_explicit_cwd_for_ephemeral_task(monkeypatch, tmp_path):
@@ -1291,6 +1300,65 @@ def test_run_prompt_submit_never_ticks_after_message_complete(monkeypatch):
     assert "message.complete" in events
     last_tick = max(i for i, e in enumerate(events) if e == "session.usage")
     assert last_tick < events.index("message.complete")
+
+
+def test_prompt_submit_emits_visible_user_turn_for_read_only_observers(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: events.append((event_type, sid, payload or {})),
+    )
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    class _DoneThread:
+        def join(self):
+            return None
+
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *_args, **_kwargs: (threading.Event(), _DoneThread()),
+    )
+
+    class _Agent:
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_message=None,
+        ):
+            return {"final_response": "done", "messages": [], "completed": True}
+
+    server._sessions["sid-observer"] = _session(agent=_Agent())
+    try:
+        response = server.handle_request(
+            {
+                "id": "observer-submit",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid-observer",
+                    "text": "expanded model-facing prompt",
+                    "display_text": "Reply exactly: IPAD LIVE RELAY OK",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid-observer", None)
+
+    assert "error" not in response
+    observer_events = [event for event in events if event[0] == "message.user"]
+    assert len(observer_events) == 1
+    payload = observer_events[0][2]
+    assert payload["text"] == "Reply exactly: IPAD LIVE RELAY OK"
+    assert payload["display_kind"] is None
+    assert payload["observer_id"].startswith("sid-observer:")
+    event_types = [event[0] for event in events]
+    assert event_types.index("message.user") < event_types.index("message.complete")
 
 
 def test_usage_ticker_unbounded_join_waits_out_blocked_emit(monkeypatch):
