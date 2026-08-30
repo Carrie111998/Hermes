@@ -56,6 +56,7 @@ from tools.budget_config import (
     BudgetConfig,
     DEFAULT_BUDGET,
 )
+from tools.oversized_result_formatters import format_oversized_result
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -318,6 +319,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    formatter_name: str | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -332,6 +334,10 @@ def maybe_persist_tool_result(
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
+        formatter_name: Tool name used for the replacement-formatter lookup
+            only, when it differs from ``tool_name``. Layer 3 passes the real
+            tool name here because it must keep forcing ``threshold=0`` under
+            the synthetic ``tool_name``. Never consulted for thresholds.
 
     Returns:
         Original content if small, or <persisted-output> replacement.
@@ -347,6 +353,14 @@ def maybe_persist_tool_result(
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
+    # The persist decision is already taken above; a registered formatter only
+    # changes how the removal is REPORTED, and every return below this point is
+    # a report of the same removal. `formatter_name` exists so layer 3 can hand
+    # us the real tool name for the lookup while still forcing threshold=0
+    # through `tool_name`. None (the shipping default for every tool but one)
+    # leaves each receipt exactly as it was.
+    custom = format_oversized_result(content, formatter_name or tool_name)
+
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
     # caches, pruned by gateway housekeeping) regardless of backend.
@@ -358,6 +372,8 @@ def maybe_persist_tool_result(
                 "Persisted large tool result: %s (%s, %d chars -> %s)",
                 tool_name, tool_use_id, len(content), host_path,
             )
+            if custom is not None:
+                return custom
             return _build_persisted_message(preview, has_more, len(content), host_path)
     elif env is not None:
         # Remote backend: the spillover dir is auto-mounted (docker) or
@@ -370,6 +386,8 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
                     tool_name, tool_use_id, len(content), visible, host_path,
                 )
+                if custom is not None:
+                    return custom
                 return _build_persisted_message(preview, has_more, len(content), visible)
         # Fallback: write into the sandbox temp dir (pre-existing containers
         # without the spillover mount, translation/probe failures).
@@ -381,6 +399,8 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
+                if custom is not None:
+                    return custom
                 return _build_persisted_message(preview, has_more, len(content), remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
@@ -389,6 +409,8 @@ def maybe_persist_tool_result(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
         tool_name, len(content),
     )
+    if custom is not None:
+        return custom
     return (
         f"{preview}\n\n"
         f"[Truncated: tool response was {len(content):,} chars. "
@@ -430,6 +452,11 @@ def enforce_turn_budget(
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
+        # `tool_name` stays synthetic so `threshold=0` is what decides the
+        # spill, exactly as before. The REAL tool name goes to formatter_name,
+        # which is consulted only after that decision, purely to choose how the
+        # removal is reported. It was already on the message and simply thrown
+        # away (make_tool_result_message sets both keys).
         replacement = maybe_persist_tool_result(
             content=content,
             tool_name=_BUDGET_TOOL_NAME,
@@ -437,6 +464,7 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
+            formatter_name=msg.get("tool_name") or msg.get("name") or None,
         )
         if replacement != content:
             total_size -= size

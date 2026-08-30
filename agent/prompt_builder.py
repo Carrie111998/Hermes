@@ -280,7 +280,17 @@ SKILLS_GUIDANCE = (
     "context compression and is inaccessible — reload it with "
     "skill_view(name='...') before acting on anything that depends on it. "
     "After reloading, ignore any remaining `[SKILL_PRUNED]` markers for that "
-    "same skill; they are historical artifacts of earlier compactions."
+    "same skill; they are historical artifacts of earlier compactions.\n"
+    "A skill result containing `[SKILL_INCOMPLETE]` was NOT loaded: its body "
+    "was removed to protect the context window and only a heading index came "
+    "back, so do not treat it as loaded and do not act on it. Retrieve the "
+    "headings you need one at a time with skill_view(name='...', "
+    "section='...') and read them before acting. If the result names a linked "
+    "file (it carries a `file` key), keep that same path on every follow-up — "
+    "skill_view(name='...', file_path='...', section='...') — because the "
+    "headings and `#n` selectors are positions inside that file; dropping "
+    "`file_path` answers out of SKILL.md instead, and says nothing about "
+    "having done so."
 )
 
 KANBAN_GUIDANCE = (

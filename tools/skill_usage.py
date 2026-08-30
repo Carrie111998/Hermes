@@ -860,6 +860,42 @@ def bump_view(skill_name: str) -> None:
     _mutate(skill_name, _apply)
 
 
+# Fields bump_use() owns. use_snapshot()/revert_use() capture and restore
+# exactly these, so a use that turned out never to have happened leaves no
+# trace -- including in last_used_at, which agent/curator.py reads as the
+# staleness clock.
+_USE_FIELDS = (
+    "use_count",
+    "last_used_at",
+    "patch_generation",
+    "last_reused_patch_generation",
+)
+
+
+def use_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Capture the bump_use()-owned fields of *record* for a later revert."""
+    return {k: record.get(k) for k in _USE_FIELDS}
+
+
+def revert_use(skill_name: str, snapshot: Dict[str, Any]) -> None:
+    """Undo a bump_use() whose skill body never reached the model.
+
+    Called from the persisted-result formatter when the skill_view result that
+    triggered the bump was replaced by an incomplete-load receipt: the agent
+    viewed the skill, it did not use it. Restores the exact pre-bump values
+    rather than decrementing, so a concurrent patch cannot be lost.
+    """
+    if not isinstance(snapshot, dict) or not snapshot:
+        return
+
+    def _apply(rec: Dict[str, Any]) -> None:
+        for key in _USE_FIELDS:
+            if key in snapshot:
+                rec[key] = snapshot[key]
+
+    _mutate(skill_name, _apply)
+
+
 def bump_use(
     skill_name: str,
     *,
