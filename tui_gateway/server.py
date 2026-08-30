@@ -8316,7 +8316,7 @@ def _make_agent(
     # otherwise Desktop UI and token accounting collapse every named custom
     # fallback to the generic ``custom`` bucket (#98739).
     active_provider = (
-        runtime.get("requested_provider")
+        runtime.get("requested_provider") or runtime.get("provider")
         if resolution.used_fallback
         else runtime.get("provider")
     )
