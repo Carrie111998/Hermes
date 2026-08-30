@@ -5680,12 +5680,12 @@ class TestSystemPromptStability:
 
 
 class TestBudgetPressure:
-    """Budget exhaustion grace call system."""
+    """Budget exhaustion system (98885: _budget_grace_call dead code removed)."""
 
     def test_grace_call_flags_initialized(self, agent):
-        """Agent should have budget grace call flags."""
+        """Agent should have budget flags (grace_call removed)."""
         assert agent._budget_exhausted_injected is False
-        assert agent._budget_grace_call is False
+        assert not hasattr(agent, "_budget_grace_call")
 
 
 class TestSafeWriter:

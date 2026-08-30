@@ -389,11 +389,12 @@ class AIAgent:
 ### Agent Loop
 
 The core loop is inside `run_conversation()` — entirely synchronous, with
-interrupt checks, budget tracking, and a one-turn grace call:
+interrupt checks and budget tracking. The loop terminates when
+`iteration_budget.consume()` returns False or `api_call_count` reaches
+`max_iterations`:
 
 ```python
-while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) \
-        or self._budget_grace_call:
+while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
     if self._interrupt_requested: break
     response = client.chat.completions.create(model=model, messages=messages, tools=tool_schemas)
     if response.tool_calls:
